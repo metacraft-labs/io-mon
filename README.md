@@ -30,16 +30,42 @@ monitored process.
 - **`io_mon/windows_injector`** — the Windows `CreateRemoteThread` +
   `LoadLibraryW` injector (the Windows substitute for the macOS
   `DYLD_INSERT_LIBRARIES` env-var injection).
+- **`io_mon/shim/*`** + **`io_mon/hooks/*`** — the syscall-interpose shim
+  (built on `nim-stackable-hooks`) that actually injects into a monitored
+  process and captures the read/written paths. The platform entry points
+  (`shim/macos_interpose`, `shim/linux_preload`, `shim/windows_interpose`)
+  build as a shared library (`--app:lib`); `fs_snoop` loads it at runtime.
+  These are NOT imported by `import io_mon` — they are `--app:lib` entry
+  points with constructors and an interpose section, built directly.
+
+## Building the interpose shim
+
+The shim builds into a shared library whose name is kept **byte-identical** to
+reprobuild's historical shim, `librepro_monitor_shim.{dylib,so,dll}`, and whose
+exported interpose ABI (`repro_monitor_shim_*` / `repro_hook_*` /
+`repro_macos_*` / `ct_linux_preload_*`, plus the macOS `__DATA,__interpose`
+section) is preserved verbatim. This keeps the shim a **drop-in** for every
+consumer that locates it by that filename — including io-mon's own
+`fs_snoop.findShimLibrary` and (in M7) reprobuild's build engine.
+
+```sh
+nimble buildShim        # or: scripts/build_shim.sh
+# → build/lib/librepro_monitor_shim.<ext>
+```
 
 ## Relocation note
 
 io-mon is a faithful **relocation** of reprobuild's
-`repro_monitor_depfile` fs-snoop stack — the same sources, with the package
-namespace renamed from `repro_monitor_depfile` to `io_mon` and the one small
-`extendedPath` path helper (formerly `repro_core/paths`) vendored locally so
-io-mon has **no dependency on reprobuild**. The binary `RMDF` format and the
-producer identifier are kept byte-identical, so depfiles round-trip
-identically between reprobuild's fs-snoop and io-mon.
+`repro_monitor_depfile` fs-snoop stack AND its `repro_monitor_shim` +
+`repro_monitor_hooks` interpose closure — the same sources, with the package
+namespaces renamed (`repro_monitor_depfile` → `io_mon`,
+`repro_monitor_shim` → `io_mon/shim`, `repro_monitor_hooks` → `io_mon/hooks`)
+and the one small `extendedPath` path helper (formerly `repro_core/paths`)
+vendored locally, so io-mon has **no dependency on reprobuild**. The binary
+`RMDF` format and the producer identifier, and the shim's exported interpose
+ABI + shared-library name, are kept byte-identical — so depfiles round-trip
+identically and the shim is a drop-in replacement for reprobuild's fs-snoop in
+M7.
 
 ## Dependency direction (one-way)
 
