@@ -29,3 +29,12 @@ task test, "Run the io-mon test suite":
   let hooksPath = "--path:../nim-stackable-hooks/src"
   exec "nim c -r " & hooksPath & " tests/test_io_mon_parity_with_fs_snoop.nim"
   exec "nim c -r " & hooksPath & " tests/test_io_mon_builds_standalone.nim"
+  # The relocated interpose shim (io_mon/shim, io_mon/hooks) must build as a
+  # drop-in `librepro_monitor_shim` shared library on nim-stackable-hooks with
+  # no reprobuild path (this test invokes `nim c --app:lib` internally).
+  exec "nim c -r " & hooksPath & " tests/test_io_mon_shim_builds_standalone.nim"
+
+task buildShim, "Build the io-mon interpose shim shared library":
+  # Produces build/lib/librepro_monitor_shim.{dylib,so,dll} — the drop-in
+  # shared-library name reprobuild's M7 swap and io-mon's own fs_snoop locate.
+  exec "scripts/build_shim.sh"
