@@ -1,0 +1,31 @@
+# Package
+
+version       = "0.1.0"
+author        = "Metacraft Labs"
+description   = "Cross-platform filesystem I/O monitoring for Nim (relocation of reprobuild's fs-snoop stack) on nim-stackable-hooks."
+license       = "MIT"
+srcDir        = "src"
+skipDirs      = @["tests"]
+
+# Dependencies
+#
+# io-mon builds on nim-stackable-hooks (the interpose framework, package name
+# `stackable_hooks`). In this `repo`-managed multi-repo workspace, sibling
+# checkouts are resolved by path — consistent with the other Metacraft Nim
+# siblings (nim-acp, nim-agents, codetracer-trace-format-nim), which likewise
+# do NOT pin workspace siblings as Nimble git deps. The `--path` switch is
+# supplied by the test task below (and by the documented `nim c -r --path:...`
+# invocations), so no published `stackable_hooks` package is required.
+#
+# Deliberately NOT a git dependency: a `requires "https://…/nim-stackable-hooks"`
+# would fight the sibling checkout the workspace already provides (pulling a
+# second, divergent copy into ~/.nimble). CI runs from the workspace and uses
+# the same sibling path.
+requires "nim >= 2.0.0"
+
+task test, "Run the io-mon test suite":
+  # The sibling nim-stackable-hooks checkout is added to the path so the
+  # `stackable_hooks/...` imports resolve without a published package.
+  let hooksPath = "--path:../nim-stackable-hooks/src"
+  exec "nim c -r " & hooksPath & " tests/test_io_mon_parity_with_fs_snoop.nim"
+  exec "nim c -r " & hooksPath & " tests/test_io_mon_builds_standalone.nim"
