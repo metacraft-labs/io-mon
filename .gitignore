@@ -20,3 +20,4 @@ tests/test_io_mon_snoop_cli
 tests/test_io_mon_macos_bodypatch
 tests/test_io_mon_macos_bodypatch_spawn
 tests/test_io_mon_macos_record_once
+tests/test_io_mon_macos_sip_system_child

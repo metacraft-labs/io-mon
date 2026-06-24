@@ -440,7 +440,15 @@ proc repro_hook_execve*(path: cstring; argv, envp: cstringArray): cint
   ## via the raw-syscall forwarder (raw `SYS_execve`, which re-adds the injection
   ## env vars and SIP-rewrites the path). The raw syscall bypasses the possibly
   ## body-patched named `execve` entry, so there is no re-entry under `both`.
-  ## execve does not return on success, so the record MUST be emitted first.
+  ##
+  ## execve does not return on success — it REPLACES the process image — so the
+  ## record must be both EMITTED *and* FLUSHED before the forward. Emitting only
+  ## appends to the per-thread fragment BUFFER, which the new image never flushes
+  ## (it loses the old image's in-flight batch); the buffered exec record would
+  ## then be dropped, and with it the launched-binary dependency for this exec
+  ## (§16.7.8). We therefore flush the in-flight batch to disk before forwarding.
+  ## (The fork+exec case is the important one: a forked child's exec record lives
+  ## only in that child's buffer, which exec would otherwise discard.)
   if not initialized or disabled > 0:
     return ct_macos_interpose_real_execve(path, argv, envp)
   var record = baseRecord(mrProcessExec, moExecute)
@@ -448,6 +456,7 @@ proc repro_hook_execve*(path: cstring; argv, envp: cstringArray): cint
     record.path = $path
   record.detail = "execve"
   emitRecord(record)
+  discard repro_monitor_shim_flush()
   result = ct_macos_interpose_real_execve(path, argv, envp)
 
 proc repro_hook_fork*(): PidT {.exportc, cdecl, dynlib.} =
