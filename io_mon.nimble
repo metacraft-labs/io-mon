@@ -41,6 +41,11 @@ task test, "Run the io-mon test suite":
   # (fopen → libsystem-internal open$NOCANCEL) that __DATA,__interpose misses,
   # and asserts the interpose-only contrast. macOS-only (no-op pass elsewhere).
   exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_bodypatch.nim"
+  # macOS body-patch SPAWN family: proves injection PROPAGATES through a
+  # shared-cache-internal (dylib-originated) spawn the interpose section misses
+  # (spec §16.7.8), with the both-vs-interpose contrast. macOS-only (no-op
+  # pass elsewhere).
+  exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_bodypatch_spawn.nim"
 
 task buildShim, "Build the io-mon interpose shim shared library":
   # Produces build/lib/librepro_monitor_shim.{dylib,so,dll} — the drop-in

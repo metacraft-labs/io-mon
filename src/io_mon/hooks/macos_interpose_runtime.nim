@@ -177,6 +177,25 @@ int repro_macos_real_execve_syscall(char *path, char **argv, char **envp) {
   return (int)syscall(SYS_execve, effective_path, argv, effective_envp);
 }
 
+/*
+ * Raw fork forwarder for the body-patch backend. The body-patch backend
+ * replaces the libsystem `fork` entry, so it must NOT forward through the named
+ * symbol or dlsym (that address is now patched and would re-enter infinitely).
+ *
+ * NOTE: `syscall(SYS_fork)` performs the bare kernel fork WITHOUT running
+ * libsystem's `fork()` userland wrapper work (atfork handlers, malloc-lock
+ * reset, etc.). That is acceptable here because (a) the body-patch fork hook is
+ * only reached for shared-cache-INTERNAL fork callers that interpose misses, and
+ * its sole job is to RECORD the spawn (a forked child inherits the already-loaded
+ * shim + env, so no propagation is needed), and (b) the immediate, overwhelming
+ * use of an internal fork is fork()+exec(), where the child execs promptly and
+ * the skipped userland bookkeeping is moot. We forward to the kernel directly to
+ * guarantee no re-entry into the patched named symbol.
+ */
+pid_t repro_macos_real_fork_syscall(void) {
+  return (pid_t)syscall(SYS_fork);
+}
+
 typedef int (*repro_macos_posix_spawn_fn)(pid_t *, const char *,
   const posix_spawn_file_actions_t *, const posix_spawnattr_t *,
   char *const [], char *const []);
@@ -335,6 +354,43 @@ int repro_macos_real_posix_spawnp(pid_t *pid, char *path, void *file_actions,
     (const posix_spawn_file_actions_t *)file_actions,
     (const posix_spawnattr_t *)attrp, argv, effective_envp);
 }
+
+/*
+ * Forward into the ORIGINAL posix_spawn/posix_spawnp via a TRAMPOLINE (built by
+ * macos_bodypatch). The trampoline runs the original wrapper's displaced
+ * prologue then resumes into its body, so libsystem's own
+ * `_posix_spawn_args_desc` marshalling runs — we must NOT hand-marshal a raw
+ * SYS_posix_spawn. `tramp` has the exact posix_spawn ABI. The hook has already
+ * applied env-propagation + SIP-rewrite to `envp`/`path` (via
+ * `repro_macos_bodypatch_spawn_rewrite`); we just call through.
+ *
+ * This is the body-patch forwarding path. It deliberately does NOT reuse
+ * `repro_macos_real_posix_spawn` (which resolves the real symbol by NAME): under
+ * body-patching the named symbol points at OUR hook, so a name-based forward
+ * would re-enter infinitely. The trampoline is the only re-entry-free path into
+ * the original marshalling body.
+ */
+int repro_macos_bodypatch_call_posix_spawn(void *tramp, pid_t *pid, char *path,
+    void *file_actions, void *attrp, char **argv, char **envp) {
+  if (tramp == NULL) return -1;
+  repro_macos_posix_spawn_fn fn = (repro_macos_posix_spawn_fn)tramp;
+  return fn(pid, path,
+    (const posix_spawn_file_actions_t *)file_actions,
+    (const posix_spawnattr_t *)attrp, argv, envp);
+}
+
+/*
+ * Apply env-propagation + SIP-rewrite to a spawn, returning the effective
+ * path and writing the effective envp through *out_envp. Mirrors what the
+ * existing `repro_macos_real_posix_spawn*` helpers do internally, factored out
+ * so the body-patch hook (which forwards via trampoline, not via the named
+ * symbol) reuses the SAME propagation logic (DRY).
+ */
+char *repro_macos_bodypatch_spawn_rewrite(char *path, char **envp,
+                                          char ***out_envp) {
+  if (out_envp) *out_envp = repro_macos_env_with_preload(envp);
+  return repro_macos_rewrite_sip_path(path);
+}
 """.}
 
 type
@@ -442,3 +498,33 @@ proc ct_macos_bodypatch_real_access*(path: cstring; mode: cint): cint =
   proc realAccess(path: cstring; mode: cint): cint
     {.importc: "repro_macos_real_access_syscall", cdecl.}
   realAccess(path, mode)
+
+# Spawn-family forwarders used ONLY by the body-patch backend. The body-patch
+# backend patches the named fork/posix_spawn symbols, so it must bypass them
+# when forwarding (see the C source for why named/dlsym would recurse).
+
+proc ct_macos_bodypatch_real_fork*(): PidT =
+  ## Raw `SYS_fork` forwarder (no userland atfork bookkeeping — see the C doc).
+  proc realForkSyscall(): PidT {.importc: "repro_macos_real_fork_syscall", cdecl.}
+  realForkSyscall()
+
+proc ct_macos_bodypatch_spawn_rewrite*(path: cstring; envp: cstringArray;
+    outEnvp: ptr cstringArray): cstring =
+  ## Apply env-propagation (re-add DYLD_INSERT_LIBRARIES + CT_SANDBOX_TOOLS_DIR)
+  ## + SIP-rewrite to a spawn. Returns the effective path and writes the
+  ## effective envp through `outEnvp`. The body-patch spawn hook calls this, then
+  ## forwards into the original wrapper via the trampoline.
+  proc spawnRewrite(path: cstring; envp: cstringArray;
+      outEnvp: ptr cstringArray): cstring
+    {.importc: "repro_macos_bodypatch_spawn_rewrite", cdecl.}
+  spawnRewrite(path, envp, outEnvp)
+
+proc ct_macos_bodypatch_call_posix_spawn*(tramp: pointer; pid: ptr PidT;
+    path: cstring; fileActions, attrp: pointer; argv, envp: cstringArray): cint =
+  ## Forward into the ORIGINAL posix_spawn/posix_spawnp via the trampoline
+  ## `tramp` (re-entry-free; runs libsystem's own `_posix_spawn_args_desc`
+  ## marshalling). `path`/`envp` must already be the rewritten effective values.
+  proc callPosixSpawn(tramp: pointer; pid: ptr PidT; path: cstring;
+      fileActions, attrp: pointer; argv, envp: cstringArray): cint
+    {.importc: "repro_macos_bodypatch_call_posix_spawn", cdecl.}
+  callPosixSpawn(tramp, pid, path, fileActions, attrp, argv, envp)

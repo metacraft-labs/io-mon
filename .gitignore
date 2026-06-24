@@ -18,3 +18,4 @@ tests/test_io_mon_builds_standalone
 tests/test_io_mon_shim_builds_standalone
 tests/test_io_mon_snoop_cli
 tests/test_io_mon_macos_bodypatch
+tests/test_io_mon_macos_bodypatch_spawn
