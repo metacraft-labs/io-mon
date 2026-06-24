@@ -182,18 +182,50 @@ int repro_macos_real_execve_syscall(char *path, char **argv, char **envp) {
  * replaces the libsystem `fork` entry, so it must NOT forward through the named
  * symbol or dlsym (that address is now patched and would re-enter infinitely).
  *
- * NOTE: `syscall(SYS_fork)` performs the bare kernel fork WITHOUT running
- * libsystem's `fork()` userland wrapper work (atfork handlers, malloc-lock
- * reset, etc.). That is acceptable here because (a) the body-patch fork hook is
- * only reached for shared-cache-INTERNAL fork callers that interpose misses, and
- * its sole job is to RECORD the spawn (a forked child inherits the already-loaded
- * shim + env, so no propagation is needed), and (b) the immediate, overwhelming
- * use of an internal fork is fork()+exec(), where the child execs promptly and
- * the skipped userland bookkeeping is moot. We forward to the kernel directly to
- * guarantee no re-entry into the patched named symbol.
+ * WHY NOT `syscall(SYS_fork)`: on Darwin/arm64 the `fork` trap does NOT follow
+ * the ordinary "x0 == return value" convention. The kernel returns the child
+ * pid in x0 for BOTH processes and distinguishes the child by setting x1 = 1
+ * (the parent gets x1 = 0). libsystem's `fork()`/`__fork()` wrapper inspects x1
+ * and rewrites the child's return to 0. The generic `syscall()` libc shim
+ * returns only x0, so a forked CHILD invoking `syscall(SYS_fork)` would observe
+ * the PARENT's pid (non-zero) instead of 0 — making the child mis-identify
+ * itself as the parent, return a bogus pid to its caller, and SKIP its own
+ * `fork()==0` branch (e.g. the `execve` in a fork+exec). That silently breaks
+ * monitoring of every fork+exec'd grandchild (a FALSE SKIP). We therefore issue
+ * the trap inline and apply the SAME x1-based child rewrite the libc wrapper
+ * does, so the child correctly sees 0.
+ *
+ * The bare kernel fork still SKIPS libsystem's userland fork bookkeeping
+ * (atfork handlers, malloc-lock reset). That is acceptable here for the same
+ * reasons as before: this forwarder is only reached for shared-cache-INTERNAL
+ * fork callers interpose misses, its job is to RECORD the spawn (the child
+ * inherits the already-loaded shim + env, so no propagation is needed), and the
+ * dominant internal use is fork()+exec() where the child execs promptly.
+ *
+ * Darwin/arm64 BSD syscall ABI: trap number in x16, `svc #0x80`; carry flag set
+ * on error (errno in x0). For fork the child indicator is x1.
  */
 pid_t repro_macos_real_fork_syscall(void) {
+#if defined(__arm64__) || defined(__aarch64__)
+  register long x16 __asm__("x16") = SYS_fork;
+  register long x0 __asm__("x0");
+  register long x1 __asm__("x1");
+  __asm__ volatile(
+    "svc #0x80\n"
+    : "=r"(x0), "=r"(x1)
+    : "r"(x16)
+    : "cc", "memory");
+  /* Child: x1 == 1 → the libc wrapper returns 0 in the child. */
+  if (x1 != 0) return 0;
+  return (pid_t)x0;
+#else
+  /* x86_64 (and any non-arm64 Darwin): the carry flag carries the child flag in
+   * EDX per the i386/x86_64 BSD fork convention, which `syscall()` also drops.
+   * We are arm64-only in practice; fall back to the libc symbol resolved by
+   * NAME here. The body-patch backend is arm64-only, so this branch is not
+   * reached under `both`; interpose-only builds resolve fork by name safely. */
   return (pid_t)syscall(SYS_fork);
+#endif
 }
 
 typedef int (*repro_macos_posix_spawn_fn)(pid_t *, const char *,

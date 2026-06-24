@@ -51,6 +51,15 @@ task test, "Run the io-mon test suite":
   # the fix that unified the interpose + body-patch hook sets (the old duplicated
   # hooks double-recorded under `both`). macOS-only (no-op pass elsewhere).
   exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_record_once.nim"
+  # macOS GENUINE system() SIP-child capture (the previously-BLOCKED test): a
+  # `system("/bin/sh -c 'cat /etc/services >/dev/null'")` probe under the shim
+  # with CT_SANDBOX_TOOLS_DIR pointed at the non-SIP drop-in bundle
+  # (scripts/build-sandbox-tools.sh) — the SIP /bin/sh AND /bin/cat are
+  # redirected to injectable drop-ins that RUN (not AMFI-killed) and the read of
+  # /etc/services IS captured, with the present-vs-absent contrast. macOS-only;
+  # skips cleanly if no runnable non-SIP sh/cat drop-in resolves (no-op pass
+  # elsewhere).
+  exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_sip_system_child.nim"
 
 task buildShim, "Build the io-mon interpose shim shared library":
   # Produces build/lib/librepro_monitor_shim.{dylib,so,dll} — the drop-in

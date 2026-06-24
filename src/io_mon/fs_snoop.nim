@@ -11,28 +11,107 @@ import io_mon/writer
 when defined(windows):
   import io_mon/windows_injector
 
-# macOS: prepare a sandbox-tools directory holding non-SIP copies of the
-# common shell binaries that show up in monitored subprocess trees. The
+# macOS: prepare a sandbox-tools directory holding non-SIP drop-ins for the
+# common system binaries that show up in monitored subprocess trees. The
 # shim's spawn hook (see repro_monitor_hooks/macos_interpose_runtime.nim)
-# rewrites SIP-protected exec paths to these copies so that
-# DYLD_INSERT_LIBRARIES is not stripped on the way into /bin/sh and
-# friends — the path-rewriting bypass documented in
-# codetracer-native-recorder/ct_interpose/src/ct_interpose/library_init.nim.
-# This is the "route B" minimum-viable populate referenced in the
-# Reprobuild M11+ integration plan; the binary list mirrors the SIP-
-# protected commands that ``osproc.execCmdEx``/``quoteShellCommand`` and
-# the dev-env activation pipeline reach for. When ct_interpose grows a
-# canonical populate routine, this list collapses to a single call.
+# rewrites SIP-protected exec paths to these drop-ins (``rewriteExecPathForSip``
+# → ``rewriteSipPath``) so that DYLD_INSERT_LIBRARIES is not stripped on the way
+# into /bin/sh, /bin/cat and friends — the path-rewriting bypass documented in
+# codetracer-native-recorder/ct_interpose/src/ct_interpose/library_init.nim and
+# in reprobuild-specs/Portable-Macos-Sandbox-Tools.milestones.org.
+#
+# WHY a drop-in and not a copy (SIP/AMFI rationale): on macOS 26 / Apple
+# Silicon, System Integrity Protection strips DYLD_INSERT_LIBRARIES when a
+# binary under /bin, /sbin, /usr/bin or /usr/sbin is exec'd, AND AMFI SIGKILLs
+# a *copy* of a restricted platform binary on launch even when ad-hoc re-signed
+# (measured). So the drop-in MUST be a NON-SIP binary we resolve elsewhere —
+# typically the Nix-provided coreutils/bash in the dev shell, or a portable
+# bundle built by scripts/build-sandbox-tools.sh. ``findNonSipAlternative``
+# resolves it on PATH; ``populateReproSandboxTools`` symlinks each SIP path to
+# that non-SIP instance.
+#
+# COVERAGE: a monitored test process tree shells out far past the four shells
+# the original route-B populate covered — a bare ``system("cat X")`` or
+# ``head``/``grep``/``sed`` in a Makefile recipe would otherwise exec the SIP
+# binary, lose DYLD_INSERT_LIBRARIES, and go blind for that whole subtree. We
+# therefore drop in the realistic POSIX/coreutils tool set at BOTH its /bin and
+# /usr/bin SIP locations (macOS ships many tools at both, and a given test may
+# invoke either path). The list is data-driven so it stays DRY and is easy to
+# extend; each entry is verified to exist before being dropped in.
+#
+# FAIL-SAFE (preserved): a tool with no non-SIP alternative on PATH (and whose
+# byte-copy fallback is AMFI-killed at launch) is simply NOT dropped in. Its
+# exec then runs the SIP original, the shim falls silent for that subtree, and
+# the monitored action re-runs — never a fabricated/false "captured nothing"
+# skip. Coverage only ever makes MORE of the tree observable; it never makes a
+# previously-correct capture wrong.
 when defined(macosx):
   import stackable_hooks/propagation as ct_propagation
 
   const reproSandboxBinaries = [
+    # Shells (the original route-B set — the most common SIP exec target via
+    # ``osproc.execCmdEx`` / ``quoteShellCommand`` and ``system(3)``).
     "/bin/sh",
     "/bin/bash",
     "/bin/dash",
     "/bin/zsh",
+    "/bin/csh",
+    "/bin/tcsh",
+    "/bin/ksh",
+    # Core file utilities at their /bin SIP locations.
+    "/bin/cat",
+    "/bin/ls",
+    "/bin/cp",
+    "/bin/mv",
+    "/bin/rm",
+    "/bin/mkdir",
+    "/bin/rmdir",
+    "/bin/ln",
+    "/bin/pwd",
+    "/bin/echo",
+    "/bin/date",
+    "/bin/sleep",
+    "/bin/df",
+    "/bin/chmod",
+    # POSIX/coreutils tools at their /usr/bin SIP locations. A Makefile recipe,
+    # configure probe, or test harness commonly reaches for these via the shell.
     "/usr/bin/env",
-    "/usr/bin/which"
+    "/usr/bin/which",
+    "/usr/bin/cat",
+    "/usr/bin/head",
+    "/usr/bin/tail",
+    "/usr/bin/wc",
+    "/usr/bin/sort",
+    "/usr/bin/uniq",
+    "/usr/bin/cut",
+    "/usr/bin/tr",
+    "/usr/bin/basename",
+    "/usr/bin/dirname",
+    "/usr/bin/sed",
+    "/usr/bin/grep",
+    "/usr/bin/egrep",
+    "/usr/bin/fgrep",
+    "/usr/bin/awk",
+    "/usr/bin/find",
+    "/usr/bin/xargs",
+    "/usr/bin/tar",
+    "/usr/bin/gzip",
+    "/usr/bin/gunzip",
+    "/usr/bin/touch",
+    "/usr/bin/true",
+    "/usr/bin/false",
+    "/usr/bin/test",
+    "/usr/bin/printf",
+    "/usr/bin/tee",
+    "/usr/bin/expr",
+    "/usr/bin/seq",
+    "/usr/bin/comm",
+    "/usr/bin/join",
+    "/usr/bin/paste",
+    "/usr/bin/od",
+    "/usr/bin/cmp",
+    "/usr/bin/diff",
+    "/usr/bin/sleep"
   ]
 
   proc findNonSipAlternative(binaryName: string): string =
@@ -59,8 +138,24 @@ when defined(macosx):
     ""
 
   proc populateReproSandboxTools(sandboxDir: string) =
+    ## Drop in a non-SIP instance of every entry in ``reproSandboxBinaries``
+    ## under ``sandboxDir``, mirroring the original SIP layout so
+    ## ``rewriteSipPath`` resolves (``/bin/cat`` → ``<sandboxDir>/bin/cat``,
+    ## ``/usr/bin/grep`` → ``<sandboxDir>/usr/bin/grep``). Each entry is a
+    ## symlink to the non-SIP alternative found on PATH; when none exists we
+    ## fall back to a byte-copy (effective on Linux / pre-arm64e macOS).
+    ##
+    ## Idempotent: an entry that already exists in ``sandboxDir`` (e.g. seeded
+    ## by a pre-built portable bundle pointed at via CT_SANDBOX_TOOLS_DIR) is
+    ## left untouched, so a distribution-grade bundle is never clobbered by the
+    ## dev-shell PATH symlinks. Fail-safe: an entry with no resolvable non-SIP
+    ## drop-in is simply skipped (its subtree stays unmonitored → re-run, never
+    ## a false skip).
     if sandboxDir.len == 0:
       return
+    # The per-entry ``createDir(destPath.parentDir)`` below makes both ``bin``
+    # and ``usr/bin`` (and any future prefix) on demand; seed ``bin`` up front
+    # so a sandboxDir that cannot be created at all fails fast and silently.
     try:
       createDir(extendedPath(sandboxDir / "bin"))
     except OSError, IOError:
