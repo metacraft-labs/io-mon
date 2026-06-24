@@ -5,6 +5,7 @@ import std/[locks, os, tables]
 from io_mon/paths import extendedPath
 
 import io_mon/hooks/macos_interpose_runtime
+import io_mon/hooks/macos_bodypatch
 import io_mon/types
 import io_mon/writer
 
@@ -181,8 +182,23 @@ proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
   recordProcessStart()
   result = 0
 
-proc repro_monitor_shim_flush*(): cint {.exportc, dynlib.} = 0
-proc repro_monitor_shim_shutdown*(): cint {.exportc, dynlib.} = 0
+proc repro_monitor_shim_flush*(): cint {.exportc, dynlib.} =
+  ## Flush the calling thread's in-flight fragment batch to disk. The fragment
+  ## writer batches frames into a per-thread buffer that is otherwise only
+  ## flushed on overflow / 100 ms age / key change. A process that does a small
+  ## amount of I/O and exits promptly (the common body-patch case — a tiny
+  ## tool that opens a few files and returns) would otherwise lose its buffered
+  ## records, so we flush explicitly here (and from the destructor below).
+  withShimMuted:
+    closeFragmentSlot()
+  result = 0
+
+proc repro_monitor_shim_shutdown*(): cint {.exportc, dynlib.} =
+  ## Flush + close the calling thread's fragment slot on shutdown so no
+  ## buffered records are dropped.
+  withShimMuted:
+    closeFragmentSlot()
+  result = 0
 proc repro_monitor_shim_disable_current_thread*() {.exportc, dynlib.} = inc disabled
 proc repro_monitor_shim_enable_current_thread*() {.exportc, dynlib.} =
   if disabled > 0:
@@ -315,6 +331,75 @@ proc repro_hook_lstat*(path: cstring; buf: pointer): cint {.exportc, cdecl, dynl
   emitRecord(record)
   setErrno(savedErrno)
 
+# --- Body-patch stat-family hooks ----------------------------------------
+#
+# These mirror repro_hook_stat/lstat but forward to the kernel via the RAW
+# stat64 syscall (ct_macos_bodypatch_real_*), NOT via the named symbol — the
+# body-patch backend has replaced the named stat/lstat/fstatat entry points, so
+# forwarding through them (or through dlsym) would re-enter infinitely. open /
+# openat / read / write / close are NOT duplicated here: their existing
+# repro_hook_* recorders already forward via the raw syscall
+# (ct_macos_interpose_real_* → *_syscall), so the body patch reuses them
+# directly (high fan-in, DRY).
+
+proc repro_bodyhook_stat*(path: cstring; buf: pointer): cint
+    {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_bodypatch_real_stat(path, buf)
+  result = ct_macos_bodypatch_real_stat(path, buf)
+  let savedErrno = getErrno()
+  var record = baseRecord(mrPathProbe, moPathProbe)
+  record.result = result.int64
+  record.probeResult = probeFromResult(result)
+  if path != nil:
+    record.path = $path
+  emitRecord(record)
+  setErrno(savedErrno)
+
+proc repro_bodyhook_lstat*(path: cstring; buf: pointer): cint
+    {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_bodypatch_real_lstat(path, buf)
+  result = ct_macos_bodypatch_real_lstat(path, buf)
+  let savedErrno = getErrno()
+  var record = baseRecord(mrPathProbe, moPathProbe)
+  record.result = result.int64
+  record.probeResult = probeFromResult(result)
+  if path != nil:
+    record.path = $path
+  emitRecord(record)
+  setErrno(savedErrno)
+
+proc repro_bodyhook_fstatat*(dirfd: cint; path: cstring; buf: pointer;
+    flag: cint): cint {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_bodypatch_real_fstatat(dirfd, path, buf, flag)
+  result = ct_macos_bodypatch_real_fstatat(dirfd, path, buf, flag)
+  let savedErrno = getErrno()
+  var record = baseRecord(mrPathProbe, moPathProbe)
+  record.result = result.int64
+  record.probeResult = probeFromResult(result)
+  if path != nil:
+    record.path = $path
+  record.detail = "fstatat dirfd=" & $dirfd
+  emitRecord(record)
+  setErrno(savedErrno)
+
+proc repro_bodyhook_access*(path: cstring; mode: cint): cint
+    {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_bodypatch_real_access(path, mode)
+  result = ct_macos_bodypatch_real_access(path, mode)
+  let savedErrno = getErrno()
+  var record = baseRecord(mrPathProbe, moPathProbe)
+  record.result = result.int64
+  record.probeResult = probeFromResult(result)
+  record.flags = uint32(mode)
+  if path != nil:
+    record.path = $path
+  emitRecord(record)
+  setErrno(savedErrno)
+
 proc repro_hook_fork*(): PidT {.exportc, cdecl, dynlib.} =
   if not initialized or disabled > 0:
     return ct_macos_interpose_real_fork()
@@ -369,9 +454,108 @@ proc repro_hook_posix_spawnp*(pid: ptr PidT; path: cstring; fileActions, attrp: 
 proc reproRuntimeInit() {.exportc.} =
   discard repro_monitor_shim_init(nil)
 
+# --- Body-patch backend selection + installation -------------------------
+#
+# IO_MON_MACOS_BACKEND selects the macOS monitoring backend:
+#   "both"      (default) — interpose stays installed (its static
+#                __DATA,__interpose section is always present) AND body-patch
+#                adds shared-cache-internal coverage.
+#   "bodypatch" — interpose section is still present (it is static and cannot
+#                be removed at runtime) but body-patch is also installed; in
+#                practice this is identical to "both" for capture purposes.
+#   "interpose" — legacy: skip the body-patch install entirely.
+# Any unrecognised value is treated as the default ("both") and a warning is
+# logged, so a typo degrades to MORE coverage, never less.
+
+type BodypatchHookSpec = object
+  names: seq[string]   ## libsystem symbol variants that share this ABI
+  hook: pointer        ## the body-hook to branch to
+
+proc shimLogToStderr(msg: string) {.raises: [].} =
+  ## Emit a diagnostic line to stderr under the shim-muted guard so the
+  ## diagnostic's own write() does not recurse into the (now body-patched)
+  ## write hook. Best-effort: never raises, never aborts the constructor.
+  withShimMuted:
+    try:
+      stderr.write(msg)
+      stderr.write("\n")
+      stderr.flushFile()
+    except IOError:
+      discard
+
+proc bodypatchEnabled(): bool {.raises: [].} =
+  ## Returns true if the body-patch backend should be installed.
+  var backend = ""
+  withShimMuted:
+    backend = getEnv("IO_MON_MACOS_BACKEND", "both")
+  case backend
+  of "interpose":
+    false
+  of "both", "bodypatch":
+    true
+  else:
+    shimLogToStderr("io-mon: unknown IO_MON_MACOS_BACKEND='" & backend &
+      "', defaulting to 'both'")
+    true
+
+proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raises: [].} =
+  ## Install every file-relevant libsystem syscall-wrapper body patch. Runs in
+  ## the constructor, single-threaded (dyld runs constructors before main and
+  ## before any monitored thread starts), so the patcher's registry is
+  ## race-free. Every failure is non-fatal: a reduced/empty capture degrades to
+  ## "re-run" downstream, never a false skip.
+  if not bodypatchEnabled():
+    shimLogToStderr("io-mon: macOS backend=interpose (body-patch skipped)")
+    return
+
+  # Each spec lists the distinct named entry points that share one ABI and
+  # therefore one hook. open / open$NOCANCEL / __open_nocancel are DISTINCT
+  # addresses (stdio's fopen/fread reach the $NOCANCEL variants), so all must
+  # be patched. Symbols absent on this OS (dlsym → NULL) are skipped.
+  let specs = @[
+    BodypatchHookSpec(
+      names: @["open", "open$NOCANCEL", "__open_nocancel"],
+      hook: cast[pointer](repro_hook_open)),
+    BodypatchHookSpec(
+      names: @["openat", "openat$NOCANCEL", "__openat_nocancel"],
+      hook: cast[pointer](repro_hook_openat)),
+    BodypatchHookSpec(
+      names: @["read", "read$NOCANCEL", "__read_nocancel"],
+      hook: cast[pointer](repro_hook_read)),
+    BodypatchHookSpec(
+      names: @["write", "write$NOCANCEL", "__write_nocancel"],
+      hook: cast[pointer](repro_hook_write)),
+    BodypatchHookSpec(
+      names: @["close", "close$NOCANCEL", "__close_nocancel"],
+      hook: cast[pointer](repro_hook_close)),
+    BodypatchHookSpec(
+      names: @["stat", "stat64", "stat$INODE64"],
+      hook: cast[pointer](repro_bodyhook_stat)),
+    BodypatchHookSpec(
+      names: @["lstat", "lstat64", "lstat$INODE64"],
+      hook: cast[pointer](repro_bodyhook_lstat)),
+    BodypatchHookSpec(
+      names: @["fstatat", "fstatat64", "fstatat$INODE64"],
+      hook: cast[pointer](repro_bodyhook_fstatat)),
+    BodypatchHookSpec(
+      names: @["access"],
+      hook: cast[pointer](repro_bodyhook_access)),
+  ]
+
+  var installed, failed, absent: cint = 0
+  for spec in specs:
+    for name in spec.names:
+      reproMacosBodypatchInstallNamed(cstring(name), spec.hook,
+        addr installed, addr failed, addr absent)
+
+  shimLogToStderr("io-mon: macOS body-patch installed=" & $installed &
+    " failed=" & $failed & " absent=" & $absent)
+
 {.emit: """
 static int repro_monitor_runtime_ready = 0;
 extern void NimMain(void);
+extern void repro_monitor_install_bodypatch(void);
+extern int repro_monitor_shim_flush(void);
 
 typedef DIR *(*repro_real_opendir_fn)(const char *);
 typedef struct dirent *(*repro_real_readdir_fn)(DIR *);
@@ -522,6 +706,32 @@ static void repro_monitor_shim_constructor(void) {
   NimMain();
   reproRuntimeInit();
   repro_monitor_runtime_ready = 1;
+  /*
+   * Install the body-patch backend AFTER the runtime is ready: the body-patch
+   * hooks (repro_hook_* / repro_bodyhook_*) require the recording runtime to
+   * be live, and runtime_ready=1 ensures the interpose wrappers route through
+   * the hooks too. Runs single-threaded here (dyld constructors execute before
+   * main and before any monitored thread starts), so the patcher's registry is
+   * race-free. A failed install is non-fatal — it logs and degrades to reduced
+   * capture (the downstream runner re-runs; it never treats this as a skip).
+   */
+  repro_monitor_install_bodypatch();
+}
+
+/*
+ * Flush the fragment batch buffer at process exit. The writer batches frames
+ * per-thread and only flushes on overflow / 100 ms age / explicit flush; a
+ * short-lived monitored process that opens a few files and exits would
+ * otherwise lose its buffered records before the parent's mergeFragments runs.
+ * Registering this as a dyld destructor closes that window for the common
+ * fast-exit case. (It runs only for normal returns / exit(); it cannot run on
+ * _exit/signal — those windows are bounded by the 100 ms age flush.)
+ */
+__attribute__((destructor))
+static void repro_monitor_shim_destructor(void) {
+  if (repro_monitor_runtime_ready) {
+    repro_monitor_shim_flush();
+  }
 }
 
 __attribute__((used))

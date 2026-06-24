@@ -1,8 +1,7 @@
 ## test_io_mon_snoop_cli — the standalone `io-mon` CLI (M8) BUILDS, is
-## RESOLVABLE, drives a live interpose capture over a freshly-built USER binary,
-## and HONESTLY documents the macOS chained-fixups interpose gap.
+## RESOLVABLE, and drives a live capture over a freshly-built USER binary.
 ##
-## # What this proves (the wiring, not a forced green)
+## # What this proves
 ##
 ## The Incremental-Test-Runner M8 relocated reprobuild's `repro internal
 ## io monitor` snoop surface into io-mon as a standalone binary
@@ -13,26 +12,21 @@
 ##      nim-stackable-hooks (no reprobuild path) — the standalone contract.
 ##   2. Confirms `inspect` round-trips a depfile (the platform-independent arm).
 ##   3. EMPIRICALLY runs a freshly-built USER binary (a tiny C program that
-##      `open()`s + `read()`s a known file) UNDER the snoop CLI with the shim
-##      injected, then checks the captured depfile.
+##      `fopen()`s + reads a known file) UNDER the snoop CLI with the shim
+##      injected, then checks the captured depfile CONTAINS the input read.
 ##
-## # Honest platform result (macOS 26 / arm64e)
+## # macOS: the interpose internal-call gap is now CLOSED
 ##
-## On macOS 26 / arm64e the `__DATA,__interpose` mechanism does NOT intercept
-## libc calls (`open`/`read`) from modern chained-fixups-linked binaries — the
-## linker default since the macOS 11 era. So the capture yields a VALID depfile
-## (the shim loads, its constructor runs, backend-profile + capability-gap
-## metadata records are emitted) but with ZERO file-read observations even for a
-## freshly-built user binary. This is NOT a wiring bug: the dylib loads (dyld
-## reports "has interposing tuples"), the constructor runs (a fragment file is
-## created), the snoop CLI exits 0 and writes a well-formed depfile. The
-## interpose simply does not fire for chained-fixups call sites.
-##
-## The test therefore asserts the WIRING (CLI runs, depfile is valid + readable)
-## and RECORDS the empirical read-capture outcome, gating the strong assertion on
-## whether ANY file-read record was captured — so a host where the interpose DOES
-## fire (older macOS, or a non-chained-fixups binary) proves the full path, while
-## this host honestly documents the gap WITHOUT faking a capture.
+## The fixture reads its input via `fopen`, whose `open` happens
+## shared-cache-internally (inside libsystem_c, via `open$NOCANCEL`). The
+## legacy `__DATA,__interpose` mechanism alone does NOT intercept that internal
+## open — interpose only rewrites the binary's own import bindings. The
+## body-patch backend (default `IO_MON_MACOS_BACKEND=both`) closes that gap by
+## replacing the libsystem open-family entry points themselves
+## (`mach_vm_remap` overwrite technique), so the snoop CLI now captures the
+## input read on macOS too. This test therefore asserts the POSITIVE capture on
+## every supported platform. (The focused interpose-vs-body-patch contrast lives
+## in `tests/test_io_mon_macos_bodypatch.nim`.)
 
 import std/[os, osproc, streams, strtabs, strutils, unittest]
 
@@ -71,7 +65,7 @@ suite "io-mon CLI (M8)":
     check code == 0
     check fileExists(snoopBin)
 
-  test "a freshly-built user binary is captured under the snoop CLI (or the macOS chained-fixups gap is documented)":
+  test "a freshly-built user binary's read is captured under the snoop CLI":
     # Build the interpose shim shared library (the live-capture half).
     let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
     checkpoint("build_shim: " & buildShim.output)
@@ -123,21 +117,17 @@ suite "io-mon CLI (M8)":
         break
 
     when defined(macosx):
-      # macOS 26 / arm64e: the __DATA,__interpose mechanism does NOT intercept
-      # libc calls from chained-fixups binaries, so the input read is NOT
-      # captured here. We document the gap honestly rather than fake a capture:
-      # the wiring is proven (CLI ran, depfile valid), the capture is empty.
-      if capturedInputRead:
-        checkpoint("macOS interpose DID capture the user-binary read " &
-          "(non-chained-fixups host) — full live path proven")
-        check capturedInputRead
-      else:
-        checkpoint("macOS chained-fixups interpose gap: the user-binary read " &
-          "was NOT captured (expected on macOS 26/arm64e). Wiring proven; " &
-          "capture empty. The runner fails safe to re-run.")
-        # Assert the FAIL-SAFE shape: a valid-but-read-empty depfile, never a
-        # fabricated read record.
-        check not capturedInputRead
+      # macOS: the __DATA,__interpose mechanism alone does NOT intercept the
+      # fopen-internal (shared-cache-internal) open the fixture performs. That
+      # gap is now CLOSED by the body-patch backend, which the snoop CLI enables
+      # by default (IO_MON_MACOS_BACKEND=both): it replaces the libsystem
+      # open/open$NOCANCEL/__open_nocancel entry points themselves and so sees
+      # the internal open regardless of caller. The user-binary read MUST now be
+      # captured. (See tests/test_io_mon_macos_bodypatch.nim for the focused
+      # interpose-vs-body-patch contrast.)
+      checkpoint("macOS host: capturedInputRead=" & $capturedInputRead &
+        " (body-patch backend closes the interpose internal-call gap)")
+      check capturedInputRead
     else:
       # Linux / Windows: LD_PRELOAD / CreateRemoteThread are expected to capture
       # the read of a freshly-built user binary. If they do not on this host,

@@ -81,6 +81,36 @@ int repro_macos_real_close_syscall(int fd) {
   return (int)syscall(SYS_close, fd);
 }
 
+/*
+ * Raw-syscall stat/lstat/access/fstatat forwarders for the body-patch backend.
+ *
+ * The body-patch backend replaces the high-level libsystem `stat`/`lstat`/...
+ * entry points themselves, so it must NOT forward through the named symbol or
+ * through dlsym(RTLD_DEFAULT, "stat") — that symbol is now patched and would
+ * re-enter infinitely. It forwards via the raw kernel syscall instead.
+ *
+ * We use the *64 syscall variants (SYS_stat64/SYS_lstat64/SYS_fstatat64),
+ * which fill the modern 64-bit-inode `struct stat` — the same layout the
+ * userland `stat$INODE64` family (the default since the 64-bit-inode era)
+ * exposes to callers, so the caller's `struct stat *buf` is filled correctly.
+ */
+int repro_macos_real_stat64_syscall(char *path, void *buf) {
+  return (int)syscall(SYS_stat64, path, buf);
+}
+
+int repro_macos_real_lstat64_syscall(char *path, void *buf) {
+  return (int)syscall(SYS_lstat64, path, buf);
+}
+
+int repro_macos_real_fstatat64_syscall(int dirfd, char *path, void *buf,
+                                       int flag) {
+  return (int)syscall(SYS_fstatat64, dirfd, path, buf, flag);
+}
+
+int repro_macos_real_access_syscall(char *path, int mode) {
+  return (int)syscall(SYS_access, path, mode);
+}
+
 int repro_macos_path_is_dir(char *path) {
   struct stat st;
 #ifdef SYS_stat64
@@ -387,3 +417,28 @@ proc ct_macos_interpose_real_posix_spawnp*(pid: ptr PidT; path: cstring;
                        argv, envp: cstringArray): cint
     {.importc: "repro_macos_real_posix_spawnp", cdecl.}
   realPosixSpawnp(pid, path, fileActions, attrp, argv, envp)
+
+# Raw-syscall stat-family forwarders used ONLY by the body-patch backend, which
+# patches the named stat/lstat/... symbols and therefore must bypass them when
+# forwarding to the kernel (see the C source for why dlsym/named would recurse).
+
+proc ct_macos_bodypatch_real_stat*(path: cstring; buf: pointer): cint =
+  proc realStat64(path: cstring; buf: pointer): cint
+    {.importc: "repro_macos_real_stat64_syscall", cdecl.}
+  realStat64(path, buf)
+
+proc ct_macos_bodypatch_real_lstat*(path: cstring; buf: pointer): cint =
+  proc realLstat64(path: cstring; buf: pointer): cint
+    {.importc: "repro_macos_real_lstat64_syscall", cdecl.}
+  realLstat64(path, buf)
+
+proc ct_macos_bodypatch_real_fstatat*(dirfd: cint; path: cstring; buf: pointer;
+    flag: cint): cint =
+  proc realFstatat64(dirfd: cint; path: cstring; buf: pointer; flag: cint): cint
+    {.importc: "repro_macos_real_fstatat64_syscall", cdecl.}
+  realFstatat64(dirfd, path, buf, flag)
+
+proc ct_macos_bodypatch_real_access*(path: cstring; mode: cint): cint =
+  proc realAccess(path: cstring; mode: cint): cint
+    {.importc: "repro_macos_real_access_syscall", cdecl.}
+  realAccess(path, mode)

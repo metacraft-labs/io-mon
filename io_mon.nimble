@@ -37,6 +37,10 @@ task test, "Run the io-mon test suite":
   # capture over a freshly-built user binary (honestly documenting the macOS
   # chained-fixups interpose gap rather than faking a capture).
   exec "nim c -r " & hooksPath & " tests/test_io_mon_snoop_cli.nim"
+  # macOS body-patch backend: positively captures a shared-cache-internal open
+  # (fopen → libsystem-internal open$NOCANCEL) that __DATA,__interpose misses,
+  # and asserts the interpose-only contrast. macOS-only (no-op pass elsewhere).
+  exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_bodypatch.nim"
 
 task buildShim, "Build the io-mon interpose shim shared library":
   # Produces build/lib/librepro_monitor_shim.{dylib,so,dll} — the drop-in
