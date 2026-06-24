@@ -15,3 +15,5 @@ test-logs/
 # Compiled test binaries (nim c -r leaves the binary next to the source)
 tests/test_io_mon_parity_with_fs_snoop
 tests/test_io_mon_builds_standalone
+tests/test_io_mon_shim_builds_standalone
+tests/test_io_mon_snoop_cli
