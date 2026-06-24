@@ -53,6 +53,29 @@ nimble buildShim        # or: scripts/build_shim.sh
 # → build/lib/librepro_monitor_shim.<ext>
 ```
 
+## macOS monitoring backends
+
+On macOS the shim supports two complementary, additive backends, selected by
+the `IO_MON_MACOS_BACKEND` environment variable read in the shim constructor:
+
+- **`interpose`** — the legacy `__DATA,__interpose` mechanism. It redirects
+  only the monitored binary's *own* import bindings, so it MISSES file
+  operations made by shared-cache-internal callers (e.g. `fopen` → `open$NOCANCEL`
+  *inside* `libsystem_c`).
+- **`bodypatch`** — replaces the libsystem syscall-wrapper entry points
+  themselves (the `mach_vm_remap` overwrite / Dobby-style technique; see
+  `src/io_mon/hooks/macos_bodypatch.nim` and `research/macos-bodypatch/`). This
+  catches ALL callers, closing the interpose blind spot.
+- **`both`** (DEFAULT) — interpose stays installed (its static section is
+  always present) AND body-patch adds the internal-call coverage. A given call
+  hits at most one layer, so the two are purely additive (no de-duplication
+  needed).
+
+Body-patch works under SIP with no entitlements, no root, and no re-signing for
+the default (non-hardened-runtime, ad-hoc/linker-signed) binaries the build/test
+system produces. A failed install is non-fatal: the capture degrades to
+"re-run" downstream, never a false skip.
+
 ## Relocation note
 
 io-mon is a faithful **relocation** of reprobuild's
