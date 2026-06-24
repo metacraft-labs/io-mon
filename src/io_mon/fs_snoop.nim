@@ -307,6 +307,15 @@ proc parseRun(args: seq[string]): ParsedFsSnoopCommand =
 proc parseFsSnoopCommand(args: seq[string]): ParsedFsSnoopCommand =
   if args.len > 0 and args[0] == "inspect":
     parseInspect(args)
+  elif args.len > 0 and args[0] == "run":
+    # Accept an explicit ``run`` subcommand so the snoop grammar reads
+    # ``io-mon run --depfile <out> -- <command>`` (the verb form the
+    # standalone CLI and the CodeTracer runner's live-capture call site use),
+    # while still supporting the bare ``--depfile … -- <command>`` form for
+    # backward compatibility with reprobuild's ``repro internal io monitor`` which
+    # dispatched the verb itself before delegating. The ``run`` token is
+    # stripped before the option parser sees it.
+    parseRun(args[1 .. ^1])
   else:
     parseRun(args)
 
