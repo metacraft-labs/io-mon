@@ -163,6 +163,52 @@ proc probeFromResult(callResult: cint): ProbeResult =
   else:
     prAbsent
 
+# --- Shared recording helpers (DRY, high fan-in) -------------------------
+#
+# Each syscall family has exactly ONE hook function (see "Unified hooks"
+# below), and each hook builds its record through ONE of these helpers, so no
+# record-building body is duplicated. The helpers take the already-computed
+# call result + path/mode so the hook stays a thin "forward then record".
+
+proc recordOpen(callResult: cint; path: cstring; flags: cint; detail: string) {.raises: [].} =
+  ## Record an mrFileOpen observation. Shared by the open/openat hooks. The
+  ## fd→path map update and directory-enumeration follow-up are done by the
+  ## caller (they need the live fd/path before this record is emitted).
+  var record = baseRecord(mrFileOpen, observationForOpen(flags))
+  record.result = callResult.int64
+  record.flags = uint32(flags)
+  if path != nil:
+    record.path = $path
+  if detail.len > 0:
+    record.detail = detail
+  emitRecord(record)
+
+proc recordPathProbe(callResult: cint; path: cstring; mode: cint; detail: string) {.raises: [].} =
+  ## Record an mrPathProbe observation for the stat/lstat/fstatat/access family.
+  ## `mode` is stored in `flags` (meaningful only for access(2); pass 0 for the
+  ## stat family). Single source of truth for the probe record body.
+  var record = baseRecord(mrPathProbe, moPathProbe)
+  record.result = callResult.int64
+  record.probeResult = probeFromResult(callResult)
+  record.flags = uint32(mode)
+  if path != nil:
+    record.path = $path
+  if detail.len > 0:
+    record.detail = detail
+  emitRecord(record)
+
+proc recordSpawn(childPid: PidT; callResult: cint; path: cstring; detail: string) {.raises: [].} =
+  ## Record an mrProcessSpawn (moExecute) observation for fork/posix_spawn(p).
+  ## Single source of truth for the spawn record body.
+  var record = baseRecord(mrProcessSpawn, moExecute)
+  record.childOsPid = uint64(childPid)
+  record.result = callResult.int64
+  if path != nil:
+    record.path = $path
+  if detail.len > 0:
+    record.detail = detail
+  emitRecord(record)
+
 proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
   if not locksReady:
     initLock(initLockVar)
@@ -212,12 +258,7 @@ proc repro_hook_open*(path: cstring; flags, mode: cint): cint {.exportc, cdecl, 
   result = ct_macos_interpose_real_open(path, flags, mode)
   let savedErrno = getErrno()
   updateFdPath(result, path)
-  var record = baseRecord(mrFileOpen, observationForOpen(flags))
-  record.result = result.int64
-  record.flags = uint32(flags)
-  if path != nil:
-    record.path = $path
-  emitRecord(record)
+  recordOpen(result, path, flags, "")
   if result >= 0:
     recordDirectoryEnumeration(path)
   setErrno(savedErrno)
@@ -229,13 +270,7 @@ proc repro_hook_openat*(dirfd: cint; path: cstring; flags, mode: cint): cint
   result = ct_macos_interpose_real_openat(dirfd, path, flags, mode)
   let savedErrno = getErrno()
   updateFdPath(result, path)
-  var record = baseRecord(mrFileOpen, observationForOpen(flags))
-  record.result = result.int64
-  record.flags = uint32(flags)
-  if path != nil:
-    record.path = $path
-  record.detail = "dirfd=" & $dirfd
-  emitRecord(record)
+  recordOpen(result, path, flags, "dirfd=" & $dirfd)
   if result >= 0:
     recordDirectoryEnumeration(path)
   setErrno(savedErrno)
@@ -305,104 +340,63 @@ proc repro_hook_closedir*(dirp: pointer): cint {.exportc, cdecl, dynlib.} =
     dec disabled
   removeDirPath(dirp)
 
-proc repro_hook_stat*(path: cstring; buf: pointer): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
-    return ct_macos_interpose_real_stat(path, buf)
-  result = ct_macos_interpose_real_stat(path, buf)
-  let savedErrno = getErrno()
-  var record = baseRecord(mrPathProbe, moPathProbe)
-  record.result = result.int64
-  record.probeResult = probeFromResult(result)
-  if path != nil:
-    record.path = $path
-  emitRecord(record)
-  setErrno(savedErrno)
-
-proc repro_hook_lstat*(path: cstring; buf: pointer): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
-    return ct_macos_interpose_real_lstat(path, buf)
-  result = ct_macos_interpose_real_lstat(path, buf)
-  let savedErrno = getErrno()
-  var record = baseRecord(mrPathProbe, moPathProbe)
-  record.result = result.int64
-  record.probeResult = probeFromResult(result)
-  if path != nil:
-    record.path = $path
-  emitRecord(record)
-  setErrno(savedErrno)
-
-# --- Body-patch stat-family hooks ----------------------------------------
+# --- Unified stat-family hooks (interpose + body-patch share ONE hook) ---
 #
-# These mirror repro_hook_stat/lstat but forward to the kernel via the RAW
-# stat64 syscall (ct_macos_bodypatch_real_*), NOT via the named symbol — the
-# body-patch backend has replaced the named stat/lstat/fstatat entry points, so
-# forwarding through them (or through dlsym) would re-enter infinitely. open /
-# openat / read / write / close are NOT duplicated here: their existing
-# repro_hook_* recorders already forward via the raw syscall
-# (ct_macos_interpose_real_* → *_syscall), so the body patch reuses them
-# directly (high fan-in, DRY).
+# There is exactly ONE hook per stat-family call, used by BOTH the static
+# __DATA,__interpose tuples AND the body-patch install. Each forwards to the
+# kernel via the RAW stat64/lstat64/fstatat64/access syscall
+# (ct_macos_bodypatch_real_*), NOT via the named symbol / dlsym.
+#
+# WHY the forward MUST bypass the named entry: under the default `both` backend
+# the body-patch has REPLACED the named stat/lstat/fstatat/access entry points.
+# If this hook forwarded via the by-name real (ct_macos_interpose_real_stat,
+# which resolves the symbol with dlsym / NSLookupSymbolInImage), the resolved
+# address would BE the body-patched entry → the call would re-enter THIS hook →
+# the record would be emitted TWICE (the double-processing bug). Forwarding via
+# the raw syscall reaches the kernel directly, so a given stat() records EXACTLY
+# ONCE regardless of backend (interpose / bodypatch / both) and never re-enters.
+# The *64 syscall variants fill the modern 64-bit-inode `struct stat` the caller
+# expects (see macos_interpose_runtime.nim).
 
-proc repro_bodyhook_stat*(path: cstring; buf: pointer): cint
-    {.exportc, cdecl, dynlib.} =
+proc repro_hook_stat*(path: cstring; buf: pointer): cint {.exportc, cdecl, dynlib.} =
   if not initialized or disabled > 0:
     return ct_macos_bodypatch_real_stat(path, buf)
   result = ct_macos_bodypatch_real_stat(path, buf)
   let savedErrno = getErrno()
-  var record = baseRecord(mrPathProbe, moPathProbe)
-  record.result = result.int64
-  record.probeResult = probeFromResult(result)
-  if path != nil:
-    record.path = $path
-  emitRecord(record)
+  recordPathProbe(result, path, 0, "")
   setErrno(savedErrno)
 
-proc repro_bodyhook_lstat*(path: cstring; buf: pointer): cint
-    {.exportc, cdecl, dynlib.} =
+proc repro_hook_lstat*(path: cstring; buf: pointer): cint {.exportc, cdecl, dynlib.} =
   if not initialized or disabled > 0:
     return ct_macos_bodypatch_real_lstat(path, buf)
   result = ct_macos_bodypatch_real_lstat(path, buf)
   let savedErrno = getErrno()
-  var record = baseRecord(mrPathProbe, moPathProbe)
-  record.result = result.int64
-  record.probeResult = probeFromResult(result)
-  if path != nil:
-    record.path = $path
-  emitRecord(record)
+  recordPathProbe(result, path, 0, "")
   setErrno(savedErrno)
 
-proc repro_bodyhook_fstatat*(dirfd: cint; path: cstring; buf: pointer;
+proc repro_hook_fstatat*(dirfd: cint; path: cstring; buf: pointer;
     flag: cint): cint {.exportc, cdecl, dynlib.} =
   if not initialized or disabled > 0:
     return ct_macos_bodypatch_real_fstatat(dirfd, path, buf, flag)
   result = ct_macos_bodypatch_real_fstatat(dirfd, path, buf, flag)
   let savedErrno = getErrno()
-  var record = baseRecord(mrPathProbe, moPathProbe)
-  record.result = result.int64
-  record.probeResult = probeFromResult(result)
-  if path != nil:
-    record.path = $path
-  record.detail = "fstatat dirfd=" & $dirfd
-  emitRecord(record)
+  recordPathProbe(result, path, 0, "fstatat dirfd=" & $dirfd)
   setErrno(savedErrno)
 
-proc repro_bodyhook_access*(path: cstring; mode: cint): cint
+proc repro_hook_access*(path: cstring; mode: cint): cint
     {.exportc, cdecl, dynlib.} =
   if not initialized or disabled > 0:
     return ct_macos_bodypatch_real_access(path, mode)
   result = ct_macos_bodypatch_real_access(path, mode)
   let savedErrno = getErrno()
-  var record = baseRecord(mrPathProbe, moPathProbe)
-  record.result = result.int64
-  record.probeResult = probeFromResult(result)
-  record.flags = uint32(mode)
-  if path != nil:
-    record.path = $path
-  emitRecord(record)
+  recordPathProbe(result, path, mode, "")
   setErrno(savedErrno)
 
-# --- Body-patch spawn-family hooks ---------------------------------------
+# --- Unified spawn-family hooks ------------------------------------------
 #
-# These close the SHARED-CACHE-INTERNAL spawn blind spot (spec §16.7.8): a
+# There is exactly ONE hook per spawn-family call, used by BOTH the static
+# __DATA,__interpose tuples AND the body-patch install. They close the
+# SHARED-CACHE-INTERNAL spawn blind spot (spec §16.7.8): a
 # `system()`/`popen()`/`NSTask` launch issues its `posix_spawn`/`fork`+`execve`
 # INSIDE libsystem, never through the program's own import stubs, so the static
 # `__DATA,__interpose` section never sees it — the child (e.g. a SIP-protected
@@ -410,162 +404,181 @@ proc repro_bodyhook_access*(path: cstring; mode: cint): cint
 # subtree would run unmonitored (a FALSE SKIP). Body-patching the spawn-family
 # ENTRY points catches the internal caller and re-applies propagation + rewrite.
 #
-# Forwarding constraint: the body patch has replaced the named
-# fork/execve/posix_spawn symbols, so these hooks must NOT forward through the
-# named symbol or dlsym (that address is now this hook -> infinite re-entry):
-#   * execve     -> the raw-syscall forwarder (already does env+SIP rewrite).
+# Forwarding constraint (WHY each hook bypasses the named entry): under the
+# default `both` backend the body-patch has REPLACED the named
+# fork/execve/posix_spawn symbols. If a hook forwarded through the named symbol
+# / dlsym (e.g. ct_macos_interpose_real_fork, which resolves via
+# NSLookupSymbolInImage), that address would BE the body-patched entry → the
+# call would re-enter THIS SAME hook → the record would be emitted TWICE and
+# env-propagation / SIP-rewrite would be applied twice (the double-processing
+# bug). So each hook forwards via a body-patch-SAFE path that reaches the kernel
+# / original body WITHOUT going through the (possibly patched) named entry:
+#   * execve     -> the raw-syscall forwarder (raw `SYS_execve`, which itself
+#                   re-adds DYLD_INSERT_LIBRARIES + CT_SANDBOX_TOOLS_DIR and
+#                   SIP-rewrites the path before the kernel call). execve does
+#                   not return on success, so its record is emitted FIRST.
 #   * fork       -> raw `SYS_fork` (a fork child inherits the loaded shim+env;
 #                   only RECORDING is needed).
-#   * posix_spawn-> rewrite env+path, then forward via a TRAMPOLINE into the
+#   * posix_spawn-> rewrite env+path ONCE, then forward via a TRAMPOLINE into the
 #                   original wrapper body so libsystem's own
-#                   `_posix_spawn_args_desc` marshalling runs.
+#                   `_posix_spawn_args_desc` marshalling runs. When no trampoline
+#                   was built (interpose-only backend, where the entry is NOT
+#                   patched) the by-name real (ct_macos_interpose_real_posix_spawn)
+#                   is re-entry-free and already rewrites, so it is used instead.
 
 var bodypatchPosixSpawnTramp: pointer = nil
   ## Trampoline into the ORIGINAL posix_spawn body (set at install time, before
   ## the entry is patched). nil ⇒ trampoline build was skipped (non-relocatable
-  ## prologue / failure) and the spawn body-patch for this symbol is NOT active;
-  ## the hook then degrades to the by-name forwarder (interpose still covers the
-  ## direct call, and the fail-safe re-runs an unmonitored subtree).
+  ## prologue / failure) OR the body-patch backend is not installed
+  ## (interpose-only), and the hook then degrades to the by-name forwarder (the
+  ## named entry is NOT patched in that case, so by-name is re-entry-free).
 var bodypatchPosixSpawnpTramp: pointer = nil
 
-proc repro_bodyhook_execve*(path: cstring; argv, envp: cstringArray): cint
+proc repro_hook_execve*(path: cstring; argv, envp: cstringArray): cint
     {.exportc, cdecl, dynlib.} =
-  ## Body-patch execve hook: record the exec, then forward via the raw-syscall
-  ## forwarder (which itself re-adds DYLD_INSERT_LIBRARIES + CT_SANDBOX_TOOLS_DIR
-  ## and SIP-rewrites the path before `syscall(SYS_execve, ...)`). execve does
-  ## not return on success, so the record MUST be emitted first.
+  ## Unified execve hook (interpose + body-patch). Record the exec, then forward
+  ## via the raw-syscall forwarder (raw `SYS_execve`, which re-adds the injection
+  ## env vars and SIP-rewrites the path). The raw syscall bypasses the possibly
+  ## body-patched named `execve` entry, so there is no re-entry under `both`.
+  ## execve does not return on success, so the record MUST be emitted first.
   if not initialized or disabled > 0:
     return ct_macos_interpose_real_execve(path, argv, envp)
   var record = baseRecord(mrProcessExec, moExecute)
   if path != nil:
     record.path = $path
-  record.detail = "bodypatch-execve"
+  record.detail = "execve"
   emitRecord(record)
   result = ct_macos_interpose_real_execve(path, argv, envp)
 
-proc repro_bodyhook_fork*(): PidT {.exportc, cdecl, dynlib.} =
-  ## Body-patch fork hook: forward via raw `SYS_fork`, recording the spawn in the
-  ## parent. A fork child inherits the already-loaded shim + env, so NO
-  ## propagation is needed — only recording (per the spec §16.7.8 process-tree
-  ## requirement: every sub-process, including those forked inside libsystem,
-  ## must be accounted for).
+proc repro_hook_fork*(): PidT {.exportc, cdecl, dynlib.} =
+  ## Unified fork hook (interpose + body-patch). Forward via raw `SYS_fork`,
+  ## recording the spawn in the parent. The raw syscall bypasses the possibly
+  ## body-patched named `fork` entry, so there is no re-entry under `both`. A
+  ## fork child inherits the already-loaded shim + env, so NO propagation is
+  ## needed — only recording (spec §16.7.8 process-tree accounting).
   if not initialized or disabled > 0:
     return ct_macos_bodypatch_real_fork()
   result = ct_macos_bodypatch_real_fork()
   if result > 0:
-    var record = baseRecord(mrProcessSpawn, moExecute)
-    record.childOsPid = uint64(result)
-    record.result = result.int64
-    record.detail = "bodypatch-fork"
-    emitRecord(record)
+    recordSpawn(result, result, nil, "fork")
   elif result == 0:
     recordProcessStart()
 
-proc bodypatchSpawnForward(tramp: pointer; pid: ptr PidT; path: cstring;
-    fileActions, attrp: pointer; argv, envp: cstringArray; detail: string): cint =
-  ## Shared body-patch posix_spawn(p) forwarding core (DRY between the two
-  ## variants): apply env-propagation + SIP-rewrite, forward into the original
-  ## wrapper via the trampoline, then record the spawn. If `tramp` is nil the
-  ## trampoline build was skipped at install time — fall back to the by-name
-  ## real forwarder (which also rewrites), preserving correctness; the static
-  ## interpose section still covers the program's own direct calls.
-  if tramp == nil:
-    # No trampoline: forward through the by-name real spawn (it rewrites too).
-    result = ct_macos_interpose_real_posix_spawn(pid, path, fileActions, attrp,
-      argv, envp)
+var inSpawnForward {.threadvar.}: int
+  ## Spawn-forward re-entrancy depth. The trampoline forward runs the ORIGINAL
+  ## libsystem posix_spawn body, which on macOS re-invokes the public
+  ## posix_spawn(p) symbol internally (the PATH-search / arg-desc wrapper funnels
+  ## back through it). Because the SAME unified hook is installed on BOTH the
+  ## body-patched entry AND the global __DATA,__interpose binding, that internal
+  ## re-invocation lands back in this hook. If we forwarded through the
+  ## trampoline AGAIN we would loop forever (the original body re-enters
+  ## endlessly). So while a spawn forward is already in flight on this thread, a
+  ## re-entry must reach the kernel via a DIFFERENT, re-entry-free path: the
+  ## by-name real forwarder (ct_macos_interpose_real_posix_spawn). On macOS that
+  ## resolves an image-local copy of the wrapper that is NOT the patched entry,
+  ## breaking the loop while still completing the spawn. The re-entry is the
+  ## SAME logical spawn, so it is NOT recorded again (recording happens only at
+  ## the outermost, depth-0 forward) — preserving exactly-once recording.
+
+proc spawnForward(tramp: pointer; pid: ptr PidT; path: cstring;
+    fileActions, attrp: pointer; argv, envp: cstringArray;
+    byName: proc(pid: ptr PidT; path: cstring; fileActions, attrp: pointer;
+                 argv, envp: cstringArray): cint {.nimcall.};
+    detail: string): cint =
+  ## Shared posix_spawn(p) forwarding core (DRY between the two variants).
+  ##
+  ## Apply env-propagation + SIP-rewrite EXACTLY ONCE, forward to the real
+  ## implementation via a path that bypasses the possibly body-patched named
+  ## entry, then record the spawn:
+  ##   * tramp != nil (body-patch active), outermost call: the named entry IS
+  ##     patched, so we pre-rewrite env+path here and forward through the
+  ##     TRAMPOLINE into the original wrapper body (the trampoline does NOT
+  ##     rewrite). The original body re-invokes the public symbol internally; see
+  ##     `inSpawnForward` for why the re-entry must NOT re-use the trampoline.
+  ##   * tramp == nil (interpose-only / trampoline build skipped) OR a re-entry
+  ##     while a forward is already in flight: forward through the by-name real
+  ##     (which itself rewrites once and is re-entry-free), WITHOUT pre-rewriting,
+  ##     so the rewrite still happens exactly once.
+  ## Recording the spawn once, at the OUTERMOST forward only, keeps a single
+  ## source of truth for the record (no duplication, no double-record under
+  ## `both`, and no spurious record for the internal re-invocation).
+  let outermost = inSpawnForward == 0
+  if tramp == nil or not outermost:
+    result = byName(pid, path, fileActions, attrp, argv, envp)
   else:
     var effectiveEnvp: cstringArray = nil
     let effectivePath =
       ct_macos_bodypatch_spawn_rewrite(path, envp, addr effectiveEnvp)
-    result = ct_macos_bodypatch_call_posix_spawn(tramp, pid, effectivePath,
-      fileActions, attrp, argv, effectiveEnvp)
-  if result == 0 and pid != nil:
-    var record = baseRecord(mrProcessSpawn, moExecute)
-    record.childOsPid = uint64(pid[])
-    record.result = result.int64
-    if path != nil:
-      record.path = $path
-    record.detail = detail
-    emitRecord(record)
+    inc inSpawnForward
+    try:
+      result = ct_macos_bodypatch_call_posix_spawn(tramp, pid, effectivePath,
+        fileActions, attrp, argv, effectiveEnvp)
+    finally:
+      dec inSpawnForward
+  if outermost and result == 0 and pid != nil:
+    recordSpawn(pid[], result, path, detail)
 
-proc repro_bodyhook_posix_spawn*(pid: ptr PidT; path: cstring;
+proc spawnForwardMuted(tramp: pointer; pid: ptr PidT; path: cstring;
+    fileActions, attrp: pointer; argv, envp: cstringArray;
+    byName: proc(pid: ptr PidT; path: cstring; fileActions, attrp: pointer;
+                 argv, envp: cstringArray): cint {.nimcall.}): cint =
+  ## Forward a posix_spawn(p) WITHOUT recording (the shim is muted), reusing the
+  ## SAME re-entry discipline as `spawnForward`. The trampoline path is taken
+  ## only at the OUTERMOST forward and MUST bump `inSpawnForward` for its whole
+  ## duration: libsystem's original body re-invokes the public symbol, which —
+  ## because both the body-patched entry and the __interpose binding route here —
+  ## lands back in this hook. Without the depth bump a muted spawn would re-enter
+  ## the trampoline at depth 0 forever; with it, the re-entry sees depth>0 and
+  ## takes the re-entry-free by-name path (mirrors the unmuted core, DRY).
+  if tramp != nil and inSpawnForward == 0:
+    inc inSpawnForward
+    try:
+      result = ct_macos_bodypatch_call_posix_spawn(tramp, pid, path,
+        fileActions, attrp, argv, envp)
+    finally:
+      dec inSpawnForward
+  else:
+    result = byName(pid, path, fileActions, attrp, argv, envp)
+
+proc repro_hook_posix_spawn*(pid: ptr PidT; path: cstring;
     fileActions, attrp: pointer; argv, envp: cstringArray): cint
     {.exportc, cdecl, dynlib.} =
-  ## Body-patch posix_spawn hook: re-propagate injection + SIP-rewrite, forward
-  ## via the trampoline into the original wrapper body, record the spawn.
+  ## Unified posix_spawn hook (interpose + body-patch). Re-propagate injection +
+  ## SIP-rewrite ONCE, forward via the trampoline (body-patch) or the by-name
+  ## real (interpose-only / re-entry), record the spawn. The detail tag reflects
+  ## which forward was taken so downstream can tell a body-patch-intercepted
+  ## internal spawn from an interpose-visible one.
   if not initialized or disabled > 0:
-    if bodypatchPosixSpawnTramp != nil:
-      return ct_macos_bodypatch_call_posix_spawn(bodypatchPosixSpawnTramp,
-        pid, path, fileActions, attrp, argv, envp)
-    return ct_macos_interpose_real_posix_spawn(pid, path, fileActions, attrp,
-      argv, envp)
-  bodypatchSpawnForward(bodypatchPosixSpawnTramp, pid, path, fileActions, attrp,
-    argv, envp, "bodypatch-posix_spawn")
+    # Muted: forward only (no record), via the depth-guarded muted forwarder so
+    # the trampoline path cannot re-enter itself at depth 0 (see
+    # `spawnForwardMuted` / `inSpawnForward`).
+    return spawnForwardMuted(bodypatchPosixSpawnTramp, pid, path, fileActions,
+      attrp, argv, envp, ct_macos_interpose_real_posix_spawn)
+  let detail =
+    if bodypatchPosixSpawnTramp != nil and inSpawnForward == 0:
+      "bodypatch-posix_spawn"
+    else:
+      "posix_spawn"
+  spawnForward(bodypatchPosixSpawnTramp, pid, path, fileActions, attrp,
+    argv, envp, ct_macos_interpose_real_posix_spawn, detail)
 
-proc repro_bodyhook_posix_spawnp*(pid: ptr PidT; path: cstring;
+proc repro_hook_posix_spawnp*(pid: ptr PidT; path: cstring;
     fileActions, attrp: pointer; argv, envp: cstringArray): cint
     {.exportc, cdecl, dynlib.} =
-  ## Body-patch posix_spawnp hook: as `repro_bodyhook_posix_spawn` for the
+  ## Unified posix_spawnp hook: as `repro_hook_posix_spawn` for the
   ## PATH-searching variant.
   if not initialized or disabled > 0:
-    if bodypatchPosixSpawnpTramp != nil:
-      return ct_macos_bodypatch_call_posix_spawn(bodypatchPosixSpawnpTramp,
-        pid, path, fileActions, attrp, argv, envp)
-    return ct_macos_interpose_real_posix_spawnp(pid, path, fileActions, attrp,
-      argv, envp)
-  bodypatchSpawnForward(bodypatchPosixSpawnpTramp, pid, path, fileActions, attrp,
-    argv, envp, "bodypatch-posix_spawnp")
-
-proc repro_hook_fork*(): PidT {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
-    return ct_macos_interpose_real_fork()
-  result = ct_macos_interpose_real_fork()
-  if result > 0:
-    var record = baseRecord(mrProcessSpawn, moExecute)
-    record.childOsPid = uint64(result)
-    record.result = result.int64
-    record.detail = "fork"
-    emitRecord(record)
-  elif result == 0:
-    recordProcessStart()
-
-proc repro_hook_execve*(path: cstring; argv, envp: cstringArray): cint
-    {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
-    return ct_macos_interpose_real_execve(path, argv, envp)
-  var record = baseRecord(mrProcessExec, moExecute)
-  if path != nil:
-    record.path = $path
-  emitRecord(record)
-  result = ct_macos_interpose_real_execve(path, argv, envp)
-
-proc repro_hook_posix_spawn*(pid: ptr PidT; path: cstring; fileActions, attrp: pointer;
-    argv, envp: cstringArray): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
-    return ct_macos_interpose_real_posix_spawn(pid, path, fileActions, attrp, argv, envp)
-  result = ct_macos_interpose_real_posix_spawn(pid, path, fileActions, attrp, argv, envp)
-  if result == 0 and pid != nil:
-    var record = baseRecord(mrProcessSpawn, moExecute)
-    record.childOsPid = uint64(pid[])
-    record.result = result.int64
-    if path != nil:
-      record.path = $path
-    record.detail = "posix_spawn"
-    emitRecord(record)
-
-proc repro_hook_posix_spawnp*(pid: ptr PidT; path: cstring; fileActions, attrp: pointer;
-    argv, envp: cstringArray): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
-    return ct_macos_interpose_real_posix_spawnp(pid, path, fileActions, attrp, argv, envp)
-  result = ct_macos_interpose_real_posix_spawnp(pid, path, fileActions, attrp, argv, envp)
-  if result == 0 and pid != nil:
-    var record = baseRecord(mrProcessSpawn, moExecute)
-    record.childOsPid = uint64(pid[])
-    record.result = result.int64
-    if path != nil:
-      record.path = $path
-    record.detail = "posix_spawnp"
-    emitRecord(record)
+    # Muted: forward only (no record), via the depth-guarded muted forwarder
+    # (see `spawnForwardMuted` / `inSpawnForward`).
+    return spawnForwardMuted(bodypatchPosixSpawnpTramp, pid, path, fileActions,
+      attrp, argv, envp, ct_macos_interpose_real_posix_spawnp)
+  let detail =
+    if bodypatchPosixSpawnpTramp != nil and inSpawnForward == 0:
+      "bodypatch-posix_spawnp"
+    else:
+      "posix_spawnp"
+  spawnForward(bodypatchPosixSpawnpTramp, pid, path, fileActions, attrp,
+    argv, envp, ct_macos_interpose_real_posix_spawnp, detail)
 
 proc reproRuntimeInit() {.exportc.} =
   discard repro_monitor_shim_init(nil)
@@ -646,25 +659,25 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
       hook: cast[pointer](repro_hook_close)),
     BodypatchHookSpec(
       names: @["stat", "stat64", "stat$INODE64"],
-      hook: cast[pointer](repro_bodyhook_stat)),
+      hook: cast[pointer](repro_hook_stat)),
     BodypatchHookSpec(
       names: @["lstat", "lstat64", "lstat$INODE64"],
-      hook: cast[pointer](repro_bodyhook_lstat)),
+      hook: cast[pointer](repro_hook_lstat)),
     BodypatchHookSpec(
       names: @["fstatat", "fstatat64", "fstatat$INODE64"],
-      hook: cast[pointer](repro_bodyhook_fstatat)),
+      hook: cast[pointer](repro_hook_fstatat)),
     BodypatchHookSpec(
       names: @["access"],
-      hook: cast[pointer](repro_bodyhook_access)),
+      hook: cast[pointer](repro_hook_access)),
     # Spawn family (spec §16.7.8): fork + execve forward via raw syscall (no
     # trampoline needed); they are installed with the plain installer below.
     # posix_spawn / posix_spawnp need a TRAMPOLINE (handled separately).
     BodypatchHookSpec(
       names: @["fork"],
-      hook: cast[pointer](repro_bodyhook_fork)),
+      hook: cast[pointer](repro_hook_fork)),
     BodypatchHookSpec(
       names: @["execve"],
-      hook: cast[pointer](repro_bodyhook_execve)),
+      hook: cast[pointer](repro_hook_execve)),
   ]
 
   var installed, failed, absent: cint = 0
@@ -682,10 +695,10 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
   # re-runs any unmonitored subtree). $NOCANCEL/`__` variants do not exist for
   # posix_spawn, so we patch just the two named entry points.
   reproMacosBodypatchInstallNamedTramp(cstring("posix_spawn"),
-    cast[pointer](repro_bodyhook_posix_spawn), addr bodypatchPosixSpawnTramp,
+    cast[pointer](repro_hook_posix_spawn), addr bodypatchPosixSpawnTramp,
     addr installed, addr failed, addr absent)
   reproMacosBodypatchInstallNamedTramp(cstring("posix_spawnp"),
-    cast[pointer](repro_bodyhook_posix_spawnp), addr bodypatchPosixSpawnpTramp,
+    cast[pointer](repro_hook_posix_spawnp), addr bodypatchPosixSpawnpTramp,
     addr installed, addr failed, addr absent)
 
   shimLogToStderr("io-mon: macOS body-patch installed=" & $installed &
@@ -850,10 +863,11 @@ static void repro_monitor_shim_constructor(void) {
   reproRuntimeInit();
   repro_monitor_runtime_ready = 1;
   /*
-   * Install the body-patch backend AFTER the runtime is ready: the body-patch
-   * hooks (repro_hook_* / repro_bodyhook_*) require the recording runtime to
-   * be live, and runtime_ready=1 ensures the interpose wrappers route through
-   * the hooks too. Runs single-threaded here (dyld constructors execute before
+   * Install the body-patch backend AFTER the runtime is ready: the unified
+   * repro_hook_* functions (used by BOTH the __interpose tuples and the
+   * body-patch install) require the recording runtime to be live, and
+   * runtime_ready=1 ensures the interpose wrappers route through the hooks too.
+   * Runs single-threaded here (dyld constructors execute before
    * main and before any monitored thread starts), so the patcher's registry is
    * race-free. A failed install is non-fatal — it logs and degrades to reduced
    * capture (the downstream runner re-runs; it never treats this as a skip).
