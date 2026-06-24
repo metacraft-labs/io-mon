@@ -47,11 +47,43 @@ The production implementation lives in:
    mach_task_self(), newPage, FALSE, &cur, &max, VM_INHERIT_COPY)`.
 6. `sys_icache_invalidate(target, 16)`.
 
-The hook forwards to the kernel via the RAW syscall (`syscall(SYS_open, ...)`),
-never via the named symbol / dlsym / RTLD_NEXT (which is now patched and would
-re-enter infinitely). No prologue-copying trampoline is built — that SIGILLs on
-PC-relative instructions (`adrp`); raw-syscall forwarding is correct for these
-thin syscall wrappers.
+The FILE hook forwards to the kernel via the RAW syscall
+(`syscall(SYS_open, ...)`), never via the named symbol / dlsym / RTLD_NEXT
+(which is now patched and would re-enter infinitely). For the thin syscall
+wrappers (open/read/write/stat/...) no prologue-copying trampoline is needed —
+raw-syscall forwarding is correct and avoids the PC-relative-prologue hazard.
+
+### The SPAWN family (trampoline path)
+
+`posix_spawn` is NOT a thin syscall wrapper: its libsystem body marshals a
+private `_posix_spawn_args_desc` before issuing `SYS_posix_spawn`, so the hook
+must forward into the ORIGINAL wrapper body (not a hand-rolled raw syscall).
+It cannot call the named symbol / dlsym (now patched → infinite re-entry), so it
+forwards via a **trampoline**: a fresh RX stub = the original's displaced first
+16 bytes (4 instructions) + `ldr x16,#8 ; br x16 ; .quad target+16`. Calling the
+trampoline runs the original prologue then continues into the body.
+
+Because copying a prologue is only safe if it is position-independent, the
+trampoline builder first runs a CONSERVATIVE relocatability check on the 4
+prologue words (against the ARM ARM A64 encodings): if ANY is PC-relative
+(`adr`/`adrp`, `b`/`bl`, `b.cond`, `cbz`/`cbnz`, `tbz`/`tbnz`, `ldr` literal) it
+refuses to build the trampoline and leaves that function interpose-only — a safe
+degradation (the downstream fail-safe re-runs any unmonitored subtree). On the
+M1 Max / macOS 26 host both `posix_spawn` and `posix_spawnp` prologues passed
+the check and the trampoline installed (`spawn_tramp=ok spawnp_tramp=ok`).
+
+The spawn hooks (`fork`/`execve`/`posix_spawn`/`posix_spawnp`) re-apply
+env-propagation (re-add `DYLD_INSERT_LIBRARIES` + `CT_SANDBOX_TOOLS_DIR`) and
+the SIP-rewrite before forwarding, closing the shared-cache-INTERNAL spawn
+propagation blind spot (a `system`/`popen`/`NSTask` launch issues its spawn
+inside libsystem, which `__DATA,__interpose` never sees). `fork` forwards via
+`syscall(SYS_fork)` (a fork child inherits the loaded shim + env, so only
+recording is needed); `execve` forwards via the raw-syscall forwarder (which
+itself re-propagates + rewrites).
+
+Production: `repro_macos_bodypatch_build_trampoline` /
+`..._install_named_tramp` in `src/io_mon/hooks/macos_bodypatch.nim`; the spawn
+hooks in `src/io_mon/shim/macos_interpose.nim`.
 
 ### References
 
