@@ -72,6 +72,22 @@ task test, "Run the io-mon test suite":
   # WORKS under the body-patch (it must not break the move). macOS-only (no-op
   # pass elsewhere).
   exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_rename.nim"
+  # macOS body-patch VARIADIC open-mode forwarding: under `both` a
+  # libsystem-internal `fopen("…","w")` (whose `open$NOCANCEL` passes `mode` on
+  # the STACK per the arm64 Apple variadic ABI) must create the file with the
+  # CORRECT mode (0644), readable back — locking in the fix for the
+  # `IO_MON_MACOS_BACKEND=both` nimcache `Permission denied` defect (the old
+  # fixed-3-arg body-patch hook read `mode` from x2/garbage). macOS-only (no-op
+  # pass elsewhere).
+  exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_bodypatch_open_mode.nim"
+  # macOS threaded-write capture: a write issued from a NON-MAIN (pthread_create'd)
+  # thread that exits before process teardown must still produce an `mrFileWrite`
+  # record. The per-thread fragment batch is flushed SYNCHRONOUSLY in the emit
+  # path for worker threads (a pthread thread-exit destructor can't flush — macOS
+  # tears down a non-Nim thread's Nim TLS before it runs). Locks in the
+  # threaded-write capture-gap fix under both backends. macOS-only (no-op pass
+  # elsewhere).
+  exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_threaded_write.nim"
 
 task buildShim, "Build the io-mon interpose shim shared library":
   # Produces build/lib/librepro_monitor_shim.{dylib,so,dll} — the drop-in

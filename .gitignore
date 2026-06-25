@@ -23,3 +23,5 @@ tests/test_io_mon_macos_record_once
 tests/test_io_mon_macos_sip_system_child
 tests/test_io_mon_macos_bodypatch_resolution
 tests/test_io_mon_macos_rename
+tests/test_io_mon_macos_bodypatch_open_mode
+tests/test_io_mon_macos_threaded_write
