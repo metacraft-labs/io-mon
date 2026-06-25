@@ -50,6 +50,22 @@ var
   nextProcessSeq: uint64 = 0
   fdPaths = initTable[cint, string]()
   dirPaths = initTable[uint, string]()
+  # The OS thread id of the thread that ran the dyld constructor (the "main"
+  # thread). Captured once at init. The fragment writer batches a thread's
+  # records into a per-thread buffer that is otherwise flushed only on overflow /
+  # 100 ms age / explicit flush; the dyld process-exit destructor flushes ONLY
+  # the main thread's batch. A WORKER thread (pthread_create'd by the monitored
+  # program) that emits a few records and then exits BEFORE process teardown
+  # would lose its buffered tail — and crucially we CANNOT flush it from a
+  # pthread-key thread-exit destructor, because macOS tears down a non-Nim
+  # thread's Nim runtime TLS before pthread destructors run, so any Nim call from
+  # there faults. We therefore flush a worker thread's batch SYNCHRONOUSLY on
+  # every emit (see emitRecord): the main thread keeps the batching win (the
+  # millions of single-threaded configure probes the optimization targeted),
+  # while worker threads trade a little batching for guaranteed capture of their
+  # reads AND writes regardless of when they exit. This closes the threaded-write
+  # capture gap without a teardown-time Nim call.
+  mainThreadId: uint64 = 0
 
 var disabled {.threadvar.}: int
 
@@ -96,6 +112,20 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
     return
   withShimMuted:
     appendFragmentRecord(fragmentDir, record)
+    # Threaded-write capture fix: if this record was emitted from a WORKER thread
+    # (not the main/constructor thread), flush its per-thread fragment batch
+    # synchronously. The batch is otherwise flushed only on overflow / 100 ms age
+    # / process-exit, and the process-exit destructor flushes only the MAIN
+    # thread's batch — a worker thread that exits early would lose its buffered
+    # tail (the threaded-write gap). We must flush here (while the thread is
+    # alive) rather than from a pthread thread-exit destructor, because macOS
+    # tears down a non-Nim thread's Nim-runtime TLS before pthread destructors
+    # run, so a Nim flush call from there faults. The main thread keeps the
+    # batching win (the single-threaded configure probe storm the optimization
+    # targeted); worker-thread I/O is comparatively rare, so per-record flushing
+    # there is an acceptable trade for guaranteed capture of its reads AND writes.
+    if record.threadId != mainThreadId:
+      flushFragmentBatch()
 
 proc recordProcessStart() {.raises: [].} =
   var record = baseRecord(mrProcessStart, moProcessStart)
@@ -251,6 +281,12 @@ proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
     fragmentDir = getEnv("REPRO_MONITOR_FRAGMENT_DIR")
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))
+  # Record the constructor thread as the "main" thread. Its fragment batch is
+  # flushed by the dyld process-exit destructor; worker threads (which the
+  # destructor cannot reach safely) flush eagerly per record in emitRecord. Init
+  # runs in the dyld constructor, single-threaded, so this captures the main
+  # thread id before any worker thread can emit.
+  mainThreadId = currentThreadId()
   initialized = true
   recordProcessStart()
   result = 0
@@ -742,6 +778,21 @@ proc bodypatchEnabled(): bool {.raises: [].} =
       "', defaulting to 'both'")
     true
 
+proc reproBodypatchOpenHookAddr(): pointer
+    {.importc: "repro_macos_bodypatch_open_hook_addr_fn", cdecl.}
+  ## Address of the VARIADIC `repro_wrap_open` thunk. The body-patch backend must
+  ## branch the patched libsystem `open`/`open$NOCANCEL`/`__open_nocancel` entries
+  ## here (NOT to the fixed-3-arg `repro_hook_open`): on the arm64 Apple ABI a
+  ## variadic `mode` argument is passed on the STACK, so the fixed-arg hook would
+  ## read garbage from x2 and create `O_CREAT` files with a corrupt permission
+  ## mode (the `both`-backend nimcache EACCES defect). The thunk reads `mode` via
+  ## `va_arg` only when the flags require it, matching the interpose path.
+
+proc reproBodypatchOpenatHookAddr(): pointer
+    {.importc: "repro_macos_bodypatch_openat_hook_addr_fn", cdecl.}
+  ## Address of the VARIADIC `repro_wrap_openat` thunk (same rationale as
+  ## `reproBodypatchOpenHookAddr`, for the `openat` family).
+
 proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raises: [].} =
   ## Install every file-relevant libsystem syscall-wrapper body patch. Runs in
   ## the constructor, single-threaded (dyld runs constructors before main and
@@ -756,13 +807,27 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
   # therefore one hook. open / open$NOCANCEL / __open_nocancel are DISTINCT
   # addresses (stdio's fopen/fread reach the $NOCANCEL variants), so all must
   # be patched. Symbols absent on this OS (dlsym → NULL) are skipped.
+  # open/openat are VARIADIC libsystem entries (`open(const char *, int, ...)`).
+  # The body-patch hook MUST be the variadic `repro_wrap_open(at)` thunk — which
+  # reads `mode` from the stack via `va_arg` (the arm64 Apple ABI passes ALL
+  # variadic args on the stack) ONLY when `O_CREAT` requires it — and NOT the
+  # fixed-3-arg `repro_hook_open(at)`, which would read `mode` from register x2
+  # (garbage) and create `O_CREAT` files with a corrupt permission mode. That
+  # corruption is the `IO_MON_MACOS_BACKEND=both` nimcache `Permission denied`
+  # defect: `fopen("...","w")` inside libsystem (a shared-cache-internal caller
+  # interpose never sees) passes `mode=0666` on the stack, so the fixed-arg hook
+  # mis-created the `.nim.c` `0404` and the compiler's later read got EACCES. The
+  # accessors return the SAME thunks the interpose tuples use (DRY) so both
+  # backends compute `mode` identically.
+  let openHook = reproBodypatchOpenHookAddr()
+  let openatHook = reproBodypatchOpenatHookAddr()
   let specs = @[
     BodypatchHookSpec(
       names: @["open", "open$NOCANCEL", "__open_nocancel"],
-      hook: cast[pointer](repro_hook_open)),
+      hook: openHook),
     BodypatchHookSpec(
       names: @["openat", "openat$NOCANCEL", "__openat_nocancel"],
-      hook: cast[pointer](repro_hook_openat)),
+      hook: openatHook),
     BodypatchHookSpec(
       names: @["read", "read$NOCANCEL", "__read_nocancel"],
       hook: cast[pointer](repro_hook_read)),
@@ -869,6 +934,35 @@ static int repro_monitor_runtime_ready = 0;
 extern void NimMain(void);
 extern void repro_monitor_install_bodypatch(void);
 extern int repro_monitor_shim_flush(void);
+
+/*
+ * Threaded-write capture: why the flush is SYNCHRONOUS (in emitRecord), not a
+ * pthread thread-exit destructor.
+ *
+ * The fragment writer (io_mon/writer.nim) batches a thread's records into a
+ * per-thread (threadvar) buffer that is otherwise flushed only on overflow
+ * (64 KiB), a 100 ms staleness age-check (LAZY — it only fires on the NEXT
+ * emit), a fragment-key change, or an explicit flush. The dyld
+ * `__attribute__((destructor))` at process exit flushes ONLY the calling (main)
+ * thread's slot, because a threadvar names a DIFFERENT object per thread. So a
+ * WORKER thread (a `pthread_create`d child of the monitored program) that emits
+ * a few records and then EXITS before process teardown would leave its buffered
+ * tail unflushed — its reads AND writes silently LOST. That is the tracked
+ * "threaded-write capture gap".
+ *
+ * The obvious fix — a `pthread_key_t` whose destructor flushes on thread exit —
+ * does NOT work here: a worker thread is a non-Nim thread, and macOS tears down
+ * its Nim-runtime TLS BEFORE pthread key destructors run, so ANY Nim proc call
+ * from such a destructor (even a trivial `raises: []` one) faults (verified
+ * empirically on this host: the destructor ran but the Nim flush call never
+ * entered its body). We therefore flush the worker thread's batch SYNCHRONOUSLY
+ * inside `emitRecord` — while the thread is still alive and its Nim runtime is
+ * intact — for every record whose `threadId` differs from the main/constructor
+ * thread. The main thread keeps the full batching win (the single-threaded
+ * configure probe storm the M9.R.15f.1 optimization targeted); worker-thread I/O
+ * is comparatively rare, so per-record flushing there is an acceptable trade for
+ * guaranteed capture. See `mainThreadId` / `emitRecord` in the Nim section.
+ */
 
 typedef DIR *(*repro_real_opendir_fn)(const char *);
 typedef struct dirent *(*repro_real_readdir_fn)(DIR *);
@@ -1027,6 +1121,47 @@ static int repro_wrap_posix_spawnp(pid_t *pid, const char *path,
   }
   return repro_hook_posix_spawnp(pid, (char *)path, (void *)file_actions,
     (void *)attrp, (char **)argv, (char **)envp);
+}
+
+/*
+ * Body-patch hook ADDRESS accessors for the VARIADIC open/openat wrappers.
+ *
+ * Why the body-patch backend MUST use the variadic repro_wrap_open(at) thunks --
+ * and NOT the fixed-3-arg repro_hook_open(at) -- for the open family:
+ *
+ * Apple's libsystem open / open$NOCANCEL / openat / ... are VARIADIC entries
+ * (open(const char *, int, ...)). On the arm64 Apple platform ABI, ALL variadic
+ * arguments are passed on the STACK, never in argument registers (contrary to
+ * the AAPCS64 default; see Apple's "Writing ARM64 Code for Apple Platforms" --
+ * variadic args live at [sp], so x2 is NOT the mode). A caller that supplies
+ * mode (e.g. libsystem_c's fopen, which emits movz w8,#0666; str x8,[sp]; bl
+ * open$NOCANCEL) therefore places mode on the stack, while register x2 holds an
+ * UNRELATED value.
+ *
+ * The body-patch overwrites the libsystem open$NOCANCEL entry so that ALL
+ * callers -- including shared-cache-internal ones like fopen that interpose
+ * never sees -- branch to our hook. If that hook is the fixed-3-arg
+ * repro_hook_open(path, flags, mode), it reads mode from x2 (garbage) and
+ * forwards open(path, flags, <garbage>) to the kernel. For an O_CREAT open that
+ * CREATES the file with a corrupt permission mode (e.g. fopen(p,"w") yielding
+ * 0404 instead of 0644), so the compiler's later read of its own just-written
+ * nimcache .nim.c fails with EACCES ("Permission denied") -- the exact
+ * IO_MON_MACOS_BACKEND=both defect. The interpose path never hit this because
+ * repro_wrap_open already reads mode via va_arg (stack-correct); only the
+ * body-patched shared-cache-internal callers were affected.
+ *
+ * The fix routes the body-patch open/openat hooks through the SAME variadic
+ * repro_wrap_open(at) thunks the interpose tuples use (DRY): they read mode via
+ * va_arg ONLY when O_CREAT requires it, then forward to repro_hook_open(at) with
+ * the CORRECT mode. The thunks are static, so we expose their addresses through
+ * these tiny accessor functions for the Nim-side body-patch installer.
+ */
+void *repro_macos_bodypatch_open_hook_addr_fn(void) {
+  return (void *)repro_wrap_open;
+}
+
+void *repro_macos_bodypatch_openat_hook_addr_fn(void) {
+  return (void *)repro_wrap_openat;
 }
 
 __attribute__((constructor))
