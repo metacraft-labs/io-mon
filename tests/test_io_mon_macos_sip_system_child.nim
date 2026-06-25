@@ -349,6 +349,13 @@ suite "io-mon macOS genuine SIP-child capture (§16.7.8, drop-in)":
     let shim = buildShim()
     let bundleDir = getTempDir() / ("io-mon-sip-bundle-" & $getCurrentProcessId())
     let bundle = buildSandboxBundle(bundleDir)
+    # Ownership of ``bundle`` decides teardown: when ``IO_MON_TEST_SANDBOX_BUNDLE``
+    # points at an externally-provided bundle (e.g. the persistent reprobuild-built
+    # ``recipes/sandbox-tools/bundle``), ``buildSandboxBundle`` returns it AS-IS and
+    # the test must NOT delete it — only a bundle the test itself built into the
+    # temp ``bundleDir`` may be removed. Deleting a caller-provided bundle destroyed
+    # the shared drop-in set on every run.
+    let bundleIsOurs = getEnv("IO_MON_TEST_SANDBOX_BUNDLE").len == 0
 
     # Gate: the drop-in sh AND cat must actually RUN on this host (a non-SIP
     # binary AMFI does not kill). If either cannot be resolved into a runnable
@@ -455,7 +462,10 @@ suite "io-mon macOS genuine SIP-child capture (§16.7.8, drop-in)":
 
       removeDir(sysFx.work)
 
-    removeDir(bundle)
+    # Only clean up a bundle the test itself created in the temp dir; never an
+    # externally-provided ``IO_MON_TEST_SANDBOX_BUNDLE`` (see ``bundleIsOurs``).
+    if bundleIsOurs:
+      removeDir(bundle)
   else:
     test "SIP system()-child capture is macOS-only (no-op on this platform)":
       check true

@@ -553,15 +553,20 @@ var inSpawnForward {.threadvar.}: int
   ## posix_spawn(p) symbol internally (the PATH-search / arg-desc wrapper funnels
   ## back through it). Because the SAME unified hook is installed on BOTH the
   ## body-patched entry AND the global __DATA,__interpose binding, that internal
-  ## re-invocation lands back in this hook. If we forwarded through the
-  ## trampoline AGAIN we would loop forever (the original body re-enters
-  ## endlessly). So while a spawn forward is already in flight on this thread, a
-  ## re-entry must reach the kernel via a DIFFERENT, re-entry-free path: the
-  ## by-name real forwarder (ct_macos_interpose_real_posix_spawn). On macOS that
-  ## resolves an image-local copy of the wrapper that is NOT the patched entry,
-  ## breaking the loop while still completing the spawn. The re-entry is the
-  ## SAME logical spawn, so it is NOT recorded again (recording happens only at
-  ## the outermost, depth-0 forward) — preserving exactly-once recording.
+  ## re-invocation lands back in this hook.
+  ##
+  ## Under the body-patch backend the re-entry MUST forward through the TRAMPOLINE
+  ## (which holds the relocated original prologue and jumps PAST the patch) — the
+  ## only genuinely re-entry-free path. The by-name "real" forwarder
+  ## (ct_macos_interpose_real_posix_spawn) is NOT safe here: body-patch overwrites
+  ## the libsystem posix_spawn body IN PLACE, so a by-name forward resolves the
+  ## patched entry and loops back into this hook forever (observed as a
+  ## spawn-hook <-> repro_macos_real_posix_spawn infinite recursion). The by-name
+  ## path is reserved for the INTERPOSE-ONLY backend, where the named symbol is
+  ## unpatched and dyld's __interpose tuples do not apply to the shim's own
+  ## image-local lookup. The depth counter still gates env/path rewriting and the
+  ## spawn record to the OUTERMOST (depth-0) forward, so the internal
+  ## re-invocation is forwarded verbatim and recorded exactly once.
 
 proc spawnForward(tramp: pointer; pid: ptr PidT; path: cstring;
     fileActions, attrp: pointer; argv, envp: cstringArray;
@@ -586,16 +591,38 @@ proc spawnForward(tramp: pointer; pid: ptr PidT; path: cstring;
   ## source of truth for the record (no duplication, no double-record under
   ## `both`, and no spurious record for the internal re-invocation).
   let outermost = inSpawnForward == 0
-  if tramp == nil or not outermost:
+  if tramp == nil:
+    # Interpose-only backend: the named ``posix_spawn`` symbol is NOT patched,
+    # and dyld's __interpose tuples do not apply to the shim's OWN image-local
+    # lookup, so the by-name real forwarder reaches the genuine libsystem entry
+    # and is re-entry-free. (Pre-rewrite is skipped here: the by-name forwarder
+    # rewrites env+path itself, exactly once.)
     result = byName(pid, path, fileActions, attrp, argv, envp)
   else:
-    var effectiveEnvp: cstringArray = nil
-    let effectivePath =
-      ct_macos_bodypatch_spawn_rewrite(path, envp, addr effectiveEnvp)
+    # Body-patch active (``both`` / ``bodypatch``). The libsystem ``posix_spawn``
+    # body is patched IN PLACE, so the by-name "real" forwarder is NOT re-entry
+    # free under this backend — it resolves the patched entry and loops back into
+    # this hook forever (observed as a spawn-hook ↔ ``repro_macos_real_posix_spawn``
+    # infinite recursion). The TRAMPOLINE (which holds the relocated original
+    # prologue and jumps PAST the patch) is the only re-entry-free path into the
+    # original marshalling body, so BOTH the outermost forward AND any in-flight
+    # re-entry must go through it. The ``inSpawnForward`` depth still gates env+
+    # path rewriting to EXACTLY ONCE (outermost only): the original body re-invokes
+    # the public symbol internally, and that internal re-invocation must forward
+    # the already-rewritten env/path verbatim rather than rewrite again.
     inc inSpawnForward
     try:
-      result = ct_macos_bodypatch_call_posix_spawn(tramp, pid, effectivePath,
-        fileActions, attrp, argv, effectiveEnvp)
+      if outermost:
+        var effectiveEnvp: cstringArray = nil
+        let effectivePath =
+          ct_macos_bodypatch_spawn_rewrite(path, envp, addr effectiveEnvp)
+        result = ct_macos_bodypatch_call_posix_spawn(tramp, pid, effectivePath,
+          fileActions, attrp, argv, effectiveEnvp)
+      else:
+        # Internal re-invocation of the already-rewritten spawn: forward verbatim
+        # through the trampoline (no second rewrite, no re-entry into the patch).
+        result = ct_macos_bodypatch_call_posix_spawn(tramp, pid, path,
+          fileActions, attrp, argv, envp)
     finally:
       dec inSpawnForward
   if outermost and result == 0 and pid != nil:
@@ -611,15 +638,20 @@ proc spawnForwardMuted(tramp: pointer; pid: ptr PidT; path: cstring;
   ## duration: libsystem's original body re-invokes the public symbol, which —
   ## because both the body-patched entry and the __interpose binding route here —
   ## lands back in this hook. Without the depth bump a muted spawn would re-enter
-  ## the trampoline at depth 0 forever; with it, the re-entry sees depth>0 and
-  ## takes the re-entry-free by-name path (mirrors the unmuted core, DRY).
-  if tramp != nil and inSpawnForward == 0:
-    inc inSpawnForward
+  ## the trampoline at depth 0 forever; with it, the re-entry stays on the
+  ## trampoline (the only re-entry-free path under body-patch — the by-name real
+  ## resolves the IN-PLACE patched entry and would loop). Only the interpose-only
+  ## backend (``tramp == nil``) uses the by-name path, where the named symbol is
+  ## unpatched and the forward is genuinely re-entry-free (mirrors the unmuted
+  ## core, DRY).
+  if tramp != nil:
+    let outermost = inSpawnForward == 0
+    if outermost: inc inSpawnForward
     try:
       result = ct_macos_bodypatch_call_posix_spawn(tramp, pid, path,
         fileActions, attrp, argv, envp)
     finally:
-      dec inSpawnForward
+      if outermost: dec inSpawnForward
   else:
     result = byName(pid, path, fileActions, attrp, argv, envp)
 
