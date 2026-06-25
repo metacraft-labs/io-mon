@@ -60,6 +60,18 @@ task test, "Run the io-mon test suite":
   # skips cleanly if no runnable non-SIP sh/cat drop-in resolves (no-op pass
   # elsewhere).
   exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_sip_system_child.nim"
+  # macOS body-patch RESOLUTION (the keystone): the installer resolves every
+  # target to the REAL libsystem (skipping the shim's own __interpose wrappers),
+  # so the install banner reports failed=0 and the fork/posix_spawn(p)
+  # trampolines all build (*_tramp=ok). Locks in the dlsym-resolves-to-shim fix
+  # that was corrupting the shim's own code (SIGTRAP). macOS-only (no-op pass
+  # elsewhere).
+  exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_bodypatch_resolution.nim"
+  # macOS rename/renameat hooks: the gnulib/autotools atomic-output move
+  # (`chmod a-w $@t; mv $@t $@`) is RECORDED as a destination write AND still
+  # WORKS under the body-patch (it must not break the move). macOS-only (no-op
+  # pass elsewhere).
+  exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_rename.nim"
 
 task buildShim, "Build the io-mon interpose shim shared library":
   # Produces build/lib/librepro_monitor_shim.{dylib,so,dll} — the drop-in

@@ -94,6 +94,41 @@ when not defined(macosx):
 #include <mach/mach_vm.h>
 #include <libkern/OSCacheControl.h>
 
+#include <mach-o/dyld.h>
+#define REPRO_SHIM_IMAGE_SUBSTR "librepro_monitor_shim"
+static int repro_bodypatch_addr_in_shim(const void *addr) {
+  Dl_info info;
+  if (addr == NULL) return 0;
+  if (dladdr(addr, &info) == 0) return 0;
+  if (info.dli_fname == NULL) return 0;
+  return strstr(info.dli_fname, REPRO_SHIM_IMAGE_SUBSTR) != NULL ? 1 : 0;
+}
+
+static void *repro_bodypatch_resolve_libsystem(const char *name) {
+  if (name == NULL) return NULL;
+  char mangled[128];
+  size_t n = strlen(name);
+  if (n + 2 > sizeof(mangled)) return NULL;
+  mangled[0] = '_';
+  memcpy(mangled + 1, name, n);
+  mangled[n + 1] = '\0';
+  uint32_t count = _dyld_image_count();
+  for (uint32_t i = 0; i < count; i++) {
+    const char *img = _dyld_get_image_name(i);
+    if (img != NULL && strstr(img, REPRO_SHIM_IMAGE_SUBSTR) != NULL) continue;
+    const struct mach_header *header = _dyld_get_image_header(i);
+    if (header == NULL) continue;
+    NSSymbol sym = NSLookupSymbolInImage(header, mangled,
+      NSLOOKUPSYMBOLINIMAGE_OPTION_BIND |
+      NSLOOKUPSYMBOLINIMAGE_OPTION_RETURN_ON_ERROR);
+    if (sym) {
+      void *ptr = NSAddressOfSymbol(sym);
+      if (ptr && !repro_bodypatch_addr_in_shim(ptr)) return ptr;
+    }
+  }
+  return NULL;
+}
+
 /*
  * Idempotency registry of already-patched target VAs. The shim installs all
  * patches in the constructor, single-threaded, before any other thread can be
@@ -210,9 +245,13 @@ int repro_macos_bodypatch_install(void *target, void *hook) {
 void repro_macos_bodypatch_install_named(const char *name, void *hook,
                                           int *installed, int *failed,
                                           int *absent) {
-  void *target = dlsym(RTLD_DEFAULT, name);
+  void *target = repro_bodypatch_resolve_libsystem(name);
   if (target == NULL) {
     if (absent) (*absent)++;
+    return;
+  }
+  if (repro_bodypatch_addr_in_shim(target)) {
+    if (failed) (*failed)++;
     return;
   }
   int rc = repro_macos_bodypatch_install(target, hook);
@@ -361,9 +400,13 @@ void repro_macos_bodypatch_install_named_tramp(const char *name, void *hook,
                                                int *installed, int *failed,
                                                int *absent) {
   if (out_trampoline) *out_trampoline = NULL;
-  void *target = dlsym(RTLD_DEFAULT, name);
+  void *target = repro_bodypatch_resolve_libsystem(name);
   if (target == NULL) {
     if (absent) (*absent)++;
+    return;
+  }
+  if (repro_bodypatch_addr_in_shim(target)) {
+    if (failed) (*failed)++;
     return;
   }
   int terr = 0;
@@ -396,9 +439,13 @@ proc reproMacosBodypatchInstall*(target, hook: pointer): cint
 proc reproMacosBodypatchInstallNamed*(name: cstring; hook: pointer;
     installed, failed, absent: ptr cint)
     {.importc: "repro_macos_bodypatch_install_named", cdecl.}
-  ## Resolve `name` via ``dlsym(RTLD_DEFAULT, ...)`` and body-patch it. NULL
-  ## symbols are counted as absent and skipped. Counters are incremented
-  ## through the supplied pointers.
+  ## Resolve `name` to the REAL libsystem symbol — walking the dyld images and
+  ## SKIPPING the shim's own image so the shim's ``__DATA,__interpose`` wrappers
+  ## are never returned (``dlsym`` would return ``repro_wrap_<name>`` here, whose
+  ## body-patch would corrupt the shim's own code) — then body-patch it. Symbols
+  ## that no non-shim image exports are counted absent and skipped; a target that
+  ## still resolves into the shim image is refused (counted failed). Counters are
+  ## incremented through the supplied pointers.
 
 proc reproMacosBodypatchBuildTrampoline*(target: pointer; err: ptr cint): pointer
     {.importc: "repro_macos_bodypatch_build_trampoline", cdecl.}
@@ -413,7 +460,11 @@ proc reproMacosBodypatchBuildTrampoline*(target: pointer; err: ptr cint): pointe
 proc reproMacosBodypatchInstallNamedTramp*(name: cstring; hook: pointer;
     outTrampoline: ptr pointer; installed, failed, absent: ptr cint)
     {.importc: "repro_macos_bodypatch_install_named_tramp", cdecl.}
-  ## Resolve ``name``, build its trampoline, then body-patch it to ``hook``,
+  ## Resolve ``name`` to the REAL libsystem symbol (skipping the shim's own image
+  ## so the shim's interpose wrappers are not returned — ``dlsym`` would return
+  ## ``repro_wrap_posix_spawn``, whose ``ADRP`` prologue is non-relocatable so the
+  ## trampoline would be skipped AND the patch would corrupt the shim), build its
+  ## trampoline, then body-patch it to ``hook``,
   ## storing the trampoline through ``outTrampoline`` so the hook can forward
   ## into the original wrapper body (needed for ``posix_spawn``, whose private
   ## ``_posix_spawn_args_desc`` marshalling must run). Absent symbols are

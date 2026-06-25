@@ -111,6 +111,27 @@ int repro_macos_real_access_syscall(char *path, int mode) {
   return (int)syscall(SYS_access, path, mode);
 }
 
+/*
+ * Raw-syscall rename/renameat forwarders for BOTH backends.
+ *
+ * gnulib's atomic-write idiom (`chmod a-w $@t; mv $@t $@`) issues a rename(2) to
+ * move a freshly-written temp file onto its final output path. Monitoring rename
+ * lets the §16.7.8 closure record the output move; the forward MUST reach the
+ * kernel directly (not via the named `rename`/`renameat` symbol or dlsym, which
+ * the body-patch backend may have replaced — that would re-enter the hook).
+ *
+ * Darwin exposes the modern rename via SYS_rename / SYS_renameat; renaming is a
+ * thin syscall wrapper (unlike posix_spawn), so a raw syscall is faithful.
+ */
+int repro_macos_real_rename_syscall(char *from, char *to) {
+  return (int)syscall(SYS_rename, from, to);
+}
+
+int repro_macos_real_renameat_syscall(int fromfd, char *from, int tofd,
+                                      char *to) {
+  return (int)syscall(SYS_renameat, fromfd, from, tofd, to);
+}
+
 int repro_macos_path_is_dir(char *path) {
   struct stat st;
 #ifdef SYS_stat64
@@ -195,12 +216,17 @@ int repro_macos_real_execve_syscall(char *path, char **argv, char **envp) {
  * the trap inline and apply the SAME x1-based child rewrite the libc wrapper
  * does, so the child correctly sees 0.
  *
- * The bare kernel fork still SKIPS libsystem's userland fork bookkeeping
- * (atfork handlers, malloc-lock reset). That is acceptable here for the same
- * reasons as before: this forwarder is only reached for shared-cache-INTERNAL
- * fork callers interpose misses, its job is to RECORD the spawn (the child
- * inherits the already-loaded shim + env, so no propagation is needed), and the
- * dominant internal use is fork()+exec() where the child execs promptly.
+ * IMPORTANT: the bare kernel fork SKIPS libsystem's userland fork bookkeeping
+ * (pthread_atfork handlers, and — critically — libsystem_malloc's fork child
+ * handler that resets the allocator across the fork). On macOS 26 / Apple
+ * Silicon that left fork CHILDREN with an inconsistent xzone allocator, crashing
+ * them with a `brk` SIGTRAP on their first `malloc` (it broke monitored gnulib
+ * `make` subshells). The fork HOOK therefore NO LONGER uses this raw forwarder
+ * for its normal path: it forwards into the libsystem fork BODY via a trampoline
+ * (repro_macos_bodypatch_call_fork) so the malloc/atfork handlers run. This raw
+ * forwarder is retained only as a last-resort fallback (and as a reusable,
+ * documented entry point that captures the Darwin fork x1-child ABI); it must
+ * NOT be used where a child will allocate before exec.
  *
  * Darwin/arm64 BSD syscall ABI: trap number in x16, `svc #0x80`; carry flag set
  * on error (errno in x0). For fork the child indicator is x1.
@@ -246,9 +272,27 @@ static repro_macos_stat_fn repro_macos_real_stat_ptr = NULL;
 static repro_macos_stat_fn repro_macos_real_lstat_ptr = NULL;
 static repro_macos_fork_fn repro_macos_real_fork_ptr = NULL;
 
+/*
+ * Resolve `symbol` (the mangled "_name" form) to a REAL libsystem address,
+ * SKIPPING the shim's own image. This matters under the body-patch (`both`)
+ * backend: the shim installs __DATA,__interpose tuples that dyld applies
+ * globally, so a plain per-image walk that included the shim — or a dlsym() —
+ * would resolve the shim's own `repro_wrap_<name>` wrapper. The by-name `real`
+ * forwarders below are used as the re-entry-FREE fallback for the spawn family
+ * (see macos_interpose.nim `inSpawnForward`); if they resolved back to the
+ * wrapper they would re-enter the hook and loop. Skipping the shim image
+ * guarantees the forwarder reaches the genuine libsystem entry. (The shim image
+ * is identified by the librepro_monitor_shim substring in its dyld path; see the
+ * body-patch resolver for the matching rationale.)
+ */
+static int repro_macos_image_is_shim(const char *path) {
+  return path != NULL && strstr(path, "librepro_monitor_shim") != NULL;
+}
+
 static void *repro_macos_lookup_image_symbol(const char *symbol) {
   uint32_t count = _dyld_image_count();
   for (uint32_t i = 0; i < count; i++) {
+    if (repro_macos_image_is_shim(_dyld_get_image_name(i))) continue;
     const struct mach_header *header = _dyld_get_image_header(i);
     if (header == NULL) continue;
     NSSymbol sym = NSLookupSymbolInImage(header, symbol,
@@ -256,7 +300,12 @@ static void *repro_macos_lookup_image_symbol(const char *symbol) {
       NSLOOKUPSYMBOLINIMAGE_OPTION_RETURN_ON_ERROR);
     if (sym) {
       void *ptr = NSAddressOfSymbol(sym);
-      if (ptr) return ptr;
+      if (ptr) {
+        /* Defensive: never return an address inside the shim image. */
+        Dl_info di;
+        if (dladdr(ptr, &di) && repro_macos_image_is_shim(di.dli_fname)) continue;
+        return ptr;
+      }
     }
   }
   return NULL;
@@ -268,14 +317,11 @@ static void repro_macos_resolve_spawn(void) {
     (repro_macos_posix_spawn_fn)repro_macos_lookup_image_symbol("_posix_spawn");
   repro_macos_real_posix_spawnp_ptr =
     (repro_macos_posix_spawn_fn)repro_macos_lookup_image_symbol("_posix_spawnp");
-  if (!repro_macos_real_posix_spawn_ptr) {
-    repro_macos_real_posix_spawn_ptr =
-      (repro_macos_posix_spawn_fn)dlsym(RTLD_DEFAULT, "posix_spawn");
-  }
-  if (!repro_macos_real_posix_spawnp_ptr) {
-    repro_macos_real_posix_spawnp_ptr =
-      (repro_macos_posix_spawn_fn)dlsym(RTLD_DEFAULT, "posix_spawnp");
-  }
+  /* NOTE: deliberately NO dlsym(RTLD_DEFAULT, ...) fallback. Under the body-patch
+   * backend dlsym resolves the shim's OWN `repro_wrap_posix_spawn` wrapper (dyld
+   * applies the shim's __interpose tuples to its own lookups), so a dlsym
+   * fallback would make this "real" forwarder re-enter the hook and loop. The
+   * shim-skipping image walk above is the only correct resolution. */
 }
 
 static void repro_macos_resolve_dir(void) {
@@ -302,12 +348,8 @@ static void repro_macos_resolve_stat(void) {
     repro_macos_real_lstat_ptr =
       (repro_macos_stat_fn)repro_macos_lookup_image_symbol("_lstat");
   }
-  if (!repro_macos_real_stat_ptr) {
-    repro_macos_real_stat_ptr = (repro_macos_stat_fn)dlsym(RTLD_DEFAULT, "stat");
-  }
-  if (!repro_macos_real_lstat_ptr) {
-    repro_macos_real_lstat_ptr = (repro_macos_stat_fn)dlsym(RTLD_DEFAULT, "lstat");
-  }
+  /* No dlsym(RTLD_DEFAULT) fallback: it would resolve the shim's own stat/lstat
+   * interpose wrapper under the body-patch backend (see repro_macos_resolve_spawn). */
 }
 
 static void repro_macos_resolve_fork(void) {
@@ -315,9 +357,8 @@ static void repro_macos_resolve_fork(void) {
     repro_macos_real_fork_ptr =
       (repro_macos_fork_fn)repro_macos_lookup_image_symbol("_fork");
   }
-  if (!repro_macos_real_fork_ptr) {
-    repro_macos_real_fork_ptr = (repro_macos_fork_fn)dlsym(RTLD_DEFAULT, "fork");
-  }
+  /* No dlsym(RTLD_DEFAULT) fallback: it would resolve the shim's own fork
+   * interpose wrapper under the body-patch backend (see repro_macos_resolve_spawn). */
 }
 
 void *repro_macos_real_opendir(char *path) {
@@ -385,6 +426,52 @@ int repro_macos_real_posix_spawnp(pid_t *pid, char *path, void *file_actions,
   return repro_macos_real_posix_spawnp_ptr(pid, effective_path,
     (const posix_spawn_file_actions_t *)file_actions,
     (const posix_spawnattr_t *)attrp, argv, effective_envp);
+}
+
+/*
+ * Forward into the ORIGINAL libsystem `fork` via a TRAMPOLINE (built by
+ * macos_bodypatch). This is the CORRECT body-patch fork forwarder — it runs
+ * libsystem's own `fork()` wrapper body, which executes the registered
+ * `pthread_atfork` handlers AND, critically, libsystem_malloc's
+ * `_malloc_fork_prepare`/`_malloc_fork_parent`/`_malloc_fork_child` hooks that
+ * reset the allocator's internal locks/zone state across the fork.
+ *
+ * WHY THIS REPLACES THE RAW `SYS_fork` FORWARDER: the bare-kernel fork above
+ * SKIPS that userland bookkeeping. On macOS 26 / Apple Silicon the modern
+ * `libsystem_malloc` "xzone" allocator keeps deferred-reclaim state that, when
+ * inherited by a fork CHILD without the malloc child-handler running, leaves the
+ * child's freelist inconsistent — the child's first `malloc` then hits an
+ * internal consistency `brk #0x1` (SIGTRAP) in `_xzm_*`. Empirically this
+ * crashed `bash`/`sh` subshells (command substitution, simple-command exec)
+ * during a monitored gnulib `make`, breaking the build. Forwarding through the
+ * libsystem fork body (trampoline) runs the malloc atfork child handler, so the
+ * child's allocator is consistent and the crash is eliminated. The libsystem
+ * wrapper also applies the correct x1-based child-return rewrite, so we no
+ * longer need the hand-rolled `svc` sequence for the body-patch path.
+ *
+ * `tramp` has the exact `pid_t fork(void)` ABI (the trampoline runs fork's
+ * displaced, relocatable prologue then resumes into its body). Returns the
+ * libsystem fork result (0 in the child, child pid in the parent, -1 on error).
+ */
+pid_t repro_macos_bodypatch_call_fork(void *tramp) {
+  if (tramp == NULL) {
+    /* No trampoline. Two cases:
+     *  - interpose-only backend: the named `fork` entry is NOT body-patched, so
+     *    the by-name real (resolved to the genuine libsystem fork via the
+     *    shim-skipping image walk) runs libsystem's full fork bookkeeping AND is
+     *    re-entry-free. This is the correct, malloc-safe path there.
+     *  - body-patch backend but the fork trampoline build was skipped: calling
+     *    by-name would re-enter the patched entry, so we must NOT; we fall back
+     *    to the raw syscall (degraded — lacks the malloc atfork reset — but the
+     *    only re-entry-free option, and the banner reports fork_tramp=skip).
+     * We cannot tell the two apart here, so the SHIM passes a nil trampoline only
+     * in the interpose-only case (it sets the trampoline whenever the body-patch
+     * backend is active); thus reaching here with tramp==NULL means interpose-
+     * only, where by-name is correct and safe. */
+    return repro_macos_real_fork();
+  }
+  repro_macos_fork_fn fn = (repro_macos_fork_fn)tramp;
+  return fn();
 }
 
 /*
@@ -531,14 +618,44 @@ proc ct_macos_bodypatch_real_access*(path: cstring; mode: cint): cint =
     {.importc: "repro_macos_real_access_syscall", cdecl.}
   realAccess(path, mode)
 
+proc ct_macos_real_rename*(fromPath, toPath: cstring): cint =
+  ## Raw `SYS_rename` forwarder shared by the interpose + body-patch rename hook.
+  ## Bypasses the named symbol so it never re-enters a body-patched `rename`.
+  proc realRename(fromPath, toPath: cstring): cint
+    {.importc: "repro_macos_real_rename_syscall", cdecl.}
+  realRename(fromPath, toPath)
+
+proc ct_macos_real_renameat*(fromfd: cint; fromPath: cstring; tofd: cint;
+    toPath: cstring): cint =
+  ## Raw `SYS_renameat` forwarder shared by the interpose + body-patch hook.
+  proc realRenameat(fromfd: cint; fromPath: cstring; tofd: cint;
+      toPath: cstring): cint
+    {.importc: "repro_macos_real_renameat_syscall", cdecl.}
+  realRenameat(fromfd, fromPath, tofd, toPath)
+
 # Spawn-family forwarders used ONLY by the body-patch backend. The body-patch
 # backend patches the named fork/posix_spawn symbols, so it must bypass them
 # when forwarding (see the C source for why named/dlsym would recurse).
 
 proc ct_macos_bodypatch_real_fork*(): PidT =
   ## Raw `SYS_fork` forwarder (no userland atfork bookkeeping — see the C doc).
+  ## DEPRECATED for the fork hook's normal path: use ct_macos_bodypatch_call_fork
+  ## with the fork trampoline so libsystem's malloc atfork handlers run. Kept as
+  ## the trampoline-unavailable fallback only.
   proc realForkSyscall(): PidT {.importc: "repro_macos_real_fork_syscall", cdecl.}
   realForkSyscall()
+
+proc ct_macos_bodypatch_call_fork*(tramp: pointer): PidT =
+  ## Forward into the ORIGINAL libsystem `fork` via the trampoline `tramp`, so
+  ## libsystem's `pthread_atfork` + malloc fork handlers run (resetting the
+  ## allocator across the fork). This is the body-patch fork hook's correct
+  ## forward path — the raw `SYS_fork` forwarder skipped that bookkeeping and
+  ## crashed fork children in libsystem_malloc (`brk` SIGTRAP) on macOS 26. If
+  ## `tramp` is nil the C helper falls back to the raw syscall. Returns 0 in the
+  ## child, the child pid in the parent, -1 on error.
+  proc callFork(tramp: pointer): PidT
+    {.importc: "repro_macos_bodypatch_call_fork", cdecl.}
+  callFork(tramp)
 
 proc ct_macos_bodypatch_spawn_rewrite*(path: cstring; envp: cstringArray;
     outEnvp: ptr cstringArray): cstring =

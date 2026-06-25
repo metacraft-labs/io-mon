@@ -580,7 +580,18 @@ proc mergeFragments*(fragmentDir, outputPath: string): MonitorDepFile =
   if dirExists(extendedPath(fragmentDir)):
     for kind, path in walkDir(extendedPath(fragmentDir)):
       if kind == pcFile and path.endsWith(".rmdf-frag"):
-        records.add readFragmentRecordsTolerant(path)
+        # TOCTOU tolerance: a monitored build spawns many short-lived children,
+        # each writing its own .rmdf-frag. A producer can remove/rotate its
+        # fragment (or its whole per-process fragment dir) between this walkDir
+        # enumeration and the read below — `readFile` then raises IOError
+        # ("cannot open"). A vanished fragment carries no recoverable records, so
+        # skip it rather than abort the WHOLE merge (which would fail the entire
+        # monitored run on a benign cleanup race). OSError covers a directory
+        # entry that disappeared underneath the walk.
+        try:
+          records.add readFragmentRecordsTolerant(path)
+        except IOError, OSError:
+          discard
   records.add profileRecords(defaultHooksMonitorProfile(
     MacosMonitorShimTaxonomyCapabilities))
 

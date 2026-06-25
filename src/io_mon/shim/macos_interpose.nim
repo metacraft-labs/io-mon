@@ -1,7 +1,7 @@
 when not defined(macosx):
   {.error: "repro_monitor_shim/macos_interpose is macOS-only".}
 
-import std/[locks, os, tables]
+import std/[locks, os, strutils, tables]
 from io_mon/paths import extendedPath
 
 import io_mon/hooks/macos_interpose_runtime
@@ -16,6 +16,7 @@ import io_mon/writer
 #include <fcntl.h>
 #include <spawn.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -209,6 +210,32 @@ proc recordSpawn(childPid: PidT; callResult: cint; path: cstring; detail: string
     record.detail = detail
   emitRecord(record)
 
+proc recordRename(callResult: cint; fromPath, toPath: cstring; detail: string) {.raises: [].} =
+  ## Record a rename(2)/renameat(2) as an OUTPUT WRITE on the DESTINATION path.
+  ##
+  ## A rename is an output move: the build's atomic-write idiom
+  ## (`chmod a-w $@t; mv $@t $@`, ubiquitous in gnulib/autotools makefiles) writes
+  ## a temp file then rename(2)s it onto the final output path. For the §16.7.8
+  ## coverage closure the dependency that matters is the DESTINATION (the output
+  ## that materialises), so — consistent with the existing write/output handling
+  ## (recordOpen's moFileWrite, repro_hook_write) — we classify it as an
+  ## moFileWrite on the destination. The source temp path is preserved in `detail`
+  ## for provenance (a rename also removes the source, but the source is a
+  ## throwaway temp the build just created, so the destination write is the
+  ## coverage-relevant fact). `result` carries the call outcome (only a
+  ## successful rename, result == 0, actually materialises the destination).
+  var record = baseRecord(mrFileWrite, moFileWrite)
+  record.result = callResult.int64
+  if toPath != nil:
+    record.path = $toPath
+  var d = detail
+  if fromPath != nil:
+    if d.len > 0: d.add ' '
+    d.add "from=" & $fromPath
+  if d.len > 0:
+    record.detail = d
+  emitRecord(record)
+
 proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
   if not locksReady:
     initLock(initLockVar)
@@ -392,6 +419,37 @@ proc repro_hook_access*(path: cstring; mode: cint): cint
   recordPathProbe(result, path, mode, "")
   setErrno(savedErrno)
 
+# --- Unified rename-family hooks (interpose + body-patch share ONE hook) ---
+#
+# gnulib/autotools makefiles materialise outputs atomically via the
+# `chmod a-w $@t; mv $@t $@` idiom (e.g. lib/configmake.h, version.c) — an
+# mv that issues rename(2)/renameat(2). Monitoring rename closes the §16.7.8
+# coverage envelope for these output moves AND ensures the body-patch backend
+# does not BREAK the move (the keystone failure was the body-patch corrupting
+# subprocesses during exactly such a make). As with the stat family, each hook
+# forwards to the kernel via the RAW rename/renameat syscall
+# (ct_macos_real_rename*), NOT the named symbol, so a single rename records
+# EXACTLY ONCE on every backend and never re-enters the (possibly patched) entry.
+
+proc repro_hook_rename*(fromPath, toPath: cstring): cint
+    {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_rename(fromPath, toPath)
+  result = ct_macos_real_rename(fromPath, toPath)
+  let savedErrno = getErrno()
+  recordRename(result, fromPath, toPath, "rename")
+  setErrno(savedErrno)
+
+proc repro_hook_renameat*(fromfd: cint; fromPath: cstring; tofd: cint;
+    toPath: cstring): cint {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_renameat(fromfd, fromPath, tofd, toPath)
+  result = ct_macos_real_renameat(fromfd, fromPath, tofd, toPath)
+  let savedErrno = getErrno()
+  recordRename(result, fromPath, toPath,
+    "renameat fromfd=" & $fromfd & " tofd=" & $tofd)
+  setErrno(savedErrno)
+
 # --- Unified spawn-family hooks ------------------------------------------
 #
 # There is exactly ONE hook per spawn-family call, used by BOTH the static
@@ -459,15 +517,31 @@ proc repro_hook_execve*(path: cstring; argv, envp: cstringArray): cint
   discard repro_monitor_shim_flush()
   result = ct_macos_interpose_real_execve(path, argv, envp)
 
+var bodypatchForkTramp: pointer = nil
+  ## Trampoline into the ORIGINAL libsystem `fork` body (set at install time,
+  ## before the entry is patched). The fork hook forwards through this so
+  ## libsystem's `pthread_atfork` + malloc fork handlers run — WITHOUT it, a raw
+  ## `SYS_fork` leaves the child's libsystem_malloc state inconsistent and the
+  ## child SIGTRAPs (`brk`) on its first allocation (observed crashing bash/sh
+  ## subshells during a monitored gnulib make on macOS 26). nil ⇒ the trampoline
+  ## build was skipped (the C forwarder then falls back to the raw syscall) OR the
+  ## body-patch backend is not installed (interpose-only — the named entry is NOT
+  ## patched, so the by-name real is re-entry-free).
+
 proc repro_hook_fork*(): PidT {.exportc, cdecl, dynlib.} =
-  ## Unified fork hook (interpose + body-patch). Forward via raw `SYS_fork`,
-  ## recording the spawn in the parent. The raw syscall bypasses the possibly
-  ## body-patched named `fork` entry, so there is no re-entry under `both`. A
-  ## fork child inherits the already-loaded shim + env, so NO propagation is
-  ## needed — only recording (spec §16.7.8 process-tree accounting).
+  ## Unified fork hook (interpose + body-patch). Forward through the fork
+  ## TRAMPOLINE into libsystem's own `fork` body so its `pthread_atfork` + malloc
+  ## fork handlers run (resetting the allocator across the fork); the raw
+  ## `SYS_fork` forwarder previously skipped that and crashed fork children in
+  ## libsystem_malloc. The trampoline bypasses the (possibly body-patched) named
+  ## `fork` entry, so there is no re-entry under `both`. A fork child inherits the
+  ## already-loaded shim + env, so NO propagation is needed — only recording
+  ## (spec §16.7.8 process-tree accounting). When no trampoline was built
+  ## (interpose-only, or the build was skipped) the C forwarder falls back to a
+  ## re-entry-free path (the named entry is not patched there).
   if not initialized or disabled > 0:
-    return ct_macos_bodypatch_real_fork()
-  result = ct_macos_bodypatch_real_fork()
+    return ct_macos_bodypatch_call_fork(bodypatchForkTramp)
+  result = ct_macos_bodypatch_call_fork(bodypatchForkTramp)
   if result > 0:
     recordSpawn(result, result, nil, "fork")
   elif result == 0:
@@ -678,20 +752,49 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
     BodypatchHookSpec(
       names: @["access"],
       hook: cast[pointer](repro_hook_access)),
-    # Spawn family (spec §16.7.8): fork + execve forward via raw syscall (no
-    # trampoline needed); they are installed with the plain installer below.
-    # posix_spawn / posix_spawnp need a TRAMPOLINE (handled separately).
+    # rename / renameat: the gnulib/autotools atomic-output move
+    # (`chmod a-w $@t; mv $@t $@`). These are thin syscall wrappers, so — like
+    # open/read/stat — the hook forwards via the RAW rename/renameat syscall and
+    # the PLAIN installer (no trampoline, no prologue copy) suffices. The plain
+    # body patch overwrites the entry's first 16 bytes with the branch stub and
+    # never needs a relocatable prologue, so rename/renameat ARE fully
+    # body-patched (catching shared-cache-internal callers too), unlike the spawn
+    # family whose trampoline DOES need relocatability.
     BodypatchHookSpec(
-      names: @["fork"],
-      hook: cast[pointer](repro_hook_fork)),
+      names: @["rename"],
+      hook: cast[pointer](repro_hook_rename)),
+    BodypatchHookSpec(
+      names: @["renameat"],
+      hook: cast[pointer](repro_hook_renameat)),
+    # Spawn family (spec §16.7.8): execve forwards via raw `SYS_execve` (it
+    # replaces the process image and never returns on success, so no trampoline
+    # and no malloc-fork concern); installed with the plain installer below.
+    # `fork` is NOT installed here — it needs a TRAMPOLINE into the libsystem fork
+    # body so the malloc/atfork handlers run (a raw `SYS_fork` left the child's
+    # libsystem_malloc state inconsistent → `brk` SIGTRAP in fork children, which
+    # broke a monitored gnulib make). fork is installed via the trampoline
+    # installer below, alongside posix_spawn / posix_spawnp.
     BodypatchHookSpec(
       names: @["execve"],
       hook: cast[pointer](repro_hook_execve)),
   ]
 
+  # Diagnostic gate: IO_MON_DEBUG_SKIP is a comma-separated list of body-patch
+  # target names to SKIP installing (e.g. "posix_spawn,posix_spawnp,fork"). It
+  # exists for root-causing host-specific body-patch faults; an empty/unset value
+  # installs everything. It never relaxes safety (skipping only REDUCES capture,
+  # which degrades to a fail-safe re-run, never a false skip).
+  var debugSkip = ""
+  withShimMuted:
+    debugSkip = getEnv("IO_MON_DEBUG_SKIP", "")
+  proc skipped(name: string): bool =
+    debugSkip.len > 0 and (name in debugSkip.split(','))
+
   var installed, failed, absent: cint = 0
   for spec in specs:
     for name in spec.names:
+      if skipped(name):
+        continue
       reproMacosBodypatchInstallNamed(cstring(name), spec.hook,
         addr installed, addr failed, addr absent)
 
@@ -703,15 +806,28 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
   # stays nil, the hook falls back to the by-name forwarder, and the fail-safe
   # re-runs any unmonitored subtree). $NOCANCEL/`__` variants do not exist for
   # posix_spawn, so we patch just the two named entry points.
-  reproMacosBodypatchInstallNamedTramp(cstring("posix_spawn"),
-    cast[pointer](repro_hook_posix_spawn), addr bodypatchPosixSpawnTramp,
-    addr installed, addr failed, addr absent)
-  reproMacosBodypatchInstallNamedTramp(cstring("posix_spawnp"),
-    cast[pointer](repro_hook_posix_spawnp), addr bodypatchPosixSpawnpTramp,
-    addr installed, addr failed, addr absent)
+  # fork: TRAMPOLINE install. The fork hook MUST forward into the libsystem fork
+  # body (via the trampoline) so the malloc/atfork child handlers run; a raw
+  # `SYS_fork` corrupted the child allocator and crashed fork children. The fork
+  # prologue (`pacibsp; stp; stp; add`) is relocatable, so the trampoline builds;
+  # if it ever could not, fork is left interpose-only (the hook then forwards via
+  # the re-entry-free by-name real) — a safe degradation.
+  if not skipped("fork"):
+    reproMacosBodypatchInstallNamedTramp(cstring("fork"),
+      cast[pointer](repro_hook_fork), addr bodypatchForkTramp,
+      addr installed, addr failed, addr absent)
+  if not skipped("posix_spawn"):
+    reproMacosBodypatchInstallNamedTramp(cstring("posix_spawn"),
+      cast[pointer](repro_hook_posix_spawn), addr bodypatchPosixSpawnTramp,
+      addr installed, addr failed, addr absent)
+  if not skipped("posix_spawnp"):
+    reproMacosBodypatchInstallNamedTramp(cstring("posix_spawnp"),
+      cast[pointer](repro_hook_posix_spawnp), addr bodypatchPosixSpawnpTramp,
+      addr installed, addr failed, addr absent)
 
   shimLogToStderr("io-mon: macOS body-patch installed=" & $installed &
     " failed=" & $failed & " absent=" & $absent &
+    " fork_tramp=" & (if bodypatchForkTramp != nil: "ok" else: "skip") &
     " spawn_tramp=" & (if bodypatchPosixSpawnTramp != nil: "ok" else: "skip") &
     " spawnp_tramp=" &
       (if bodypatchPosixSpawnpTramp != nil: "ok" else: "skip"))
@@ -833,6 +949,21 @@ static pid_t repro_wrap_fork(void) {
   return repro_hook_fork();
 }
 
+static int repro_wrap_rename(const char *from, const char *to) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_rename, from, to);
+  }
+  return repro_hook_rename((char *)from, (char *)to);
+}
+
+static int repro_wrap_renameat(int fromfd, const char *from, int tofd,
+                               const char *to) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_renameat, fromfd, from, tofd, to);
+  }
+  return repro_hook_renameat(fromfd, (char *)from, tofd, (char *)to);
+}
+
 static int repro_wrap_execve(const char *path, char *const argv[], char *const envp[]) {
   if (!repro_monitor_runtime_ready) {
     return (int)syscall(SYS_execve, path, argv, envp);
@@ -916,6 +1047,8 @@ static struct {
   { (const void *)repro_wrap_stat, (const void *)stat },
   { (const void *)repro_wrap_lstat, (const void *)lstat },
   { (const void *)repro_wrap_fork, (const void *)fork },
+  { (const void *)repro_wrap_rename, (const void *)rename },
+  { (const void *)repro_wrap_renameat, (const void *)renameat },
   { (const void *)repro_wrap_execve, (const void *)execve },
   { (const void *)repro_wrap_posix_spawn, (const void *)posix_spawn },
   { (const void *)repro_wrap_posix_spawnp, (const void *)posix_spawnp }
