@@ -15,13 +15,15 @@ const
     mcapBackendProvenance,
     mcapFileCreate,
     mcapFileTruncate,
-    mcapFileAppend
+    mcapFileAppend,
+    # rename/renameat are now hooked (interpose + body-patch) and recorded as an
+    # output write on the destination — the gnulib/autotools `mv $@t $@` move.
+    mcapRename
   }
 
   MacosInterposeKnownUnsupportedCapabilities* = {
     mcapEndpointSecurity,
     mcapHybrid,
-    mcapRename,
     mcapSymlink,
     mcapLibraryLoad,
     mcapAuthorizationEnforcement,
@@ -40,7 +42,8 @@ const
     mcapBackendProvenance,
     mcapFileCreate,
     mcapFileTruncate,
-    mcapFileAppend
+    mcapFileAppend,
+    mcapRename
   }
 
   LinuxPreloadSupportedCapabilities* = {
@@ -148,7 +151,11 @@ proc unsupportedReason(capability: MonitorCapability): string =
   of mcapHybrid:
     "hybrid EndpointSecurity plus interpose profile is not implemented in M14"
   of mcapRename:
-    "macOS interpose shim does not hook rename/renameat yet"
+    # rename/renameat ARE now hooked on macOS (interpose + body-patch); this
+    # branch is retained only for the Linux/other profiles that share this enum
+    # and have not yet wired rename, and as a defensive default.
+    "rename/renameat are hooked on the macOS interpose+body-patch shim; this " &
+      "reason applies only where rename is not yet advertised"
   of mcapSymlink:
     "macOS interpose shim does not hook symlink/symlinkat/readlink yet"
   of mcapLibraryLoad:
