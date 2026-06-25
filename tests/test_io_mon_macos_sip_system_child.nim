@@ -93,11 +93,31 @@ when defined(macosx):
     shim
 
   proc buildSandboxBundle(dest: string): string =
-    ## Build the self-contained NON-SIP drop-in bundle into ``dest`` and return
-    ## it. Uses a DEDICATED output dir (not the canonical ``build/sandbox-tools``)
-    ## so the test never clobbers a bundle the dev shell / .envrc points at.
-    ## Fails loudly if the build script errors; the CALLER decides whether the
-    ## produced bundle is usable and skips cleanly otherwise.
+    ## Resolve the NON-SIP drop-in bundle the SIP-child test redirects to.
+    ##
+    ## When ``IO_MON_TEST_SANDBOX_BUNDLE`` points at an existing bundle (a
+    ## ``<DIR>/bin/sh`` is present), that bundle is used AS-IS — this is how the
+    ## test runs against the REPROBUILD-BUILT-FROM-SOURCE bundle
+    ## (``reprobuild/recipes/sandbox-tools/bundle``, produced by
+    ## ``repro build recipes/sandbox-tools/<tool>`` + ``assemble-bundle.sh``),
+    ## proving the SIP redirect works with reprobuild-built tools rather than the
+    ## interim nix-symlink bundle. See
+    ## reprobuild-specs/Portable-Macos-Sandbox-Tools.milestones.org M3.
+    ##
+    ## Otherwise it builds the interim self-contained bundle into ``dest`` via
+    ## ``scripts/build-sandbox-tools.sh`` (a DEDICATED output dir, so the test
+    ## never clobbers a bundle the dev shell / .envrc points at). Fails loudly if
+    ## the build script errors; the CALLER decides whether the produced bundle is
+    ## usable and skips cleanly otherwise.
+    let provided = getEnv("IO_MON_TEST_SANDBOX_BUNDLE")
+    if provided.len > 0:
+      if not fileExists(provided / "bin" / "sh"):
+        raise newException(IOError,
+          "IO_MON_TEST_SANDBOX_BUNDLE=" & provided &
+          " does not contain bin/sh (build the reprobuild sandbox-tools bundle " &
+          "first: repro build recipes/sandbox-tools/{coreutils,bash} then " &
+          "recipes/sandbox-tools/assemble-bundle.sh)")
+      return provided
     var env = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): env[k] = v
     env["SANDBOX_TOOLS_OUT_DIR"] = dest
