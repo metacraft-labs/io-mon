@@ -29,3 +29,4 @@ tests/test_io_mon_t0_completeness
 tests/test_io_mon_macos_content_hooks
 tests/test_io_mon_macos_symlink
 tests/test_io_mon_macos_setexec
+tests/test_io_mon_macos_ipc_breakaway

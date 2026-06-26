@@ -23,7 +23,12 @@ const
     # canonical path (fcntl F_GETPATH) and a hooked lstat of a symlink resolves
     # its realpath target, so the REAL file behind a link/inode path is recorded
     # (findings doc break #7 / T2). Moved from unsupported.
-    mcapSymlink
+    mcapSymlink,
+    # T3a (Phase 2 / break #1): connect(2) is hooked (interpose + body-patch) and
+    # recorded with the peer pid, so the merge downgrades completeness when a
+    # monitored client talks to an out-of-tree breakaway daemon (sccache, distcc,
+    # gradle, tsserver, …) over a socket.
+    mcapIpcConnect
   }
 
   MacosInterposeKnownUnsupportedCapabilities* = {
@@ -48,7 +53,8 @@ const
     mcapFileTruncate,
     mcapFileAppend,
     mcapRename,
-    mcapSymlink
+    mcapSymlink,
+    mcapIpcConnect
   }
 
   LinuxPreloadSupportedCapabilities* = {
@@ -73,7 +79,10 @@ const
     mcapSymlink,
     mcapLibraryLoad,
     mcapAuthorizationEnforcement,
-    mcapPathMutation
+    mcapPathMutation,
+    # The Linux LD_PRELOAD shim does not yet hook connect(2); IPC-breakaway
+    # detection is currently a macOS-only capability.
+    mcapIpcConnect
   }
 
 proc backendFamilyId*(family: MonitorBackendFamily): string =
@@ -129,6 +138,8 @@ proc capabilityId*(capability: MonitorCapability): string =
     "authorization-enforcement"
   of mcapPathMutation:
     "path-mutation"
+  of mcapIpcConnect:
+    "ipc-connect"
 
 proc capabilityFromId*(value: string): MonitorCapability =
   for capability in MonitorCapability:
@@ -169,6 +180,12 @@ proc unsupportedReason(capability: MonitorCapability): string =
     "macOS interpose shim observes only and cannot authorize or deny operations"
   of mcapPathMutation:
     "macOS interpose shim does not cover the full mutation surface yet"
+  of mcapIpcConnect:
+    # connect(2) IS hooked on the macOS interpose+body-patch shim; this branch is
+    # retained only for profiles that share this enum and have not wired it, and
+    # as a defensive default.
+    "connect(2) is hooked on the macOS interpose+body-patch shim; this reason " &
+      "applies only where IPC-connect is not yet advertised"
   else:
     "capability is not advertised by the selected macOS interpose profile"
 
@@ -188,6 +205,8 @@ proc linuxUnsupportedReason(capability: MonitorCapability): string =
     "Linux preload shim observes only and cannot authorize or deny operations"
   of mcapPathMutation:
     "Linux preload shim does not cover the full mutation surface yet"
+  of mcapIpcConnect:
+    "Linux preload shim does not yet hook connect(2) for IPC-breakaway detection"
   else:
     "capability is not advertised by the selected Linux preload profile"
 
