@@ -10,13 +10,17 @@ import io_mon/types
 import io_mon/writer
 
 {.emit: """
+#include <copyfile.h>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <spawn.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <sys/attr.h>
+#include <sys/clonefile.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -315,6 +319,122 @@ proc repro_monitor_shim_enable_current_thread*() {.exportc, dynlib.} =
 proc repro_monitor_shim_version*(): cstring {.exportc, dynlib.} =
   "repro_monitor_shim_m11"
 
+# --- T2 content/metadata recording helpers (findings doc breaks #3/#5/#7) ---
+#
+# Each new hook family routes through ONE of these helpers, mirroring the
+# recordOpen/recordPathProbe/recordSpawn pattern (DRY: one record-builder per
+# record classification).
+
+proc recordContentCopy(callResult: cint; src, dst, detail: string) {.raises: [].} =
+  ## Classify a clonefile/link/copyfile-CLONE as a CONTENT (read) dependency on
+  ## the SOURCE plus an output WRITE on the DESTINATION. An APFS clonefile clone
+  ## reads ZERO source bytes (copy-on-write) and a hardlink merely aliases the
+  ## inode, so the call itself is the ONLY evidence the source content is a
+  ## dependency (findings doc break #3). Only a successful call (result == 0)
+  ## consumes the source / materialises the destination; the result is recorded
+  ## so the consumer can tell. Empty path components (e.g. an unmapped fd) are
+  ## skipped rather than recording a blank dependency.
+  if src.len > 0:
+    var rd = baseRecord(mrFileRead, moFileRead)
+    rd.path = src
+    rd.result = callResult.int64
+    if detail.len > 0: rd.detail = detail & " src"
+    emitRecord(rd)
+  if dst.len > 0:
+    var wr = baseRecord(mrFileWrite, moFileWrite)
+    wr.path = dst
+    wr.result = callResult.int64
+    if detail.len > 0: wr.detail = detail & " dst"
+    emitRecord(wr)
+
+proc recordDirEnumByFd(fd: cint; detail: string) {.raises: [].} =
+  ## Record a directory enumeration keyed on an OPEN dir fd (getattrlistbulk /
+  ## getdirentries). opendir/readdir are already hooked, but these bulk-scan a
+  ## dir via a plain open()ed fd with no readdir call; the dir open IS captured
+  ## (so pathForFd resolves the dir), and we add a directory-enumerate record to
+  ## match the opendir/readdir granularity. Per-child name extraction from the
+  ## packed attribute buffer is deferred (findings doc T2: "per-entry … partial").
+  let p = pathForFd(fd)
+  if p.len == 0:
+    return
+  var record = baseRecord(mrDirectoryEnumerate, moDirectoryEnumerate)
+  record.path = p
+  record.result = 1
+  record.detail = detail
+  emitRecord(record)
+
+proc recordCanonicalTarget(fd: cint; original: cstring) {.raises: [].} =
+  ## After a successful open, resolve the fd's canonical real path via
+  ## fcntl(F_GETPATH). When it differs from the caller-supplied path the open
+  ## traversed a SYMLINK or a /.vol/<dev>/<inode> firmlink (findings doc break #7,
+  ## mcapSymlink): record an ADDITIONAL file-open dependency on the resolved
+  ## target and re-point the fd→path map at it, so subsequent reads — and the
+  ## dependency set — name the REAL file, not the opaque link/inode path. fcntl is
+  ## not hooked (raw syscall), so this is reentrancy-free.
+  if fd < 0:
+    return
+  var buf: array[1024, char]
+  if ct_macos_fd_real_path(fd, addr buf[0], csize_t(buf.len)) == 0:
+    return
+  let canonical = $cast[cstring](addr buf[0])
+  if canonical.len == 0 or (original != nil and canonical == $original):
+    return
+  updateFdPath(fd, cstring(canonical))
+  var record = baseRecord(mrFileOpen, moFileOpen)
+  record.path = canonical
+  record.result = fd.int64
+  record.detail = "resolved-target"
+  emitRecord(record)
+
+proc recordCanonicalProbe(callResult: cint; path: cstring) {.raises: [].} =
+  ## For a successful lstat of a SYMLINK, ALSO record a path-probe on the
+  ## realpath-resolved target (findings doc break #7 / mcapSymlink): editing the
+  ## target while the link is unchanged must remain a visible dependency.
+  ## realpath's internal lstat calls are body-patched, so the canonicalisation is
+  ## done with the shim MUTED (disabled>0) to avoid recursion; the probe is then
+  ## emitted with the shim un-muted.
+  if callResult != 0 or path == nil:
+    return
+  var buf: array[1024, char]
+  var ok = false
+  withShimMuted:
+    ok = ct_macos_canonical_path(path, addr buf[0], csize_t(buf.len)) != 0
+  if not ok:
+    return
+  let canonical = $cast[cstring](addr buf[0])
+  if canonical.len == 0 or canonical == $path:
+    return
+  recordPathProbe(callResult, cstring(canonical), 0, "resolved-target")
+
+proc recordSetexecExec(attrp: pointer; path: cstring) {.raises: [].} =
+  ## If a posix_spawn(p) sets POSIX_SPAWN_SETEXEC it REPLACES the calling
+  ## process image and NEVER returns on success — so (mirroring repro_hook_execve
+  ## exactly) emit the exec record AND FLUSH it BEFORE the forward, else the
+  ## record dies with the old image's in-flight fragment batch and the launched
+  ## binary's dependency is lost (findings doc break #2). `childOsPid` is set to
+  ## this pid: a SETEXEC re-images THIS process, and T0's exec-coverage check
+  ## (writer.unmonitoredSubtreeLossCount) then downgrades completeness to a
+  ## conservative re-run if the new image is un-injectable (no post-exec
+  ## process-start), while an injectable child re-loads the shim and is captured.
+  if not ct_macos_spawnattr_has_setexec(attrp):
+    return
+  var record = baseRecord(mrProcessExec, moExecute)
+  if path != nil:
+    record.path = $path
+  record.childOsPid = uint64(c_getpid())
+  record.detail = "posix_spawn-setexec"
+  emitRecord(record)
+  discard repro_monitor_shim_flush()
+
+const
+  # copyfile(3) clone-mode flags (<copyfile.h>): these clone via the APFS CoW
+  # path and issue NO internal open/read on the source, so the source dependency
+  # is invisible unless recorded. The DATA/ALL data modes DO open+read
+  # internally (already captured), so we record only for the clone modes to avoid
+  # double-counting (findings doc §"Coverage wins").
+  CopyfileClone = 1'u32 shl 24
+  CopyfileCloneForce = 1'u32 shl 25
+
 proc repro_hook_open*(path: cstring; flags, mode: cint): cint {.exportc, cdecl, dynlib.} =
   if not initialized or disabled > 0:
     return ct_macos_interpose_real_open(path, flags, mode)
@@ -324,6 +444,11 @@ proc repro_hook_open*(path: cstring; flags, mode: cint): cint {.exportc, cdecl, 
   recordOpen(result, path, flags, "")
   if result >= 0:
     recordDirectoryEnumeration(path)
+    # Resolve symlink / .vol firmlink targets for read-ish opens only (an output
+    # create/write open of a fresh path has no target to resolve). One fcntl per
+    # read open; negligible next to the open itself.
+    if observationForOpen(flags) == moFileOpen:
+      recordCanonicalTarget(result, path)
   setErrno(savedErrno)
 
 proc repro_hook_openat*(dirfd: cint; path: cstring; flags, mode: cint): cint
@@ -336,6 +461,8 @@ proc repro_hook_openat*(dirfd: cint; path: cstring; flags, mode: cint): cint
   recordOpen(result, path, flags, "dirfd=" & $dirfd)
   if result >= 0:
     recordDirectoryEnumeration(path)
+    if observationForOpen(flags) == moFileOpen:
+      recordCanonicalTarget(result, path)
   setErrno(savedErrno)
 
 proc repro_hook_read*(fd: cint; buf: pointer; count: csize_t): int {.exportc, cdecl, dynlib.} =
@@ -435,6 +562,12 @@ proc repro_hook_lstat*(path: cstring; buf: pointer): cint {.exportc, cdecl, dynl
   result = ct_macos_bodypatch_real_lstat(path, buf)
   let savedErrno = getErrno()
   recordPathProbe(result, path, 0, "")
+  # If the lstat'd object IS a symlink, also record its resolved target so
+  # editing the target (while the link is unchanged) stays a visible dependency
+  # (findings doc break #7 / mcapSymlink). Gated on S_ISLNK so realpath is only
+  # paid for actual symlinks, never the stat-probe storm.
+  if result == 0 and ct_macos_stat_is_symlink(buf):
+    recordCanonicalProbe(result, path)
   setErrno(savedErrno)
 
 proc repro_hook_fstatat*(dirfd: cint; path: cstring; buf: pointer;
@@ -485,6 +618,137 @@ proc repro_hook_renameat*(fromfd: cint; fromPath: cstring; tofd: cint;
   recordRename(result, fromPath, toPath,
     "renameat fromfd=" & $fromfd & " tofd=" & $tofd)
   setErrno(savedErrno)
+
+# --- Unified clonefile / link / copyfile hooks (content dependency, #3) ---
+#
+# Each forwards via the body-patch-safe path (raw syscall for clonefile/link;
+# the resolved genuine libsystem entry for copyfile — copyfile is interpose-only
+# and never body-patched, see its forwarder doc) and classifies the SOURCE as a
+# content read + the DESTINATION as an output write.
+
+proc repro_hook_clonefile*(src, dst: cstring; flags: cint): cint
+    {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_clonefile(src, dst, flags)
+  result = ct_macos_real_clonefile(src, dst, flags)
+  let savedErrno = getErrno()
+  recordContentCopy(result, $src, $dst, "clonefile")
+  setErrno(savedErrno)
+
+proc repro_hook_clonefileat*(srcfd: cint; src: cstring; dstfd: cint;
+    dst: cstring; flags: cint): cint {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_clonefileat(srcfd, src, dstfd, dst, flags)
+  result = ct_macos_real_clonefileat(srcfd, src, dstfd, dst, flags)
+  let savedErrno = getErrno()
+  recordContentCopy(result, $src, $dst,
+    "clonefileat srcfd=" & $srcfd & " dstfd=" & $dstfd)
+  setErrno(savedErrno)
+
+proc repro_hook_fclonefileat*(srcfd, dstfd: cint; dst: cstring;
+    flags: cint): cint {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_fclonefileat(srcfd, dstfd, dst, flags)
+  result = ct_macos_real_fclonefileat(srcfd, dstfd, dst, flags)
+  let savedErrno = getErrno()
+  # The source is named only by fd; record its mapped path (empty ⇒ skipped).
+  recordContentCopy(result, pathForFd(srcfd), $dst, "fclonefileat srcfd=" & $srcfd)
+  setErrno(savedErrno)
+
+proc repro_hook_link*(src, dst: cstring): cint {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_link(src, dst)
+  result = ct_macos_real_link(src, dst)
+  let savedErrno = getErrno()
+  recordContentCopy(result, $src, $dst, "link")
+  setErrno(savedErrno)
+
+proc repro_hook_linkat*(fd1: cint; src: cstring; fd2: cint; dst: cstring;
+    flag: cint): cint {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_linkat(fd1, src, fd2, dst, flag)
+  result = ct_macos_real_linkat(fd1, src, fd2, dst, flag)
+  let savedErrno = getErrno()
+  recordContentCopy(result, $src, $dst, "linkat fd1=" & $fd1 & " fd2=" & $fd2)
+  setErrno(savedErrno)
+
+proc repro_hook_copyfile*(src, dst: cstring; state: pointer;
+    flags: uint32): cint {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_copyfile(src, dst, state, flags)
+  result = ct_macos_real_copyfile(src, dst, state, flags)
+  let savedErrno = getErrno()
+  if (flags and (CopyfileClone or CopyfileCloneForce)) != 0:
+    recordContentCopy(result, $src, $dst, "copyfile-clone")
+  setErrno(savedErrno)
+
+proc repro_hook_fcopyfile*(srcfd, dstfd: cint; state: pointer;
+    flags: uint32): cint {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_fcopyfile(srcfd, dstfd, state, flags)
+  result = ct_macos_real_fcopyfile(srcfd, dstfd, state, flags)
+  let savedErrno = getErrno()
+  if (flags and (CopyfileClone or CopyfileCloneForce)) != 0:
+    recordContentCopy(result, pathForFd(srcfd), pathForFd(dstfd),
+      "fcopyfile srcfd=" & $srcfd & " dstfd=" & $dstfd)
+  setErrno(savedErrno)
+
+# --- Unified getattrlist-family hooks (path-probe, break #5) -------------
+# getattrlist/getattrlistat/fgetattrlist are an existence+metadata probe with NO
+# stat record, so a tool that checks "does this exist / what is its mtime" via
+# them hides the dependency. Classify as a path-probe (like stat). Each forwards
+# via the RAW syscall, bypassing any body-patched named entry.
+
+proc repro_hook_getattrlist*(path: cstring; al, buf: pointer; size: csize_t;
+    opts: culong): cint {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_getattrlist(path, al, buf, size, opts)
+  result = ct_macos_real_getattrlist(path, al, buf, size, opts)
+  let savedErrno = getErrno()
+  recordPathProbe(result, path, 0, "getattrlist")
+  setErrno(savedErrno)
+
+proc repro_hook_getattrlistat*(fd: cint; path: cstring; al, buf: pointer;
+    size: csize_t; opts: culong): cint {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_getattrlistat(fd, path, al, buf, size, opts)
+  result = ct_macos_real_getattrlistat(fd, path, al, buf, size, opts)
+  let savedErrno = getErrno()
+  recordPathProbe(result, path, 0, "getattrlistat dirfd=" & $fd)
+  setErrno(savedErrno)
+
+proc repro_hook_fgetattrlist*(fd: cint; al, buf: pointer; size: csize_t;
+    opts: culong): cint {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_fgetattrlist(fd, al, buf, size, opts)
+  result = ct_macos_real_fgetattrlist(fd, al, buf, size, opts)
+  let savedErrno = getErrno()
+  let p = pathForFd(fd)
+  if p.len > 0:
+    recordPathProbe(result, cstring(p), 0, "fgetattrlist fd=" & $fd)
+  setErrno(savedErrno)
+
+# --- Per-entry directory enumeration (getattrlistbulk / getdirentries) ---
+# The libsystem-wrapper call sites are reachable; a program issuing the RAW
+# getdirentries64 syscall inline is the structurally-unfixable raw-syscall gap
+# (#6). Records the dir as enumerated (per-child parsing deferred — see
+# recordDirEnumByFd).
+
+proc repro_hook_getattrlistbulk*(dirfd: cint; al, buf: pointer; size: csize_t;
+    opts: uint64): cint {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_getattrlistbulk(dirfd, al, buf, size, opts)
+  result = ct_macos_real_getattrlistbulk(dirfd, al, buf, size, opts)
+  if result > 0:
+    recordDirEnumByFd(dirfd, "getattrlistbulk")
+
+proc repro_hook_getdirentries*(fd: cint; buf: pointer; nbytes: cint;
+    basep: ptr clong): cint {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_getdirentries(fd, buf, nbytes, basep)
+  result = ct_macos_real_getdirentries(fd, buf, nbytes, basep)
+  if result > 0:
+    recordDirEnumByFd(fd, "getdirentries")
 
 # --- Unified spawn-family hooks ------------------------------------------
 #
@@ -705,6 +969,9 @@ proc repro_hook_posix_spawn*(pid: ptr PidT; path: cstring;
     # `spawnForwardMuted` / `inSpawnForward`).
     return spawnForwardMuted(bodypatchPosixSpawnTramp, pid, path, fileActions,
       attrp, argv, envp, ct_macos_interpose_real_posix_spawn)
+  # A POSIX_SPAWN_SETEXEC spawn re-images THIS process and never returns on
+  # success — record + flush the exec BEFORE forwarding (break #2).
+  recordSetexecExec(attrp, path)
   let detail =
     if bodypatchPosixSpawnTramp != nil and inSpawnForward == 0:
       "bodypatch-posix_spawn"
@@ -723,6 +990,7 @@ proc repro_hook_posix_spawnp*(pid: ptr PidT; path: cstring;
     # (see `spawnForwardMuted` / `inSpawnForward`).
     return spawnForwardMuted(bodypatchPosixSpawnpTramp, pid, path, fileActions,
       attrp, argv, envp, ct_macos_interpose_real_posix_spawnp)
+  recordSetexecExec(attrp, path)
   let detail =
     if bodypatchPosixSpawnpTramp != nil and inSpawnForward == 0:
       "bodypatch-posix_spawnp"
@@ -931,6 +1199,45 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
     BodypatchHookSpec(
       names: @["execve"],
       hook: cast[pointer](repro_hook_execve)),
+    # T2 content/metadata hooks (findings doc breaks #3/#5/#7). Like the
+    # stat/rename family these are thin syscall wrappers, so the hook forwards
+    # via the RAW syscall and the PLAIN body patch (no trampoline) suffices —
+    # catching shared-cache-internal callers (e.g. ditto/cp internals) too. The
+    # body-patch branches directly to the recording repro_hook_* (each forwards
+    # via its raw-syscall forwarder, bypassing the patched entry). copyfile /
+    # fcopyfile are DELIBERATELY absent: copyfile(3) is not a thin syscall (no
+    # faithful raw forward), so it is interpose-only and forwards via the
+    # resolved genuine libsystem entry — see its forwarder doc.
+    BodypatchHookSpec(
+      names: @["clonefile"],
+      hook: cast[pointer](repro_hook_clonefile)),
+    BodypatchHookSpec(
+      names: @["clonefileat"],
+      hook: cast[pointer](repro_hook_clonefileat)),
+    BodypatchHookSpec(
+      names: @["fclonefileat"],
+      hook: cast[pointer](repro_hook_fclonefileat)),
+    BodypatchHookSpec(
+      names: @["link"],
+      hook: cast[pointer](repro_hook_link)),
+    BodypatchHookSpec(
+      names: @["linkat"],
+      hook: cast[pointer](repro_hook_linkat)),
+    BodypatchHookSpec(
+      names: @["getattrlist"],
+      hook: cast[pointer](repro_hook_getattrlist)),
+    BodypatchHookSpec(
+      names: @["getattrlistat"],
+      hook: cast[pointer](repro_hook_getattrlistat)),
+    BodypatchHookSpec(
+      names: @["fgetattrlist"],
+      hook: cast[pointer](repro_hook_fgetattrlist)),
+    BodypatchHookSpec(
+      names: @["getattrlistbulk"],
+      hook: cast[pointer](repro_hook_getattrlistbulk)),
+    BodypatchHookSpec(
+      names: @["getdirentries", "__getdirentries64"],
+      hook: cast[pointer](repro_hook_getdirentries)),
   ]
 
   # Diagnostic gate: IO_MON_DEBUG_SKIP is a comma-separated list of body-patch
@@ -1470,6 +1777,113 @@ static int repro_wrap_posix_spawnp(pid_t *pid, const char *path,
 }
 
 /*
+ * T2 content/metadata interpose thunks (findings doc breaks #3/#5/#7).
+ *
+ * These are the __DATA,__interpose replacements for the clonefile/link/copyfile/
+ * getattrlist families. They mirror the existing thunks' not-ready passthrough
+ * (forward to the kernel/genuine entry before the recording runtime is live)
+ * then branch to the recording repro_hook_*. UNLIKE the original thunks they do
+ * NOT carry the debug-only interpose-DISABLE forward (REPRO_INTERPOSE_FORWARD_*):
+ * that A/B knob attributes a capture to interpose-vs-body-patch, and these
+ * Phase-1 hardening hooks are exercised only under the default `both` and the
+ * `interpose` arms (where they correctly record via interpose). Omitting it
+ * keeps them simple and cannot weaken a production capture (both mechanisms are
+ * always on in release).
+ */
+static int repro_wrap_clonefile(const char *src, const char *dst, int flags) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_clonefileat, AT_FDCWD, src, AT_FDCWD, dst, flags);
+  }
+  return repro_hook_clonefile((char *)src, (char *)dst, flags);
+}
+
+static int repro_wrap_clonefileat(int srcfd, const char *src, int dstfd,
+                                  const char *dst, int flags) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_clonefileat, srcfd, src, dstfd, dst, flags);
+  }
+  return repro_hook_clonefileat(srcfd, (char *)src, dstfd, (char *)dst, flags);
+}
+
+static int repro_wrap_fclonefileat(int srcfd, int dstfd, const char *dst,
+                                   int flags) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_fclonefileat, srcfd, dstfd, dst, flags);
+  }
+  return repro_hook_fclonefileat(srcfd, dstfd, (char *)dst, flags);
+}
+
+static int repro_wrap_link(const char *src, const char *dst) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_link, src, dst);
+  }
+  return repro_hook_link((char *)src, (char *)dst);
+}
+
+static int repro_wrap_linkat(int fd1, const char *src, int fd2,
+                             const char *dst, int flag) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_linkat, fd1, src, fd2, dst, flag);
+  }
+  return repro_hook_linkat(fd1, (char *)src, fd2, (char *)dst, flag);
+}
+
+static int repro_wrap_copyfile(const char *from, const char *to,
+                               copyfile_state_t state, copyfile_flags_t flags) {
+  if (!repro_monitor_runtime_ready) {
+    int (*real)(const char *, const char *, copyfile_state_t, copyfile_flags_t)
+      = (int (*)(const char *, const char *, copyfile_state_t,
+                 copyfile_flags_t))dlsym(RTLD_NEXT, "copyfile");
+    return real ? real(from, to, state, flags) : -1;
+  }
+  return repro_hook_copyfile((char *)from, (char *)to, (void *)state,
+    (uint32_t)flags);
+}
+
+static int repro_wrap_fcopyfile(int from, int to, copyfile_state_t state,
+                                copyfile_flags_t flags) {
+  if (!repro_monitor_runtime_ready) {
+    int (*real)(int, int, copyfile_state_t, copyfile_flags_t)
+      = (int (*)(int, int, copyfile_state_t, copyfile_flags_t))
+          dlsym(RTLD_NEXT, "fcopyfile");
+    return real ? real(from, to, state, flags) : -1;
+  }
+  return repro_hook_fcopyfile(from, to, (void *)state, (uint32_t)flags);
+}
+
+static int repro_wrap_getattrlist(const char *path, void *al, void *buf,
+                                  size_t size, unsigned long opts) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_getattrlist, path, al, buf, size, opts);
+  }
+  return repro_hook_getattrlist((char *)path, al, buf, size, opts);
+}
+
+static int repro_wrap_getattrlistat(int fd, const char *path, void *al,
+                                    void *buf, size_t size, unsigned long opts) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_getattrlistat, fd, path, al, buf, size, opts);
+  }
+  return repro_hook_getattrlistat(fd, (char *)path, al, buf, size, opts);
+}
+
+static int repro_wrap_fgetattrlist(int fd, void *al, void *buf, size_t size,
+                                   unsigned long opts) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_fgetattrlist, fd, al, buf, size, opts);
+  }
+  return repro_hook_fgetattrlist(fd, al, buf, size, opts);
+}
+
+static int repro_wrap_getattrlistbulk(int dirfd, void *al, void *buf,
+                                      size_t size, uint64_t opts) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_getattrlistbulk, dirfd, al, buf, size, opts);
+  }
+  return repro_hook_getattrlistbulk(dirfd, al, buf, size, opts);
+}
+
+/*
  * Body-patch hook ADDRESS accessors for the VARIADIC open/openat wrappers.
  *
  * Why the body-patch backend MUST use the variadic repro_wrap_open(at) thunks --
@@ -1564,6 +1978,23 @@ static struct {
   { (const void *)repro_wrap_renameat, (const void *)renameat },
   { (const void *)repro_wrap_execve, (const void *)execve },
   { (const void *)repro_wrap_posix_spawn, (const void *)posix_spawn },
-  { (const void *)repro_wrap_posix_spawnp, (const void *)posix_spawnp }
+  { (const void *)repro_wrap_posix_spawnp, (const void *)posix_spawnp },
+  /* T2 content/metadata hooks (findings doc breaks #3/#5/#7). */
+  { (const void *)repro_wrap_clonefile, (const void *)clonefile },
+  { (const void *)repro_wrap_clonefileat, (const void *)clonefileat },
+  { (const void *)repro_wrap_fclonefileat, (const void *)fclonefileat },
+  { (const void *)repro_wrap_link, (const void *)link },
+  { (const void *)repro_wrap_linkat, (const void *)linkat },
+  { (const void *)repro_wrap_copyfile, (const void *)copyfile },
+  { (const void *)repro_wrap_fcopyfile, (const void *)fcopyfile },
+  { (const void *)repro_wrap_getattrlist, (const void *)getattrlist },
+  { (const void *)repro_wrap_getattrlistat, (const void *)getattrlistat },
+  { (const void *)repro_wrap_fgetattrlist, (const void *)fgetattrlist },
+  { (const void *)repro_wrap_getattrlistbulk, (const void *)getattrlistbulk }
+  /* getdirentries is intentionally NOT in the interpose tuple: the SDK header
+   * poisons the symbol under 64-bit inodes (`getdirentries_is_not_available…`),
+   * so it cannot be referenced here. It is body-patched by string name instead
+   * (see the BodypatchHookSpec list). The raw-syscall getdirentries call site is
+   * the structurally-unfixable #6 gap regardless. */
 };
 """.}

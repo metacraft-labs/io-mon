@@ -18,13 +18,17 @@ const
     mcapFileAppend,
     # rename/renameat are now hooked (interpose + body-patch) and recorded as an
     # output write on the destination — the gnulib/autotools `mv $@t $@` move.
-    mcapRename
+    mcapRename,
+    # symlink-target + /.vol firmlink resolution: a hooked open resolves the fd's
+    # canonical path (fcntl F_GETPATH) and a hooked lstat of a symlink resolves
+    # its realpath target, so the REAL file behind a link/inode path is recorded
+    # (findings doc break #7 / T2). Moved from unsupported.
+    mcapSymlink
   }
 
   MacosInterposeKnownUnsupportedCapabilities* = {
     mcapEndpointSecurity,
     mcapHybrid,
-    mcapSymlink,
     mcapLibraryLoad,
     mcapAuthorizationEnforcement,
     mcapPathMutation
@@ -43,7 +47,8 @@ const
     mcapFileCreate,
     mcapFileTruncate,
     mcapFileAppend,
-    mcapRename
+    mcapRename,
+    mcapSymlink
   }
 
   LinuxPreloadSupportedCapabilities* = {

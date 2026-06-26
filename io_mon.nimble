@@ -88,6 +88,26 @@ task test, "Run the io-mon test suite":
   # threaded-write capture-gap fix under both backends. macOS-only (no-op pass
   # elsewhere).
   exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_threaded_write.nim"
+  # T0 earned-completeness (adversarial hardening): unit coverage for the
+  # unmonitored-subtree downgrade algorithm on synthetic record sets (platform-
+  # independent; fast). An un-injected spawn child or an exec/SETEXEC into an
+  # un-injectable image yields one event-loss → mcIncomplete.
+  exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_t0_completeness.nim"
+  # macOS T2 content/metadata hooks (adversarial hardening #3/#5): a clonefile /
+  # hardlink / copyfile-CLONE source is recorded as a read, and a getattrlist
+  # existence probe as a path-probe — the CoW/metadata dependencies the open/read
+  # and stat hooks miss. macOS-only (no-op pass elsewhere).
+  exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_content_hooks.nim"
+  # macOS symlink + /.vol target resolution (adversarial hardening #7,
+  # mcapSymlink): a hooked open of a symlink / inode firmlink ALSO records the
+  # fcntl(F_GETPATH)-resolved real target. macOS-only (no-op pass elsewhere).
+  exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_symlink.nim"
+  # macOS POSIX_SPAWN_SETEXEC recording + env override (T1) and the earned-
+  # completeness downgrade (T0): a SETEXEC records+flushes its exec BEFORE the
+  # non-returning forward; an empty caller DYLD is overridden so the child is
+  # injected; a SETEXEC/spawn into an un-injectable image downgrades to
+  # mcIncomplete. macOS-only (no-op pass elsewhere).
+  exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_setexec.nim"
 
 task buildShim, "Build the io-mon interpose shim shared library":
   # Produces build/lib/librepro_monitor_shim.{dylib,so,dll} — the drop-in

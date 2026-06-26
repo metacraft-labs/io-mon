@@ -132,6 +132,129 @@ int repro_macos_real_renameat_syscall(int fromfd, char *from, int tofd,
   return (int)syscall(SYS_renameat, fromfd, from, tofd, to);
 }
 
+/*
+ * T2 content/metadata-dependency forwarders (see reprobuild-specs/
+ * MacOS-Monitoring-Adversarial-Hardening.milestones.org breaks #3/#5/#7).
+ *
+ * Each reaches the kernel via the RAW syscall, exactly like the stat/rename
+ * forwarders above, so a body-patched libsystem entry of the same name is never
+ * re-entered (the body-patch backend overwrites those entries IN PLACE; a
+ * by-name / dlsym forward would resolve the patch and loop — see the spawn
+ * family's `inSpawnForward` discussion). clonefile/link/getattrlist are thin
+ * syscall wrappers, so a raw syscall is semantically faithful.
+ *
+ * Break #3 (clonefile/link): an APFS `clonefile` copy-on-write clone — and a
+ * hardlink `link` — consume the SOURCE file's content WITHOUT ever issuing a
+ * hooked open/read on it (CoW reads zero source bytes; a hardlink merely aliases
+ * the inode). The call itself is therefore the ONLY signal that the source is a
+ * content dependency. `clonefile(src,dst,flags)` is libsystem sugar for
+ * `clonefileat(AT_FDCWD,src,AT_FDCWD,dst,flags)`, so we issue SYS_clonefileat.
+ */
+int repro_macos_real_clonefile_syscall(char *src, char *dst, int flags) {
+  return (int)syscall(SYS_clonefileat, AT_FDCWD, src, AT_FDCWD, dst, flags);
+}
+int repro_macos_real_clonefileat_syscall(int srcfd, char *src, int dstfd,
+                                         char *dst, int flags) {
+  return (int)syscall(SYS_clonefileat, srcfd, src, dstfd, dst, flags);
+}
+int repro_macos_real_fclonefileat_syscall(int srcfd, int dstfd, char *dst,
+                                          int flags) {
+  return (int)syscall(SYS_fclonefileat, srcfd, dstfd, dst, flags);
+}
+int repro_macos_real_link_syscall(char *src, char *dst) {
+  return (int)syscall(SYS_link, src, dst);
+}
+int repro_macos_real_linkat_syscall(int fd1, char *src, int fd2, char *dst,
+                                    int flag) {
+  return (int)syscall(SYS_linkat, fd1, src, fd2, dst, flag);
+}
+
+/*
+ * Break #5 (getattrlist family): an existence/metadata probe (mtime, objtype,
+ * fsid/fileid) that — unlike stat/lstat/fstatat — leaves NO stat record, so a
+ * build tool that checks "does this header exist / what is its mtime" via
+ * getattrlist hides the dependency. We classify it as a path-probe (like stat).
+ */
+int repro_macos_real_getattrlist_syscall(char *path, void *al, void *buf,
+                                         size_t size, unsigned long opts) {
+  return (int)syscall(SYS_getattrlist, path, al, buf, size, opts);
+}
+int repro_macos_real_getattrlistat_syscall(int fd, char *path, void *al,
+                                           void *buf, size_t size,
+                                           unsigned long opts) {
+  return (int)syscall(SYS_getattrlistat, fd, path, al, buf, size, opts);
+}
+int repro_macos_real_fgetattrlist_syscall(int fd, void *al, void *buf,
+                                          size_t size, unsigned long opts) {
+  return (int)syscall(SYS_fgetattrlist, fd, al, buf, size, opts);
+}
+
+/*
+ * Per-entry directory enumeration (getattrlistbulk / the libsystem
+ * getdirentries wrapper). opendir/readdir are hooked, but a tool can open() a
+ * directory fd and bulk-scan its entries via these syscalls with NO readdir
+ * call. We forward via the raw syscall and record a directory-enumerate at the
+ * dir granularity (per-child name extraction from getattrlistbulk's packed
+ * attribute buffer is deferred — see the hook comment). NOTE: a program issuing
+ * the RAW `syscall(SYS_getdirentries64, …)` inline (never touching the libsystem
+ * wrapper) is the structurally-unfixable raw-syscall gap (#6); only the
+ * libsystem-wrapper call sites are reachable in-process.
+ */
+int repro_macos_real_getattrlistbulk_syscall(int dirfd, void *al, void *buf,
+                                             size_t size, uint64_t opts) {
+  return (int)syscall(SYS_getattrlistbulk, dirfd, al, buf, size, opts);
+}
+int repro_macos_real_getdirentries_syscall(int fd, void *buf, int nbytes,
+                                           long *basep) {
+  return (int)syscall(SYS_getdirentries, fd, buf, nbytes, basep);
+}
+
+/*
+ * Break #7 (path fidelity): recover the canonical real path behind an open fd
+ * via fcntl(F_GETPATH). This resolves BOTH a symlink target (open follows the
+ * link, so the fd names the real target) AND a /.vol/<dev>/<inode> firmlink open
+ * (the fd names the real path the opaque inode path points at). `fcntl` is not
+ * hooked and we issue the raw syscall, so this is reentrancy-free. Returns 1 and
+ * fills `out` (which MUST be >= MAXPATHLEN) on success, 0 otherwise.
+ */
+int repro_macos_fd_real_path(int fd, void *out, size_t outlen) {
+  if (fd < 0 || out == NULL || outlen < 1024) return 0;
+  char tmp[1024]; /* MAXPATHLEN */
+  if (syscall(SYS_fcntl, fd, F_GETPATH, tmp) != 0) return 0;
+  size_t n = strlen(tmp);
+  if (n + 1 > outlen) return 0;
+  memcpy(out, tmp, n + 1);
+  return 1;
+}
+
+/*
+ * Canonicalise a path via realpath(3) (resolves symlink components). Used by the
+ * stat/lstat hooks to ALSO record the resolved symlink target as a path-probe so
+ * editing the target while the link is unchanged is visible. realpath's internal
+ * lstat calls are body-patched, but the caller invokes this with the shim muted
+ * (disabled>0), so those forward without recording (no recursion). Returns 1 +
+ * canonical path on success, 0 otherwise.
+ */
+int repro_macos_canonical_path(char *path, void *out, size_t outlen) {
+  if (!path || !out || outlen < 1024) return 0;
+  char buf[1024]; /* MAXPATHLEN */
+  if (realpath(path, buf) == NULL) return 0;
+  size_t n = strlen(buf);
+  if (n + 1 > outlen) return 0;
+  memcpy(out, buf, n + 1);
+  return 1;
+}
+
+/* True if the (64-bit-inode) struct stat buffer describes a symlink. Used to
+ * gate the lstat hook's symlink-target resolution so realpath() is only paid for
+ * actual symlinks, not every probe. The SYS_lstat64-filled buffer is the modern
+ * `struct stat` layout on arm64 (stat == stat64), so the cast is correct. */
+int repro_macos_stat_is_symlink(void *buf) {
+  if (!buf) return 0;
+  struct stat *st = (struct stat *)buf;
+  return S_ISLNK(st->st_mode) ? 1 : 0;
+}
+
 int repro_macos_path_is_dir(char *path) {
   struct stat st;
 #ifdef SYS_stat64
@@ -142,45 +265,104 @@ int repro_macos_path_is_dir(char *path) {
   return S_ISDIR(st.st_mode) ? 1 : 0;
 }
 
-static int repro_macos_env_has(char **envp, const char *name) {
+/*
+ * Return the value part of envp's first NAME= entry, or NULL if absent.
+ */
+static const char *repro_macos_env_value(char **envp, const char *name) {
   if (!envp) envp = environ;
   size_t name_len = strlen(name);
   for (char **env = envp; env && *env; env++) {
     if (strncmp(*env, name, name_len) == 0 && (*env)[name_len] == '=') {
-      return 1;
+      return *env + name_len + 1;
     }
+  }
+  return NULL;
+}
+
+/*
+ * True if colon-delimited `list` already contains `item` as a whole element.
+ * Used to keep our shim present EXACTLY ONCE in DYLD_INSERT_LIBRARIES across a
+ * deep monitored process tree (prepending unconditionally would grow the value
+ * shim:shim:shim… at every generation).
+ */
+static int repro_macos_pathlist_has(const char *list, const char *item) {
+  if (!list || !item || !item[0]) return 0;
+  size_t item_len = strlen(item);
+  const char *p = list;
+  while (*p) {
+    const char *end = strchr(p, ':');
+    size_t seg_len = end ? (size_t)(end - p) : strlen(p);
+    if (seg_len == item_len && strncmp(p, item, item_len) == 0) return 1;
+    if (!end) break;
+    p = end + 1;
   }
   return 0;
 }
 
+/*
+ * Build the monitored child's environment: OVERRIDE (not skip-if-present) the
+ * injection vars (findings doc T1, break #2). A caller that scrubs or sets an
+ * EMPTY/bogus DYLD_INSERT_LIBRARIES / CT_SANDBOX_TOOLS_DIR previously BLOCKED
+ * re-propagation (the old skip-if-present logic), so the child ran un-injected
+ * and unmonitored. We now:
+ *   * Force DYLD_INSERT_LIBRARIES to our shim, PREPENDED so it is always first,
+ *     while preserving any genuine additional libraries the caller listed (and
+ *     never duplicating our own shim — see repro_macos_pathlist_has).
+ *   * Force CT_SANDBOX_TOOLS_DIR to the active sandbox-tools dir.
+ * The caller's matching entries are dropped and our overrides appended, so the
+ * result has exactly one authoritative value for each.
+ */
 static char **repro_macos_env_with_preload(char **envp) {
   const char *shim = getenv("REPRO_MONITOR_SHIM_LIB");
   char *sandbox_dir = repro_macos_get_sandbox_tools_dir();
-  int need_dyld = shim && shim[0] != '\0' &&
-    !repro_macos_env_has(envp, "DYLD_INSERT_LIBRARIES");
-  int need_sandbox = sandbox_dir && sandbox_dir[0] != '\0' &&
-    !repro_macos_env_has(envp, "CT_SANDBOX_TOOLS_DIR");
-  if (!need_dyld && !need_sandbox) return envp;
+  int want_dyld = shim && shim[0] != '\0';
+  int want_sandbox = sandbox_dir && sandbox_dir[0] != '\0';
+  if (!want_dyld && !want_sandbox) return envp;
 
   char **source = envp ? envp : environ;
+  /* Capture the caller's existing DYLD list BEFORE we drop it, so we can keep
+   * any non-shim libraries the caller legitimately wanted inserted. */
+  const char *existing_dyld =
+    want_dyld ? repro_macos_env_value(source, "DYLD_INSERT_LIBRARIES") : NULL;
+
   size_t count = 0;
   while (source && source[count]) count++;
 
-  size_t extras = (need_dyld ? 1u : 0u) + (need_sandbox ? 1u : 0u);
-  char **result = (char **)calloc(count + extras + 1, sizeof(char *));
+  /* Worst case: every source entry kept + our two overrides + NULL. */
+  char **result = (char **)calloc(count + 3, sizeof(char *));
   if (!result) return envp;
-  for (size_t i = 0; i < count; i++) result[i] = source[i];
 
-  size_t slot = count;
-  if (need_dyld) {
+  size_t slot = 0;
+  for (size_t i = 0; i < count; i++) {
+    if (want_dyld &&
+        strncmp(source[i], "DYLD_INSERT_LIBRARIES=", 22) == 0) {
+      continue; /* dropped; re-added as the override below */
+    }
+    if (want_sandbox &&
+        strncmp(source[i], "CT_SANDBOX_TOOLS_DIR=", 21) == 0) {
+      continue;
+    }
+    result[slot++] = source[i];
+  }
+
+  if (want_dyld) {
     const char *prefix = "DYLD_INSERT_LIBRARIES=";
-    size_t value_len = strlen(prefix) + strlen(shim) + 1;
+    /* Append the caller's other libraries after ours, unless they already
+     * include our shim (avoid unbounded shim:shim… growth across the tree). */
+    int append_existing =
+      existing_dyld && existing_dyld[0] != '\0' &&
+      !repro_macos_pathlist_has(existing_dyld, shim);
+    size_t value_len = strlen(prefix) + strlen(shim) +
+      (append_existing ? 1 + strlen(existing_dyld) : 0) + 1;
     char *value = (char *)malloc(value_len);
     if (!value) { free(result); return envp; }
-    snprintf(value, value_len, "%s%s", prefix, shim);
+    if (append_existing)
+      snprintf(value, value_len, "%s%s:%s", prefix, shim, existing_dyld);
+    else
+      snprintf(value, value_len, "%s%s", prefix, shim);
     result[slot++] = value;
   }
-  if (need_sandbox) {
+  if (want_sandbox) {
     const char *prefix = "CT_SANDBOX_TOOLS_DIR=";
     size_t value_len = strlen(prefix) + strlen(sandbox_dir) + 1;
     char *value = (char *)malloc(value_len);
@@ -528,6 +710,56 @@ char *repro_macos_bodypatch_spawn_rewrite(char *path, char **envp,
   if (out_envp) *out_envp = repro_macos_env_with_preload(envp);
   return repro_macos_rewrite_sip_path(path);
 }
+
+/*
+ * copyfile / fcopyfile forwarders (break #3, the COPYFILE_CLONE arm).
+ *
+ * Unlike clonefile/link, copyfile(3) is NOT a thin syscall wrapper: the kernel
+ * SYS_copyfile is a legacy stub the modern libcopyfile does not use — it does
+ * open/read/write (data mode) or an internal clonefile (clone mode) in
+ * userland. So the forward MUST run the genuine libsystem copyfile body. We
+ * therefore DELIBERATELY do NOT body-patch copyfile (only interpose it); the
+ * forward resolves the real libsystem entry via the shim-skipping image walk
+ * (genuine + unpatched because we never patched it), so there is no re-entry.
+ * The hook records the SOURCE as a read ONLY for the clone modes — the data
+ * mode's internal open/read is already captured by those hooks, so recording it
+ * again would double-count (see the §"Coverage wins" note in the findings doc).
+ */
+typedef int (*repro_copyfile_fn)(const char *, const char *, void *, uint32_t);
+typedef int (*repro_fcopyfile_fn)(int, int, void *, uint32_t);
+static repro_copyfile_fn repro_real_copyfile_ptr = NULL;
+static repro_fcopyfile_fn repro_real_fcopyfile_ptr = NULL;
+
+int repro_macos_real_copyfile_call(char *from, char *to, void *state,
+                                   uint32_t flags) {
+  if (!repro_real_copyfile_ptr)
+    repro_real_copyfile_ptr =
+      (repro_copyfile_fn)repro_macos_lookup_image_symbol("_copyfile");
+  if (!repro_real_copyfile_ptr) { errno = ENOSYS; return -1; }
+  return repro_real_copyfile_ptr(from, to, state, flags);
+}
+
+int repro_macos_real_fcopyfile_call(int from, int to, void *state,
+                                    uint32_t flags) {
+  if (!repro_real_fcopyfile_ptr)
+    repro_real_fcopyfile_ptr =
+      (repro_fcopyfile_fn)repro_macos_lookup_image_symbol("_fcopyfile");
+  if (!repro_real_fcopyfile_ptr) { errno = ENOSYS; return -1; }
+  return repro_real_fcopyfile_ptr(from, to, state, flags);
+}
+
+/* POSIX_SPAWN_SETEXEC detection (break #2). A SETEXEC spawn REPLACES the calling
+ * process image and never returns on success, so the spawn hook must emit +
+ * flush its exec record BEFORE forwarding (mirroring execve). Reads the attr
+ * flags via the public getter; returns 1 if SETEXEC is set. attrp==NULL ⇒ no
+ * attributes ⇒ not SETEXEC. */
+int repro_macos_spawnattr_has_setexec(void *attrp) {
+  if (attrp == NULL) return 0;
+  short flags = 0;
+  if (posix_spawnattr_getflags((const posix_spawnattr_t *)attrp, &flags) != 0)
+    return 0;
+  return (flags & POSIX_SPAWN_SETEXEC) ? 1 : 0;
+}
 """.}
 
 type
@@ -695,3 +927,118 @@ proc ct_macos_bodypatch_call_posix_spawn*(tramp: pointer; pid: ptr PidT;
       fileActions, attrp: pointer; argv, envp: cstringArray): cint
     {.importc: "repro_macos_bodypatch_call_posix_spawn", cdecl.}
   callPosixSpawn(tramp, pid, path, fileActions, attrp, argv, envp)
+
+# --- T2 content/metadata-dependency raw-syscall forwarders ------------------
+# Shared by the interpose + body-patch hooks for the clonefile/link/getattrlist
+# families. Each bypasses the (possibly body-patched) named symbol via the raw
+# syscall, exactly like the stat/rename forwarders, so a single call records
+# once and never re-enters the patched entry.
+
+proc ct_macos_real_clonefile*(src, dst: cstring; flags: cint): cint =
+  proc realClonefile(src, dst: cstring; flags: cint): cint
+    {.importc: "repro_macos_real_clonefile_syscall", cdecl.}
+  realClonefile(src, dst, flags)
+
+proc ct_macos_real_clonefileat*(srcfd: cint; src: cstring; dstfd: cint;
+    dst: cstring; flags: cint): cint =
+  proc realClonefileat(srcfd: cint; src: cstring; dstfd: cint; dst: cstring;
+      flags: cint): cint
+    {.importc: "repro_macos_real_clonefileat_syscall", cdecl.}
+  realClonefileat(srcfd, src, dstfd, dst, flags)
+
+proc ct_macos_real_fclonefileat*(srcfd, dstfd: cint; dst: cstring;
+    flags: cint): cint =
+  proc realFclonefileat(srcfd, dstfd: cint; dst: cstring; flags: cint): cint
+    {.importc: "repro_macos_real_fclonefileat_syscall", cdecl.}
+  realFclonefileat(srcfd, dstfd, dst, flags)
+
+proc ct_macos_real_link*(src, dst: cstring): cint =
+  proc realLink(src, dst: cstring): cint
+    {.importc: "repro_macos_real_link_syscall", cdecl.}
+  realLink(src, dst)
+
+proc ct_macos_real_linkat*(fd1: cint; src: cstring; fd2: cint; dst: cstring;
+    flag: cint): cint =
+  proc realLinkat(fd1: cint; src: cstring; fd2: cint; dst: cstring;
+      flag: cint): cint
+    {.importc: "repro_macos_real_linkat_syscall", cdecl.}
+  realLinkat(fd1, src, fd2, dst, flag)
+
+proc ct_macos_real_getattrlist*(path: cstring; al, buf: pointer; size: csize_t;
+    opts: culong): cint =
+  proc realGetattrlist(path: cstring; al, buf: pointer; size: csize_t;
+      opts: culong): cint
+    {.importc: "repro_macos_real_getattrlist_syscall", cdecl.}
+  realGetattrlist(path, al, buf, size, opts)
+
+proc ct_macos_real_getattrlistat*(fd: cint; path: cstring; al, buf: pointer;
+    size: csize_t; opts: culong): cint =
+  proc realGetattrlistat(fd: cint; path: cstring; al, buf: pointer;
+      size: csize_t; opts: culong): cint
+    {.importc: "repro_macos_real_getattrlistat_syscall", cdecl.}
+  realGetattrlistat(fd, path, al, buf, size, opts)
+
+proc ct_macos_real_fgetattrlist*(fd: cint; al, buf: pointer; size: csize_t;
+    opts: culong): cint =
+  proc realFgetattrlist(fd: cint; al, buf: pointer; size: csize_t;
+      opts: culong): cint
+    {.importc: "repro_macos_real_fgetattrlist_syscall", cdecl.}
+  realFgetattrlist(fd, al, buf, size, opts)
+
+proc ct_macos_real_getattrlistbulk*(dirfd: cint; al, buf: pointer;
+    size: csize_t; opts: uint64): cint =
+  proc realGetattrlistbulk(dirfd: cint; al, buf: pointer; size: csize_t;
+      opts: uint64): cint
+    {.importc: "repro_macos_real_getattrlistbulk_syscall", cdecl.}
+  realGetattrlistbulk(dirfd, al, buf, size, opts)
+
+proc ct_macos_real_getdirentries*(fd: cint; buf: pointer; nbytes: cint;
+    basep: ptr clong): cint =
+  proc realGetdirentries(fd: cint; buf: pointer; nbytes: cint;
+      basep: ptr clong): cint
+    {.importc: "repro_macos_real_getdirentries_syscall", cdecl.}
+  realGetdirentries(fd, buf, nbytes, basep)
+
+proc ct_macos_real_copyfile*(src, dst: cstring; state: pointer;
+    flags: uint32): cint =
+  ## Forward to the GENUINE libsystem copyfile (copyfile is interpose-only, never
+  ## body-patched — see the C forwarder doc), so it runs the real copy body.
+  proc realCopyfile(src, dst: cstring; state: pointer; flags: uint32): cint
+    {.importc: "repro_macos_real_copyfile_call", cdecl.}
+  realCopyfile(src, dst, state, flags)
+
+proc ct_macos_real_fcopyfile*(srcfd, dstfd: cint; state: pointer;
+    flags: uint32): cint =
+  proc realFcopyfile(srcfd, dstfd: cint; state: pointer; flags: uint32): cint
+    {.importc: "repro_macos_real_fcopyfile_call", cdecl.}
+  realFcopyfile(srcfd, dstfd, state, flags)
+
+proc ct_macos_fd_real_path*(fd: cint; outBuf: pointer; outLen: csize_t): cint =
+  ## fcntl(F_GETPATH) canonicalisation of an open fd (symlink target + /.vol
+  ## firmlink resolution, break #7). Returns non-zero on success.
+  proc fdRealPath(fd: cint; outBuf: pointer; outLen: csize_t): cint
+    {.importc: "repro_macos_fd_real_path", cdecl.}
+  fdRealPath(fd, outBuf, outLen)
+
+proc ct_macos_canonical_path*(path: cstring; outBuf: pointer;
+    outLen: csize_t): cint =
+  ## realpath(3) canonicalisation of a path (symlink-target resolution for the
+  ## stat/lstat hooks). MUST be called with the shim muted (disabled>0) so the
+  ## internal lstat calls do not recurse into recording. Returns non-zero on ok.
+  proc canonicalPath(path: cstring; outBuf: pointer; outLen: csize_t): cint
+    {.importc: "repro_macos_canonical_path", cdecl.}
+  canonicalPath(path, outBuf, outLen)
+
+proc ct_macos_spawnattr_has_setexec*(attrp: pointer): bool =
+  ## True if the spawn attributes set POSIX_SPAWN_SETEXEC (break #2). A SETEXEC
+  ## spawn replaces the process image and never returns on success.
+  proc hasSetexec(attrp: pointer): cint
+    {.importc: "repro_macos_spawnattr_has_setexec", cdecl.}
+  hasSetexec(attrp) != 0
+
+proc ct_macos_stat_is_symlink*(buf: pointer): bool =
+  ## True if a (64-bit-inode) struct stat buffer describes a symlink. Gates the
+  ## lstat hook's realpath-based symlink-target resolution to actual symlinks.
+  proc isSymlink(buf: pointer): cint
+    {.importc: "repro_macos_stat_is_symlink", cdecl.}
+  isSymlink(buf) != 0

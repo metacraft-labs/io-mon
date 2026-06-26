@@ -1,4 +1,4 @@
-import std/[algorithm, atomics, monotimes, os, strutils, times]
+import std/[algorithm, atomics, monotimes, os, sets, strutils, tables, times]
 from io_mon/paths import extendedPath
 
 import io_mon/codec
@@ -608,6 +608,69 @@ proc encodeCanonical*(records: openArray[MonitorRecord]): seq[byte] =
   result.writeU64Le(uint64(ordered.len))
   result.writeU64Le(checksum(body))
 
+proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord]): int =
+  ## T0 — EARN mcComplete (MacOS-Monitoring-Adversarial-Hardening.milestones.org
+  ## §"T0 — Earn mcComplete"; Monitor-Hook-Shim.md §"Failure Semantics":
+  ## "successful child exit MUST NOT hide monitor failure").
+  ##
+  ## The monitor must not ASSERT `mcComplete`; it must EARN it. The cross-process
+  ## merge sees every monitored process's fragments, so it can PROVE the process
+  ## tree was fully monitored. This returns the number of synthetic event-loss
+  ## records to inject — one per piece of DIRECT EVIDENCE that some child/exec
+  ## subtree ran UN-monitored — so the existing event-loss → `mcIncomplete` path
+  ## (`summarizeRecords` → `depFileFromRecords`) downgrades completeness to a
+  ## CONSERVATIVE RE-RUN instead of a silent false skip (the cardinal sin).
+  ##
+  ## Two independent signals, both keyed purely on records io-mon already emits.
+  ## The machinery is deliberately generic so Phase 2's IPC break (#1) reuses it:
+  ## a `connect`/`sendmsg` to a peer with NO `process-start` in the injected set
+  ## is structurally identical to an un-injected spawn child here.
+  ##
+  ## (a) SPAWN with no child process-start. Every INJECTED process emits an
+  ##     `mrProcessStart` with its own osPid. A recorded `mrProcessSpawn`
+  ##     (fork/posix_spawn) names the child in `childOsPid`; if NO `mrProcessStart`
+  ##     with `osPid == childOsPid` exists, that child never loaded the shim — its
+  ##     whole subtree (and every file it read) ran unmonitored (a posix_spawn into
+  ##     a hardened/notarized binary, or break #1's spawn arm). A fork child is
+  ##     safe: it inherits the loaded shim and emits its OWN process-start, so it
+  ##     is always matched.
+  ##
+  ## (b) EXEC into an un-injectable image. An exec — `execve`, or a
+  ##     POSIX_SPAWN_SETEXEC spawn (break #2) — REPLACES the current image in the
+  ##     SAME pid. If the new image is injectable, the re-loaded shim emits a fresh
+  ##     `mrProcessStart` for that pid; so while every image in a pid stays
+  ##     monitored, that pid's `process-start` count is exactly one greater than
+  ##     its exec count. The instant an exec lands in an un-injectable image (no
+  ##     post-exec start), the exec count CATCHES UP. Hence
+  ##     `execCount(pid) >= startCount(pid)` (with execCount > 0) means the LAST
+  ##     exec in that pid ran un-monitored — catching a SETEXEC into a hardened
+  ##     binary (break #2, which the subtree fail-safe alone misses) AND a plain
+  ##     execve into one.
+  var startPids: HashSet[uint64]
+  var startCount = initCountTable[uint64]()
+  var execCount = initCountTable[uint64]()
+  for r in records:
+    case r.kind
+    of mrProcessStart:
+      startPids.incl r.osPid
+      startCount.inc r.osPid
+    of mrProcessExec:
+      execCount.inc r.osPid
+    else: discard
+  result = 0
+  # (a) spawned children with no matching process-start (count each child once).
+  var flaggedChildren: HashSet[uint64]
+  for r in records:
+    if r.kind == mrProcessSpawn and r.childOsPid != 0 and
+        r.childOsPid != r.osPid and r.childOsPid notin startPids and
+        r.childOsPid notin flaggedChildren:
+      flaggedChildren.incl r.childOsPid
+      inc result
+  # (b) execs whose last image was un-injectable (one loss per such pid).
+  for pid, execs in execCount:
+    if execs > 0 and execs >= startCount.getOrDefault(pid):
+      inc result
+
 proc mergeFragments*(fragmentDir, outputPath: string): MonitorDepFile =
   # DSL-port M9.R.15c.1 — close the calling thread's cached fragment
   # handle before merging so any post-SIGKILL or pre-close buffered
@@ -651,6 +714,19 @@ proc mergeFragments*(fragmentDir, outputPath: string): MonitorDepFile =
       records.add MonitorRecord(kind: mrEventLoss,
         observationKind: moEventLoss,
         detail: "corrupt or partial RMDF fragment in " & fragmentDir)
+  # T0 — downgrade completeness when the merged evidence proves some spawn/exec
+  # subtree ran UN-monitored (un-injectable spawn child or a SETEXEC/execve into
+  # a hardened image). One synthetic event-loss per piece of evidence forces
+  # `mcIncomplete` via the SAME event-loss machinery as the corrupt-fragment
+  # path, so an un-injectable child becomes a conservative re-run rather than a
+  # false skip — self-flagged by io-mon, not left solely to the consumer
+  # (Monitor-Hook-Shim.md §"Failure Semantics"). See unmonitoredSubtreeLossCount.
+  let subtreeLosses = unmonitoredSubtreeLossCount(records)
+  for _ in 0 ..< subtreeLosses:
+    records.add MonitorRecord(kind: mrEventLoss,
+      observationKind: moEventLoss,
+      detail: "unmonitored spawn/exec subtree " &
+        "(un-injectable child or SETEXEC into a hardened image)")
   records.add profileRecords(defaultHooksMonitorProfile(
     MacosMonitorShimTaxonomyCapabilities))
 
