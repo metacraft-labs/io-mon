@@ -21,8 +21,15 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$here"
 
+# Both the output library dir and the nimcache dir are overridable with
+# ABSOLUTE paths so a consumer can build this shim while io-mon's own source
+# tree is READ-ONLY (e.g. when io-mon is a Nix flake input / store path, as in
+# reprobuild's package build and dev shell). Defaulting nimcache to the
+# relative `build/nimcache` would `mkdir`/write inside the read-only source and
+# fail with "Permission denied" / "Read-only file system".
 out_dir="${IO_MON_SHIM_OUT_DIR:-build/lib}"
-mkdir -p "$out_dir" build/nimcache
+nimcache_dir="${IO_MON_SHIM_NIMCACHE_DIR:-build/nimcache}"
+mkdir -p "$out_dir" "$nimcache_dir"
 
 stackable_hooks_src="${STACKABLE_HOOKS_SRC:-../nim-stackable-hooks/src}"
 if [ ! -d "$stackable_hooks_src" ]; then
@@ -58,7 +65,7 @@ case "$(uname -s)" in
       --threads:on \
       --path:src \
       --path:"${stackable_hooks_src}" \
-      --nimcache:build/nimcache/io-mon-shim-dylib \
+      --nimcache:"${nimcache_dir}/io-mon-shim-dylib" \
       --out:"${out_dir}/librepro_monitor_shim.dylib" \
       src/io_mon/shim/macos_interpose.nim
     ;;
@@ -69,7 +76,7 @@ case "$(uname -s)" in
       --threads:on \
       --path:src \
       --path:"${stackable_hooks_src}" \
-      --nimcache:build/nimcache/io-mon-shim-so \
+      --nimcache:"${nimcache_dir}/io-mon-shim-so" \
       --out:"${out_dir}/librepro_monitor_shim.so" \
       src/io_mon/shim/linux_preload.nim
     ;;
@@ -82,7 +89,7 @@ case "$(uname -s)" in
       --cc:gcc \
       --path:src \
       --path:"${stackable_hooks_src}" \
-      --nimcache:build/nimcache/io-mon-shim-dll \
+      --nimcache:"${nimcache_dir}/io-mon-shim-dll" \
       --out:"${out_dir}/librepro_monitor_shim.dll" \
       src/io_mon/shim/windows_interpose.nim
     ;;
