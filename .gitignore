@@ -25,3 +25,7 @@ tests/test_io_mon_macos_bodypatch_resolution
 tests/test_io_mon_macos_rename
 tests/test_io_mon_macos_bodypatch_open_mode
 tests/test_io_mon_macos_threaded_write
+tests/test_io_mon_t0_completeness
+tests/test_io_mon_macos_content_hooks
+tests/test_io_mon_macos_symlink
+tests/test_io_mon_macos_setexec
