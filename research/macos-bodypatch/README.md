@@ -12,8 +12,11 @@ The production implementation lives in:
 - `src/io_mon/hooks/macos_bodypatch.nim` — the reusable body-patcher
   (`repro_macos_bodypatch_install` / `..._install_named`).
 - `src/io_mon/shim/macos_interpose.nim` — installs the patches in the shim
-  constructor, gated by `IO_MON_MACOS_BACKEND` (`bodypatch` | `interpose` |
-  `both`, default `both`).
+  constructor UNCONDITIONALLY (both mechanisms are always on by default; there
+  is no runtime backend selector). For diagnosis, NON-release shims honour
+  debug-only per-mechanism disable toggles (`IO_MON_DEBUG_DISABLE_BODYPATCH`,
+  `IO_MON_DEBUG_DISABLE_INTERPOSE`); in release builds those reads are compiled
+  out and both mechanisms always run.
 - `src/io_mon/hooks/macos_interpose_runtime.nim` — the raw-syscall forwarders
   the hooks use (so they never re-enter the now-patched named symbols).
 - `tests/test_io_mon_macos_bodypatch.nim` — the regression test asserting the

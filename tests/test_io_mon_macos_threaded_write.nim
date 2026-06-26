@@ -22,8 +22,9 @@
 ## # What this test asserts
 ##
 ## A probe writes a uniquely-tagged file from the MAIN thread and ANOTHER from a
-## `pthread_create`d CHILD thread (then joins it). Under both `IO_MON_MACOS_BACKEND`
-## backends the merged depfile must contain an `mrFileWrite` record for BOTH the
+## `pthread_create`d CHILD thread (then joins it). Under each diagnostic A/B arm
+## (interpose-only, body-patch-only, and the default both-on)
+## the merged depfile must contain an `mrFileWrite` record for BOTH the
 ## parent-thread file AND the child-thread file, and the two writes must carry
 ## DIFFERENT thread ids (proving the child-thread record is genuinely captured,
 ## not the parent's). macOS-only; no-op pass elsewhere.
@@ -36,6 +37,7 @@ const
 
 when defined(macosx):
   import io_mon  # readMonitorDepFile, mergeFragments, MonitorObservationKind
+  import macos_backend_toggle  # applyMacosBackendToggle (A/B → debug toggles)
 
   proc buildShim(): string =
     let (output, code) = execCmdEx("bash " &
@@ -121,7 +123,7 @@ int main(int argc, char **argv) {
     for k, v in envPairs(): env[k] = v
     env["DYLD_INSERT_LIBRARIES"] = shim
     env["REPRO_MONITOR_FRAGMENT_DIR"] = fragmentDir
-    env["IO_MON_MACOS_BACKEND"] = backend
+    applyMacosBackendToggle(env, backend)
 
     let p = startProcess(probe, args = @[parentOut, childOut], env = env,
       options = {poStdErrToStdOut})

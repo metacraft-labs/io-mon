@@ -36,6 +36,7 @@ import std/[os, osproc, streams, strtabs, unittest]
 
 when defined(macosx):
   import io_mon  # readMonitorDepFile, mergeFragments, record kinds
+  import macos_backend_toggle  # applyMacosBackendToggle (A/B → debug toggles)
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir()
@@ -131,7 +132,7 @@ int main(void) {
     env["DYLD_INSERT_LIBRARIES"] = shim
     env["REPRO_MONITOR_SHIM_LIB"] = shim
     env["REPRO_MONITOR_FRAGMENT_DIR"] = fragmentDir
-    env["IO_MON_MACOS_BACKEND"] = backend
+    applyMacosBackendToggle(env, backend)
 
     let p = startProcess(fx.probe, args = @[], env = env,
       options = {poStdErrToStdOut})

@@ -20,12 +20,13 @@
 ##
 ## A freshly-built probe performs the build-shaped sequence: write a temp file,
 ## `chmod a-w` it, then rename(2) it onto the destination, then re-create. Run
-## under the shim with `IO_MON_MACOS_BACKEND=both` (body-patch active):
+## under the shim with both mechanisms on (the default, body-patch active):
 ##   * the sequence COMPLETES (the destination has the moved contents — the
 ##     body-patch did not break the move), and
 ##   * a write record (moFileWrite) for the DESTINATION path IS captured (the
 ##     rename was hooked and classified as an output write).
-## The same is asserted under `interpose` to lock in that both backends hook it.
+## The same is asserted with body-patch disabled for diagnosis (the
+## interpose-only A/B arm) to lock in that interpose hooks it too.
 ##
 ## macOS-only; a no-op pass elsewhere.
 
@@ -33,6 +34,7 @@ import std/[os, osproc, streams, strtabs, strutils, unittest]
 
 when defined(macosx):
   import io_mon  # readMonitorDepFile, mergeFragments, MonitorObservationKind
+  import macos_backend_toggle  # applyMacosBackendToggle (A/B → debug toggles)
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir()
@@ -114,7 +116,7 @@ int main(int argc, char **argv) {
     env["DYLD_INSERT_LIBRARIES"] = shim
     env["REPRO_MONITOR_SHIM_LIB"] = shim
     env["REPRO_MONITOR_FRAGMENT_DIR"] = fragmentDir
-    env["IO_MON_MACOS_BACKEND"] = backend
+    applyMacosBackendToggle(env, backend)
 
     let p = startProcess(fx.probe, args = @[fx.tmpPath, fx.dstPath], env = env,
       options = {poStdErrToStdOut})

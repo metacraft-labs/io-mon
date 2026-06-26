@@ -6,18 +6,20 @@
 ##
 ## ``fopen("/etc/services","r")`` performs its ``open`` *inside* ``libsystem_c``
 ## (via ``open$NOCANCEL``), through libsystem's own call site — NOT through the
-## test binary's import table. The legacy ``__DATA,__interpose`` backend only
+## test binary's import table. The ``__DATA,__interpose`` mechanism only
 ## rewrites the *binary's own* import bindings, so it never sees that internal
-## open: under ``IO_MON_MACOS_BACKEND=interpose`` the ``/etc/services`` record
-## is ABSENT.
+## open: with body-patch DISABLED for diagnosis
+## (``IO_MON_DEBUG_DISABLE_BODYPATCH=1``, the "interpose-only" A/B arm) the
+## ``/etc/services`` record is ABSENT.
 ##
-## The body-patch backend replaces the libsystem ``open`` / ``open$NOCANCEL`` /
+## The body-patch mechanism replaces the libsystem ``open`` / ``open$NOCANCEL`` /
 ## ``__open_nocancel`` *entry points* themselves (the Dobby / substrate
 ## ``mach_vm_remap`` overwrite technique — see
 ## ``src/io_mon/hooks/macos_bodypatch.nim`` and
 ## ``research/macos-bodypatch/internal3.c``), so it catches the call regardless
-## of who makes it. Under ``IO_MON_MACOS_BACKEND=bodypatch`` (and the default
-## ``both``) the ``/etc/services`` record is PRESENT.
+## of who makes it. With interpose DISABLED for diagnosis
+## (``IO_MON_DEBUG_DISABLE_INTERPOSE=1``, the "body-patch-only" arm) and under
+## the DEFAULT (both mechanisms on) the ``/etc/services`` record is PRESENT.
 ##
 ## This test asserts BOTH directions — presence under body-patch / both,
 ## absence under interpose — to lock in that body-patch is precisely what
@@ -28,6 +30,7 @@ from std/strutils import contains
 
 when defined(macosx):
   import io_mon  # readMonitorDepFile, mergeFragments, MonitorObservationKind
+  import macos_backend_toggle  # applyMacosBackendToggle (A/B → debug toggles)
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir()
@@ -83,7 +86,7 @@ int main(void) {
     for k, v in envPairs(): env[k] = v
     env["DYLD_INSERT_LIBRARIES"] = shim
     env["REPRO_MONITOR_FRAGMENT_DIR"] = fragmentDir
-    env["IO_MON_MACOS_BACKEND"] = backend
+    applyMacosBackendToggle(env, backend)
 
     let p = startProcess(probe, args = @[], env = env,
       options = {poStdErrToStdOut})

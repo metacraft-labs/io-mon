@@ -410,14 +410,14 @@ proc repro_hook_closedir*(dirp: pointer): cint {.exportc, cdecl, dynlib.} =
 # kernel via the RAW stat64/lstat64/fstatat64/access syscall
 # (ct_macos_bodypatch_real_*), NOT via the named symbol / dlsym.
 #
-# WHY the forward MUST bypass the named entry: under the default `both` backend
-# the body-patch has REPLACED the named stat/lstat/fstatat/access entry points.
-# If this hook forwarded via the by-name real (ct_macos_interpose_real_stat,
-# which resolves the symbol with dlsym / NSLookupSymbolInImage), the resolved
-# address would BE the body-patched entry → the call would re-enter THIS hook →
-# the record would be emitted TWICE (the double-processing bug). Forwarding via
-# the raw syscall reaches the kernel directly, so a given stat() records EXACTLY
-# ONCE regardless of backend (interpose / bodypatch / both) and never re-enters.
+# WHY the forward MUST bypass the named entry: body-patch (always installed by
+# default) REPLACES the named stat/lstat/fstatat/access entry points. If this
+# hook forwarded via the by-name real (ct_macos_interpose_real_stat, which
+# resolves the symbol with dlsym / NSLookupSymbolInImage), the resolved address
+# would BE the body-patched entry → the call would re-enter THIS hook → the
+# record would be emitted TWICE (the double-processing bug). Forwarding via the
+# raw syscall reaches the kernel directly, so a given stat() records EXACTLY ONCE
+# regardless of which mechanism's entry it arrived through and never re-enters.
 # The *64 syscall variants fill the modern 64-bit-inode `struct stat` the caller
 # expects (see macos_interpose_runtime.nim).
 
@@ -498,8 +498,8 @@ proc repro_hook_renameat*(fromfd: cint; fromPath: cstring; tofd: cint;
 # subtree would run unmonitored (a FALSE SKIP). Body-patching the spawn-family
 # ENTRY points catches the internal caller and re-applies propagation + rewrite.
 #
-# Forwarding constraint (WHY each hook bypasses the named entry): under the
-# default `both` backend the body-patch has REPLACED the named
+# Forwarding constraint (WHY each hook bypasses the named entry): body-patch
+# (always installed by default) has REPLACED the named
 # fork/execve/posix_spawn symbols. If a hook forwarded through the named symbol
 # / dlsym (e.g. ct_macos_interpose_real_fork, which resolves via
 # NSLookupSymbolInImage), that address would BE the body-patched entry → the
@@ -734,18 +734,46 @@ proc repro_hook_posix_spawnp*(pid: ptr PidT; path: cstring;
 proc reproRuntimeInit() {.exportc.} =
   discard repro_monitor_shim_init(nil)
 
-# --- Body-patch backend selection + installation -------------------------
+# --- Monitoring mechanisms + DEBUG-ONLY per-mechanism diagnostic toggles ---
 #
-# IO_MON_MACOS_BACKEND selects the macOS monitoring backend:
-#   "both"      (default) — interpose stays installed (its static
-#                __DATA,__interpose section is always present) AND body-patch
-#                adds shared-cache-internal coverage.
-#   "bodypatch" — interpose section is still present (it is static and cannot
-#                be removed at runtime) but body-patch is also installed; in
-#                practice this is identical to "both" for capture purposes.
-#   "interpose" — legacy: skip the body-patch install entirely.
-# Any unrecognised value is treated as the default ("both") and a warning is
-# logged, so a typo degrades to MORE coverage, never less.
+# On macOS the shim ALWAYS runs BOTH monitoring mechanisms by default — there is
+# NO user-facing backend selector:
+#   * interpose  — the static `__DATA,__interpose` section is linked into the
+#                  shim unconditionally (it cannot be added or removed at
+#                  runtime), so dyld always rebinds the monitored binary's own
+#                  import stubs to the `repro_wrap_*` thunks.
+#   * body-patch — the constructor ALWAYS runs `installBodypatchHooks`, which
+#                  overwrites the libsystem syscall-wrapper entry points so that
+#                  shared-cache-INTERNAL callers (which interpose never sees) are
+#                  also captured.
+# The two are additive: a given call is recorded by exactly one mechanism at its
+# own layer, so the union is the full picture with no de-duplication needed.
+#
+# For DIAGNOSIS ONLY — and ONLY in NON-release (debug) builds — each mechanism
+# has its own opt-in disable toggle. They let a developer perform a clean A/B to
+# attribute a capture (or a regression) to a specific mechanism:
+#   * IO_MON_DEBUG_DISABLE_BODYPATCH=1 → skip the body-patch install entirely
+#     (→ interpose-only); proves which records come from interpose alone.
+#   * IO_MON_DEBUG_DISABLE_INTERPOSE=1 → keep the static `__interpose` section
+#     linked (it cannot be removed) but make the `repro_wrap_*` thunks STOP
+#     RECORDING: instead of calling the recording `repro_hook_*`, they forward to
+#     the REAL libsystem function via the (possibly body-patched) NAMED entry, so
+#     body-patch records the call if it is active and nothing is recorded if it
+#     is not. See `repro_interpose_disabled` in the C section for the exact
+#     mechanism and re-entrancy handling.
+#   * IO_MON_DEBUG_SKIP=<names> → comma-separated body-patch target names to skip
+#     installing (finer-grained body-patch diagnosis).
+# The clean A/B matrix these produce:
+#   * neither disabled (DEFAULT)      — both mechanisms record at their own layer.
+#   * body-patch disabled             — interpose only.
+#   * interpose disabled              — body-patch only.
+#   * both disabled                   — monitoring effectively off.
+#
+# RELEASE-vs-DEBUG GATING: every `IO_MON_DEBUG_*` env read is wrapped in
+# `when not defined(release)`. In a RELEASE build the reads are not compiled in,
+# the toggles are hard-wired off, and BOTH mechanisms are always on — so the
+# diagnostic knobs can never weaken a production capture. Adding a future
+# mechanism's toggle is a one-liner via `debugToggleEnabled` below.
 
 type BodypatchHookSpec = object
   names: seq[string]   ## libsystem symbol variants that share this ABI
@@ -763,20 +791,37 @@ proc shimLogToStderr(msg: string) {.raises: [].} =
     except IOError:
       discard
 
-proc bodypatchEnabled(): bool {.raises: [].} =
-  ## Returns true if the body-patch backend should be installed.
-  var backend = ""
-  withShimMuted:
-    backend = getEnv("IO_MON_MACOS_BACKEND", "both")
-  case backend
-  of "interpose":
-    false
-  of "both", "bodypatch":
-    true
+proc debugToggleEnabled(name: string): bool {.raises: [].} =
+  ## Read a DEBUG-ONLY per-mechanism diagnostic toggle (`name` is the full env
+  ## var, e.g. "IO_MON_DEBUG_DISABLE_BODYPATCH"). A toggle is honoured ONLY when
+  ## its env var is exactly "1". Single source of truth for every `IO_MON_DEBUG_*`
+  ## switch so adding a future mechanism's toggle is one call.
+  ##
+  ## RELEASE GATING: in a `-d:release` build the env read is NOT compiled in and
+  ## this ALWAYS returns false — both mechanisms stay on, the diagnostic knobs
+  ## have no effect, and a typo can never weaken a production capture.
+  when not defined(release):
+    var value = ""
+    withShimMuted:
+      value = getEnv(name)
+    result = value == "1"
   else:
-    shimLogToStderr("io-mon: unknown IO_MON_MACOS_BACKEND='" & backend &
-      "', defaulting to 'both'")
-    true
+    discard name
+    result = false
+
+proc setInterposeDisabledC(disabled: cint)
+  {.importc: "repro_macos_set_interpose_disabled", cdecl.}
+  ## Publish the interpose-disable diagnostic state to the C interpose thunks
+  ## (see `repro_interpose_disabled`). Called once from the constructor.
+
+proc setInterposeDisabled(disabled: bool) =
+  setInterposeDisabledC(if disabled: 1.cint else: 0.cint)
+
+proc bodypatchEnabled(): bool {.raises: [].} =
+  ## Returns true unless the body-patch mechanism is disabled for diagnosis via
+  ## the DEBUG-only `IO_MON_DEBUG_DISABLE_BODYPATCH` toggle (always true in a
+  ## release build — body-patch is unconditionally installed there).
+  not debugToggleEnabled("IO_MON_DEBUG_DISABLE_BODYPATCH")
 
 proc reproBodypatchOpenHookAddr(): pointer
     {.importc: "repro_macos_bodypatch_open_hook_addr_fn", cdecl.}
@@ -799,8 +844,20 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
   ## before any monitored thread starts), so the patcher's registry is
   ## race-free. Every failure is non-fatal: a reduced/empty capture degrades to
   ## "re-run" downstream, never a false skip.
+  #
+  # Publish the interpose-disable diagnostic state to the C thunks FIRST, while
+  # still single-threaded in the constructor (before main / any monitored
+  # thread). In release this is always false (the toggle is compiled out), so the
+  # interpose thunks always record. When true (debug + IO_MON_DEBUG_DISABLE_INTERPOSE)
+  # the `repro_wrap_*` thunks forward to the named entry without recording, so
+  # only body-patch (if installed) contributes records.
+  setInterposeDisabled(debugToggleEnabled("IO_MON_DEBUG_DISABLE_INTERPOSE"))
+
   if not bodypatchEnabled():
-    shimLogToStderr("io-mon: macOS backend=interpose (body-patch skipped)")
+    # DEBUG-only diagnostic state (IO_MON_DEBUG_DISABLE_BODYPATCH): body-patch is
+    # skipped so only the static interpose mechanism records. In release builds
+    # `bodypatchEnabled` is always true, so this branch is unreachable there.
+    shimLogToStderr("io-mon: macOS body-patch not installed [debug] body-patch disabled")
     return
 
   # Each spec lists the distinct named entry points that share one ABI and
@@ -813,7 +870,7 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
   # variadic args on the stack) ONLY when `O_CREAT` requires it — and NOT the
   # fixed-3-arg `repro_hook_open(at)`, which would read `mode` from register x2
   # (garbage) and create `O_CREAT` files with a corrupt permission mode. That
-  # corruption is the `IO_MON_MACOS_BACKEND=both` nimcache `Permission denied`
+  # corruption is the body-patch nimcache `Permission denied`
   # defect: `fopen("...","w")` inside libsystem (a shared-cache-internal caller
   # interpose never sees) passes `mode=0666` on the stack, so the fixed-arg hook
   # mis-created the `.nim.c` `0404` and the compiler's later read got EACCES. The
@@ -879,11 +936,15 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
   # Diagnostic gate: IO_MON_DEBUG_SKIP is a comma-separated list of body-patch
   # target names to SKIP installing (e.g. "posix_spawn,posix_spawnp,fork"). It
   # exists for root-causing host-specific body-patch faults; an empty/unset value
-  # installs everything. It never relaxes safety (skipping only REDUCES capture,
-  # which degrades to a fail-safe re-run, never a false skip).
+  # installs everything. Like the other IO_MON_DEBUG_* knobs it is honoured ONLY
+  # in NON-release builds (the read is compiled out under -d:release), so it can
+  # never relax a production capture. Even in debug it never relaxes safety
+  # (skipping only REDUCES capture, which degrades to a fail-safe re-run, never a
+  # false skip).
   var debugSkip = ""
-  withShimMuted:
-    debugSkip = getEnv("IO_MON_DEBUG_SKIP", "")
+  when not defined(release):
+    withShimMuted:
+      debugSkip = getEnv("IO_MON_DEBUG_SKIP", "")
   proc skipped(name: string): bool =
     debugSkip.len > 0 and (name in debugSkip.split(','))
 
@@ -922,18 +983,76 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
       cast[pointer](repro_hook_posix_spawnp), addr bodypatchPosixSpawnpTramp,
       addr installed, addr failed, addr absent)
 
+  # In NON-release builds, if interpose has been disabled for diagnosis
+  # (IO_MON_DEBUG_DISABLE_INTERPOSE), append a clear note so the A/B state is
+  # visible in the banner. The static `__interpose` section stays linked; the
+  # note means its `repro_wrap_*` thunks forward to the named entry WITHOUT
+  # recording (body-patch records instead). In release builds the toggle is a
+  # no-op and this note never appears.
+  var interposeNote = ""
+  when not defined(release):
+    if debugToggleEnabled("IO_MON_DEBUG_DISABLE_INTERPOSE"):
+      interposeNote = " [debug] interpose disabled"
+
   shimLogToStderr("io-mon: macOS body-patch installed=" & $installed &
     " failed=" & $failed & " absent=" & $absent &
     " fork_tramp=" & (if bodypatchForkTramp != nil: "ok" else: "skip") &
     " spawn_tramp=" & (if bodypatchPosixSpawnTramp != nil: "ok" else: "skip") &
     " spawnp_tramp=" &
-      (if bodypatchPosixSpawnpTramp != nil: "ok" else: "skip"))
+      (if bodypatchPosixSpawnpTramp != nil: "ok" else: "skip") &
+    interposeNote)
 
 {.emit: """
 static int repro_monitor_runtime_ready = 0;
 extern void NimMain(void);
 extern void repro_monitor_install_bodypatch(void);
 extern int repro_monitor_shim_flush(void);
+extern void *repro_macos_resolve_libsystem_symbol(const char *symbol);
+
+/*
+ * Interpose-DISABLE diagnostic state (debug-only; see the Nim section's
+ * `debugToggleEnabled` / IO_MON_DEBUG_DISABLE_INTERPOSE). When set, the
+ * `repro_wrap_*` interpose thunks STOP RECORDING: instead of calling the
+ * recording `repro_hook_*`, the OUTERMOST thunk invocation forwards to the REAL
+ * libsystem function at its resolved entry ADDRESS (which body-patch overwrites
+ * in place). Effect:
+ *   * body-patch active  → the forward lands on the patched entry → body-patch
+ *                          records the call (interpose contributes nothing).
+ *   * body-patch disabled→ the forward lands on genuine libsystem → NO record
+ *                          (monitoring effectively off for this call).
+ * The static `__DATA,__interpose` section cannot be removed at runtime, so this
+ * is how "interpose disabled" is realised: the section stays linked but its
+ * thunks become non-recording pass-throughs. In RELEASE builds the toggle is
+ * compiled out and this flag stays 0 (both mechanisms always record).
+ *
+ * `repro_wrap_reentry` is a per-thread guard that breaks the open-family loop:
+ * for open/openat the body-patch hook IS `repro_wrap_open`/`repro_wrap_openat`,
+ * so forwarding to the patched `_open` re-enters the SAME thunk. The guard makes
+ * the re-entry (depth > 0) fall through to the recording `repro_hook_*` (that IS
+ * the body-patch recording), so a single call records exactly once and never
+ * loops. For the other families the body-patch hook is a distinct `repro_hook_*`
+ * that never re-enters the wrapper, so the guard simply stays balanced.
+ */
+static int repro_interpose_disabled = 0;
+static __thread int repro_wrap_reentry = 0;
+
+void repro_macos_set_interpose_disabled(int value) {
+  repro_interpose_disabled = value ? 1 : 0;
+}
+
+/*
+ * Forward an interposed call to the REAL libsystem function via its resolved
+ * entry ADDRESS (NOT the named symbol reference, which could be re-interposed,
+ * and NOT a raw syscall, which would bypass the body-patch entry and so never
+ * let body-patch record). Returns 1 if `*out_fn` was populated, 0 if the symbol
+ * could not be resolved (the caller then degrades to the normal recording hook).
+ * The resolved pointer is cached per symbol (resolution is a dyld image walk;
+ * this path is debug-only, but caching keeps repeated calls cheap and the cache
+ * is written single-threaded-equivalently — a benign racey re-resolve yields the
+ * same address).
+ */
+#define REPRO_INTERPOSE_FORWARD_BEGIN \
+  (repro_interpose_disabled && repro_wrap_reentry == 0)
 
 /*
  * Threaded-write capture: why the flush is SYNCHRONOUS (in emitRecord), not a
@@ -972,6 +1091,45 @@ typedef int (*repro_real_posix_spawn_fn)(pid_t *, const char *,
   const posix_spawn_file_actions_t *, const posix_spawnattr_t *,
   char *const [], char *const []);
 
+/*
+ * Cached libsystem entry-address resolvers for the interpose-disable forward.
+ * Each returns the patched-in-place libsystem entry for its symbol (or NULL if
+ * unresolved), via the shared shim-skipping resolver. Used ONLY on the debug-only
+ * interpose-disabled path; the cache makes repeated calls cheap.
+ */
+typedef int (*repro_open_var_fn)(const char *, int, ...);
+typedef ssize_t (*repro_rw_fn)(int, void *, size_t);
+typedef int (*repro_close_fn)(int);
+
+static repro_open_var_fn repro_libsystem_open(void) {
+  static repro_open_var_fn fn = NULL;
+  if (!fn) fn = (repro_open_var_fn)repro_macos_resolve_libsystem_symbol("_open");
+  return fn;
+}
+static int (*repro_libsystem_openat_fn)(int, const char *, int, ...) = NULL;
+static int repro_libsystem_openat_call(int dirfd, const char *p, int fl, int m) {
+  if (!repro_libsystem_openat_fn)
+    repro_libsystem_openat_fn = (int (*)(int, const char *, int, ...))
+      repro_macos_resolve_libsystem_symbol("_openat");
+  if (!repro_libsystem_openat_fn) return -1;
+  return repro_libsystem_openat_fn(dirfd, p, fl, m);
+}
+static repro_rw_fn repro_libsystem_read(void) {
+  static repro_rw_fn fn = NULL;
+  if (!fn) fn = (repro_rw_fn)repro_macos_resolve_libsystem_symbol("_read");
+  return fn;
+}
+static repro_rw_fn repro_libsystem_write(void) {
+  static repro_rw_fn fn = NULL;
+  if (!fn) fn = (repro_rw_fn)repro_macos_resolve_libsystem_symbol("_write");
+  return fn;
+}
+static repro_close_fn repro_libsystem_close(void) {
+  static repro_close_fn fn = NULL;
+  if (!fn) fn = (repro_close_fn)repro_macos_resolve_libsystem_symbol("_close");
+  return fn;
+}
+
 static int repro_wrap_open(const char *path, int flags, ...) {
   int mode = 0;
   if (flags & O_CREAT) {
@@ -982,6 +1140,19 @@ static int repro_wrap_open(const char *path, int flags, ...) {
   }
   if (!repro_monitor_runtime_ready) {
     return (int)syscall(SYS_open, path, flags, mode);
+  }
+  /* Interpose disabled (debug A/B): forward to the libsystem open entry (which
+   * body-patch may have replaced) WITHOUT recording here. Pass `mode` as a
+   * variadic arg so the arm64 Apple ABI places it on the STACK exactly where a
+   * va_arg reader expects it (see the open-mode rationale below). */
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    repro_open_var_fn fn = repro_libsystem_open();
+    if (fn) {
+      repro_wrap_reentry++;
+      int r = fn(path, flags, mode);
+      repro_wrap_reentry--;
+      return r;
+    }
   }
   return repro_hook_open((char *)path, flags, mode);
 }
@@ -997,12 +1168,27 @@ static int repro_wrap_openat(int dirfd, const char *path, int flags, ...) {
   if (!repro_monitor_runtime_ready) {
     return (int)syscall(SYS_openat, dirfd, path, flags, mode);
   }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    repro_wrap_reentry++;
+    int r = repro_libsystem_openat_call(dirfd, path, flags, mode);
+    repro_wrap_reentry--;
+    return r;
+  }
   return repro_hook_openat(dirfd, (char *)path, flags, mode);
 }
 
 static ssize_t repro_wrap_read(int fd, void *buf, size_t count) {
   if (!repro_monitor_runtime_ready) {
     return syscall(SYS_read, fd, buf, count);
+  }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    repro_rw_fn fn = repro_libsystem_read();
+    if (fn) {
+      repro_wrap_reentry++;
+      ssize_t r = fn(fd, buf, count);
+      repro_wrap_reentry--;
+      return r;
+    }
   }
   return repro_hook_read(fd, buf, count);
 }
@@ -1011,6 +1197,15 @@ static ssize_t repro_wrap_write(int fd, const void *buf, size_t count) {
   if (!repro_monitor_runtime_ready) {
     return syscall(SYS_write, fd, buf, count);
   }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    repro_rw_fn fn = repro_libsystem_write();
+    if (fn) {
+      repro_wrap_reentry++;
+      ssize_t r = fn(fd, (void *)buf, count);
+      repro_wrap_reentry--;
+      return r;
+    }
+  }
   return repro_hook_write(fd, (void *)buf, count);
 }
 
@@ -1018,13 +1213,49 @@ static int repro_wrap_close(int fd) {
   if (!repro_monitor_runtime_ready) {
     return (int)syscall(SYS_close, fd);
   }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    repro_close_fn fn = repro_libsystem_close();
+    if (fn) {
+      repro_wrap_reentry++;
+      int r = fn(fd);
+      repro_wrap_reentry--;
+      return r;
+    }
+  }
   return repro_hook_close(fd);
 }
+
+/* Cached libsystem entry-address resolvers for the remaining wrap families
+ * (interpose-disable forward). Each lands on the patched-in-place body-patch
+ * entry when body-patch is active, or genuine libsystem when it is not — both
+ * bypassing the __interpose tuple. */
+static DIR *(*repro_libsystem_opendir_fn)(const char *) = NULL;
+static struct dirent *(*repro_libsystem_readdir_fn)(DIR *) = NULL;
+static int (*repro_libsystem_closedir_fn)(DIR *) = NULL;
+static int (*repro_libsystem_stat_fn)(const char *, struct stat *) = NULL;
+static int (*repro_libsystem_lstat_fn)(const char *, struct stat *) = NULL;
+static pid_t (*repro_libsystem_fork_fn)(void) = NULL;
+static int (*repro_libsystem_rename_fn)(const char *, const char *) = NULL;
+static int (*repro_libsystem_renameat_fn)(int, const char *, int,
+                                          const char *) = NULL;
+static int (*repro_libsystem_execve_fn)(const char *, char *const [],
+                                        char *const []) = NULL;
 
 static DIR *repro_wrap_opendir(const char *path) {
   if (!repro_monitor_runtime_ready) {
     repro_real_opendir_fn real_fn = (repro_real_opendir_fn)dlsym(RTLD_NEXT, "opendir");
     return real_fn(path);
+  }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    if (!repro_libsystem_opendir_fn)
+      repro_libsystem_opendir_fn = (DIR *(*)(const char *))
+        repro_macos_resolve_libsystem_symbol("_opendir");
+    if (repro_libsystem_opendir_fn) {
+      repro_wrap_reentry++;
+      DIR *r = repro_libsystem_opendir_fn(path);
+      repro_wrap_reentry--;
+      return r;
+    }
   }
   return (DIR *)repro_hook_opendir((char *)path);
 }
@@ -1034,6 +1265,17 @@ static struct dirent *repro_wrap_readdir(DIR *dirp) {
     repro_real_readdir_fn real_fn = (repro_real_readdir_fn)dlsym(RTLD_NEXT, "readdir");
     return real_fn(dirp);
   }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    if (!repro_libsystem_readdir_fn)
+      repro_libsystem_readdir_fn = (struct dirent *(*)(DIR *))
+        repro_macos_resolve_libsystem_symbol("_readdir");
+    if (repro_libsystem_readdir_fn) {
+      repro_wrap_reentry++;
+      struct dirent *r = repro_libsystem_readdir_fn(dirp);
+      repro_wrap_reentry--;
+      return r;
+    }
+  }
   return (struct dirent *)repro_hook_readdir(dirp);
 }
 
@@ -1041,6 +1283,17 @@ static int repro_wrap_closedir(DIR *dirp) {
   if (!repro_monitor_runtime_ready) {
     repro_real_closedir_fn real_fn = (repro_real_closedir_fn)dlsym(RTLD_NEXT, "closedir");
     return real_fn(dirp);
+  }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    if (!repro_libsystem_closedir_fn)
+      repro_libsystem_closedir_fn = (int (*)(DIR *))
+        repro_macos_resolve_libsystem_symbol("_closedir");
+    if (repro_libsystem_closedir_fn) {
+      repro_wrap_reentry++;
+      int r = repro_libsystem_closedir_fn(dirp);
+      repro_wrap_reentry--;
+      return r;
+    }
   }
   return repro_hook_closedir(dirp);
 }
@@ -1053,6 +1306,17 @@ static int repro_wrap_stat(const char *path, struct stat *buf) {
     return (int)syscall(SYS_stat, path, buf);
 #endif
   }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    if (!repro_libsystem_stat_fn)
+      repro_libsystem_stat_fn = (int (*)(const char *, struct stat *))
+        repro_macos_resolve_libsystem_symbol("_stat");
+    if (repro_libsystem_stat_fn) {
+      repro_wrap_reentry++;
+      int r = repro_libsystem_stat_fn(path, buf);
+      repro_wrap_reentry--;
+      return r;
+    }
+  }
   return repro_hook_stat((char *)path, buf);
 }
 
@@ -1064,6 +1328,17 @@ static int repro_wrap_lstat(const char *path, struct stat *buf) {
     return (int)syscall(SYS_lstat, path, buf);
 #endif
   }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    if (!repro_libsystem_lstat_fn)
+      repro_libsystem_lstat_fn = (int (*)(const char *, struct stat *))
+        repro_macos_resolve_libsystem_symbol("_lstat");
+    if (repro_libsystem_lstat_fn) {
+      repro_wrap_reentry++;
+      int r = repro_libsystem_lstat_fn(path, buf);
+      repro_wrap_reentry--;
+      return r;
+    }
+  }
   return repro_hook_lstat((char *)path, buf);
 }
 
@@ -1072,12 +1347,34 @@ static pid_t repro_wrap_fork(void) {
     repro_real_fork_fn real_fn = (repro_real_fork_fn)dlsym(RTLD_NEXT, "fork");
     return real_fn();
   }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    if (!repro_libsystem_fork_fn)
+      repro_libsystem_fork_fn = (pid_t (*)(void))
+        repro_macos_resolve_libsystem_symbol("_fork");
+    if (repro_libsystem_fork_fn) {
+      repro_wrap_reentry++;
+      pid_t r = repro_libsystem_fork_fn();
+      repro_wrap_reentry--;
+      return r;
+    }
+  }
   return repro_hook_fork();
 }
 
 static int repro_wrap_rename(const char *from, const char *to) {
   if (!repro_monitor_runtime_ready) {
     return (int)syscall(SYS_rename, from, to);
+  }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    if (!repro_libsystem_rename_fn)
+      repro_libsystem_rename_fn = (int (*)(const char *, const char *))
+        repro_macos_resolve_libsystem_symbol("_rename");
+    if (repro_libsystem_rename_fn) {
+      repro_wrap_reentry++;
+      int r = repro_libsystem_rename_fn(from, to);
+      repro_wrap_reentry--;
+      return r;
+    }
   }
   return repro_hook_rename((char *)from, (char *)to);
 }
@@ -1087,6 +1384,17 @@ static int repro_wrap_renameat(int fromfd, const char *from, int tofd,
   if (!repro_monitor_runtime_ready) {
     return (int)syscall(SYS_renameat, fromfd, from, tofd, to);
   }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    if (!repro_libsystem_renameat_fn)
+      repro_libsystem_renameat_fn = (int (*)(int, const char *, int,
+        const char *))repro_macos_resolve_libsystem_symbol("_renameat");
+    if (repro_libsystem_renameat_fn) {
+      repro_wrap_reentry++;
+      int r = repro_libsystem_renameat_fn(fromfd, from, tofd, to);
+      repro_wrap_reentry--;
+      return r;
+    }
+  }
   return repro_hook_renameat(fromfd, (char *)from, tofd, (char *)to);
 }
 
@@ -1094,8 +1402,22 @@ static int repro_wrap_execve(const char *path, char *const argv[], char *const e
   if (!repro_monitor_runtime_ready) {
     return (int)syscall(SYS_execve, path, argv, envp);
   }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    if (!repro_libsystem_execve_fn)
+      repro_libsystem_execve_fn = (int (*)(const char *, char *const [],
+        char *const []))repro_macos_resolve_libsystem_symbol("_execve");
+    if (repro_libsystem_execve_fn) {
+      repro_wrap_reentry++;
+      int r = repro_libsystem_execve_fn(path, argv, envp);
+      repro_wrap_reentry--;
+      return r;
+    }
+  }
   return repro_hook_execve((char *)path, (char **)argv, (char **)envp);
 }
+
+static repro_real_posix_spawn_fn repro_libsystem_posix_spawn_fn = NULL;
+static repro_real_posix_spawn_fn repro_libsystem_posix_spawnp_fn = NULL;
 
 static int repro_wrap_posix_spawn(pid_t *pid, const char *path,
   const posix_spawn_file_actions_t *file_actions,
@@ -1105,6 +1427,18 @@ static int repro_wrap_posix_spawn(pid_t *pid, const char *path,
     repro_real_posix_spawn_fn real_fn =
       (repro_real_posix_spawn_fn)dlsym(RTLD_NEXT, "posix_spawn");
     return real_fn(pid, path, file_actions, attrp, argv, envp);
+  }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    if (!repro_libsystem_posix_spawn_fn)
+      repro_libsystem_posix_spawn_fn = (repro_real_posix_spawn_fn)
+        repro_macos_resolve_libsystem_symbol("_posix_spawn");
+    if (repro_libsystem_posix_spawn_fn) {
+      repro_wrap_reentry++;
+      int r = repro_libsystem_posix_spawn_fn(pid, path, file_actions, attrp,
+        argv, envp);
+      repro_wrap_reentry--;
+      return r;
+    }
   }
   return repro_hook_posix_spawn(pid, (char *)path, (void *)file_actions,
     (void *)attrp, (char **)argv, (char **)envp);
@@ -1118,6 +1452,18 @@ static int repro_wrap_posix_spawnp(pid_t *pid, const char *path,
     repro_real_posix_spawn_fn real_fn =
       (repro_real_posix_spawn_fn)dlsym(RTLD_NEXT, "posix_spawnp");
     return real_fn(pid, path, file_actions, attrp, argv, envp);
+  }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    if (!repro_libsystem_posix_spawnp_fn)
+      repro_libsystem_posix_spawnp_fn = (repro_real_posix_spawn_fn)
+        repro_macos_resolve_libsystem_symbol("_posix_spawnp");
+    if (repro_libsystem_posix_spawnp_fn) {
+      repro_wrap_reentry++;
+      int r = repro_libsystem_posix_spawnp_fn(pid, path, file_actions, attrp,
+        argv, envp);
+      repro_wrap_reentry--;
+      return r;
+    }
   }
   return repro_hook_posix_spawnp(pid, (char *)path, (void *)file_actions,
     (void *)attrp, (char **)argv, (char **)envp);
@@ -1146,7 +1492,7 @@ static int repro_wrap_posix_spawnp(pid_t *pid, const char *path,
  * CREATES the file with a corrupt permission mode (e.g. fopen(p,"w") yielding
  * 0404 instead of 0644), so the compiler's later read of its own just-written
  * nimcache .nim.c fails with EACCES ("Permission denied") -- the exact
- * IO_MON_MACOS_BACKEND=both defect. The interpose path never hit this because
+ * body-patch defect. The interpose path never hit this because
  * repro_wrap_open already reads mode via va_arg (stack-correct); only the
  * body-patched shared-cache-internal callers were affected.
  *

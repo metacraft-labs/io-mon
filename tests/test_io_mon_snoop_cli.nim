@@ -21,7 +21,7 @@
 ## shared-cache-internally (inside libsystem_c, via `open$NOCANCEL`). The
 ## legacy `__DATA,__interpose` mechanism alone does NOT intercept that internal
 ## open — interpose only rewrites the binary's own import bindings. The
-## body-patch backend (default `IO_MON_MACOS_BACKEND=both`) closes that gap by
+## body-patch mechanism (always on by default) closes that gap by
 ## replacing the libsystem open-family entry points themselves
 ## (`mach_vm_remap` overwrite technique), so the snoop CLI now captures the
 ## input read on macOS too. This test therefore asserts the POSITIVE capture on
@@ -119,14 +119,14 @@ suite "io-mon CLI (M8)":
     when defined(macosx):
       # macOS: the __DATA,__interpose mechanism alone does NOT intercept the
       # fopen-internal (shared-cache-internal) open the fixture performs. That
-      # gap is now CLOSED by the body-patch backend, which the snoop CLI enables
-      # by default (IO_MON_MACOS_BACKEND=both): it replaces the libsystem
+      # gap is now CLOSED by the body-patch mechanism, which the shim always runs
+      # by default (both mechanisms on): it replaces the libsystem
       # open/open$NOCANCEL/__open_nocancel entry points themselves and so sees
       # the internal open regardless of caller. The user-binary read MUST now be
       # captured. (See tests/test_io_mon_macos_bodypatch.nim for the focused
       # interpose-vs-body-patch contrast.)
       checkpoint("macOS host: capturedInputRead=" & $capturedInputRead &
-        " (body-patch backend closes the interpose internal-call gap)")
+        " (body-patch closes the interpose internal-call gap)")
       check capturedInputRead
     else:
       # Linux / Windows: LD_PRELOAD / CreateRemoteThread are expected to capture
