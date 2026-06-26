@@ -31,3 +31,4 @@ tests/test_io_mon_macos_symlink
 tests/test_io_mon_macos_setexec
 tests/test_io_mon_macos_ipc_breakaway
 tests/test_io_mon_macos_library_load
+tests/test_io_mon_macos_endpoint_security

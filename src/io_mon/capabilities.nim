@@ -39,6 +39,17 @@ const
   }
 
   MacosInterposeKnownUnsupportedCapabilities* = {
+    # T3c (adversarial-hardening break #6): the EndpointSecurity backend is now
+    # DESIGNED + FEASIBILITY-PROBED + SKELETONED — see
+    # reprobuild-specs/MacOS-EndpointSecurity-Backend.md and the integration stub
+    # at src/io_mon/backends/endpoint_security.nim (behind the off-by-default
+    # `-d:ioMonEndpointSecurity` define). It stays UNSUPPORTED here until the
+    # entitled production client ships, because the kernel-sourced ES client
+    # requires the Apple-granted endpoint-security.client entitlement + signing/
+    # notarization + root (none available on a dev machine; proven by the on-host
+    # feasibility probe: es_new_client → ERR_NOT_PRIVILEGED, AMFI-kill of an
+    # ad-hoc-entitled binary). Until then, T0 earned-completeness keeps the
+    # interpose backend's break-#6 default conservative.
     mcapEndpointSecurity,
     mcapHybrid,
     mcapAuthorizationEnforcement,
@@ -171,7 +182,12 @@ proc parseCapabilityList(value: string): set[MonitorCapability] =
 proc unsupportedReason(capability: MonitorCapability): string =
   case capability
   of mcapEndpointSecurity:
-    "EndpointSecurity backend is not implemented in M14; future native backend"
+    # Designed + skeletoned under T3c (MacOS-EndpointSecurity-Backend.md;
+    # src/io_mon/backends/endpoint_security.nim, behind -d:ioMonEndpointSecurity).
+    # Still unsupported here: the production client needs the Apple-granted
+    # endpoint-security.client entitlement + signing/notarization + root.
+    "EndpointSecurity backend is designed + skeletoned (T3c) but not yet shipped; " &
+      "production client is gated on the Apple endpoint-security.client entitlement"
   of mcapHybrid:
     "hybrid EndpointSecurity plus interpose profile is not implemented in M14"
   of mcapRename:

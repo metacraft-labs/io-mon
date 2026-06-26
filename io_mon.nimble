@@ -128,6 +128,18 @@ task test, "Run the io-mon test suite":
   # /tmp-built dependent dylib are captured while libSystem is NOT (no flood).
   # macOS-only (no-op pass elsewhere).
   exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_library_load.nim"
+  # T3c EndpointSecurity backend SKELETON (adversarial hardening #6, the residual
+  # raw-syscall / XPC gap the in-process interpose backend structurally cannot
+  # see): unit coverage for the pure, SDK-free logic the production ES backend is
+  # built on — the process-subtree filter (ES is system-global; keep only the
+  # build's root pid + FORK/EXEC descendants), the global_seq_num event-loss
+  # detector (a drop → mrEventLoss → mcIncomplete, reusing the T0 machinery), and
+  # the ES-event → existing-RMDF-record mapping (no new wire-format enum). Also
+  # asserts the default-build backend is an HONEST design stub (refuses to start).
+  # The entitlement-restricted ES client is behind the off-by-default
+  # `-d:ioMonEndpointSecurity` define and is NOT exercised here. Platform-
+  # independent. See reprobuild-specs/MacOS-EndpointSecurity-Backend.md.
+  exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_endpoint_security.nim"
 
 task buildShim, "Build the io-mon interpose shim shared library":
   # Produces build/lib/librepro_monitor_shim.{dylib,so,dll} — the drop-in
