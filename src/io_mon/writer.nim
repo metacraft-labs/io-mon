@@ -292,27 +292,58 @@ proc decodeFrames*(bytes: openArray[byte]): seq[MonitorRecord] =
     result.add decodeRecordPayload(bytes.toOpenArray(pos, pos + length - 1))
     pos += length
 
-proc decodeFramesTolerant*(bytes: openArray[byte]): seq[MonitorRecord] =
+proc decodeFramesTolerant*(bytes: openArray[byte]; cleanEof: var bool):
+    seq[MonitorRecord] =
   ## DSL-port M9.R.15c.1 — like ``decodeFrames`` but stops at the first
   ## truncated trailing frame instead of raising. This is the crash-
   ## recovery path: a SIGKILL between ``writeBuffer`` and ``flushFile``
   ## may leave the fragment with a partial length-prefix or partial
   ## payload at the tail. Every complete frame ahead of it remains
   ## byte-identical to what the producer wrote.
+  ##
+  ## ``cleanEof`` reports whether decoding consumed the WHOLE buffer with
+  ## no leftover bytes. ``false`` means the fragment ended with bytes that
+  ## could not be decoded as a complete frame — a partial RMDF write (e.g.
+  ## a SIGKILL'd shim) or outright corruption. Per Monitor-Hook-Shim.md
+  ## §"Failure Semantics" ("partial RMDF writes MUST fail reader
+  ## validation"; "shim crash MUST reject cache publication"), the caller
+  ## MUST treat ``cleanEof == false`` as monitor-evidence incompleteness so
+  ## the action fails closed and is not published to the cache. We still
+  ## recover every complete leading frame so diagnostics/streaming can show
+  ## what was captured before the truncation point.
+  cleanEof = true
   var pos = 0
   while pos < bytes.len:
     if pos + 4 > bytes.len:
+      # A trailing run of < 4 bytes can never form a frame's length
+      # prefix: the producer was cut mid-write. Surface as not-clean.
+      cleanEof = false
       break
     var lengthCursor = pos
     let length = int(readU32Le(bytes, lengthCursor))
     if length <= 0 or lengthCursor + length > bytes.len:
+      # Either a non-positive/garbage length (corruption) or a length
+      # prefix promising more payload bytes than remain (truncated tail).
+      # Both leave the fragment not cleanly consumed.
+      cleanEof = false
       break
     try:
       result.add decodeRecordPayload(
         bytes.toOpenArray(lengthCursor, lengthCursor + length - 1))
     except EnvelopeError:
+      # A length that points at a payload the codec rejects is corruption,
+      # not a clean tail truncation. Stop and flag incompleteness.
+      cleanEof = false
       break
     pos = lengthCursor + length
+
+proc decodeFramesTolerant*(bytes: openArray[byte]): seq[MonitorRecord] =
+  ## Backwards-compatible overload that discards the clean-EOF signal.
+  ## Prefer the ``cleanEof``-aware overload on any path that decides cache
+  ## publication; this one is for callers that only want the recovered
+  ## records (e.g. record-level parity assertions).
+  var cleanEof: bool
+  decodeFramesTolerant(bytes, cleanEof)
 
 proc fragmentPath*(fragmentDir: string; osPid, threadId: uint64): string =
   fragmentDir / ("repro-monitor-" & $osPid & "-" & $threadId & ".rmdf-frag")
@@ -498,13 +529,21 @@ proc readFragmentRecords*(path: string): seq[MonitorRecord] =
   let raw = readFile(extendedPath(path)).toBytes()
   decodeFrames(raw)
 
-proc readFragmentRecordsTolerant*(path: string): seq[MonitorRecord] =
+proc readFragmentRecordsTolerant*(path: string; cleanEof: var bool):
+    seq[MonitorRecord] =
   ## DSL-port M9.R.15c.1 — crash-recovery sibling of
   ## ``readFragmentRecords``. Stops at the first truncated frame
   ## instead of raising, so a SIGKILL'd producer's fragment can still
-  ## be merged into the canonical depfile.
+  ## be merged into the canonical depfile. ``cleanEof`` reports whether
+  ## the fragment decoded fully (see ``decodeFramesTolerant``); a
+  ## ``false`` value MUST block cache publication (fail-closed).
   let raw = readFile(extendedPath(path)).toBytes()
-  decodeFramesTolerant(raw)
+  decodeFramesTolerant(raw, cleanEof)
+
+proc readFragmentRecordsTolerant*(path: string): seq[MonitorRecord] =
+  ## Records-only overload; discards the clean-EOF signal.
+  var cleanEof: bool
+  readFragmentRecordsTolerant(path, cleanEof)
 
 proc canonicalOrder(a, b: MonitorRecord): int =
   result = cmp(a.osPid, b.osPid)
@@ -577,6 +616,16 @@ proc mergeFragments*(fragmentDir, outputPath: string): MonitorDepFile =
   # frame (if any).
   closeFragmentSlot()
   var records: seq[MonitorRecord] = @[]
+  # Fail-closed accounting: any fragment that does not decode cleanly to EOF
+  # is a partial or corrupt RMDF write. Per Monitor-Hook-Shim.md §"Failure
+  # Semantics" ("partial RMDF writes MUST fail reader validation"; "shim
+  # crash MUST reject cache publication"; "successful child exit MUST NOT
+  # hide monitor failure"), such evidence MUST NOT be published. We surface
+  # it in-band as event-loss so the existing completeness machinery
+  # (``summarizeRecords`` → ``depFileFromRecords``) marks the depfile
+  # ``mcIncomplete``, which the build engine already rejects for caching.
+  # Recovered complete frames are still kept for diagnostics/streaming.
+  var corruptFragments = 0
   if dirExists(extendedPath(fragmentDir)):
     for kind, path in walkDir(extendedPath(fragmentDir)):
       if kind == pcFile and path.endsWith(".rmdf-frag"):
@@ -589,9 +638,19 @@ proc mergeFragments*(fragmentDir, outputPath: string): MonitorDepFile =
         # monitored run on a benign cleanup race). OSError covers a directory
         # entry that disappeared underneath the walk.
         try:
-          records.add readFragmentRecordsTolerant(path)
+          var cleanEof = true
+          records.add readFragmentRecordsTolerant(path, cleanEof)
+          if not cleanEof:
+            inc corruptFragments
         except IOError, OSError:
           discard
+  if corruptFragments > 0:
+    # One synthetic event-loss record per corrupt fragment. ``mrEventLoss``
+    # makes ``summarizeRecords`` count event loss, forcing ``mcIncomplete``.
+    for _ in 0 ..< corruptFragments:
+      records.add MonitorRecord(kind: mrEventLoss,
+        observationKind: moEventLoss,
+        detail: "corrupt or partial RMDF fragment in " & fragmentDir)
   records.add profileRecords(defaultHooksMonitorProfile(
     MacosMonitorShimTaxonomyCapabilities))
 

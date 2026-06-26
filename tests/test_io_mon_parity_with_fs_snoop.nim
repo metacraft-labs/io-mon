@@ -207,12 +207,53 @@ suite "io-mon parity with fs-snoop (record/encode/decode level)":
     bytes.add("\xff\xff\xff\xff\x00\x00")
     writeFile(fragFile, bytes)
 
-    let recovered = readFragmentRecordsTolerant(fragFile)
+    var cleanEof = true
+    let recovered = readFragmentRecordsTolerant(fragFile, cleanEof)
     var recoveredReads: HashSet[string]
     for r in recovered:
       if r.kind == mrFileRead:
         recoveredReads.incl r.path
     check recoveredReads == toHashSet(reads)
+    # The complete leading frames are recovered, but the truncated tail means
+    # the fragment did NOT decode cleanly to EOF — the fail-closed signal that
+    # blocks cache publication (Monitor-Hook-Shim.md §"Failure Semantics":
+    # "partial RMDF writes MUST fail reader validation").
+    check not cleanEof
+
+  test "merge fails closed on a corrupt fragment (incomplete evidence)":
+    # Fail-closed contract (Monitor-Hook-Shim.md §"Failure Semantics":
+    # "partial RMDF writes MUST fail reader validation"; "shim crash MUST
+    # reject cache publication"; "successful child exit MUST NOT hide monitor
+    # failure"). A fragment that does not decode cleanly — e.g. a shim that
+    # crashed before writing any complete frame, leaving garbage — MUST make
+    # the merged depfile ``mcIncomplete`` so the build engine refuses to
+    # publish the action to the cache and re-executes it on the next run.
+    let root = createTempDir("io-mon-corrupt-frag", "")
+    defer: removeDir(root)
+    let fragDir = root / "frag"
+    createDir(fragDir)
+
+    # Write a single complete, valid fragment so the merge has real evidence,
+    # then drop a wholly-corrupt fragment alongside it.
+    var rec = readRecord(1'u64, root / "good-input")
+    appendFragmentRecord(fragDir, rec)
+    closeFragmentSlot()
+    writeFile(fragDir / "corrupt.rmdf-frag", "not an RMDF fragment")
+
+    let dep = mergeFragments(fragDir, root / "merged.rdep")
+    check dep.completeness == mcIncomplete
+    check dep.summary.eventLossCount >= 1'u64
+    # The valid fragment's record is still recovered for diagnostics.
+    var goodReads: HashSet[string]
+    for r in dep.records:
+      if r.kind == mrFileRead:
+        goodReads.incl r.path
+    check (root / "good-input") in goodReads
+
+    # And the on-disk depfile re-reads as incomplete via the canonical reader
+    # the build engine uses, confirming the signal survives canonicalization.
+    let reread = readMonitorDepFile(root / "merged.rdep")
+    check reread.completeness == mcIncomplete
 
   test "reader rejects a corrupted depfile (checksum mismatch)":
     # Parity on the validation surface: a flipped byte must be caught, exactly
