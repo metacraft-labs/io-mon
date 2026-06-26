@@ -1,7 +1,7 @@
-## test_io_mon_macos_bodypatch_open_mode — under the body-patch (`both`) backend,
+## test_io_mon_macos_bodypatch_open_mode — under the default (both mechanisms on),
 ## a libsystem-internal variadic `O_CREAT` open forwards its `mode` argument
 ## CORRECTLY, so files are created with the requested permissions and remain
-## readable. This locks in the fix for the `IO_MON_MACOS_BACKEND=both` nimcache
+## readable. This locks in the fix for the body-patch nimcache
 ## `Permission denied` defect.
 ##
 ## # The defect this guards against
@@ -14,7 +14,7 @@
 ## `movz w8,#0666; str x8,[sp]; bl open$NOCANCEL` — therefore puts `mode` on the
 ## stack, while register x2 holds an unrelated value.
 ##
-## The body-patch backend overwrites the libsystem `open$NOCANCEL` ENTRY so that
+## The body-patch mechanism overwrites the libsystem `open$NOCANCEL` ENTRY so that
 ## ALL callers (including shared-cache-internal ones like `fopen` that interpose
 ## never sees) branch to our hook. The previous defect registered the FIXED
 ## 3-arg `repro_hook_open(path, flags, mode)` there, which read `mode` from x2
@@ -26,7 +26,7 @@
 ##
 ## # What this test asserts
 ##
-## A probe `fopen(out,"w")`s a fresh file under `IO_MON_MACOS_BACKEND=both`,
+## A probe `fopen(out,"w")`s a fresh file under the default (both mechanisms on),
 ## writes to it, closes it, then `stat`s the result. The test asserts:
 ##   * the probe exits 0 (the body-patch did not break the open), and
 ##   * the created file's mode is exactly the umask-default `0666 & ~umask`
@@ -41,6 +41,8 @@ const
   repoRoot = currentSourcePath().parentDir().parentDir()
 
 when defined(macosx):
+  import macos_backend_toggle  # applyMacosBackendToggle (A/B → debug toggles)
+
   proc buildShim(): string =
     ## Build the fat (arm64+arm64e) shim and return its path. Fails loudly.
     let (output, code) = execCmdEx("bash " &
@@ -139,7 +141,7 @@ int main(int argc, char **argv) {
     var env = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): env[k] = v
     env["DYLD_INSERT_LIBRARIES"] = shim
-    env["IO_MON_MACOS_BACKEND"] = backend
+    applyMacosBackendToggle(env, backend)
     let p = startProcess(probe, args = @[fopenOut, openOut], env = env,
       options = {poStdErrToStdOut})
     let outText = p.outputStream.readAll()

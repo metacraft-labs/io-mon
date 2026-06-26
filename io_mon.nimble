@@ -72,13 +72,13 @@ task test, "Run the io-mon test suite":
   # WORKS under the body-patch (it must not break the move). macOS-only (no-op
   # pass elsewhere).
   exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_rename.nim"
-  # macOS body-patch VARIADIC open-mode forwarding: under `both` a
-  # libsystem-internal `fopen("…","w")` (whose `open$NOCANCEL` passes `mode` on
-  # the STACK per the arm64 Apple variadic ABI) must create the file with the
-  # CORRECT mode (0644), readable back — locking in the fix for the
-  # `IO_MON_MACOS_BACKEND=both` nimcache `Permission denied` defect (the old
-  # fixed-3-arg body-patch hook read `mode` from x2/garbage). macOS-only (no-op
-  # pass elsewhere).
+  # macOS body-patch VARIADIC open-mode forwarding: with both mechanisms on (the
+  # default) a libsystem-internal `fopen("…","w")` (whose `open$NOCANCEL` passes
+  # `mode` on the STACK per the arm64 Apple variadic ABI) must create the file
+  # with the CORRECT mode (0644), readable back — locking in the fix for the
+  # body-patch nimcache `Permission denied` defect (the old fixed-3-arg
+  # body-patch hook read `mode` from x2/garbage). macOS-only (no-op pass
+  # elsewhere).
   exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_bodypatch_open_mode.nim"
   # macOS threaded-write capture: a write issued from a NON-MAIN (pthread_create'd)
   # thread that exits before process teardown must still produce an `mrFileWrite`

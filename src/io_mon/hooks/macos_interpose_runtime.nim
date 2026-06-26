@@ -311,6 +311,24 @@ static void *repro_macos_lookup_image_symbol(const char *symbol) {
   return NULL;
 }
 
+/*
+ * Public (non-static) accessor for the shim-skipping libsystem symbol resolver.
+ *
+ * The interpose-DISABLE diagnostic path (IO_MON_DEBUG_DISABLE_INTERPOSE, a
+ * debug-only A/B knob) needs to forward an interposed call to the libsystem
+ * function's ACTUAL entry address — which the body-patch backend overwrites IN
+ * PLACE — so that body-patch records the call if active (and a genuine,
+ * unrecorded libsystem call happens if it is not). Calling through the resolved
+ * address bypasses the `__DATA,__interpose` tuple (which only rebinds import
+ * STUBS, not direct address calls), so the forward cannot re-enter the interpose
+ * wrapper via the tuple. Resolving via the SAME shim-skipping image walk keeps a
+ * single source of truth for "find the real libsystem `_name`" (DRY). `symbol`
+ * is the mangled "_name" form (e.g. "_write").
+ */
+void *repro_macos_resolve_libsystem_symbol(const char *symbol) {
+  return repro_macos_lookup_image_symbol(symbol);
+}
+
 static void repro_macos_resolve_spawn(void) {
   if (repro_macos_real_posix_spawn_ptr && repro_macos_real_posix_spawnp_ptr) return;
   repro_macos_real_posix_spawn_ptr =

@@ -154,15 +154,15 @@ when defined(macosx):
 
   proc childEnv(shim, bundle, fragmentDir: string; useSandbox: bool):
       StringTableRef =
-    ## Build the monitored-child environment. The DEFAULT ``both`` backend is
-    ## used (interpose + body-patch — what production runs). ``useSandbox``
-    ## toggles the CT_SANDBOX_TOOLS_DIR drop-in redirect for the contrast.
+    ## Build the monitored-child environment. BOTH mechanisms (interpose +
+    ## body-patch) run by default — exactly what production runs — so no
+    ## diagnostic toggle is set. ``useSandbox`` toggles the CT_SANDBOX_TOOLS_DIR
+    ## drop-in redirect for the contrast.
     result = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): result[k] = v
     result["DYLD_INSERT_LIBRARIES"] = shim
     result["REPRO_MONITOR_SHIM_LIB"] = shim
     result["REPRO_MONITOR_FRAGMENT_DIR"] = fragmentDir
-    result["IO_MON_MACOS_BACKEND"] = "both"
     if useSandbox:
       result["CT_SANDBOX_TOOLS_DIR"] = bundle
     else:

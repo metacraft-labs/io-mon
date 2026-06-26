@@ -14,14 +14,14 @@
 ## then gets NEITHER re-propagation (DYLD_INSERT_LIBRARIES) NOR SIP-rewrite, so
 ## its whole subtree — and every file it reads — runs UNMONITORED (a FALSE SKIP).
 ##
-## The body-patch backend replaces the libsystem ``posix_spawn`` / ``fork`` /
+## The body-patch mechanism replaces the libsystem ``posix_spawn`` / ``fork`` /
 ## ``execve`` ENTRY points themselves (the ``mach_vm_remap`` overwrite technique,
 ## with a relocatable-prologue TRAMPOLINE so the original ``posix_spawn``
 ## marshalling body still runs — see ``src/io_mon/hooks/macos_bodypatch.nim``).
 ## Patching the callee catches the internal caller, re-applies env-propagation +
 ## SIP-rewrite, and so the child IS injected and monitored.
 ##
-## # What this test asserts (the BOTH-vs-INTERPOSE contrast)
+## # What this test asserts (the both-on vs interpose-only contrast)
 ##
 ## A probe ``dlopen``s a helper dylib whose ``posix_spawn`` call originates from
 ## the dylib's OWN binding (NOT the executable's import table — so it is OUTSIDE
@@ -29,10 +29,11 @@
 ## spawn). That spawn launches a freshly-built, NON-SIP grandchild helper which
 ## reads a marker file.
 ##
-##   * ``IO_MON_MACOS_BACKEND=both`` (body-patch active): the grandchild is
+##   * default (both mechanisms on, body-patch active): the grandchild is
 ##     injected (the body-patched ``posix_spawn`` re-added DYLD_INSERT_LIBRARIES),
 ##     so the marker READ and the spawn/exec record ARE captured.
-##   * ``IO_MON_MACOS_BACKEND=interpose``: the dylib-originated spawn bypasses the
+##   * body-patch disabled for diagnosis (``IO_MON_DEBUG_DISABLE_BODYPATCH=1``,
+##     the interpose-only arm): the dylib-originated spawn bypasses the
 ##     executable's ``__interpose`` section, the grandchild is NOT injected, and
 ##     the marker read is ABSENT — locking in that the spawn body-patch is what
 ##     closes the gap.
@@ -58,6 +59,7 @@ import std/[os, osproc, streams, strtabs, unittest]
 
 when defined(macosx):
   import io_mon  # readMonitorDepFile, mergeFragments, MonitorObservationKind
+  import macos_backend_toggle  # applyMacosBackendToggle (A/B → debug toggles)
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir()
@@ -190,7 +192,7 @@ int main(void) { return system("/usr/bin/true"); }
     env["DYLD_INSERT_LIBRARIES"] = shim
     env["REPRO_MONITOR_SHIM_LIB"] = shim
     env["REPRO_MONITOR_FRAGMENT_DIR"] = fragmentDir
-    env["IO_MON_MACOS_BACKEND"] = backend
+    applyMacosBackendToggle(env, backend)
 
     let p = startProcess(fx.probe, args = @[], env = env,
       options = {poStdErrToStdOut})
@@ -239,7 +241,7 @@ int main(void) { return system("/usr/bin/true"); }
     env["DYLD_INSERT_LIBRARIES"] = shim
     env["REPRO_MONITOR_SHIM_LIB"] = shim
     env["REPRO_MONITOR_FRAGMENT_DIR"] = fragmentDir
-    env["IO_MON_MACOS_BACKEND"] = backend
+    applyMacosBackendToggle(env, backend)
 
     let p = startProcess(fx.probe, args = @[], env = env,
       options = {poStdErrToStdOut})

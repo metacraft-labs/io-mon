@@ -23,7 +23,7 @@
 ##
 ## # What this test asserts
 ##
-## A freshly-built probe run under the shim with `IO_MON_MACOS_BACKEND=both`
+## A freshly-built probe run under the shim with both mechanisms on (the default)
 ## emits the install banner on stderr. We assert the banner reports
 ## `failed=0` and `fork_tramp=ok spawn_tramp=ok spawnp_tramp=ok` — the exact
 ## post-fix state. Under the broken (mis-resolving) installer the banner showed
@@ -37,6 +37,8 @@ const
   repoRoot = currentSourcePath().parentDir().parentDir()
 
 when defined(macosx):
+  import macos_backend_toggle  # applyMacosBackendToggle (A/B → debug toggles)
+
   proc buildShim(): string =
     let (output, code) = execCmdEx("bash " &
       quoteShell(repoRoot / "scripts" / "build_shim.sh"))
@@ -65,7 +67,7 @@ when defined(macosx):
     for k, v in envPairs(): env[k] = v
     env["DYLD_INSERT_LIBRARIES"] = shim
     env["REPRO_MONITOR_SHIM_LIB"] = shim
-    env["IO_MON_MACOS_BACKEND"] = backend
+    applyMacosBackendToggle(env, backend)
     let p = startProcess(probe, args = @[], env = env,
       options = {poStdErrToStdOut})
     let outText = p.outputStream.readAll()
@@ -100,19 +102,25 @@ suite "io-mon macOS body-patch resolves real libsystem (not the shim)":
       check banner.contains("spawn_tramp=ok")
       check banner.contains("spawnp_tramp=ok")
 
-    test "the 'bodypatch' backend reports the same clean banner":
+    test "body-patch-only (interpose disabled) reports the same clean banner":
+      # IO_MON_DEBUG_DISABLE_INTERPOSE: body-patch still installs fully (the same
+      # clean counters), and the banner additionally carries the debug note that
+      # interpose was disabled for diagnosis.
       let banner = bannerFor(shim, probe, "bodypatch")
       checkpoint("banner = " & banner)
       check banner.contains("failed=0")
       check banner.contains("fork_tramp=ok")
       check banner.contains("spawn_tramp=ok")
       check banner.contains("spawnp_tramp=ok")
+      check banner.contains("[debug] interpose disabled")
 
-    test "interpose backend installs no body patch (no banner crash)":
+    test "interpose-only (body-patch disabled) installs no body patch (no crash)":
+      # IO_MON_DEBUG_DISABLE_BODYPATCH: body-patch is skipped, so the constructor
+      # logs the "not installed" skip line (with the debug note) instead of an
+      # install banner with counters.
       let banner = bannerFor(shim, probe, "interpose")
       checkpoint("banner = " & banner)
-      # Interpose-only logs the skip line, not an install banner with counters.
-      check banner.contains("interpose") or banner.len == 0
+      check banner.contains("[debug] body-patch disabled") or banner.len == 0
 
     removeDir(work)
   else:
