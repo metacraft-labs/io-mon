@@ -108,6 +108,16 @@ task test, "Run the io-mon test suite":
   # injected; a SETEXEC/spawn into an un-injectable image downgrades to
   # mcIncomplete. macOS-only (no-op pass elsewhere).
   exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_setexec.nim"
+  # macOS T3a IPC / daemon-over-socket breakaway (adversarial hardening #1): the
+  # CRITICAL escape that DEFEATS the subtree fail-safe. A persistent daemon
+  # started OUTSIDE the invocation reads files on a monitored client's behalf over
+  # an AF_UNIX socket. The connect(2) hook records the peer pid; the merge
+  # downgrades to mcIncomplete when the peer is out-of-tree (regression: was
+  # mcComplete), keeps mcComplete for intra-tree IPC (the cardinal-sin guard), and
+  # — via a cooperating daemon's breakaway report (BuildXL Trusted-Tools prior
+  # art) — keeps mcComplete WITH the daemon-read file folded in. macOS-only (no-op
+  # pass elsewhere).
+  exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_ipc_breakaway.nim"
 
 task buildShim, "Build the io-mon interpose shim shared library":
   # Produces build/lib/librepro_monitor_shim.{dylib,so,dll} — the drop-in

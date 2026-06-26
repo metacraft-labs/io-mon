@@ -21,6 +21,7 @@ import io_mon/writer
 #include <stdio.h>
 #include <sys/attr.h>
 #include <sys/clonefile.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -42,6 +43,14 @@ const
   OCreat = 0x0200.cint
   OTrunc = 0x0400.cint
   OAppend = 0x0008.cint
+  # Darwin address-family + errno constants used by the IPC-connect hook (T3a).
+  # AF_UNIX=1, AF_INET=2, AF_INET6=30, EINPROGRESS=36 on macOS/arm64 (stable
+  # ABI values in <sys/socket.h> / <sys/errno.h>); inlined here so the Nim hook
+  # need not pull the headers into its own scope.
+  AfUnix = 1.cint
+  AfInet = 2.cint
+  AfInet6 = 30.cint
+  EInProgress = 36.cint
 
 var
   initialized = false
@@ -268,6 +277,43 @@ proc recordRename(callResult: cint; fromPath, toPath: cstring; detail: string) {
     d.add "from=" & $fromPath
   if d.len > 0:
     record.detail = d
+  emitRecord(record)
+
+proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32;
+    callResult: cint) {.raises: [].} =
+  ## Record a successful (or in-flight non-blocking) connect(2) to an
+  ## AF_UNIX / AF_INET(6) peer — the DAEMON-OVER-SOCKET breakaway hook (T3a,
+  ## findings-doc break #1; see the runtime C doc for the full threat model).
+  ##
+  ## `childOsPid` carries the PEER PID (AF_UNIX via LOCAL_PEERPID; 0/unknown for
+  ## INET). This deliberately mirrors `recordSpawn`'s use of `childOsPid` so the
+  ## SAME merge-time peer-set machinery (writer.unmonitoredSubtreeLossCount) can
+  ## decide INSIDE-vs-OUTSIDE the injected tree: a peer pid with a matching
+  ## `mrProcessStart` is a monitored in-tree process (FINE — no downgrade, the
+  ## cardinal-sin guard for legitimate intra-tree IPC); a peer pid NOT in the set,
+  ## or an UNKNOWN peer, is an out-of-tree breakaway that may have read files on
+  ## our behalf ⇒ the merge injects an event-loss ⇒ mcIncomplete (a conservative
+  ## RE-RUN, never a false skip — Monitor-Hook-Shim.md §Failure Semantics).
+  if address == nil:
+    return
+  var dest: array[1024, char]
+  dest[0] = '\0'
+  var peerPid: cint = 0
+  let family = ct_macos_socket_describe(fd, address, addrLen,
+    addr dest[0], csize_t(dest.len), addr peerPid)
+  # Only socket families that can carry a file-serving peer are interesting:
+  # AF_UNIX (local build daemons) and AF_INET/INET6 (remote/loopback services).
+  # Other families (AF_ROUTE, AF_SYSTEM, …) and bad-arg (-1) returns are skipped.
+  if family != AfUnix and family != AfInet and family != AfInet6:
+    return
+  var record = baseRecord(mrIpcConnect, moIpcConnect)
+  record.result = callResult.int64
+  record.flags = uint32(family)
+  record.childOsPid = uint64(peerPid)        # peer pid (0 ⇒ unobtainable)
+  record.path = $cast[cstring](addr dest[0]) # socket path or "ip:port"
+  record.detail =
+    (if family == AfUnix: "connect af_unix" else: "connect af_inet") &
+    (if peerPid != 0: " peer=" & $peerPid else: " peer=unknown")
   emitRecord(record)
 
 proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
@@ -749,6 +795,28 @@ proc repro_hook_getdirentries*(fd: cint; buf: pointer; nbytes: cint;
   result = ct_macos_real_getdirentries(fd, buf, nbytes, basep)
   if result > 0:
     recordDirEnumByFd(fd, "getdirentries")
+
+# --- Unified connect hook (IPC / breakaway detection, T3a / break #1) -----
+# There is exactly ONE connect hook, used by BOTH the static __DATA,__interpose
+# tuple AND the body-patch install. connect is a thin syscall wrapper, so — like
+# the stat/rename/clonefile families — the hook forwards via the RAW SYS_connect
+# syscall (ct_macos_real_connect), bypassing any body-patched libsystem `connect`
+# entry so a single connect records EXACTLY ONCE and never re-enters the patch.
+
+proc repro_hook_connect*(fd: cint; address: pointer; addrLen: uint32): cint
+    {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_connect(fd, address, addrLen)
+  result = ct_macos_real_connect(fd, address, addrLen)
+  let savedErrno = getErrno()
+  # Record an ESTABLISHED connection (result == 0 — the blocking daemon/sccache
+  # case) or an in-flight NON-BLOCKING one (result < 0 && EINPROGRESS — the
+  # connection will complete asynchronously; the peer pid may not be resolvable
+  # yet, which the merge treats conservatively as out-of-tree). A hard failure
+  # (ECONNREFUSED, …) reached no peer and is NOT recorded.
+  if result == 0 or (result < 0 and savedErrno == EInProgress):
+    recordIpcConnect(fd, address, addrLen, result)
+  setErrno(savedErrno)
 
 # --- Unified spawn-family hooks ------------------------------------------
 #
@@ -1238,6 +1306,15 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
     BodypatchHookSpec(
       names: @["getdirentries", "__getdirentries64"],
       hook: cast[pointer](repro_hook_getdirentries)),
+    # T3a IPC-breakaway hook (findings doc break #1). connect is a thin syscall
+    # wrapper, so the hook forwards via raw SYS_connect and the PLAIN body patch
+    # (no trampoline) suffices — catching shared-cache-internal callers (e.g. a
+    # daemon-client library that issues connect from inside a dylib) too. The
+    # $NOCANCEL / __ variants are the cancellation-point entries stdio-ish code
+    # reaches; all share the connect ABI and one hook.
+    BodypatchHookSpec(
+      names: @["connect", "connect$NOCANCEL", "__connect_nocancel"],
+      hook: cast[pointer](repro_hook_connect)),
   ]
 
   # Diagnostic gate: IO_MON_DEBUG_SKIP is a comma-separated list of body-patch
@@ -1884,6 +1961,24 @@ static int repro_wrap_getattrlistbulk(int dirfd, void *al, void *buf,
 }
 
 /*
+ * T3a IPC-breakaway interpose thunk (findings doc break #1). Mirrors the T2
+ * thunks: forward to the kernel before the recording runtime is live, then
+ * branch to the recording repro_hook_connect (which itself forwards via raw
+ * SYS_connect, bypassing any body-patched entry). It deliberately omits the
+ * debug-only interpose-DISABLE A/B forward (REPRO_INTERPOSE_FORWARD_*) — this is
+ * a hardening hook exercised under the default `both` and `interpose` arms, and
+ * omitting the knob cannot weaken a production capture (both mechanisms are
+ * always on in release).
+ */
+static int repro_wrap_connect(int fd, const struct sockaddr *addr,
+                              socklen_t addrlen) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_connect, fd, addr, addrlen);
+  }
+  return repro_hook_connect(fd, (void *)addr, (unsigned int)addrlen);
+}
+
+/*
  * Body-patch hook ADDRESS accessors for the VARIADIC open/openat wrappers.
  *
  * Why the body-patch backend MUST use the variadic repro_wrap_open(at) thunks --
@@ -1990,7 +2085,9 @@ static struct {
   { (const void *)repro_wrap_getattrlist, (const void *)getattrlist },
   { (const void *)repro_wrap_getattrlistat, (const void *)getattrlistat },
   { (const void *)repro_wrap_fgetattrlist, (const void *)fgetattrlist },
-  { (const void *)repro_wrap_getattrlistbulk, (const void *)getattrlistbulk }
+  { (const void *)repro_wrap_getattrlistbulk, (const void *)getattrlistbulk },
+  /* T3a IPC-breakaway hook (findings doc break #1). */
+  { (const void *)repro_wrap_connect, (const void *)connect }
   /* getdirentries is intentionally NOT in the interpose tuple: the SDK header
    * poisons the symbol under 64-bit inodes (`getdirentries_is_not_available…`),
    * so it cannot be referenced here. It is body-patched by string name instead

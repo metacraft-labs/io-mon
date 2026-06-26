@@ -17,6 +17,7 @@ proc recordKindName(record: MonitorRecord): string =
   of mrDirectoryEnumerate: "directory-enumerate"
   of mrBackendProfile: "backend-profile"
   of mrCapabilityGap: "capability-gap"
+  of mrIpcConnect: "ipc-connect"
 
 proc observationKindName(record: MonitorRecord): string =
   case record.observationKind
@@ -30,6 +31,7 @@ proc observationKindName(record: MonitorRecord): string =
   of moDirectoryEnumerate: "directory-enumerate"
   of moBackendProfile: "backend-profile"
   of moCapabilityGap: "capability-gap"
+  of moIpcConnect: "ipc-connect"
 
 proc itemKindName(kind: FsSnoopStreamItemKind): string =
   case kind

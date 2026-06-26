@@ -608,7 +608,17 @@ proc encodeCanonical*(records: openArray[MonitorRecord]): seq[byte] =
   result.writeU64Le(uint64(ordered.len))
   result.writeU64Le(checksum(body))
 
-proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord]): int =
+proc monitoredStartPids*(records: openArray[MonitorRecord]): HashSet[uint64] =
+  ## The set of osPids that emitted an `mrProcessStart` — i.e. every process that
+  ## actually loaded the shim and is therefore INSIDE the monitored injected tree.
+  ## Shared by the subtree-loss check and the breakaway-report folding (DRY).
+  result = initHashSet[uint64]()
+  for r in records:
+    if r.kind == mrProcessStart:
+      result.incl r.osPid
+
+proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord];
+    trustedPeerPids: HashSet[uint64] = initHashSet[uint64]()): int =
   ## T0 — EARN mcComplete (MacOS-Monitoring-Adversarial-Hardening.milestones.org
   ## §"T0 — Earn mcComplete"; Monitor-Hook-Shim.md §"Failure Semantics":
   ## "successful child exit MUST NOT hide monitor failure").
@@ -621,10 +631,28 @@ proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord]): int =
   ## (`summarizeRecords` → `depFileFromRecords`) downgrades completeness to a
   ## CONSERVATIVE RE-RUN instead of a silent false skip (the cardinal sin).
   ##
-  ## Two independent signals, both keyed purely on records io-mon already emits.
-  ## The machinery is deliberately generic so Phase 2's IPC break (#1) reuses it:
-  ## a `connect`/`sendmsg` to a peer with NO `process-start` in the injected set
-  ## is structurally identical to an un-injected spawn child here.
+  ## THREE independent signals, all keyed purely on records io-mon already emits.
+  ## The machinery is deliberately generic, so Phase 2's IPC break (#1) reuses it:
+  ## a `connect` to a peer with NO `process-start` in the injected set is
+  ## structurally identical to an un-injected spawn child here.
+  ##
+  ## (c) IPC-CONNECT to an out-of-tree / opaque peer (T3a, findings-doc break #1 —
+  ##     the DAEMON-OVER-SOCKET breakaway that DEFEATS the subtree fail-safe). A
+  ##     monitored client `connect`s to a persistent daemon (sccache/ccache server,
+  ##     distcc/icecc, the Gradle daemon, a Bazel persistent worker, tsserver,
+  ##     watchman, the nix daemon, …) started OUTSIDE the invocation; the daemon
+  ##     opens+reads files on the client's behalf and returns the bytes, so the
+  ##     real file dependency is invisible AND there is no spawn to anchor the
+  ##     subtree check on. Each `mrIpcConnect` carries the PEER PID in `childOsPid`
+  ##     (AF_UNIX via LOCAL_PEERPID; 0/unknown for INET). The peer is INSIDE the
+  ##     tree iff its pid has a matching `mrProcessStart` — then two MONITORED
+  ##     processes are legitimately talking over a socket and we must NOT downgrade
+  ##     (the cardinal-sin guard). Otherwise (peer pid known but NOT in the set, OR
+  ##     peer pid UNKNOWN) the peer is an out-of-tree breakaway ⇒ one loss ⇒
+  ##     `mcIncomplete` (a conservative re-run). `trustedPeerPids` exempts peers a
+  ##     COOPERATING daemon has reported its reads for (BuildXL Trusted-Tools /
+  ##     Shared-Compilation breakaway compensation; see `mergeFragments` +
+  ##     `loadBreakawayReports`): an accounted-for daemon need not force a re-run.
   ##
   ## (a) SPAWN with no child process-start. Every INJECTED process emits an
   ##     `mrProcessStart` with its own osPid. A recorded `mrProcessSpawn`
@@ -670,8 +698,113 @@ proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord]): int =
   for pid, execs in execCount:
     if execs > 0 and execs >= startCount.getOrDefault(pid):
       inc result
+  # (c) IPC-connect to an out-of-tree / opaque / un-reported peer (break #1).
+  # Dedup so a client that connects to the same daemon many times counts once:
+  # key on the peer pid when known, else on the destination (an unknown-peer
+  # socket is keyed by its address/path). A peer that is a monitored in-tree
+  # process (its pid emitted process-start) OR a trusted daemon that reported its
+  # reads is fully accounted for and never downgrades — the cardinal-sin guard.
+  var flaggedPeers: HashSet[string]
+  for r in records:
+    if r.kind == mrIpcConnect:
+      let peer = r.childOsPid
+      if peer != 0 and (peer in startPids or peer in trustedPeerPids):
+        continue
+      let key = if peer != 0: "pid:" & $peer else: "dest:" & r.path
+      if key in flaggedPeers:
+        continue
+      flaggedPeers.incl key
+      inc result
 
-proc mergeFragments*(fragmentDir, outputPath: string): MonitorDepFile =
+const
+  BreakawayReportExt* = ".io-mon-report"
+    ## File extension a COOPERATING daemon writes its breakaway report under,
+    ## inside the `IO_MON_BREAKAWAY_REPORT_DIR`. Distinct from `.rmdf-frag` so the
+    ## report scan never collides with the per-process fragment files.
+  IoMonBreakawayReportDirEnv* = "IO_MON_BREAKAWAY_REPORT_DIR"
+    ## Env var naming the directory a trusted daemon drops breakaway reports into
+    ## (and that the merge folds them from). See `loadBreakawayReports` and the
+    ## T3a design notes in MacOS-Monitoring-Adversarial-Hardening.milestones.org.
+
+type
+  BreakawayFold = object
+    ## Result of folding a directory of cooperating-daemon breakaway reports into
+    ## a merge: synthetic file-read records to ADD to the depfile (so the
+    ## daemon-served files become visible dependencies) and the set of daemon pids
+    ## that accounted for their reads (so the IPC-connect check does NOT downgrade
+    ## a connection to such a trusted daemon).
+    reads: seq[MonitorRecord]
+    trustedPeerPids: HashSet[uint64]
+
+proc loadBreakawayReports*(reportDir: string;
+    monitored: HashSet[uint64]): BreakawayFold =
+  ## BuildXL-style TRUSTED-DAEMON breakaway compensation (T3a). A cooperating
+  ## daemon (e.g. a future io-mon-aware sccache) that serves a monitored client
+  ## writes a small text report into `reportDir` naming the CLIENT pid it served,
+  ## its OWN (daemon) pid, and every file it read on the client's behalf:
+  ##
+  ##   io-mon-breakaway-report v1
+  ##   client <client-pid>
+  ##   daemon <daemon-pid>
+  ##   read <abs-path>
+  ##   read <abs-path>
+  ##
+  ## (BuildXL prior art: "Trusted Tools / Shared Compilation" + breakaway-process
+  ## compensation, PR #1175.) The merge folds in only reports whose CLIENT pid is
+  ## one of THIS invocation's monitored processes — a persistent daemon serves
+  ## many builds, so a report for another build's client is ignored. For each
+  ## accepted report it (a) emits an `mrFileRead` for every read path (so the
+  ## daemon-served file appears in the depfile as a real dependency) and (b) marks
+  ## the daemon pid trusted, so the client's `mrIpcConnect` to it does NOT
+  ## downgrade completeness — the build stays `mcComplete` BECAUSE the daemon
+  ## accounted for its reads.
+  result.reads = @[]
+  result.trustedPeerPids = initHashSet[uint64]()
+  if reportDir.len == 0 or not dirExists(extendedPath(reportDir)):
+    return
+  for kind, path in walkDir(extendedPath(reportDir)):
+    if kind != pcFile or not path.endsWith(BreakawayReportExt):
+      continue
+    var content = ""
+    try:
+      content = readFile(extendedPath(path))
+    except IOError, OSError:
+      # A report that vanished / is unreadable carries no evidence; skip it
+      # rather than abort the whole merge (benign producer race).
+      continue
+    var clientPid, daemonPid: uint64 = 0
+    var readPaths: seq[string] = @[]
+    for rawLine in content.splitLines():
+      let line = rawLine.strip()
+      let toks = line.splitWhitespace()
+      if toks.len < 2:
+        continue
+      case toks[0]
+      of "client":
+        try: clientPid = uint64(parseBiggestUInt(toks[1]))
+        except ValueError: discard
+      of "daemon":
+        try: daemonPid = uint64(parseBiggestUInt(toks[1]))
+        except ValueError: discard
+      of "read":
+        # A read path may itself contain spaces, so take everything after the
+        # directive verbatim rather than relying on the whitespace split.
+        readPaths.add line[("read".len) .. ^1].strip()
+      else:
+        discard
+    if clientPid == 0 or clientPid notin monitored:
+      continue
+    if daemonPid != 0:
+      result.trustedPeerPids.incl daemonPid
+    for rp in readPaths:
+      if rp.len == 0:
+        continue
+      result.reads.add MonitorRecord(kind: mrFileRead,
+        observationKind: moFileRead, osPid: clientPid, path: rp,
+        detail: "breakaway-daemon-report daemon=" & $daemonPid)
+
+proc mergeFragments*(fragmentDir, outputPath: string;
+    breakawayReportDir = ""): MonitorDepFile =
   # DSL-port M9.R.15c.1 — close the calling thread's cached fragment
   # handle before merging so any post-SIGKILL or pre-close buffered
   # bytes are visible to the read path. ``readFragmentRecordsTolerant``
@@ -714,19 +847,38 @@ proc mergeFragments*(fragmentDir, outputPath: string): MonitorDepFile =
       records.add MonitorRecord(kind: mrEventLoss,
         observationKind: moEventLoss,
         detail: "corrupt or partial RMDF fragment in " & fragmentDir)
-  # T0 — downgrade completeness when the merged evidence proves some spawn/exec
-  # subtree ran UN-monitored (un-injectable spawn child or a SETEXEC/execve into
-  # a hardened image). One synthetic event-loss per piece of evidence forces
-  # `mcIncomplete` via the SAME event-loss machinery as the corrupt-fragment
-  # path, so an un-injectable child becomes a conservative re-run rather than a
-  # false skip — self-flagged by io-mon, not left solely to the consumer
-  # (Monitor-Hook-Shim.md §"Failure Semantics"). See unmonitoredSubtreeLossCount.
-  let subtreeLosses = unmonitoredSubtreeLossCount(records)
+  # T3a — TRUSTED-DAEMON breakaway compensation (BuildXL Trusted-Tools prior
+  # art). Fold any cooperating-daemon reports from `breakawayReportDir` (an
+  # explicit arg, else the `IO_MON_BREAKAWAY_REPORT_DIR` env var) into the merge
+  # BEFORE the completeness check: the daemon-reported reads become real
+  # dependencies in the depfile, and the reporting daemons' pids are exempted
+  # from the IPC-connect downgrade so an accounted-for daemon need not force a
+  # re-run. See loadBreakawayReports.
+  let reportDir =
+    if breakawayReportDir.len > 0: breakawayReportDir
+    else: getEnv(IoMonBreakawayReportDirEnv)
+  var trustedPeerPids = initHashSet[uint64]()
+  if reportDir.len > 0:
+    let fold = loadBreakawayReports(reportDir, monitoredStartPids(records))
+    for rd in fold.reads:
+      records.add rd
+    trustedPeerPids = fold.trustedPeerPids
+  # T0/T3a — downgrade completeness when the merged evidence proves some
+  # spawn/exec subtree ran UN-monitored (un-injectable spawn child or a
+  # SETEXEC/execve into a hardened image) OR a client talked to an out-of-tree
+  # breakaway daemon over a socket (IPC break #1). One synthetic event-loss per
+  # piece of evidence forces `mcIncomplete` via the SAME event-loss machinery as
+  # the corrupt-fragment path, so the breakaway becomes a conservative re-run
+  # rather than a false skip — self-flagged by io-mon, not left solely to the
+  # consumer (Monitor-Hook-Shim.md §"Failure Semantics"). See
+  # unmonitoredSubtreeLossCount.
+  let subtreeLosses = unmonitoredSubtreeLossCount(records, trustedPeerPids)
   for _ in 0 ..< subtreeLosses:
     records.add MonitorRecord(kind: mrEventLoss,
       observationKind: moEventLoss,
-      detail: "unmonitored spawn/exec subtree " &
-        "(un-injectable child or SETEXEC into a hardened image)")
+      detail: "unmonitored subtree/peer (un-injectable spawn child, SETEXEC " &
+        "into a hardened image, or IPC connect to an out-of-tree breakaway " &
+        "daemon)")
   records.add profileRecords(defaultHooksMonitorProfile(
     MacosMonitorShimTaxonomyCapabilities))
 

@@ -13,6 +13,12 @@ type
     mrDirectoryEnumerate = 9
     mrBackendProfile = 10
     mrCapabilityGap = 11
+    # T3a (Phase 2 / findings-doc break #1): a `connect(2)` (or connectionless
+    # `sendmsg`/`sendto`) to an AF_UNIX / AF_INET(6) peer. APPENDED AT THE END to
+    # preserve RMDF wire-compat (the dgNoRuntimeDependencies lesson — never
+    # renumber an existing enum case). Carries the destination in `path` and the
+    # PEER PID in `childOsPid` (AF_UNIX via LOCAL_PEERPID; 0 when unobtainable).
+    mrIpcConnect = 12
 
   MonitorObservationKind* = enum
     moProcessStart = 1
@@ -25,6 +31,8 @@ type
     moDirectoryEnumerate = 8
     moBackendProfile = 9
     moCapabilityGap = 10
+    # T3a — IPC-connect observation (appended for wire-compat, see mrIpcConnect).
+    moIpcConnect = 11
 
   ProbeResult* = enum
     prUnknown = 0
@@ -64,6 +72,10 @@ type
     mcapLibraryLoad
     mcapAuthorizationEnforcement
     mcapPathMutation
+    # T3a — IPC / breakaway detection: the shim hooks connect(2) and records the
+    # peer (with its pid when obtainable) so the merge can prove whether a socket
+    # peer is a monitored in-tree process or an out-of-tree breakaway daemon.
+    mcapIpcConnect
 
   MonitorDiagnosticLevel* = enum
     mdlInfo

@@ -55,6 +55,10 @@ proc repro_macos_get_sandbox_tools_dir*(): cstring
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -207,6 +211,87 @@ int repro_macos_real_getattrlistbulk_syscall(int dirfd, void *al, void *buf,
 int repro_macos_real_getdirentries_syscall(int fd, void *buf, int nbytes,
                                            long *basep) {
   return (int)syscall(SYS_getdirentries, fd, buf, nbytes, basep);
+}
+
+/*
+ * T3a (Phase 2 / findings-doc break #1): the DAEMON-OVER-SOCKET / out-of-tree
+ * breakaway escape. A persistent daemon (sccache/ccache server, distcc/icecc,
+ * the Gradle daemon, a Bazel persistent worker, tsserver, watchman, the nix
+ * daemon, …) is started OUTSIDE the monitored invocation; a monitored client
+ * sends it a path over an AF_UNIX (or AF_INET) socket; the DAEMON opens+reads
+ * the file on the client's behalf and returns the bytes. io-mon records the
+ * client's socket send/recv as PATH-LESS file-write/file-read but NOT the file,
+ * and — because the daemon predates the process tree — sees NO process-start for
+ * it, so the existing subtree fail-safe (which anchors on a spawn) cannot fire.
+ * The depfile is stamped mcComplete ⇒ a PROVEN false cache hit (two different
+ * daemon-side inputs produced byte-identical depfiles).
+ *
+ * The fix hooks connect(2) (the latent path-less socket records ARE the hook
+ * point named in the spec). connect is a thin syscall wrapper, so — exactly like
+ * the stat/rename/clonefile families — the hook forwards via the RAW SYS_connect
+ * syscall, bypassing any body-patched libsystem `connect` entry so a single call
+ * records once and never re-enters the patch.
+ */
+int repro_macos_real_connect_syscall(int fd, void *addr,
+                                     unsigned int addrlen) {
+  return (int)syscall(SYS_connect, fd, addr, (socklen_t)addrlen);
+}
+
+/*
+ * Describe a connect() target for the IPC-breakaway hook. Returns the address
+ * family (AF_UNIX / AF_INET / AF_INET6 / …) or -1 on bad args. Fills `out_dest`
+ * with the AF_UNIX socket path or an "ip:port" / "[ip6]:port" string. Sets
+ * `*out_peer_pid` to the PEER's pid:
+ *   * AF_UNIX  → the local peer pid via getsockopt(SOL_LOCAL, LOCAL_PEERPID).
+ *                After a successful connect() the client socket is connected to
+ *                the listener, so the kernel-tracked peer credentials name the
+ *                daemon process — the crucial signal for the merge-time peer-set
+ *                check (a daemon predating the tree has NO process-start, so its
+ *                pid is not in the injected set ⇒ downgrade).
+ *   * AF_INET/INET6 → 0 (a remote/loopback peer's pid is not locally knowable;
+ *                the merge treats an unknown peer conservatively as out-of-tree).
+ * getsockopt/inet_ntop/snprintf are not hooked, so this is reentrancy-free.
+ */
+int repro_macos_socket_describe(int fd, void *addr, unsigned int addrlen,
+                                void *out_dest_raw, size_t out_dest_len,
+                                int *out_peer_pid) {
+  char *out_dest = (char *)out_dest_raw;
+  if (out_peer_pid) *out_peer_pid = 0;
+  if (out_dest && out_dest_len) out_dest[0] = '\0';
+  if (!addr || addrlen < sizeof(sa_family_t)) return -1;
+  const struct sockaddr *sa = (const struct sockaddr *)addr;
+  int family = sa->sa_family;
+  if (family == AF_UNIX) {
+    const struct sockaddr_un *un = (const struct sockaddr_un *)addr;
+    /* sun_path need not be NUL-terminated within addrlen; bound the copy. */
+    size_t maxp = sizeof(un->sun_path);
+    size_t pl = strnlen(un->sun_path, maxp);
+    if (out_dest && pl + 1 <= out_dest_len) {
+      memcpy(out_dest, un->sun_path, pl);
+      out_dest[pl] = '\0';
+    }
+    if (out_peer_pid) {
+      pid_t pid = 0;
+      socklen_t plen = sizeof(pid);
+      if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &plen) == 0)
+        *out_peer_pid = (int)pid;
+    }
+  } else if (family == AF_INET) {
+    const struct sockaddr_in *in4 = (const struct sockaddr_in *)addr;
+    char ip[INET_ADDRSTRLEN];
+    ip[0] = '\0';
+    inet_ntop(AF_INET, &in4->sin_addr, ip, sizeof ip);
+    if (out_dest && out_dest_len)
+      snprintf(out_dest, out_dest_len, "%s:%d", ip, ntohs(in4->sin_port));
+  } else if (family == AF_INET6) {
+    const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)addr;
+    char ip[INET6_ADDRSTRLEN];
+    ip[0] = '\0';
+    inet_ntop(AF_INET6, &in6->sin6_addr, ip, sizeof ip);
+    if (out_dest && out_dest_len)
+      snprintf(out_dest, out_dest_len, "[%s]:%d", ip, ntohs(in6->sin6_port));
+  }
+  return family;
 }
 
 /*
@@ -998,6 +1083,24 @@ proc ct_macos_real_getdirentries*(fd: cint; buf: pointer; nbytes: cint;
       basep: ptr clong): cint
     {.importc: "repro_macos_real_getdirentries_syscall", cdecl.}
   realGetdirentries(fd, buf, nbytes, basep)
+
+proc ct_macos_real_connect*(fd: cint; address: pointer; addrLen: uint32): cint =
+  ## Raw `SYS_connect` forwarder shared by the interpose + body-patch connect
+  ## hook (T3a, break #1). Bypasses the named symbol so it never re-enters a
+  ## body-patched `connect`.
+  proc realConnect(fd: cint; address: pointer; addrLen: uint32): cint
+    {.importc: "repro_macos_real_connect_syscall", cdecl.}
+  realConnect(fd, address, addrLen)
+
+proc ct_macos_socket_describe*(fd: cint; address: pointer; addrLen: uint32;
+    outDest: pointer; outDestLen: csize_t; outPeerPid: ptr cint): cint =
+  ## Describe a connect() target (T3a): returns the address family and fills
+  ## `outDest` with the AF_UNIX path or "ip:port"; writes the AF_UNIX peer pid
+  ## (LOCAL_PEERPID) through `outPeerPid` (0 when unobtainable). See the C doc.
+  proc describe(fd: cint; address: pointer; addrLen: uint32; outDest: pointer;
+      outDestLen: csize_t; outPeerPid: ptr cint): cint
+    {.importc: "repro_macos_socket_describe", cdecl.}
+  describe(fd, address, addrLen, outDest, outDestLen, outPeerPid)
 
 proc ct_macos_real_copyfile*(src, dst: cstring; state: pointer;
     flags: uint32): cint =
