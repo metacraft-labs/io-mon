@@ -28,13 +28,19 @@ const
     # recorded with the peer pid, so the merge downgrades completeness when a
     # monitored client talks to an out-of-tree breakaway daemon (sccache, distcc,
     # gradle, tsserver, …) over a socket.
-    mcapIpcConnect
+    mcapIpcConnect,
+    # T3b (Phase 3 / break #4 + the dlopen arm of #7): the dyld IMAGE SET is
+    # captured via the `_dyld` add-image callback (NOT by hooking open, which dyld
+    # bypasses when it kernel-mmaps a dependent dylib). A real clang/ld64 link's
+    # ~620 dependent dylibs and any runtime dlopen'd image are now recorded as
+    # content (read) dependencies, so an in-place toolchain-library upgrade busts
+    # a content-addressed cache instead of serving a stale result.
+    mcapLibraryLoad
   }
 
   MacosInterposeKnownUnsupportedCapabilities* = {
     mcapEndpointSecurity,
     mcapHybrid,
-    mcapLibraryLoad,
     mcapAuthorizationEnforcement,
     mcapPathMutation
   }
@@ -54,7 +60,9 @@ const
     mcapFileAppend,
     mcapRename,
     mcapSymlink,
-    mcapIpcConnect
+    mcapIpcConnect,
+    # T3b — dyld dependent-dylib / dlopen image-set capture (see above).
+    mcapLibraryLoad
   }
 
   LinuxPreloadSupportedCapabilities* = {

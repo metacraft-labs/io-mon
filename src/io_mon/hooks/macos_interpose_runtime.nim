@@ -47,6 +47,7 @@ proc repro_macos_get_sandbox_tools_dir*(): cstring
 #include <errno.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include <spawn.h>
 #include <stdio.h>
@@ -338,6 +339,85 @@ int repro_macos_stat_is_symlink(void *buf) {
   if (!buf) return 0;
   struct stat *st = (struct stat *)buf;
   return S_ISLNK(st->st_mode) ? 1 : 0;
+}
+
+/*
+ * T3b (findings-doc break #4 + the dlopen arm of #7): classify a dyld IMAGE — a
+ * dependent dylib dyld mapped via low-level kernel mmap, OR a dlopen'd one — as
+ * a NON-SYSTEM, real-on-disk library-load dependency, or reject it.
+ *
+ * WHY this exists: dyld maps an executable's dependent dylibs (and dlopen'd
+ * ones) DIRECTLY via the kernel, bypassing the interposed/body-patched
+ * open/openat. A real clang-21 + ld64 link loaded 620 dylibs while io-mon
+ * recorded ZERO; the 24 non-system toolchain dylibs missed include
+ * libclang-cpp.dylib, libLLVM.dylib, libcrypto.3, libxml2, … A content-addressed
+ * cache fingerprinting only the depfile would then serve a STALE result after an
+ * in-place compiler-library upgrade (e.g. libclang.dylib updated beside a stable
+ * driver path). We capture the image set via _dyld_register_func_for_add_image
+ * instead (see the shim constructor): dyld invokes that callback for EVERY
+ * already-loaded image AND every future dlopen — the only path that sees these
+ * maps.
+ *
+ * FILTER (aggressive, to avoid recording the ~600-image SYSTEM BASELINE — both
+ * gratuitous noise and a per-dlopen cost — while keeping the toolchain's own
+ * dylibs):
+ *   - filetype must be MH_DYLIB / MH_BUNDLE. The MAIN EXECUTABLE (MH_EXECUTE) is
+ *     already recorded as a process-exec, so skipping it avoids a duplicate.
+ *   - reject our OWN injected shim (librepro_monitor_shim) — it is not a build
+ *     input — by substring (matches the shim under any sandbox drop-in path too).
+ *   - reject /usr/lib/** and /System/** (the OS framework baseline).
+ *   - reject anything resident in the dyld SHARED CACHE
+ *     (_dyld_shared_cache_contains_path): on modern macOS essentially every
+ *     system dylib lives ONLY in the shared cache with NO separate on-disk
+ *     Mach-O, so this is the dominant baseline filter.
+ *   - require the path to exist as a real on-disk REGULAR FILE (raw SYS_stat64,
+ *     unhooked → reentrancy-free): a shared-cache-only image is intentionally NOT
+ *     recorded (it is not a separate cacheable input). This is also the backstop
+ *     should the shared-cache predicate be unavailable.
+ * What SURVIVES is exactly the target: the toolchain's /nix/store, /opt/homebrew,
+ * /usr/local dylibs and a ./plugin.dylib-style dlopen'd image (dladdr resolves a
+ * relative dlopen path to its absolute on-disk path).
+ *
+ * DEADLOCK SAFETY: this runs INSIDE dyld's add-image callback (dyld holds its
+ * loader lock). It must NOT re-enter dyld. It uses dladdr (a lock-safe read) for
+ * the image path and a RAW stat syscall for the existence probe — NEVER the
+ * by-name image walk (repro_macos_lookup_image_symbol), which calls _dyld_* /
+ * NSLookupSymbolInImage and could deadlock. Returns 1 and fills `out` (>= 1024)
+ * when the image is a recordable dependency, 0 otherwise.
+ */
+int repro_macos_dyld_image_dep_path(void *mh_raw, void *out_raw,
+                                    size_t outlen) {
+  char *out = (char *)out_raw;
+  if (mh_raw == NULL || out == NULL || outlen < 1) return 0;
+  out[0] = '\0';
+  const struct mach_header *mh = (const struct mach_header *)mh_raw;
+  /* mh->filetype occupies the same offset in the 32- and 64-bit mach_header, so
+   * reading it through the 32-bit struct is correct for our arm64/arm64e images. */
+  uint32_t ft = mh->filetype;
+  if (ft != MH_DYLIB && ft != MH_BUNDLE) return 0;
+  Dl_info di;
+  if (!dladdr((const void *)mh, &di) || di.dli_fname == NULL) return 0;
+  const char *path = di.dli_fname;
+  size_t plen = strlen(path);
+  if (plen == 0 || plen + 1 > outlen) return 0;
+  /* Our own injected shim is never a build input. */
+  if (strstr(path, "librepro_monitor_shim") != NULL) return 0;
+  /* OS framework baseline by path prefix. */
+  if (strncmp(path, "/usr/lib/", 9) == 0) return 0;
+  if (strncmp(path, "/System/", 8) == 0) return 0;
+  /* Shared-cache-resident system images (the bulk of the ~600 baseline). Guarded
+   * by availability; the on-disk stat below is the backstop if it is absent. */
+  if (__builtin_available(macOS 11.0, *)) {
+    if (_dyld_shared_cache_contains_path(path)) return 0;
+  }
+  /* Must be a real on-disk REGULAR file: a shared-cache-only image has no
+   * separate Mach-O to fingerprint and is intentionally skipped. Raw syscall —
+   * no dyld re-entry. */
+  struct stat st;
+  if (syscall(SYS_stat64, path, &st) != 0) return 0;
+  if (!S_ISREG(st.st_mode)) return 0;
+  memcpy(out, path, plen + 1);
+  return 1;
 }
 
 int repro_macos_path_is_dir(char *path) {
@@ -1145,3 +1225,17 @@ proc ct_macos_stat_is_symlink*(buf: pointer): bool =
   proc isSymlink(buf: pointer): cint
     {.importc: "repro_macos_stat_is_symlink", cdecl.}
   isSymlink(buf) != 0
+
+proc ct_macos_dyld_image_dep_path*(mh: pointer; outBuf: pointer;
+    outLen: csize_t): cint =
+  ## T3b: classify a dyld image (a dependent dylib dyld kernel-mmap'd, or a
+  ## dlopen'd one) as a NON-SYSTEM, real-on-disk library-load dependency. Returns
+  ## non-zero and fills `outBuf` with the dylib's real path when it is a
+  ## recordable content dependency; 0 when it is filtered out (our own shim, the
+  ## /usr/lib + /System framework baseline, a shared-cache-only image, or anything
+  ## not present as an on-disk regular file). Deadlock-safe to call from inside a
+  ## `_dyld` add-image callback (see the C doc): it uses dladdr + a raw stat and
+  ## NEVER re-enters dyld.
+  proc imageDepPath(mh: pointer; outBuf: pointer; outLen: csize_t): cint
+    {.importc: "repro_macos_dyld_image_dep_path", cdecl.}
+  imageDepPath(mh, outBuf, outLen)
