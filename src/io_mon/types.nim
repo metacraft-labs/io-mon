@@ -19,6 +19,21 @@ type
     # renumber an existing enum case). Carries the destination in `path` and the
     # PEER PID in `childOsPid` (AF_UNIX via LOCAL_PEERPID; 0 when unobtainable).
     mrIpcConnect = 12
+    # T3b (Phase 3 / findings-doc break #4 + the dlopen arm of #7): a DEPENDENT
+    # DYLIB (or dlopen'd image) that dyld mapped via low-level kernel mmap,
+    # BYPASSING every hooked `open`/`openat`. A real clang/ld64 link loads ~620
+    # toolchain dylibs (libLLVM, libclang-cpp, …) that NEVER pass through the
+    # hooked open, so without this they were recorded NOWHERE — a content-addressed
+    # cache fingerprinting only the depfile would then serve a STALE result after
+    # an in-place compiler-library upgrade. Captured via the `_dyld` add-image
+    # callback (NOT by hooking open). APPENDED AT THE END to preserve RMDF
+    # wire-compat (the dgNoRuntimeDependencies / mrIpcConnect lesson — never
+    # renumber an existing case). The path is the dylib's REAL on-disk path; the
+    # `observationKind` is deliberately `moFileRead` so the dylib is treated as a
+    # genuine CONTENT (read) dependency by every consumer that keys on the
+    # observation kind — directly closing the stale-cache hole. The distinct record
+    # kind keeps a library-load identifiable for inspection + the no-flooding tests.
+    mrLibraryLoad = 13
 
   MonitorObservationKind* = enum
     moProcessStart = 1

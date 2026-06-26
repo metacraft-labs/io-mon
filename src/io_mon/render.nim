@@ -18,6 +18,7 @@ proc recordKindName(record: MonitorRecord): string =
   of mrBackendProfile: "backend-profile"
   of mrCapabilityGap: "capability-gap"
   of mrIpcConnect: "ipc-connect"
+  of mrLibraryLoad: "library-load"
 
 proc observationKindName(record: MonitorRecord): string =
   case record.observationKind

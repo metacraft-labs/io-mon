@@ -118,6 +118,16 @@ task test, "Run the io-mon test suite":
   # art) — keeps mcComplete WITH the daemon-read file folded in. macOS-only (no-op
   # pass elsewhere).
   exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_ipc_breakaway.nim"
+  # macOS T3b library-load / dependent-dylib + dlopen capture (adversarial
+  # hardening #4 + the dlopen arm of #7): dyld maps an executable's dependent
+  # dylibs — and dlopen'd images — via low-level kernel mmap, bypassing the hooked
+  # open/openat (a real clang/ld64 link loaded 620 dylibs while io-mon recorded
+  # 0). The shim's `_dyld` add-image callback now records each non-system,
+  # real-on-disk dylib as a library-load content dependency; an aggressive filter
+  # drops the ~600-image system baseline. Asserts the dlopen'd plugin and a
+  # /tmp-built dependent dylib are captured while libSystem is NOT (no flood).
+  # macOS-only (no-op pass elsewhere).
+  exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_library_load.nim"
 
 task buildShim, "Build the io-mon interpose shim shared library":
   # Produces build/lib/librepro_monitor_shim.{dylib,so,dll} — the drop-in

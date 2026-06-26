@@ -316,6 +316,55 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32;
     (if peerPid != 0: " peer=" & $peerPid else: " peer=unknown")
   emitRecord(record)
 
+proc recordLibraryLoad(path: cstring) {.raises: [].} =
+  ## Record a dyld-mapped DEPENDENT DYLIB (or a dlopen'd image) as a CONTENT
+  ## (read) dependency — findings-doc break #4 (a real clang/ld64 link mmaps ~620
+  ## toolchain dylibs — libLLVM, libclang-cpp, … — that NEVER pass through the
+  ## hooked open) plus the dlopen arm of break #7. dyld maps these via low-level
+  ## kernel mmap, bypassing every open/openat hook, so the ONLY way to see them is
+  ## the `_dyld` add-image callback (see `repro_hook_dyld_add_image`).
+  ##
+  ## The record carries the dylib's REAL on-disk path and uses `observationKind ==
+  ## moFileRead` so that an existing read-dependency consumer fingerprints the
+  ## dylib BYTES — directly closing the stale-cache hole (an in-place
+  ## libclang.dylib upgrade beside a stable driver path MUST bust the cache). The
+  ## distinct `mrLibraryLoad` record kind keeps it identifiable for inspection and
+  ## for the no-flooding tests. The aggressive FILTER (the runtime C helper) has
+  ## already dropped the ~600-image system baseline, so this fires only for real
+  ## non-system on-disk dylibs — no gratuitous noise.
+  if path == nil or path[0] == '\0':
+    return
+  var record = baseRecord(mrLibraryLoad, moFileRead)
+  record.path = $path
+  record.detail = "library-load dyld-image"
+  emitRecord(record)
+
+proc repro_hook_dyld_add_image*(mh: pointer; slide: int)
+    {.exportc, cdecl, dynlib.} =
+  ## dyld add-image callback (T3b). Registered via
+  ## `_dyld_register_func_for_add_image` in the shim constructor: dyld invokes it
+  ## ONCE for every image already loaded at registration time (the executable's
+  ## full dependent-dylib closure — complete here because dyld maps all static
+  ## dependencies BEFORE running initializers/this constructor) AND again for
+  ## every future `dlopen`. A single code path therefore covers BOTH break #4 (the
+  ## static toolchain-dylib closure) and the dlopen arm of break #7.
+  ##
+  ## SAFETY (this runs in dyld's image-loading context, dyld holding its loader
+  ## lock):
+  ##   * fail-safe: bail before the recording runtime is live (`initialized`).
+  ##   * reentrancy: if a record-emit ever re-entered dyld (it should not — it does
+  ##     only file I/O), `emitRecord` raises `disabled` for its append, so a nested
+  ##     callback sees `disabled > 0` and bails — no loop.
+  ##   * deadlock: all work is MINIMAL and dyld-free — the C classifier uses dladdr
+  ##     + a raw stat (never the `_dyld` image walk), and the emit is plain file
+  ##     I/O. No heavy work, no dlopen, no symbol resolution here.
+  if not initialized or disabled > 0:
+    return
+  var buf: array[1024, char]
+  buf[0] = '\0'
+  if ct_macos_dyld_image_dep_path(mh, addr buf[0], csize_t(buf.len)) != 0:
+    recordLibraryLoad(cast[cstring](addr buf[0]))
+
 proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
   if not locksReady:
     initLock(initLockVar)
@@ -1387,11 +1436,18 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
     interposeNote)
 
 {.emit: """
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+
 static int repro_monitor_runtime_ready = 0;
 extern void NimMain(void);
 extern void repro_monitor_install_bodypatch(void);
 extern int repro_monitor_shim_flush(void);
 extern void *repro_macos_resolve_libsystem_symbol(const char *symbol);
+/* T3b: the dyld add-image callback `repro_hook_dyld_add_image` is a Nim exportc
+ * proc whose prototype is already emitted (N_LIB_EXPORT) earlier in this same
+ * translation unit, so no re-declaration is needed here; we cast its function
+ * pointer to dyld's expected signature when registering below. */
 
 /*
  * Interpose-DISABLE diagnostic state (debug-only; see the Nim section's
@@ -2035,6 +2091,23 @@ static void repro_monitor_shim_constructor(void) {
    * capture (the downstream runner re-runs; it never treats this as a skip).
    */
   repro_monitor_install_bodypatch();
+  /*
+   * T3b (findings-doc break #4 + the dlopen arm of #7): capture the dyld IMAGE
+   * SET — dependent dylibs that dyld maps via low-level kernel mmap (bypassing
+   * every open/openat hook) plus future dlopen'd images.
+   * _dyld_register_func_for_add_image invokes the callback ONCE for each image
+   * ALREADY loaded (the executable's full dependent-dylib closure — complete at
+   * this point because dyld maps all static dependencies before running
+   * initializers/this constructor, so a separate _dyld_image_count() sweep would
+   * only re-deliver the same images and risk double-recording) AND again for
+   * every later dlopen — one path covers both breaks. Registered LAST so the
+   * recording runtime (runtime_ready / shim_init) is fully live when the initial
+   * burst of callbacks fires; the callback itself filters out the ~600-image
+   * system baseline. The cast adapts the Nim proc's ABI to dyld's expected
+   * `void(*)(const struct mach_header *, intptr_t)` (register-compatible).
+   */
+  _dyld_register_func_for_add_image(
+    (void (*)(const struct mach_header *, intptr_t))repro_hook_dyld_add_image);
 }
 
 /*
