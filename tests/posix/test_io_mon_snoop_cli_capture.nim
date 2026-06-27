@@ -1,39 +1,31 @@
-## test_io_mon_snoop_cli — the standalone `io-mon` CLI (M8) BUILDS, is
-## RESOLVABLE, and drives a live capture over a freshly-built USER binary.
+## test_io_mon_snoop_cli_capture — POSIX LIVE half of the standalone `io-mon` CLI
+## (M8): EMPIRICALLY run a freshly-built USER binary (a tiny C program that
+## `fopen()`s + reads a known file) UNDER the snoop CLI with the shim injected,
+## then assert the captured depfile CONTAINS the input read.
 ##
-## # What this proves
-##
-## The Incremental-Test-Runner M8 relocated reprobuild's `repro internal
-## io monitor` snoop surface into io-mon as a standalone binary
-## (`cmd/io_mon_snoop.nim`, built by `nimble buildSnoop` → `build/bin/io-mon`).
-## This test:
-##
-##   1. BUILDS the snoop CLI from source with ONLY io-mon's modules +
-##      nim-stackable-hooks (no reprobuild path) — the standalone contract.
-##   2. Confirms `inspect` round-trips a depfile (the platform-independent arm).
-##   3. EMPIRICALLY runs a freshly-built USER binary (a tiny C program that
-##      `fopen()`s + reads a known file) UNDER the snoop CLI with the shim
-##      injected, then checks the captured depfile CONTAINS the input read.
+## This is POSIX-shared behavior (macOS DYLD_INSERT + body-patch; Linux
+## LD_PRELOAD): the snoop CLI sets up the platform injection itself, so the same
+## test exercises both shims. The platform-INDEPENDENT build + `inspect` smoke
+## lives in `tests/portable/test_io_mon_snoop_cli_smoke.nim`.
 ##
 ## # macOS: the interpose internal-call gap is now CLOSED
 ##
 ## The fixture reads its input via `fopen`, whose `open` happens
-## shared-cache-internally (inside libsystem_c, via `open$NOCANCEL`). The
-## legacy `__DATA,__interpose` mechanism alone does NOT intercept that internal
-## open — interpose only rewrites the binary's own import bindings. The
-## body-patch mechanism (always on by default) closes that gap by
-## replacing the libsystem open-family entry points themselves
-## (`mach_vm_remap` overwrite technique), so the snoop CLI now captures the
-## input read on macOS too. This test therefore asserts the POSITIVE capture on
-## every supported platform. (The focused interpose-vs-body-patch contrast lives
-## in `tests/test_io_mon_macos_bodypatch.nim`.)
+## shared-cache-internally (inside libsystem_c, via `open$NOCANCEL`). The legacy
+## `__DATA,__interpose` mechanism alone does NOT intercept that internal open. The
+## body-patch mechanism (always on by default) closes that gap by replacing the
+## libsystem open-family entry points themselves (`mach_vm_remap` overwrite), so
+## the snoop CLI captures the input read on macOS too. This test therefore asserts
+## the POSITIVE capture on every supported POSIX platform. (The focused
+## interpose-vs-body-patch contrast lives in
+## `tests/macos/test_io_mon_macos_bodypatch.nim`.)
 
 import std/[os, osproc, streams, strtabs, strutils, unittest]
 
 import io_mon  # readMonitorDepFile, MonitorObservationKind, findShimLibrary
 
 const
-  repoRoot = currentSourcePath().parentDir().parentDir()
+  repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
   hooksSrc = repoRoot.parentDir() / "nim-stackable-hooks" / "src"
   snoopSrc = repoRoot / "cmd" / "io_mon_snoop.nim"
   fixtureC = repoRoot / "tests" / "fixtures" / "fs_snoop_tool" / "fs_snoop_tool.c"
@@ -47,25 +39,24 @@ proc run(cmd: string; args: seq[string]; env: StringTableRef = nil):
   p.close()
   (output, code)
 
-suite "io-mon CLI (M8)":
-  let work = getTempDir() / ("io-mon-cli-" & $getCurrentProcessId())
+suite "io-mon CLI (M8) — POSIX live capture":
+  let work = getTempDir() / ("io-mon-cli-cap-" & $getCurrentProcessId())
   createDir(work)
   let snoopBin = work / "io-mon"
 
-  test "the snoop CLI builds standalone (io-mon + nim-stackable-hooks only)":
+  test "a freshly-built user binary's read is captured under the snoop CLI":
+    # Build the snoop CLI (the out-of-process driver the runner uses).
     check fileExists(snoopSrc)
-    check dirExists(hooksSrc)
-    let (output, code) = run("nim", @[
+    let (cliOut, cliCode) = run("nim", @[
       "c", "--hints:off", "--warnings:off", "--threads:on",
       "--path:" & (repoRoot / "src"),
       "--path:" & hooksSrc,
       "--out:" & snoopBin,
       snoopSrc])
-    checkpoint(output)
-    check code == 0
+    checkpoint(cliOut)
+    check cliCode == 0
     check fileExists(snoopBin)
 
-  test "a freshly-built user binary's read is captured under the snoop CLI":
     # Build the interpose shim shared library (the live-capture half).
     let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
     checkpoint("build_shim: " & buildShim.output)
@@ -107,7 +98,7 @@ suite "io-mon CLI (M8)":
     let dep = readMonitorDepFile(depfile)
     check dep.records.len > 0  # at minimum the backend-profile + capability-gap
 
-    # EMPIRICAL read-capture outcome: did the interpose fire for the user binary?
+    # EMPIRICAL read-capture outcome: did the injection fire for the user binary?
     var capturedInputRead = false
     for rec in dep.records:
       if rec.path.len > 0 and inputPath in rec.path and
@@ -118,31 +109,24 @@ suite "io-mon CLI (M8)":
 
     when defined(macosx):
       # macOS: the __DATA,__interpose mechanism alone does NOT intercept the
-      # fopen-internal (shared-cache-internal) open the fixture performs. That
-      # gap is now CLOSED by the body-patch mechanism, which the shim always runs
-      # by default (both mechanisms on): it replaces the libsystem
-      # open/open$NOCANCEL/__open_nocancel entry points themselves and so sees
-      # the internal open regardless of caller. The user-binary read MUST now be
-      # captured. (See tests/test_io_mon_macos_bodypatch.nim for the focused
-      # interpose-vs-body-patch contrast.)
+      # fopen-internal (shared-cache-internal) open the fixture performs. That gap
+      # is now CLOSED by the body-patch mechanism, which the shim always runs by
+      # default (both mechanisms on). The user-binary read MUST now be captured.
       checkpoint("macOS host: capturedInputRead=" & $capturedInputRead &
         " (body-patch closes the interpose internal-call gap)")
       check capturedInputRead
     else:
-      # Linux / Windows: LD_PRELOAD / CreateRemoteThread are expected to capture
-      # the read of a freshly-built user binary. If they do not on this host,
-      # surface it loudly (it is a real gap to validate), don't silently pass.
-      checkpoint("non-macOS host: capturedInputRead=" & $capturedInputRead)
+      # Linux / *BSD: LD_PRELOAD is expected to capture the read of a freshly-built
+      # user binary. If it does not on this host, surface it loudly (a real gap to
+      # validate), don't silently pass.
+      checkpoint("non-macOS POSIX host: capturedInputRead=" & $capturedInputRead)
       check capturedInputRead
 
-  test "inspect round-trips a captured depfile":
-    # The platform-independent arm: `inspect` decodes + renders a real depfile.
-    let depfile = work / "cap.rdep"
-    if fileExists(depfile):
-      let (output, code) = run(snoopBin,
-        @["inspect", depfile, "--format", "text"])
-      checkpoint(output)
-      check code == 0
-      check "RMDF" in output
+    # `inspect` decodes + renders the depfile the live capture just produced.
+    let (insOut, insCode) = run(snoopBin,
+      @["inspect", depfile, "--format", "text"])
+    checkpoint(insOut)
+    check insCode == 0
+    check "RMDF" in insOut
 
   removeDir(work)

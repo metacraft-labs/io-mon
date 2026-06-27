@@ -12,26 +12,9 @@ build/
 *.exp
 test-logs/
 
-# Compiled test binaries (nim c -r leaves the binary next to the source)
-tests/test_io_mon_parity_with_fs_snoop
-tests/test_io_mon_builds_standalone
-tests/test_io_mon_shim_builds_standalone
-tests/test_io_mon_snoop_cli
-tests/test_io_mon_macos_bodypatch
-tests/test_io_mon_macos_bodypatch_spawn
-tests/test_io_mon_macos_record_once
-tests/test_io_mon_macos_sip_system_child
-tests/test_io_mon_macos_bodypatch_resolution
-tests/test_io_mon_macos_rename
-tests/test_io_mon_macos_bodypatch_open_mode
-tests/test_io_mon_macos_threaded_write
-tests/test_io_mon_t0_completeness
-tests/test_io_mon_macos_content_hooks
-tests/test_io_mon_macos_symlink
-tests/test_io_mon_macos_setexec
-tests/test_io_mon_macos_ipc_breakaway
-tests/test_io_mon_macos_library_load
-tests/test_io_mon_macos_endpoint_security
-tests/test_io_mon_macos_round2_rb
-tests/test_io_mon_macos_xpc_mach_breakaway
-tests/test_io_mon_macos_rd
+# Compiled test binaries (nim c -r leaves the binary next to its source).
+# Tests live under per-OS subdirs (tests/portable, tests/posix, tests/macos,
+# tests/linux, tests/windows); the binary has the same name as the .nim source
+# minus the extension. Ignore the binaries, keep the sources.
+tests/*/test_*
+!tests/*/test_*.nim

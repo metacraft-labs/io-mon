@@ -37,7 +37,7 @@ when defined(macosx):
   import macos_backend_toggle
 
 const
-  repoRoot = currentSourcePath().parentDir().parentDir()
+  repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
   corpus = repoRoot / "research" / "adversarial-2026-06" / "adv_proctree"
   # ROUND-2 R8 — a fixed run id shared between the shim env and the cooperating
   # trusted daemon so its run-scoped breakaway report authenticates.

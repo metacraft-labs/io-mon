@@ -33,7 +33,7 @@ import std/[os, osproc, streams, strtabs, unittest]
 from std/strutils import contains
 
 const
-  repoRoot = currentSourcePath().parentDir().parentDir()
+  repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
 
 when defined(macosx):
   import io_mon  # readMonitorDepFile, mergeFragments, MonitorObservationKind

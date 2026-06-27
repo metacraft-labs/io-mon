@@ -33,7 +33,7 @@ when defined(macosx):
   import macos_backend_toggle  # applyMacosBackendToggle (A/B → debug toggles)
 
 const
-  repoRoot = currentSourcePath().parentDir().parentDir()
+  repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
 
 when defined(macosx):
   # A shared-cache-internal target that exists on every macOS host and is read

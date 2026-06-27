@@ -48,7 +48,7 @@ when defined(macosx):
   import macos_backend_toggle
 
 const
-  repoRoot = currentSourcePath().parentDir().parentDir()
+  repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
   corpus = repoRoot / "research" / "adversarial-2026-06-round2" / "r2_xpc"
   testRunId = "io-mon-xpc-test-run"
 

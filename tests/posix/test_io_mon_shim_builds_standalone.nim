@@ -29,7 +29,7 @@
 import std/[os, osproc, strutils, tempfiles, unittest]
 
 const
-  repoRoot = currentSourcePath().parentDir().parentDir()
+  repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
   hooksSrc = repoRoot.parentDir() / "nim-stackable-hooks" / "src"
 
 proc platformShimModule(): string =

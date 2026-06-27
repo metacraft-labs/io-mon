@@ -39,7 +39,7 @@ when defined(macosx):
   import macos_backend_toggle  # applyMacosBackendToggle (A/B → debug toggles)
 
 const
-  repoRoot = currentSourcePath().parentDir().parentDir()
+  repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
 
 when defined(macosx):
   proc buildShim(): string =
