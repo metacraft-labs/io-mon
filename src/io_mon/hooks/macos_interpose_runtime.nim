@@ -61,6 +61,8 @@ proc repro_macos_get_sandbox_tools_dir*(): cstring
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <libproc.h>
+#include <sys/proc_info.h>
 
 extern char **environ;
 extern char *repro_macos_rewrite_sip_path(char *path);
@@ -293,6 +295,43 @@ int repro_macos_socket_describe(int fd, void *addr, unsigned int addrlen,
       snprintf(out_dest, out_dest_len, "[%s]:%d", ip, ntohs(in6->sin6_port));
   }
   return family;
+}
+
+/*
+ * ROUND-2 R7 ((pid, start-time) process identity): macOS pids WRAP (~40k
+ * allocations recycle the namespace, see research/.../r2_machinery/pidwrap.c).
+ * The merge-time matching of spawn children / IPC peers / process-start records
+ * keyed on the BARE pid then false-matches a recycled pid against a stale
+ * monitored process-start. The kernel process-creation time disambiguates: a
+ * recycled pid has a DIFFERENT start time than the stale process that last held
+ * it. `proc_pidinfo(PROC_PIDTBSDINFO)` returns the BSD-info start timeval for ANY
+ * pid the caller can see (it works cross-process, so a parent can stamp a freshly
+ * spawned child's start time, and a client can stamp a daemon peer's). Returns
+ * microseconds-since-epoch, or 0 when the pid is gone / unqueryable (the merge
+ * then degrades to bare-pid matching for that record — safe, never a false
+ * downgrade). proc_pidinfo / arc4random are not hooked, so this is reentrancy-free.
+ */
+unsigned long long repro_macos_proc_start_usec(int pid) {
+  if (pid <= 0) return 0ull;
+  struct proc_bsdinfo info;
+  int n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, (int)sizeof(info));
+  if (n != (int)sizeof(info)) return 0ull;
+  return (unsigned long long)info.pbi_start_tvsec * 1000000ull +
+         (unsigned long long)info.pbi_start_tvusec;
+}
+
+/*
+ * ROUND-2 R8 (trusted-daemon report authentication): a cryptographically random
+ * per-connection nonce stamped into each `mrIpcConnect` record (and offered to a
+ * cooperating daemon via the ticket sidecar). The merge rejects a breakaway
+ * report whose `nonce` token does not match a nonce the shim actually recorded
+ * for an observed connection, so a report cannot be fabricated for a connection
+ * the monitor never saw. arc4random_buf is CSPRNG-grade and unguessable.
+ */
+unsigned long long repro_macos_random_u64(void) {
+  unsigned long long v = 0ull;
+  arc4random_buf(&v, sizeof v);
+  return v;
 }
 
 /*
@@ -1181,6 +1220,23 @@ proc ct_macos_socket_describe*(fd: cint; address: pointer; addrLen: uint32;
       outDestLen: csize_t; outPeerPid: ptr cint): cint
     {.importc: "repro_macos_socket_describe", cdecl.}
   describe(fd, address, addrLen, outDest, outDestLen, outPeerPid)
+
+proc ct_macos_proc_start_usec*(pid: cint): uint64 =
+  ## ROUND-2 R7 — kernel process start time (microseconds since epoch) for `pid`,
+  ## via `proc_pidinfo(PROC_PIDTBSDINFO)`; 0 when unqueryable. Used to stamp the
+  ## (pid, start-time) identity on process-start / spawn-child / IPC-peer records
+  ## so the merge cannot false-match a recycled (wrapped) pid against a stale
+  ## monitored process-start. See the C helper for the pid-wrap rationale.
+  proc impl(pid: cint): uint64
+    {.importc: "repro_macos_proc_start_usec", cdecl.}
+  impl(pid)
+
+proc ct_macos_random_u64*(): uint64 =
+  ## ROUND-2 R8 — an unguessable per-connection nonce (arc4random_buf) stamped on
+  ## each IPC-connect record so a trusted-daemon breakaway report must echo a nonce
+  ## the shim actually recorded for an observed connection.
+  proc impl(): uint64 {.importc: "repro_macos_random_u64", cdecl.}
+  impl()
 
 proc ct_macos_real_copyfile*(src, dst: cstring; state: pointer;
     flags: uint32): cint =

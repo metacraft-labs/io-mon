@@ -79,6 +79,11 @@ var
   # reads AND writes regardless of when they exit. This closes the threaded-write
   # capture gap without a teardown-time Nim call.
   mainThreadId: uint64 = 0
+  # ROUND-2 R8 — this invocation's RUN ID, read once from REPRO_MONITOR_SESSION at
+  # init. Stamped (as a `run=` token) onto every process-start and IPC-connect
+  # record so the merge can scope trusted-daemon breakaway reports to THIS run and
+  # reject stale / cross-run reports. Empty when the launcher set no session.
+  runId: string = ""
 
 var disabled {.threadvar.}: int
 
@@ -140,9 +145,19 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
     if record.threadId != mainThreadId:
       flushFragmentBatch()
 
+proc runIdToken(): string {.raises: [].} =
+  ## ROUND-2 R8 — the ` run=<id>` detail suffix (empty when no run id). Single
+  ## source of truth so process-start and IPC-connect stamp it identically.
+  if runId.len > 0: " run=" & runId else: ""
+
 proc recordProcessStart() {.raises: [].} =
   var record = baseRecord(mrProcessStart, moProcessStart)
-  record.detail = "shim-loaded"
+  # ROUND-2 R7/R8 — stamp this process's (pid, kernel-start-time) identity and the
+  # invocation run id. The merge keys monitored-process matching on (pid,
+  # start-time) so a wrapped/recycled pid cannot false-match a stale process-start,
+  # and scopes trusted-daemon reports to `run`.
+  record.detail = "shim-loaded start=" &
+    $ct_macos_proc_start_usec(c_getpid()) & runIdToken()
   emitRecord(record)
 
 proc observationForOpen(flags: cint): MonitorObservationKind =
@@ -249,8 +264,19 @@ proc recordSpawn(childPid: PidT; callResult: cint; path: cstring; detail: string
   record.result = callResult.int64
   if path != nil:
     record.path = $path
-  if detail.len > 0:
-    record.detail = detail
+  var d = detail
+  # ROUND-2 R7 — stamp the CHILD's kernel start time so the merge matches the
+  # spawn against the child's own process-start by (pid, start-time), not bare
+  # pid. The child pid exists the instant posix_spawn/fork returns, so its start
+  # time is queryable now. A recycled child pid whose start time differs from a
+  # stale monitored process-start is then correctly seen as un-monitored.
+  if childPid > 0:
+    let childStart = ct_macos_proc_start_usec(cint(childPid))
+    if childStart != 0:
+      if d.len > 0: d.add ' '
+      d.add "childstart=" & $childStart
+  if d.len > 0:
+    record.detail = d
   emitRecord(record)
 
 proc recordRename(callResult: cint; fromPath, toPath: cstring; detail: string) {.raises: [].} =
@@ -311,9 +337,22 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32;
   record.flags = uint32(family)
   record.childOsPid = uint64(peerPid)        # peer pid (0 ⇒ unobtainable)
   record.path = $cast[cstring](addr dest[0]) # socket path or "ip:port"
-  record.detail =
+  # ROUND-2 R7 — stamp the PEER's (pid, start-time) so the merge matches an
+  # in-tree peer by identity, not bare pid (a recycled peer pid with a different
+  # start time is correctly out-of-tree). ROUND-2 R8 — stamp the run id (report
+  # scoping) and an unguessable per-connection nonce (recorded so the merge can
+  # reject a trusted-daemon report whose nonce does not match an OBSERVED
+  # connection). See writer.unmonitoredSubtreeLossCount / loadBreakawayReports.
+  var d =
     (if family == AfUnix: "connect af_unix" else: "connect af_inet") &
     (if peerPid != 0: " peer=" & $peerPid else: " peer=unknown")
+  if peerPid != 0:
+    let peerStart = ct_macos_proc_start_usec(peerPid)
+    if peerStart != 0:
+      d.add " peerstart=" & $peerStart
+  d.add runIdToken()
+  d.add " nonce=" & $ct_macos_random_u64()
+  record.detail = d
   emitRecord(record)
 
 proc recordLibraryLoad(path: cstring) {.raises: [].} =
@@ -380,6 +419,8 @@ proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
     fragmentDir = getEnv("REPRO_MONITOR_FRAGMENT_DIR")
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))
+    # ROUND-2 R8 — capture the invocation run id for report authentication.
+    runId = getEnv("REPRO_MONITOR_SESSION")
   # Record the constructor thread as the "main" thread. Its fragment batch is
   # flushed by the dyld process-exit destructor; worker threads (which the
   # destructor cannot reach safely) flush eagerly per record in emitRecord. Init

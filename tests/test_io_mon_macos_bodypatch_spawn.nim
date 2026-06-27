@@ -55,7 +55,7 @@
 ##
 ## macOS-only; a no-op pass elsewhere.
 
-import std/[os, osproc, streams, strtabs, unittest]
+import std/[os, osproc, streams, strtabs, strutils, unittest]
 
 when defined(macosx):
   import io_mon  # readMonitorDepFile, mergeFragments, MonitorObservationKind
@@ -219,8 +219,15 @@ int main(void) { return system("/usr/bin/true"); }
       result.anySpawnRecord = true
       if rec.path.len > 0:
         result.shellPath = rec.path
-      if rec.detail == "bodypatch-posix_spawn" or
-          rec.detail == "bodypatch-posix_spawnp":
+      # ROUND-2 R7 — a spawn record's `detail` is now a multi-token field: the
+      # backend tag is the FIRST token, optionally FOLLOWED by appended identity
+      # tokens (e.g. `childstart=<usec>`, see writer.detailToken /
+      # macos_interpose.recordSpawn). Match the leading tag token, not the whole
+      # string, so the body-patch tag is still recognised once R7 stamps the
+      # child's (pid, start-time) identity onto the record.
+      let detailTag = rec.detail.splitWhitespace()
+      let tag = if detailTag.len > 0: detailTag[0] else: ""
+      if tag == "bodypatch-posix_spawn" or tag == "bodypatch-posix_spawnp":
         result.bodypatchSpawnRecord = true
 
   type Capture = object

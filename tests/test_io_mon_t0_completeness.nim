@@ -25,6 +25,26 @@ proc ipc(pid, peer: uint64; dest = "/tmp/d.sock"): MonitorRecord =
   MonitorRecord(kind: mrIpcConnect, observationKind: moIpcConnect,
     osPid: pid, childOsPid: peer, path: dest)
 
+# ROUND-2 R7 helpers — records carrying the (pid, start-time) identity tokens the
+# shim stamps. Used to prove a recycled (wrapped) pid no longer false-matches.
+proc startAt(pid: uint64; startUsec: string; run = ""): MonitorRecord =
+  result = MonitorRecord(kind: mrProcessStart, observationKind: moProcessStart,
+    osPid: pid, detail: "shim-loaded start=" & startUsec)
+  if run.len > 0: result.detail.add " run=" & run
+
+proc spawnChildAt(parent, child: uint64; childStartUsec: string): MonitorRecord =
+  MonitorRecord(kind: mrProcessSpawn, observationKind: moExecute,
+    osPid: parent, childOsPid: child,
+    detail: "posix_spawn childstart=" & childStartUsec)
+
+proc ipcPeerAt(pid, peer: uint64; peerStartUsec: string;
+    dest = "/tmp/d.sock"; run = ""; nonce = ""): MonitorRecord =
+  result = MonitorRecord(kind: mrIpcConnect, observationKind: moIpcConnect,
+    osPid: pid, childOsPid: peer, path: dest,
+    detail: "connect af_unix peer=" & $peer & " peerstart=" & peerStartUsec)
+  if run.len > 0: result.detail.add " run=" & run
+  if nonce.len > 0: result.detail.add " nonce=" & nonce
+
 suite "io-mon T0 earned-completeness (unmonitoredSubtreeLossCount)":
   test "a fully monitored fork+exec tree yields NO loss":
     # parent 100 forks child 200 (which emits its own start), then 200 execs into
@@ -104,71 +124,248 @@ suite "io-mon T3a IPC-breakaway downgrade (unmonitoredSubtreeLossCount)":
     # spawn 300 (no start) + exec into un-injectable + connect to 999 = 3 losses.
     check unmonitoredSubtreeLossCount(records) == 3
 
-suite "io-mon T3a breakaway-report folding (mergeFragments)":
-  test "a trusted-daemon report keeps the build mcComplete and adds the read":
-    # End-to-end through mergeFragments, platform-independent: synthesize a
-    # client's fragment (process-start + ipc-connect to an OUT-OF-TREE daemon),
-    # then prove the merge downgrades WITHOUT a report and stays complete WITH one
-    # — and that the daemon-served file becomes a real dependency.
-    let work = getTempDir() / ("io-mon-breakaway-" & $getCurrentProcessId())
+suite "io-mon R1 ROOT-process completeness guard (mergeFragments)":
+  # ROUND-2 R1 — a SIP/hardened/notarized ROOT (e.g. /bin/cat) strips DYLD inject,
+  # loads no shim, emits NO process-start, leaving an EMPTY fragment set that the
+  # old merge published as mcComplete (a zero-effort false cache hit). The launcher
+  # passes the root pid; the merge proves the root was monitored or downgrades.
+  test "an un-monitored root (no process-start) downgrades to mcIncomplete":
+    let work = getTempDir() / ("io-mon-r1-sip-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let frag = work / "frags"
+    createDir(frag)            # empty fragment set — the SIP-root reality
+    let dep = mergeFragments(frag, work / "out.rdep", expectedRootPid = 4321'u64)
+    check dep.completeness == mcIncomplete
     removeDir(work)
-    createDir(work)
+
+  test "a monitored root (its process-start present) stays mcComplete":
+    # The no-false-downgrade guard: a normal user-binary root DOES load the shim
+    # and emits its own process-start, so the synthetic root-spawn is matched.
+    let work = getTempDir() / ("io-mon-r1-ok-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
     let frag = work / "frags"
     createDir(frag)
+    appendFragmentRecord(frag, startAt(4321'u64, "9000"))
+    let dep = mergeFragments(frag, work / "out.rdep", expectedRootPid = 4321'u64)
+    check dep.completeness == mcComplete
+    removeDir(work)
+
+  test "expectedRootPid=0 preserves legacy behaviour (no synthetic spawn)":
+    let work = getTempDir() / ("io-mon-r1-legacy-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let frag = work / "frags"
+    createDir(frag)
+    appendFragmentRecord(frag, start(4321'u64))
+    check mergeFragments(frag, work / "out.rdep").completeness == mcComplete
+    removeDir(work)
+
+suite "io-mon R7 (pid, start-time) identity (defeat pid-reuse)":
+  # macOS pids WRAP (~40k allocs); a recycled pid otherwise false-matches a stale
+  # monitored process-start, so the subtree/IPC checks pass and the unmonitored
+  # child/peer is hidden (the round-2 R7 defeat). The merge now keys matching on
+  # (pid, kernel-start-time). The full pid-wrap exploit is impractical to script,
+  # so these unit tests construct records with the SAME pid but DIFFERENT start
+  # times and assert NO false match — while a genuine in-tree match still holds.
+  test "spawn child with RECYCLED pid (different start time) is NOT matched":
+    # A stale monitored process-start for pid 200 @ t=1000 exists; later an
+    # un-injectable child REUSES pid 200 with start time t=2000. The spawn names
+    # (200, 2000) which is NOT the stale (200, 1000) ⇒ one loss (was 0 under the
+    # old bare-pid match — the defeat).
+    let records = @[startAt(200, "1000"), spawnChildAt(100, 200, "2000")]
+    check unmonitoredSubtreeLossCount(records) == 1
+
+  test "genuine in-tree child (matching pid AND start time) is still matched":
+    # The cardinal-sin guard: a real fork/spawn child whose start time matches its
+    # own process-start must NOT downgrade.
+    let records = @[startAt(200, "2000"), spawnChildAt(100, 200, "2000")]
+    check unmonitoredSubtreeLossCount(records) == 0
+
+  test "IPC peer with RECYCLED pid (different start time) is out-of-tree":
+    let records = @[startAt(999, "1000"), startAt(100, "5000"),
+      ipcPeerAt(100, 999, "2000")]
+    check unmonitoredSubtreeLossCount(records) == 1
+
+  test "IPC peer that is a genuine in-tree process (pid+start match) → NO loss":
+    let records = @[startAt(999, "2000"), startAt(100, "5000"),
+      ipcPeerAt(100, 999, "2000")]
+    check unmonitoredSubtreeLossCount(records) == 0
+
+  test "missing start-time token falls back to bare-pid (no false downgrade)":
+    # A record predating the identity stamp (or where proc_pidinfo failed) carries
+    # no start token; matching degrades to bare pid, preserving old behaviour.
+    let records = @[start(200), spawn(100, 200)]   # no start tokens anywhere
+    check unmonitoredSubtreeLossCount(records) == 0
+
+suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
+  # ROUND-2 R8 — the un-authenticated fold was DEFEATED by a forged no-reads
+  # report (3b) and a stale cross-run report (3c). A report is now trusted only if
+  # it is run-scoped, bound to an OBSERVED connection, explicitly complete, and
+  # accounts for ≥1 read. These platform-independent tests lock the auth in.
+  const runId = "session-abc-123"
+
+  proc clientFrag(work: string; clientPid, daemonPid: uint64): string =
+    ## A client fragment: process-start (run-stamped) + an ipc-connect to an
+    ## OUT-OF-TREE daemon (so without a valid report the merge downgrades).
+    let frag = work / "frags"
+    createDir(frag)
+    appendFragmentRecord(frag, startAt(clientPid, "7000", runId))
+    appendFragmentRecord(frag, ipcPeerAt(clientPid, daemonPid, "8000",
+      "/tmp/sccache.sock", runId, "noncedeadbeef"))
+    frag
+
+  test "an AUTHENTICATED report keeps mcComplete and adds the read":
+    let work = getTempDir() / ("io-mon-r8-ok-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
     let reportDir = work / "reports"
     createDir(reportDir)
-    let clientPid = 4242'u64
-    let daemonPid = 9999'u64
-    appendFragmentRecord(frag, MonitorRecord(kind: mrProcessStart,
-      observationKind: moProcessStart, osPid: clientPid, threadId: 1))
-    appendFragmentRecord(frag, MonitorRecord(kind: mrIpcConnect,
-      observationKind: moIpcConnect, osPid: clientPid, threadId: 1,
-      childOsPid: daemonPid, path: "/tmp/sccache.sock",
-      detail: "connect af_unix peer=9999"))
+    let frag = clientFrag(work, 4242'u64, 9999'u64)
     let served = "/some/served/header.h"
     writeFile(reportDir / "report-4242-9999-0.io-mon-report",
-      "io-mon-breakaway-report v1\nclient " & $clientPid & "\ndaemon " &
-        $daemonPid & "\nread " & served & "\n")
-
-    # WITHOUT the report: the out-of-tree peer downgrades to mcIncomplete.
-    let depNo = mergeFragments(frag, work / "no.rdep")
-    check depNo.completeness == mcIncomplete
-
-    # WITH the report: the daemon accounted for its read → mcComplete, and the
-    # served file appears in the depfile as a dependency.
-    let depYes = mergeFragments(frag, work / "yes.rdep", reportDir)
-    check depYes.completeness == mcComplete
+      "io-mon-breakaway-report v1\nrun " & runId & "\nclient 4242\ndaemon 9999\n" &
+        "read " & served & "\ncomplete\n")
+    # WITHOUT the report the out-of-tree peer downgrades…
+    check mergeFragments(frag, work / "no.rdep").completeness == mcIncomplete
+    # …WITH the authenticated report it stays complete and the read is folded in.
+    let dep = mergeFragments(frag, work / "yes.rdep", reportDir)
+    check dep.completeness == mcComplete
     var sawServed = false
-    for r in depYes.records:
-      if r.path == served and r.observationKind == moFileRead:
-        sawServed = true
+    for r in dep.records:
+      if r.path == served and r.observationKind == moFileRead: sawServed = true
     check sawServed
     removeDir(work)
 
-  test "a report for ANOTHER build's client pid is ignored (per-build isolation)":
-    # A persistent daemon serves many builds; a report whose client pid is NOT one
-    # of THIS merge's monitored processes must not trust the daemon (the connect
-    # still downgrades) nor inject a foreign read.
-    let work = getTempDir() / ("io-mon-breakaway2-" & $getCurrentProcessId())
-    removeDir(work)
-    createDir(work)
-    let frag = work / "frags"
-    createDir(frag)
+  test "3b FORGED: a report with NO reads does NOT suppress the downgrade":
+    # The malicious_client.c forgery: it names itself client + the daemon, but
+    # lists no reads and makes no completeness claim ⇒ untrusted ⇒ mcIncomplete.
+    let work = getTempDir() / ("io-mon-r8-forge-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
     let reportDir = work / "reports"
     createDir(reportDir)
-    let clientPid = 5151'u64
-    let daemonPid = 9999'u64
-    appendFragmentRecord(frag, MonitorRecord(kind: mrProcessStart,
-      observationKind: moProcessStart, osPid: clientPid, threadId: 1))
-    appendFragmentRecord(frag, MonitorRecord(kind: mrIpcConnect,
-      observationKind: moIpcConnect, osPid: clientPid, threadId: 1,
-      childOsPid: daemonPid, path: "/tmp/sccache.sock"))
-    # The report names a DIFFERENT client pid (another build).
-    writeFile(reportDir / "report-1111-9999-0.io-mon-report",
-      "io-mon-breakaway-report v1\nclient 1111\ndaemon " & $daemonPid &
-        "\nread /other/build/file.h\n")
+    let frag = clientFrag(work, 4242'u64, 9999'u64)
+    writeFile(reportDir / "forged.io-mon-report",
+      "io-mon-breakaway-report v1\nrun " & runId & "\nclient 4242\ndaemon 9999\n")
+    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    check dep.completeness == mcIncomplete
+    removeDir(work)
+
+  test "3b PARTIAL: reads present but NOT declared complete ⇒ untrusted":
+    let work = getTempDir() / ("io-mon-r8-partial-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let reportDir = work / "reports"
+    createDir(reportDir)
+    let frag = clientFrag(work, 4242'u64, 9999'u64)
+    writeFile(reportDir / "partial.io-mon-report",
+      "io-mon-breakaway-report v1\nrun " & runId &
+        "\nclient 4242\ndaemon 9999\nread /x/y.h\n")  # no `complete`
+    check mergeFragments(frag, work / "out.rdep", reportDir).completeness ==
+      mcIncomplete
+    removeDir(work)
+
+  test "3c STALE: a report from ANOTHER run is not folded (run mismatch)":
+    let work = getTempDir() / ("io-mon-r8-stale-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let reportDir = work / "reports"
+    createDir(reportDir)
+    let frag = clientFrag(work, 4242'u64, 9999'u64)
+    # Same client pid (a collision) and a full report — but a DIFFERENT run id.
+    writeFile(reportDir / "stale.io-mon-report",
+      "io-mon-breakaway-report v1\nrun OLD-SESSION-999\nclient 4242\ndaemon 9999\n" &
+        "read /stale/build/file.h\ncomplete\n")
+    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    check dep.completeness == mcIncomplete
+    for r in dep.records:
+      check r.path != "/stale/build/file.h"
+    removeDir(work)
+
+  test "a complete report for an UN-OBSERVED daemon (no connect) is rejected":
+    # Connection binding: the report names a daemon the client never connected to.
+    let work = getTempDir() / ("io-mon-r8-noconn-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let reportDir = work / "reports"
+    createDir(reportDir)
+    let frag = clientFrag(work, 4242'u64, 9999'u64)  # client connected to 9999
+    writeFile(reportDir / "wrong.io-mon-report",
+      "io-mon-breakaway-report v1\nrun " & runId &
+        "\nclient 4242\ndaemon 7777\nread /x.h\ncomplete\n")  # daemon 7777!
+    check mergeFragments(frag, work / "out.rdep", reportDir).completeness ==
+      mcIncomplete
+    removeDir(work)
+
+  test "a report for ANOTHER build's client pid is ignored (per-build isolation)":
+    let work = getTempDir() / ("io-mon-r8-iso-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let reportDir = work / "reports"
+    createDir(reportDir)
+    let frag = clientFrag(work, 5151'u64, 9999'u64)
+    writeFile(reportDir / "foreign.io-mon-report",
+      "io-mon-breakaway-report v1\nrun " & runId &
+        "\nclient 1111\ndaemon 9999\nread /other/build/file.h\ncomplete\n")
     let dep = mergeFragments(frag, work / "out.rdep", reportDir)
     check dep.completeness == mcIncomplete
     for r in dep.records:
       check r.path != "/other/build/file.h"
+    removeDir(work)
+
+suite "io-mon R5 kill-before-flush durability (reading-sentinel)":
+  # ROUND-2 R5 — a monitored process whose MAIN thread buffered read records is
+  # SIGKILLed before its tail batch flushes (no dyld exit destructor) leaves the
+  # early-flushed process-start on disk but loses the un-flushed reads. The old
+  # merge published mcComplete MINUS those reads (the r2_machinery/kill_probe.c
+  # defeat). The writer now drops a `.io-mon-reading` sentinel the instant a batch
+  # turns dirty and removes it on flush; a leftover sentinel after the run proves a
+  # kill-before-flush, so mergeFragments injects an event-loss and downgrades. The
+  # sentinel lifecycle and the merge-side detection are BOTH platform-independent,
+  # so these tests reproduce the defeat deterministically without an actual signal.
+
+  proc readRec(pid: uint64; path: string): MonitorRecord =
+    MonitorRecord(kind: mrFileRead, observationKind: moFileRead,
+      osPid: pid, path: path)
+
+  test "a dirty batch MARKS the sentinel; a flush CLEARS it (lifecycle)":
+    let work = getTempDir() / ("io-mon-r5-life-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let frag = work / "frags"
+    createDir(frag)
+    let sentinel = readingSentinelPath(frag, 700'u64, 0'u64)
+    # A buffered (un-flushed) record turns the batch dirty → sentinel appears.
+    appendFragmentRecord(frag, startAt(700'u64, "1000"))
+    check fileExists(sentinel)
+    # An explicit flush makes the tail durable → the sentinel is retired.
+    flushFragmentBatch()
+    check not fileExists(sentinel)
+    removeDir(work)
+
+  test "a leftover sentinel (killed pre-flush) downgrades to mcIncomplete":
+    # Model the kill: a durable process-start is already on disk (early flush),
+    # but an orphaned `.io-mon-reading` sentinel remains — the un-flushed read tail
+    # the dead process never persisted. The merge MUST downgrade, NOT publish a
+    # false mcComplete minus the lost read.
+    let work = getTempDir() / ("io-mon-r5-kill-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let frag = work / "frags"
+    createDir(frag)
+    # Durable process-start (the early-flushed evidence that survives the kill).
+    appendFragmentRecord(frag, startAt(700'u64, "1000"))
+    flushFragmentBatch()
+    # Orphaned tail sentinel left behind by the uncatchable SIGKILL.
+    writeFile(readingSentinelPath(frag, 700'u64, 0'u64), "")
+    let dep = mergeFragments(frag, work / "out.rdep")
+    check dep.completeness == mcIncomplete
+    # The merge CONSUMES the sentinel so a warm-restart merge does not double-count.
+    check not fileExists(readingSentinelPath(frag, 700'u64, 0'u64))
+    removeDir(work)
+
+  test "a clean flushed run (no leftover sentinel) stays mcComplete":
+    # The no-false-downgrade guard: a process that started, read a file and flushed
+    # cleanly leaves NO sentinel, so its build is still complete.
+    let work = getTempDir() / ("io-mon-r5-clean-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let frag = work / "frags"
+    createDir(frag)
+    appendFragmentRecord(frag, startAt(700'u64, "1000"))
+    appendFragmentRecord(frag, readRec(700'u64, "/dep/header.h"))
+    flushFragmentBatch()
+    check not fileExists(readingSentinelPath(frag, 700'u64, 0'u64))
+    let dep = mergeFragments(frag, work / "out.rdep")
+    check dep.completeness == mcComplete
     removeDir(work)

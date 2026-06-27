@@ -73,6 +73,11 @@ const
   FragmentBatchBufLen = 64 * 1024
   FragmentBatchMaxAgeNs = 100_000_000'i64  # 100 ms
   BatchStalenessProbeInterval = 64        # check time every 64 emits
+  ReadingSentinelExt* = ".io-mon-reading"
+    ## ROUND-2 R5 — extension of the per-thread "un-flushed read tail" sentinel
+    ## file (see `FragmentSlot.readingSentinelActive`). Distinct from `.rmdf-frag`
+    ## and `.io-mon-report` so the merge's fragment / report scans never collide
+    ## with it.
 
 type
   FragmentSlot = object
@@ -111,6 +116,18 @@ type
     # (interval * per-emit-cost), still well below the SIGKILL data-
     # loss budget for any realistic emit rate.
     batchProbeCountdown: int
+    # ROUND-2 R5 (kill-before-flush): `readingSentinelActive` tracks whether this
+    # thread currently has a NON-DURABLE (un-flushed) batch tail on disk-backing.
+    # When the batch transitions empty→dirty we drop a tiny sidecar sentinel file
+    # next to the fragment; when the batch is flushed (overflow / 100 ms age /
+    # explicit flush / clean exit) we remove it. A SIGKILL runs NO destructor, so
+    # a process that buffered reads and was killed before its tail flushed leaves
+    # the sentinel behind — `mergeFragments` then injects an event-loss and the
+    # build downgrades to `mcIncomplete` instead of falsely publishing `mcComplete`
+    # minus the lost reads (the round-2 r2_machinery/kill_probe.c defeat). The flag
+    # makes the create/remove cost ONE pair of file ops per dirty→clean cycle (≈ per
+    # 64 KiB batch on the main thread), not per record.
+    readingSentinelActive: bool
     batchBuf: array[FragmentBatchBufLen, byte]
 
 var
@@ -135,6 +152,46 @@ proc slotFragmentDirAssign(slot: var FragmentSlot; s: string): bool =
   slot.fragmentDirBuf[s.len] = '\0'
   slot.fragmentDirLen = s.len
   true
+
+proc slotFragmentDir(slot: FragmentSlot): string =
+  ## Recover the slot's fragment directory as a string from its POD char buffer.
+  result = newString(slot.fragmentDirLen)
+  for i in 0 ..< slot.fragmentDirLen:
+    result[i] = slot.fragmentDirBuf[i]
+
+proc readingSentinelPath*(fragmentDir: string; osPid, threadId: uint64): string =
+  ## ROUND-2 R5 — deterministic path of a thread's "un-flushed read tail" sentinel
+  ## file inside `fragmentDir`. Keyed on (osPid, threadId) like the fragment file
+  ## itself so one process's worker threads never clobber each other's sentinel.
+  fragmentDir / ("repro-reading-" & $osPid & "-" & $threadId & ReadingSentinelExt)
+
+proc markReadingSentinel() =
+  ## ROUND-2 R5 — record that this thread's batch now holds non-durable bytes, by
+  ## creating the sentinel file ONCE per dirty cycle. Best-effort: a failed create
+  ## merely loses the kill-before-flush guard for this cycle (degrades to the
+  ## pre-round-2 behaviour); it never aborts the monitored process.
+  if fragmentSlot.readingSentinelActive or not fragmentSlot.isOpen:
+    return
+  let p = readingSentinelPath(slotFragmentDir(fragmentSlot),
+    fragmentSlot.osPid, fragmentSlot.threadId)
+  try:
+    writeFile(extendedPath(p), "")
+    fragmentSlot.readingSentinelActive = true
+  except IOError, OSError:
+    discard
+
+proc clearReadingSentinel() =
+  ## ROUND-2 R5 — the batch just became durable (flushed); remove the sentinel so
+  ## a clean continuation / exit is NOT mistaken for a kill-before-flush.
+  if not fragmentSlot.readingSentinelActive:
+    return
+  let p = readingSentinelPath(slotFragmentDir(fragmentSlot),
+    fragmentSlot.osPid, fragmentSlot.threadId)
+  try:
+    removeFile(extendedPath(p))
+  except OSError:
+    discard
+  fragmentSlot.readingSentinelActive = false
 
 proc fragmentLogOpenCount*(): uint64 =
   ## DSL-port M9.R.15c.1 — return the lifetime number of fragment-log
@@ -197,6 +254,9 @@ proc flushFragmentBatch*() =
   fragmentSlot.batchLen = 0
   fragmentSlot.batchOpenedAtNs = 0
   fragmentSlot.batchProbeCountdown = 0
+  # ROUND-2 R5 — the buffered tail is now on disk; the kill-before-flush window
+  # is closed for this batch, so retire the sentinel.
+  clearReadingSentinel()
 
 proc closeFragmentSlot*() =
   ## Force the calling thread's cached fragment-log handle (if any) to
@@ -208,6 +268,9 @@ proc closeFragmentSlot*() =
       flushFragmentBatch()
     except EnvelopeError, IOError, OSError:
       discard
+    # Defensive: flush above clears the sentinel on the normal path; ensure no
+    # stale sentinel survives a flush that raised / early-returned.
+    clearReadingSentinel()
     try:
       close(fragmentSlot.file)
     except IOError, OSError:
@@ -220,6 +283,7 @@ proc closeFragmentSlot*() =
     fragmentSlot.batchLen = 0
     fragmentSlot.batchOpenedAtNs = 0
     fragmentSlot.batchProbeCountdown = 0
+    fragmentSlot.readingSentinelActive = false
 
 proc checksum*(bytes: openArray[byte]): uint64 =
   result = FnvOffset
@@ -364,6 +428,7 @@ proc openFragmentSlot(fragmentDir: string; osPid, threadId: uint64;
   fragmentSlot.batchLen = 0
   fragmentSlot.batchOpenedAtNs = 0
   fragmentSlot.batchProbeCountdown = 0
+  fragmentSlot.readingSentinelActive = false
   discard fragmentOpenCount.fetchAdd(1, moRelaxed)
   true
 
@@ -524,6 +589,10 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   putString(record.detail)
 
   fragmentSlot.batchLen = cursor
+  # ROUND-2 R5 — the batch now holds a non-durable tail; mark the kill-before-flush
+  # sentinel (once per dirty cycle). A subsequent flush retires it; an uncatchable
+  # SIGKILL leaves it behind for `mergeFragments` to detect.
+  markReadingSentinel()
 
 proc readFragmentRecords*(path: string): seq[MonitorRecord] =
   let raw = readFile(extendedPath(path)).toBytes()
@@ -617,6 +686,66 @@ proc monitoredStartPids*(records: openArray[MonitorRecord]): HashSet[uint64] =
     if r.kind == mrProcessStart:
       result.incl r.osPid
 
+const
+  # ROUND-2 R7/R8 — identity metadata is carried as space-separated `key=value`
+  # tokens APPENDED to a record's free-form `detail` field rather than as new
+  # struct fields, so the RMDF wire format (magic/version/payload layout) stays
+  # BYTE-STABLE and every existing reader/codec path is untouched (the
+  # dgNoRuntimeDependencies / mrIpcConnect "append, never renumber" lesson applied
+  # to record metadata). A record that predates these tokens simply lacks them and
+  # the merge degrades to the pre-round-2 bare-pid matching for it — never a false
+  # downgrade. See `detailToken`.
+  StartTimeToken = "start"          ## process-start: this pid's kernel start usec
+  ChildStartTimeToken = "childstart" ## spawn: the CHILD pid's kernel start usec
+  PeerStartTimeToken = "peerstart"  ## ipc-connect: the PEER pid's kernel start usec
+  RunIdToken = "run"                ## process-start / ipc-connect: invocation run id
+  NonceToken = "nonce"              ## ipc-connect: per-connection nonce (R8)
+
+proc detailToken*(detail, key: string): string =
+  ## Extract the value of a `key=value` token from a record's `detail` field
+  ## (ROUND-2 R7/R8). Tokens are whitespace-separated and values contain no
+  ## whitespace (pids, start-usec, run ids and nonces are all bare integers/ids).
+  ## Returns "" when the key is absent. Single source of truth so every identity
+  ## read is consistent (DRY).
+  let needle = key & "="
+  for tok in detail.splitWhitespace():
+    if tok.len > needle.len and tok.startsWith(needle):
+      return tok[needle.len .. ^1]
+  ""
+
+type
+  ProcIdentity = tuple[pid: uint64, startTime: string]
+    ## ROUND-2 R7 — a process is identified by (osPid, kernel-start-time), NOT the
+    ## bare osPid, because macOS pids wrap and a recycled pid otherwise false-matches
+    ## a stale monitored process-start. `startTime` is the decimal start-usec token
+    ## ("" when the producer could not obtain it — then we fall back to bare-pid).
+
+proc processStartIdentities(records: openArray[MonitorRecord]):
+    tuple[idents: HashSet[ProcIdentity]; pids: HashSet[uint64]] =
+  ## ROUND-2 R7 — collect the (pid, start-time) identities of every monitored
+  ## process (those that emitted `mrProcessStart`) plus the bare-pid set used as a
+  ## fallback when a counterpart record carries no start-time token. Shared by the
+  ## spawn-child and IPC-peer checks (DRY).
+  result.idents = initHashSet[ProcIdentity]()
+  result.pids = initHashSet[uint64]()
+  for r in records:
+    if r.kind == mrProcessStart:
+      result.pids.incl r.osPid
+      result.idents.incl (r.osPid, detailToken(r.detail, StartTimeToken))
+
+proc childIsMonitored(childPid: uint64; childStart: string;
+    idents: HashSet[ProcIdentity]; pids: HashSet[uint64]): bool =
+  ## ROUND-2 R7 — is a spawned child / IPC peer one of THIS run's monitored
+  ## processes? With a known start-time we require an EXACT (pid, start-time)
+  ## match, so a recycled pid whose start-time differs from the stale monitored
+  ## process is correctly seen as un-monitored. With no start-time (the producer
+  ## could not query it, or a pre-round-2 record) we degrade to bare-pid membership
+  ## — preserving the original behaviour and never introducing a false downgrade.
+  if childStart.len > 0:
+    (childPid, childStart) in idents
+  else:
+    childPid in pids
+
 proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord];
     trustedPeerPids: HashSet[uint64] = initHashSet[uint64]()): int =
   ## T0 — EARN mcComplete (MacOS-Monitoring-Adversarial-Hardening.milestones.org
@@ -674,26 +803,32 @@ proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord];
   ##     exec in that pid ran un-monitored — catching a SETEXEC into a hardened
   ##     binary (break #2, which the subtree fail-safe alone misses) AND a plain
   ##     execve into one.
-  var startPids: HashSet[uint64]
+  # ROUND-2 R7 — match on (pid, kernel-start-time), not the bare pid, so a wrapped
+  # (recycled) child/peer pid cannot false-match a stale monitored process-start.
+  let (startIdents, startPids) = processStartIdentities(records)
   var startCount = initCountTable[uint64]()
   var execCount = initCountTable[uint64]()
   for r in records:
     case r.kind
     of mrProcessStart:
-      startPids.incl r.osPid
       startCount.inc r.osPid
     of mrProcessExec:
       execCount.inc r.osPid
     else: discard
   result = 0
   # (a) spawned children with no matching process-start (count each child once).
-  var flaggedChildren: HashSet[uint64]
+  # Keyed on the child's (pid, start-time) identity: a recycled pid whose
+  # start-time differs from a stale monitored process is correctly un-monitored.
+  var flaggedChildren: HashSet[ProcIdentity]
   for r in records:
     if r.kind == mrProcessSpawn and r.childOsPid != 0 and
-        r.childOsPid != r.osPid and r.childOsPid notin startPids and
-        r.childOsPid notin flaggedChildren:
-      flaggedChildren.incl r.childOsPid
-      inc result
+        r.childOsPid != r.osPid:
+      let childStart = detailToken(r.detail, ChildStartTimeToken)
+      let ident = (r.childOsPid, childStart)
+      if not childIsMonitored(r.childOsPid, childStart, startIdents, startPids) and
+          ident notin flaggedChildren:
+        flaggedChildren.incl ident
+        inc result
   # (b) execs whose last image was un-injectable (one loss per such pid).
   for pid, execs in execCount:
     if execs > 0 and execs >= startCount.getOrDefault(pid):
@@ -708,9 +843,17 @@ proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord];
   for r in records:
     if r.kind == mrIpcConnect:
       let peer = r.childOsPid
-      if peer != 0 and (peer in startPids or peer in trustedPeerPids):
+      let peerStart = detailToken(r.detail, PeerStartTimeToken)
+      # A peer is INSIDE the tree iff its (pid, start-time) identity matches a
+      # monitored process-start (R7 — a recycled peer pid with a different start
+      # time is NOT in-tree), OR a trusted daemon accounted for its reads. Either
+      # way: no downgrade (the cardinal-sin guard for legitimate intra-tree IPC).
+      if peer != 0 and
+          (childIsMonitored(peer, peerStart, startIdents, startPids) or
+           peer in trustedPeerPids):
         continue
-      let key = if peer != 0: "pid:" & $peer else: "dest:" & r.path
+      let key = if peer != 0: "pid:" & $peer & "@" & peerStart
+                else: "dest:" & r.path
       if key in flaggedPeers:
         continue
       flaggedPeers.incl key
@@ -736,28 +879,104 @@ type
     reads: seq[MonitorRecord]
     trustedPeerPids: HashSet[uint64]
 
-proc loadBreakawayReports*(reportDir: string;
-    monitored: HashSet[uint64]): BreakawayFold =
-  ## BuildXL-style TRUSTED-DAEMON breakaway compensation (T3a). A cooperating
-  ## daemon (e.g. a future io-mon-aware sccache) that serves a monitored client
-  ## writes a small text report into `reportDir` naming the CLIENT pid it served,
-  ## its OWN (daemon) pid, and every file it read on the client's behalf:
+  BreakawayAuthContext* = object
+    ## ROUND-2 R8 — the per-invocation facts a breakaway report must be checked
+    ## against before it is trusted. Derived purely from the merged records, so the
+    ## authentication uses what the SHIM observed, not what a report CLAIMS.
+    runId*: string
+      ## This invocation's run id (the `run=` token the shim stamped on its
+      ## `mrProcessStart` / `mrIpcConnect` records, sourced from
+      ## REPRO_MONITOR_SESSION). Empty when no monitored process recorded one.
+    connectedPeers*: HashSet[string]
+      ## "client:daemon" pid pairs the shim OBSERVED the client connect to (from
+      ## `mrIpcConnect`). A report is bound to a real, recorded connection.
+    validNonces*: HashSet[string]
+      ## The per-connection nonces the shim recorded on `mrIpcConnect`. A report
+      ## that carries a `nonce` must echo one of these.
+
+const
+  BreakawayReportCompleteToken* = "complete"
+    ## ROUND-2 R8 — a cooperating daemon MUST emit a bare `complete` line to assert
+    ## "this report fully accounts for everything I did on this client's behalf".
+    ## A report lacking it (the round-2 malicious_client.c forgery, which lists NO
+    ## reads and makes no completeness claim) is treated as untrusted, so the
+    ## client's connect still downgrades.
+
+proc breakawayAuthContext*(records: openArray[MonitorRecord]):
+    BreakawayAuthContext =
+  ## ROUND-2 R8 — extract the report-authentication context from the merged
+  ## records (DRY: one source of truth shared by `mergeFragments`).
+  result.connectedPeers = initHashSet[string]()
+  result.validNonces = initHashSet[string]()
+  for r in records:
+    case r.kind
+    of mrProcessStart:
+      if result.runId.len == 0:
+        let run = detailToken(r.detail, RunIdToken)
+        if run.len > 0:
+          result.runId = run
+    of mrIpcConnect:
+      if r.childOsPid != 0:
+        result.connectedPeers.incl($r.osPid & ":" & $r.childOsPid)
+      let nonce = detailToken(r.detail, NonceToken)
+      if nonce.len > 0:
+        result.validNonces.incl nonce
+      if result.runId.len == 0:
+        let run = detailToken(r.detail, RunIdToken)
+        if run.len > 0:
+          result.runId = run
+    else: discard
+
+proc loadBreakawayReports*(reportDir: string; monitored: HashSet[uint64];
+    auth: BreakawayAuthContext): BreakawayFold =
+  ## BuildXL-style TRUSTED-DAEMON breakaway compensation (T3a), AUTHENTICATED
+  ## (ROUND-2 R8). A cooperating daemon (e.g. a future io-mon-aware sccache) that
+  ## serves a monitored client writes a small text report into `reportDir`:
   ##
   ##   io-mon-breakaway-report v1
+  ##   run <run-id>            # this invocation's REPRO_MONITOR_SESSION
   ##   client <client-pid>
   ##   daemon <daemon-pid>
+  ##   nonce <nonce>           # optional: a per-connection nonce the shim recorded
   ##   read <abs-path>
   ##   read <abs-path>
+  ##   complete                # asserts the report fully accounts for its reads
   ##
   ## (BuildXL prior art: "Trusted Tools / Shared Compilation" + breakaway-process
-  ## compensation, PR #1175.) The merge folds in only reports whose CLIENT pid is
-  ## one of THIS invocation's monitored processes — a persistent daemon serves
-  ## many builds, so a report for another build's client is ignored. For each
-  ## accepted report it (a) emits an `mrFileRead` for every read path (so the
-  ## daemon-served file appears in the depfile as a real dependency) and (b) marks
-  ## the daemon pid trusted, so the client's `mrIpcConnect` to it does NOT
-  ## downgrade completeness — the build stays `mcComplete` BECAUSE the daemon
-  ## accounted for its reads.
+  ## compensation, PR #1175.)
+  ##
+  ## ROUND-2 R8 — a round-2 adversarial campaign DEFEATED the un-authenticated
+  ## fold two ways (research/.../r2_machinery):
+  ##   (3b) an in-tree UNTRUSTED tool dropped a report naming itself as client and
+  ##        the out-of-tree daemon as daemon, with ZERO read lines — suppressing the
+  ##        IPC downgrade and yielding a false `mcComplete` with the served file
+  ##        missing (malicious_client.c);
+  ##   (3c) a STALE report from a PREVIOUS run was folded into a later run via pid
+  ##        collision.
+  ## A report is now trusted ONLY when ALL hold (else it is ignored, so the
+  ## client's connect still downgrades — fail-closed, a conservative re-run):
+  ##   1. its CLIENT pid is one of THIS invocation's monitored processes;
+  ##   2. it carries a `run` matching this invocation's run id — and the run id is
+  ##      known (defeats 3c: a stale/cross-run report carries a different run id);
+  ##   3. the shim actually OBSERVED the client connect to that daemon pid
+  ##      (`mrIpcConnect` peer binding) — a report cannot be fabricated for a
+  ##      connection the monitor never saw;
+  ##   4. if it carries a `nonce`, the nonce matches one the shim recorded for an
+  ##      observed connection (per-connection binding strengthening);
+  ##   5. it explicitly asserts `complete` AND lists ≥1 `read` — a report that makes
+  ##      no completeness claim or accounts for nothing is not evidence of coverage
+  ##      (defeats 3b: the no-reads forgery).
+  ##
+  ## HONEST LIMITATION (documented, not hidden): criteria 2–4 bind a report to this
+  ## run and to an observed connection, but an in-tree process can read
+  ## REPRO_MONITOR_SESSION from its environment and could, in principle, forge a
+  ## `complete` report that lists DIFFERENT reads than the daemon truly performed
+  ## (omitting the real dependency). Fully closing that requires either a secret
+  ## per-connection nonce HANDED to the daemon over an out-of-band channel the
+  ## client cannot read (a shim↔daemon handshake), or out-of-band kernel
+  ## observation (the EndpointSecurity backend). Both are tracked follow-ups; the
+  ## checks here close the round-2 probes and every report that does not
+  ## non-trivially and run-correctly account for an observed connection.
   result.reads = @[]
   result.trustedPeerPids = initHashSet[uint64]()
   if reportDir.len == 0 or not dirExists(extendedPath(reportDir)):
@@ -773,9 +992,14 @@ proc loadBreakawayReports*(reportDir: string;
       # rather than abort the whole merge (benign producer race).
       continue
     var clientPid, daemonPid: uint64 = 0
+    var reportRun, reportNonce: string = ""
+    var declaredComplete = false
     var readPaths: seq[string] = @[]
     for rawLine in content.splitLines():
       let line = rawLine.strip()
+      if line == BreakawayReportCompleteToken:
+        declaredComplete = true
+        continue
       let toks = line.splitWhitespace()
       if toks.len < 2:
         continue
@@ -786,16 +1010,41 @@ proc loadBreakawayReports*(reportDir: string;
       of "daemon":
         try: daemonPid = uint64(parseBiggestUInt(toks[1]))
         except ValueError: discard
+      of "run":
+        reportRun = toks[1]
+      of "nonce":
+        reportNonce = toks[1]
       of "read":
         # A read path may itself contain spaces, so take everything after the
         # directive verbatim rather than relying on the whitespace split.
         readPaths.add line[("read".len) .. ^1].strip()
       else:
         discard
+    # ---- ROUND-2 R8 authentication (fail-closed: any unmet criterion ⇒ ignore) --
+    # 1. client must be a monitored process of THIS invocation.
     if clientPid == 0 or clientPid notin monitored:
       continue
-    if daemonPid != 0:
-      result.trustedPeerPids.incl daemonPid
+    # 2. run-id scoping — defeats stale / cross-run folding (3c).
+    if auth.runId.len == 0 or reportRun != auth.runId:
+      continue
+    # 3. the connection must have been OBSERVED by the shim.
+    if daemonPid == 0 or
+        ($clientPid & ":" & $daemonPid) notin auth.connectedPeers:
+      continue
+    # 4. a supplied nonce must match a recorded one (optional strengthening).
+    if reportNonce.len > 0 and reportNonce notin auth.validNonces:
+      continue
+    # 5. explicit completeness + non-trivial coverage — defeats the no-reads
+    #    forgery (3b). A report that lists nothing accounts for nothing.
+    var hasRead = false
+    for rp in readPaths:
+      if rp.len > 0:
+        hasRead = true
+        break
+    if not declaredComplete or not hasRead:
+      continue
+    # Authenticated — trust the daemon and fold its reads in as real dependencies.
+    result.trustedPeerPids.incl daemonPid
     for rp in readPaths:
       if rp.len == 0:
         continue
@@ -804,7 +1053,28 @@ proc loadBreakawayReports*(reportDir: string;
         detail: "breakaway-daemon-report daemon=" & $daemonPid)
 
 proc mergeFragments*(fragmentDir, outputPath: string;
-    breakawayReportDir = ""): MonitorDepFile =
+    breakawayReportDir = ""; expectedRootPid: uint64 = 0): MonitorDepFile =
+  ## ROUND-2 R1 (ROOT-process completeness guard) — `expectedRootPid` is the pid of
+  ## the top-level process the LAUNCHER spawned (io-mon's own `run` driver, the
+  ## reprobuild engine's `monitoredAction`, or the codetracer runner). The shim
+  ## NEVER loads into a SIP/hardened/notarized root binary (e.g. `/bin/cat`):
+  ## DYLD_INSERT_LIBRARIES is stripped, so NO `mrProcessStart` is emitted and the
+  ## fragment set is EMPTY — yet the old merge asserted `mcComplete` for an empty
+  ## record set (processes=0), a zero-effort false cache hit for the ROOT.
+  ##
+  ## When `expectedRootPid != 0`, the merge injects a synthetic `mrProcessSpawn`
+  ## naming the root as its child, so the EXISTING un-injected-spawn-child check
+  ## (`unmonitoredSubtreeLossCount`) fires unless the root actually emitted a
+  ## process-start — downgrading an un-monitored root to `mcIncomplete` instead of
+  ## a false skip. A root that DID load the shim has a matching process-start, so
+  ## the synthetic spawn is matched and there is NO false downgrade.
+  ##
+  ## CONTRACT FOR LAUNCHERS: any launcher that wraps a root command MUST pass the
+  ## pid it spawned as `expectedRootPid` (io-mon's `runMonitoredCommand` already
+  ## does). Passing 0 (the default) preserves the legacy behaviour for callers that
+  ## merge fragment dirs without having spawned a single known root (e.g. tests
+  ## merging hand-built fragments).
+  #
   # DSL-port M9.R.15c.1 — close the calling thread's cached fragment
   # handle before merging so any post-SIGKILL or pre-close buffered
   # bytes are visible to the read path. ``readFragmentRecordsTolerant``
@@ -847,6 +1117,32 @@ proc mergeFragments*(fragmentDir, outputPath: string;
       records.add MonitorRecord(kind: mrEventLoss,
         observationKind: moEventLoss,
         detail: "corrupt or partial RMDF fragment in " & fragmentDir)
+  # ROUND-2 R5 (kill-before-flush) — a leftover ``.io-mon-reading`` sentinel means
+  # a monitored process buffered read records on its MAIN thread and was killed by
+  # an uncatchable signal before the tail flushed (no dyld destructor ran). The
+  # early-flushed process-start survived but the unflushed reads were lost, so the
+  # depfile would otherwise publish ``mcComplete`` minus those reads. One synthetic
+  # event-loss per leftover sentinel forces ``mcIncomplete`` (the same conservative
+  # re-run machinery as a corrupt fragment). The sentinel is consumed (removed) so a
+  # warm-restart merge does not double-count it. See research/.../kill_probe.c.
+  var killedReaders = 0
+  if dirExists(extendedPath(fragmentDir)):
+    for kind, path in walkDir(extendedPath(fragmentDir)):
+      if kind == pcFile and path.endsWith(ReadingSentinelExt):
+        inc killedReaders
+        try: removeFile(extendedPath(path))
+        except OSError: discard
+  for _ in 0 ..< killedReaders:
+    records.add MonitorRecord(kind: mrEventLoss, observationKind: moEventLoss,
+      detail: "process killed with an un-flushed read batch (kill-before-flush)")
+  # ROUND-2 R1 (ROOT-process completeness guard) — inject a synthetic spawn naming
+  # the launcher-spawned root as its child, BEFORE the breakaway fold and the
+  # subtree-loss check, so a root that never loaded the shim (no process-start) is
+  # caught by the existing un-injected-spawn-child path. See the proc doc.
+  if expectedRootPid != 0:
+    records.add MonitorRecord(kind: mrProcessSpawn, observationKind: moExecute,
+      osPid: 0, childOsPid: expectedRootPid,
+      detail: "io-mon-root-spawn launcher-expected-root")
   # T3a — TRUSTED-DAEMON breakaway compensation (BuildXL Trusted-Tools prior
   # art). Fold any cooperating-daemon reports from `breakawayReportDir` (an
   # explicit arg, else the `IO_MON_BREAKAWAY_REPORT_DIR` env var) into the merge
@@ -859,7 +1155,11 @@ proc mergeFragments*(fragmentDir, outputPath: string;
     else: getEnv(IoMonBreakawayReportDirEnv)
   var trustedPeerPids = initHashSet[uint64]()
   if reportDir.len > 0:
-    let fold = loadBreakawayReports(reportDir, monitoredStartPids(records))
+    # ROUND-2 R8 — authenticate reports against what the shim actually observed
+    # (run id, connected peers, recorded nonces) so a forged / partial / stale
+    # report can no longer suppress the downgrade. See loadBreakawayReports.
+    let fold = loadBreakawayReports(reportDir, monitoredStartPids(records),
+      breakawayAuthContext(records))
     for rd in fold.reads:
       records.add rd
     trustedPeerPids = fold.trustedPeerPids
