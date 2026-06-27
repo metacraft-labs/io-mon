@@ -19,6 +19,10 @@ proc recordKindName(record: MonitorRecord): string =
   of mrCapabilityGap: "capability-gap"
   of mrIpcConnect: "ipc-connect"
   of mrLibraryLoad: "library-load"
+  of mrEnvRead: "env-read"
+  of mrSysctlRead: "sysctl-read"
+  of mrNonDeterministic: "non-deterministic"
+  of mrTimeRead: "time-read"
 
 proc observationKindName(record: MonitorRecord): string =
   case record.observationKind
@@ -33,6 +37,10 @@ proc observationKindName(record: MonitorRecord): string =
   of moBackendProfile: "backend-profile"
   of moCapabilityGap: "capability-gap"
   of moIpcConnect: "ipc-connect"
+  of moEnvRead: "env-read"
+  of moSysctlRead: "sysctl-read"
+  of moNonDeterministic: "non-deterministic"
+  of moTimeRead: "time-read"
 
 proc itemKindName(kind: FsSnoopStreamItemKind): string =
   case kind
