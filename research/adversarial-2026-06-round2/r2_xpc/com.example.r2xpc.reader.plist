@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.r2xpc.reader</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/tmp/r2_xpc/xpc_service</string>
+    </array>
+    <key>MachServices</key>
+    <dict>
+        <key>com.example.r2xpc.reader</key>
+        <true/>
+    </dict>
+    <key>StandardErrorPath</key>
+    <string>/tmp/r2_xpc/service.err</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/r2_xpc/service.out</string>
+</dict>
+</plist>

@@ -23,6 +23,11 @@ int main(int argc, char **argv) {
   const char *sock = argv[1];
   const char *ready = argv[2];
   const char *reportdir = getenv("IO_MON_BREAKAWAY_REPORT_DIR");
+  // ROUND-2 R8 — a cooperating daemon SCOPES its report to the current invocation
+  // by echoing its REPRO_MONITOR_SESSION run id (so a stale report can't be folded
+  // into a later run) and explicitly asserts `complete`. The build hands the run
+  // id to the daemon via the environment.
+  const char *runid = getenv("REPRO_MONITOR_SESSION");
 
   unlink(sock);
   int s = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -68,8 +73,10 @@ int main(int argc, char **argv) {
                reportdir, (int)client, (int)getpid(), seq++);
       FILE *r = fopen(rp, "w");
       if (r) {
-        fprintf(r, "io-mon-breakaway-report v1\nclient %d\ndaemon %d\nread %s\n",
-                (int)client, (int)getpid(), path);
+        // ROUND-2 R8 authenticated report: run-scoped + explicitly complete.
+        fprintf(r, "io-mon-breakaway-report v1\nrun %s\nclient %d\ndaemon %d\n"
+                   "read %s\ncomplete\n",
+                runid ? runid : "", (int)client, (int)getpid(), path);
         fclose(r);
       }
     }

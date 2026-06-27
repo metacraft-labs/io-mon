@@ -39,6 +39,9 @@ when defined(macosx):
 const
   repoRoot = currentSourcePath().parentDir().parentDir()
   corpus = repoRoot / "research" / "adversarial-2026-06" / "adv_proctree"
+  # ROUND-2 R8 — a fixed run id shared between the shim env and the cooperating
+  # trusted daemon so its run-scoped breakaway report authenticates.
+  testRunId = "io-mon-ipc-test-run"
 
 when defined(macosx):
   proc buildShim(): string =
@@ -75,6 +78,9 @@ when defined(macosx):
     result["DYLD_INSERT_LIBRARIES"] = shim
     result["REPRO_MONITOR_SHIM_LIB"] = shim
     result["REPRO_MONITOR_FRAGMENT_DIR"] = fragmentDir
+    # ROUND-2 R8 — give the invocation a run id so the shim stamps `run=` on its
+    # records and the trusted-daemon report (run-scoped) authenticates.
+    result["REPRO_MONITOR_SESSION"] = testRunId
     applyMacosBackendToggle(result, "both")
 
   proc runUnderShim(shim, prog: string; args: seq[string];
@@ -201,6 +207,9 @@ suite "io-mon macOS IPC / daemon-over-socket breakaway (T3a, break #1)":
           var e = newStringTable(modeCaseSensitive)
           for k, v in envPairs(): e[k] = v
           e["IO_MON_BREAKAWAY_REPORT_DIR"] = reportDir
+          # ROUND-2 R8 — the daemon echoes this run id so its report is
+          # scoped to (and authenticates against) THIS invocation.
+          e["REPRO_MONITOR_SESSION"] = testRunId
           e),
         options = {poStdErrToStdOut})
       doAssert waitForFile(ready), "trusted daemon did not become ready"

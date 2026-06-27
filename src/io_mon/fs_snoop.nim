@@ -565,10 +565,17 @@ proc runMonitoredCommand(request: FsSnoopRequest): int =
     let process = startProcess(effectiveCommand[0],
       args = childArgs,
       options = {poUsePath, poParentStreams})
+    # ROUND-2 R1 — remember the root pid so the merge can PROVE the root was
+    # monitored. A SIP/hardened/notarized root (e.g. /bin/cat) strips
+    # DYLD_INSERT_LIBRARIES and emits no process-start; passing its pid to
+    # mergeFragments downgrades that case to mcIncomplete instead of asserting a
+    # false mcComplete over an empty record set.
+    let rootPid = uint64(process.processID)
     result = waitForExit(process)
     close(process)
 
-    discard mergeFragments(fragmentDir, request.depFilePath)
+    discard mergeFragments(fragmentDir, request.depFilePath,
+      expectedRootPid = rootPid)
     discard readMonitorDepFile(request.depFilePath)
     renderStreamToPath(request.depFilePath, request.streamMode,
       request.eventStreamPath)
@@ -599,10 +606,13 @@ proc runMonitoredCommand(request: FsSnoopRequest): int =
     let process = startProcess(request.command[0],
       args = childArgs,
       options = {poUsePath, poParentStreams})
+    # ROUND-2 R1 — see the macOS branch: prove the root was monitored.
+    let rootPid = uint64(process.processID)
     result = waitForExit(process)
     close(process)
 
-    discard mergeFragments(fragmentDir, request.depFilePath)
+    discard mergeFragments(fragmentDir, request.depFilePath,
+      expectedRootPid = rootPid)
     discard readMonitorDepFile(request.depFilePath)
     renderStreamToPath(request.depFilePath, request.streamMode,
       request.eventStreamPath)
