@@ -477,6 +477,49 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32;
   record.detail = d
   emitRecord(record)
 
+proc recordMachLookup(serviceName: cstring; callResult: cint) {.raises: [].} =
+  ## ROUND-2 R-C — record a successful `bootstrap_look_up` / XPC mach-service
+  ## connection-establishment to an OUT-OF-TREE service as an `mrIpcConnect`
+  ## breakaway, the XPC/Mach-port analog of the connect(2) daemon-over-socket hook
+  ## (findings-doc break #1). XPC and raw Mach RPC never issue connect(2) — they
+  ## resolve a service name to a send port via bootstrap + mach_msg — so the
+  ## connect hook is blind to them; a monitored client that delegates a file read
+  ## to an out-of-tree service (the confirmed r2_xpc break) otherwise produces a
+  ## false `mcComplete`. See the runtime C doc for the full threat model.
+  ##
+  ## We REUSE the `mrIpcConnect` record kind so the SAME merge-time downgrade
+  ## machinery (`writer.unmonitoredSubtreeLossCount` case (c)) fires with ZERO
+  ## merge changes and NO wire-format change: a Mach peer pid is launchd-brokered
+  ## and NOT knowable from the send port, so `childOsPid` is 0 (unknown peer) and
+  ## the merge keys the downgrade on the destination (the service name). An
+  ## unknown peer is treated conservatively as out-of-tree ⇒ one event-loss ⇒
+  ## `mcIncomplete` (a conservative RE-RUN, never a false skip) — the same
+  ## downgrade-on-uncertainty stance as the INET-peer-unknown connect(2) case.
+  ##
+  ## The CARDINAL-SIN guard lives in `ct_macos_mach_service_recordable`: only a
+  ## NON-`com.apple.*` service is recorded, so a normal build (whose only
+  ## Mach-service lookups are the pervasive system `com.apple.*` ones, including
+  ## any the shim itself triggers) is NEVER downgraded. Pre-init / muted lookups
+  ## never reach here (the hooks bail on `not initialized` / `disabled > 0`).
+  if serviceName == nil or serviceName[0] == '\0':
+    return
+  if not ct_macos_mach_service_recordable(serviceName):
+    return
+  var record = baseRecord(mrIpcConnect, moIpcConnect)
+  record.result = callResult.int64
+  record.flags = 0                              # no socket family (Mach lookup)
+  record.childOsPid = 0                         # launchd-brokered peer ⇒ unknown
+  record.path = $serviceName                    # the mach service name
+  # ROUND-2 R8 — stamp the run id (report scoping) and an unguessable
+  # per-connection nonce, mirroring recordIpcConnect, so a future cooperating
+  # daemon could authenticate a breakaway report for this lookup. `peer=unknown`
+  # documents that the Mach peer pid is not obtainable from the send port.
+  var d = "connect mach-service peer=unknown service=" & $serviceName
+  d.add runIdToken()
+  d.add " nonce=" & $ct_macos_random_u64()
+  record.detail = d
+  emitRecord(record)
+
 proc recordLibraryLoad(path: cstring) {.raises: [].} =
   ## Record a dyld-mapped DEPENDENT DYLIB (or a dlopen'd image) as a CONTENT
   ## (read) dependency — findings-doc break #4 (a real clang/ld64 link mmaps ~620
@@ -1162,6 +1205,58 @@ proc repro_hook_connect*(fd: cint; address: pointer; addrLen: uint32): cint
     recordIpcConnect(fd, address, addrLen, result)
   setErrno(savedErrno)
 
+# --- XPC / Mach-port breakaway hooks (R-C, round-2 break R2) --------------
+# XPC and raw Mach RPC bottom out in mach_msg to launchd's bootstrap port and
+# NEVER call connect(2), so the connect hook above is blind to a monitored
+# client that delegates a file read to an out-of-tree Mach/XPC service (the
+# confirmed r2_xpc break). We hook the cheap connection-establishment boundary —
+# bootstrap_look_up (raw-Mach clients) and xpc_connection_create_mach_service
+# (the XPC client entry) — NOT the hot mach_msg send path. Both are
+# INTERPOSE-ONLY (not body-patched): the program's own direct call to either is
+# caught by the __interpose tuple; a shared-cache-INTERNAL bootstrap_look_up
+# (e.g. a framework that internally brokers an XPC connection) is a documented
+# residual for the EndpointSecurity backend (T3c). Each forwards via the GENUINE
+# libsystem entry (resolved through the shim-skipping image walk), never a
+# by-name call that could re-enter the shim's own interpose binding.
+
+proc repro_hook_bootstrap_look_up*(bp: uint32; serviceName: cstring;
+    sp: ptr uint32): cint {.exportc, cdecl, dynlib.} =
+  ## bootstrap_look_up hook (R-C): a raw-Mach client resolving a service name to a
+  ## send port. Record only a SUCCESSFUL lookup (KERN_SUCCESS == 0 and a non-null
+  ## returned port) of a NON-`com.apple.*` service as an out-of-tree breakaway
+  ## (see recordMachLookup / the cardinal-sin filter). A failed lookup reached no
+  ## peer and is not recorded.
+  if not initialized or disabled > 0:
+    return ct_macos_real_bootstrap_look_up(bp, serviceName, sp)
+  result = ct_macos_real_bootstrap_look_up(bp, serviceName, sp)
+  let savedErrno = getErrno()
+  if result == 0 and sp != nil and sp[] != 0'u32:
+    recordMachLookup(serviceName, result)
+  setErrno(savedErrno)
+
+const
+  # XPC_CONNECTION_MACH_SERVICE_LISTENER (<xpc/connection.h>, 1<<0): the SERVER
+  # side — a monitored process OFFERING a mach service, not delegating a read to
+  # one. A listener is not a breakaway-via-delegation, so it is NOT recorded
+  # (recording it could falsely downgrade a monitored tool that hosts a service).
+  XpcMachServiceListener = 1'u64
+
+proc repro_hook_xpc_connection_create_mach_service*(name: cstring;
+    targetq: pointer; flags: uint64): pointer {.exportc, cdecl, dynlib.} =
+  ## xpc_connection_create_mach_service hook (R-C): the XPC CLIENT entry. XPC sits
+  ## on Mach, but modern libxpc resolves the service via an internal
+  ## (shared-cache) lookup path that the interposed `bootstrap_look_up` does not
+  ## see, so we hook the XPC create entry directly. We record the INTENT to talk
+  ## to a non-system mach service at connection-create time (the connection is
+  ## lazy; recording at create is conservative — write-intent style — and cannot
+  ## miss a later send). A successful create returns a non-nil xpc_connection_t.
+  ## A LISTENER connection (the server role) is skipped (see XpcMachServiceListener).
+  if not initialized or disabled > 0:
+    return ct_macos_real_xpc_create_mach_service(name, targetq, flags)
+  result = ct_macos_real_xpc_create_mach_service(name, targetq, flags)
+  if result != nil and (flags and XpcMachServiceListener) == 0:
+    recordMachLookup(name, 0)
+
 # --- Unified spawn-family hooks ------------------------------------------
 #
 # There is exactly ONE hook per spawn-family call, used by BOTH the static
@@ -1733,12 +1828,22 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
 {.emit: """
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
+#include <mach/mach.h>
+#include <servers/bootstrap.h>
+#include <xpc/xpc.h>
 
 static int repro_monitor_runtime_ready = 0;
 extern void NimMain(void);
 extern void repro_monitor_install_bodypatch(void);
 extern int repro_monitor_shim_flush(void);
 extern void *repro_macos_resolve_libsystem_symbol(const char *symbol);
+/* R-C: forwarders to the genuine libsystem bootstrap/XPC entries (defined in the
+ * macos_interpose_runtime translation unit), used by the not-ready interpose
+ * thunks below before the recording runtime is live. */
+extern kern_return_t repro_macos_real_bootstrap_look_up_call(mach_port_t bp,
+    char *name, mach_port_t *sp);
+extern void *repro_macos_real_xpc_create_mach_service_call(char *name,
+    void *targetq, unsigned long long flags);
 /* T3b: the dyld add-image callback `repro_hook_dyld_add_image` is a Nim exportc
  * proc whose prototype is already emitted (N_LIB_EXPORT) earlier in this same
  * translation unit, so no re-declaration is needed here; we cast its function
@@ -2356,6 +2461,34 @@ static int repro_wrap_connect(int fd, const struct sockaddr *addr,
 }
 
 /*
+ * R-C XPC / Mach-port breakaway interpose thunks (round-2 break R2). Mirror the
+ * T3a connect thunk: forward to the GENUINE libsystem entry before the recording
+ * runtime is live, then branch to the recording repro_hook_*. These are
+ * INTERPOSE-ONLY (bootstrap_look_up / xpc_connection_create_mach_service are not
+ * thin syscall wrappers and are not body-patched), so the not-ready forward uses
+ * the shim-skipping genuine-entry forwarder (which itself falls back to
+ * dlsym(RTLD_NEXT) so the program never breaks). Like the other hardening thunks
+ * they omit the debug-only interpose-DISABLE A/B forward.
+ */
+static kern_return_t repro_wrap_bootstrap_look_up(mach_port_t bp,
+    const char *name, mach_port_t *sp) {
+  if (!repro_monitor_runtime_ready) {
+    return repro_macos_real_bootstrap_look_up_call(bp, (char *)name, sp);
+  }
+  return repro_hook_bootstrap_look_up(bp, (char *)name, sp);
+}
+
+static xpc_connection_t repro_wrap_xpc_connection_create_mach_service(
+    const char *name, dispatch_queue_t targetq, uint64_t flags) {
+  if (!repro_monitor_runtime_ready) {
+    return (xpc_connection_t)repro_macos_real_xpc_create_mach_service_call(
+      (char *)name, (void *)targetq, (unsigned long long)flags);
+  }
+  return (xpc_connection_t)repro_hook_xpc_connection_create_mach_service(
+    (char *)name, (void *)targetq, (unsigned long long)flags);
+}
+
+/*
  * Body-patch hook ADDRESS accessors for the VARIADIC open/openat wrappers.
  *
  * Why the body-patch backend MUST use the variadic repro_wrap_open(at) thunks --
@@ -2484,7 +2617,15 @@ static struct {
   { (const void *)repro_wrap_fgetattrlist, (const void *)fgetattrlist },
   { (const void *)repro_wrap_getattrlistbulk, (const void *)getattrlistbulk },
   /* T3a IPC-breakaway hook (findings doc break #1). */
-  { (const void *)repro_wrap_connect, (const void *)connect }
+  { (const void *)repro_wrap_connect, (const void *)connect },
+  /* R-C XPC / Mach-port breakaway hooks (round-2 break R2). bootstrap_look_up
+   * (raw-Mach clients) + xpc_connection_create_mach_service (the XPC client
+   * entry) — the connection-establishment boundary the connect(2) hook is blind
+   * to. Interpose-only (see the thunks). */
+  { (const void *)repro_wrap_bootstrap_look_up,
+    (const void *)bootstrap_look_up },
+  { (const void *)repro_wrap_xpc_connection_create_mach_service,
+    (const void *)xpc_connection_create_mach_service }
   /* getdirentries is intentionally NOT in the interpose tuple: the SDK header
    * poisons the symbol under 64-bit inodes (`getdirentries_is_not_available…`),
    * so it cannot be referenced here. It is body-patched by string name instead

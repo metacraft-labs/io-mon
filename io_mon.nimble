@@ -152,6 +152,22 @@ task test, "Run the io-mon test suite":
   # `-d:ioMonEndpointSecurity` define and is NOT exercised here. Platform-
   # independent. See reprobuild-specs/MacOS-EndpointSecurity-Backend.md.
   exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_endpoint_security.nim"
+  # macOS ROUND-2 phase R-C: close the XPC / Mach-port breakaway false negative
+  # (round-2 break R2), the CRITICAL escape that DEFEATS the connect(2) breakaway
+  # fail-safe. XPC and raw Mach RPC never issue connect(2) — a client resolves a
+  # service name to a Mach send port via bootstrap_look_up (raw Mach) or
+  # xpc_connection_create_mach_service (XPC) + mach_msg — so a monitored client
+  # that delegates a file read to an out-of-tree service produced a false
+  # mcComplete. R-C hooks the connection-establishment boundary: a resolution of a
+  # NON-com.apple.* service records an mrIpcConnect with an unknown
+  # (launchd-brokered) peer pid, which the merge downgrades to mcIncomplete via
+  # the EXACT T3a machinery. Asserts: the raw-Mach r2_xpc escape now downgrades
+  # (was mcComplete; best-effort, skips if the host forbids raw Mach bootstrap),
+  # the XPC create-entry path downgrades environment-independently, and — the
+  # CRITICAL no-false-downgrade guard — a trivial program AND a com.apple.*-only
+  # program both stay mcComplete (the shim's own startup bootstrap calls must not
+  # self-downgrade every capture). macOS-only (no-op pass elsewhere).
+  exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_xpc_mach_breakaway.nim"
 
 task buildShim, "Build the io-mon interpose shim shared library":
   # Produces build/lib/librepro_monitor_shim.{dylib,so,dll} — the drop-in

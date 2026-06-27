@@ -33,3 +33,4 @@ tests/test_io_mon_macos_ipc_breakaway
 tests/test_io_mon_macos_library_load
 tests/test_io_mon_macos_endpoint_security
 tests/test_io_mon_macos_round2_rb
+tests/test_io_mon_macos_xpc_mach_breakaway
