@@ -41,7 +41,7 @@ when defined(macosx):
   import macos_backend_toggle
 
 const
-  repoRoot = currentSourcePath().parentDir().parentDir()
+  repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
   corpus = repoRoot / "research" / "adversarial-2026-06" / "adv_realbuild"
 
 when defined(macosx):

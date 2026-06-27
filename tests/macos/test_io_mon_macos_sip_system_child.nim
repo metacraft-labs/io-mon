@@ -75,7 +75,7 @@ when defined(macosx):
   import io_mon  # readMonitorDepFile, mergeFragments, record kinds
 
 const
-  repoRoot = currentSourcePath().parentDir().parentDir()
+  repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
   # The SIP-protected system file the grandchild ``cat`` reads. It is a stable,
   # always-present, plain-text file outside the test tree, so a captured read of
   # it can ONLY have come from the grandchild — never from the probe or shim.

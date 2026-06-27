@@ -39,7 +39,7 @@ when defined(macosx):
   import macos_backend_toggle
 
 const
-  repoRoot = currentSourcePath().parentDir().parentDir()
+  repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
   r2mmap = repoRoot / "research" / "adversarial-2026-06-round2" / "r2_mmap"
   r2path = repoRoot / "research" / "adversarial-2026-06-round2" / "r2_path"
   r2impl = repoRoot / "research" / "adversarial-2026-06-round2" / "r2_implicit"

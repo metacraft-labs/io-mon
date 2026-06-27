@@ -27,11 +27,14 @@
 ## file MUST stay mcComplete / cacheable, with the env read recorded as an observed
 ## input and NO non-determinism flag. ONLY randomness auto-downgrades.
 ##
-## The platform-independent suite locks the merge-side three-way classification
-## (`nonDeterminismLossCount` + `mergeFragments`); the macOS suite proves the live
-## hooks against the round-2 r2_implicit corpus (minicc.c / readfile.c).
+## The merge-side three-way classification (`nonDeterminismLossCount` +
+## `mergeFragments`) is platform-independent and now lives in the portable suite
+## `tests/portable/test_io_mon_rd_classification.nim` (it runs on EVERY OS). THIS
+## file keeps ONLY the macOS LIVE capture, which proves the shim's getenv /
+## sysctl / clock / entropy hooks against the round-2 r2_implicit corpus
+## (minicc.c / readfile.c).
 
-import std/[os, sets, strutils, unittest]
+import std/[os, strutils, unittest]
 import io_mon
 
 when defined(macosx):
@@ -39,80 +42,8 @@ when defined(macosx):
   import macos_backend_toggle
 
 const
-  repoRoot = currentSourcePath().parentDir().parentDir()
+  repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
   r2impl = repoRoot / "research" / "adversarial-2026-06-round2" / "r2_implicit"
-
-# ---------------------------------------------------------------------------
-# Platform-independent: the merge-side three-way classification.
-# ---------------------------------------------------------------------------
-
-proc start(pid: uint64): MonitorRecord =
-  MonitorRecord(kind: mrProcessStart, observationKind: moProcessStart, osPid: pid)
-
-proc envRead(pid: uint64; name: string): MonitorRecord =
-  MonitorRecord(kind: mrEnvRead, observationKind: moEnvRead, osPid: pid,
-    path: name, detail: "env-read")
-
-proc sysctlRead(pid: uint64; name: string): MonitorRecord =
-  MonitorRecord(kind: mrSysctlRead, observationKind: moSysctlRead, osPid: pid,
-    path: name, detail: "sysctl-read")
-
-proc timeRead(pid: uint64; source: string): MonitorRecord =
-  MonitorRecord(kind: mrTimeRead, observationKind: moTimeRead, osPid: pid,
-    path: source, detail: "time-read")
-
-proc nonDet(pid: uint64; source: string): MonitorRecord =
-  MonitorRecord(kind: mrNonDeterministic, observationKind: moNonDeterministic,
-    osPid: pid, path: source, detail: "non-deterministic entropy source")
-
-suite "io-mon R-D non-determinism classification (nonDeterminismLossCount)":
-  test "ONLY randomness counts: one mrNonDeterministic yields one loss":
-    check nonDeterminismLossCount(@[start(1), nonDet(1, "arc4random")]) == 1
-
-  test "CARDINAL SIN GUARD: env + sysctl + time reads yield ZERO losses":
-    # A normal deterministic build that reads env vars, sysctls and clocks must NOT
-    # be flagged non-deterministic — else every build re-runs forever.
-    let records = @[start(1), envRead(1, "SOURCE_DATE_EPOCH"),
-      envRead(1, "CFLAGS"), sysctlRead(1, "hw.ncpu"), sysctlRead(1, "uname"),
-      timeRead(1, "clock_gettime"), timeRead(1, "gettimeofday")]
-    check nonDeterminismLossCount(records) == 0
-
-  test "distinct entropy sources each count":
-    let records = @[start(1), nonDet(1, "arc4random"), nonDet(1, "getentropy"),
-      nonDet(1, "arc4random_buf")]
-    check nonDeterminismLossCount(records) == 3
-
-suite "io-mon R-D merge downgrade (mergeFragments)":
-  test "an entropy-consuming build downgrades to mcIncomplete":
-    let work = getTempDir() / ("io-mon-rd-nd-" & $getCurrentProcessId())
-    removeDir(work); createDir(work)
-    let frag = work / "frags"
-    createDir(frag)
-    appendFragmentRecord(frag, start(700'u64))
-    appendFragmentRecord(frag, nonDet(700'u64, "arc4random"))
-    let dep = mergeFragments(frag, work / "out.rdep")
-    check dep.completeness == mcIncomplete
-    removeDir(work)
-
-  test "CARDINAL SIN GUARD: env + time reads stay mcComplete (NO downgrade)":
-    # The most important property: observed env inputs and benign clock reads must
-    # NEVER downgrade. The env read is folded into the consumer's cache key; the
-    # time read is recorded-not-downgraded.
-    let work = getTempDir() / ("io-mon-rd-ok-" & $getCurrentProcessId())
-    removeDir(work); createDir(work)
-    let frag = work / "frags"
-    createDir(frag)
-    appendFragmentRecord(frag, start(700'u64))
-    appendFragmentRecord(frag, envRead(700'u64, "SOURCE_DATE_EPOCH"))
-    appendFragmentRecord(frag, timeRead(700'u64, "clock_gettime"))
-    let dep = mergeFragments(frag, work / "out.rdep")
-    check dep.completeness == mcComplete
-    # The env read is preserved in the depfile so the consumer CAN fold it.
-    var sawEnv = false
-    for r in dep.records:
-      if r.kind == mrEnvRead and r.path == "SOURCE_DATE_EPOCH": sawEnv = true
-    check sawEnv
-    removeDir(work)
 
 # ---------------------------------------------------------------------------
 # macOS live capture against the r2_implicit corpus.
