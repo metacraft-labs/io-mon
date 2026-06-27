@@ -221,6 +221,29 @@ proc closeFragmentSlot*() =
     fragmentSlot.batchOpenedAtNs = 0
     fragmentSlot.batchProbeCountdown = 0
 
+proc discardFragmentSlotAfterFork*() =
+  ## Reset the calling thread's fragment slot in a fork CHILD WITHOUT flushing
+  ## the in-flight batch. The child inherited the slot copy-on-write; its
+  ## buffered frames belong to the PARENT (which flushes its own copy), so
+  ## flushing here would duplicate them and interleave the parent's fragment
+  ## file. Drop the batch and close the inherited handle so the child's next
+  ## append opens a fresh fragment under the child's own (osPid, threadId).
+  ## (Between batches the stdio buffer is already empty — flushFragmentBatch
+  ## ends with flushFile — so close() writes none of the parent's frames.)
+  if fragmentSlot.isOpen:
+    try:
+      close(fragmentSlot.file)
+    except IOError, OSError:
+      discard
+  fragmentSlot.isOpen = false
+  fragmentSlot.fragmentDirLen = 0
+  fragmentSlot.fragmentDirBuf[0] = '\0'
+  fragmentSlot.osPid = 0
+  fragmentSlot.threadId = 0
+  fragmentSlot.batchLen = 0
+  fragmentSlot.batchOpenedAtNs = 0
+  fragmentSlot.batchProbeCountdown = 0
+
 proc checksum*(bytes: openArray[byte]): uint64 =
   result = FnvOffset
   for b in bytes:
@@ -880,7 +903,8 @@ proc mergeFragments*(fragmentDir, outputPath: string;
         "into a hardened image, or IPC connect to an out-of-tree breakaway " &
         "daemon)")
   records.add profileRecords(defaultHooksMonitorProfile(
-    MacosMonitorShimTaxonomyCapabilities))
+    when defined(linux): LinuxPreloadSupportedCapabilities
+    else: MacosMonitorShimTaxonomyCapabilities))
 
   let canonical = encodeCanonical(records)
   writeFile(extendedPath(outputPath), canonical.fromBytes())

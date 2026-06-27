@@ -1,7 +1,7 @@
 when not defined(linux):
   {.error: "repro_monitor_shim/linux_preload is Linux-only".}
 
-import std/[locks, os, tables]
+import std/[locks, os, strutils, tables]
 from io_mon/paths import extendedPath
 
 import io_mon/types
@@ -27,6 +27,12 @@ var
   nextProcessSeq: uint64 = 0
   fdPaths = initTable[cint, string]()
   dirPaths = initTable[uint, string]()
+  # Thread id of the thread that ran the preload constructor (the process
+  # main thread). Its fragment batch is flushed by the process-exit
+  # destructor; worker threads flush eagerly per record (see emitRecord),
+  # mirroring the macOS shim, because a pthread-key thread-exit destructor
+  # cannot safely touch Nim TLS during teardown.
+  mainThreadId: uint64 = 0
 
 var
   disabled {.threadvar.}: int
@@ -50,10 +56,20 @@ void repro_linux_set_errno(int value) {
 }
 
 extern int repro_monitor_shim_init(char *configPath);
+extern int repro_monitor_shim_shutdown(void);
 
 __attribute__((constructor))
 static void repro_linux_monitor_constructor(void) {
   repro_monitor_shim_init(NULL);
+}
+
+__attribute__((destructor))
+static void repro_linux_monitor_destructor(void) {
+  /* Flush the main thread's buffered fragment batch on process exit so a
+     short-lived process (or the trailing batch of any process) does not
+     drop its records — which would otherwise make a fast child look
+     un-injected and downgrade completeness to mcIncomplete. */
+  repro_monitor_shim_shutdown();
 }
 """.}
 
@@ -101,6 +117,12 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
     return
   withShimMuted:
     appendFragmentRecord(fragmentDir, record)
+    # The main thread keeps the batching win (flushed by the process-exit
+    # destructor); a worker thread that exits early cannot be reached by the
+    # destructor and has no safe pthread-key flush, so flush its batch eagerly
+    # per record. Mirrors the macOS shim's threaded-write handling.
+    if mainThreadId != 0 and record.threadId != mainThreadId:
+      flushFragmentBatch()
 
 proc recordProcessStart() {.raises: [].} =
   var record = baseRecord(mrProcessStart, moProcessStart)
@@ -189,11 +211,24 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))
   initialized = true
+  mainThreadId = currentThreadId()
   recordProcessStart()
   result = 0
 
-proc repro_monitor_shim_flush*(): cint {.exportc, dynlib, raises: [].} = 0
-proc repro_monitor_shim_shutdown*(): cint {.exportc, dynlib, raises: [].} = 0
+proc repro_monitor_shim_flush*(): cint {.exportc, dynlib, raises: [].} =
+  ## Flush + close the calling thread's fragment slot so no buffered records
+  ## are dropped (previously a no-op, which lost the batched tail).
+  withShimMuted:
+    try: closeFragmentSlot()
+    except CatchableError: discard
+  result = 0
+proc repro_monitor_shim_shutdown*(): cint {.exportc, dynlib, raises: [].} =
+  ## Process/thread shutdown: flush + close the calling thread's fragment
+  ## slot. Invoked by the process-exit destructor for the main thread.
+  withShimMuted:
+    try: closeFragmentSlot()
+    except CatchableError: discard
+  result = 0
 proc repro_monitor_shim_disable_current_thread*() {.exportc, dynlib, raises: [].} =
   inc disabled
 proc repro_monitor_shim_enable_current_thread*() {.exportc, dynlib, raises: [].} =
@@ -353,11 +388,42 @@ proc repro_hook_closedir*(ctx: var ClosedirContext) {.raises: [].} =
   removeDirPath(ctx.dirp)
   c_set_errno(savedErrno)
 
+proc processIsSingleThreaded(): bool {.raises: [].} =
+  ## True iff the current process has exactly one thread. Read in the PARENT
+  ## BEFORE fork so the child — which inherits the answer copy-on-write — knows
+  ## whether the parent was single-threaded. That is the safety precondition for
+  ## the child to keep recording: with no sibling threads, none could have held
+  ## a Nim lock across the fork, so the child can do monitor bookkeeping without
+  ## deadlock. Conservatively returns false (treat as multi-threaded) on any
+  ## read error.
+  var content: string
+  try:
+    withShimMuted:
+      content = readFile("/proc/self/status")
+  except CatchableError:
+    return false
+  const key = "Threads:"
+  let idx = content.find(key)
+  if idx < 0:
+    return false
+  var i = idx + key.len
+  while i < content.len and content[i] in {' ', '\t'}:
+    inc i
+  var n = 0
+  var sawDigit = false
+  while i < content.len and content[i] in {'0' .. '9'}:
+    n = n * 10 + (ord(content[i]) - ord('0'))
+    sawDigit = true
+    inc i
+  result = sawDigit and n == 1
+
 proc repro_hook_fork*(ctx: var ForkContext) {.raises: [].} =
   if shouldBypass():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
+  # Sampled in the parent, before the fork, and inherited by the child.
+  let parentSingleThreaded = processIsSingleThreaded()
   callNext(ctx)
   let savedErrno = c_get_errno()
   if ctx.result > 0:
@@ -367,10 +433,23 @@ proc repro_hook_fork*(ctx: var ForkContext) {.raises: [].} =
     record.detail = "fork"
     emitRecord(record)
   elif ctx.result == 0:
-    # After fork only the calling thread survives. Other threads may have held
-    # Nim locks when fork happened, so the child must avoid monitor bookkeeping
-    # until exec loads a fresh image and runs the preload constructor again.
-    inForkChild = true
+    if parentSingleThreaded:
+      # Single-threaded parent ⇒ no sibling thread could hold a Nim lock across
+      # the fork, so the child can safely keep recording. Reset the inherited
+      # (copy-on-write) fragment slot so the child writes its OWN fragment, then
+      # emit the child's process-start. This stops a fork-WITHOUT-exec child
+      # (e.g. a nix cc/clang-wrapper command-substitution subshell) from being
+      # flagged as an un-monitored subtree, and captures its I/O too. It only
+      # ADDS evidence — a later exec re-runs the constructor (a second
+      # process-start is expected and harmless; see t0-completeness).
+      withShimMuted:
+        discardFragmentSlotAfterFork()
+      recordProcessStart()
+    else:
+      # Multi-threaded parent: another thread may have held a Nim lock at fork,
+      # so the child must avoid monitor bookkeeping until exec loads a fresh
+      # image and re-runs the preload constructor.
+      inForkChild = true
   c_set_errno(savedErrno)
 
 proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
