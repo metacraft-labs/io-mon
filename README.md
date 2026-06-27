@@ -9,6 +9,76 @@ process tree and persists that observation in a compact binary depfile format
 the interpose framework that installs the read/write/exec hooks into the
 monitored process.
 
+## Scope & responsibilities
+
+**io-mon IS** the cross-platform filesystem/process **observation** layer. It
+watches a monitored process tree and records, as it happens:
+
+- file **reads**, **writes**, **opens**, and existence **probes**
+  (`stat`/`access`/`getattrlist`), plus directory enumerations;
+- content dependencies the bare `open`/`read` path misses — clonefile/CoW and
+  hardlink sources, `mmap(MAP_SHARED|PROT_WRITE)` write-backs, and
+  **library loads** (dependent dylibs + `dlopen`, mapped by dyld via low-level
+  kernel `mmap` that bypasses the hooked `open`);
+- **process** spawns / execs / starts (the process tree);
+- **IPC** connects (`connect(2)` to AF_UNIX/AF_INET peers, with the peer pid)
+  so a build that talks to an out-of-tree daemon can be detected.
+
+It emits these as an **RMDF dependency depfile** carrying an honest
+**completeness signal**: `mcComplete` is asserted **only** when the capture is
+provably complete; otherwise the depfile is marked `mcIncomplete`, meaning the
+consumer must conservatively re-run / re-build rather than trust the observed
+set. io-mon ships the machinery that makes this work: the injected
+interpose + body-patch shim (macOS), the `LD_PRELOAD` shim (Linux), the
+`CreateRemoteThread`+`LoadLibraryW` injected hooks (Windows), the SIP-bypass
+sandbox-tools drop-in propagation (macOS), and the depfile reader / writer /
+merge.
+
+**io-mon is NOT** a build system, a cache, an incremental test runner, or a
+policy/enforcement sandbox. It does **not** decide what to rebuild or which
+tests to skip. It supplies the *observed dependency set + completeness signal*;
+a **consumer** — reprobuild's build engine, or CodeTracer's incremental test
+runner — makes the caching / skip decisions. The dependency direction is
+strictly one-way (`reprobuild → io-mon`, `codetracer → io-mon`, never the
+reverse).
+
+### Correctness contract (the cardinal sin)
+
+io-mon must **never** claim `mcComplete` when it might have missed a
+dependency. A false `mcComplete` becomes a consumer **false cache hit** or
+**false test-skip** — the single worst failure mode. Every uncertainty is
+therefore resolved by **downgrading to `mcIncomplete`** (fail-safe → re-run):
+a partial/corrupt fragment write, an un-injected spawn child, an `exec`/SETEXEC
+into an un-injectable (hardened/SIP) image, a root that stripped
+`DYLD_INSERT_LIBRARIES` (see the `expectedRootPid` root-guard in
+`mergeFragments`), or an IPC connect to an out-of-tree daemon all force
+`mcIncomplete`. This contract has been exercised by the adversarial-hardening
+campaigns in
+`reprobuild-specs/MacOS-Monitoring-Adversarial-Hardening.milestones.org` (the
+`adv_*` / `r2_*` corpora under `research/`). **Known residual gaps**, tracked
+honestly: raw-syscall / indirect-syscall and XPC/Mach-IPC observation are
+structurally invisible to the in-process interpose backend (adversarial
+hardening #6) — these are the motivation for the designed/skeletoned
+**EndpointSecurity** backend (`reprobuild-specs/MacOS-EndpointSecurity-Backend.md`),
+which is behind the off-by-default `-d:ioMonEndpointSecurity` define and refuses
+to start as an honest stub today.
+
+### Platform scope
+
+- **macOS** — most complete: interpose (`__DATA,__interpose`) **and** body-patch
+  (`mach_vm_remap` overwrite) always run together, additively, working under SIP
+  with no entitlements/root for the ad-hoc-signed binaries the build/test system
+  produces.
+- **Linux** — `LD_PRELOAD` shim (needs full end-to-end validation on a Linux
+  host).
+- **Windows** — injected hooks via `CreateRemoteThread`+`LoadLibraryW` (needs
+  validation under the DIY toolchain).
+- **EndpointSecurity** — designed/skeletoned (see above), not yet a shipping
+  backend.
+
+See [docs/usage.md](docs/usage.md) for the CLI and library usage guides, and
+[repro.nim](repro.nim) for building/testing io-mon through reprobuild.
+
 ## What's in the box
 
 `import io_mon` re-exports the full public API:
@@ -136,3 +206,24 @@ nimble test
 nim c -r --path:../nim-stackable-hooks/src tests/test_io_mon_parity_with_fs_snoop.nim
 nim c -r --path:../nim-stackable-hooks/src tests/test_io_mon_builds_standalone.nim
 ```
+
+The nimble tasks are: `nimble buildShim` (the shim shared library),
+`nimble buildSnoop` (the `io-mon` CLI), and `nimble test` (the suite).
+
+### Building and testing with reprobuild
+
+[`repro.nim`](repro.nim) exposes io-mon's build/test as reprobuild edges so a
+developer on any OS can drive them through the engine. From inside the io-mon
+checkout (with `nim-stackable-hooks` checked out as a sibling):
+
+```sh
+repro build io-mon          # the io-mon CLI (the `default` collection)
+repro build io-mon:shim     # the librepro_monitor_shim shared library
+repro build io-mon:test     # compile + run the full test suite
+```
+
+From a sibling repo, the same qualified `io-mon:<target>` selectors apply.
+Each edge wraps the corresponding existing build entry point verbatim
+(`scripts/build_shim.sh`, `nimble buildSnoop`, `nimble test`) — see the
+top-of-file comment in `repro.nim` for the rationale and the
+`nim-stackable-hooks` sibling requirement.
