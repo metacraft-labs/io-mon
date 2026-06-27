@@ -128,6 +128,18 @@ task test, "Run the io-mon test suite":
   # /tmp-built dependent dylib are captured while libSystem is NOT (no flood).
   # macOS-only (no-op pass elsewhere).
   exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_library_load.nim"
+  # macOS ROUND-2 phase R-B: four content/metadata hook-coverage false-negatives
+  # closed against the round-2 adversarial corpora — R3 (a pure O_RDWR open is an
+  # INPUT, not collapsed to a write, so an O_RDWR-opened-then-read config is not
+  # dropped from the inputs), R4 (the stat/lstat/fstatat/access family ALSO records
+  # the realpath-canonical companion and stamps (dev, ino) for hardlink identity,
+  # so a `/./`-laden / mid-symlink / relative-after-chdir metadata dependency stays
+  # matchable), R6 (the library-load self-exclusion is by mach_header / exact
+  # realpath identity, not a substring, so a dependency dylib whose path merely
+  # CONTAINS "librepro_monitor_shim" is recorded), and R9 (a MAP_SHARED|PROT_WRITE
+  # mmap write-back is recorded as a content write the bare open does not convey).
+  # macOS-only (no-op pass elsewhere).
+  exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_round2_rb.nim"
   # T3c EndpointSecurity backend SKELETON (adversarial hardening #6, the residual
   # raw-syscall / XPC gap the in-process interpose backend structurally cannot
   # see): unit coverage for the pure, SDK-free logic the production ES backend is
