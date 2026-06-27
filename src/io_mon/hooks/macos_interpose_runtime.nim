@@ -64,6 +64,9 @@ proc repro_macos_get_sandbox_tools_dir*(): cstring
 #include <unistd.h>
 #include <libproc.h>
 #include <sys/proc_info.h>
+#include <mach/mach.h>
+#include <servers/bootstrap.h>
+#include <xpc/xpc.h>
 
 extern char **environ;
 extern char *repro_macos_rewrite_sip_path(char *path);
@@ -1097,6 +1100,87 @@ int repro_macos_spawnattr_has_setexec(void *attrp) {
     return 0;
   return (flags & POSIX_SPAWN_SETEXEC) ? 1 : 0;
 }
+
+/*
+ * ROUND-2 R-C (XPC / Mach-port breakaway): close the connection-establishment
+ * blind spot that DEFEATS the connect(2) breakaway fail-safe (round-2 findings,
+ * the confirmed r2_xpc break). XPC and raw Mach RPC NEVER issue connect(2): a
+ * client resolves a service name to a Mach send port via bootstrap_look_up +
+ * mach_msg to launchd's bootstrap port. A monitored client that delegates a file
+ * read to an OUT-OF-TREE service (research/.../r2_xpc: mach_server opens+reads
+ * the marker on the client's behalf and returns the bytes) produces NO
+ * mrIpcConnect, NO spawn, NO event-loss → a false `mcComplete` cache hit. We hook
+ * the CONNECTION-ESTABLISHMENT boundary (bootstrap_look_up + the XPC client
+ * entry), NOT the hot mach_msg send path — mirroring exactly how connect(2) is
+ * handled for the socket-daemon breakaway.
+ *
+ * Forwarding (interpose-only, like copyfile): bootstrap_look_up /
+ * xpc_connection_create_mach_service are NOT thin syscall wrappers and are NOT
+ * body-patched, so the recording hook's forward resolves the GENUINE libsystem
+ * entry via the shim-skipping image walk (a by-name call could re-enter the
+ * shim's own __interpose binding and loop). dlsym(RTLD_NEXT) is the fallback so
+ * the monitored program NEVER breaks if the image walk cannot resolve the symbol.
+ */
+typedef kern_return_t (*repro_bootstrap_look_up_fn)(mach_port_t, const char *,
+                                                    mach_port_t *);
+static repro_bootstrap_look_up_fn repro_real_bootstrap_look_up_ptr = NULL;
+
+kern_return_t repro_macos_real_bootstrap_look_up_call(mach_port_t bp,
+    char *name, mach_port_t *sp) {
+  if (!repro_real_bootstrap_look_up_ptr)
+    repro_real_bootstrap_look_up_ptr = (repro_bootstrap_look_up_fn)
+      repro_macos_lookup_image_symbol("_bootstrap_look_up");
+  if (!repro_real_bootstrap_look_up_ptr)
+    repro_real_bootstrap_look_up_ptr = (repro_bootstrap_look_up_fn)
+      dlsym(RTLD_NEXT, "bootstrap_look_up");
+  if (!repro_real_bootstrap_look_up_ptr) return BOOTSTRAP_UNKNOWN_SERVICE;
+  return repro_real_bootstrap_look_up_ptr(bp, name, sp);
+}
+
+typedef xpc_connection_t (*repro_xpc_create_fn)(const char *,
+                                                dispatch_queue_t, uint64_t);
+static repro_xpc_create_fn repro_real_xpc_create_ptr = NULL;
+
+void *repro_macos_real_xpc_create_mach_service_call(char *name,
+    void *targetq, unsigned long long flags) {
+  if (!repro_real_xpc_create_ptr)
+    repro_real_xpc_create_ptr = (repro_xpc_create_fn)
+      repro_macos_lookup_image_symbol("_xpc_connection_create_mach_service");
+  if (!repro_real_xpc_create_ptr)
+    repro_real_xpc_create_ptr = (repro_xpc_create_fn)
+      dlsym(RTLD_NEXT, "xpc_connection_create_mach_service");
+  if (!repro_real_xpc_create_ptr) return NULL;
+  return (void *)repro_real_xpc_create_ptr(name, (dispatch_queue_t)targetq,
+                                           (uint64_t)flags);
+}
+
+/*
+ * Classify a Mach service name: 1 if a bootstrap_look_up / XPC connection to it
+ * should be RECORDED as a potential out-of-tree breakaway, 0 if it is a SYSTEM
+ * BASELINE name that EVERY normal program resolves (the bootstrap analog of the
+ * /usr/lib + /System + dyld-shared-cache library-load filter). The com.apple.*
+ * namespace is the dominant baseline (notifyd, logd, distributed notifications,
+ * the dyld/XPC system services, com.apple.dt.* developer tooling, …) and the
+ * shim's own / libsystem's own startup lookups all fall in it; recording those
+ * would self-downgrade EVERY capture — the CARDINAL SIN. A NON-Apple service
+ * (sccache/distcc/icecc/custom build daemons, and the r2_xpc com.example.*
+ * breakaway) is the conservative downgrade trigger: a normal compile/link/make
+ * never resolves one, so the no-false-downgrade guard holds, while a delegated
+ * file read to a custom out-of-tree daemon is caught.
+ *
+ * RESIDUAL (documented): a breakaway delegated to a com.apple.* service
+ * (SourceKit com.apple.dt.*, Virtualization.framework, sandboxd) is NOT caught
+ * here — an in-process hook cannot distinguish a benign com.apple.* lookup
+ * (pervasive in every build) from a malicious one without false-downgrading
+ * everything. The structural fix is the EndpointSecurity backend (T3c). This
+ * in-process hook is the conservative stopgap for the non-Apple custom-daemon
+ * breakaway surface the confirmed break exercises.
+ */
+int repro_macos_mach_service_recordable(char *name) {
+  if (!name || !name[0]) return 0;
+  if (strncmp(name, "com.apple.", 10) == 0) return 0;
+  return 1;
+}
 """.}
 
 type
@@ -1343,6 +1427,34 @@ proc ct_macos_real_connect*(fd: cint; address: pointer; addrLen: uint32): cint =
   proc realConnect(fd: cint; address: pointer; addrLen: uint32): cint
     {.importc: "repro_macos_real_connect_syscall", cdecl.}
   realConnect(fd, address, addrLen)
+
+proc ct_macos_real_bootstrap_look_up*(bp: uint32; serviceName: cstring;
+    sp: ptr uint32): cint =
+  ## ROUND-2 R-C — forward to the GENUINE libsystem `bootstrap_look_up` (resolved
+  ## via the shim-skipping image walk; dlsym(RTLD_NEXT) fallback). bootstrap_look_up
+  ## is interpose-only (never body-patched) and not a thin syscall, so — like
+  ## copyfile — a by-name forward could re-enter the shim's own interpose binding.
+  proc realLookup(bp: uint32; serviceName: cstring; sp: ptr uint32): cint
+    {.importc: "repro_macos_real_bootstrap_look_up_call", cdecl.}
+  realLookup(bp, serviceName, sp)
+
+proc ct_macos_real_xpc_create_mach_service*(name: cstring; targetq: pointer;
+    flags: uint64): pointer =
+  ## ROUND-2 R-C — forward to the GENUINE libxpc `xpc_connection_create_mach_service`
+  ## (interpose-only; resolved via the shim-skipping image walk + dlsym fallback).
+  proc realCreate(name: cstring; targetq: pointer; flags: uint64): pointer
+    {.importc: "repro_macos_real_xpc_create_mach_service_call", cdecl.}
+  realCreate(name, targetq, flags)
+
+proc ct_macos_mach_service_recordable*(name: cstring): bool =
+  ## ROUND-2 R-C — true if a bootstrap_look_up / XPC connection to `name` should be
+  ## recorded as a potential out-of-tree breakaway (non-`com.apple.*`). The
+  ## `com.apple.*` system baseline is excluded so a normal build — whose only
+  ## Mach-service lookups are system ones — is never falsely downgraded. See the C
+  ## helper for the cardinal-sin rationale and the documented com.apple.* residual.
+  proc recordable(name: cstring): cint
+    {.importc: "repro_macos_mach_service_recordable", cdecl.}
+  name != nil and recordable(name) != 0
 
 proc ct_macos_socket_describe*(fd: cint; address: pointer; addrLen: uint32;
     outDest: pointer; outDestLen: csize_t; outPeerPid: ptr cint): cint =
