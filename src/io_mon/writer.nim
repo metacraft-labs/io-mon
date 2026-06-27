@@ -859,6 +859,36 @@ proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord];
       flaggedPeers.incl key
       inc result
 
+proc nonDeterminismLossCount*(records: openArray[MonitorRecord]): int =
+  ## ROUND-2 R-D (break R10) — the AUTO-DOWNGRADE arm of the three-way non-file
+  ## determinism split. Returns the number of synthetic event-loss records to
+  ## inject so the merge downgrades to `mcIncomplete` (a conservative RE-RUN, never
+  ## a cache hit) when the build CONSUMED ENTROPY and is therefore genuinely
+  ## non-reproducible.
+  ##
+  ## Keyed PURELY on `mrNonDeterministic` records, which the shim emits for the
+  ## program's own DIRECT entropy use — getentropy / arc4random* — and ONLY when the
+  ## call's CALLER is in the program's own main-executable __TEXT range (caller
+  ## attribution; see `ct_macos_addr_in_program`). That gate is essential: an
+  ## interpose hook ALSO sees cross-dylib libsystem/libobjc/libswift entropy
+  ## (malloc cookies, stack-guard, hash seeds) which would otherwise downgrade every
+  ## real cc/clang/bash run (the cardinal sin). A /dev/random or /dev/urandom open is
+  ## NOT flagged (mktemp opens /dev/urandom for a random temp name on most builds).
+  ## The shim DEDUPES per-process by source, so a tight `arc4random()` loop counts
+  ## once, not millions of times. Counting one loss per distinct source record is
+  ## enough to force the downgrade.
+  ##
+  ## CARDINAL-SIN GUARD: ONLY `mrNonDeterministic` downgrades. `mrEnvRead` /
+  ## `mrSysctlRead` are OBSERVED INPUTS (folded into the consumer's cache key, never
+  ## a downgrade) and `mrTimeRead` is recorded-not-downgraded (almost every program
+  ## reads a clock for benign timing). A normal deterministic build that reads
+  ## env vars and calls clock_gettime therefore stays `mcComplete` — see
+  ## `mergeFragments` and the R-D design note.
+  result = 0
+  for r in records:
+    if r.kind == mrNonDeterministic:
+      inc result
+
 const
   BreakawayReportExt* = ".io-mon-report"
     ## File extension a COOPERATING daemon writes its breakaway report under,
@@ -1179,6 +1209,20 @@ proc mergeFragments*(fragmentDir, outputPath: string;
       detail: "unmonitored subtree/peer (un-injectable spawn child, SETEXEC " &
         "into a hardened image, or IPC connect to an out-of-tree breakaway " &
         "daemon)")
+  # ROUND-2 R-D (break R10) — AUTO-DOWNGRADE on entropy consumption. A build whose
+  # OWN code drew randomness (getentropy / arc4random*) is genuinely non-reproducible:
+  # its output cannot be cached on a depfile of FILE deps alone. One synthetic
+  # event-loss per `mrNonDeterministic` source forces `mcIncomplete` via the SAME
+  # machinery as a corrupt fragment / un-injected subtree — a conservative re-run.
+  # ONLY caller-attributed program entropy downgrades here; mrEnvRead/mrSysctlRead
+  # are observed inputs, mrTimeRead is recorded-not-downgraded, and a /dev/urandom
+  # open is NOT flagged (the cardinal-sin guard). See nonDeterminismLossCount.
+  let nonDeterministicLosses = nonDeterminismLossCount(records)
+  for _ in 0 ..< nonDeterministicLosses:
+    records.add MonitorRecord(kind: mrEventLoss,
+      observationKind: moEventLoss,
+      detail: "non-deterministic input consumed (the program's own code called " &
+        "getentropy/arc4random) — build is not reproducible, always re-run")
   records.add profileRecords(defaultHooksMonitorProfile(
     MacosMonitorShimTaxonomyCapabilities))
 

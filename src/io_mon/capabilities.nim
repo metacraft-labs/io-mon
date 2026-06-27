@@ -35,7 +35,15 @@ const
     # ~620 dependent dylibs and any runtime dlopen'd image are now recorded as
     # content (read) dependencies, so an in-place toolchain-library upgrade busts
     # a content-addressed cache instead of serving a stale result.
-    mcapLibraryLoad
+    mcapLibraryLoad,
+    # ROUND-2 R-D (break R10) — non-file determinism inputs. getenv / sysctlbyname /
+    # sysctl / uname / gethostname / gethostuuid are hooked and recorded as OBSERVED
+    # DECLARED INPUTS (mcapObservedEnv); getentropy / arc4random* / a /dev/urandom
+    # open are flagged non-deterministic (auto-downgrade) and clock_gettime /
+    # gettimeofday / time / mach_absolute_time are recorded-not-downgraded
+    # (mcapNonDeterminism).
+    mcapObservedEnv,
+    mcapNonDeterminism
   }
 
   MacosInterposeKnownUnsupportedCapabilities* = {
@@ -73,7 +81,10 @@ const
     mcapSymlink,
     mcapIpcConnect,
     # T3b — dyld dependent-dylib / dlopen image-set capture (see above).
-    mcapLibraryLoad
+    mcapLibraryLoad,
+    # ROUND-2 R-D — non-file determinism inputs (see MacosInterposeSupportedCapabilities).
+    mcapObservedEnv,
+    mcapNonDeterminism
   }
 
   LinuxPreloadSupportedCapabilities* = {
@@ -101,7 +112,11 @@ const
     mcapPathMutation,
     # The Linux LD_PRELOAD shim does not yet hook connect(2); IPC-breakaway
     # detection is currently a macOS-only capability.
-    mcapIpcConnect
+    mcapIpcConnect,
+    # ROUND-2 R-D — the Linux preload shim does not yet hook getenv/sysctl/uname or
+    # the entropy/time sources; non-file determinism handling is macOS-only so far.
+    mcapObservedEnv,
+    mcapNonDeterminism
   }
 
 proc backendFamilyId*(family: MonitorBackendFamily): string =
@@ -159,6 +174,10 @@ proc capabilityId*(capability: MonitorCapability): string =
     "path-mutation"
   of mcapIpcConnect:
     "ipc-connect"
+  of mcapObservedEnv:
+    "observed-env"
+  of mcapNonDeterminism:
+    "non-determinism"
 
 proc capabilityFromId*(value: string): MonitorCapability =
   for capability in MonitorCapability:
@@ -210,6 +229,15 @@ proc unsupportedReason(capability: MonitorCapability): string =
     # as a defensive default.
     "connect(2) is hooked on the macOS interpose+body-patch shim; this reason " &
       "applies only where IPC-connect is not yet advertised"
+  of mcapObservedEnv:
+    # getenv/sysctlbyname/sysctl/uname/gethostname/gethostuuid ARE hooked on the
+    # macOS interpose shim (ROUND-2 R-D); this reason applies only where the
+    # observed-env capability is not yet advertised.
+    "getenv/sysctl/uname are hooked on the macOS interpose shim; this reason " &
+      "applies only where observed-env recording is not yet advertised"
+  of mcapNonDeterminism:
+    "entropy/time sources are hooked on the macOS interpose shim; this reason " &
+      "applies only where non-determinism handling is not yet advertised"
   else:
     "capability is not advertised by the selected macOS interpose profile"
 
@@ -231,6 +259,10 @@ proc linuxUnsupportedReason(capability: MonitorCapability): string =
     "Linux preload shim does not cover the full mutation surface yet"
   of mcapIpcConnect:
     "Linux preload shim does not yet hook connect(2) for IPC-breakaway detection"
+  of mcapObservedEnv:
+    "Linux preload shim does not yet hook getenv/sysctl/uname as observed inputs"
+  of mcapNonDeterminism:
+    "Linux preload shim does not yet hook entropy/time sources for non-determinism"
   else:
     "capability is not advertised by the selected Linux preload profile"
 

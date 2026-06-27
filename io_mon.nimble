@@ -140,6 +140,19 @@ task test, "Run the io-mon test suite":
   # mmap write-back is recorded as a content write the bare open does not convey).
   # macOS-only (no-op pass elsewhere).
   exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_round2_rb.nim"
+  # macOS ROUND-2 phase R-D: NON-FILE determinism inputs (round-2 break R10) — a
+  # build whose output depends on a non-file input that changed produces a
+  # byte-identical depfile (a false cache hit a file-monitor cannot see). Handled by
+  # a THREE-WAY split: env vars / sysctl / uname are OBSERVED DECLARED INPUTS
+  # (recorded, folded into the consumer's cache key — BuildXL observed-environment
+  # model — NO downgrade); getentropy / arc4random* / a /dev/urandom read are
+  # AUTO-DOWNGRADED (non-deterministic ⇒ always re-run); clock_gettime / gettimeofday
+  # / time / mach_absolute_time are RECORDED-not-downgraded (almost every program
+  # times a loop benignly — flagging that would re-run everything, the cardinal sin).
+  # The cardinal-sin guard (env/time stay mcComplete; ONLY randomness downgrades) is
+  # the key correctness property. Proven live against the r2_implicit corpus
+  # (minicc.c / readfile.c) plus platform-independent merge tests. macOS-only.
+  exec "nim c -r " & hooksPath & " --path:src tests/test_io_mon_macos_rd.nim"
   # T3c EndpointSecurity backend SKELETON (adversarial hardening #6, the residual
   # raw-syscall / XPC gap the in-process interpose backend structurally cannot
   # see): unit coverage for the pure, SDK-free logic the production ES backend is

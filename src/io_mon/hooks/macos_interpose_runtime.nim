@@ -47,6 +47,7 @@ proc repro_macos_get_sandbox_tools_dir*(): cstring
 #include <errno.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include <spawn.h>
@@ -313,7 +314,7 @@ int repro_macos_socket_describe(int fd, void *addr, unsigned int addrlen,
  * spawned child's start time, and a client can stamp a daemon peer's). Returns
  * microseconds-since-epoch, or 0 when the pid is gone / unqueryable (the merge
  * then degrades to bare-pid matching for that record — safe, never a false
- * downgrade). proc_pidinfo / arc4random are not hooked, so this is reentrancy-free.
+ * downgrade). proc_pidinfo is not hooked, so this is reentrancy-free.
  */
 unsigned long long repro_macos_proc_start_usec(int pid) {
   if (pid <= 0) return 0ull;
@@ -331,10 +332,23 @@ unsigned long long repro_macos_proc_start_usec(int pid) {
  * report whose `nonce` token does not match a nonce the shim actually recorded
  * for an observed connection, so a report cannot be fabricated for a connection
  * the monitor never saw. arc4random_buf is CSPRNG-grade and unguessable.
+ *
+ * ROUND-2 R-D — the shim now INTERPOSES arc4random_buf (entropy auto-downgrade).
+ * The shim's OWN nonce randomness here MUST NOT be recorded as the monitored
+ * program's non-determinism — that would self-downgrade EVERY capture with an IPC
+ * connect (the cardinal sin). We forward to the GENUINE libsystem arc4random_buf
+ * resolved via dlsym(RTLD_NEXT) (RTLD_NEXT searches images loaded AFTER the shim,
+ * so it skips the shim's own __interpose wrapper and reaches libsystem directly).
+ * The direct-call fallback runs only if the (never-observed) resolution fails.
  */
 unsigned long long repro_macos_random_u64(void) {
+  static void (*real_arc4random_buf)(void *, size_t) = NULL;
+  if (!real_arc4random_buf)
+    real_arc4random_buf =
+      (void (*)(void *, size_t))dlsym(RTLD_NEXT, "arc4random_buf");
   unsigned long long v = 0ull;
-  arc4random_buf(&v, sizeof v);
+  if (real_arc4random_buf) real_arc4random_buf(&v, sizeof v);
+  else arc4random_buf(&v, sizeof v);
   return v;
 }
 
@@ -593,6 +607,74 @@ int repro_macos_dyld_image_dep_path(void *mh_raw, void *out_raw,
   if (!S_ISREG(st.st_mode)) return 0;
   memcpy(out, path, plen + 1);
   return 1;
+}
+
+/* ROUND-2 R-D — CALLER ATTRIBUTION for the entropy auto-downgrade.
+ *
+ * The entropy hooks (arc4random*, getentropy) AUTO-DOWNGRADE, so a false positive
+ * is catastrophic. The original R-D premise — that an interpose hook sees ONLY the
+ * program's OWN direct entropy use because libsystem-internal randomness "never
+ * crosses an import stub" — is FALSE: on every process startup /usr/lib/libobjc,
+ * /usr/lib/swift/libswiftCore, /usr/lib/system/libsystem_malloc / _trace call
+ * arc4random_buf and /usr/lib/system/libcorecrypto calls getentropy, ALL
+ * cross-dylib (so they DO cross the interpose stub and WERE flagged). The result
+ * was that EVERY non-trivial real program — `cc`/`clang`/`ld`/`bash` — auto-
+ * downgraded to mcIncomplete (the CARDINAL SIN: every build re-runs).
+ *
+ * We attribute each entropy call to its CALLER (the return address the wrapper
+ * passes) and flag ONLY when the caller is in the monitored program's OWN MAIN
+ * EXECUTABLE — captured ONCE at init as the main image's __TEXT address range. A
+ * program's own arc4random() call (the case the milestone targets, e.g. a tool
+ * baking a random salt) lands in the main exe's __TEXT and is flagged; the
+ * libsystem/libobjc/libswift baseline lands in a system dylib's __TEXT and is NOT.
+ *
+ * WHY A RANGE COMPARE, NOT dladdr: these hooks fire while libobjc/libswift run
+ * their image INITIALISERS, i.e. UNDER dyld's loader lock. dladdr /
+ * _dyld_shared_cache_contains_path can re-enter dyld there (a documented loader-lock
+ * hazard), and they also allocate. A pure pointer-range compare touches no dyld, no
+ * malloc, no lock — it is safe at any lifecycle point and re-entry-free, and far
+ * cheaper per call. The narrower main-exe-only scope (a non-system toolchain DYLIB
+ * that itself draws entropy is not flagged) is an accepted, documented FALSE
+ * NEGATIVE — far cheaper than the cardinal-sin false positive the milestone ranks
+ * worst. */
+static const void *repro_main_text_start = NULL;
+static const void *repro_main_text_end = NULL;
+
+void repro_macos_capture_main_image(void) {
+  /* Find the MAIN EXECUTABLE (the one MH_EXECUTE image) and record its __TEXT
+   * address range. We must NOT use index 0: when the shim is injected via
+   * DYLD_INSERT_LIBRARIES, the INSERTED dylibs occupy the low image indices, so
+   * _dyld_get_image_header(0) is the SHIM, not the program (observed: capturing
+   * the shim's range, so the program's own entropy use was never attributed). The
+   * exactly-one MH_EXECUTE image is the program regardless of insertion order.
+   * mh->filetype sits at the same offset in mach_header / mach_header_64, so the
+   * 32-bit struct read is correct for arm64/arm64e. getsegmentdata returns the
+   * actual (slid) mapped address + size, so the range already accounts for ASLR.
+   * Called single-threaded at init (before runtime_ready), so it cannot race the
+   * hot-path readers. */
+  uint32_t count = _dyld_image_count();
+  for (uint32_t i = 0; i < count; i++) {
+    const struct mach_header *mh = _dyld_get_image_header(i);
+    if (mh == NULL || mh->filetype != MH_EXECUTE) continue;
+    unsigned long size = 0;
+    uint8_t *p = getsegmentdata((const struct mach_header_64 *)mh, "__TEXT",
+                                &size);
+    if (p != NULL && size > 0) {
+      repro_main_text_start = (const void *)p;
+      repro_main_text_end = (const void *)(p + size);
+    }
+    return;
+  }
+}
+
+/* Return 1 iff `retaddr` lies in the monitored program's main-executable __TEXT
+ * range (⇒ the program's OWN entropy use ⇒ flag). 0 otherwise (libsystem baseline,
+ * a toolchain dylib, or an unknown/unset range ⇒ do NOT flag — conservative
+ * against the cardinal sin). Pure compare; no dyld, no lock, no allocation. */
+int repro_macos_addr_in_program(void *retaddr) {
+  if (retaddr == NULL || repro_main_text_start == NULL) return 0;
+  return (retaddr >= repro_main_text_start && retaddr < repro_main_text_end)
+    ? 1 : 0;
 }
 
 int repro_macos_path_is_dir(char *path) {
@@ -1181,6 +1263,208 @@ int repro_macos_mach_service_recordable(char *name) {
   if (strncmp(name, "com.apple.", 10) == 0) return 0;
   return 1;
 }
+
+/* ===================================================================== *
+ * ROUND-2 R-D (break R10) — NON-FILE DETERMINISM INPUT forwarders.
+ *
+ * These reach the GENUINE libsystem entry for the env / sysctl / uname /
+ * entropy / time functions the shim now interposes, so the recording hook can
+ * forward the real call WITHOUT re-entering its own __interpose wrapper. All are
+ * INTERPOSE-ONLY (not body-patched), which is DELIBERATE: it means the hooks see
+ * ONLY the monitored program's OWN direct calls (an import-stub crossing), never
+ * a libsystem-INTERNAL one (a direct intra-dylib call) — so benign internal
+ * randomness (malloc cookies, stack-guard, mktemp, DNS query ids) and internal
+ * env/clock reads are NOT misattributed to the program. The genuine entry is
+ * resolved via dlsym(RTLD_NEXT, name): RTLD_NEXT searches images loaded AFTER the
+ * shim, skipping the shim's own wrapper and reaching libsystem. Each resolver is
+ * cached. Signatures use generic pointer / int / size types (matching Nim's
+ * emitted importc prototypes) so no struct headers are needed here (the caller
+ * passes the real struct pointers through as void pointers). A resolution failure
+ * returns a benign error (ENOSYS / 0), never the shim's own wrapper.
+ * ===================================================================== */
+
+/* getenv: walk `environ` directly (exactly what libc getenv does): allocation-
+ * and resolution-free, and inherently re-entry-free (never crosses an import
+ * stub). Reuses the existing environ-scan helper. Returns the value or NULL. The
+ * non-const `char *name` matches Nim's emitted importc prototype. */
+char *repro_macos_real_getenv(char *name) {
+  if (!name) return NULL;
+  return (char *)repro_macos_env_value(environ, name);
+}
+
+/* Resolve a symbol to its GENUINE libsystem entry via the shim-skipping image walk
+ * (`repro_macos_lookup_image_symbol`, the SAME resolver copyfile/bootstrap use),
+ * with a per-function RECURSION GUARD.
+ *
+ * Why NOT dlsym(RTLD_NEXT): the __DATA,__interpose tuple makes dyld rebind the
+ * symbol GLOBALLY, so dlsym(RTLD_NEXT, "uname") resolves to OUR OWN
+ * `repro_wrap_uname` wrapper rather than the genuine libsystem uname — calling the
+ * resolved pointer then re-enters the hook forever (observed: an infinite
+ * repro_hook_uname ↔ ct_macos_real_uname recursion → Nim stack-overflow). The image
+ * walk (NSLookupSymbolInImage on each non-shim image) returns the ACTUAL libsystem
+ * symbol address, not the interpose binding, so it never loops. The `symbol` arg is
+ * the MANGLED "_name" form.
+ *
+ * The thread-local `resolving` flag additionally breaks any re-entry DURING the
+ * one-time walk (should the resolver internally touch the function being resolved):
+ * the nested call takes the `fail` fallback once, then `fn` is cached and every
+ * later call forwards normally. */
+#define REPRO_RD_RESOLVE_GUARD(fnptr, type, symbol, fail) \
+  do { \
+    if (!(fnptr)) { \
+      static __thread int repro_rd_resolving = 0; \
+      if (repro_rd_resolving) { fail; } \
+      repro_rd_resolving = 1; \
+      (fnptr) = (type)repro_macos_lookup_image_symbol(symbol); \
+      repro_rd_resolving = 0; \
+    } \
+  } while (0)
+
+/* sysctlbyname / sysctl / gethostuuid / getentropy / gettimeofday forward via the
+ * RAW SYSCALL, NOT dlsym. This is ESSENTIAL: sysctlbyname is called CROSS-DYLIB by
+ * libdispatch (querying hw.ncpu/hw.activecpu for its thread pool) DURING libSystem
+ * init — which runs BEFORE our shim constructor, with `repro_monitor_runtime_ready`
+ * still 0, so the not-ready forward is exercised THEN. A dlsym there is unsafe
+ * (libdispatch is mid-init; observed SIGSEGV). The raw syscall is allocation- and
+ * dlsym-free and re-entry-free — exactly how the open/read/stat not-ready thunks
+ * already forward. The SYS_sysctlbyname trap takes the name's strlen as `namelen`. */
+int repro_macos_real_sysctlbyname_call(char *name, void *oldp,
+    size_t *oldlenp, void *newp, size_t newlen) {
+  return (int)syscall(SYS_sysctlbyname, name, name ? strlen(name) : (size_t)0,
+                      oldp, oldlenp, newp, newlen);
+}
+
+int repro_macos_real_sysctl_call(int *name, unsigned int namelen, void *oldp,
+    size_t *oldlenp, void *newp, size_t newlen) {
+  return (int)syscall(SYS_sysctl, name, namelen, oldp, oldlenp, newp, newlen);
+}
+
+/* uname has NO direct syscall on Darwin (it is implemented via sysctl); it is not
+ * called during early libdispatch init, so the guarded dlsym is safe here. */
+int repro_macos_real_uname_call(void *buf) {
+  static int (*fn)(void *) = NULL;
+  REPRO_RD_RESOLVE_GUARD(fn, int (*)(void *), "_uname",
+    { errno = ENOSYS; return -1; });
+  if (!fn) { errno = ENOSYS; return -1; }
+  return fn(buf);
+}
+
+/* gethostname has no direct syscall (implemented via sysctl KERN_HOSTNAME); not an
+ * early-init function, so the guarded dlsym is safe. */
+int repro_macos_real_gethostname_call(char *name, size_t namelen) {
+  static int (*fn)(char *, size_t) = NULL;
+  REPRO_RD_RESOLVE_GUARD(fn, int (*)(char *, size_t), "_gethostname",
+    { errno = ENOSYS; return -1; });
+  if (!fn) { errno = ENOSYS; return -1; }
+  return fn(name, namelen);
+}
+
+int repro_macos_real_gethostuuid_call(void *uuid, void *timeout) {
+  return (int)syscall(SYS_gethostuuid, uuid, timeout);
+}
+
+/* Build a stable identity string ("mib:6.5") for the integer-MIB sysctl(2) form,
+ * whose name is an array of `namelen` ints rather than a string. The MIB integers
+ * uniquely identify the queried system parameter, so the consumer folds the value
+ * behind this key into its cache key. Returns the byte length written (excluding
+ * NUL). Bounded by `outlen`. */
+int repro_macos_sysctl_mib_describe(int *name, unsigned int namelen,
+                                    void *out_raw, size_t outlen) {
+  char *out = (char *)out_raw;
+  if (!out || outlen < 5) return 0;
+  size_t pos = 0;
+  const char *prefix = "mib:";
+  for (const char *p = prefix; *p && pos + 1 < outlen; p++) out[pos++] = *p;
+  for (unsigned int i = 0; name && i < namelen && pos + 1 < outlen; i++) {
+    if (i > 0 && pos + 1 < outlen) out[pos++] = '.';
+    char num[16];
+    int n = snprintf(num, sizeof num, "%d", name[i]);
+    for (int j = 0; j < n && pos + 1 < outlen; j++) out[pos++] = num[j];
+  }
+  out[pos] = '\0';
+  return (int)pos;
+}
+
+/* getentropy forwards via the raw SYS_getentropy syscall (dlsym-free; the kernel
+ * entropy source). arc4random / stack-guard underlie this but call it intra-dylib. */
+int repro_macos_real_getentropy_call(void *buf, size_t len) {
+  return (int)syscall(SYS_getentropy, buf, len);
+}
+
+/* arc4random / arc4random_buf / arc4random_uniform forward via the raw
+ * SYS_getentropy syscall (the same kernel CSPRNG source arc4random itself draws
+ * from), NOT dlsym. arc4random is called CROSS-DYLIB at process teardown by
+ * libSystem; a dlsym (or its thread-local resolution guard) at that late teardown
+ * point ABORTS (observed SIGABRT — TLS/dyld are being torn down). The raw syscall
+ * is dlsym-free, TLS-free and re-entry-free, so it is safe at any lifecycle point.
+ * getentropy caps at 256 bytes per call, so arc4random_buf loops. */
+unsigned int repro_macos_real_arc4random_call(void) {
+  unsigned int v = 0u;
+  (void)syscall(SYS_getentropy, &v, sizeof v);
+  return v;
+}
+
+void repro_macos_real_arc4random_buf_call(void *buf, size_t n) {
+  unsigned char *p = (unsigned char *)buf;
+  while (n > 0) {
+    size_t chunk = n > 256 ? 256 : n;
+    if (syscall(SYS_getentropy, p, chunk) != 0) break;  /* best-effort */
+    p += chunk;
+    n -= chunk;
+  }
+}
+
+unsigned int repro_macos_real_arc4random_uniform_call(unsigned int upper) {
+  if (upper < 2u) return 0u;
+  /* Rejection sampling — matches arc4random_uniform's unbiased semantics. */
+  unsigned int min = (0u - upper) % upper;  /* == 2^32 mod upper */
+  unsigned int v = 0u;
+  do {
+    if (syscall(SYS_getentropy, &v, sizeof v) != 0) { v = 0u; break; }
+  } while (v < min);
+  return v % upper;
+}
+
+int repro_macos_real_clock_gettime_call(int clk, void *ts) {
+  static int (*fn)(int, void *) = NULL;
+  REPRO_RD_RESOLVE_GUARD(fn, int (*)(int, void *), "_clock_gettime",
+    { errno = ENOSYS; return -1; });
+  if (!fn) { errno = ENOSYS; return -1; }
+  return fn(clk, ts);
+}
+
+/* gettimeofday forwards via the genuine libc gettimeofday (image-walk resolved,
+ * like clock_gettime/time) — NOT the raw SYS_gettimeofday syscall. The raw syscall
+ * is UNSAFE on macOS arm64: the kernel's gettimeofday trap returns the seconds in
+ * the result register (a commpage-fast-path ABI the libc stub unpacks), so a bare
+ * `syscall(SYS_gettimeofday, …)` mis-signals (returns -1/EINVAL) and corrupts the
+ * caller's stack frame (observed: a plain gettimeofday loop SIGSEGVs the caller —
+ * e.g. bash's seedrand32). The genuine libc entry handles the commpage ABI. */
+int repro_macos_real_gettimeofday_call(void *tp, void *tzp) {
+  static int (*fn)(void *, void *) = NULL;
+  REPRO_RD_RESOLVE_GUARD(fn, int (*)(void *, void *), "_gettimeofday",
+    { errno = ENOSYS; return -1; });
+  if (!fn) { errno = ENOSYS; return -1; }
+  return fn(tp, tzp);
+}
+
+long long repro_macos_real_time_call(void *tloc) {
+  static long long (*fn)(void *) = NULL;
+  REPRO_RD_RESOLVE_GUARD(fn, long long (*)(void *), "_time", { return -1; });
+  if (!fn) return -1;
+  return fn(tloc);
+}
+
+/* NOTE on mach_absolute_time: it is DELIBERATELY NOT interposed. libdispatch calls
+ * it CROSS-DYLIB during early libSystem init (before our constructor), so a
+ * not-ready forward would be exercised then; it has no raw syscall (it is a
+ * commpage / CNTVCT read), so a safe early-init forward is impractical, and
+ * interposing it destabilises libdispatch. It is also a MONOTONIC TICK COUNTER, not
+ * a wall clock — a relative interval value almost never baked into a build's output
+ * as a determinism input — so the gettimeofday / time / clock_gettime wall-clock
+ * signals cover the surface that matters. This is a documented residual (R-D). */
+
+#undef REPRO_RD_RESOLVE_GUARD
 """.}
 
 type
@@ -1573,3 +1857,102 @@ proc ct_macos_dyld_image_dep_path*(mh: pointer; outBuf: pointer;
   proc imageDepPath(mh: pointer; outBuf: pointer; outLen: csize_t): cint
     {.importc: "repro_macos_dyld_image_dep_path", cdecl.}
   imageDepPath(mh, outBuf, outLen)
+
+# --- ROUND-2 R-D (break R10) non-file-determinism genuine-entry forwarders ----
+# Each forwards a hooked env/sysctl/uname/entropy/time call to the GENUINE
+# libsystem entry (resolved via dlsym(RTLD_NEXT), shim-skipping) so the recording
+# hook never re-enters its own __interpose wrapper. See the C section.
+
+proc ct_macos_real_getenv*(name: cstring): cstring =
+  ## Genuine getenv (environ walk; allocation- and re-entry-free).
+  proc impl(name: cstring): cstring {.importc: "repro_macos_real_getenv", cdecl.}
+  impl(name)
+
+proc ct_macos_real_sysctlbyname*(name: cstring; oldp: pointer;
+    oldlenp: ptr csize_t; newp: pointer; newlen: csize_t): cint =
+  proc impl(name: cstring; oldp: pointer; oldlenp: ptr csize_t; newp: pointer;
+      newlen: csize_t): cint
+    {.importc: "repro_macos_real_sysctlbyname_call", cdecl.}
+  impl(name, oldp, oldlenp, newp, newlen)
+
+proc ct_macos_real_sysctl*(name: ptr cint; namelen: cuint; oldp: pointer;
+    oldlenp: ptr csize_t; newp: pointer; newlen: csize_t): cint =
+  proc impl(name: ptr cint; namelen: cuint; oldp: pointer; oldlenp: ptr csize_t;
+      newp: pointer; newlen: csize_t): cint
+    {.importc: "repro_macos_real_sysctl_call", cdecl.}
+  impl(name, namelen, oldp, oldlenp, newp, newlen)
+
+proc ct_macos_real_uname*(buf: pointer): cint =
+  proc impl(buf: pointer): cint {.importc: "repro_macos_real_uname_call", cdecl.}
+  impl(buf)
+
+proc ct_macos_real_gethostname*(name: cstring; namelen: csize_t): cint =
+  proc impl(name: cstring; namelen: csize_t): cint
+    {.importc: "repro_macos_real_gethostname_call", cdecl.}
+  impl(name, namelen)
+
+proc ct_macos_real_gethostuuid*(uuid: pointer; timeout: pointer): cint =
+  proc impl(uuid: pointer; timeout: pointer): cint
+    {.importc: "repro_macos_real_gethostuuid_call", cdecl.}
+  impl(uuid, timeout)
+
+proc ct_macos_sysctl_mib_describe*(name: ptr cint; namelen: cuint;
+    outBuf: pointer; outLen: csize_t): cint =
+  ## Build a stable "mib:6.5" identity for the integer-MIB sysctl(2) form.
+  proc impl(name: ptr cint; namelen: cuint; outBuf: pointer; outLen: csize_t): cint
+    {.importc: "repro_macos_sysctl_mib_describe", cdecl.}
+  impl(name, namelen, outBuf, outLen)
+
+proc ct_macos_capture_main_image*() =
+  ## ROUND-2 R-D — capture the main executable's __TEXT range ONCE at init for the
+  ## entropy caller-attribution (see ct_macos_addr_in_program). Single-threaded at
+  ## shim init, before runtime_ready.
+  proc impl() {.importc: "repro_macos_capture_main_image", cdecl.}
+  impl()
+
+proc ct_macos_addr_in_program*(caller: pointer): bool =
+  ## ROUND-2 R-D — CALLER ATTRIBUTION for the entropy auto-downgrade. True iff
+  ## `caller` (the return address captured at an entropy hook) is in the monitored
+  ## program's OWN main-executable __TEXT — the program's direct entropy use (to
+  ## flag). False for the benign libsystem/libobjc/libswift baseline or an unknown
+  ## caller (do NOT flag — conservative against the cardinal sin). A pure pointer
+  ## compare: safe under dyld's loader lock where dladdr would crash. See the C note.
+  proc impl(caller: pointer): cint
+    {.importc: "repro_macos_addr_in_program", cdecl.}
+  impl(caller) != 0
+
+proc ct_macos_real_getentropy*(buf: pointer; len: csize_t): cint =
+  proc impl(buf: pointer; len: csize_t): cint
+    {.importc: "repro_macos_real_getentropy_call", cdecl.}
+  impl(buf, len)
+
+proc ct_macos_real_arc4random*(): cuint =
+  proc impl(): cuint {.importc: "repro_macos_real_arc4random_call", cdecl.}
+  impl()
+
+proc ct_macos_real_arc4random_buf*(buf: pointer; n: csize_t) =
+  proc impl(buf: pointer; n: csize_t)
+    {.importc: "repro_macos_real_arc4random_buf_call", cdecl.}
+  impl(buf, n)
+
+proc ct_macos_real_arc4random_uniform*(upper: cuint): cuint =
+  proc impl(upper: cuint): cuint
+    {.importc: "repro_macos_real_arc4random_uniform_call", cdecl.}
+  impl(upper)
+
+proc ct_macos_real_clock_gettime*(clk: cint; ts: pointer): cint =
+  proc impl(clk: cint; ts: pointer): cint
+    {.importc: "repro_macos_real_clock_gettime_call", cdecl.}
+  impl(clk, ts)
+
+proc ct_macos_real_gettimeofday*(tp: pointer; tzp: pointer): cint =
+  proc impl(tp: pointer; tzp: pointer): cint
+    {.importc: "repro_macos_real_gettimeofday_call", cdecl.}
+  impl(tp, tzp)
+
+proc ct_macos_real_time*(tloc: pointer): clonglong =
+  proc impl(tloc: pointer): clonglong
+    {.importc: "repro_macos_real_time_call", cdecl.}
+  impl(tloc)
+# NOTE: mach_absolute_time is intentionally NOT hooked — see the C forwarder note
+# (libdispatch early-init hazard + it is a monotonic counter, not a wall clock).

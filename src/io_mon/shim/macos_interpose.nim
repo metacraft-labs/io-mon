@@ -1,7 +1,7 @@
 when not defined(macosx):
   {.error: "repro_monitor_shim/macos_interpose is macOS-only".}
 
-import std/[locks, os, strutils, tables]
+import std/[locks, os, sets, strutils, tables]
 from io_mon/paths import extendedPath
 
 import io_mon/hooks/macos_interpose_runtime
@@ -19,13 +19,20 @@ import io_mon/writer
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/attr.h>
 #include <sys/clonefile.h>
 #include <sys/mman.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
+#include <time.h>
+#include <mach/mach_time.h>
 #include <unistd.h>
 
 static int repro_monitor_get_errno(void) {
@@ -60,6 +67,12 @@ const
   # (a crude but O(1)-amortised, memory-bounded eviction — the working set of a
   # build's probed inputs is far below this).
   CanonicalCacheCap = 8192
+  # ROUND-2 R-D — cap on the per-process observed-input dedup set
+  # (`seenObservedInputs`). getenv/clock_gettime are HOT; the dedup records each
+  # DISTINCT key once, so the set's working size is tiny (a few dozen env-var
+  # names + a handful of sysctl/clock sources). Cleared wholesale when exceeded —
+  # the same O(1)-amortised, memory-bounded eviction as CanonicalCacheCap.
+  ObservedInputCacheCap = 8192
   # ROUND-2 R9 — mmap classification constants (<sys/mman.h>, stable Darwin ABI).
   # A MAP_SHARED|PROT_WRITE FILE mapping changes the file's CONTENT with NO
   # write(2) syscall (ld64 writes its output executable this way; r2_mmap probeC),
@@ -86,6 +99,15 @@ var
   # (a per-component lstat chain) every time. See `canonicalPathFor`.
   canonicalLock: Lock
   canonicalCache = initTable[string, string]()
+  # ROUND-2 R-D (break R10) — per-process DEDUP set for the observed non-file
+  # determinism inputs (env-var / sysctl / uname names, entropy sources, time
+  # sources). getenv is HOT (a build re-reads PATH/HOME/etc thousands of times),
+  # so the recorder records each DISTINCT key once and bails on a repeat — bounding
+  # the perf. Keys are category-prefixed ("env:NAME", "sysctl:NAME", "nd:SOURCE",
+  # "time:SOURCE") so one structure dedupes all four categories. Guarded by
+  # `observedLock`; cleared wholesale at ObservedInputCacheCap.
+  observedLock: Lock
+  seenObservedInputs = initHashSet[string]()
   fragmentDir: string
   nextProcessSeq: uint64 = 0
   fdPaths = initTable[cint, string]()
@@ -473,7 +495,15 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32;
     if peerStart != 0:
       d.add " peerstart=" & $peerStart
   d.add runIdToken()
-  d.add " nonce=" & $ct_macos_random_u64()
+  # ROUND-2 R-D — the shim's OWN nonce randomness must NEVER be recorded as the
+  # program's non-determinism (it would self-downgrade this capture — the cardinal
+  # sin). repro_macos_random_u64 already resolves the genuine arc4random_buf
+  # (bypassing the interpose wrapper); muting here is the belt-and-suspenders guard
+  # against the wrapper being hit during dlsym's one-time internal resolution.
+  inc disabled
+  let nonce = ct_macos_random_u64()
+  dec disabled
+  d.add " nonce=" & $nonce
   record.detail = d
   emitRecord(record)
 
@@ -516,7 +546,11 @@ proc recordMachLookup(serviceName: cstring; callResult: cint) {.raises: [].} =
   # documents that the Mach peer pid is not obtainable from the send port.
   var d = "connect mach-service peer=unknown service=" & $serviceName
   d.add runIdToken()
-  d.add " nonce=" & $ct_macos_random_u64()
+  # ROUND-2 R-D — mute the shim's own nonce randomness (see recordIpcConnect).
+  inc disabled
+  let nonce = ct_macos_random_u64()
+  dec disabled
+  d.add " nonce=" & $nonce
   record.detail = d
   emitRecord(record)
 
@@ -585,6 +619,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
     initLock(fdLock)
     initLock(dirLock)
     initLock(canonicalLock)   # ROUND-2 R4 — guards the realpath memo
+    initLock(observedLock)    # ROUND-2 R-D — guards the observed-input dedup set
     locksReady = true
   acquire(initLockVar)
   defer: release(initLockVar)
@@ -610,6 +645,11 @@ proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
   # realpath here reaches genuine libsystem (body-patch is not yet installed and the
   # interpose wrappers passthrough while runtime_ready is 0), so it cannot recurse.
   ct_macos_capture_shim_image()
+  # ROUND-2 R-D — capture the main executable's __TEXT range NOW (single-threaded,
+  # before runtime_ready) so the entropy hooks can attribute a caller to the
+  # program's OWN code by a pure pointer-range compare — the crash-safe
+  # cardinal-sin guard (see ct_macos_addr_in_program).
+  ct_macos_capture_main_image()
   initialized = true
   recordProcessStart()
   result = 0
@@ -814,6 +854,121 @@ const
   # double-counting (findings doc §"Coverage wins").
   CopyfileClone = 1'u32 shl 24
   CopyfileCloneForce = 1'u32 shl 25
+
+# --- ROUND-2 R-D (break R10) non-file determinism recorders -----------------
+#
+# THE THREE-WAY SPLIT (the crux — different non-file inputs need DIFFERENT
+# handling, or we cause the cardinal sin of a false downgrade that re-runs every
+# build). All four categories route through ONE shared per-process DEDUP
+# (`recordObservedOnce`) so a HOT source (getenv, clock_gettime) records each
+# DISTINCT key ONCE — cheap, bounded, muted:
+#   1. env vars / sysctl / uname → OBSERVED DECLARED INPUTS (record, do NOT
+#      downgrade). The consumer folds the queried value into its cache key
+#      (BuildXL observed-environment model). Closes SOURCE_DATE_EPOCH / $CFLAGS /
+#      hw.ncpu / uname PRECISELY — a benign PATH read just adds PATH to the key.
+#   2. randomness (getentropy/arc4random*//dev/urandom) → AUTO-DOWNGRADE
+#      (non-deterministic ⇒ always re-run). Rare in builds; low false-positive
+#      (interpose-only ⇒ only the program's OWN direct entropy use is seen).
+#   3. wall clock (clock_gettime/gettimeofday/time/mach_absolute_time) → RECORD but
+#      do NOT auto-downgrade (almost every program times a loop benignly — flagging
+#      that would re-run everything, the cardinal sin).
+
+const
+  # The shim's OWN monitoring / injection environment variables are NOT build
+  # inputs (they are control vars the launcher sets per-run). Recording them as
+  # observed inputs would fold a per-run injection path into the consumer's cache
+  # key, busting the cache on EVERY run — effectively the cardinal sin via the
+  # consumer. We therefore DENYLIST them (BuildXL likewise excludes its sandbox's
+  # own control variables). A program legitimately reading DYLD_INSERT_LIBRARIES is
+  # excluded too (our injection must never leak into the build's cache key).
+  ObservedEnvDenylistPrefixes = [
+    "REPRO_MONITOR_", "CT_SANDBOX_TOOLS_DIR", "IO_MON_",
+    "DYLD_INSERT_LIBRARIES"]
+
+proc isDenylistedEnvName(name: string): bool {.raises: [].} =
+  for prefix in ObservedEnvDenylistPrefixes:
+    if name.startsWith(prefix):
+      return true
+  false
+
+proc recordObservedOnce(kind: MonitorRecordKind; obs: MonitorObservationKind;
+    dedupKey, namePath, detail: string) {.raises: [].} =
+  ## Shared per-process DEDUP + emit for the R-D records (DRY: one builder for all
+  ## four categories). Records `dedupKey` ONCE per process; a repeat bails before
+  ## emit (bounding the cost of a HOT source like getenv). The dedup set is bounded
+  ## (ObservedInputCacheCap, cleared wholesale). The dedup lookup is done OUTSIDE
+  ## emit so the emit's own muting does not interfere.
+  if not initialized or fragmentDir.len == 0 or disabled > 0:
+    return
+  var fresh = false
+  acquire(observedLock)
+  if dedupKey notin seenObservedInputs:
+    if seenObservedInputs.len >= ObservedInputCacheCap:
+      seenObservedInputs.clear()
+    seenObservedInputs.incl dedupKey
+    fresh = true
+  release(observedLock)
+  if not fresh:
+    return
+  var record = baseRecord(kind, obs)
+  record.path = namePath
+  record.detail = detail
+  emitRecord(record)
+
+proc recordEnvRead(name: cstring) {.raises: [].} =
+  ## Record a getenv query as an OBSERVED DECLARED INPUT (do NOT downgrade). The
+  ## env-var NAME is recorded (deduped) so the CONSUMER folds the var's VALUE (or
+  ## its absence) into the cache key — closing the SOURCE_DATE_EPOCH / $CFLAGS
+  ## breaks precisely without over-re-running. The shim's own injection vars are
+  ## denylisted (see ObservedEnvDenylistPrefixes).
+  if name == nil or name[0] == '\0':
+    return
+  let n = $name
+  if isDenylistedEnvName(n):
+    return
+  recordObservedOnce(mrEnvRead, moEnvRead, "env:" & n, n, "env-read")
+
+proc recordSysctlRead(name: string) {.raises: [].} =
+  ## Record a sysctl/uname/gethostname/gethostuuid query as an OBSERVED DECLARED
+  ## INPUT (do NOT downgrade). `name` is the sysctl name ("hw.ncpu"), the integer
+  ## MIB identity ("mib:6.5"), or the source ("uname"/"gethostname"/"gethostuuid").
+  if name.len == 0:
+    return
+  recordObservedOnce(mrSysctlRead, moSysctlRead, "sysctl:" & name, name,
+    "sysctl-read")
+
+proc recordNonDeterministic(source: string) {.raises: [].} =
+  ## Flag the program's consumption of ENTROPY (getentropy/arc4random*/a
+  ## /dev/urandom open) as NON-DETERMINISTIC ⇒ the merge AUTO-DOWNGRADES to
+  ## mcIncomplete (always re-run; never a cache hit). Deduped per process (one flag
+  ## per distinct source suffices for the downgrade).
+  if source.len == 0:
+    return
+  recordObservedOnce(mrNonDeterministic, moNonDeterministic, "nd:" & source,
+    source, "non-deterministic entropy source")
+
+proc recordTimeRead(source: string) {.raises: [].} =
+  ## Record a WALL-CLOCK read (clock_gettime/gettimeofday/time/mach_absolute_time)
+  ## as a marker but DO NOT downgrade — almost every program reads a clock for
+  ## benign timing whose value never reaches the output, so auto-downgrading would
+  ## re-run everything (the cardinal sin). Deduped per process per source.
+  if source.len == 0:
+    return
+  recordObservedOnce(mrTimeRead, moTimeRead, "time:" & source, source, "time-read")
+
+# ROUND-2 R-D CARDINAL-SIN FIX — a /dev/urandom / /dev/random OPEN is DELIBERATELY
+# NOT auto-downgraded. The original R-D flagged it non-deterministic on the premise
+# that opening it signals intent to consume entropy. Measured against a real
+# toolchain that premise is unsafe: a normal `cc`/`clang` compile opens /dev/urandom
+# via `mktemp` (coreutils) to pick a RANDOM TEMP-FILE NAME — a build intermediate
+# whose name never reaches the output — so auto-downgrading on a /dev/urandom open
+# would re-run essentially every build that uses a temp file (the cardinal sin).
+# Caller-image attribution does not help here (mktemp is a non-system /nix/store
+# binary opening it from its OWN code). The /dev/urandom open/read is STILL captured
+# as a normal file dependency; we just do not treat it as a non-determinism
+# downgrade. A program that embeds /dev/urandom bytes in its output is therefore a
+# documented FALSE NEGATIVE (it should use getentropy/arc4random, which ARE flagged,
+# or declare the dependency) — far cheaper than the cardinal-sin false positive.
 
 proc repro_hook_open*(path: cstring; flags, mode: cint): cint {.exportc, cdecl, dynlib.} =
   if not initialized or disabled > 0:
@@ -1256,6 +1411,177 @@ proc repro_hook_xpc_connection_create_mach_service*(name: cstring;
   result = ct_macos_real_xpc_create_mach_service(name, targetq, flags)
   if result != nil and (flags and XpcMachServiceListener) == 0:
     recordMachLookup(name, 0)
+
+# --- ROUND-2 R-D (break R10) non-file determinism hooks -------------------
+#
+# All INTERPOSE-ONLY (NOT body-patched). This is DELIBERATE and is the heart of
+# the cardinal-sin guard for the randomness arm: interpose sees ONLY the
+# program's OWN direct call (an import-stub crossing), never a libsystem-INTERNAL
+# one. So malloc's internal arc4random (zone cookies), stack-guard setup, mktemp,
+# and DNS query-id randomness — all direct intra-dylib calls inside libsystem —
+# are NEVER misattributed to the program. Each hook forwards via the genuine
+# libsystem entry (ct_macos_real_*, resolved shim-skipping) so it never re-enters
+# its own wrapper, then routes through the deduped recorder. errno is preserved
+# around the recording for the functions that report via errno.
+
+proc repro_hook_getenv*(name: cstring): cstring {.exportc, cdecl, dynlib.} =
+  ## Observed declared input (env). Forwards via the genuine getenv (environ walk)
+  ## then records the queried NAME (deduped, denylisted). Does NOT downgrade.
+  if not initialized or disabled > 0:
+    return ct_macos_real_getenv(name)
+  result = ct_macos_real_getenv(name)
+  let savedErrno = getErrno()
+  recordEnvRead(name)
+  setErrno(savedErrno)
+
+proc repro_hook_sysctlbyname*(name: cstring; oldp: pointer; oldlenp: ptr csize_t;
+    newp: pointer; newlen: csize_t): cint {.exportc, cdecl, dynlib.} =
+  ## Observed declared input (sysctl by name, e.g. "hw.ncpu"). Does NOT downgrade.
+  if not initialized or disabled > 0:
+    return ct_macos_real_sysctlbyname(name, oldp, oldlenp, newp, newlen)
+  result = ct_macos_real_sysctlbyname(name, oldp, oldlenp, newp, newlen)
+  let savedErrno = getErrno()
+  if name != nil:
+    recordSysctlRead($name)
+  setErrno(savedErrno)
+
+proc repro_hook_sysctl*(name: ptr cint; namelen: cuint; oldp: pointer;
+    oldlenp: ptr csize_t; newp: pointer; newlen: csize_t): cint
+    {.exportc, cdecl, dynlib.} =
+  ## Observed declared input (integer-MIB sysctl form). The MIB ints are rendered
+  ## to a stable "mib:6.5" identity for the cache key. Does NOT downgrade.
+  if not initialized or disabled > 0:
+    return ct_macos_real_sysctl(name, namelen, oldp, oldlenp, newp, newlen)
+  result = ct_macos_real_sysctl(name, namelen, oldp, oldlenp, newp, newlen)
+  let savedErrno = getErrno()
+  var buf: array[128, char]
+  if ct_macos_sysctl_mib_describe(name, namelen, addr buf[0],
+      csize_t(buf.len)) > 0:
+    recordSysctlRead($cast[cstring](addr buf[0]))
+  setErrno(savedErrno)
+
+proc repro_hook_uname*(buf: pointer): cint {.exportc, cdecl, dynlib.} =
+  ## Observed declared input (machine config). Does NOT downgrade.
+  if not initialized or disabled > 0:
+    return ct_macos_real_uname(buf)
+  result = ct_macos_real_uname(buf)
+  let savedErrno = getErrno()
+  recordSysctlRead("uname")
+  setErrno(savedErrno)
+
+proc repro_hook_gethostname*(name: cstring; namelen: csize_t): cint
+    {.exportc, cdecl, dynlib.} =
+  ## Observed declared input (host identity). Does NOT downgrade.
+  if not initialized or disabled > 0:
+    return ct_macos_real_gethostname(name, namelen)
+  result = ct_macos_real_gethostname(name, namelen)
+  let savedErrno = getErrno()
+  recordSysctlRead("gethostname")
+  setErrno(savedErrno)
+
+proc repro_hook_gethostuuid*(uuid: pointer; timeout: pointer): cint
+    {.exportc, cdecl, dynlib.} =
+  ## Observed declared input (host uuid). Does NOT downgrade.
+  if not initialized or disabled > 0:
+    return ct_macos_real_gethostuuid(uuid, timeout)
+  result = ct_macos_real_gethostuuid(uuid, timeout)
+  let savedErrno = getErrno()
+  recordSysctlRead("gethostuuid")
+  setErrno(savedErrno)
+
+# ROUND-2 R-D CARDINAL-SIN FIX — the entropy hooks AUTO-DOWNGRADE, so they are the
+# one place a false positive is catastrophic. The original "interpose only sees the
+# program's own call" premise was WRONG: /usr/lib/libobjc, /usr/lib/swift,
+# /usr/lib/system/libsystem_malloc / _trace call arc4random_buf and
+# /usr/lib/system/libcorecrypto calls getentropy on EVERY process startup, all
+# cross-dylib (so they DO cross the interpose stub) — which downgraded every real
+# program (cc/clang/ld/bash → mcIncomplete, every build re-runs). We therefore
+# ATTRIBUTE each entropy call to its CALLER (the `caller` return address the C
+# wrapper passes via __builtin_return_address) and flag ONLY when the caller lies in
+# the program's OWN main-executable __TEXT range (captured at init). The benign
+# libsystem/libobjc/libswift baseline lands in a system dylib and is excluded; a
+# program's OWN direct arc4random/getentropy still downgrades. The check is a pure
+# pointer-range compare (ct_macos_addr_in_program) — these hooks fire UNDER dyld's
+# loader lock during image init, where a dladdr-based check would risk re-entering
+# dyld; a range compare touches no dyld/malloc/lock and is re-entry-safe.
+
+proc repro_hook_getentropy*(buf: pointer; len: csize_t; caller: pointer): cint
+    {.exportc, cdecl, dynlib.} =
+  ## NON-DETERMINISM (entropy) ⇒ AUTO-DOWNGRADE, but ONLY for the program's own use
+  ## (caller in the program's main-exe __TEXT). Forward genuine, conditionally flag.
+  if not initialized or disabled > 0:
+    return ct_macos_real_getentropy(buf, len)
+  result = ct_macos_real_getentropy(buf, len)
+  let savedErrno = getErrno()
+  if ct_macos_addr_in_program(caller):
+    recordNonDeterministic("getentropy")
+  setErrno(savedErrno)
+
+proc repro_hook_arc4random*(caller: pointer): cuint {.exportc, cdecl, dynlib.} =
+  ## NON-DETERMINISM (entropy) ⇒ AUTO-DOWNGRADE for the program's own use only.
+  if not initialized or disabled > 0:
+    return ct_macos_real_arc4random()
+  result = ct_macos_real_arc4random()
+  if ct_macos_addr_in_program(caller):
+    recordNonDeterministic("arc4random")
+
+proc repro_hook_arc4random_buf*(buf: pointer; n: csize_t; caller: pointer)
+    {.exportc, cdecl, dynlib.} =
+  ## NON-DETERMINISM (entropy) ⇒ AUTO-DOWNGRADE for the program's own use only. The
+  ## shim's OWN nonce randomness bypasses this wrapper (repro_macos_random_u64
+  ## resolves the genuine entry); the libsystem/libobjc/libswift startup baseline is
+  ## excluded by the caller-image check (its caller is in /usr/lib).
+  if not initialized or disabled > 0:
+    ct_macos_real_arc4random_buf(buf, n)
+    return
+  ct_macos_real_arc4random_buf(buf, n)
+  if ct_macos_addr_in_program(caller):
+    recordNonDeterministic("arc4random_buf")
+
+proc repro_hook_arc4random_uniform*(upper: cuint; caller: pointer): cuint
+    {.exportc, cdecl, dynlib.} =
+  ## NON-DETERMINISM (entropy) ⇒ AUTO-DOWNGRADE for the program's own use only.
+  if not initialized or disabled > 0:
+    return ct_macos_real_arc4random_uniform(upper)
+  result = ct_macos_real_arc4random_uniform(upper)
+  if ct_macos_addr_in_program(caller):
+    recordNonDeterministic("arc4random_uniform")
+
+proc repro_hook_clock_gettime*(clk: cint; ts: pointer): cint
+    {.exportc, cdecl, dynlib.} =
+  ## WALL-CLOCK read — RECORD but do NOT downgrade (the cardinal-sin guard: almost
+  ## every program times a loop benignly). The shim's own monoNowNs clock reads run
+  ## under `disabled` (during emit), so they forward without recording.
+  if not initialized or disabled > 0:
+    return ct_macos_real_clock_gettime(clk, ts)
+  result = ct_macos_real_clock_gettime(clk, ts)
+  let savedErrno = getErrno()
+  recordTimeRead("clock_gettime")
+  setErrno(savedErrno)
+
+proc repro_hook_gettimeofday*(tp: pointer; tzp: pointer): cint
+    {.exportc, cdecl, dynlib.} =
+  ## WALL-CLOCK read — RECORD but do NOT downgrade.
+  if not initialized or disabled > 0:
+    return ct_macos_real_gettimeofday(tp, tzp)
+  result = ct_macos_real_gettimeofday(tp, tzp)
+  let savedErrno = getErrno()
+  recordTimeRead("gettimeofday")
+  setErrno(savedErrno)
+
+proc repro_hook_time*(tloc: pointer): clonglong {.exportc, cdecl, dynlib.} =
+  ## WALL-CLOCK read — RECORD but do NOT downgrade.
+  if not initialized or disabled > 0:
+    return ct_macos_real_time(tloc)
+  result = ct_macos_real_time(tloc)
+  let savedErrno = getErrno()
+  recordTimeRead("time")
+  setErrno(savedErrno)
+
+# NOTE: mach_absolute_time is intentionally NOT hooked — libdispatch calls it
+# cross-dylib during early libSystem init (a not-ready forward hazard with no safe
+# raw-syscall path), and it is a monotonic tick counter rather than a wall clock,
+# so it is almost never baked into a build's output. See the runtime C note (R-D).
 
 # --- Unified spawn-family hooks ------------------------------------------
 #
@@ -1844,6 +2170,27 @@ extern kern_return_t repro_macos_real_bootstrap_look_up_call(mach_port_t bp,
     char *name, mach_port_t *sp);
 extern void *repro_macos_real_xpc_create_mach_service_call(char *name,
     void *targetq, unsigned long long flags);
+/* ROUND-2 R-D: genuine-entry forwarders for the non-file-determinism hooks
+ * (defined in the macos_interpose_runtime TU). The not-ready interpose thunks
+ * forward through these before the recording runtime is live; the ready thunks
+ * branch to the recording repro_hook_* (which forward through these too, so the
+ * recording hook never re-enters its own wrapper). */
+extern char *repro_macos_real_getenv(const char *name);
+extern int repro_macos_real_sysctlbyname_call(const char *name, void *oldp,
+    size_t *oldlenp, void *newp, size_t newlen);
+extern int repro_macos_real_sysctl_call(int *name, unsigned int namelen,
+    void *oldp, size_t *oldlenp, void *newp, size_t newlen);
+extern int repro_macos_real_uname_call(void *buf);
+extern int repro_macos_real_gethostname_call(char *name, size_t namelen);
+extern int repro_macos_real_gethostuuid_call(unsigned char *uuid,
+    const void *timeout);
+extern int repro_macos_real_getentropy_call(void *buf, size_t len);
+extern unsigned int repro_macos_real_arc4random_call(void);
+extern void repro_macos_real_arc4random_buf_call(void *buf, size_t n);
+extern unsigned int repro_macos_real_arc4random_uniform_call(unsigned int upper);
+extern int repro_macos_real_clock_gettime_call(int clk, void *ts);
+extern int repro_macos_real_gettimeofday_call(void *tp, void *tzp);
+extern long long repro_macos_real_time_call(void *tloc);
 /* T3b: the dyld add-image callback `repro_hook_dyld_add_image` is a Nim exportc
  * proc whose prototype is already emitted (N_LIB_EXPORT) earlier in this same
  * translation unit, so no re-declaration is needed here; we cast its function
@@ -2489,6 +2836,105 @@ static xpc_connection_t repro_wrap_xpc_connection_create_mach_service(
 }
 
 /*
+ * ROUND-2 R-D (break R10) non-file-determinism interpose thunks. Each mirrors the
+ * existing hardening thunks: forward to the GENUINE libsystem entry before the
+ * recording runtime is live, then branch to the recording repro_hook_* (which
+ * itself forwards via the genuine entry, so the recording hook never re-enters its
+ * own wrapper). All are INTERPOSE-ONLY (not body-patched), so they see only the
+ * monitored program's OWN direct call — the basis of the no-false-downgrade guard
+ * for the randomness arm (libsystem-internal benign randomness is never seen).
+ * Like the other hardening thunks they omit the debug-only interpose-DISABLE A/B
+ * forward (it attributes a capture to interpose-vs-body-patch, moot here).
+ */
+static char *repro_wrap_getenv(const char *name) {
+  if (!repro_monitor_runtime_ready) return repro_macos_real_getenv(name);
+  return repro_hook_getenv((char *)name);
+}
+
+static int repro_wrap_sysctlbyname(const char *name, void *oldp,
+    size_t *oldlenp, void *newp, size_t newlen) {
+  if (!repro_monitor_runtime_ready)
+    return repro_macos_real_sysctlbyname_call(name, oldp, oldlenp, newp, newlen);
+  return repro_hook_sysctlbyname((char *)name, oldp, oldlenp, newp, newlen);
+}
+
+static int repro_wrap_sysctl(int *name, unsigned int namelen, void *oldp,
+    size_t *oldlenp, void *newp, size_t newlen) {
+  if (!repro_monitor_runtime_ready)
+    return repro_macos_real_sysctl_call(name, namelen, oldp, oldlenp, newp, newlen);
+  return repro_hook_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+}
+
+static int repro_wrap_uname(struct utsname *buf) {
+  if (!repro_monitor_runtime_ready) return repro_macos_real_uname_call(buf);
+  return repro_hook_uname((void *)buf);
+}
+
+static int repro_wrap_gethostname(char *name, size_t namelen) {
+  if (!repro_monitor_runtime_ready)
+    return repro_macos_real_gethostname_call(name, namelen);
+  return repro_hook_gethostname(name, namelen);
+}
+
+static int repro_wrap_gethostuuid(unsigned char *uuid,
+    const struct timespec *timeout) {
+  if (!repro_monitor_runtime_ready)
+    return repro_macos_real_gethostuuid_call(uuid, (const void *)timeout);
+  return repro_hook_gethostuuid((void *)uuid, (void *)timeout);
+}
+
+/* The entropy wrappers capture __builtin_return_address(0) — the address of the
+ * instruction after the PROGRAM's call to the entropy API (the interpose binding
+ * lands the program's call directly on this wrapper). It is passed to the recording
+ * hook for CALLER-IMAGE ATTRIBUTION so only the program's OWN entropy use is flagged
+ * (the /usr/lib libsystem/libobjc/libswift startup baseline is excluded) — the fix
+ * for the cardinal-sin false downgrade of every real cc/clang/ld/bash run. */
+static int repro_wrap_getentropy(void *buf, size_t len) {
+  void *ra = __builtin_return_address(0);
+  if (!repro_monitor_runtime_ready) return repro_macos_real_getentropy_call(buf, len);
+  return repro_hook_getentropy(buf, len, ra);
+}
+
+static uint32_t repro_wrap_arc4random(void) {
+  void *ra = __builtin_return_address(0);
+  if (!repro_monitor_runtime_ready) return repro_macos_real_arc4random_call();
+  return repro_hook_arc4random(ra);
+}
+
+static void repro_wrap_arc4random_buf(void *buf, size_t n) {
+  void *ra = __builtin_return_address(0);
+  if (!repro_monitor_runtime_ready) { repro_macos_real_arc4random_buf_call(buf, n); return; }
+  repro_hook_arc4random_buf(buf, n, ra);
+}
+
+static uint32_t repro_wrap_arc4random_uniform(uint32_t upper) {
+  void *ra = __builtin_return_address(0);
+  if (!repro_monitor_runtime_ready) return repro_macos_real_arc4random_uniform_call(upper);
+  return repro_hook_arc4random_uniform(upper, ra);
+}
+
+static int repro_wrap_clock_gettime(clockid_t clk, struct timespec *ts) {
+  if (!repro_monitor_runtime_ready)
+    return repro_macos_real_clock_gettime_call((int)clk, (void *)ts);
+  return repro_hook_clock_gettime((int)clk, (void *)ts);
+}
+
+static int repro_wrap_gettimeofday(struct timeval *tp, void *tzp) {
+  if (!repro_monitor_runtime_ready)
+    return repro_macos_real_gettimeofday_call((void *)tp, tzp);
+  return repro_hook_gettimeofday((void *)tp, tzp);
+}
+
+static time_t repro_wrap_time(time_t *tloc) {
+  if (!repro_monitor_runtime_ready)
+    return (time_t)repro_macos_real_time_call((void *)tloc);
+  return (time_t)repro_hook_time((void *)tloc);
+}
+
+/* mach_absolute_time is intentionally NOT interposed (libdispatch early-init
+ * hazard; monotonic counter, not a wall clock). See the Nim/runtime R-D notes. */
+
+/*
  * Body-patch hook ADDRESS accessors for the VARIADIC open/openat wrappers.
  *
  * Why the body-patch backend MUST use the variadic repro_wrap_open(at) thunks --
@@ -2625,7 +3071,26 @@ static struct {
   { (const void *)repro_wrap_bootstrap_look_up,
     (const void *)bootstrap_look_up },
   { (const void *)repro_wrap_xpc_connection_create_mach_service,
-    (const void *)xpc_connection_create_mach_service }
+    (const void *)xpc_connection_create_mach_service },
+  /* ROUND-2 R-D (break R10) non-file determinism hooks. Interpose-only (NOT
+   * body-patched) so only the program's OWN direct calls are seen — the basis of
+   * the cardinal-sin guard for the randomness arm. Env/sysctl/uname are observed
+   * declared INPUTS (no downgrade); getentropy/arc4random* are AUTO-DOWNGRADE;
+   * clock_gettime/gettimeofday/time/mach_absolute_time are recorded-not-downgraded. */
+  { (const void *)repro_wrap_getenv, (const void *)getenv },
+  { (const void *)repro_wrap_clock_gettime, (const void *)clock_gettime },
+  { (const void *)repro_wrap_gettimeofday, (const void *)gettimeofday },
+  { (const void *)repro_wrap_time, (const void *)time },
+  { (const void *)repro_wrap_sysctlbyname, (const void *)sysctlbyname },
+  { (const void *)repro_wrap_sysctl, (const void *)sysctl },
+  { (const void *)repro_wrap_uname, (const void *)uname },
+  { (const void *)repro_wrap_gethostname, (const void *)gethostname },
+  { (const void *)repro_wrap_gethostuuid, (const void *)gethostuuid },
+  { (const void *)repro_wrap_getentropy, (const void *)getentropy },
+  { (const void *)repro_wrap_arc4random, (const void *)arc4random },
+  { (const void *)repro_wrap_arc4random_buf, (const void *)arc4random_buf },
+  { (const void *)repro_wrap_arc4random_uniform,
+    (const void *)arc4random_uniform }
   /* getdirentries is intentionally NOT in the interpose tuple: the SDK header
    * poisons the symbol under 64-bit inodes (`getdirentries_is_not_available…`),
    * so it cannot be referenced here. It is body-patched by string name instead
