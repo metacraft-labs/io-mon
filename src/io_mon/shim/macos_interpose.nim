@@ -21,6 +21,7 @@ import io_mon/writer
 #include <stdio.h>
 #include <sys/attr.h>
 #include <sys/clonefile.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -51,6 +52,24 @@ const
   AfInet = 2.cint
   AfInet6 = 30.cint
   EInProgress = 36.cint
+  # ROUND-2 R4 — `fstatat`'s AT_FDCWD sentinel (<fcntl.h>, -2 on Darwin). The
+  # fstatat canonicalisation is applied only for ABSOLUTE paths or AT_FDCWD, since
+  # realpath resolves a relative path against the CWD, not an arbitrary `dirfd`.
+  AtFdCwd = -2.cint
+  # ROUND-2 R4 — cap on the canonical-path memo; cleared wholesale when exceeded
+  # (a crude but O(1)-amortised, memory-bounded eviction — the working set of a
+  # build's probed inputs is far below this).
+  CanonicalCacheCap = 8192
+  # ROUND-2 R9 — mmap classification constants (<sys/mman.h>, stable Darwin ABI).
+  # A MAP_SHARED|PROT_WRITE FILE mapping changes the file's CONTENT with NO
+  # write(2) syscall (ld64 writes its output executable this way; r2_mmap probeC),
+  # so the open alone does not convey the write. PROT_READ/MAP_PRIVATE/MAP_ANON
+  # mappings are NOT recorded (a read mapping is already covered by the open; a
+  # private/anon mapping never reaches the backing file).
+  ProtRead = 0x01.cint
+  ProtWrite = 0x02.cint
+  MapShared = 0x0001.cint
+  MapAnon = 0x1000.cint
 
 var
   initialized = false
@@ -59,6 +78,14 @@ var
   recordLock: Lock
   fdLock: Lock
   dirLock: Lock
+  # ROUND-2 R4 — a bounded per-process realpath MEMO for the path-probe-family
+  # canonicalisation. Maps a raw probe path → its realpath (the empty string when
+  # realpath failed). Bounds the cost of canonicalising successful stat/lstat/
+  # access probes: a repeated probe of the same file (ubiquitous in builds — make
+  # re-stats the same inputs many times) is then O(1) instead of paying realpath
+  # (a per-component lstat chain) every time. See `canonicalPathFor`.
+  canonicalLock: Lock
+  canonicalCache = initTable[string, string]()
   fragmentDir: string
   nextProcessSeq: uint64 = 0
   fdPaths = initTable[cint, string]()
@@ -86,6 +113,13 @@ var
   runId: string = ""
 
 var disabled {.threadvar.}: int
+  ## Global shim-mute depth (suppresses ALL recording while > 0; emitRecord bails).
+var inMmapHook {.threadvar.}: int
+  ## ROUND-2 R9 — mmap-hook re-entrancy depth. The mmap recording path allocates
+  ## (and malloc mmaps), which would re-enter the hook; while > 0 a nested mmap
+  ## takes the plain forward without recording. Separate from `disabled` because
+  ## the OUTER call must still record (emitRecord bails on disabled>0). See
+  ## repro_hook_mmap.
 
 proc c_getpid(): cint {.importc: "getpid", header: "<unistd.h>".}
 proc c_getppid(): cint {.importc: "getppid", header: "<unistd.h>".}
@@ -161,13 +195,30 @@ proc recordProcessStart() {.raises: [].} =
   emitRecord(record)
 
 proc observationForOpen(flags: cint): MonitorObservationKind =
+  ## Classify an open's PRIMARY observation.
+  ##
+  ## ROUND-2 R3 — a pure `O_RDWR` open (no O_CREAT/O_TRUNC/O_APPEND) is classified
+  ## as an INPUT (`moFileOpen`), NOT a write. The round-1 code collapsed ANY
+  ## O_RDWR/O_WRONLY/O_CREAT/O_TRUNC/O_APPEND open to `moFileWrite`, so a file
+  ## opened O_RDWR but only READ (SQLite opens its DB O_RDWR even read-only;
+  ## lockfiles; editors; the defensive lock-then-read idiom) was recorded purely as
+  ## an OUTPUT — and a downstream "inputs = read AND NOT written" fold then EXCLUDED
+  ## a genuine input that changes ⇒ a false cache hit (demonstrated in
+  ## research/.../r2_mmap probeA/probeB). The DANGEROUS direction is dropping it
+  ## from INPUTS, so a plain O_RDWR is an input by default; an ACTUAL write on the
+  ## fd — a `write(2)` (recorded by repro_hook_write) or a MAP_SHARED|PROT_WRITE
+  ## mmap (recorded by repro_hook_mmap, R9) — is what marks the path WRITTEN, so a
+  ## genuine in-place O_RDWR edit is still an output. O_CREAT/O_TRUNC/O_APPEND and a
+  ## pure O_WRONLY remain unambiguous OUTPUTS.
   if (flags and (OCreat or OTrunc or OAppend)) != 0:
     moFileWrite
   else:
     let acc = flags and OAccMode
-    if acc == OWrOnly or acc == ORdWr:
+    if acc == OWrOnly:
       moFileWrite
     else:
+      # O_RDONLY and pure O_RDWR are both inputs (the latter writable only if an
+      # actual write/mmap-write is later observed on the fd — see above).
       moFileOpen
 
 proc recordDirectoryEnumeration(path: cstring) {.raises: [].} =
@@ -229,17 +280,88 @@ proc probeFromResult(callResult: cint): ProbeResult =
 # record-building body is duplicated. The helpers take the already-computed
 # call result + path/mode so the hook stays a thin "forward then record".
 
+proc devInoSuffix(detail: string; dev, ino: uint64): string {.raises: [].} =
+  ## Append a ` dev=<n> ino=<n>` token pair to `detail` (ROUND-2 R4 hardlink
+  ## identity). The tokens are whitespace-separated `key=value` pairs read back via
+  ## writer.detailToken, exactly like the round-2 R7/R8 start/peer tokens — so no
+  ## wire-format field is added (RMDF stays byte-stable). realpath collapses two
+  ## NAMES of one file to one canonical path, but it CANNOT collapse a HARDLINK
+  ## (distinct directory entries, same inode); the (dev, ino) lets a consumer match
+  ## that alternate-name case by inode identity.
+  result = detail
+  if result.len > 0: result.add ' '
+  result.add "dev=" & $dev & " ino=" & $ino
+
+proc statDetail(detail: string; buf: pointer; ok: bool): string {.raises: [].} =
+  ## `detail` with the stat buffer's (dev, ino) appended when the probe succeeded
+  ## and a buffer is available (ROUND-2 R4). Single source of truth for the
+  ## stat-family hooks.
+  if not ok or buf == nil:
+    return detail
+  var dev, ino: uint64
+  if not ct_macos_stat_dev_ino(buf, addr dev, addr ino):
+    return detail
+  devInoSuffix(detail, dev, ino)
+
+proc canonicalPathFor(rawPath: string): string {.raises: [].} =
+  ## ROUND-2 R4 — the realpath of `rawPath`, memoised in a bounded per-process LRU
+  ## (canonicalCache). Returns "" when realpath failed OR the path is already
+  ## canonical. realpath's internal lstat is body-patched, so the resolution runs
+  ## with the shim MUTED (disabled>0) to avoid recursing into recording. The memo
+  ## bounds cost: a build re-stats the same inputs many times, and each repeat is
+  ## then O(1); the first touch of a distinct successful path pays one realpath.
+  ## (Failed/ENOENT probes never reach here — see recordCanonicalPathProbe — so the
+  ## configure/find_program probe storm, dominated by absent paths, costs nothing.)
+  if rawPath.len == 0:
+    return ""
+  # Cache representation: the stored value is the realpath when it DIFFERS from the
+  # raw path, otherwise `rawPath` itself — a self-sentinel meaning "already
+  # canonical / unresolvable, no companion needed". getOrDefault("") therefore
+  # cleanly distinguishes a MISS ("") from a stored skip (== rawPath), without the
+  # KeyError-raising `[]` (illegal in this raises:[] proc).
+  acquire(canonicalLock)
+  let cached = canonicalCache.getOrDefault(rawPath, "")
+  release(canonicalLock)
+  if cached.len > 0:
+    return (if cached == rawPath: "" else: cached)
+  var buf: array[1024, char]
+  # Mute the shim around realpath: its internal lstat is body-patched and would
+  # otherwise record a path-probe for every component (and risk recursion). Manual
+  # inc/dec (not the withShimMuted template) keeps this value-returning raises:[]
+  # proc free of an enclosing try/finally.
+  inc disabled
+  let ok = ct_macos_canonical_path(cstring(rawPath), addr buf[0],
+    csize_t(buf.len)) != 0
+  dec disabled
+  let canonical = if ok: $cast[cstring](addr buf[0]) else: ""
+  let stored = if canonical.len > 0 and canonical != rawPath: canonical
+               else: rawPath
+  acquire(canonicalLock)
+  if canonicalCache.len >= CanonicalCacheCap:
+    canonicalCache.clear()
+  canonicalCache[rawPath] = stored
+  release(canonicalLock)
+  if stored == rawPath: "" else: stored
+
 proc recordOpen(callResult: cint; path: cstring; flags: cint; detail: string) {.raises: [].} =
   ## Record an mrFileOpen observation. Shared by the open/openat hooks. The
   ## fd→path map update and directory-enumeration follow-up are done by the
   ## caller (they need the live fd/path before this record is emitted).
+  var d = detail
+  # ROUND-2 R4 — stamp the opened file's (dev, ino) via a raw fstat
+  # (reentrancy-free) so a hardlink-alternate-name open is matchable by inode
+  # identity (realpath cannot collapse a hardlink). Only on a successful open.
+  if callResult >= 0:
+    var dev, ino: uint64
+    if ct_macos_fd_dev_ino(callResult, addr dev, addr ino):
+      d = devInoSuffix(d, dev, ino)
   var record = baseRecord(mrFileOpen, observationForOpen(flags))
   record.result = callResult.int64
   record.flags = uint32(flags)
   if path != nil:
     record.path = $path
-  if detail.len > 0:
-    record.detail = detail
+  if d.len > 0:
+    record.detail = d
   emitRecord(record)
 
 proc recordPathProbe(callResult: cint; path: cstring; mode: cint; detail: string) {.raises: [].} =
@@ -401,7 +523,16 @@ proc repro_hook_dyld_add_image*(mh: pointer; slide: int)
     return
   var buf: array[1024, char]
   buf[0] = '\0'
-  if ct_macos_dyld_image_dep_path(mh, addr buf[0], csize_t(buf.len)) != 0:
+  # ROUND-2 R6 — the filter now realpath-CANONICALISES the candidate path (so a
+  # `..`-laden or /private/var/…/usr/lib/… path cannot dodge/falsely-trip the
+  # baseline prefix tests). realpath's internal lstat is body-patched, so we MUTE
+  # the shim around the C call: a muted lstat forwards without recording (no
+  # recursion), and we un-mute before recordLibraryLoad so the library-load record
+  # is actually emitted.
+  inc disabled
+  let recordable = ct_macos_dyld_image_dep_path(mh, addr buf[0], csize_t(buf.len)) != 0
+  dec disabled
+  if recordable:
     recordLibraryLoad(cast[cstring](addr buf[0]))
 
 proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
@@ -410,6 +541,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
     initLock(recordLock)
     initLock(fdLock)
     initLock(dirLock)
+    initLock(canonicalLock)   # ROUND-2 R4 — guards the realpath memo
     locksReady = true
   acquire(initLockVar)
   defer: release(initLockVar)
@@ -427,6 +559,14 @@ proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
   # runs in the dyld constructor, single-threaded, so this captures the main
   # thread id before any worker thread can emit.
   mainThreadId = currentThreadId()
+  # ROUND-2 R6 — capture the shim's OWN (mach_header, realpath) NOW, single-threaded
+  # at init and BEFORE the body-patch install / add-image registration, so the
+  # library-load filter excludes our shim by unspoofable identity (header pointer /
+  # exact realpath) rather than the round-1 substring test that false-dropped
+  # genuine dependency dylibs whose path merely contained "librepro_monitor_shim".
+  # realpath here reaches genuine libsystem (body-patch is not yet installed and the
+  # interpose wrappers passthrough while runtime_ready is 0), so it cannot recurse.
+  ct_macos_capture_shim_image()
   initialized = true
   recordProcessStart()
   result = 0
@@ -542,6 +682,67 @@ proc recordCanonicalProbe(callResult: cint; path: cstring) {.raises: [].} =
     return
   recordPathProbe(callResult, cstring(canonical), 0, "resolved-target")
 
+proc recordCanonicalPathProbe(callResult: cint; path: cstring; mode: cint;
+    detail: string) {.raises: [].} =
+  ## ROUND-2 R4 — for a SUCCESSFUL stat/lstat/fstatat/access probe whose raw path
+  ## is NON-CANONICAL, ALSO record a path-probe on the realpath-canonical form, so
+  ## a metadata-only dependency (existence/mtime — HUGE in builds: make/ninja mtime
+  ## checks, compiler include-search via access/stat, `configure`'s `test -f`)
+  ## stays matchable when the consumer keys on the canonical path. Round 1
+  ## canonicalised OPENS (the F_GETPATH companion) but the PATH-PROBE family
+  ## recorded the RAW path verbatim, so `/dir/./file`, a case-folded `FILE.TXT` on
+  ## case-insensitive APFS, a mid-path symlink, or a relative-after-chdir path never
+  ## matched a canonical cache key ⇒ a changed dependency was MISSED → a false skip
+  ## (research/.../r2_path). We record BOTH the as-passed (recordPathProbe in the
+  ## caller) AND the canonical path here, mirroring the open #7/#8 dual record, so a
+  ## consumer keyed on EITHER matches.
+  ##
+  ## Perf is bounded (stat storms are large): only on SUCCESS (callResult == 0 — the
+  ## ENOENT probe storm is skipped) and via the realpath memo in canonicalPathFor.
+  ## `detail` carries the as-passed probe's (dev, ino) so the canonical companion is
+  ## inode-matchable too.
+  if callResult != 0 or path == nil:
+    return
+  let raw = $path
+  let canonical = canonicalPathFor(raw)
+  if canonical.len == 0 or canonical == raw:
+    return
+  recordPathProbe(callResult, cstring(canonical), mode,
+    (if detail.len > 0: detail & " resolved-target" else: "resolved-target"))
+
+proc recordMmap(callResult: pointer; prot, flags, fd: cint) {.raises: [].} =
+  ## ROUND-2 R9 — classify an `mmap` of a FILE-backed fd. A MAP_SHARED|PROT_WRITE
+  ## mapping changes the file's CONTENT with NO write(2)/pwrite(2) syscall (ld64
+  ## writes its output executable this way; r2_mmap probeC), so the open alone does
+  ## not convey the write → the output is INVISIBLE to a write-only-via-syscall
+  ## monitor. We record an output WRITE on the mapped fd's path at mmap time
+  ## (write-INTENT — conservative: a mapped-writable-but-never-written file is
+  ## over-recorded as an output, the SAFE direction, never a missed output).
+  ##
+  ## A read-only / private / anonymous mapping is NOT recorded: the round-1 finding
+  ## showed mmap-AFTER-open is already covered by the captured open (the file is in
+  ## the input set), so recording a read mapping would be a gratuitous double-record
+  ## (and an O_RDWR-then-PROT_READ-mmap input is already captured as an input by the
+  ## R3 open classification). Only the MAP_SHARED|PROT_WRITE content write is a
+  ## genuine fact the open does not carry.
+  if callResult == cast[pointer](-1) or fd < 0:   # MAP_FAILED or no backing fd
+    return
+  if (flags and MapAnon) != 0:                    # anonymous: no file backing
+    return
+  if (flags and MapShared) == 0:                  # private: writes don't hit disk
+    return
+  if (prot and ProtWrite) == 0:                   # read-only: open already covers
+    return
+  let p = pathForFd(fd)
+  if p.len == 0:
+    return
+  var record = baseRecord(mrFileWrite, moFileWrite)
+  record.path = p
+  record.result = 0
+  record.flags = uint32(fd)
+  record.detail = "mmap-write MAP_SHARED|PROT_WRITE"
+  emitRecord(record)
+
 proc recordSetexecExec(attrp: pointer; path: cstring) {.raises: [].} =
   ## If a posix_spawn(p) sets POSIX_SPAWN_SETEXEC it REPLACES the calling
   ## process image and NEVER returns on success — so (mirroring repro_hook_execve
@@ -629,6 +830,37 @@ proc repro_hook_close*(fd: cint): cint {.exportc, cdecl, dynlib.} =
   result = ct_macos_interpose_real_close(fd)
   removeFdPath(fd)
 
+proc repro_hook_mmap*(adr: pointer; length: csize_t; prot, flags, fd: cint;
+    offset: int64): pointer {.exportc, cdecl, dynlib.} =
+  ## ROUND-2 R9 — the output-via-memory blind spot. A file modified through a
+  ## MAP_SHARED|PROT_WRITE mapping changes content with NO write(2) syscall, so the
+  ## round-1 hook set saw only the open. We forward via the inline-asm BSD mmap
+  ## syscall (full 64-bit return, allocation-free) then classify the mapping (see
+  ## recordMmap): a MAP_SHARED|PROT_WRITE file mapping is recorded as a content
+  ## WRITE on the fd's path; read-only/private/anonymous mappings are intentionally
+  ## NOT recorded (the open already covers a read mapping — no double-record).
+  ##
+  ## mmap is INTERPOSE-only (not body-patched): build tools call mmap directly, so
+  ## the __interpose tuple sees the program's own MAP_SHARED writes; mmap is also a
+  ## very hot, early-init libsystem entry (dyld/malloc map heavily before main), so
+  ## body-patching it would add early-init risk for no coverage gain.
+  ##
+  ## RE-ENTRANCY (critical): the recording path (recordMmap → baseRecord/emitRecord)
+  ## ALLOCATES, and malloc mmaps, so a naive hook would re-enter itself and recurse
+  ## to a stack-overflow crash. `inMmapHook` (a thread-local depth) makes any mmap
+  ## issued WHILE recording take the plain forward (no record), so the outer call
+  ## records exactly once and the inner allocations just map. The global `disabled`
+  ## guard is NOT reused for this because emitRecord bails when disabled>0 (it would
+  ## suppress the very record we want); `inMmapHook` gates ONLY the re-entry.
+  if not initialized or disabled > 0 or inMmapHook > 0:
+    return ct_macos_real_mmap(adr, length, prot, flags, fd, offset)
+  inc inMmapHook
+  result = ct_macos_real_mmap(adr, length, prot, flags, fd, offset)
+  let savedErrno = getErrno()
+  recordMmap(result, prot, flags, fd)
+  setErrno(savedErrno)
+  dec inMmapHook
+
 proc repro_hook_opendir*(path: cstring): pointer {.exportc, cdecl, dynlib.} =
   if not initialized or disabled > 0:
     return ct_macos_interpose_real_opendir(path)
@@ -689,7 +921,13 @@ proc repro_hook_stat*(path: cstring; buf: pointer): cint {.exportc, cdecl, dynli
     return ct_macos_bodypatch_real_stat(path, buf)
   result = ct_macos_bodypatch_real_stat(path, buf)
   let savedErrno = getErrno()
-  recordPathProbe(result, path, 0, "")
+  # ROUND-2 R4 — record the as-passed probe (with (dev, ino)) AND, when the raw
+  # path is non-canonical, a companion probe on the realpath form. stat()'s path
+  # resolves against the CWD, exactly as realpath does, so both absolute and
+  # relative (post-chdir) paths canonicalise correctly.
+  let dino = statDetail("", buf, result == 0)
+  recordPathProbe(result, path, 0, dino)
+  recordCanonicalPathProbe(result, path, 0, dino)
   setErrno(savedErrno)
 
 proc repro_hook_lstat*(path: cstring; buf: pointer): cint {.exportc, cdecl, dynlib.} =
@@ -697,13 +935,19 @@ proc repro_hook_lstat*(path: cstring; buf: pointer): cint {.exportc, cdecl, dynl
     return ct_macos_bodypatch_real_lstat(path, buf)
   result = ct_macos_bodypatch_real_lstat(path, buf)
   let savedErrno = getErrno()
-  recordPathProbe(result, path, 0, "")
+  let dino = statDetail("", buf, result == 0)
+  recordPathProbe(result, path, 0, dino)
   # If the lstat'd object IS a symlink, also record its resolved target so
   # editing the target (while the link is unchanged) stays a visible dependency
   # (findings doc break #7 / mcapSymlink). Gated on S_ISLNK so realpath is only
   # paid for actual symlinks, never the stat-probe storm.
   if result == 0 and ct_macos_stat_is_symlink(buf):
     recordCanonicalProbe(result, path)
+  else:
+    # ROUND-2 R4 — for a non-symlink lstat, the canonical-companion (a mid-path
+    # symlink, case-fold, `.`/`..`) is still relevant; recordCanonicalProbe already
+    # covered the symlink-leaf case above, so avoid emitting it twice.
+    recordCanonicalPathProbe(result, path, 0, dino)
   setErrno(savedErrno)
 
 proc repro_hook_fstatat*(dirfd: cint; path: cstring; buf: pointer;
@@ -712,7 +956,14 @@ proc repro_hook_fstatat*(dirfd: cint; path: cstring; buf: pointer;
     return ct_macos_bodypatch_real_fstatat(dirfd, path, buf, flag)
   result = ct_macos_bodypatch_real_fstatat(dirfd, path, buf, flag)
   let savedErrno = getErrno()
-  recordPathProbe(result, path, 0, "fstatat dirfd=" & $dirfd)
+  let dino = statDetail("fstatat dirfd=" & $dirfd, buf, result == 0)
+  recordPathProbe(result, path, 0, dino)
+  # ROUND-2 R4 — canonicalise only when the path is ABSOLUTE or relative to
+  # AT_FDCWD: realpath resolves a relative path against the CWD, not an arbitrary
+  # `dirfd`, so a dirfd-relative fstatat would canonicalise to the wrong file.
+  # (A dirfd-relative probe's canonical companion is a documented residual gap.)
+  if path != nil and (path[0] == '/' or dirfd == AtFdCwd):
+    recordCanonicalPathProbe(result, path, 0, dino)
   setErrno(savedErrno)
 
 proc repro_hook_access*(path: cstring; mode: cint): cint
@@ -721,7 +972,10 @@ proc repro_hook_access*(path: cstring; mode: cint): cint
     return ct_macos_bodypatch_real_access(path, mode)
   result = ct_macos_bodypatch_real_access(path, mode)
   let savedErrno = getErrno()
+  # access has no stat buffer, so no (dev, ino) is available — record the raw
+  # probe and, on success, the canonical companion (ROUND-2 R4).
   recordPathProbe(result, path, mode, "")
+  recordCanonicalPathProbe(result, path, mode, "")
   setErrno(savedErrno)
 
 # --- Unified rename-family hooks (interpose + body-patch share ONE hook) ---
@@ -1706,6 +1960,32 @@ static int repro_wrap_close(int fd) {
   return repro_hook_close(fd);
 }
 
+/*
+ * ROUND-2 R9 mmap interpose thunk. Like the T2/T3a thunks it forwards to the
+ * kernel before the recording runtime is live, then branches to the recording
+ * repro_hook_mmap (which forwards via the genuine libsystem mmap). It omits the
+ * debug-only interpose-DISABLE A/B forward (REPRO_INTERPOSE_FORWARD_*): mmap is
+ * interpose-only (never body-patched), and the knob attributes a capture to
+ * interpose-vs-body-patch, which is moot for an interpose-only hook. The signature
+ * matches `void *mmap(void *, size_t, int, int, int, off_t)`.
+ */
+extern void *repro_macos_real_mmap_syscall(void *addr, size_t len, int prot,
+                                           int flags, int fd, long long offset);
+
+static void *repro_wrap_mmap(void *addr, size_t len, int prot, int flags,
+                             int fd, off_t offset) {
+  if (!repro_monitor_runtime_ready) {
+    /* Forward via the inline-asm BSD mmap syscall (full 64-bit return). MUST be
+     * allocation-free here: the interpose tuple is live from image-load, so this
+     * thunk fires for libsystem-internal mmaps BEFORE our constructor, and a
+     * dlsym/resolve forward would malloc → mmap → re-enter this thunk → recurse.
+     * NOT the libc syscall() shim either (it truncates the pointer → crash). */
+    return repro_macos_real_mmap_syscall(addr, len, prot, flags, fd,
+                                         (long long)offset);
+  }
+  return repro_hook_mmap(addr, len, prot, flags, fd, (long long)offset);
+}
+
 /* Cached libsystem entry-address resolvers for the remaining wrap families
  * (interpose-disable forward). Each lands on the patched-in-place body-patch
  * entry when body-patch is active, or genuine libsystem when it is not — both
@@ -2177,6 +2457,9 @@ static struct {
   { (const void *)repro_wrap_read, (const void *)read },
   { (const void *)repro_wrap_write, (const void *)write },
   { (const void *)repro_wrap_close, (const void *)close },
+  /* ROUND-2 R9 — mmap output-via-memory hook (MAP_SHARED|PROT_WRITE content
+   * write with no write() syscall). Interpose-only (not body-patched). */
+  { (const void *)repro_wrap_mmap, (const void *)mmap },
   { (const void *)repro_wrap_opendir, (const void *)opendir },
   { (const void *)repro_wrap_readdir, (const void *)readdir },
   { (const void *)repro_wrap_closedir, (const void *)closedir },

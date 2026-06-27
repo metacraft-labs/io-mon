@@ -53,6 +53,7 @@ proc repro_macos_get_sandbox_tools_dir*(): cstring
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -381,6 +382,84 @@ int repro_macos_stat_is_symlink(void *buf) {
 }
 
 /*
+ * ROUND-2 R4 — extract (st_dev, st_ino) from a (64-bit-inode) struct stat buffer.
+ * realpath() resolves symlinks/case/dot/dot-dot so two NAMES of the same file map to
+ * one canonical path — but it CANNOT collapse a HARDLINK (two independent
+ * directory entries, same inode, neither a symlink of the other). Recording the
+ * (dev, ino) identity lets a consumer match the hardlink-alternate-name case by
+ * inode rather than by path. Returns 1 and fills *out_dev/*out_ino on success.
+ * The SYS_*stat64-filled buffer is the modern arm64 `struct stat`, so the cast is
+ * correct (stat == stat64).
+ */
+int repro_macos_stat_dev_ino(void *buf, unsigned long long *out_dev,
+                             unsigned long long *out_ino) {
+  if (!buf || !out_dev || !out_ino) return 0;
+  struct stat *st = (struct stat *)buf;
+  *out_dev = (unsigned long long)st->st_dev;
+  *out_ino = (unsigned long long)st->st_ino;
+  return 1;
+}
+
+/*
+ * ROUND-2 R4 — (dev, ino) for an open fd via a RAW fstat syscall (unhooked →
+ * reentrancy-free). Used to stamp inode identity on file-open records so a
+ * hardlink-alternate-name open can be matched by inode. Returns 1 on success.
+ */
+int repro_macos_fd_dev_ino(int fd, unsigned long long *out_dev,
+                           unsigned long long *out_ino) {
+  if (fd < 0 || !out_dev || !out_ino) return 0;
+  struct stat st;
+  if (syscall(SYS_fstat64, fd, &st) != 0) return 0;
+  *out_dev = (unsigned long long)st.st_dev;
+  *out_ino = (unsigned long long)st.st_ino;
+  return 1;
+}
+
+/*
+ * ROUND-2 R9 — mmap forwarder for the file-content-via-memory hook. Issues the
+ * BSD mmap syscall via INLINE ASM (svc #0x80), capturing the FULL 64-bit x0
+ * return. This is ALLOCATION-FREE and re-entry-free — the two properties an mmap
+ * forwarder absolutely needs (see the hook + the not-ready thunk):
+ *   * NOT the libc `syscall()` shim: on Darwin it is declared `int syscall(int,
+ *     ...)`, so `(void*)syscall(SYS_mmap, …)` TRUNCATES the 64-bit mapping address
+ *     to 32 bits → a corrupt pointer → a hard SIGSEGV the instant malloc/dyld
+ *     touched the mapping (verified: a raw `syscall(SYS_mmap)` crashed in
+ *     isolation with -Wint-to-pointer-cast). The asm path returns x0 in full.
+ *   * NOT the resolved libsystem `_mmap` function pointer: resolving it (an image
+ *     walk + dladdr) MALLOCs, and malloc mmaps, so a lazy resolve inside the hot
+ *     hook RE-ENTERS mmap and recurses to a stack-overflow crash — and the
+ *     resolution cannot be done before our constructor, yet the interpose tuple is
+ *     live (and firing mmaps) from image-load. The asm path needs no resolution.
+ * Darwin/arm64 BSD syscall ABI: trap number in x16, args x0-x5, `svc #0x80`; the
+ * carry flag is set on error (errno in x0). Mirrors repro_macos_real_fork_syscall.
+ */
+void *repro_macos_real_mmap_syscall(void *addr, size_t len, int prot, int flags,
+                                    int fd, long long offset) {
+#if defined(__arm64__) || defined(__aarch64__)
+  register long x0 __asm__("x0") = (long)addr;
+  register long x1 __asm__("x1") = (long)len;
+  register long x2 __asm__("x2") = (long)prot;
+  register long x3 __asm__("x3") = (long)flags;
+  register long x4 __asm__("x4") = (long)fd;
+  register long x5 __asm__("x5") = (long)offset;
+  register long x16 __asm__("x16") = SYS_mmap;
+  register long err __asm__("x6");
+  __asm__ volatile(
+    "svc #0x80\n\t"
+    "cset x6, cs\n"
+    : "+r"(x0), "=r"(err)
+    : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x16)
+    : "cc", "memory");
+  if (err) { errno = (int)x0; return MAP_FAILED; }
+  return (void *)x0;
+#else
+  /* Non-arm64 Darwin is not a supported host for this shim. */
+  errno = ENOSYS;
+  return MAP_FAILED;
+#endif
+}
+
+/*
  * T3b (findings-doc break #4 + the dlopen arm of #7): classify a dyld IMAGE — a
  * dependent dylib dyld mapped via low-level kernel mmap, OR a dlopen'd one — as
  * a NON-SYSTEM, real-on-disk library-load dependency, or reject it.
@@ -424,24 +503,78 @@ int repro_macos_stat_is_symlink(void *buf) {
  * NSLookupSymbolInImage and could deadlock. Returns 1 and fills `out` (>= 1024)
  * when the image is a recordable dependency, 0 otherwise.
  */
+/*
+ * ROUND-2 R6 — the shim's OWN image identity, captured ONCE at init (see
+ * repro_macos_capture_shim_image, called from the constructor before the
+ * add-image callback is registered). The library-load filter must exclude OUR
+ * injected shim — but the round-1 code did so by the SUBSTRING test
+ * `strstr(path,"librepro_monitor_shim")`, which ALSO dropped any genuine
+ * dependency dylib whose path merely CONTAINED that substring (e.g.
+ * `/tmp/x_librepro_monitor_shim_dep.dylib`, or a dir
+ * `…/librepro_monitor_shim_plugins/…`). Because dyld-mmap'd dylibs have NO open
+ * backstop, such a dependency then vanished from the dep set → a false cache hit
+ * (demonstrated in research/.../r2_implicit). We now exclude the shim by
+ * UNSPOOFABLE identity: the mach_header POINTER dyld passes for the shim equals
+ * the shim's own captured header (a candidate cannot forge its load address), with
+ * a realpath'd exact-path backstop. A dependency whose path merely contains the
+ * substring has a DIFFERENT header and a different realpath, so it is recorded.
+ */
+static const struct mach_header *repro_shim_mach_header = NULL;
+static char repro_shim_real_path[1024] = {0};
+
+void repro_macos_capture_shim_image(void) {
+  /* dladdr on an address INSIDE this image yields the shim's load base
+   * (dli_fbase == its mach_header) and its on-disk path. Runs single-threaded at
+   * init, before body-patch is installed and before runtime_ready, so realpath's
+   * internal lstat reaches genuine libsystem (no hook, no recording). */
+  Dl_info di;
+  if (dladdr((const void *)&repro_macos_capture_shim_image, &di)) {
+    repro_shim_mach_header = (const struct mach_header *)di.dli_fbase;
+    if (di.dli_fname != NULL) {
+      char buf[1024];
+      if (realpath(di.dli_fname, buf) != NULL) {
+        size_t n = strlen(buf);
+        if (n + 1 <= sizeof(repro_shim_real_path))
+          memcpy(repro_shim_real_path, buf, n + 1);
+      }
+    }
+  }
+}
+
 int repro_macos_dyld_image_dep_path(void *mh_raw, void *out_raw,
                                     size_t outlen) {
   char *out = (char *)out_raw;
   if (mh_raw == NULL || out == NULL || outlen < 1) return 0;
   out[0] = '\0';
   const struct mach_header *mh = (const struct mach_header *)mh_raw;
+  /* R6: exclude our OWN shim by UNSPOOFABLE mach_header identity (the header
+   * pointer dyld passes for the shim image == our captured header). This replaces
+   * the round-1 substring test that false-dropped genuine deps containing the
+   * substring in their path. Checked FIRST and cheapest. */
+  if (repro_shim_mach_header != NULL && mh == repro_shim_mach_header) return 0;
   /* mh->filetype occupies the same offset in the 32- and 64-bit mach_header, so
    * reading it through the 32-bit struct is correct for our arm64/arm64e images. */
   uint32_t ft = mh->filetype;
   if (ft != MH_DYLIB && ft != MH_BUNDLE) return 0;
   Dl_info di;
   if (!dladdr((const void *)mh, &di) || di.dli_fname == NULL) return 0;
+  /* R6: CANONICALISE the candidate path (realpath) BEFORE the /usr/lib//System/
+   * prefix tests and the shim-path backstop, so a dot-dot-laden or
+   * /private/var/…/usr/lib/… path can neither DODGE the baseline filter nor
+   * FALSELY trip it. realpath's internal lstat is body-patched, but the Nim caller
+   * (repro_hook_dyld_add_image) invokes us with the shim MUTED, so it forwards
+   * without recording (no recursion). Fall back to the raw dladdr path if realpath
+   * fails (e.g. an unreadable component). */
   const char *path = di.dli_fname;
+  char realbuf[1024];
+  if (realpath(di.dli_fname, realbuf) != NULL) path = realbuf;
   size_t plen = strlen(path);
   if (plen == 0 || plen + 1 > outlen) return 0;
-  /* Our own injected shim is never a build input. */
-  if (strstr(path, "librepro_monitor_shim") != NULL) return 0;
-  /* OS framework baseline by path prefix. */
+  /* R6 backstop: exclude the shim by its realpath'd EXACT path (not substring),
+   * covering the unlikely case the mach_header capture was unavailable. */
+  if (repro_shim_real_path[0] != '\0' &&
+      strcmp(path, repro_shim_real_path) == 0) return 0;
+  /* OS framework baseline by path prefix (now on the canonicalised path). */
   if (strncmp(path, "/usr/lib/", 9) == 0) return 0;
   if (strncmp(path, "/System/", 8) == 0) return 0;
   /* Shared-cache-resident system images (the bulk of the ~600 baseline). Guarded
@@ -1281,6 +1414,39 @@ proc ct_macos_stat_is_symlink*(buf: pointer): bool =
   proc isSymlink(buf: pointer): cint
     {.importc: "repro_macos_stat_is_symlink", cdecl.}
   isSymlink(buf) != 0
+
+proc ct_macos_capture_shim_image*() =
+  ## ROUND-2 R6 — capture the shim's own (mach_header, realpath) ONCE at init so
+  ## the library-load filter can exclude OUR injected shim by UNSPOOFABLE identity
+  ## rather than the round-1 substring test that false-dropped genuine deps whose
+  ## path merely contained "librepro_monitor_shim". Call from the constructor,
+  ## single-threaded, before the add-image callback is registered.
+  proc captureShimImage() {.importc: "repro_macos_capture_shim_image", cdecl.}
+  captureShimImage()
+
+proc ct_macos_real_mmap*(adr: pointer; length: csize_t; prot, flags, fd: cint;
+    offset: int64): pointer =
+  ## ROUND-2 R9 — forward mmap via the inline-asm BSD syscall (full 64-bit return).
+  ## Allocation-free and re-entry-free; see the C forwarder for why neither the libc
+  ## `syscall()` shim (truncates the pointer to 32 bits → crash) nor a resolved
+  ## libsystem `_mmap` pointer (resolution mallocs → re-enters mmap → crash) works.
+  proc realMmap(adr: pointer; length: csize_t; prot, flags, fd: cint;
+      offset: int64): pointer
+    {.importc: "repro_macos_real_mmap_syscall", cdecl.}
+  realMmap(adr, length, prot, flags, fd, offset)
+
+proc ct_macos_stat_dev_ino*(buf: pointer; outDev, outIno: ptr uint64): bool =
+  ## ROUND-2 R4 — read (st_dev, st_ino) from a struct stat buffer (hardlink
+  ## identity, which realpath cannot collapse). True on success.
+  proc devIno(buf: pointer; outDev, outIno: ptr uint64): cint
+    {.importc: "repro_macos_stat_dev_ino", cdecl.}
+  devIno(buf, outDev, outIno) != 0
+
+proc ct_macos_fd_dev_ino*(fd: cint; outDev, outIno: ptr uint64): bool =
+  ## ROUND-2 R4 — (st_dev, st_ino) for an open fd via a raw fstat (reentrancy-free).
+  proc fdDevIno(fd: cint; outDev, outIno: ptr uint64): cint
+    {.importc: "repro_macos_fd_dev_ino", cdecl.}
+  fdDevIno(fd, outDev, outIno) != 0
 
 proc ct_macos_dyld_image_dep_path*(mh: pointer; outBuf: pointer;
     outLen: csize_t): cint =
