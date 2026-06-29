@@ -69,8 +69,14 @@ to start as an honest stub today.
   (`mach_vm_remap` overwrite) always run together, additively, working under SIP
   with no entitlements/root for the ad-hoc-signed binaries the build/test system
   produces.
-- **Linux** — `LD_PRELOAD` shim (needs full end-to-end validation on a Linux
-  host).
+- **Linux** — `LD_PRELOAD` shim. It captures direct `open`/`read` paths,
+  glibc `fopen`/`fread` stream reads, and `connect(2)` IPC establishment; a
+  monitored process that talks to an out-of-tree Unix/TCP daemon now fails
+  closed as `mcIncomplete`. Known residuals: raw `syscall(2)` / `openat2`,
+  raw zero-copy syscalls (`sendfile`, `splice`, raw `copy_file_range`), path
+  fidelity for `access`/`readlink`/`statx` and hardlink aliases, and Linux
+  non-file determinism inputs (`getenv`, `uname`, `sysconf`, time,
+  `getrandom`) still need dedicated hooks or a native backend.
 - **Windows** — injected hooks via `CreateRemoteThread`+`LoadLibraryW` (needs
   validation under the DIY toolchain).
 - **EndpointSecurity** — designed/skeletoned (see above), not yet a shipping

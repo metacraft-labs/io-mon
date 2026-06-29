@@ -99,7 +99,8 @@ const
     mcapBackendProvenance,
     mcapFileCreate,
     mcapFileTruncate,
-    mcapFileAppend
+    mcapFileAppend,
+    mcapIpcConnect
   }
 
   LinuxPreloadKnownUnsupportedCapabilities* = {
@@ -110,9 +111,6 @@ const
     mcapLibraryLoad,
     mcapAuthorizationEnforcement,
     mcapPathMutation,
-    # The Linux LD_PRELOAD shim does not yet hook connect(2); IPC-breakaway
-    # detection is currently a macOS-only capability.
-    mcapIpcConnect,
     # ROUND-2 R-D — the Linux preload shim does not yet hook getenv/sysctl/uname or
     # the entropy/time sources; non-file determinism handling is macOS-only so far.
     mcapObservedEnv,
