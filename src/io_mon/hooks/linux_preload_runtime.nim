@@ -9,7 +9,7 @@ type
   LinuxHookSymbol = enum
     lhsOpen, lhsOpen64, lhsOpenat, lhsOpenat64, lhsClose, lhsRead, lhsWrite,
     lhsStat, lhsLstat, lhsOpendir, lhsReaddir, lhsClosedir, lhsFork,
-    lhsExecve, lhsPosixSpawn, lhsPosixSpawnp
+    lhsExecve, lhsPosixSpawn, lhsPosixSpawnp, lhsFopen, lhsFopen64, lhsConnect
 
   OpenContext* = object
     path*: cstring
@@ -69,6 +69,33 @@ type
     result*: cint
     nextIndex: int
 
+  FopenContext* = object
+    path*: cstring
+    mode*: cstring
+    result*: pointer
+    symbol: LinuxHookSymbol
+    nextIndex: int
+
+  FreadContext* = object
+    data*: pointer
+    size*: csize_t
+    nmemb*: csize_t
+    stream*: pointer
+    result*: csize_t
+    nextIndex: int
+
+  FcloseContext* = object
+    stream*: pointer
+    result*: cint
+    nextIndex: int
+
+  ConnectContext* = object
+    fd*: cint
+    address*: pointer
+    addrLen*: uint32
+    result*: cint
+    nextIndex: int
+
   ForkContext* = object
     result*: PidT
     nextIndex: int
@@ -100,6 +127,10 @@ type
   OpendirHook* = proc(ctx: var OpendirContext) {.raises: [].}
   ReaddirHook* = proc(ctx: var ReaddirContext) {.raises: [].}
   ClosedirHook* = proc(ctx: var ClosedirContext) {.raises: [].}
+  FopenHook* = proc(ctx: var FopenContext) {.raises: [].}
+  FreadHook* = proc(ctx: var FreadContext) {.raises: [].}
+  FcloseHook* = proc(ctx: var FcloseContext) {.raises: [].}
+  ConnectHook* = proc(ctx: var ConnectContext) {.raises: [].}
   ForkHook* = proc(ctx: var ForkContext) {.raises: [].}
   ExecveHook* = proc(ctx: var ExecveContext) {.raises: [].}
   PosixSpawnHook* = proc(ctx: var PosixSpawnContext) {.raises: [].}
@@ -131,6 +162,18 @@ type
   ClosedirHookEntry = object
     priority: int
     callback: ClosedirHook
+  FopenHookEntry = object
+    priority: int
+    callback: FopenHook
+  FreadHookEntry = object
+    priority: int
+    callback: FreadHook
+  FcloseHookEntry = object
+    priority: int
+    callback: FcloseHook
+  ConnectHookEntry = object
+    priority: int
+    callback: ConnectHook
   ForkHookEntry = object
     priority: int
     callback: ForkHook
@@ -153,6 +196,7 @@ type
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -167,6 +211,10 @@ typedef int (*ct_stat_hook_fn)(char *, void *);
 typedef void *(*ct_opendir_hook_fn)(char *);
 typedef void *(*ct_readdir_hook_fn)(void *);
 typedef int (*ct_closedir_hook_fn)(void *);
+typedef void *(*ct_fopen_hook_fn)(char *, char *);
+typedef size_t (*ct_fread_hook_fn)(void *, size_t, size_t, void *);
+typedef int (*ct_fclose_hook_fn)(void *);
+typedef int (*ct_connect_hook_fn)(int, void *, unsigned int);
 typedef pid_t (*ct_fork_hook_fn)(void);
 typedef int (*ct_execve_hook_fn)(char *, char **, char **);
 typedef int (*ct_posix_spawn_hook_fn)(pid_t *, char *, void *, void *,
@@ -182,6 +230,10 @@ typedef int (*ct_xstat_real_fn)(int, const char *, struct stat *);
 typedef DIR *(*ct_opendir_real_fn)(const char *);
 typedef struct dirent *(*ct_readdir_real_fn)(DIR *);
 typedef int (*ct_closedir_real_fn)(DIR *);
+typedef FILE *(*ct_fopen_real_fn)(const char *, const char *);
+typedef size_t (*ct_fread_real_fn)(void *, size_t, size_t, FILE *);
+typedef int (*ct_fclose_real_fn)(FILE *);
+typedef int (*ct_connect_real_fn)(int, const struct sockaddr *, socklen_t);
 typedef pid_t (*ct_fork_real_fn)(void);
 typedef int (*ct_execve_real_fn)(const char *, char *const [], char *const []);
 typedef int (*ct_posix_spawn_real_fn)(pid_t *, const char *,
@@ -204,6 +256,11 @@ static ct_stat_hook_fn ct_lstat_hook = NULL;
 static ct_opendir_hook_fn ct_opendir_hook = NULL;
 static ct_readdir_hook_fn ct_readdir_hook = NULL;
 static ct_closedir_hook_fn ct_closedir_hook = NULL;
+static ct_fopen_hook_fn ct_fopen_hook = NULL;
+static ct_fopen_hook_fn ct_fopen64_hook = NULL;
+static ct_fread_hook_fn ct_fread_hook = NULL;
+static ct_fclose_hook_fn ct_fclose_hook = NULL;
+static ct_connect_hook_fn ct_connect_hook = NULL;
 static ct_fork_hook_fn ct_fork_hook = NULL;
 static ct_execve_hook_fn ct_execve_hook = NULL;
 static ct_posix_spawn_hook_fn ct_posix_spawn_hook = NULL;
@@ -223,6 +280,11 @@ static ct_xstat_real_fn real_lxstat_ptr = NULL;
 static ct_opendir_real_fn real_opendir_ptr = NULL;
 static ct_readdir_real_fn real_readdir_ptr = NULL;
 static ct_closedir_real_fn real_closedir_ptr = NULL;
+static ct_fopen_real_fn real_fopen_ptr = NULL;
+static ct_fopen_real_fn real_fopen64_ptr = NULL;
+static ct_fread_real_fn real_fread_ptr = NULL;
+static ct_fclose_real_fn real_fclose_ptr = NULL;
+static ct_connect_real_fn real_connect_ptr = NULL;
 static ct_fork_real_fn real_fork_ptr = NULL;
 static ct_execve_real_fn real_execve_ptr = NULL;
 static ct_posix_spawn_real_fn real_posix_spawn_ptr = NULL;
@@ -327,6 +389,11 @@ void ct_linux_preload_register_lstat_hook(ct_stat_hook_fn hook) { ct_lstat_hook 
 void ct_linux_preload_register_opendir_hook(ct_opendir_hook_fn hook) { ct_opendir_hook = hook; }
 void ct_linux_preload_register_readdir_hook(ct_readdir_hook_fn hook) { ct_readdir_hook = hook; }
 void ct_linux_preload_register_closedir_hook(ct_closedir_hook_fn hook) { ct_closedir_hook = hook; }
+void ct_linux_preload_register_fopen_hook(ct_fopen_hook_fn hook) { ct_fopen_hook = hook; }
+void ct_linux_preload_register_fopen64_hook(ct_fopen_hook_fn hook) { ct_fopen64_hook = hook; }
+void ct_linux_preload_register_fread_hook(ct_fread_hook_fn hook) { ct_fread_hook = hook; }
+void ct_linux_preload_register_fclose_hook(ct_fclose_hook_fn hook) { ct_fclose_hook = hook; }
+void ct_linux_preload_register_connect_hook(ct_connect_hook_fn hook) { ct_connect_hook = hook; }
 void ct_linux_preload_register_fork_hook(ct_fork_hook_fn hook) { ct_fork_hook = hook; }
 void ct_linux_preload_register_execve_hook(ct_execve_hook_fn hook) { ct_execve_hook = hook; }
 void ct_linux_preload_register_posix_spawn_hook(ct_posix_spawn_hook_fn hook) { ct_posix_spawn_hook = hook; }
@@ -412,6 +479,37 @@ void *ct_linux_preload_real_readdir(void *dirp) {
 int ct_linux_preload_real_closedir(void *dirp) {
   CT_REAL("closedir", real_closedir_ptr, ct_closedir_real_fn);
   return real_closedir_ptr((DIR *)dirp);
+}
+
+void *ct_linux_preload_real_fopen(char *path, char *mode) {
+  if (real_fopen_ptr == NULL)
+    real_fopen_ptr = (ct_fopen_real_fn)ct_resolve("fopen");
+  if (real_fopen_ptr == NULL) { errno = ENOSYS; return NULL; }
+  return real_fopen_ptr(path, mode);
+}
+
+void *ct_linux_preload_real_fopen64(char *path, char *mode) {
+  if (real_fopen64_ptr == NULL)
+    real_fopen64_ptr = (ct_fopen_real_fn)ct_resolve("fopen64");
+  if (real_fopen64_ptr == NULL) { errno = ENOSYS; return NULL; }
+  return real_fopen64_ptr(path, mode);
+}
+
+size_t ct_linux_preload_real_fread(void *buf, size_t size, size_t nmemb, void *stream) {
+  if (real_fread_ptr == NULL)
+    real_fread_ptr = (ct_fread_real_fn)ct_resolve("fread");
+  if (real_fread_ptr == NULL) { errno = ENOSYS; return 0; }
+  return real_fread_ptr(buf, size, nmemb, (FILE *)stream);
+}
+
+int ct_linux_preload_real_fclose(void *stream) {
+  CT_REAL("fclose", real_fclose_ptr, ct_fclose_real_fn);
+  return real_fclose_ptr((FILE *)stream);
+}
+
+int ct_linux_preload_real_connect(int fd, void *addr, unsigned int addrlen) {
+  CT_REAL("connect", real_connect_ptr, ct_connect_real_fn);
+  return real_connect_ptr(fd, (const struct sockaddr *)addr, (socklen_t)addrlen);
 }
 
 pid_t ct_linux_preload_real_fork(void) {
@@ -558,6 +656,43 @@ int closedir(DIR *dirp) {
   return CT_CALL_HOOK(ct_closedir_hook((void *)dirp));
 }
 
+FILE *fopen(const char *path, const char *mode) __attribute__((visibility("default")));
+FILE *fopen(const char *path, const char *mode) {
+  if (CT_BYPASS() || ct_fopen_hook == NULL)
+    return (FILE *)ct_linux_preload_real_fopen((char *)path, (char *)mode);
+  return (FILE *)CT_CALL_HOOK(ct_fopen_hook((char *)path, (char *)mode));
+}
+
+FILE *fopen64(const char *path, const char *mode) __attribute__((visibility("default")));
+FILE *fopen64(const char *path, const char *mode) {
+  if (CT_BYPASS() || ct_fopen64_hook == NULL)
+    return (FILE *)ct_linux_preload_real_fopen64((char *)path, (char *)mode);
+  return (FILE *)CT_CALL_HOOK(ct_fopen64_hook((char *)path, (char *)mode));
+}
+
+size_t fread(void *buf, size_t size, size_t nmemb, FILE *stream)
+    __attribute__((visibility("default")));
+size_t fread(void *buf, size_t size, size_t nmemb, FILE *stream) {
+  if (CT_BYPASS() || ct_fread_hook == NULL)
+    return ct_linux_preload_real_fread(buf, size, nmemb, (void *)stream);
+  return CT_CALL_HOOK(ct_fread_hook(buf, size, nmemb, (void *)stream));
+}
+
+int fclose(FILE *stream) __attribute__((visibility("default")));
+int fclose(FILE *stream) {
+  if (CT_BYPASS() || ct_fclose_hook == NULL)
+    return ct_linux_preload_real_fclose((void *)stream);
+  return CT_CALL_HOOK(ct_fclose_hook((void *)stream));
+}
+
+int connect(int fd, const struct sockaddr *addr, socklen_t addrlen)
+    __attribute__((visibility("default")));
+int connect(int fd, const struct sockaddr *addr, socklen_t addrlen) {
+  if (CT_BYPASS() || ct_connect_hook == NULL)
+    return ct_linux_preload_real_connect(fd, (void *)addr, (unsigned int)addrlen);
+  return CT_CALL_HOOK(ct_connect_hook(fd, (void *)addr, (unsigned int)addrlen));
+}
+
 pid_t fork(void) __attribute__((visibility("default")));
 pid_t fork(void) {
   if (CT_BYPASS() || ct_fork_hook == NULL)
@@ -662,6 +797,16 @@ proc realReaddir*(dirp: pointer): pointer
   {.importc: "ct_linux_preload_real_readdir", raises: [].}
 proc realClosedir*(dirp: pointer): cint
   {.importc: "ct_linux_preload_real_closedir", raises: [].}
+proc realFopen*(path, mode: cstring): pointer
+  {.importc: "ct_linux_preload_real_fopen", raises: [].}
+proc realFopen64*(path, mode: cstring): pointer
+  {.importc: "ct_linux_preload_real_fopen64", raises: [].}
+proc realFread*(buf: pointer; size, nmemb: csize_t; stream: pointer): csize_t
+  {.importc: "ct_linux_preload_real_fread", raises: [].}
+proc realFclose*(stream: pointer): cint
+  {.importc: "ct_linux_preload_real_fclose", raises: [].}
+proc realConnect*(fd: cint; address: pointer; addrLen: uint32): cint
+  {.importc: "ct_linux_preload_real_connect", raises: [].}
 proc realFork*(): PidT {.importc: "ct_linux_preload_real_fork", raises: [].}
 proc realExecve*(path: cstring; argv, envp: cstringArray): cint
   {.importc: "ct_linux_preload_real_execve", raises: [].}
@@ -686,6 +831,12 @@ type
   OpendirDispatch = proc(path: cstring): pointer {.cdecl, raises: [].}
   ReaddirDispatch = proc(dirp: pointer): pointer {.cdecl, raises: [].}
   ClosedirDispatch = proc(dirp: pointer): cint {.cdecl, raises: [].}
+  FopenDispatch = proc(path, mode: cstring): pointer {.cdecl, raises: [].}
+  FreadDispatch = proc(buf: pointer; size, nmemb: csize_t; stream: pointer):
+    csize_t {.cdecl, raises: [].}
+  FcloseDispatch = proc(stream: pointer): cint {.cdecl, raises: [].}
+  ConnectDispatch = proc(fd: cint; address: pointer; addrLen: uint32): cint
+    {.cdecl, raises: [].}
   ForkDispatch = proc(): PidT {.cdecl, raises: [].}
   ExecveDispatch = proc(path: cstring; argv, envp: cstringArray): cint
     {.cdecl, raises: [].}
@@ -717,6 +868,16 @@ proc installReaddirDispatcher(dispatch: ReaddirDispatch)
   {.importc: "ct_linux_preload_register_readdir_hook", raises: [].}
 proc installClosedirDispatcher(dispatch: ClosedirDispatch)
   {.importc: "ct_linux_preload_register_closedir_hook", raises: [].}
+proc installFopenDispatcher(dispatch: FopenDispatch)
+  {.importc: "ct_linux_preload_register_fopen_hook", raises: [].}
+proc installFopen64Dispatcher(dispatch: FopenDispatch)
+  {.importc: "ct_linux_preload_register_fopen64_hook", raises: [].}
+proc installFreadDispatcher(dispatch: FreadDispatch)
+  {.importc: "ct_linux_preload_register_fread_hook", raises: [].}
+proc installFcloseDispatcher(dispatch: FcloseDispatch)
+  {.importc: "ct_linux_preload_register_fclose_hook", raises: [].}
+proc installConnectDispatcher(dispatch: ConnectDispatch)
+  {.importc: "ct_linux_preload_register_connect_hook", raises: [].}
 proc installForkDispatcher(dispatch: ForkDispatch)
   {.importc: "ct_linux_preload_register_fork_hook", raises: [].}
 proc installExecveDispatcher(dispatch: ExecveDispatch)
@@ -739,6 +900,11 @@ var
   opendirHooks: seq[OpendirHookEntry] = @[]
   readdirHooks: seq[ReaddirHookEntry] = @[]
   closedirHooks: seq[ClosedirHookEntry] = @[]
+  fopenHooks: seq[FopenHookEntry] = @[]
+  fopen64Hooks: seq[FopenHookEntry] = @[]
+  freadHooks: seq[FreadHookEntry] = @[]
+  fcloseHooks: seq[FcloseHookEntry] = @[]
+  connectHooks: seq[ConnectHookEntry] = @[]
   forkHooks: seq[ForkHookEntry] = @[]
   execveHooks: seq[ExecveHookEntry] = @[]
   posixSpawnHooks: seq[PosixSpawnHookEntry] = @[]
@@ -816,6 +982,36 @@ proc registerClosedirHook*(hook: ClosedirHook; priority = 100) {.raises: [].} =
   closedirHooks.add(ClosedirHookEntry(priority: priority, callback: hook))
   closedirHooks.sort(proc(a, b: ClosedirHookEntry): int = cmp(a.priority, b.priority))
 
+proc registerFopenHook*(hook: FopenHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  fopenHooks.add(FopenHookEntry(priority: priority, callback: hook))
+  fopenHooks.sort(proc(a, b: FopenHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerFopen64Hook*(hook: FopenHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  fopen64Hooks.add(FopenHookEntry(priority: priority, callback: hook))
+  fopen64Hooks.sort(proc(a, b: FopenHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerFreadHook*(hook: FreadHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  freadHooks.add(FreadHookEntry(priority: priority, callback: hook))
+  freadHooks.sort(proc(a, b: FreadHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerFcloseHook*(hook: FcloseHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  fcloseHooks.add(FcloseHookEntry(priority: priority, callback: hook))
+  fcloseHooks.sort(proc(a, b: FcloseHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerConnectHook*(hook: ConnectHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  connectHooks.add(ConnectHookEntry(priority: priority, callback: hook))
+  connectHooks.sort(proc(a, b: ConnectHookEntry): int = cmp(a.priority, b.priority))
+
 proc registerForkHook*(hook: ForkHook; priority = 100) {.raises: [].} =
   if hook == nil:
     return
@@ -880,6 +1076,22 @@ proc callReal*(ctx: var ReaddirContext) {.raises: [].} =
 
 proc callReal*(ctx: var ClosedirContext) {.raises: [].} =
   ctx.result = realClosedir(ctx.dirp)
+
+proc callReal*(ctx: var FopenContext) {.raises: [].} =
+  case ctx.symbol
+  of lhsFopen64:
+    ctx.result = realFopen64(ctx.path, ctx.mode)
+  else:
+    ctx.result = realFopen(ctx.path, ctx.mode)
+
+proc callReal*(ctx: var FreadContext) {.raises: [].} =
+  ctx.result = realFread(ctx.data, ctx.size, ctx.nmemb, ctx.stream)
+
+proc callReal*(ctx: var FcloseContext) {.raises: [].} =
+  ctx.result = realFclose(ctx.stream)
+
+proc callReal*(ctx: var ConnectContext) {.raises: [].} =
+  ctx.result = realConnect(ctx.fd, ctx.address, ctx.addrLen)
 
 proc callReal*(ctx: var ForkContext) {.raises: [].} =
   ctx.result = realFork()
@@ -995,6 +1207,47 @@ proc callNext*(ctx: var ClosedirContext) {.raises: [].} =
   else:
     callReal(ctx)
 
+proc callNext*(ctx: var FopenContext) {.raises: [].} =
+  case ctx.symbol
+  of lhsFopen64:
+    if ctx.nextIndex < fopen64Hooks.len:
+      let index = ctx.nextIndex
+      inc ctx.nextIndex
+      fopen64Hooks[index].callback(ctx)
+    else:
+      callReal(ctx)
+  else:
+    if ctx.nextIndex < fopenHooks.len:
+      let index = ctx.nextIndex
+      inc ctx.nextIndex
+      fopenHooks[index].callback(ctx)
+    else:
+      callReal(ctx)
+
+proc callNext*(ctx: var FreadContext) {.raises: [].} =
+  if ctx.nextIndex < freadHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    freadHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var FcloseContext) {.raises: [].} =
+  if ctx.nextIndex < fcloseHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    fcloseHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var ConnectContext) {.raises: [].} =
+  if ctx.nextIndex < connectHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    connectHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
 proc callNext*(ctx: var ForkContext) {.raises: [].} =
   if ctx.nextIndex < forkHooks.len:
     let index = ctx.nextIndex
@@ -1096,6 +1349,35 @@ proc dispatchClosedir(dirp: pointer): cint {.cdecl, raises: [].} =
   callNext(ctx)
   result = ctx.result
 
+proc dispatchFopen(path, mode: cstring): pointer {.cdecl, raises: [].} =
+  var ctx = FopenContext(path: path, mode: mode, result: nil, symbol: lhsFopen)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchFopen64(path, mode: cstring): pointer {.cdecl, raises: [].} =
+  var ctx = FopenContext(path: path, mode: mode, result: nil, symbol: lhsFopen64)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchFread(buf: pointer; size, nmemb: csize_t; stream: pointer): csize_t
+    {.cdecl, raises: [].} =
+  var ctx = FreadContext(data: buf, size: size, nmemb: nmemb, stream: stream,
+                         result: 0)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchFclose(stream: pointer): cint {.cdecl, raises: [].} =
+  var ctx = FcloseContext(stream: stream, result: -1)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchConnect(fd: cint; address: pointer; addrLen: uint32): cint
+    {.cdecl, raises: [].} =
+  var ctx = ConnectContext(fd: fd, address: address, addrLen: addrLen,
+                           result: -1)
+  callNext(ctx)
+  result = ctx.result
+
 proc dispatchFork(): PidT {.cdecl, raises: [].} =
   var ctx = ForkContext(result: -1)
   callNext(ctx)
@@ -1135,6 +1417,11 @@ installLstatDispatcher(dispatchLstat)
 installOpendirDispatcher(dispatchOpendir)
 installReaddirDispatcher(dispatchReaddir)
 installClosedirDispatcher(dispatchClosedir)
+installFopenDispatcher(dispatchFopen)
+installFopen64Dispatcher(dispatchFopen64)
+installFreadDispatcher(dispatchFread)
+installFcloseDispatcher(dispatchFclose)
+installConnectDispatcher(dispatchConnect)
 installForkDispatcher(dispatchFork)
 installExecveDispatcher(dispatchExecve)
 installPosixSpawnDispatcher(dispatchPosixSpawn)
