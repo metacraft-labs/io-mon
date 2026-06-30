@@ -160,7 +160,8 @@ type
   ForkHook* = proc(ctx: var ForkContext) {.raises: [].}
   ExecveHook* = proc(ctx: var ExecveContext) {.raises: [].}
   PosixSpawnHook* = proc(ctx: var PosixSpawnContext) {.raises: [].}
-  RawSyscallHook* = proc(number: clong) {.raises: [].}
+  RawSyscallHook* = proc(number, a1, a2, a3, a4, a5, a6, result: clong;
+                         inlineTrap: cint) {.raises: [].}
 
   OpenHookEntry = object
     priority: int
@@ -292,8 +293,23 @@ static ct_fork_hook_fn ct_fork_hook = NULL;
 static ct_execve_hook_fn ct_execve_hook = NULL;
 static ct_posix_spawn_hook_fn ct_posix_spawn_hook = NULL;
 static ct_posix_spawn_hook_fn ct_posix_spawnp_hook = NULL;
-typedef void (*ct_raw_syscall_hook_fn)(long);
+typedef void (*ct_raw_syscall_hook_fn)(long, long, long, long, long, long, long,
+                                       long, int);
 static ct_raw_syscall_hook_fn ct_raw_syscall_hook = NULL;
+
+#define CT_RAW_SYSCALL_EVENT_CAP 4096
+#define CT_RAW_SYSCALL_SOURCE_LIBC 0
+#define CT_RAW_SYSCALL_SOURCE_INLINE 1
+struct ct_raw_syscall_event {
+  long nr;
+  long args[6];
+  long result;
+  int source;
+  unsigned long address;
+};
+static struct ct_raw_syscall_event ct_raw_syscall_events[CT_RAW_SYSCALL_EVENT_CAP];
+static volatile sig_atomic_t ct_raw_syscall_event_count_value = 0;
+static volatile sig_atomic_t ct_raw_syscall_event_overflow_value = 0;
 
 static ct_open_real_fn real_open_ptr = NULL;
 static ct_open_real_fn real_open64_ptr = NULL;
@@ -355,6 +371,50 @@ static void *ct_resolve(const char *name) {
   return stackable_linux_preload_resolve_next(name);
 }
 
+static void ct_record_raw_syscall_event(long nr, const long args[6],
+                                        long result, int source,
+                                        unsigned long address) {
+  sig_atomic_t count = ct_raw_syscall_event_count_value;
+  if (count >= CT_RAW_SYSCALL_EVENT_CAP) {
+    ct_raw_syscall_event_overflow_value = 1;
+    return;
+  }
+  struct ct_raw_syscall_event *event = &ct_raw_syscall_events[count];
+  event->nr = nr;
+  for (int i = 0; i < 6; i++) event->args[i] = args[i];
+  event->result = result;
+  event->source = source;
+  event->address = address;
+  ct_raw_syscall_event_count_value = count + 1;
+}
+
+long ct_linux_raw_syscall_event_count(void) {
+  return (long)ct_raw_syscall_event_count_value;
+}
+
+int ct_linux_raw_syscall_event_overflowed(void) {
+  return ct_raw_syscall_event_overflow_value != 0;
+}
+
+int ct_linux_raw_syscall_event_at(long index, long *nr, long *a1, long *a2,
+                                  long *a3, long *a4, long *a5, long *a6,
+                                  long *result, int *source,
+                                  unsigned long *address) {
+  if (index < 0 || index >= ct_raw_syscall_event_count_value) return -1;
+  struct ct_raw_syscall_event *event = &ct_raw_syscall_events[index];
+  if (nr) *nr = event->nr;
+  if (a1) *a1 = event->args[0];
+  if (a2) *a2 = event->args[1];
+  if (a3) *a3 = event->args[2];
+  if (a4) *a4 = event->args[3];
+  if (a5) *a5 = event->args[4];
+  if (a6) *a6 = event->args[5];
+  if (result) *result = event->result;
+  if (source) *source = event->source;
+  if (address) *address = event->address;
+  return 0;
+}
+
 static int ct_inline_syscall_site_index(unsigned long address) {
   sig_atomic_t count = ct_inline_syscall_site_count_value;
   for (sig_atomic_t i = 0; i < count; i++) {
@@ -370,6 +430,8 @@ void ct_linux_inline_syscall_reset(void) {
   ct_inline_syscall_last_nr_value = -1;
   ct_inline_syscall_overflow_value = 0;
   ct_inline_syscall_last_address_value = 0;
+  ct_raw_syscall_event_count_value = 0;
+  ct_raw_syscall_event_overflow_value = 0;
 }
 
 int ct_linux_inline_syscall_record_site(unsigned long address) {
@@ -401,6 +463,9 @@ static void ct_linux_inline_syscall_sigtrap_handler(
   ct_inline_syscall_last_nr_value = (sig_atomic_t)regs.nr;
   ct_inline_syscall_last_address_value = regs.syscall_address;
   long result = stackable_linux_replay_syscall_regs(&regs);
+  ct_record_raw_syscall_event(regs.nr, regs.args, result,
+                              CT_RAW_SYSCALL_SOURCE_INLINE,
+                              regs.syscall_address);
   rc = stackable_linux_write_syscall_result_to_ucontext(
       ucontext, result, regs.resume_rip);
   if (rc == 0) {
@@ -556,10 +621,16 @@ long ct_linux_preload_syscall_replacement(long nr, long a1, long a2, long a3,
     __attribute__((visibility("default")));
 long ct_linux_preload_syscall_replacement(long nr, long a1, long a2, long a3,
                                           long a4, long a5, long a6) {
+  long result = stackable_linux_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
   if (!CT_BYPASS() && ct_raw_syscall_hook != NULL) {
-    CT_CALL_HOOK((ct_raw_syscall_hook(nr), 0));
+    CT_CALL_HOOK((ct_raw_syscall_hook(nr, a1, a2, a3, a4, a5, a6, result,
+                                      CT_RAW_SYSCALL_SOURCE_LIBC), 0));
   }
-  return ct_linux_preload_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
+  if (result < 0 && result >= -4095) {
+    errno = (int)-result;
+    return -1;
+  }
+  return result;
 }
 
 static int ct_real_open_common(ct_open_real_fn *slot, const char *symbol,
@@ -1006,7 +1077,8 @@ type
   PosixSpawnDispatch = proc(pid: ptr PidT; path: cstring; fileActions,
                            attrp: pointer; argv, envp: cstringArray): cint
     {.cdecl, raises: [].}
-  RawSyscallDispatch = proc(number: clong) {.cdecl, raises: [].}
+  RawSyscallDispatch = proc(number, a1, a2, a3, a4, a5, a6, result: clong;
+                            inlineTrap: cint) {.cdecl, raises: [].}
 
 proc rawSyscallReplacement(number, a1, a2, a3, a4, a5, a6: clong): clong
   {.importc: "ct_linux_preload_syscall_replacement", cdecl, raises: [].}
@@ -1028,6 +1100,14 @@ proc cInlineSyscallLastAddress(): culong
   {.importc: "ct_linux_inline_syscall_last_address", raises: [].}
 proc cInlineSyscallOverflowed(): cint
   {.importc: "ct_linux_inline_syscall_overflowed", raises: [].}
+proc cRawSyscallEventCount(): clong
+  {.importc: "ct_linux_raw_syscall_event_count", raises: [].}
+proc cRawSyscallEventOverflowed(): cint
+  {.importc: "ct_linux_raw_syscall_event_overflowed", raises: [].}
+proc cRawSyscallEventAt(index: clong; number, a1, a2, a3, a4, a5, a6,
+                        result: ptr clong; source: ptr cint;
+                        address: ptr culong): cint
+  {.importc: "ct_linux_raw_syscall_event_at", raises: [].}
 
 proc installOpenDispatcher(dispatch: OpenDispatch)
   {.importc: "ct_linux_preload_register_open_hook", raises: [].}
@@ -1242,9 +1322,31 @@ proc registerPosixSpawnpHook*(hook: PosixSpawnHook; priority = 100) {.raises: []
 proc registerRawSyscallHook*(hook: RawSyscallHook) {.raises: [].} =
   rawSyscallHook = hook
 
-proc rawSyscallDispatcher(number: clong) {.cdecl, raises: [].} =
+proc rawSyscallDispatcher(number, a1, a2, a3, a4, a5, a6, result: clong;
+                          inlineTrap: cint) {.cdecl, raises: [].} =
   if rawSyscallHook != nil:
-    rawSyscallHook(number)
+    rawSyscallHook(number, a1, a2, a3, a4, a5, a6, result, inlineTrap)
+
+proc rawSyscallEventCount*(): int {.raises: [].} =
+  int(cRawSyscallEventCount())
+
+proc rawSyscallEventOverflowed*(): bool {.raises: [].} =
+  cRawSyscallEventOverflowed() != 0
+
+proc rawSyscallEventAt*(index: int):
+    tuple[ok: bool, number, a1, a2, a3, a4, a5, a6, result: clong,
+          source: cint, address: uint] {.raises: [].} =
+  var
+    number, a1, a2, a3, a4, a5, a6, callResult: clong
+    source: cint
+    address: culong
+  let rc = cRawSyscallEventAt(clong(index), addr number, addr a1, addr a2,
+    addr a3, addr a4, addr a5, addr a6, addr callResult, addr source,
+    addr address)
+  if rc != 0:
+    return (false, 0.clong, 0.clong, 0.clong, 0.clong, 0.clong, 0.clong,
+      0.clong, 0.clong, 0.cint, 0'u)
+  (true, number, a1, a2, a3, a4, a5, a6, callResult, source, uint(address))
 
 proc installRawSyscallWrapperPatch*(): RawSyscallPatchStatus {.raises: [].} =
   if rawSyscallPatchAttempted:

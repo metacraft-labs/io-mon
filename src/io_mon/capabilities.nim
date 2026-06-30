@@ -375,9 +375,9 @@ proc linuxPreloadMonitorProfile*(
       "backend is unavailable in M14")
   result.diagnostics.add MonitorDiagnostic(
     level: mdlInfo,
-    message: "Linux exported libc syscall(2) wrapper coverage is " &
-      "stackable-backed and fail-closed; main-executable inline 0f05 " &
-      "scanner/SIGTRAP coverage is stackable-backed and fail-closed")
+    message: "Linux raw syscall coverage is stackable-backed; io-mon " &
+      "classifies common file/probe syscalls and fails closed for " &
+      "unsupported raw syscall numbers")
 
   var gapCapabilities = LinuxPreloadKnownUnsupportedCapabilities
   for capability in required:
