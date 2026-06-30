@@ -23,10 +23,12 @@ var
   recordLock: Lock
   fdLock: Lock
   dirLock: Lock
+  streamLock: Lock
   fragmentDir: string
   nextProcessSeq: uint64 = 0
   fdPaths = initTable[cint, string]()
   dirPaths = initTable[uint, string]()
+  streamPaths = initTable[uint, string]()
   # Thread id of the thread that ran the preload constructor (the process
   # main thread). Its fragment batch is flushed by the process-exit
   # destructor; worker threads flush eagerly per record (see emitRecord),
@@ -39,6 +41,10 @@ var
   inForkChild {.threadvar.}: bool
 
 {.emit: """
+#define _GNU_SOURCE
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <netinet/in.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <errno.h>
@@ -53,6 +59,23 @@ int repro_linux_get_errno(void) {
 
 void repro_linux_set_errno(int value) {
   errno = value;
+}
+
+int repro_linux_errno_is_connect_in_progress(int value) {
+  return value == EINPROGRESS || value == EALREADY || value == EWOULDBLOCK;
+}
+
+int repro_linux_sockaddr_family(void *addr, unsigned int addrlen) {
+  if (addr == NULL || addrlen < sizeof(sa_family_t)) return 0;
+  return ((struct sockaddr *)addr)->sa_family;
+}
+
+long repro_linux_socket_peer_pid(int fd) {
+  struct ucred cred;
+  socklen_t len = sizeof(cred);
+  if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0)
+    return (long)cred.pid;
+  return 0;
 }
 
 extern int repro_monitor_shim_init(char *configPath);
@@ -78,6 +101,12 @@ proc c_getppid(): cint {.importc: "getppid", header: "<unistd.h>".}
 proc c_gettid(): clong {.importc: "repro_linux_gettid", raises: [].}
 proc c_get_errno(): cint {.importc: "repro_linux_get_errno", raises: [].}
 proc c_set_errno(value: cint) {.importc: "repro_linux_set_errno", raises: [].}
+proc c_errno_is_connect_in_progress(value: cint): cint
+  {.importc: "repro_linux_errno_is_connect_in_progress", raises: [].}
+proc c_sockaddr_family(address: pointer; addrLen: uint32): cint
+  {.importc: "repro_linux_sockaddr_family", raises: [].}
+proc c_socket_peer_pid(fd: cint): clong
+  {.importc: "repro_linux_socket_peer_pid", raises: [].}
 
 proc currentThreadId(): uint64 =
   uint64(c_gettid())
@@ -188,6 +217,26 @@ proc pathForDir(dirp: pointer): string =
   result = dirPaths.getOrDefault(dirKey(dirp), "")
   release(dirLock)
 
+proc streamKey(stream: pointer): uint =
+  cast[uint](stream)
+
+proc updateStreamPath(stream: pointer; path: cstring) =
+  if stream == nil or path == nil:
+    return
+  acquire(streamLock)
+  streamPaths[streamKey(stream)] = $path
+  release(streamLock)
+
+proc removeStreamPath(stream: pointer) =
+  acquire(streamLock)
+  streamPaths.del(streamKey(stream))
+  release(streamLock)
+
+proc pathForStream(stream: pointer): string =
+  acquire(streamLock)
+  result = streamPaths.getOrDefault(streamKey(stream), "")
+  release(streamLock)
+
 proc probeFromResult(callResult: cint): ProbeResult =
   if callResult == 0:
     prExistingOther
@@ -201,6 +250,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     initLock(recordLock)
     initLock(fdLock)
     initLock(dirLock)
+    initLock(streamLock)
     locksReady = true
   acquire(initLockVar)
   defer: release(initLockVar)
@@ -388,6 +438,108 @@ proc repro_hook_closedir*(ctx: var ClosedirContext) {.raises: [].} =
   removeDirPath(ctx.dirp)
   c_set_errno(savedErrno)
 
+proc modeLooksReadable(mode: cstring): bool =
+  if mode == nil or mode[0] == '\0':
+    return true
+  if mode[0] == 'r':
+    return true
+  var i = 0
+  while mode[i] != '\0':
+    if mode[i] == '+':
+      return true
+    inc i
+  result = false
+
+proc recordFopen(path, mode: cstring; stream: pointer) {.raises: [].} =
+  if stream != nil:
+    updateStreamPath(stream, path)
+  var record = baseRecord(mrFileOpen,
+    if modeLooksReadable(mode): moFileOpen else: moFileWrite)
+  record.result = cast[int64](stream)
+  if path != nil:
+    record.path = $path
+  if mode != nil:
+    record.detail = "stdio:" & $mode
+  emitRecord(record)
+
+proc repro_hook_fopen*(ctx: var FopenContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  recordFopen(ctx.path, ctx.mode, ctx.result)
+  c_set_errno(savedErrno)
+
+proc repro_hook_fopen64*(ctx: var FopenContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  recordFopen(ctx.path, ctx.mode, ctx.result)
+  c_set_errno(savedErrno)
+
+proc repro_hook_fread*(ctx: var FreadContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result > 0:
+    var record = baseRecord(mrFileRead, moFileRead)
+    record.path = pathForStream(ctx.stream)
+    record.result = int64(ctx.result * ctx.size)
+    emitRecord(record)
+  c_set_errno(savedErrno)
+
+proc repro_hook_fclose*(ctx: var FcloseContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  removeStreamPath(ctx.stream)
+  c_set_errno(savedErrno)
+
+proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32) {.raises: [].} =
+  let family = c_sockaddr_family(address, addrLen)
+  if family == 0:
+    return
+  var peerPid: uint64 = 0
+  var familyName = "af_other"
+  case family
+  of 1: # AF_UNIX
+    familyName = "af_unix"
+    let pid = c_socket_peer_pid(fd)
+    if pid > 0:
+      peerPid = uint64(pid)
+  of 2, 10: # AF_INET / AF_INET6
+    familyName = "af_inet"
+  else:
+    discard
+
+  var record = baseRecord(mrIpcConnect, moIpcConnect)
+  record.childOsPid = peerPid
+  record.result = int64(fd)
+  record.detail = "connect " & familyName &
+    (if peerPid == 0: " peer=unknown" else: " peer=" & $peerPid)
+  emitRecord(record)
+
+proc repro_hook_connect*(ctx: var ConnectContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0 or c_errno_is_connect_in_progress(savedErrno) != 0:
+    recordIpcConnect(ctx.fd, ctx.address, ctx.addrLen)
+  c_set_errno(savedErrno)
+
 proc processIsSingleThreaded(): bool {.raises: [].} =
   ## True iff the current process has exactly one thread. Read in the PARENT
   ## BEFORE fork so the child — which inherits the answer copy-on-write — knows
@@ -513,6 +665,11 @@ registerLstatHook(repro_hook_lstat)
 registerOpendirHook(repro_hook_opendir)
 registerReaddirHook(repro_hook_readdir)
 registerClosedirHook(repro_hook_closedir)
+registerFopenHook(repro_hook_fopen)
+registerFopen64Hook(repro_hook_fopen64)
+registerFreadHook(repro_hook_fread)
+registerFcloseHook(repro_hook_fclose)
+registerConnectHook(repro_hook_connect)
 registerForkHook(repro_hook_fork)
 registerExecveHook(repro_hook_execve)
 registerPosixSpawnHook(repro_hook_posix_spawn)
