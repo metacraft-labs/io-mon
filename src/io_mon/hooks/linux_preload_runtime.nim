@@ -4,10 +4,12 @@ when not defined(linux):
 import std/algorithm
 
 import stackable_hooks/platform/linux_preload
+import stackable_hooks/platform/linux_raw_syscalls
 
 const linuxPreloadBackend* = "stackable_hooks/platform/linux_preload"
 static:
   doAssert compiles(currentPreloadHookDepth())
+  doAssert compiles(installAbsoluteJumpPatchTransaction(nil, nil))
 
 type
   PidT* = int32
@@ -124,6 +126,13 @@ type
     symbol: LinuxHookSymbol
     nextIndex: int
 
+  RawSyscallPatchStatus* = object
+    installed*: bool
+    diagnostic*: LinuxRawSyscallDiagnostic
+    stage*: LinuxPatchStage
+    osErrno*: cint
+    target*: pointer
+
   OpenHook* = proc(ctx: var OpenContext) {.raises: [].}
   OpenatHook* = proc(ctx: var OpenatContext) {.raises: [].}
   CloseHook* = proc(ctx: var CloseContext) {.raises: [].}
@@ -140,6 +149,7 @@ type
   ForkHook* = proc(ctx: var ForkContext) {.raises: [].}
   ExecveHook* = proc(ctx: var ExecveContext) {.raises: [].}
   PosixSpawnHook* = proc(ctx: var PosixSpawnContext) {.raises: [].}
+  RawSyscallHook* = proc(number: clong) {.raises: [].}
 
   OpenHookEntry = object
     priority: int
@@ -270,6 +280,8 @@ static ct_fork_hook_fn ct_fork_hook = NULL;
 static ct_execve_hook_fn ct_execve_hook = NULL;
 static ct_posix_spawn_hook_fn ct_posix_spawn_hook = NULL;
 static ct_posix_spawn_hook_fn ct_posix_spawnp_hook = NULL;
+typedef void (*ct_raw_syscall_hook_fn)(long);
+static ct_raw_syscall_hook_fn ct_raw_syscall_hook = NULL;
 
 static ct_open_real_fn real_open_ptr = NULL;
 static ct_open_real_fn real_open64_ptr = NULL;
@@ -299,6 +311,8 @@ extern void *stackable_linux_preload_resolve_next(const char *name);
 extern int stackable_linux_preload_hooks_allowed(void);
 extern void stackable_linux_preload_enter_hook(void);
 extern void stackable_linux_preload_exit_hook(void);
+extern long stackable_linux_raw_syscall6(long nr, long a1, long a2, long a3,
+                                         long a4, long a5, long a6);
 
 static void *ct_resolve(const char *name) {
   return stackable_linux_preload_resolve_next(name);
@@ -405,6 +419,28 @@ void ct_linux_preload_register_fork_hook(ct_fork_hook_fn hook) { ct_fork_hook = 
 void ct_linux_preload_register_execve_hook(ct_execve_hook_fn hook) { ct_execve_hook = hook; }
 void ct_linux_preload_register_posix_spawn_hook(ct_posix_spawn_hook_fn hook) { ct_posix_spawn_hook = hook; }
 void ct_linux_preload_register_posix_spawnp_hook(ct_posix_spawn_hook_fn hook) { ct_posix_spawnp_hook = hook; }
+void ct_linux_preload_register_raw_syscall_hook(ct_raw_syscall_hook_fn hook) { ct_raw_syscall_hook = hook; }
+
+static long ct_linux_preload_raw_syscall6(long nr, long a1, long a2, long a3,
+                                          long a4, long a5, long a6) {
+  long result = stackable_linux_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
+  if (result < 0 && result >= -4095) {
+    errno = (int)-result;
+    return -1;
+  }
+  return result;
+}
+
+long ct_linux_preload_syscall_replacement(long nr, long a1, long a2, long a3,
+                                          long a4, long a5, long a6)
+    __attribute__((visibility("default")));
+long ct_linux_preload_syscall_replacement(long nr, long a1, long a2, long a3,
+                                          long a4, long a5, long a6) {
+  if (!CT_BYPASS() && ct_raw_syscall_hook != NULL) {
+    CT_CALL_HOOK((ct_raw_syscall_hook(nr), 0));
+  }
+  return ct_linux_preload_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
+}
 
 static int ct_real_open_common(ct_open_real_fn *slot, const char *symbol,
                                char *path, int flags, int mode) {
@@ -850,6 +886,10 @@ type
   PosixSpawnDispatch = proc(pid: ptr PidT; path: cstring; fileActions,
                            attrp: pointer; argv, envp: cstringArray): cint
     {.cdecl, raises: [].}
+  RawSyscallDispatch = proc(number: clong) {.cdecl, raises: [].}
+
+proc rawSyscallReplacement(number, a1, a2, a3, a4, a5, a6: clong): clong
+  {.importc: "ct_linux_preload_syscall_replacement", cdecl, raises: [].}
 
 proc installOpenDispatcher(dispatch: OpenDispatch)
   {.importc: "ct_linux_preload_register_open_hook", raises: [].}
@@ -893,6 +933,8 @@ proc installPosixSpawnDispatcher(dispatch: PosixSpawnDispatch)
   {.importc: "ct_linux_preload_register_posix_spawn_hook", raises: [].}
 proc installPosixSpawnpDispatcher(dispatch: PosixSpawnDispatch)
   {.importc: "ct_linux_preload_register_posix_spawnp_hook", raises: [].}
+proc installRawSyscallDispatcher(dispatch: RawSyscallDispatch)
+  {.importc: "ct_linux_preload_register_raw_syscall_hook", raises: [].}
 
 var
   openHooks: seq[OpenHookEntry] = @[]
@@ -916,6 +958,12 @@ var
   execveHooks: seq[ExecveHookEntry] = @[]
   posixSpawnHooks: seq[PosixSpawnHookEntry] = @[]
   posixSpawnpHooks: seq[PosixSpawnHookEntry] = @[]
+  rawSyscallHook: RawSyscallHook = nil
+  rawSyscallPatchAttempted = false
+  rawSyscallPatchStatus = RawSyscallPatchStatus(
+    installed: false,
+    diagnostic: lrsInvalidArgument,
+    stage: lpsNone)
 
 proc registerOpenHook*(hook: OpenHook; priority = 100) {.raises: [].} =
   if hook == nil:
@@ -1044,6 +1092,44 @@ proc registerPosixSpawnpHook*(hook: PosixSpawnHook; priority = 100) {.raises: []
   posixSpawnpHooks.add(PosixSpawnHookEntry(priority: priority, callback: hook))
   posixSpawnpHooks.sort(proc(a, b: PosixSpawnHookEntry): int =
     cmp(a.priority, b.priority))
+
+proc registerRawSyscallHook*(hook: RawSyscallHook) {.raises: [].} =
+  rawSyscallHook = hook
+
+proc rawSyscallDispatcher(number: clong) {.cdecl, raises: [].} =
+  if rawSyscallHook != nil:
+    rawSyscallHook(number)
+
+proc installRawSyscallWrapperPatch*(): RawSyscallPatchStatus {.raises: [].} =
+  if rawSyscallPatchAttempted:
+    return rawSyscallPatchStatus
+  rawSyscallPatchAttempted = true
+  result.diagnostic = linuxRawSyscallSupported()
+  result.stage = lpsNone
+  if result.diagnostic != lrsOk:
+    rawSyscallPatchStatus = result
+    return
+  let target = resolveDefaultSymbol("syscall")
+  result.target = target
+  if target == nil:
+    result.diagnostic = lrsSymbolNotFound
+    rawSyscallPatchStatus = result
+    return
+  try:
+    let tx = installAbsoluteJumpPatchTransaction(
+      target, cast[pointer](rawSyscallReplacement), captureRestoreBytes = false)
+    result.diagnostic = tx.diagnostic
+    result.stage = tx.stage
+    result.osErrno = tx.osErrno
+    result.installed = tx.diagnostic == lrsOk or
+      (tx.diagnostic == lrsPostPatchMprotectBackFailed and tx.patchLive)
+  except CatchableError:
+    result.diagnostic = lrsPatchWriteFailed
+    result.stage = lpsWritePatch
+  rawSyscallPatchStatus = result
+
+proc rawSyscallWrapperPatchStatus*(): RawSyscallPatchStatus {.raises: [].} =
+  rawSyscallPatchStatus
 
 proc callReal*(ctx: var OpenContext) {.raises: [].} =
   case ctx.symbol
@@ -1433,3 +1519,4 @@ installForkDispatcher(dispatchFork)
 installExecveDispatcher(dispatchExecve)
 installPosixSpawnDispatcher(dispatchPosixSpawn)
 installPosixSpawnpDispatcher(dispatchPosixSpawnp)
+installRawSyscallDispatcher(rawSyscallDispatcher)
