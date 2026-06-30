@@ -1,12 +1,18 @@
 when not defined(linux):
   {.error: "repro_monitor_hooks/linux_preload_runtime is Linux-only".}
 
-import std/[algorithm, os, strutils]
+import std/[algorithm, locks, os, strutils]
 
 import stackable_hooks/platform/linux_preload
 import stackable_hooks/platform/linux_raw_syscalls
 
 const linuxPreloadBackend* = "stackable_hooks/platform/linux_preload"
+const
+  linuxProtWrite = 0x2
+  linuxProtExec = 0x4
+  linuxMapPrivate = 0x02
+  linuxMapAnonymous = 0x20
+  linuxInlineAnonScanMaxBytes = 64 * 1024 * 1024
 static:
   doAssert compiles(currentPreloadHookDepth())
   doAssert compiles(installAbsoluteJumpPatchTransaction(nil, nil))
@@ -118,6 +124,38 @@ type
     result*: pointer
     nextIndex: int
 
+  MmapContext* = object
+    address*: pointer
+    length*: csize_t
+    prot*: cint
+    flags*: cint
+    fd*: cint
+    offset*: clong
+    result*: pointer
+    nextIndex: int
+
+  MprotectContext* = object
+    address*: pointer
+    length*: csize_t
+    prot*: cint
+    result*: cint
+    nextIndex: int
+
+  MunmapContext* = object
+    address*: pointer
+    length*: csize_t
+    result*: cint
+    nextIndex: int
+
+  MremapContext* = object
+    oldAddress*: pointer
+    oldSize*: csize_t
+    newSize*: csize_t
+    flags*: cint
+    newAddress*: pointer
+    result*: pointer
+    nextIndex: int
+
   ForkContext* = object
     result*: PidT
     nextIndex: int
@@ -158,6 +196,10 @@ type
     firstPatchErrno*: cint
     firstPatchAddress*: uint
 
+  AnonymousExecutableRange = object
+    start: uint
+    stop: uint
+
   OpenHook* = proc(ctx: var OpenContext) {.raises: [].}
   OpenatHook* = proc(ctx: var OpenatContext) {.raises: [].}
   CloseHook* = proc(ctx: var CloseContext) {.raises: [].}
@@ -173,6 +215,10 @@ type
   ConnectHook* = proc(ctx: var ConnectContext) {.raises: [].}
   DlopenHook* = proc(ctx: var DlopenContext) {.raises: [].}
   DlmopenHook* = proc(ctx: var DlmopenContext) {.raises: [].}
+  MmapHook* = proc(ctx: var MmapContext) {.raises: [].}
+  MprotectHook* = proc(ctx: var MprotectContext) {.raises: [].}
+  MunmapHook* = proc(ctx: var MunmapContext) {.raises: [].}
+  MremapHook* = proc(ctx: var MremapContext) {.raises: [].}
   ForkHook* = proc(ctx: var ForkContext) {.raises: [].}
   ExecveHook* = proc(ctx: var ExecveContext) {.raises: [].}
   PosixSpawnHook* = proc(ctx: var PosixSpawnContext) {.raises: [].}
@@ -224,6 +270,18 @@ type
   DlmopenHookEntry = object
     priority: int
     callback: DlmopenHook
+  MmapHookEntry = object
+    priority: int
+    callback: MmapHook
+  MprotectHookEntry = object
+    priority: int
+    callback: MprotectHook
+  MunmapHookEntry = object
+    priority: int
+    callback: MunmapHook
+  MremapHookEntry = object
+    priority: int
+    callback: MremapHook
   ForkHookEntry = object
     priority: int
     callback: ForkHook
@@ -243,9 +301,11 @@ type
 #include <signal.h>
 #include <spawn.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -268,6 +328,10 @@ typedef int (*ct_fclose_hook_fn)(void *);
 typedef int (*ct_connect_hook_fn)(int, void *, unsigned int);
 typedef void *(*ct_dlopen_hook_fn)(char *, int);
 typedef void *(*ct_dlmopen_hook_fn)(long, char *, int);
+typedef void *(*ct_mmap_hook_fn)(void *, size_t, int, int, int, long);
+typedef int (*ct_mprotect_hook_fn)(void *, size_t, int);
+typedef int (*ct_munmap_hook_fn)(void *, size_t);
+typedef void *(*ct_mremap_hook_fn)(void *, size_t, size_t, int, void *);
 typedef pid_t (*ct_fork_hook_fn)(void);
 typedef int (*ct_execve_hook_fn)(char *, char **, char **);
 typedef int (*ct_posix_spawn_hook_fn)(pid_t *, char *, void *, void *,
@@ -289,6 +353,10 @@ typedef int (*ct_fclose_real_fn)(FILE *);
 typedef int (*ct_connect_real_fn)(int, const struct sockaddr *, socklen_t);
 typedef void *(*ct_dlopen_real_fn)(const char *, int);
 typedef void *(*ct_dlmopen_real_fn)(Lmid_t, const char *, int);
+typedef void *(*ct_mmap_real_fn)(void *, size_t, int, int, int, off_t);
+typedef int (*ct_mprotect_real_fn)(void *, size_t, int);
+typedef int (*ct_munmap_real_fn)(void *, size_t);
+typedef void *(*ct_mremap_real_fn)(void *, size_t, size_t, int, ...);
 typedef pid_t (*ct_fork_real_fn)(void);
 typedef int (*ct_execve_real_fn)(const char *, char *const [], char *const []);
 typedef int (*ct_posix_spawn_real_fn)(pid_t *, const char *,
@@ -317,6 +385,10 @@ static ct_fclose_hook_fn ct_fclose_hook = NULL;
 static ct_connect_hook_fn ct_connect_hook = NULL;
 static ct_dlopen_hook_fn ct_dlopen_hook = NULL;
 static ct_dlmopen_hook_fn ct_dlmopen_hook = NULL;
+static ct_mmap_hook_fn ct_mmap_hook = NULL;
+static ct_mprotect_hook_fn ct_mprotect_hook = NULL;
+static ct_munmap_hook_fn ct_munmap_hook = NULL;
+static ct_mremap_hook_fn ct_mremap_hook = NULL;
 static ct_fork_hook_fn ct_fork_hook = NULL;
 static ct_execve_hook_fn ct_execve_hook = NULL;
 static ct_posix_spawn_hook_fn ct_posix_spawn_hook = NULL;
@@ -360,6 +432,10 @@ static ct_fclose_real_fn real_fclose_ptr = NULL;
 static ct_connect_real_fn real_connect_ptr = NULL;
 static ct_dlopen_real_fn real_dlopen_ptr = NULL;
 static ct_dlmopen_real_fn real_dlmopen_ptr = NULL;
+static ct_mmap_real_fn real_mmap_ptr = NULL;
+static ct_mprotect_real_fn real_mprotect_ptr = NULL;
+static ct_munmap_real_fn real_munmap_ptr = NULL;
+static ct_mremap_real_fn real_mremap_ptr = NULL;
 static ct_fork_real_fn real_fork_ptr = NULL;
 static ct_execve_real_fn real_execve_ptr = NULL;
 static ct_posix_spawn_real_fn real_posix_spawn_ptr = NULL;
@@ -632,6 +708,10 @@ void ct_linux_preload_register_fclose_hook(ct_fclose_hook_fn hook) { ct_fclose_h
 void ct_linux_preload_register_connect_hook(ct_connect_hook_fn hook) { ct_connect_hook = hook; }
 void ct_linux_preload_register_dlopen_hook(ct_dlopen_hook_fn hook) { ct_dlopen_hook = hook; }
 void ct_linux_preload_register_dlmopen_hook(ct_dlmopen_hook_fn hook) { ct_dlmopen_hook = hook; }
+void ct_linux_preload_register_mmap_hook(ct_mmap_hook_fn hook) { ct_mmap_hook = hook; }
+void ct_linux_preload_register_mprotect_hook(ct_mprotect_hook_fn hook) { ct_mprotect_hook = hook; }
+void ct_linux_preload_register_munmap_hook(ct_munmap_hook_fn hook) { ct_munmap_hook = hook; }
+void ct_linux_preload_register_mremap_hook(ct_mremap_hook_fn hook) { ct_mremap_hook = hook; }
 void ct_linux_preload_register_fork_hook(ct_fork_hook_fn hook) { ct_fork_hook = hook; }
 void ct_linux_preload_register_execve_hook(ct_execve_hook_fn hook) { ct_execve_hook = hook; }
 void ct_linux_preload_register_posix_spawn_hook(ct_posix_spawn_hook_fn hook) { ct_posix_spawn_hook = hook; }
@@ -790,6 +870,35 @@ void *ct_linux_preload_real_dlmopen(long namespace_id, char *path, int flags) {
     real_dlmopen_ptr = (ct_dlmopen_real_fn)ct_resolve("dlmopen");
   if (real_dlmopen_ptr == NULL) { errno = ENOSYS; return NULL; }
   return real_dlmopen_ptr((Lmid_t)namespace_id, path, flags);
+}
+
+void *ct_linux_preload_real_mmap(void *addr, size_t length, int prot, int flags,
+                                 int fd, long offset) {
+  if (real_mmap_ptr == NULL)
+    real_mmap_ptr = (ct_mmap_real_fn)ct_resolve("mmap");
+  if (real_mmap_ptr == NULL) { errno = ENOSYS; return MAP_FAILED; }
+  return real_mmap_ptr(addr, length, prot, flags, fd, (off_t)offset);
+}
+
+int ct_linux_preload_real_mprotect(void *addr, size_t length, int prot) {
+  CT_REAL("mprotect", real_mprotect_ptr, ct_mprotect_real_fn);
+  return real_mprotect_ptr(addr, length, prot);
+}
+
+int ct_linux_preload_real_munmap(void *addr, size_t length) {
+  CT_REAL("munmap", real_munmap_ptr, ct_munmap_real_fn);
+  return real_munmap_ptr(addr, length);
+}
+
+void *ct_linux_preload_real_mremap(void *old_addr, size_t old_size,
+                                   size_t new_size, int flags,
+                                   void *new_addr) {
+  if (real_mremap_ptr == NULL)
+    real_mremap_ptr = (ct_mremap_real_fn)ct_resolve("mremap");
+  if (real_mremap_ptr == NULL) { errno = ENOSYS; return MAP_FAILED; }
+  if ((flags & MREMAP_FIXED) != 0)
+    return real_mremap_ptr(old_addr, old_size, new_size, flags, new_addr);
+  return real_mremap_ptr(old_addr, old_size, new_size, flags);
 }
 
 pid_t ct_linux_preload_real_fork(void) {
@@ -988,6 +1097,45 @@ void *dlmopen(Lmid_t namespace_id, const char *path, int flags) {
   return CT_CALL_HOOK(ct_dlmopen_hook((long)namespace_id, (char *)path, flags));
 }
 
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
+    __attribute__((visibility("default")));
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+  if (CT_BYPASS() || ct_mmap_hook == NULL)
+    return ct_linux_preload_real_mmap(addr, length, prot, flags, fd, (long)offset);
+  return CT_CALL_HOOK(ct_mmap_hook(addr, length, prot, flags, fd, (long)offset));
+}
+
+int mprotect(void *addr, size_t length, int prot)
+    __attribute__((visibility("default")));
+int mprotect(void *addr, size_t length, int prot) {
+  if (CT_BYPASS() || ct_mprotect_hook == NULL)
+    return ct_linux_preload_real_mprotect(addr, length, prot);
+  return CT_CALL_HOOK(ct_mprotect_hook(addr, length, prot));
+}
+
+int munmap(void *addr, size_t length)
+    __attribute__((visibility("default")));
+int munmap(void *addr, size_t length) {
+  if (CT_BYPASS() || ct_munmap_hook == NULL)
+    return ct_linux_preload_real_munmap(addr, length);
+  return CT_CALL_HOOK(ct_munmap_hook(addr, length));
+}
+
+void *mremap(void *old_addr, size_t old_size, size_t new_size, int flags, ...)
+    __attribute__((visibility("default")));
+void *mremap(void *old_addr, size_t old_size, size_t new_size, int flags, ...) {
+  void *new_addr = NULL;
+  if ((flags & MREMAP_FIXED) != 0) {
+    va_list ap;
+    va_start(ap, flags);
+    new_addr = va_arg(ap, void *);
+    va_end(ap);
+  }
+  if (CT_BYPASS() || ct_mremap_hook == NULL)
+    return ct_linux_preload_real_mremap(old_addr, old_size, new_size, flags, new_addr);
+  return CT_CALL_HOOK(ct_mremap_hook(old_addr, old_size, new_size, flags, new_addr));
+}
+
 pid_t fork(void) __attribute__((visibility("default")));
 pid_t fork(void) {
   if (CT_BYPASS() || ct_fork_hook == NULL)
@@ -1106,6 +1254,16 @@ proc realDlopen*(path: cstring; flags: cint): pointer
   {.importc: "ct_linux_preload_real_dlopen", raises: [].}
 proc realDlmopen*(namespaceId: clong; path: cstring; flags: cint): pointer
   {.importc: "ct_linux_preload_real_dlmopen", raises: [].}
+proc realMmap*(address: pointer; length: csize_t; prot, flags, fd: cint;
+               offset: clong): pointer
+  {.importc: "ct_linux_preload_real_mmap", raises: [].}
+proc realMprotect*(address: pointer; length: csize_t; prot: cint): cint
+  {.importc: "ct_linux_preload_real_mprotect", raises: [].}
+proc realMunmap*(address: pointer; length: csize_t): cint
+  {.importc: "ct_linux_preload_real_munmap", raises: [].}
+proc realMremap*(oldAddress: pointer; oldSize, newSize: csize_t; flags: cint;
+                 newAddress: pointer): pointer
+  {.importc: "ct_linux_preload_real_mremap", raises: [].}
 proc realFork*(): PidT {.importc: "ct_linux_preload_real_fork", raises: [].}
 proc realExecve*(path: cstring; argv, envp: cstringArray): cint
   {.importc: "ct_linux_preload_real_execve", raises: [].}
@@ -1139,6 +1297,15 @@ type
   DlopenDispatch = proc(path: cstring; flags: cint): pointer
     {.cdecl, raises: [].}
   DlmopenDispatch = proc(namespaceId: clong; path: cstring; flags: cint): pointer
+    {.cdecl, raises: [].}
+  MmapDispatch = proc(address: pointer; length: csize_t; prot, flags, fd: cint;
+                      offset: clong): pointer {.cdecl, raises: [].}
+  MprotectDispatch = proc(address: pointer; length: csize_t; prot: cint): cint
+    {.cdecl, raises: [].}
+  MunmapDispatch = proc(address: pointer; length: csize_t): cint
+    {.cdecl, raises: [].}
+  MremapDispatch = proc(oldAddress: pointer; oldSize, newSize: csize_t;
+                        flags: cint; newAddress: pointer): pointer
     {.cdecl, raises: [].}
   ForkDispatch = proc(): PidT {.cdecl, raises: [].}
   ExecveDispatch = proc(path: cstring; argv, envp: cstringArray): cint
@@ -1216,6 +1383,14 @@ proc installDlopenDispatcher(dispatch: DlopenDispatch)
   {.importc: "ct_linux_preload_register_dlopen_hook", raises: [].}
 proc installDlmopenDispatcher(dispatch: DlmopenDispatch)
   {.importc: "ct_linux_preload_register_dlmopen_hook", raises: [].}
+proc installMmapDispatcher(dispatch: MmapDispatch)
+  {.importc: "ct_linux_preload_register_mmap_hook", raises: [].}
+proc installMprotectDispatcher(dispatch: MprotectDispatch)
+  {.importc: "ct_linux_preload_register_mprotect_hook", raises: [].}
+proc installMunmapDispatcher(dispatch: MunmapDispatch)
+  {.importc: "ct_linux_preload_register_munmap_hook", raises: [].}
+proc installMremapDispatcher(dispatch: MremapDispatch)
+  {.importc: "ct_linux_preload_register_mremap_hook", raises: [].}
 proc installForkDispatcher(dispatch: ForkDispatch)
   {.importc: "ct_linux_preload_register_fork_hook", raises: [].}
 proc installExecveDispatcher(dispatch: ExecveDispatch)
@@ -1247,6 +1422,10 @@ var
   connectHooks: seq[ConnectHookEntry] = @[]
   dlopenHooks: seq[DlopenHookEntry] = @[]
   dlmopenHooks: seq[DlmopenHookEntry] = @[]
+  mmapHooks: seq[MmapHookEntry] = @[]
+  mprotectHooks: seq[MprotectHookEntry] = @[]
+  munmapHooks: seq[MunmapHookEntry] = @[]
+  mremapHooks: seq[MremapHookEntry] = @[]
   forkHooks: seq[ForkHookEntry] = @[]
   execveHooks: seq[ExecveHookEntry] = @[]
   posixSpawnHooks: seq[PosixSpawnHookEntry] = @[]
@@ -1265,6 +1444,10 @@ var
     installDiagnostic: lrsInvalidArgument,
     firstPatchDiagnostic: lrsOk,
     firstPatchStage: lpsNone)
+  anonymousRangeLock: Lock
+  anonymousExecutableRanges: seq[AnonymousExecutableRange] = @[]
+
+initLock(anonymousRangeLock)
 
 proc registerOpenHook*(hook: OpenHook; priority = 100) {.raises: [].} =
   if hook == nil:
@@ -1380,6 +1563,30 @@ proc registerDlmopenHook*(hook: DlmopenHook; priority = 100) {.raises: [].} =
   dlmopenHooks.add(DlmopenHookEntry(priority: priority, callback: hook))
   dlmopenHooks.sort(proc(a, b: DlmopenHookEntry): int = cmp(a.priority, b.priority))
 
+proc registerMmapHook*(hook: MmapHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  mmapHooks.add(MmapHookEntry(priority: priority, callback: hook))
+  mmapHooks.sort(proc(a, b: MmapHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerMprotectHook*(hook: MprotectHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  mprotectHooks.add(MprotectHookEntry(priority: priority, callback: hook))
+  mprotectHooks.sort(proc(a, b: MprotectHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerMunmapHook*(hook: MunmapHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  munmapHooks.add(MunmapHookEntry(priority: priority, callback: hook))
+  munmapHooks.sort(proc(a, b: MunmapHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerMremapHook*(hook: MremapHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  mremapHooks.add(MremapHookEntry(priority: priority, callback: hook))
+  mremapHooks.sort(proc(a, b: MremapHookEntry): int = cmp(a.priority, b.priority))
+
 proc registerForkHook*(hook: ForkHook; priority = 100) {.raises: [].} =
   if hook == nil:
     return
@@ -1434,6 +1641,218 @@ proc rawSyscallEventAt*(index: int):
     return (false, 0.clong, 0.clong, 0.clong, 0.clong, 0.clong, 0.clong,
       0.clong, 0.clong, 0.cint, 0'u)
   (true, number, a1, a2, a3, a4, a5, a6, callResult, source, uint(address))
+
+proc rangesIntersect(aStart, aStop, bStart, bStop: uint): bool {.inline, raises: [].} =
+  aStart < bStop and bStart < aStop
+
+proc isSuccessfulMmapResult*(value: pointer): bool {.inline, raises: [].} =
+  value != nil and cast[int](value) != -1
+
+proc isAnonymousPrivateMmap*(flags, fd: cint): bool {.inline, raises: [].} =
+  (flags and linuxMapAnonymous) != 0 and (flags and linuxMapPrivate) != 0 and
+    fd == -1
+
+proc protIncludesExec*(prot: cint): bool {.inline, raises: [].} =
+  (prot and linuxProtExec) != 0
+
+proc protIncludesWrite*(prot: cint): bool {.inline, raises: [].} =
+  (prot and linuxProtWrite) != 0
+
+proc recordAnonymousPrivateMmap*(result: pointer; length: csize_t) {.raises: [].} =
+  if not isSuccessfulMmapResult(result) or length == 0:
+    return
+  let start = cast[uint](result)
+  let stop = start + uint(length)
+  if stop <= start:
+    return
+  acquire(anonymousRangeLock)
+  try:
+    anonymousExecutableRanges.add AnonymousExecutableRange(start: start, stop: stop)
+  finally:
+    release(anonymousRangeLock)
+
+proc removeAnonymousPrivateRange*(address: pointer; length: csize_t) {.raises: [].} =
+  if address == nil or length == 0:
+    return
+  let removeStart = cast[uint](address)
+  let removeStop = removeStart + uint(length)
+  if removeStop <= removeStart:
+    return
+  acquire(anonymousRangeLock)
+  try:
+    var updated: seq[AnonymousExecutableRange] = @[]
+    for tracked in anonymousExecutableRanges:
+      if not rangesIntersect(removeStart, removeStop, tracked.start, tracked.stop):
+        updated.add tracked
+        continue
+      if tracked.start < removeStart:
+        updated.add AnonymousExecutableRange(
+          start: tracked.start,
+          stop: min(removeStart, tracked.stop))
+      if removeStop < tracked.stop:
+        updated.add AnonymousExecutableRange(
+          start: max(removeStop, tracked.start),
+          stop: tracked.stop)
+    anonymousExecutableRanges = updated
+  finally:
+    release(anonymousRangeLock)
+
+proc rangeFullyTrackedLocked(start, stop: uint): bool {.raises: [].} =
+  if stop <= start:
+    return false
+  var intersections: seq[AnonymousExecutableRange] = @[]
+  for tracked in anonymousExecutableRanges:
+    if rangesIntersect(start, stop, tracked.start, tracked.stop):
+      intersections.add AnonymousExecutableRange(
+        start: max(start, tracked.start),
+        stop: min(stop, tracked.stop))
+  if intersections.len == 0:
+    return false
+  intersections.sort(proc(a, b: AnonymousExecutableRange): int =
+    cmp(a.start, b.start))
+  var cursor = start
+  for item in intersections:
+    if item.start > cursor:
+      return false
+    if item.stop > cursor:
+      cursor = item.stop
+    if cursor >= stop:
+      return true
+  false
+
+proc anonymousPrivateRangeFullyTracked*(address: pointer; length: csize_t): bool
+    {.raises: [].} =
+  if address == nil or length == 0:
+    return false
+  let start = cast[uint](address)
+  let stop = start + uint(length)
+  if stop <= start:
+    return false
+  acquire(anonymousRangeLock)
+  try:
+    result = rangeFullyTrackedLocked(start, stop)
+  finally:
+    release(anonymousRangeLock)
+
+proc anonymousPrivateRangeIntersects*(address: pointer; length: csize_t): bool
+    {.raises: [].} =
+  if address == nil or length == 0:
+    return false
+  let start = cast[uint](address)
+  let stop = start + uint(length)
+  if stop <= start:
+    return false
+  acquire(anonymousRangeLock)
+  try:
+    for tracked in anonymousExecutableRanges:
+      if rangesIntersect(start, stop, tracked.start, tracked.stop):
+        return true
+  finally:
+    release(anonymousRangeLock)
+
+proc remapAnonymousPrivateRange*(oldAddress: pointer; oldSize: csize_t;
+                                 newAddress: pointer; newSize: csize_t): bool
+    {.raises: [].} =
+  ## Returns true only when ownership was moved precisely for a fully tracked
+  ## old interval. Partial ownership is dropped instead of widened.
+  if oldAddress == nil or oldSize == 0:
+    return false
+  let oldStart = cast[uint](oldAddress)
+  let oldStop = oldStart + uint(oldSize)
+  if oldStop <= oldStart:
+    return false
+  acquire(anonymousRangeLock)
+  try:
+    result = rangeFullyTrackedLocked(oldStart, oldStop)
+  finally:
+    release(anonymousRangeLock)
+  removeAnonymousPrivateRange(oldAddress, oldSize)
+  if result:
+    recordAnonymousPrivateMmap(newAddress, newSize)
+
+proc mappingLooksOwnedAnonymousExecutable(mapping: LinuxExecutableMapping): bool
+    {.raises: [].} =
+  mapping.readable and mapping.executable and mapping.privateMapping and
+    mapping.path.len == 0 and mapping.stop > mapping.start
+
+proc trackedAnonymousIntersections(start, stop: uint): seq[AnonymousExecutableRange]
+    {.raises: [].} =
+  if stop <= start:
+    return @[]
+  acquire(anonymousRangeLock)
+  try:
+    for tracked in anonymousExecutableRanges:
+      if rangesIntersect(start, stop, tracked.start, tracked.stop):
+        result.add AnonymousExecutableRange(
+          start: max(start, tracked.start),
+          stop: min(stop, tracked.stop))
+  finally:
+    release(anonymousRangeLock)
+
+proc trackedAnonymousExecutableRangeExists*(start: pointer; length: csize_t): bool
+    {.raises: [].} =
+  if start == nil or length == 0:
+    return false
+  let rangeStart = cast[uint](start)
+  let rangeStop = rangeStart + uint(length)
+  trackedAnonymousIntersections(rangeStart, rangeStop).len > 0
+
+proc liveAnonymousExecutableMappingIntersects*(start: pointer; length: csize_t):
+    bool {.raises: [].} =
+  if start == nil or length == 0:
+    return false
+  let rangeStart = cast[uint](start)
+  let rangeStop = rangeStart + uint(length)
+  if rangeStop <= rangeStart:
+    return false
+  let mappings =
+    try:
+      enumerateLinuxExecutableMappings()
+    except CatchableError:
+      return false
+  if mappings.diagnostic != lrsOk:
+    return false
+  for mapping in mappings.mappings:
+    if mappingLooksOwnedAnonymousExecutable(mapping) and
+        rangesIntersect(rangeStart, rangeStop, mapping.start, mapping.stop):
+      return true
+
+proc liveAnonymousExecutableCoverage*(start: pointer; length: csize_t):
+    tuple[mapsAvailable: bool; liveIntersects: bool; fullyTracked: bool]
+    {.raises: [].} =
+  ## Describes the live anonymous executable bytes inside a requested range.
+  ## fullyTracked is true only when every live executable anonymous byte in the
+  ## requested range is covered by the current mmap lifecycle ownership table.
+  result = (mapsAvailable: false, liveIntersects: false, fullyTracked: false)
+  if start == nil or length == 0:
+    return
+  let rangeStart = cast[uint](start)
+  let rangeStop = rangeStart + uint(length)
+  if rangeStop <= rangeStart:
+    return
+  let mappings =
+    try:
+      enumerateLinuxExecutableMappings()
+    except CatchableError:
+      return
+  if mappings.diagnostic != lrsOk:
+    return
+  result.mapsAvailable = true
+  result.fullyTracked = true
+  acquire(anonymousRangeLock)
+  try:
+    for mapping in mappings.mappings:
+      if not mappingLooksOwnedAnonymousExecutable(mapping):
+        continue
+      if not rangesIntersect(rangeStart, rangeStop, mapping.start, mapping.stop):
+        continue
+      result.liveIntersects = true
+      let intersectStart = max(rangeStart, mapping.start)
+      let intersectStop = min(rangeStop, mapping.stop)
+      if not rangeFullyTrackedLocked(intersectStart, intersectStop):
+        result.fullyTracked = false
+  finally:
+    release(anonymousRangeLock)
 
 proc installRawSyscallWrapperPatch*(): RawSyscallPatchStatus {.raises: [].} =
   if rawSyscallPatchAttempted:
@@ -1527,6 +1946,93 @@ proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
       statusPtr[].firstPatchAddress = site.address
     true
   )
+
+proc installInlineSyscallPatches*(): InlineSyscallPatchStatus {.raises: [].}
+
+proc patchOwnedAnonymousInlineSyscallRange(start, stop: uint;
+                                           status: var InlineSyscallPatchStatus)
+    {.raises: [].} =
+  if stop <= start:
+    return
+  let span = stop - start
+  if span > uint(linuxInlineAnonScanMaxBytes):
+    if status.firstPatchDiagnostic == lrsOk:
+      status.firstPatchDiagnostic = lrsInvalidArgument
+      status.firstPatchStage = lpsNone
+      status.firstPatchAddress = start
+    return
+  let mapping = LinuxExecutableMapping(
+    start: start,
+    stop: stop,
+    readable: true,
+    writable: false,
+    executable: true,
+    privateMapping: true,
+    path: "")
+  patchInlineSyscallMapping(mapping, status)
+
+proc scanInlineSyscallPatchesForOwnedAnonymousRange*(start: pointer;
+                                                     length: csize_t):
+    InlineSyscallPatchStatus {.raises: [].} =
+  ## Incremental JIT/anonymous scan for ranges whose ownership was established
+  ## through io-mon's mmap wrapper. The startup installer owns handler setup.
+  if length < 3:
+    return inlineSyscallPatchStatus
+  if not inlineSyscallPatchAttempted:
+    discard installInlineSyscallPatches()
+  var status = inlineSyscallPatchStatus
+  if not status.handlerInstalled or status.scanDiagnostic != lrsOk:
+    return status
+  let rangeStart = cast[uint](start)
+  let rangeStop = rangeStart + uint(length)
+  patchOwnedAnonymousInlineSyscallRange(rangeStart, rangeStop, status)
+  status.patchedSites = int(cInlineSyscallSiteCount())
+  if cInlineSyscallOverflowed() != 0 and status.firstPatchDiagnostic == lrsOk:
+    status.firstPatchDiagnostic = lrsInvalidArgument
+  inlineSyscallPatchStatus = status
+  status
+
+proc scanInlineSyscallPatchesForTrackedMprotectRange*(start: pointer;
+                                                      length: csize_t):
+    InlineSyscallPatchStatus {.raises: [].} =
+  ## Scan only live anonymous/private executable map entries that overlap a
+  ## range previously created through the mmap wrapper.
+  if length < 3:
+    return inlineSyscallPatchStatus
+  if not inlineSyscallPatchAttempted:
+    discard installInlineSyscallPatches()
+  var status = inlineSyscallPatchStatus
+  if not status.handlerInstalled or status.scanDiagnostic != lrsOk:
+    return status
+  let requestedStart = cast[uint](start)
+  let requestedStop = requestedStart + uint(length)
+  let tracked = trackedAnonymousIntersections(requestedStart, requestedStop)
+  if tracked.len == 0:
+    return status
+  let mappings =
+    try:
+      enumerateLinuxExecutableMappings()
+    except CatchableError:
+      (diagnostic: lrsInvalidArgument, mappings: newSeq[LinuxExecutableMapping]())
+  status.scanDiagnostic = mappings.diagnostic
+  if mappings.diagnostic != lrsOk:
+    inlineSyscallPatchStatus = status
+    return status
+  for mapping in mappings.mappings:
+    if not mappingLooksOwnedAnonymousExecutable(mapping):
+      continue
+    for owned in tracked:
+      if not rangesIntersect(mapping.start, mapping.stop, owned.start, owned.stop):
+        continue
+      patchOwnedAnonymousInlineSyscallRange(
+        max(mapping.start, owned.start),
+        min(mapping.stop, owned.stop),
+        status)
+  status.patchedSites = int(cInlineSyscallSiteCount())
+  if cInlineSyscallOverflowed() != 0 and status.firstPatchDiagnostic == lrsOk:
+    status.firstPatchDiagnostic = lrsInvalidArgument
+  inlineSyscallPatchStatus = status
+  status
 
 proc installInlineSyscallPatches*(): InlineSyscallPatchStatus {.raises: [].} =
   if inlineSyscallPatchAttempted:
@@ -1680,6 +2186,20 @@ proc callReal*(ctx: var DlopenContext) {.raises: [].} =
 
 proc callReal*(ctx: var DlmopenContext) {.raises: [].} =
   ctx.result = realDlmopen(ctx.namespaceId, ctx.path, ctx.flags)
+
+proc callReal*(ctx: var MmapContext) {.raises: [].} =
+  ctx.result = realMmap(ctx.address, ctx.length, ctx.prot, ctx.flags, ctx.fd,
+    ctx.offset)
+
+proc callReal*(ctx: var MprotectContext) {.raises: [].} =
+  ctx.result = realMprotect(ctx.address, ctx.length, ctx.prot)
+
+proc callReal*(ctx: var MunmapContext) {.raises: [].} =
+  ctx.result = realMunmap(ctx.address, ctx.length)
+
+proc callReal*(ctx: var MremapContext) {.raises: [].} =
+  ctx.result = realMremap(ctx.oldAddress, ctx.oldSize, ctx.newSize, ctx.flags,
+    ctx.newAddress)
 
 proc callReal*(ctx: var ForkContext) {.raises: [].} =
   ctx.result = realFork()
@@ -1852,6 +2372,38 @@ proc callNext*(ctx: var DlmopenContext) {.raises: [].} =
   else:
     callReal(ctx)
 
+proc callNext*(ctx: var MmapContext) {.raises: [].} =
+  if ctx.nextIndex < mmapHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    mmapHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var MprotectContext) {.raises: [].} =
+  if ctx.nextIndex < mprotectHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    mprotectHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var MunmapContext) {.raises: [].} =
+  if ctx.nextIndex < munmapHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    munmapHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var MremapContext) {.raises: [].} =
+  if ctx.nextIndex < mremapHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    mremapHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
 proc callNext*(ctx: var ForkContext) {.raises: [].} =
   if ctx.nextIndex < forkHooks.len:
     let index = ctx.nextIndex
@@ -1994,6 +2546,34 @@ proc dispatchDlmopen(namespaceId: clong; path: cstring; flags: cint): pointer
   callNext(ctx)
   result = ctx.result
 
+proc dispatchMmap(address: pointer; length: csize_t; prot, flags, fd: cint;
+                  offset: clong): pointer {.cdecl, raises: [].} =
+  var ctx = MmapContext(address: address, length: length, prot: prot, flags: flags,
+                        fd: fd, offset: offset, result: cast[pointer](-1))
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchMprotect(address: pointer; length: csize_t; prot: cint): cint
+    {.cdecl, raises: [].} =
+  var ctx = MprotectContext(address: address, length: length, prot: prot, result: -1)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchMunmap(address: pointer; length: csize_t): cint
+    {.cdecl, raises: [].} =
+  var ctx = MunmapContext(address: address, length: length, result: -1)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchMremap(oldAddress: pointer; oldSize, newSize: csize_t;
+                    flags: cint; newAddress: pointer): pointer
+    {.cdecl, raises: [].} =
+  var ctx = MremapContext(oldAddress: oldAddress, oldSize: oldSize,
+                          newSize: newSize, flags: flags,
+                          newAddress: newAddress, result: cast[pointer](-1))
+  callNext(ctx)
+  result = ctx.result
+
 proc dispatchFork(): PidT {.cdecl, raises: [].} =
   var ctx = ForkContext(result: -1)
   callNext(ctx)
@@ -2040,6 +2620,10 @@ installFcloseDispatcher(dispatchFclose)
 installConnectDispatcher(dispatchConnect)
 installDlopenDispatcher(dispatchDlopen)
 installDlmopenDispatcher(dispatchDlmopen)
+installMmapDispatcher(dispatchMmap)
+installMprotectDispatcher(dispatchMprotect)
+installMunmapDispatcher(dispatchMunmap)
+installMremapDispatcher(dispatchMremap)
 installForkDispatcher(dispatchFork)
 installExecveDispatcher(dispatchExecve)
 installPosixSpawnDispatcher(dispatchPosixSpawn)

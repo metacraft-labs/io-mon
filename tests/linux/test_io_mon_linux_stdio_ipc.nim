@@ -495,6 +495,445 @@ int main(int argc, char **argv) {
     check not dep.records.anyIt(it.kind == mrEventLoss and
       "late inline raw-syscall scanner unavailable" in it.detail)
 
+  test "anonymous executable mmap mprotect inline syscall captures dependency":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let jitReader = buildC(work, "jit_mprotect_reader", """
+#include <fcntl.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+typedef int (*jit_read_marker_fn)(const char *);
+
+int main(int argc, char **argv) {
+  unsigned char code[] = {
+    0x53, 0x41, 0x54, 0x48, 0x83, 0xec, 0x40,
+    0x48, 0x89, 0xfe,
+    0xb8, 0x01, 0x01, 0x00, 0x00,
+    0xbf, 0x9c, 0xff, 0xff, 0xff,
+    0x31, 0xd2,
+    0x45, 0x31, 0xd2,
+    0x0f, 0x05,
+    0x48, 0x85, 0xc0,
+    0x78, 0x29,
+    0x89, 0xc3,
+    0x31, 0xc0,
+    0x89, 0xdf,
+    0x48, 0x89, 0xe6,
+    0xba, 0x40, 0x00, 0x00, 0x00,
+    0x0f, 0x05,
+    0x49, 0x89, 0xc4,
+    0xb8, 0x03, 0x00, 0x00, 0x00,
+    0x89, 0xdf,
+    0x0f, 0x05,
+    0x49, 0x83, 0xfc, 0x00,
+    0x7f, 0x0e,
+    0xb8, 0x03, 0x00, 0x00, 0x00,
+    0xeb, 0x09,
+    0xb8, 0x02, 0x00, 0x00, 0x00,
+    0xeb, 0x02,
+    0x31, 0xc0,
+    0x48, 0x83, 0xc4, 0x40,
+    0x41, 0x5c,
+    0x5b,
+    0xc3
+  };
+  void *mem = mmap(0, 4096, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mem == MAP_FAILED) return 4;
+  memcpy(mem, code, sizeof(code));
+  if (mprotect(mem, 4096, PROT_READ | PROT_EXEC) != 0) return 5;
+  return ((jit_read_marker_fn)mem)(argv[1]);
+}
+""")
+    let marker = work / "jit-mprotect-marker.txt"
+    writeFile(marker, "jit mprotect marker\n")
+    let depfile = work / "jit-mprotect-syscall.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", jitReader,
+      marker], childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check hasRawDependency(dep, marker)
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      "inline raw syscall unsupported" in it.detail)
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      "mprotect-anonymous-exec" in it.detail)
+
+  test "anonymous writable executable mmap fails closed":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let rwxMapper = buildC(work, "rwx_mmap_probe", """
+#include <sys/mman.h>
+#include <unistd.h>
+int main(void) {
+  void *mem = mmap(0, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mem == MAP_FAILED) return 4;
+  ((char *)mem)[0] = (char)0xc3;
+  return 0;
+}
+""")
+    let depfile = work / "rwx-mmap.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", rwxMapper],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcIncomplete
+    check dep.records.anyIt(it.kind == mrEventLoss and
+      "anonymous executable mmap is writable" in it.detail)
+
+  test "anonymous munmap removes stale ownership before address reuse":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let reuseProbe = buildC(work, "jit_munmap_reuse_reader", """
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+typedef int (*jit_read_marker_fn)(const char *);
+
+int main(int argc, char **argv) {
+  unsigned char code[] = {
+    0x53, 0x41, 0x54, 0x48, 0x83, 0xec, 0x40,
+    0x48, 0x89, 0xfe,
+    0xb8, 0x01, 0x01, 0x00, 0x00,
+    0xbf, 0x9c, 0xff, 0xff, 0xff,
+    0x31, 0xd2,
+    0x45, 0x31, 0xd2,
+    0x0f, 0x05,
+    0x48, 0x85, 0xc0,
+    0x78, 0x29,
+    0x89, 0xc3,
+    0x31, 0xc0,
+    0x89, 0xdf,
+    0x48, 0x89, 0xe6,
+    0xba, 0x40, 0x00, 0x00, 0x00,
+    0x0f, 0x05,
+    0x49, 0x89, 0xc4,
+    0xb8, 0x03, 0x00, 0x00, 0x00,
+    0x89, 0xdf,
+    0x0f, 0x05,
+    0x49, 0x83, 0xfc, 0x00,
+    0x7f, 0x0e,
+    0xb8, 0x03, 0x00, 0x00, 0x00,
+    0xeb, 0x09,
+    0xb8, 0x02, 0x00, 0x00, 0x00,
+    0xeb, 0x02,
+    0x31, 0xc0,
+    0x48, 0x83, 0xc4, 0x40,
+    0x41, 0x5c,
+    0x5b,
+    0xc3
+  };
+  void *owned = mmap(0, 4096, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (owned == MAP_FAILED) return 4;
+  if (munmap(owned, 4096) != 0) return 5;
+  void *reused = (void *)syscall(SYS_mmap, owned, 4096,
+                                 PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                                 -1, 0);
+  if (reused == MAP_FAILED || reused != owned) return 6;
+  memcpy(reused, code, sizeof(code));
+  if (mprotect(reused, 4096, PROT_READ | PROT_EXEC) != 0) return 7;
+  return ((jit_read_marker_fn)reused)(argv[1]);
+}
+""")
+    let marker = work / "jit-munmap-reuse-marker.txt"
+    writeFile(marker, "jit munmap reuse marker\n")
+    let depfile = work / "jit-munmap-reuse.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", reuseProbe,
+      marker], childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcIncomplete
+    check not hasRawDependency(dep, marker)
+    check dep.records.anyIt(it.kind == mrEventLoss and
+      "mprotect-anonymous-untracked" in it.detail)
+
+  test "mixed tracked untracked anonymous mprotect fails closed":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let mixedProbe = buildC(work, "jit_mprotect_mixed_reader", """
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+typedef int (*jit_read_marker_fn)(const char *);
+
+int main(int argc, char **argv) {
+  unsigned char code[] = {
+    0x53, 0x41, 0x54, 0x48, 0x83, 0xec, 0x40,
+    0x48, 0x89, 0xfe,
+    0xb8, 0x01, 0x01, 0x00, 0x00,
+    0xbf, 0x9c, 0xff, 0xff, 0xff,
+    0x31, 0xd2,
+    0x45, 0x31, 0xd2,
+    0x0f, 0x05,
+    0x48, 0x85, 0xc0,
+    0x78, 0x29,
+    0x89, 0xc3,
+    0x31, 0xc0,
+    0x89, 0xdf,
+    0x48, 0x89, 0xe6,
+    0xba, 0x40, 0x00, 0x00, 0x00,
+    0x0f, 0x05,
+    0x49, 0x89, 0xc4,
+    0xb8, 0x03, 0x00, 0x00, 0x00,
+    0x89, 0xdf,
+    0x0f, 0x05,
+    0x49, 0x83, 0xfc, 0x00,
+    0x7f, 0x0e,
+    0xb8, 0x03, 0x00, 0x00, 0x00,
+    0xeb, 0x09,
+    0xb8, 0x02, 0x00, 0x00, 0x00,
+    0xeb, 0x02,
+    0x31, 0xc0,
+    0x48, 0x83, 0xc4, 0x40,
+    0x41, 0x5c,
+    0x5b,
+    0xc3
+  };
+  void *reserved = (void *)syscall(SYS_mmap, 0, 8192, PROT_NONE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (reserved == MAP_FAILED) return 4;
+  void *owned = mmap(reserved, 4096, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+  if (owned == MAP_FAILED || owned != reserved) return 5;
+  memcpy(owned, code, sizeof(code));
+  if (mprotect(reserved, 8192, PROT_READ | PROT_EXEC) != 0) return 6;
+  return ((jit_read_marker_fn)owned)(argv[1]);
+}
+""")
+    let marker = work / "jit-mprotect-mixed-marker.txt"
+    writeFile(marker, "jit mixed mprotect marker\n")
+    let depfile = work / "jit-mprotect-mixed.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", mixedProbe,
+      marker], childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcIncomplete
+    check dep.records.anyIt(it.kind == mrEventLoss and
+      "mprotect-anonymous-untracked" in it.detail)
+
+  test "anonymous mremap preserves ownership before executable scan":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let remapProbe = buildC(work, "jit_mremap_reader", """
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+typedef int (*jit_read_marker_fn)(const char *);
+
+int main(int argc, char **argv) {
+  unsigned char code[] = {
+    0x53, 0x41, 0x54, 0x48, 0x83, 0xec, 0x40,
+    0x48, 0x89, 0xfe,
+    0xb8, 0x01, 0x01, 0x00, 0x00,
+    0xbf, 0x9c, 0xff, 0xff, 0xff,
+    0x31, 0xd2,
+    0x45, 0x31, 0xd2,
+    0x0f, 0x05,
+    0x48, 0x85, 0xc0,
+    0x78, 0x29,
+    0x89, 0xc3,
+    0x31, 0xc0,
+    0x89, 0xdf,
+    0x48, 0x89, 0xe6,
+    0xba, 0x40, 0x00, 0x00, 0x00,
+    0x0f, 0x05,
+    0x49, 0x89, 0xc4,
+    0xb8, 0x03, 0x00, 0x00, 0x00,
+    0x89, 0xdf,
+    0x0f, 0x05,
+    0x49, 0x83, 0xfc, 0x00,
+    0x7f, 0x0e,
+    0xb8, 0x03, 0x00, 0x00, 0x00,
+    0xeb, 0x09,
+    0xb8, 0x02, 0x00, 0x00, 0x00,
+    0xeb, 0x02,
+    0x31, 0xc0,
+    0x48, 0x83, 0xc4, 0x40,
+    0x41, 0x5c,
+    0x5b,
+    0xc3
+  };
+  void *mem = mmap(0, 4096, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mem == MAP_FAILED) return 4;
+  memcpy(mem, code, sizeof(code));
+  void *target = mmap(0, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (target == MAP_FAILED) return 5;
+  if (munmap(target, 4096) != 0) return 6;
+  void *moved = mremap(mem, 4096, 4096, MREMAP_MAYMOVE | MREMAP_FIXED, target);
+  if (moved == MAP_FAILED || moved != target) return 7;
+  if (mprotect(moved, 4096, PROT_READ | PROT_EXEC) != 0) return 8;
+  return ((jit_read_marker_fn)moved)(argv[1]);
+}
+""")
+    let marker = work / "jit-mremap-marker.txt"
+    writeFile(marker, "jit mremap marker\n")
+    let depfile = work / "jit-mremap.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", remapProbe,
+      marker], childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check hasRawDependency(dep, marker)
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      "mremap-anonymous" in it.detail)
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      "mprotect-anonymous-untracked" in it.detail)
+
+  test "partial overlap anonymous mremap fails closed":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let partialRemapProbe = buildC(work, "jit_mremap_partial_probe", """
+#define _GNU_SOURCE
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+int main(void) {
+  void *mem = mmap(0, 8192, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mem == MAP_FAILED) return 4;
+  if (munmap(mem, 4096) != 0) return 5;
+  void *untracked = (void *)syscall(SYS_mmap, mem, 4096,
+                                    PROT_READ | PROT_WRITE,
+                                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                                    -1, 0);
+  if (untracked == MAP_FAILED || untracked != mem) return 6;
+  void *target = mmap(0, 8192, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (target == MAP_FAILED) return 7;
+  if (munmap(target, 8192) != 0) return 8;
+  void *moved = mremap(mem, 8192, 8192, MREMAP_MAYMOVE | MREMAP_FIXED, target);
+  if (moved == MAP_FAILED || moved != target) return 9;
+  return 0;
+}
+""")
+    let depfile = work / "jit-mremap-partial.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--",
+      partialRemapProbe], childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcIncomplete
+    check dep.records.anyIt(it.kind == mrEventLoss and
+      "mremap-anonymous" in it.detail)
+
   test "raw libc statx/access/readlink probes capture path dependencies":
     let snoopBin = work / "io-mon"
     if not fileExists(snoopBin):

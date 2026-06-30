@@ -378,8 +378,12 @@ proc linuxPreloadMonitorProfile*(
     message: "Linux raw syscall coverage is stackable-backed; io-mon " &
       "classifies common file/probe syscalls from libc, main-executable, " &
       "startup non-system application-DSO, and late dlopen/dlmopen " &
-      "application-DSO raw syscall sites and fails closed for unsupported " &
-      "raw syscall numbers")
+      "application-DSO raw syscall sites, plus tracked anonymous/private " &
+      "mmap/mprotect executable ranges with munmap/mremap lifecycle " &
+      "bookkeeping, and fails closed for unsupported raw syscall numbers, " &
+      "untracked or partially tracked anonymous executable mprotect, " &
+      "partial-overlap mremap ownership escapes, or anonymous writable+" &
+      "executable mappings")
 
   var gapCapabilities = LinuxPreloadKnownUnsupportedCapabilities
   for capability in required:
