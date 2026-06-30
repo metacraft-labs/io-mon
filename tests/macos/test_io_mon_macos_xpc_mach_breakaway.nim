@@ -50,6 +50,10 @@ when defined(macosx):
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
   corpus = repoRoot / "research" / "adversarial-2026-06-round2" / "r2_xpc"
+  # ROUND-3 S0 — the residual corpus whose mach_server/mach_client reproduce the
+  # `com.apple.*` forged-name escape (a daemon bootstrap_register-ing an arbitrary
+  # unused `com.apple.<custom>` name from an unsigned binary).
+  r3Corpus = repoRoot / "research" / "adversarial-2026-06-round3" / "r3_residual"
   testRunId = "io-mon-xpc-test-run"
 
 when defined(macosx):
@@ -151,9 +155,13 @@ int main(int argc, char **argv) {
     test "CARDINAL SIN: only com.apple.* service traffic stays mcComplete":
       # A program that does ONLY system-service traffic — an XPC connection to a
       # com.apple.* mach service and a com.apple.* bootstrap_look_up — the kind of
-      # lookups a normal compile/link/make performs pervasively. The com.apple.*
-      # baseline filter (the bootstrap analog of the /usr/lib + /System
-      # library-load filter) must keep this mcComplete.
+      # lookups a normal compile/link/make performs pervasively. Both services here
+      # (com.apple.cfprefsd.daemon, com.apple.system.notification_center) are GENUINE
+      # Apple services DECLARED in the SIP-protected launchd plists, so the ROUND-3
+      # S0 SIP-declared-service check (which replaced the round-2 blunt com.apple.*
+      # prefix filter) exempts them and this build stays mcComplete. This locks in
+      # the no-false-downgrade guarantee for the finer-grained round-3 logic: a real
+      # Apple-service lookup must NOT be mistaken for the forged-name breakaway.
       let apple = work / "apple"
       let appleSrc = work / "apple.c"
       writeProbe(appleSrc, """
@@ -272,6 +280,71 @@ int main(void) {
           check dep.completeness == mcIncomplete
         else:
           checkpoint("client did not complete the Mach round-trip — skip")
+          check true
+
+    # --- ROUND-3 S0 (com.apple.* forged-name escape, raw Mach end-to-end) ----
+
+    test "ROUND-3 S0: forged com.apple.* name from an unsigned daemon downgrades":
+      # The round-2 R-C fix exempted EVERY `com.apple.*` service by name prefix.
+      # That is trivially bypassable: an unsigned third-party process can
+      # `bootstrap_register` an arbitrary UNUSED `com.apple.<custom>` name (verified:
+      # bootstrap_register returns KERN_SUCCESS for such a name from an unsigned
+      # binary), then serve a monitored client a delegated file read over Mach IPC —
+      # producing a false `mcComplete` with the secret input absent. ROUND-3 S0
+      # replaces the prefix exemption with a SIP-declared-service check: a
+      # `com.apple.*` name is exempt ONLY when it is declared in the SIP-protected
+      # launchd plists (which the attacker cannot write). The attacker's forged name
+      # is absent there, so it is now RECORDED and downgrades to `mcIncomplete`.
+      #
+      # Best-effort like the regression above: honestly skip if this host forbids
+      # raw Mach bootstrap registration (no launchd bootstrap access).
+      let server = work / "r3_mach_server"
+      let client = work / "r3_mach_client"
+      cc(r3Corpus / "mach_server.c", server, @["-I", r3Corpus])
+      cc(r3Corpus / "mach_client.c", client, @["-I", r3Corpus])
+
+      # An UNUSED com.apple.* name — the exact escape vector. A real Apple service
+      # name would already be registered (bootstrap_register would fail), so the
+      # attacker is forced to an undeclared name, which the SIP-set check catches.
+      let svc = "com.apple.r3residual.regress." & $getCurrentProcessId()
+      let srv = startProcess(server, args = @[svc],
+        options = {poStdErrToStdOut})
+      sleep(1000)                          # let bootstrap_register settle
+      let serverAlive = srv.peekExitCode() < 0
+
+      proc stopR3Server() =
+        try: srv.terminate() except CatchableError: discard
+        try: discard srv.waitForExit() except CatchableError: discard
+        srv.close()
+
+      if not serverAlive:
+        checkpoint("r3 mach_server exited early (no raw Mach bootstrap here) — skip")
+        stopR3Server()
+        check true
+      else:
+        let marker = work / "r3-secret-mach.txt"
+        let markText = "R3-APPLE-FNEG-" & $getCurrentProcessId()
+        writeFile(marker, markText & "\n")
+        let frag = work / "r3MachFrag"
+        createDir(frag)
+        let (outM, _) = runUnderShim(shim, client, @[marker, svc], frag)
+        checkpoint("r3 mach_client: " & outM)
+        stopR3Server()
+
+        if markText in outM:
+          # The forged-com.apple.* breakaway DID happen…
+          let dep = mergeFragments(frag, work / "r3mach.rdep")
+          let recs = machServiceRecords(dep)
+          check recs.len >= 1            # the com.apple.* lookup is now recorded
+          var sawSvc = false
+          for r in recs:
+            if svc in r.path: sawSvc = true
+          check sawSvc                   # …on the attacker's forged name…
+          # …and the false cache hit is closed: mcIncomplete (was mcComplete under
+          # the round-2 prefix filter). This is the round-3 S0 regression guard.
+          check dep.completeness == mcIncomplete
+        else:
+          checkpoint("r3 client did not complete the Mach round-trip — skip")
           check true
 
     removeDir(work)

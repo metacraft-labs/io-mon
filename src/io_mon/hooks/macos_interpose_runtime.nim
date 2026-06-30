@@ -1237,31 +1237,97 @@ void *repro_macos_real_xpc_create_mach_service_call(char *name,
 }
 
 /*
- * Classify a Mach service name: 1 if a bootstrap_look_up / XPC connection to it
- * should be RECORDED as a potential out-of-tree breakaway, 0 if it is a SYSTEM
- * BASELINE name that EVERY normal program resolves (the bootstrap analog of the
- * /usr/lib + /System + dyld-shared-cache library-load filter). The com.apple.*
- * namespace is the dominant baseline (notifyd, logd, distributed notifications,
- * the dyld/XPC system services, com.apple.dt.* developer tooling, …) and the
- * shim's own / libsystem's own startup lookups all fall in it; recording those
- * would self-downgrade EVERY capture — the CARDINAL SIN. A NON-Apple service
- * (sccache/distcc/icecc/custom build daemons, and the r2_xpc com.example.*
- * breakaway) is the conservative downgrade trigger: a normal compile/link/make
- * never resolves one, so the no-false-downgrade guard holds, while a delegated
- * file read to a custom out-of-tree daemon is caught.
+ * Mach-service-name classification MOVED TO NIM (ROUND-3 S0). The round-2 blunt
+ * `com.apple.*` name-prefix exemption that used to live here was trivially
+ * bypassable: any unsigned process can `bootstrap_register` an arbitrary UNUSED
+ * `com.apple.<custom>` name and serve a monitored client a delegated file read
+ * with no downgrade. The decision now lives in `machServiceRecordable` /
+ * `isDeclaredAppleService` in shim/macos_interpose.nim, which exempts a
+ * `com.apple.*` name ONLY when it is declared in the SIP-protected launchd plists
+ * (an attacker-unforgeable allowlist). That code needs the shim's mute/lock
+ * machinery to scan the plists without self-recording, so it belongs in the Nim
+ * shim module rather than this header-only runtime helper.
  *
- * RESIDUAL (documented): a breakaway delegated to a com.apple.* service
- * (SourceKit com.apple.dt.*, Virtualization.framework, sandboxd) is NOT caught
- * here — an in-process hook cannot distinguish a benign com.apple.* lookup
- * (pervasive in every build) from a malicious one without false-downgrading
- * everything. The structural fix is the EndpointSecurity backend (T3c). This
- * in-process hook is the conservative stopgap for the non-Apple custom-daemon
- * breakaway surface the confirmed break exercises.
+ * It does, however, need to READ the SIP-protected launchd plists without
+ * tripping the shim's own hooks.
+ *
+ * It is implemented with PURE RAW SYSCALLS — `SYS_open(O_DIRECTORY)` +
+ * `SYS_getdirentries64` for enumeration, `SYS_open`/`SYS_read`/`SYS_close` for the
+ * files — and NO libsystem opendir/readdir at all. This is deliberate: under the
+ * shim, BOTH `dlsym("readdir")` and the shim-skipping image walk resolve to a
+ * `readdir` whose record layout is OFF BY ONE relative to the C `struct dirent`
+ * (observed: every d_name comes back missing its first byte — "om.apple.…" for
+ * "com.apple.…", "sh.plist" for "ssh.plist") because the interpose `__interpose`
+ * tuple and the shim's wrapper forwarding perturb the resolution. The raw
+ * `SYS_getdirentries64` kernel record format is fixed and self-describing
+ * (d_ino,8 · d_seekoff,8 · d_reclen,2 · d_namlen,2 · d_type,1 · d_name[d_namlen]),
+ * so we parse it directly and the first-byte corruption cannot occur (verified:
+ * d_name="com.apple.srp-mdns-proxy.plist", "ssh.plist"). Raw syscalls also never
+ * fire a file-I/O hook, so the scan records nothing.
+ *
+ * It concatenates every non-directory entry's bytes — with a NUL separator after
+ * each so a service name cannot straddle two files — into the caller's buffer,
+ * bounded by `cap`, starting at `pos`, and returns the new write position.
+ * Unreadable entries are silently skipped (at worst a name is treated as
+ * undeclared ⇒ a conservative re-run).
  */
-int repro_macos_mach_service_recordable(char *name) {
-  if (!name || !name[0]) return 0;
-  if (strncmp(name, "com.apple.", 10) == 0) return 0;
-  return 1;
+size_t repro_macos_concat_sip_plists(char *dir, void *out_raw, size_t cap,
+                                     size_t pos) {
+  char *out = (char *)out_raw;
+  if (!dir || !out || pos >= cap) return pos;
+  /* The fixed SYS_getdirentries64 record layout (Darwin `struct dirent`, packed
+   * here so d_name follows d_type with no implicit tail padding). */
+  struct repro_dirent64 {
+    uint64_t d_ino;
+    uint64_t d_seekoff;
+    uint16_t d_reclen;
+    uint16_t d_namlen;
+    uint8_t  d_type;
+    char     d_name[];
+  } __attribute__((packed));
+  int dfd = (int)syscall(SYS_open, dir, O_RDONLY | O_DIRECTORY, 0);
+  if (dfd < 0) return pos;
+  size_t dirlen = strlen(dir);
+  char dbuf[16384];
+  long basep = 0;
+  for (;;) {
+    int n = (int)syscall(SYS_getdirentries64, dfd, dbuf, sizeof(dbuf), &basep);
+    if (n <= 0) break;                       /* 0 = end, <0 = error */
+    int off = 0;
+    while (off + (int)sizeof(struct repro_dirent64) <= n) {
+      struct repro_dirent64 *e = (struct repro_dirent64 *)(dbuf + off);
+      if (e->d_reclen == 0) break;           /* defensive: avoid an infinite loop */
+      /* Skip subdirectories and "." / ".."; accept regular files, symlinks, and
+       * unknown-typed entries (a filesystem that does not populate d_type). */
+      if (e->d_type != DT_DIR) {
+        const char *nm = e->d_name;
+        size_t nlen = e->d_namlen;
+        int isDot = (nlen == 1 && nm[0] == '.') ||
+                    (nlen == 2 && nm[0] == '.' && nm[1] == '.');
+        char path[1100];
+        if (!isDot && dirlen + 1 + nlen + 1 <= sizeof(path)) {
+          memcpy(path, dir, dirlen);
+          path[dirlen] = '/';
+          memcpy(path + dirlen + 1, nm, nlen);
+          path[dirlen + 1 + nlen] = '\0';
+          int fd = (int)syscall(SYS_open, path, O_RDONLY, 0);
+          if (fd >= 0) {
+            for (;;) {
+              if (pos >= cap) break;
+              ssize_t r = (ssize_t)syscall(SYS_read, fd, out + pos, cap - pos);
+              if (r <= 0) break;
+              pos += (size_t)r;
+            }
+            syscall(SYS_close, fd);
+            if (pos < cap) out[pos++] = '\0';  /* per-file NUL separator */
+          }
+        }
+      }
+      off += e->d_reclen;
+    }
+  }
+  syscall(SYS_close, dfd);
+  return pos;
 }
 
 /* ===================================================================== *
@@ -1730,16 +1796,6 @@ proc ct_macos_real_xpc_create_mach_service*(name: cstring; targetq: pointer;
     {.importc: "repro_macos_real_xpc_create_mach_service_call", cdecl.}
   realCreate(name, targetq, flags)
 
-proc ct_macos_mach_service_recordable*(name: cstring): bool =
-  ## ROUND-2 R-C — true if a bootstrap_look_up / XPC connection to `name` should be
-  ## recorded as a potential out-of-tree breakaway (non-`com.apple.*`). The
-  ## `com.apple.*` system baseline is excluded so a normal build — whose only
-  ## Mach-service lookups are system ones — is never falsely downgraded. See the C
-  ## helper for the cardinal-sin rationale and the documented com.apple.* residual.
-  proc recordable(name: cstring): cint
-    {.importc: "repro_macos_mach_service_recordable", cdecl.}
-  name != nil and recordable(name) != 0
-
 proc ct_macos_socket_describe*(fd: cint; address: pointer; addrLen: uint32;
     outDest: pointer; outDestLen: csize_t; outPeerPid: ptr cint): cint =
   ## Describe a connect() target (T3a): returns the address family and fills
@@ -1749,6 +1805,20 @@ proc ct_macos_socket_describe*(fd: cint; address: pointer; addrLen: uint32;
       outDestLen: csize_t; outPeerPid: ptr cint): cint
     {.importc: "repro_macos_socket_describe", cdecl.}
   describe(fd, address, addrLen, outDest, outDestLen, outPeerPid)
+
+proc ct_macos_concat_sip_plists*(dir: cstring; outBuf: pointer; cap: csize_t;
+    pos: csize_t): csize_t =
+  ## ROUND-3 S0 — concatenate the raw bytes of every regular file in the
+  ## SIP-protected launchd plist directory `dir` into `outBuf` (bounded by `cap`),
+  ## starting at `pos`; returns the new write position. Reentrancy-safe: the C
+  ## helper enumerates and reads via PURE RAW SYSCALLS (SYS_open(O_DIRECTORY) +
+  ## SYS_getdirentries64 for the dir, SYS_open/read/close for the files) — no
+  ## libsystem opendir/readdir at all — so it never re-enters the shim's hooks and
+  ## never records its own I/O. See the C helper for why the read cannot go through
+  ## libsystem/Nim's std/posix readdir (an off-by-one in the shimmed record layout).
+  proc impl(dir: cstring; outBuf: pointer; cap: csize_t; pos: csize_t): csize_t
+    {.importc: "repro_macos_concat_sip_plists", cdecl.}
+  impl(dir, outBuf, cap, pos)
 
 proc ct_macos_proc_start_usec*(pid: cint): uint64 =
   ## ROUND-2 R7 — kernel process start time (microseconds since epoch) for `pid`,
