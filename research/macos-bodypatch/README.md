@@ -9,8 +9,9 @@ no re-signing — exactly the conditions the io-mon build/test system produces
 
 The production implementation lives in:
 
-- `src/io_mon/hooks/macos_bodypatch.nim` — the reusable body-patcher
-  (`repro_macos_bodypatch_install` / `..._install_named`).
+- `../nim-stackable-hooks/src/stackable_hooks/platform/macos_bodypatch.nim` —
+  the reusable body-patcher (`stackable_macos_bodypatch_install` /
+  `..._install_named_excluding`).
 - `src/io_mon/shim/macos_interpose.nim` — installs the patches in the shim
   constructor UNCONDITIONALLY (both mechanisms are always on by default; there
   is no runtime backend selector). For diagnosis, NON-release shims honour
@@ -84,8 +85,9 @@ inside libsystem, which `__DATA,__interpose` never sees). `fork` forwards via
 recording is needed); `execve` forwards via the raw-syscall forwarder (which
 itself re-propagates + rewrites).
 
-Production: `repro_macos_bodypatch_build_trampoline` /
-`..._install_named_tramp` in `src/io_mon/hooks/macos_bodypatch.nim`; the spawn
+Production: `stackable_macos_bodypatch_build_trampoline` /
+`..._install_named_tramp_excluding` in
+`stackable_hooks/platform/macos_bodypatch.nim`; the spawn
 hooks in `src/io_mon/shim/macos_interpose.nim`.
 
 ### References

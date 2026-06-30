@@ -5,7 +5,7 @@ import std/[locks, os, sets, strutils, tables]
 from io_mon/paths import extendedPath
 
 import io_mon/hooks/macos_interpose_runtime
-import io_mon/hooks/macos_bodypatch
+import stackable_hooks/platform/macos_bodypatch
 import io_mon/types
 import io_mon/writer
 
@@ -2781,6 +2781,8 @@ type BodypatchHookSpec = object
   names: seq[string]   ## libsystem symbol variants that share this ABI
   hook: pointer        ## the body-hook to branch to
 
+const BodypatchExcludeImage = "librepro_monitor_shim"
+
 proc shimLogToStderr(msg: string) {.raises: [].} =
   ## Emit a diagnostic line to stderr under the shim-muted guard so the
   ## diagnostic's own write() does not recurse into the (now body-patched)
@@ -3003,8 +3005,8 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
     for name in spec.names:
       if skipped(name):
         continue
-      reproMacosBodypatchInstallNamed(cstring(name), spec.hook,
-        addr installed, addr failed, addr absent)
+      stackableMacosBodypatchInstallNamedExcluding(cstring(name), spec.hook,
+        cstring(BodypatchExcludeImage), addr installed, addr failed, addr absent)
 
   # posix_spawn / posix_spawnp: the trampoline path. posix_spawn is NOT a thin
   # syscall wrapper (it marshals a private _posix_spawn_args_desc), so the hook
@@ -3021,17 +3023,17 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
   # if it ever could not, fork is left interpose-only (the hook then forwards via
   # the re-entry-free by-name real) — a safe degradation.
   if not skipped("fork"):
-    reproMacosBodypatchInstallNamedTramp(cstring("fork"),
-      cast[pointer](repro_hook_fork), addr bodypatchForkTramp,
-      addr installed, addr failed, addr absent)
+    stackableMacosBodypatchInstallNamedTrampExcluding(cstring("fork"),
+      cast[pointer](repro_hook_fork), cstring(BodypatchExcludeImage),
+      addr bodypatchForkTramp, addr installed, addr failed, addr absent)
   if not skipped("posix_spawn"):
-    reproMacosBodypatchInstallNamedTramp(cstring("posix_spawn"),
-      cast[pointer](repro_hook_posix_spawn), addr bodypatchPosixSpawnTramp,
-      addr installed, addr failed, addr absent)
+    stackableMacosBodypatchInstallNamedTrampExcluding(cstring("posix_spawn"),
+      cast[pointer](repro_hook_posix_spawn), cstring(BodypatchExcludeImage),
+      addr bodypatchPosixSpawnTramp, addr installed, addr failed, addr absent)
   if not skipped("posix_spawnp"):
-    reproMacosBodypatchInstallNamedTramp(cstring("posix_spawnp"),
-      cast[pointer](repro_hook_posix_spawnp), addr bodypatchPosixSpawnpTramp,
-      addr installed, addr failed, addr absent)
+    stackableMacosBodypatchInstallNamedTrampExcluding(cstring("posix_spawnp"),
+      cast[pointer](repro_hook_posix_spawnp), cstring(BodypatchExcludeImage),
+      addr bodypatchPosixSpawnpTramp, addr installed, addr failed, addr absent)
 
   # In NON-release builds, if interpose has been disabled for diagnosis
   # (IO_MON_DEBUG_DISABLE_INTERPOSE), append a clear note so the A/B state is
