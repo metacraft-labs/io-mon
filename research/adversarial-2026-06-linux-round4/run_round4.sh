@@ -78,22 +78,52 @@ int main(int argc, char **argv) {
 }
 C
 
-cat >"$RUN_DIR/probes/raw_sendfile.c" <<'C'
+cat >"$RUN_DIR/probes/raw_zero_copy.c" <<'C'
 #define _GNU_SOURCE
 #include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
 #include <sys/sendfile.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#ifndef SYS_copy_file_range
+#define SYS_copy_file_range 326
+#endif
+#ifndef SYS_splice
+#define SYS_splice 275
+#endif
+static long xsplice(int in, int out) {
+  int p[2];
+  if (pipe(p) != 0) return -1;
+  long n = syscall(SYS_splice, in, 0, p[1], 0, 4096, 0);
+  if (n > 0) {
+    long m = syscall(SYS_splice, p[0], 0, out, 0, (size_t)n, 0);
+    if (m < 0) n = -1;
+  }
+  close(p[0]);
+  close(p[1]);
+  return n;
+}
 int main(int argc, char **argv) {
-  int in = (int)syscall(SYS_openat, AT_FDCWD, argv[1], O_RDONLY, 0);
+  if (argc != 4) return 2;
+  int in = (int)syscall(SYS_openat, AT_FDCWD, argv[2], O_RDONLY, 0);
   if (in < 0) return 2;
-  int out = (int)syscall(SYS_openat, AT_FDCWD, argv[2],
+  int out = (int)syscall(SYS_openat, AT_FDCWD, argv[3],
                          O_WRONLY | O_CREAT | O_TRUNC, 0666);
   if (out < 0) return 3;
-  long n = syscall(SYS_sendfile, out, in, 0, 4096);
+  long n = -1;
+  if (strcmp(argv[1], "sendfile") == 0) {
+    n = syscall(SYS_sendfile, out, in, 0, 4096);
+  } else if (strcmp(argv[1], "copy_file_range") == 0) {
+    n = syscall(SYS_copy_file_range, in, 0, out, 0, 4096, 0);
+  } else if (strcmp(argv[1], "splice") == 0) {
+    n = xsplice(in, out);
+  } else {
+    return 4;
+  }
   syscall(SYS_close, out);
   syscall(SYS_close, in);
-  return n > 0 ? 0 : 4;
+  return n > 0 ? 0 : 5;
 }
 C
 
@@ -163,7 +193,7 @@ int main(void) {
 C
 
 "$CC" "$RUN_DIR/probes/content_channels.c" -o "$RUN_DIR/content_channels"
-"$CC" "$RUN_DIR/probes/raw_sendfile.c" -o "$RUN_DIR/raw_sendfile"
+"$CC" "$RUN_DIR/probes/raw_zero_copy.c" -o "$RUN_DIR/raw_zero_copy"
 "$CC" "$RUN_DIR/probes/hardlink_alias.c" -o "$RUN_DIR/hardlink_alias"
 "$CC" "$RUN_DIR/probes/rename_staging.c" -o "$RUN_DIR/rename_staging"
 "$CC" "$RUN_DIR/probes/nonfile.c" -o "$RUN_DIR/nonfile"
@@ -227,7 +257,9 @@ run_probe preadv "$RUN_DIR/content_channels" preadv "$src" "$RUN_DIR/out/preadv.
 run_probe sendfile "$RUN_DIR/content_channels" sendfile "$src" "$RUN_DIR/out/sendfile.out"
 run_probe copy_file_range "$RUN_DIR/content_channels" copy_file_range "$src" "$RUN_DIR/out/copy_file_range.out"
 run_probe splice "$RUN_DIR/content_channels" splice "$src" "$RUN_DIR/out/splice.out"
-run_probe raw_sendfile "$RUN_DIR/raw_sendfile" "$src" "$RUN_DIR/out/raw_sendfile.out"
+run_probe raw_sendfile "$RUN_DIR/raw_zero_copy" sendfile "$src" "$RUN_DIR/out/raw_sendfile.out"
+run_probe raw_copy_file_range "$RUN_DIR/raw_zero_copy" copy_file_range "$src" "$RUN_DIR/out/raw_copy_file_range.out"
+run_probe raw_splice "$RUN_DIR/raw_zero_copy" splice "$src" "$RUN_DIR/out/raw_splice.out"
 run_probe hardlink_alias "$RUN_DIR/hardlink_alias" "$src" \
   "$RUN_DIR/out/hardlink_alias.out" "$RUN_DIR/out" \
   "$RUN_DIR/out/hardlink_alias_linkat.out" "hardlink_alias_linkat.out"

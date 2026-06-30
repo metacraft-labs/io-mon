@@ -505,6 +505,94 @@ int main(int argc, char **argv) {
     check not dep.records.anyIt(it.kind == mrEventLoss and
       "libc raw syscall unsupported" in it.detail)
 
+  test "raw libc zero-copy syscalls capture source and destination evidence":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let mover = buildC(work, "raw_zero_copy_syscalls", """
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#ifndef SYS_copy_file_range
+#define SYS_copy_file_range 326
+#endif
+#ifndef SYS_splice
+#define SYS_splice 275
+#endif
+static long xsplice(int in, int out) {
+  int p[2];
+  if (pipe(p) != 0) return -1;
+  long n = syscall(SYS_splice, in, 0, p[1], 0, 4096, 0);
+  if (n > 0) {
+    long m = syscall(SYS_splice, p[0], 0, out, 0, (size_t)n, 0);
+    if (m < 0) n = -1;
+  }
+  close(p[0]);
+  close(p[1]);
+  return n;
+}
+int main(int argc, char **argv) {
+  if (argc != 4) return 2;
+  int in = (int)syscall(SYS_openat, AT_FDCWD, argv[2], O_RDONLY, 0);
+  if (in < 0) return 3;
+  int out = (int)syscall(SYS_openat, AT_FDCWD, argv[3],
+                         O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if (out < 0) return 4;
+  long n = -1;
+  if (strcmp(argv[1], "sendfile") == 0) {
+    n = syscall(SYS_sendfile, out, in, 0, 4096);
+  } else if (strcmp(argv[1], "copy_file_range") == 0) {
+    n = syscall(SYS_copy_file_range, in, 0, out, 0, 4096, 0);
+  } else if (strcmp(argv[1], "splice") == 0) {
+    n = xsplice(in, out);
+  } else {
+    return 5;
+  }
+  syscall(SYS_close, out);
+  syscall(SYS_close, in);
+  if (n < 0) {
+    fprintf(stderr, "%s failed: %s\n", argv[1], strerror(errno));
+    return 6;
+  }
+  return n > 0 ? 0 : 7;
+}
+""")
+    let marker = work / "raw-zero-copy-marker.txt"
+    writeFile(marker, "raw zero copy marker\n")
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+
+    for mode in ["sendfile", "copy_file_range", "splice"]:
+      let outPath = work / ("raw-zero-copy-" & mode & ".out")
+      let depfile = work / ("raw-zero-copy-" & mode & ".rdep")
+      let cap = run(snoopBin, @["run", "--depfile", depfile, "--", mover,
+        mode, marker, outPath], childEnv)
+      checkpoint(mode & ": " & cap.output)
+      check cap.code == 0
+
+      let dep = readMonitorDepFile(depfile)
+      check dep.completeness == mcComplete
+      check hasFileRead(dep, marker)
+      check hasFileWrite(dep, outPath)
+      check not dep.records.anyIt(it.kind == mrEventLoss and
+        "libc raw syscall unsupported" in it.detail)
+
   test "inline assembly syscall openat/read captures dependency":
     let snoopBin = work / "io-mon"
     if not fileExists(snoopBin):

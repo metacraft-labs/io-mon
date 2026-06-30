@@ -16,10 +16,12 @@ Scratch artifacts: `/tmp/io_mon_linux_round4`.
 | 5 | `sendfile` libc zero-copy file copy | Captured: source read plus destination write. |
 | 6 | `copy_file_range` libc zero-copy file copy | Captured: source read plus destination write. |
 | 7 | `splice` libc file-to-pipe-to-file copy | Captured: source read plus destination write. |
-| 8 | Direct raw `syscall(SYS_sendfile)` | Fail-closed: unsupported raw syscall event loss, `mcIncomplete`. |
-| 9 | Hardlink alias read | Captured by M-FW-6B for libc-visible `link`/`linkat`: source identity is recorded as a file read and the alias as a write. |
-| 10 | Rename staging write | Captured by M-FW-6B for libc-visible `rename`/`renameat`/`renameat2`: final destination path is recorded as a write. |
-| 11 | Non-file determinism (`getenv`, `uname`, `sysconf`, clock, `getrandom`) | Captured by M-FW-6C for the libc-visible subset: observed-input records for env/uname/sysconf/time diagnostics plus `getrandom` non-determinism, yielding `mcIncomplete`. |
+| 8 | Direct raw `syscall(SYS_sendfile)` | Captured by M-FW-6D: source read plus destination write. |
+| 9 | Direct raw `syscall(SYS_copy_file_range)` | Captured by M-FW-6D: source read plus destination write. |
+| 10 | Direct raw `syscall(SYS_splice)` | Captured by M-FW-6D over file-to-pipe and pipe-to-file legs. |
+| 11 | Hardlink alias read | Captured by M-FW-6B for libc-visible `link`/`linkat`: source identity is recorded as a file read and the alias as a write. Direct raw mutation variants remain residual. |
+| 12 | Rename staging write | Captured by M-FW-6B for libc-visible `rename`/`renameat`/`renameat2`: final destination path is recorded as a write. Direct raw mutation variants remain residual. |
+| 13 | Non-file determinism (`getenv`, `uname`, `sysconf`, clock, `getrandom`) | Captured by M-FW-6C for the libc-visible subset: observed-input records for env/uname/sysconf/time diagnostics plus `getrandom` non-determinism, yielding `mcIncomplete`. |
 
 No new silent false-negative was confirmed in the newly targeted
 libc-visible positioned/vector/zero-copy file-content channels. The first two
@@ -71,6 +73,25 @@ model:
   path maps to event-loss and `mcIncomplete`.
 - Direct raw syscall and vDSO clock/time paths are not claimed by this slice.
 
+## Fourth fix milestone
+
+M-FW-6D is ready for review: Linux raw syscall classification now covers the
+zero-copy file movers that can be classified from known fd state:
+
+- raw `sendfile` records the source fd as `mrFileRead` and destination fd as
+  `mrFileWrite` when both fds are known.
+- raw `copy_file_range` records source and destination evidence with the same
+  known-fd requirement.
+- raw `splice` records whichever file side is known for each successful leg,
+  covering the common file-to-pipe plus pipe-to-file transfer pattern without
+  treating pipe fds as file paths.
+- The live regression executes all three raw syscalls under the built shim and
+  requires actual source-read and destination-write evidence with no unsupported
+  raw-syscall event loss.
+- Direct raw `link*`/`rename*` path-mutation classification is not claimed in
+  this slice; it remains fail-closed/residual pending a safe pointer and dirfd
+  policy.
+
 ## Follow-up candidates
 
 - Pre-existing hardlink/inode aliases and direct raw `link*`/`rename*`
@@ -78,6 +99,6 @@ model:
 - Direct raw/vDSO and broader Linux non-file determinism APIs beyond the
   current libc-visible `getenv`/`uname`/`sysconf`/clock/time/`getrandom`
   subset.
-- Direct raw zero-copy syscall classification for `sendfile`, `splice`, and
-  `copy_file_range` if it can be done safely through the existing raw syscall
-  event path.
+- Inherited/unknown-fd zero-copy cases where the fd table cannot name a file
+  side; these remain capability-gated/fail-closed rather than silently
+  complete.

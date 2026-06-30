@@ -23,11 +23,14 @@ const
   LinuxSysStat = 4.clong
   LinuxSysLstat = 6.clong
   LinuxSysAccess = 21.clong
+  LinuxSysSendfile = 40.clong
   LinuxSysReadlink = 89.clong
   LinuxSysOpenat = 257.clong
   LinuxSysNewfstatat = 262.clong
   LinuxSysReadlinkat = 267.clong
   LinuxSysFaccessat = 269.clong
+  LinuxSysSplice = 275.clong
+  LinuxSysCopyFileRange = 326.clong
   LinuxSysStatx = 332.clong
   LinuxSysOpenat2 = 437.clong
   LinuxEfault = 14.clong
@@ -556,6 +559,54 @@ proc recordRawRead(fd: cint; callResult: clong): bool {.raises: [].} =
   emitRecord(record)
   true
 
+proc recordRawWrite(fd: cint; callResult: clong): bool {.raises: [].} =
+  if callResult < 0:
+    return true
+  if fd <= 2:
+    return true
+  let path = pathForFd(fd)
+  if path.len == 0:
+    return false
+  var record = baseRecord(mrFileWrite, moFileWrite)
+  record.path = path
+  record.result = callResult.int64
+  record.flags = uint32(fd)
+  emitRecord(record)
+  true
+
+proc recordRawFileCopy(inFd, outFd: cint; callResult: clong): bool
+    {.raises: [].} =
+  if callResult <= 0:
+    return callResult >= 0
+  let readOk = recordRawRead(inFd, callResult)
+  let writeOk = recordRawWrite(outFd, callResult)
+  readOk and writeOk
+
+proc recordRawSplice(fdIn, fdOut: cint; callResult: clong): bool
+    {.raises: [].} =
+  if callResult <= 0:
+    return callResult >= 0
+  var recorded = false
+  if fdIn > 2:
+    let inPath = pathForFd(fdIn)
+    if inPath.len > 0:
+      var record = baseRecord(mrFileRead, moFileRead)
+      record.path = inPath
+      record.result = callResult.int64
+      record.flags = uint32(fdIn)
+      emitRecord(record)
+      recorded = true
+  if fdOut > 2:
+    let outPath = pathForFd(fdOut)
+    if outPath.len > 0:
+      var record = baseRecord(mrFileWrite, moFileWrite)
+      record.path = outPath
+      record.result = callResult.int64
+      record.flags = uint32(fdOut)
+      emitRecord(record)
+      recorded = true
+  recorded
+
 proc openHowFlags(howArg, callResult: clong; flags, mode: var cint): bool
     {.raises: [].} =
   if callResult < 0 or howArg == 0:
@@ -592,6 +643,12 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
     true
   of LinuxSysRead:
     recordRawRead(cint(a1), callResult)
+  of LinuxSysSendfile:
+    recordRawFileCopy(cint(a2), cint(a1), callResult)
+  of LinuxSysCopyFileRange:
+    recordRawFileCopy(cint(a1), cint(a3), callResult)
+  of LinuxSysSplice:
+    recordRawSplice(cint(a1), cint(a3), callResult)
   of LinuxSysClose:
     if callResult >= 0:
       removeFdPath(cint(a1))
