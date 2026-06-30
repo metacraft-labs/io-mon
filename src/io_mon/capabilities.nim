@@ -116,6 +116,9 @@ const
     mcapLibraryLoad,
     mcapAuthorizationEnforcement,
     mcapPathMutation,
+    mcapAdversarialRawSyscall,
+    mcapExecutableMappingLifecycle,
+    mcapPathIdentity,
     # ROUND-2 R-D — the Linux preload shim does not yet hook getenv/sysctl/uname or
     # the entropy/time sources; non-file determinism handling is macOS-only so far.
     mcapObservedEnv,
@@ -185,6 +188,12 @@ proc capabilityId*(capability: MonitorCapability): string =
     "non-determinism"
   of mcapExternalContent:
     "external-content"
+  of mcapAdversarialRawSyscall:
+    "adversarial-raw-syscall"
+  of mcapExecutableMappingLifecycle:
+    "executable-mapping-lifecycle"
+  of mcapPathIdentity:
+    "path-identity"
 
 proc capabilityFromId*(value: string): MonitorCapability =
   for capability in MonitorCapability:
@@ -230,6 +239,12 @@ proc unsupportedReason(capability: MonitorCapability): string =
     "macOS interpose shim observes only and cannot authorize or deny operations"
   of mcapPathMutation:
     "macOS interpose shim does not cover the full mutation surface yet"
+  of mcapAdversarialRawSyscall:
+    "direct/raw syscall completeness requires a native kernel-sourced backend"
+  of mcapExecutableMappingLifecycle:
+    "executable mapping lifecycle completeness requires a native mapping source"
+  of mcapPathIdentity:
+    "path identity coverage for hardlink/inode aliases is not advertised by this profile"
   of mcapIpcConnect:
     # connect(2) IS hooked on the macOS interpose+body-patch shim; this branch is
     # retained only for profiles that share this enum and have not wired it, and
@@ -264,8 +279,22 @@ proc linuxUnsupportedReason(capability: MonitorCapability): string =
     "Linux preload shim observes only and cannot authorize or deny operations"
   of mcapPathMutation:
     "Linux preload shim does not cover the full mutation surface yet"
+  of mcapAdversarialRawSyscall:
+    "Linux LD_PRELOAD covers libc syscall(2), selected application inline " &
+      "syscall sites, and tracked anonymous executable mappings, but does " &
+      "not claim adversarial/direct raw-syscall completeness for excluded " &
+      "runtime-prefix DSOs, executable mappings outside the preload mmap " &
+      "lifecycle, or unclassified syscall families"
+  of mcapExecutableMappingLifecycle:
+    "Linux LD_PRELOAD scans executable mappings only when they are owned by " &
+      "the preload mmap/mprotect/munmap/mremap lifecycle; mappings created " &
+      "outside that lifecycle are not production-complete"
+  of mcapPathIdentity:
+    "Linux preload shim does not yet provide full hardlink/inode alias and " &
+      "rename-staging path identity fidelity"
   of mcapIpcConnect:
-    "Linux preload shim does not yet hook connect(2) for IPC-breakaway detection"
+    "Linux preload shim hooks connect(2); this reason applies only where " &
+      "IPC-connect is not advertised"
   of mcapObservedEnv:
     "Linux preload shim does not yet hook getenv/sysctl/uname as observed inputs"
   of mcapNonDeterminism:
@@ -384,6 +413,14 @@ proc linuxPreloadMonitorProfile*(
       "untracked or partially tracked anonymous executable mprotect, " &
       "partial-overlap mremap ownership escapes, or anonymous writable+" &
       "executable mappings")
+  result.diagnostics.add MonitorDiagnostic(
+    level: mdlWarning,
+    message: "Linux LD_PRELOAD completeness excludes adversarial residuals " &
+      "unless they are represented by event-loss at runtime: excluded-prefix " &
+      "startup DSOs, executable mappings outside the preload mmap lifecycle, " &
+      "raw zero-copy/mutation syscalls, hardlink/path-identity aliases, and " &
+      "non-file determinism inputs. Consumers that require those threat models " &
+      "must request the corresponding capability and treat the gap as incomplete.")
 
   var gapCapabilities = LinuxPreloadKnownUnsupportedCapabilities
   for capability in required:

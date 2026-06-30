@@ -100,7 +100,13 @@ to start as an honest stub today.
   zero-copy syscalls (`sendfile`, `splice`, raw `copy_file_range`), hardlink
   aliases, and Linux non-file determinism inputs (`getenv`, `uname`, `sysconf`,
   time, `getrandom`) still need dedicated hooks or stackable-backed
-  scanner/classifier integration.
+  scanner/classifier integration. The default Linux profile is therefore an
+  `LD_PRELOAD` completeness profile, not a native/adversarial production
+  profile: consumers that require those residual threat models must request the
+  explicit capabilities (`adversarial-raw-syscall`,
+  `executable-mapping-lifecycle`, `external-content`, `library-load`,
+  `path-mutation`, `path-identity`, `observed-env`, `non-determinism`) and
+  treat the resulting required capability gap as `mcIncomplete`.
 - **Windows** — injected hooks via `CreateRemoteThread`+`LoadLibraryW` (needs
   validation under the DIY toolchain).
 - **EndpointSecurity** — designed/skeletoned (see above), not yet a shipping
