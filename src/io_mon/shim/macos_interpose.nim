@@ -1480,6 +1480,57 @@ proc recordFdRead(fd: cint; nbytes: int) {.raises: [].} =
   else:
     classifyEmptyFdRead(fd)
 
+proc recordFdWrite(fd: cint; nbytes: int; detail = "") {.raises: [].} =
+  ## ROUND-4 RW1 — shared content-WRITE recorder for write/pwrite/pwritev/writev/
+  ## ftruncate. The write-side mirror of `recordFdRead`: emit an
+  ## `mrFileWrite`/`moFileWrite` on the fd's open path so a positioned/vectored
+  ## write (pwrite/pwritev/writev) or an fd-based size mutation (ftruncate) marks
+  ## the path WRITTEN — upgrading a pure `O_RDWR` open from INPUT (moFileOpen) to
+  ## OUTPUT exactly as `write(2)`/the MAP_SHARED|PROT_WRITE mmap already do.
+  ##
+  ## THE ROUND-4 FINDING (research/adversarial-2026-06-round4/r4_write): an
+  ## `O_RDWR` file mutated ONLY via pwrite (SQLite/LMDB page writes), writev
+  ## (linkers/archivers/log writers) or ftruncate (the ld64 "open O_RDWR, ftruncate
+  ## to size, mmap-write" idiom) carried NO `write(2)`, so the open's `moFileOpen`
+  ## was the only record and a downstream "inputs = read AND NOT written" fold left
+  ## the produced output OUT of the action's output set → a SKIP candidate on
+  ## rebuild → stale content / downstream false-skip. Recording the write here is
+  ## the fix (io-mon records the write EVENT on the right path; the consumer
+  ## re-reads the content). `detail` tags non-`write(2)` mutations (e.g. ftruncate).
+  ##
+  ## `fd <= 2` (the std streams) are skipped: a write to stdout/stderr is not a
+  ## file output. This mirrors `repro_hook_write`'s `fd > 2` guard exactly — the
+  ## two hooks therefore never disagree about which fds count, and (being DISTINCT
+  ## syscalls) they never double-record the same byte transfer.
+  if fd <= 2:
+    return
+  var record = baseRecord(mrFileWrite, moFileWrite)
+  record.path = pathForFd(fd)
+  record.result = nbytes.int64
+  record.flags = uint32(fd)
+  if detail.len > 0:
+    record.detail = detail
+  emitRecord(record)
+
+proc recordPathWrite(path: cstring; size: int64; detail: string) {.raises: [].} =
+  ## ROUND-4 RW1 — emit an `moFileWrite` for a PATH-based content mutation that
+  ## carries no fd and no `write(2)`: `truncate(2)` shrinks (destroying tail bytes)
+  ## or zero-extends a pre-existing file's content. round-4 r4_write
+  ## (path_truncate.c / clean_truncate.c) found such a mutation left ZERO records
+  ## referencing the output. The path is CANONICALIZED (mirroring the rename-dest
+  ## output handling, `recordRename`) so it matches the consumer's view of the
+  ## file. `size` (the new length) is stamped into `result` for provenance.
+  if path == nil:
+    return
+  var record = baseRecord(mrFileWrite, moFileWrite)
+  let raw = $path
+  let canonical = canonicalPathFor(raw)
+  record.path = if canonical.len > 0: canonical else: raw
+  record.result = size
+  if detail.len > 0:
+    record.detail = detail
+  emitRecord(record)
+
 # --- ROUND-2 R-D (break R10) non-file determinism recorders -----------------
 #
 # THE THREE-WAY SPLIT (the crux — different non-file inputs need DIFFERENT
@@ -1645,12 +1696,10 @@ proc repro_hook_write*(fd: cint; buf: pointer; count: csize_t): int {.exportc, c
   if not initialized or disabled > 0:
     return ct_macos_interpose_real_write(fd, buf, count)
   result = ct_macos_interpose_real_write(fd, buf, count)
-  if result >= 0 and fd > 2:
-    var record = baseRecord(mrFileWrite, moFileWrite)
-    record.path = pathForFd(fd)
-    record.result = result.int64
-    record.flags = uint32(fd)
-    emitRecord(record)
+  if result >= 0:
+    # ROUND-4 RW1 — write(2) and the new positioned/vectored write hooks share one
+    # recorder (recordFdWrite), which applies the `fd > 2` std-stream guard.
+    recordFdWrite(fd, result)
 
 proc repro_hook_close*(fd: cint): cint {.exportc, cdecl, dynlib.} =
   if not initialized or disabled > 0:
@@ -1888,6 +1937,90 @@ proc repro_hook_readv*(fd: cint; iov: pointer; iovcnt: cint): int
   let savedErrno = getErrno()
   if result >= 0:
     recordFdRead(fd, result)
+  setErrno(savedErrno)
+
+# --- ROUND-4 RW1 write-side content hooks (symmetric to the S1d read hooks) -----
+#
+# Round-3 added the READ-side positioned/vectored hooks (pread/preadv/readv/
+# sendfile) but NO write-side equivalents, so an O_RDWR file mutated ONLY via a
+# positioned/vectored write or a size mutation was recorded as a pure INPUT (the
+# open's moFileOpen) and folded out of the action's output set
+# (research/adversarial-2026-06-round4/r4_write). These hooks close that gap. Like
+# the read hooks they are INTERPOSE-ONLY: build tools call pwrite/writev/ftruncate/
+# truncate DIRECTLY (not via shared-cache-internal libsystem paths the way fopen
+# reaches read), so the interpose tuple captures the program's own calls and
+# body-patching them would add early-init risk for no coverage gain. Each forwards
+# via its RAW syscall (reentrancy-free, never re-entering its own interpose
+# wrapper) and preserves errno across the recording bookkeeping (the shim's own
+# writes stay muted under the `disabled`/withShimMuted guard).
+#
+# pwritev2(2) is NOT hooked: it is a Linux-only API with no macOS symbol or
+# syscall (the macOS uio.h declares only readv/preadv/writev/pwritev).
+
+proc repro_hook_pwrite*(fd: cint; buf: pointer; count: csize_t;
+    offset: int64): int {.exportc, cdecl, dynlib.} =
+  ## ROUND-4 RW1 — pwrite(2): positioned write. The SQLite/LMDB in-place page-write
+  ## idiom (open O_RDWR, pwrite the changed page) mutates a pre-existing file's
+  ## content with NO write(2); r4_write rdwr_pwrite.c / clean_pwrite.c recorded it
+  ## as a pure INPUT. recordFdWrite marks the path written (INPUT→OUTPUT).
+  if not initialized or disabled > 0:
+    return ct_macos_real_pwrite(fd, buf, count, offset)
+  result = ct_macos_real_pwrite(fd, buf, count, offset)
+  let savedErrno = getErrno()
+  if result >= 0:
+    recordFdWrite(fd, result)
+  setErrno(savedErrno)
+
+proc repro_hook_pwritev*(fd: cint; iov: pointer; iovcnt: cint;
+    offset: int64): int {.exportc, cdecl, dynlib.} =
+  ## ROUND-4 RW1 — pwritev(2): positioned scatter/gather write (macOS 11+).
+  if not initialized or disabled > 0:
+    return ct_macos_real_pwritev(fd, iov, iovcnt, offset)
+  result = ct_macos_real_pwritev(fd, iov, iovcnt, offset)
+  let savedErrno = getErrno()
+  if result >= 0:
+    recordFdWrite(fd, result)
+  setErrno(savedErrno)
+
+proc repro_hook_writev*(fd: cint; iov: pointer; iovcnt: cint): int
+    {.exportc, cdecl, dynlib.} =
+  ## ROUND-4 RW1 — writev(2): vectored write (NOT the hooked write(2)). The
+  ## linker/archiver/log-writer idiom; r4_write rdwr_writev.c recorded it as INPUT.
+  if not initialized or disabled > 0:
+    return ct_macos_real_writev(fd, iov, iovcnt)
+  result = ct_macos_real_writev(fd, iov, iovcnt)
+  let savedErrno = getErrno()
+  if result >= 0:
+    recordFdWrite(fd, result)
+  setErrno(savedErrno)
+
+proc repro_hook_ftruncate*(fd: cint; length: int64): cint
+    {.exportc, cdecl, dynlib.} =
+  ## ROUND-4 RW1 — ftruncate(2): an fd-based size/content mutation. The ld64 linker
+  ## idiom is "open O_RDWR, ftruncate to final size, mmap-write" — R9 catches the
+  ## mmap region but a ftruncate-only shrink (destroying tail bytes) or zero-extend
+  ## escaped (r4_write rdwr_ftruncate.c / clean_ftruncate.c). Record a write on the
+  ## fd's path; `length` (the new size) is stamped for provenance.
+  if not initialized or disabled > 0:
+    return ct_macos_real_ftruncate(fd, length)
+  result = ct_macos_real_ftruncate(fd, length)
+  let savedErrno = getErrno()
+  if result == 0:
+    recordFdWrite(fd, int(length), "ftruncate")
+  setErrno(savedErrno)
+
+proc repro_hook_truncate*(path: cstring; length: int64): cint
+    {.exportc, cdecl, dynlib.} =
+  ## ROUND-4 RW1 — truncate(2): a PATH-based size/content mutation with no fd and
+  ## no write(2). r4_write path_truncate.c / clean_truncate.c left ZERO records
+  ## referencing the mutated output. Record a write on the CANONICAL path
+  ## (mirroring the rename-dest output handling).
+  if not initialized or disabled > 0:
+    return ct_macos_real_truncate(path, length)
+  result = ct_macos_real_truncate(path, length)
+  let savedErrno = getErrno()
+  if result == 0:
+    recordPathWrite(path, length, "truncate")
   setErrno(savedErrno)
 
 proc repro_hook_mmap*(adr: pointer; length: csize_t; prot, flags, fd: cint;
@@ -4028,6 +4161,37 @@ static ssize_t repro_wrap_readv(int fd, const struct iovec *iov, int iovcnt) {
   return repro_hook_readv(fd, (void *)iov, iovcnt);
 }
 
+/* ROUND-4 RW1 write-side content thunks (symmetric to the pread/preadv/readv read
+ * thunks): forward via the RAW syscall before the recording runtime is live, then
+ * branch to the recording repro_hook_*. Interpose-only, like the read side. */
+static ssize_t repro_wrap_pwrite(int fd, const void *buf, size_t count,
+    off_t offset) {
+  if (!repro_monitor_runtime_ready)
+    return (ssize_t)syscall(SYS_pwrite, fd, buf, count, offset);
+  return repro_hook_pwrite(fd, (void *)buf, count, (long long)offset);
+}
+static ssize_t repro_wrap_pwritev(int fd, const struct iovec *iov, int iovcnt,
+    off_t offset) {
+  if (!repro_monitor_runtime_ready)
+    return (ssize_t)syscall(SYS_pwritev, fd, iov, iovcnt, offset);
+  return repro_hook_pwritev(fd, (void *)iov, iovcnt, (long long)offset);
+}
+static ssize_t repro_wrap_writev(int fd, const struct iovec *iov, int iovcnt) {
+  if (!repro_monitor_runtime_ready)
+    return (ssize_t)syscall(SYS_writev, fd, iov, iovcnt);
+  return repro_hook_writev(fd, (void *)iov, iovcnt);
+}
+static int repro_wrap_ftruncate(int fd, off_t length) {
+  if (!repro_monitor_runtime_ready)
+    return (int)syscall(SYS_ftruncate, fd, length);
+  return repro_hook_ftruncate(fd, (long long)length);
+}
+static int repro_wrap_truncate(const char *path, off_t length) {
+  if (!repro_monitor_runtime_ready)
+    return (int)syscall(SYS_truncate, path, length);
+  return repro_hook_truncate((char *)path, (long long)length);
+}
+
 /*
  * Body-patch hook ADDRESS accessors for the VARIADIC open/openat wrappers.
  *
@@ -4212,7 +4376,18 @@ static struct {
   { (const void *)repro_wrap_sendfile, (const void *)sendfile },
   { (const void *)repro_wrap_pread, (const void *)pread },
   { (const void *)repro_wrap_preadv, (const void *)preadv },
-  { (const void *)repro_wrap_readv, (const void *)readv }
+  { (const void *)repro_wrap_readv, (const void *)readv },
+  /* ROUND-4 RW1 write-side content hooks. pwrite/pwritev/writev positioned/
+   * vectored writes + ftruncate/truncate size mutations. An O_RDWR file mutated
+   * ONLY via these (SQLite/LMDB pwrite, linker/archiver writev, the ld64 ftruncate
+   * idiom, a path-based truncate) carried no write(2) and was recorded as a pure
+   * INPUT, folding out of the action's output set (research/.../r4_write).
+   * Interpose-only (build tools call these directly), like the read hooks above. */
+  { (const void *)repro_wrap_pwrite, (const void *)pwrite },
+  { (const void *)repro_wrap_pwritev, (const void *)pwritev },
+  { (const void *)repro_wrap_writev, (const void *)writev },
+  { (const void *)repro_wrap_ftruncate, (const void *)ftruncate },
+  { (const void *)repro_wrap_truncate, (const void *)truncate }
   /* getdirentries is intentionally NOT in the interpose tuple: the SDK header
    * poisons the symbol under 64-bit inodes (`getdirentries_is_not_available…`),
    * so it cannot be referenced here. It is body-patched by string name instead

@@ -380,6 +380,28 @@ ssize_t repro_macos_real_readv_syscall(int fd, void *iov, int iovcnt) {
   return (ssize_t)syscall(SYS_readv, fd, iov, iovcnt);
 }
 
+/* ROUND-4 RW1 write-side raw-syscall forwarders (symmetric to the pread/preadv/
+ * readv forwarders): used by the body-patch-safe write hooks so a write recording
+ * never re-enters its own interpose wrapper. ftruncate/truncate take a 64-bit
+ * off_t length (in a register on arm64; passed as long long through syscall). */
+ssize_t repro_macos_real_pwrite_syscall(int fd, void *buf, size_t n,
+                                        long long offset) {
+  return (ssize_t)syscall(SYS_pwrite, fd, buf, n, offset);
+}
+ssize_t repro_macos_real_pwritev_syscall(int fd, void *iov, int iovcnt,
+                                         long long offset) {
+  return (ssize_t)syscall(SYS_pwritev, fd, iov, iovcnt, offset);
+}
+ssize_t repro_macos_real_writev_syscall(int fd, void *iov, int iovcnt) {
+  return (ssize_t)syscall(SYS_writev, fd, iov, iovcnt);
+}
+int repro_macos_real_ftruncate_syscall(int fd, long long length) {
+  return (int)syscall(SYS_ftruncate, fd, length);
+}
+int repro_macos_real_truncate_syscall(char *path, long long length) {
+  return (int)syscall(SYS_truncate, path, length);
+}
+
 /*
  * Describe a connect() target for the IPC-breakaway hook. Returns the address
  * family (AF_UNIX / AF_INET / AF_INET6 / …) or -1 on bad args. Fills `out_dest`
@@ -2334,6 +2356,35 @@ proc ct_macos_real_readv*(fd: cint; iov: pointer; iovcnt: cint): int =
   proc impl(fd: cint; iov: pointer; iovcnt: cint): clong
     {.importc: "repro_macos_real_readv_syscall", cdecl.}
   int(impl(fd, iov, iovcnt))
+
+# ROUND-4 RW1 write-side raw-syscall forwarders (mirror the pread/preadv/readv
+# variants above). Each forwards via the matching SYS_* trap so the recording
+# write hooks never re-enter their own interpose wrapper.
+proc ct_macos_real_pwrite*(fd: cint; buf: pointer; n: csize_t; offset: int64): int =
+  proc impl(fd: cint; buf: pointer; n: csize_t; offset: int64): clong
+    {.importc: "repro_macos_real_pwrite_syscall", cdecl.}
+  int(impl(fd, buf, n, offset))
+
+proc ct_macos_real_pwritev*(fd: cint; iov: pointer; iovcnt: cint;
+    offset: int64): int =
+  proc impl(fd: cint; iov: pointer; iovcnt: cint; offset: int64): clong
+    {.importc: "repro_macos_real_pwritev_syscall", cdecl.}
+  int(impl(fd, iov, iovcnt, offset))
+
+proc ct_macos_real_writev*(fd: cint; iov: pointer; iovcnt: cint): int =
+  proc impl(fd: cint; iov: pointer; iovcnt: cint): clong
+    {.importc: "repro_macos_real_writev_syscall", cdecl.}
+  int(impl(fd, iov, iovcnt))
+
+proc ct_macos_real_ftruncate*(fd: cint; length: int64): cint =
+  proc impl(fd: cint; length: int64): cint
+    {.importc: "repro_macos_real_ftruncate_syscall", cdecl.}
+  impl(fd, length)
+
+proc ct_macos_real_truncate*(path: cstring; length: int64): cint =
+  proc impl(path: cstring; length: int64): cint
+    {.importc: "repro_macos_real_truncate_syscall", cdecl.}
+  impl(path, length)
 
 proc ct_macos_dyld_image_dep_path*(mh: pointer; outBuf: pointer;
     outLen: csize_t): cint =
