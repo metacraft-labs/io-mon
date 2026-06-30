@@ -56,6 +56,9 @@ proc hasFileWrite(dep: MonitorDepFile; path: string): bool =
 proc hasPathProbe(dep: MonitorDepFile; path: string): bool =
   dep.records.anyIt(it.kind == mrPathProbe and path in it.path)
 
+proc hasRecord(dep: MonitorDepFile; kind: MonitorRecordKind; path: string): bool =
+  dep.records.anyIt(it.kind == kind and it.path == path)
+
 suite "io-mon Linux LD_PRELOAD live gaps":
   let work = getTempDir() / ("io-mon-linux-live-" & $getCurrentProcessId())
   createDir(work)
@@ -1196,6 +1199,76 @@ int main(int argc, char **argv) {
     check dep.completeness == mcComplete
     check hasPathProbe(dep, marker)
     check hasPathProbe(dep, linkPath)
+
+  test "Linux non-file determinism hooks record observed inputs and entropy":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let probe = buildC(work, "linux_non_file_determinism", """
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/random.h>
+#include <sys/time.h>
+#include <sys/utsname.h>
+#include <time.h>
+#include <unistd.h>
+
+int main(void) {
+  const char *v = getenv("IO_MON_ROUND4_ENV_MARKER");
+  struct utsname uts;
+  struct timespec ts;
+  struct timeval tv;
+  time_t now;
+  unsigned char rnd[8];
+  long pagesize = sysconf(_SC_PAGESIZE);
+  if (v == NULL || strcmp(v, "present") != 0) return 2;
+  if (uname(&uts) != 0) return 3;
+  if (pagesize <= 0) return 4;
+  if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return 5;
+  if (gettimeofday(&tv, NULL) != 0) return 6;
+  if (time(&now) == (time_t)-1) return 7;
+  if (getrandom(rnd, sizeof(rnd), 0) != (ssize_t)sizeof(rnd)) {
+    fprintf(stderr, "getrandom failed: %s\n", strerror(errno));
+    return 8;
+  }
+  return rnd[0] == 255 ? 9 : 0;
+}
+""")
+    let depfile = work / "non-file-determinism.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    childEnv["IO_MON_ROUND4_ENV_MARKER"] = "present"
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", probe],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcIncomplete
+    check hasRecord(dep, mrEnvRead, "IO_MON_ROUND4_ENV_MARKER")
+    check hasRecord(dep, mrSysctlRead, "uname")
+    check dep.records.anyIt(it.kind == mrSysctlRead and
+      it.path.startsWith("sysconf:"))
+    check dep.records.anyIt(it.kind == mrTimeRead and
+      it.path.startsWith("clock_gettime:"))
+    check hasRecord(dep, mrTimeRead, "gettimeofday")
+    check hasRecord(dep, mrTimeRead, "time")
+    check hasRecord(dep, mrNonDeterministic, "getrandom")
 
   test "unsupported raw libc syscall still fails closed":
     let snoopBin = work / "io-mon"

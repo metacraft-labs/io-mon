@@ -26,7 +26,8 @@ type
     lhsExecve, lhsPosixSpawn, lhsPosixSpawnp, lhsFopen, lhsFopen64, lhsConnect,
     lhsDlopen, lhsDlmopen, lhsPread, lhsReadv, lhsPreadv, lhsSendfile,
     lhsCopyFileRange, lhsSplice, lhsLink, lhsLinkat, lhsRename, lhsRenameat,
-    lhsRenameat2
+    lhsRenameat2, lhsGetenv, lhsUname, lhsSysconf, lhsClockGettime,
+    lhsGettimeofday, lhsTime, lhsGetrandom
 
   OpenContext* = object
     path*: cstring
@@ -242,6 +243,45 @@ type
     result*: pointer
     nextIndex: int
 
+  GetenvContext* = object
+    name*: cstring
+    result*: cstring
+    nextIndex: int
+
+  UnameContext* = object
+    buf*: pointer
+    result*: cint
+    nextIndex: int
+
+  SysconfContext* = object
+    name*: cint
+    result*: clong
+    nextIndex: int
+
+  ClockGettimeContext* = object
+    clockId*: cint
+    timespecPtr*: pointer
+    result*: cint
+    nextIndex: int
+
+  GettimeofdayContext* = object
+    timevalPtr*: pointer
+    timezonePtr*: pointer
+    result*: cint
+    nextIndex: int
+
+  TimeContext* = object
+    timePtr*: pointer
+    result*: clong
+    nextIndex: int
+
+  GetrandomContext* = object
+    buf*: pointer
+    buflen*: csize_t
+    flags*: cuint
+    result*: clong
+    nextIndex: int
+
   ForkContext* = object
     result*: PidT
     nextIndex: int
@@ -315,6 +355,13 @@ type
   MprotectHook* = proc(ctx: var MprotectContext) {.raises: [].}
   MunmapHook* = proc(ctx: var MunmapContext) {.raises: [].}
   MremapHook* = proc(ctx: var MremapContext) {.raises: [].}
+  GetenvHook* = proc(ctx: var GetenvContext) {.raises: [].}
+  UnameHook* = proc(ctx: var UnameContext) {.raises: [].}
+  SysconfHook* = proc(ctx: var SysconfContext) {.raises: [].}
+  ClockGettimeHook* = proc(ctx: var ClockGettimeContext) {.raises: [].}
+  GettimeofdayHook* = proc(ctx: var GettimeofdayContext) {.raises: [].}
+  TimeHook* = proc(ctx: var TimeContext) {.raises: [].}
+  GetrandomHook* = proc(ctx: var GetrandomContext) {.raises: [].}
   ForkHook* = proc(ctx: var ForkContext) {.raises: [].}
   ExecveHook* = proc(ctx: var ExecveContext) {.raises: [].}
   PosixSpawnHook* = proc(ctx: var PosixSpawnContext) {.raises: [].}
@@ -408,6 +455,27 @@ type
   MremapHookEntry = object
     priority: int
     callback: MremapHook
+  GetenvHookEntry = object
+    priority: int
+    callback: GetenvHook
+  UnameHookEntry = object
+    priority: int
+    callback: UnameHook
+  SysconfHookEntry = object
+    priority: int
+    callback: SysconfHook
+  ClockGettimeHookEntry = object
+    priority: int
+    callback: ClockGettimeHook
+  GettimeofdayHookEntry = object
+    priority: int
+    callback: GettimeofdayHook
+  TimeHookEntry = object
+    priority: int
+    callback: TimeHook
+  GetrandomHookEntry = object
+    priority: int
+    callback: GetrandomHook
   ForkHookEntry = object
     priority: int
     callback: ForkHook
@@ -432,10 +500,14 @@ type
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/random.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/utsname.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -473,6 +545,13 @@ typedef void *(*ct_mmap_hook_fn)(void *, size_t, int, int, int, long);
 typedef int (*ct_mprotect_hook_fn)(void *, size_t, int);
 typedef int (*ct_munmap_hook_fn)(void *, size_t);
 typedef void *(*ct_mremap_hook_fn)(void *, size_t, size_t, int, void *);
+typedef char *(*ct_getenv_hook_fn)(char *);
+typedef int (*ct_uname_hook_fn)(void *);
+typedef long (*ct_sysconf_hook_fn)(int);
+typedef int (*ct_clock_gettime_hook_fn)(int, void *);
+typedef int (*ct_gettimeofday_hook_fn)(void *, void *);
+typedef long (*ct_time_hook_fn)(void *);
+typedef ssize_like_t (*ct_getrandom_hook_fn)(void *, size_t, unsigned int);
 typedef pid_t (*ct_fork_hook_fn)(void);
 typedef int (*ct_execve_hook_fn)(char *, char **, char **);
 typedef int (*ct_posix_spawn_hook_fn)(pid_t *, char *, void *, void *,
@@ -512,6 +591,13 @@ typedef void *(*ct_mmap_real_fn)(void *, size_t, int, int, int, off_t);
 typedef int (*ct_mprotect_real_fn)(void *, size_t, int);
 typedef int (*ct_munmap_real_fn)(void *, size_t);
 typedef void *(*ct_mremap_real_fn)(void *, size_t, size_t, int, ...);
+typedef char *(*ct_getenv_real_fn)(const char *);
+typedef int (*ct_uname_real_fn)(struct utsname *);
+typedef long (*ct_sysconf_real_fn)(int);
+typedef int (*ct_clock_gettime_real_fn)(clockid_t, struct timespec *);
+typedef int (*ct_gettimeofday_real_fn)(struct timeval *, void *);
+typedef time_t (*ct_time_real_fn)(time_t *);
+typedef ssize_t (*ct_getrandom_real_fn)(void *, size_t, unsigned int);
 typedef pid_t (*ct_fork_real_fn)(void);
 typedef int (*ct_execve_real_fn)(const char *, char *const [], char *const []);
 typedef int (*ct_posix_spawn_real_fn)(pid_t *, const char *,
@@ -555,6 +641,13 @@ static ct_mmap_hook_fn ct_mmap_hook = NULL;
 static ct_mprotect_hook_fn ct_mprotect_hook = NULL;
 static ct_munmap_hook_fn ct_munmap_hook = NULL;
 static ct_mremap_hook_fn ct_mremap_hook = NULL;
+static ct_getenv_hook_fn ct_getenv_hook = NULL;
+static ct_uname_hook_fn ct_uname_hook = NULL;
+static ct_sysconf_hook_fn ct_sysconf_hook = NULL;
+static ct_clock_gettime_hook_fn ct_clock_gettime_hook = NULL;
+static ct_gettimeofday_hook_fn ct_gettimeofday_hook = NULL;
+static ct_time_hook_fn ct_time_hook = NULL;
+static ct_getrandom_hook_fn ct_getrandom_hook = NULL;
 static ct_fork_hook_fn ct_fork_hook = NULL;
 static ct_execve_hook_fn ct_execve_hook = NULL;
 static ct_posix_spawn_hook_fn ct_posix_spawn_hook = NULL;
@@ -615,6 +708,13 @@ static ct_mmap_real_fn real_mmap_ptr = NULL;
 static ct_mprotect_real_fn real_mprotect_ptr = NULL;
 static ct_munmap_real_fn real_munmap_ptr = NULL;
 static ct_mremap_real_fn real_mremap_ptr = NULL;
+static ct_getenv_real_fn real_getenv_ptr = NULL;
+static ct_uname_real_fn real_uname_ptr = NULL;
+static ct_sysconf_real_fn real_sysconf_ptr = NULL;
+static ct_clock_gettime_real_fn real_clock_gettime_ptr = NULL;
+static ct_gettimeofday_real_fn real_gettimeofday_ptr = NULL;
+static ct_time_real_fn real_time_ptr = NULL;
+static ct_getrandom_real_fn real_getrandom_ptr = NULL;
 static ct_fork_real_fn real_fork_ptr = NULL;
 static ct_execve_real_fn real_execve_ptr = NULL;
 static ct_posix_spawn_real_fn real_posix_spawn_ptr = NULL;
@@ -902,6 +1002,13 @@ void ct_linux_preload_register_mmap_hook(ct_mmap_hook_fn hook) { ct_mmap_hook = 
 void ct_linux_preload_register_mprotect_hook(ct_mprotect_hook_fn hook) { ct_mprotect_hook = hook; }
 void ct_linux_preload_register_munmap_hook(ct_munmap_hook_fn hook) { ct_munmap_hook = hook; }
 void ct_linux_preload_register_mremap_hook(ct_mremap_hook_fn hook) { ct_mremap_hook = hook; }
+void ct_linux_preload_register_getenv_hook(ct_getenv_hook_fn hook) { ct_getenv_hook = hook; }
+void ct_linux_preload_register_uname_hook(ct_uname_hook_fn hook) { ct_uname_hook = hook; }
+void ct_linux_preload_register_sysconf_hook(ct_sysconf_hook_fn hook) { ct_sysconf_hook = hook; }
+void ct_linux_preload_register_clock_gettime_hook(ct_clock_gettime_hook_fn hook) { ct_clock_gettime_hook = hook; }
+void ct_linux_preload_register_gettimeofday_hook(ct_gettimeofday_hook_fn hook) { ct_gettimeofday_hook = hook; }
+void ct_linux_preload_register_time_hook(ct_time_hook_fn hook) { ct_time_hook = hook; }
+void ct_linux_preload_register_getrandom_hook(ct_getrandom_hook_fn hook) { ct_getrandom_hook = hook; }
 void ct_linux_preload_register_fork_hook(ct_fork_hook_fn hook) { ct_fork_hook = hook; }
 void ct_linux_preload_register_execve_hook(ct_execve_hook_fn hook) { ct_execve_hook = hook; }
 void ct_linux_preload_register_posix_spawn_hook(ct_posix_spawn_hook_fn hook) { ct_posix_spawn_hook = hook; }
@@ -1181,6 +1288,48 @@ void *ct_linux_preload_real_mremap(void *old_addr, size_t old_size,
   if ((flags & MREMAP_FIXED) != 0)
     return real_mremap_ptr(old_addr, old_size, new_size, flags, new_addr);
   return real_mremap_ptr(old_addr, old_size, new_size, flags);
+}
+
+char *ct_linux_preload_real_getenv(char *name) {
+  if (real_getenv_ptr == NULL)
+    real_getenv_ptr = (ct_getenv_real_fn)ct_resolve("getenv");
+  if (real_getenv_ptr == NULL) return NULL;
+  return real_getenv_ptr(name);
+}
+
+int ct_linux_preload_real_uname(void *buf) {
+  CT_REAL("uname", real_uname_ptr, ct_uname_real_fn);
+  return real_uname_ptr((struct utsname *)buf);
+}
+
+long ct_linux_preload_real_sysconf(int name) {
+  if (real_sysconf_ptr == NULL)
+    real_sysconf_ptr = (ct_sysconf_real_fn)ct_resolve("sysconf");
+  if (real_sysconf_ptr == NULL) { errno = ENOSYS; return -1; }
+  return real_sysconf_ptr(name);
+}
+
+int ct_linux_preload_real_clock_gettime(int clock_id, void *tp) {
+  CT_REAL("clock_gettime", real_clock_gettime_ptr, ct_clock_gettime_real_fn);
+  return real_clock_gettime_ptr((clockid_t)clock_id, (struct timespec *)tp);
+}
+
+int ct_linux_preload_real_gettimeofday(void *tv, void *tz) {
+  CT_REAL("gettimeofday", real_gettimeofday_ptr, ct_gettimeofday_real_fn);
+  return real_gettimeofday_ptr((struct timeval *)tv, tz);
+}
+
+long ct_linux_preload_real_time(void *tloc) {
+  if (real_time_ptr == NULL)
+    real_time_ptr = (ct_time_real_fn)ct_resolve("time");
+  if (real_time_ptr == NULL) { errno = ENOSYS; return -1; }
+  return (long)real_time_ptr((time_t *)tloc);
+}
+
+ssize_like_t ct_linux_preload_real_getrandom(void *buf, size_t buflen,
+                                             unsigned int flags) {
+  CT_REAL("getrandom", real_getrandom_ptr, ct_getrandom_real_fn);
+  return (ssize_like_t)real_getrandom_ptr(buf, buflen, flags);
 }
 
 pid_t ct_linux_preload_real_fork(void) {
@@ -1546,6 +1695,58 @@ void *mremap(void *old_addr, size_t old_size, size_t new_size, int flags, ...) {
   return CT_CALL_HOOK(ct_mremap_hook(old_addr, old_size, new_size, flags, new_addr));
 }
 
+char *getenv(const char *name) __attribute__((visibility("default")));
+char *getenv(const char *name) {
+  if (CT_BYPASS() || ct_getenv_hook == NULL)
+    return ct_linux_preload_real_getenv((char *)name);
+  return CT_CALL_HOOK(ct_getenv_hook((char *)name));
+}
+
+int uname(struct utsname *buf) __attribute__((visibility("default")));
+int uname(struct utsname *buf) {
+  if (CT_BYPASS() || ct_uname_hook == NULL)
+    return ct_linux_preload_real_uname((void *)buf);
+  return CT_CALL_HOOK(ct_uname_hook((void *)buf));
+}
+
+long sysconf(int name) __attribute__((visibility("default")));
+long sysconf(int name) {
+  if (CT_BYPASS() || ct_sysconf_hook == NULL)
+    return ct_linux_preload_real_sysconf(name);
+  return CT_CALL_HOOK(ct_sysconf_hook(name));
+}
+
+int clock_gettime(clockid_t clock_id, struct timespec *tp)
+    __attribute__((visibility("default")));
+int clock_gettime(clockid_t clock_id, struct timespec *tp) {
+  if (CT_BYPASS() || ct_clock_gettime_hook == NULL)
+    return ct_linux_preload_real_clock_gettime((int)clock_id, (void *)tp);
+  return CT_CALL_HOOK(ct_clock_gettime_hook((int)clock_id, (void *)tp));
+}
+
+int gettimeofday(struct timeval *tv, void *tz)
+    __attribute__((visibility("default")));
+int gettimeofday(struct timeval *tv, void *tz) {
+  if (CT_BYPASS() || ct_gettimeofday_hook == NULL)
+    return ct_linux_preload_real_gettimeofday((void *)tv, (void *)tz);
+  return CT_CALL_HOOK(ct_gettimeofday_hook((void *)tv, (void *)tz));
+}
+
+time_t time(time_t *tloc) __attribute__((visibility("default")));
+time_t time(time_t *tloc) {
+  if (CT_BYPASS() || ct_time_hook == NULL)
+    return (time_t)ct_linux_preload_real_time((void *)tloc);
+  return (time_t)CT_CALL_HOOK(ct_time_hook((void *)tloc));
+}
+
+ssize_t getrandom(void *buf, size_t buflen, unsigned int flags)
+    __attribute__((visibility("default")));
+ssize_t getrandom(void *buf, size_t buflen, unsigned int flags) {
+  if (CT_BYPASS() || ct_getrandom_hook == NULL)
+    return (ssize_t)ct_linux_preload_real_getrandom(buf, buflen, flags);
+  return (ssize_t)CT_CALL_HOOK(ct_getrandom_hook(buf, buflen, flags));
+}
+
 pid_t fork(void) __attribute__((visibility("default")));
 pid_t fork(void) {
   if (CT_BYPASS() || ct_fork_hook == NULL)
@@ -1702,6 +1903,20 @@ proc realMunmap*(address: pointer; length: csize_t): cint
 proc realMremap*(oldAddress: pointer; oldSize, newSize: csize_t; flags: cint;
                  newAddress: pointer): pointer
   {.importc: "ct_linux_preload_real_mremap", raises: [].}
+proc realGetenv*(name: cstring): cstring
+  {.importc: "ct_linux_preload_real_getenv", raises: [].}
+proc realUname*(buf: pointer): cint
+  {.importc: "ct_linux_preload_real_uname", raises: [].}
+proc realSysconf*(name: cint): clong
+  {.importc: "ct_linux_preload_real_sysconf", raises: [].}
+proc realClockGettime*(clockId: cint; timespecPtr: pointer): cint
+  {.importc: "ct_linux_preload_real_clock_gettime", raises: [].}
+proc realGettimeofday*(timevalPtr, timezonePtr: pointer): cint
+  {.importc: "ct_linux_preload_real_gettimeofday", raises: [].}
+proc realTime*(timePtr: pointer): clong
+  {.importc: "ct_linux_preload_real_time", raises: [].}
+proc realGetrandom*(buf: pointer; buflen: csize_t; flags: cuint): clong
+  {.importc: "ct_linux_preload_real_getrandom", raises: [].}
 proc realFork*(): PidT {.importc: "ct_linux_preload_real_fork", raises: [].}
 proc realExecve*(path: cstring; argv, envp: cstringArray): cint
   {.importc: "ct_linux_preload_real_execve", raises: [].}
@@ -1768,6 +1983,16 @@ type
     {.cdecl, raises: [].}
   MremapDispatch = proc(oldAddress: pointer; oldSize, newSize: csize_t;
                         flags: cint; newAddress: pointer): pointer
+    {.cdecl, raises: [].}
+  GetenvDispatch = proc(name: cstring): cstring {.cdecl, raises: [].}
+  UnameDispatch = proc(buf: pointer): cint {.cdecl, raises: [].}
+  SysconfDispatch = proc(name: cint): clong {.cdecl, raises: [].}
+  ClockGettimeDispatch = proc(clockId: cint; timespecPtr: pointer): cint
+    {.cdecl, raises: [].}
+  GettimeofdayDispatch = proc(timevalPtr, timezonePtr: pointer): cint
+    {.cdecl, raises: [].}
+  TimeDispatch = proc(timePtr: pointer): clong {.cdecl, raises: [].}
+  GetrandomDispatch = proc(buf: pointer; buflen: csize_t; flags: cuint): clong
     {.cdecl, raises: [].}
   ForkDispatch = proc(): PidT {.cdecl, raises: [].}
   ExecveDispatch = proc(path: cstring; argv, envp: cstringArray): cint
@@ -1875,6 +2100,20 @@ proc installMunmapDispatcher(dispatch: MunmapDispatch)
   {.importc: "ct_linux_preload_register_munmap_hook", raises: [].}
 proc installMremapDispatcher(dispatch: MremapDispatch)
   {.importc: "ct_linux_preload_register_mremap_hook", raises: [].}
+proc installGetenvDispatcher(dispatch: GetenvDispatch)
+  {.importc: "ct_linux_preload_register_getenv_hook", raises: [].}
+proc installUnameDispatcher(dispatch: UnameDispatch)
+  {.importc: "ct_linux_preload_register_uname_hook", raises: [].}
+proc installSysconfDispatcher(dispatch: SysconfDispatch)
+  {.importc: "ct_linux_preload_register_sysconf_hook", raises: [].}
+proc installClockGettimeDispatcher(dispatch: ClockGettimeDispatch)
+  {.importc: "ct_linux_preload_register_clock_gettime_hook", raises: [].}
+proc installGettimeofdayDispatcher(dispatch: GettimeofdayDispatch)
+  {.importc: "ct_linux_preload_register_gettimeofday_hook", raises: [].}
+proc installTimeDispatcher(dispatch: TimeDispatch)
+  {.importc: "ct_linux_preload_register_time_hook", raises: [].}
+proc installGetrandomDispatcher(dispatch: GetrandomDispatch)
+  {.importc: "ct_linux_preload_register_getrandom_hook", raises: [].}
 proc installForkDispatcher(dispatch: ForkDispatch)
   {.importc: "ct_linux_preload_register_fork_hook", raises: [].}
 proc installExecveDispatcher(dispatch: ExecveDispatch)
@@ -1921,6 +2160,13 @@ var
   mprotectHooks: seq[MprotectHookEntry] = @[]
   munmapHooks: seq[MunmapHookEntry] = @[]
   mremapHooks: seq[MremapHookEntry] = @[]
+  getenvHooks: seq[GetenvHookEntry] = @[]
+  unameHooks: seq[UnameHookEntry] = @[]
+  sysconfHooks: seq[SysconfHookEntry] = @[]
+  clockGettimeHooks: seq[ClockGettimeHookEntry] = @[]
+  gettimeofdayHooks: seq[GettimeofdayHookEntry] = @[]
+  timeHooks: seq[TimeHookEntry] = @[]
+  getrandomHooks: seq[GetrandomHookEntry] = @[]
   forkHooks: seq[ForkHookEntry] = @[]
   execveHooks: seq[ExecveHookEntry] = @[]
   posixSpawnHooks: seq[PosixSpawnHookEntry] = @[]
@@ -2150,6 +2396,56 @@ proc registerMremapHook*(hook: MremapHook; priority = 100) {.raises: [].} =
     return
   mremapHooks.add(MremapHookEntry(priority: priority, callback: hook))
   mremapHooks.sort(proc(a, b: MremapHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerGetenvHook*(hook: GetenvHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  getenvHooks.add(GetenvHookEntry(priority: priority, callback: hook))
+  getenvHooks.sort(proc(a, b: GetenvHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerUnameHook*(hook: UnameHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  unameHooks.add(UnameHookEntry(priority: priority, callback: hook))
+  unameHooks.sort(proc(a, b: UnameHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerSysconfHook*(hook: SysconfHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  sysconfHooks.add(SysconfHookEntry(priority: priority, callback: hook))
+  sysconfHooks.sort(proc(a, b: SysconfHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerClockGettimeHook*(hook: ClockGettimeHook; priority = 100)
+    {.raises: [].} =
+  if hook == nil:
+    return
+  clockGettimeHooks.add(ClockGettimeHookEntry(priority: priority,
+    callback: hook))
+  clockGettimeHooks.sort(proc(a, b: ClockGettimeHookEntry): int =
+    cmp(a.priority, b.priority))
+
+proc registerGettimeofdayHook*(hook: GettimeofdayHook; priority = 100)
+    {.raises: [].} =
+  if hook == nil:
+    return
+  gettimeofdayHooks.add(GettimeofdayHookEntry(priority: priority,
+    callback: hook))
+  gettimeofdayHooks.sort(proc(a, b: GettimeofdayHookEntry): int =
+    cmp(a.priority, b.priority))
+
+proc registerTimeHook*(hook: TimeHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  timeHooks.add(TimeHookEntry(priority: priority, callback: hook))
+  timeHooks.sort(proc(a, b: TimeHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerGetrandomHook*(hook: GetrandomHook; priority = 100)
+    {.raises: [].} =
+  if hook == nil:
+    return
+  getrandomHooks.add(GetrandomHookEntry(priority: priority, callback: hook))
+  getrandomHooks.sort(proc(a, b: GetrandomHookEntry): int =
+    cmp(a.priority, b.priority))
 
 proc registerForkHook*(hook: ForkHook; priority = 100) {.raises: [].} =
   if hook == nil:
@@ -2804,6 +3100,27 @@ proc callReal*(ctx: var MremapContext) {.raises: [].} =
   ctx.result = realMremap(ctx.oldAddress, ctx.oldSize, ctx.newSize, ctx.flags,
     ctx.newAddress)
 
+proc callReal*(ctx: var GetenvContext) {.raises: [].} =
+  ctx.result = realGetenv(ctx.name)
+
+proc callReal*(ctx: var UnameContext) {.raises: [].} =
+  ctx.result = realUname(ctx.buf)
+
+proc callReal*(ctx: var SysconfContext) {.raises: [].} =
+  ctx.result = realSysconf(ctx.name)
+
+proc callReal*(ctx: var ClockGettimeContext) {.raises: [].} =
+  ctx.result = realClockGettime(ctx.clockId, ctx.timespecPtr)
+
+proc callReal*(ctx: var GettimeofdayContext) {.raises: [].} =
+  ctx.result = realGettimeofday(ctx.timevalPtr, ctx.timezonePtr)
+
+proc callReal*(ctx: var TimeContext) {.raises: [].} =
+  ctx.result = realTime(ctx.timePtr)
+
+proc callReal*(ctx: var GetrandomContext) {.raises: [].} =
+  ctx.result = realGetrandom(ctx.buf, ctx.buflen, ctx.flags)
+
 proc callReal*(ctx: var ForkContext) {.raises: [].} =
   ctx.result = realFork()
 
@@ -3096,6 +3413,62 @@ proc callNext*(ctx: var MremapContext) {.raises: [].} =
   else:
     callReal(ctx)
 
+proc callNext*(ctx: var GetenvContext) {.raises: [].} =
+  if ctx.nextIndex < getenvHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    getenvHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var UnameContext) {.raises: [].} =
+  if ctx.nextIndex < unameHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    unameHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var SysconfContext) {.raises: [].} =
+  if ctx.nextIndex < sysconfHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    sysconfHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var ClockGettimeContext) {.raises: [].} =
+  if ctx.nextIndex < clockGettimeHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    clockGettimeHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var GettimeofdayContext) {.raises: [].} =
+  if ctx.nextIndex < gettimeofdayHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    gettimeofdayHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var TimeContext) {.raises: [].} =
+  if ctx.nextIndex < timeHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    timeHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var GetrandomContext) {.raises: [].} =
+  if ctx.nextIndex < getrandomHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    getrandomHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
 proc callNext*(ctx: var ForkContext) {.raises: [].} =
   if ctx.nextIndex < forkHooks.len:
     let index = ctx.nextIndex
@@ -3349,6 +3722,46 @@ proc dispatchMremap(oldAddress: pointer; oldSize, newSize: csize_t;
   callNext(ctx)
   result = ctx.result
 
+proc dispatchGetenv(name: cstring): cstring {.cdecl, raises: [].} =
+  var ctx = GetenvContext(name: name, result: nil)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchUname(buf: pointer): cint {.cdecl, raises: [].} =
+  var ctx = UnameContext(buf: buf, result: -1)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchSysconf(name: cint): clong {.cdecl, raises: [].} =
+  var ctx = SysconfContext(name: name, result: -1)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchClockGettime(clockId: cint; timespecPtr: pointer): cint
+    {.cdecl, raises: [].} =
+  var ctx = ClockGettimeContext(clockId: clockId, timespecPtr: timespecPtr,
+                                result: -1)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchGettimeofday(timevalPtr, timezonePtr: pointer): cint
+    {.cdecl, raises: [].} =
+  var ctx = GettimeofdayContext(timevalPtr: timevalPtr,
+                                timezonePtr: timezonePtr, result: -1)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchTime(timePtr: pointer): clong {.cdecl, raises: [].} =
+  var ctx = TimeContext(timePtr: timePtr, result: -1)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchGetrandom(buf: pointer; buflen: csize_t; flags: cuint): clong
+    {.cdecl, raises: [].} =
+  var ctx = GetrandomContext(buf: buf, buflen: buflen, flags: flags, result: -1)
+  callNext(ctx)
+  result = ctx.result
+
 proc dispatchFork(): PidT {.cdecl, raises: [].} =
   var ctx = ForkContext(result: -1)
   callNext(ctx)
@@ -3410,6 +3823,13 @@ installMmapDispatcher(dispatchMmap)
 installMprotectDispatcher(dispatchMprotect)
 installMunmapDispatcher(dispatchMunmap)
 installMremapDispatcher(dispatchMremap)
+installGetenvDispatcher(dispatchGetenv)
+installUnameDispatcher(dispatchUname)
+installSysconfDispatcher(dispatchSysconf)
+installClockGettimeDispatcher(dispatchClockGettime)
+installGettimeofdayDispatcher(dispatchGettimeofday)
+installTimeDispatcher(dispatchTime)
+installGetrandomDispatcher(dispatchGetrandom)
 installForkDispatcher(dispatchFork)
 installExecveDispatcher(dispatchExecve)
 installPosixSpawnDispatcher(dispatchPosixSpawn)

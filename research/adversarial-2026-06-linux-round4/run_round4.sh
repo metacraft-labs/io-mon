@@ -157,7 +157,7 @@ int main(void) {
   uname(&u);
   sysconf(_SC_NPROCESSORS_ONLN);
   clock_gettime(CLOCK_REALTIME, &ts);
-  getrandom(buf, sizeof(buf), 0);
+  if (getrandom(buf, sizeof(buf), 0) != (ssize_t)sizeof(buf)) return 2;
   return 0;
 }
 C
@@ -171,7 +171,7 @@ C
 src="$RUN_DIR/source.txt"
 printf 'round4 source marker for adversarial content probes\n' >"$src"
 
-printf 'probe\texit\tcompleteness\tfile_read_source\tfile_write_output\tevent_loss\tclassification\n' >"$RUN_DIR/summary.tsv"
+printf 'probe\texit\tcompleteness\tfile_read_source\tfile_write_output\tobserved_nonfile\tnondeterminism\tevent_loss\tclassification\n' >"$RUN_DIR/summary.tsv"
 
 run_probe() {
   local name="$1"
@@ -184,23 +184,40 @@ run_probe() {
   local code=$?
   set -e
   "$IO_MON" inspect "$dep" >"$inspect"
-  local completeness file_read file_write event_loss classification
+  local completeness file_read file_write observed_nonfile nondeterminism event_loss classification
   completeness="$(sed -n '1s/.*completeness=//p' "$inspect" | awk '{print $1}')"
   awk -v src="$src" '/^#[0-9]+ .*file-read/ && index($0, src) { found=1 } END { exit(found ? 0 : 1) }' "$inspect" && file_read=yes || file_read=no
   awk -v out="$out" '/^#[0-9]+ .*file-write/ && index($0, out) { found=1 } END { exit(found ? 0 : 1) }' "$inspect" && file_write=yes || file_write=no
   if [ "$name" = "rename_staging" ]; then
     awk -v p="$RUN_DIR/out/rename_staging.tmp" '/^#[0-9]+ .*file-read/ && index($0, p) { found=1 } END { exit(found ? 0 : 1) }' "$inspect" && file_read=yes || file_read=no
   fi
+  observed_nonfile=no
+  if grep -Eq '^#[0-9]+ env-read .*IO_MON_ROUND4_ENV' "$inspect" &&
+     grep -Eq '^#[0-9]+ sysctl-read .*uname' "$inspect" &&
+     grep -Eq '^#[0-9]+ sysctl-read .*sysconf:' "$inspect" &&
+     grep -Eq '^#[0-9]+ time-read .*clock_gettime:' "$inspect"; then
+    observed_nonfile=yes
+  fi
+  grep -Eq '^#[0-9]+ non-deterministic .*getrandom' "$inspect" && nondeterminism=yes || nondeterminism=no
   grep -Eq '^#[0-9]+ event-loss' "$inspect" && event_loss=yes || event_loss=no
   classification="captured"
+  if [ "$name" = "nonfile" ] && [ "$observed_nonfile" = "yes" ] &&
+     [ "$nondeterminism" = "yes" ] && [ "$completeness" = "mcIncomplete" ]; then
+    classification="captured/fail-closed"
+  fi
   if [ "$completeness" = "mcIncomplete" ]; then
     classification="fail-closed/incomplete"
   elif [ "$file_read" = "no" ] || [ "$event_loss" = "yes" ]; then
     classification="unsupported-capability-gated"
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$name" "$code" "$completeness" "$file_read" "$file_write" "$event_loss" \
-    "$classification" >>"$RUN_DIR/summary.tsv"
+  if [ "$name" = "nonfile" ] && [ "$observed_nonfile" = "yes" ] &&
+     [ "$nondeterminism" = "yes" ] && [ "$completeness" = "mcIncomplete" ]; then
+    classification="captured/fail-closed"
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$name" "$code" "$completeness" "$file_read" "$file_write" \
+    "$observed_nonfile" "$nondeterminism" "$event_loss" "$classification" \
+    >>"$RUN_DIR/summary.tsv"
 }
 
 run_probe baseline_read "$RUN_DIR/content_channels" read "$src" "$RUN_DIR/out/baseline_read.out"
