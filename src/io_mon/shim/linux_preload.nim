@@ -428,6 +428,22 @@ proc repro_hook_openat64*(ctx: var OpenatContext) {.raises: [].} =
   recordOpen(ctx.path, ctx.flags, ctx.mode, ctx.result)
   c_set_errno(savedErrno)
 
+proc recordFdRead(fd: cint; bytes: clong) {.raises: [].} =
+  if bytes >= 0:
+    var record = baseRecord(mrFileRead, moFileRead)
+    record.path = pathForFd(fd)
+    record.result = bytes.int64
+    record.flags = uint32(fd)
+    emitRecord(record)
+
+proc recordFdWrite(fd: cint; bytes: clong) {.raises: [].} =
+  if bytes >= 0 and fd > 2:
+    var record = baseRecord(mrFileWrite, moFileWrite)
+    record.path = pathForFd(fd)
+    record.result = bytes.int64
+    record.flags = uint32(fd)
+    emitRecord(record)
+
 proc repro_hook_read*(ctx: var ReadContext) {.raises: [].} =
   if shouldBypass():
     callNext(ctx)
@@ -435,12 +451,37 @@ proc repro_hook_read*(ctx: var ReadContext) {.raises: [].} =
   ensureInitializedPreservingErrno()
   callNext(ctx)
   let savedErrno = c_get_errno()
-  if ctx.result >= 0:
-    var record = baseRecord(mrFileRead, moFileRead)
-    record.path = pathForFd(ctx.fd)
-    record.result = ctx.result.int64
-    record.flags = uint32(ctx.fd)
-    emitRecord(record)
+  recordFdRead(ctx.fd, ctx.result)
+  c_set_errno(savedErrno)
+
+proc repro_hook_pread*(ctx: var PreadContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  recordFdRead(ctx.fd, ctx.result)
+  c_set_errno(savedErrno)
+
+proc repro_hook_readv*(ctx: var ReadvContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  recordFdRead(ctx.fd, ctx.result)
+  c_set_errno(savedErrno)
+
+proc repro_hook_preadv*(ctx: var PreadvContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  recordFdRead(ctx.fd, ctx.result)
   c_set_errno(savedErrno)
 
 proc repro_hook_write*(ctx: var WriteContext) {.raises: [].} =
@@ -450,12 +491,7 @@ proc repro_hook_write*(ctx: var WriteContext) {.raises: [].} =
   ensureInitializedPreservingErrno()
   callNext(ctx)
   let savedErrno = c_get_errno()
-  if ctx.result >= 0 and ctx.fd > 2:
-    var record = baseRecord(mrFileWrite, moFileWrite)
-    record.path = pathForFd(ctx.fd)
-    record.result = ctx.result.int64
-    record.flags = uint32(ctx.fd)
-    emitRecord(record)
+  recordFdWrite(ctx.fd, ctx.result)
   c_set_errno(savedErrno)
 
 proc repro_hook_close*(ctx: var CloseContext) {.raises: [].} =
@@ -736,6 +772,42 @@ proc repro_hook_connect*(ctx: var ConnectContext) {.raises: [].} =
     recordIpcConnect(ctx.fd, ctx.address, ctx.addrLen)
   c_set_errno(savedErrno)
 
+proc repro_hook_sendfile*(ctx: var SendfileContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result > 0:
+    recordFdRead(ctx.inFd, ctx.result)
+    recordFdWrite(ctx.outFd, ctx.result)
+  c_set_errno(savedErrno)
+
+proc repro_hook_copy_file_range*(ctx: var CopyFileRangeContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result > 0:
+    recordFdRead(ctx.inFd, ctx.result)
+    recordFdWrite(ctx.outFd, ctx.result)
+  c_set_errno(savedErrno)
+
+proc repro_hook_splice*(ctx: var SpliceContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result > 0:
+    recordFdRead(ctx.fdIn, ctx.result)
+    recordFdWrite(ctx.fdOut, ctx.result)
+  c_set_errno(savedErrno)
+
 proc repro_hook_dlopen*(ctx: var DlopenContext) {.raises: [].} =
   if shouldBypass():
     callNext(ctx)
@@ -967,6 +1039,9 @@ registerOpen64Hook(repro_hook_open64)
 registerOpenatHook(repro_hook_openat)
 registerOpenat64Hook(repro_hook_openat64)
 registerReadHook(repro_hook_read)
+registerPreadHook(repro_hook_pread)
+registerReadvHook(repro_hook_readv)
+registerPreadvHook(repro_hook_preadv)
 registerWriteHook(repro_hook_write)
 registerCloseHook(repro_hook_close)
 registerStatHook(repro_hook_stat)
@@ -979,6 +1054,9 @@ registerFopen64Hook(repro_hook_fopen64)
 registerFreadHook(repro_hook_fread)
 registerFcloseHook(repro_hook_fclose)
 registerConnectHook(repro_hook_connect)
+registerSendfileHook(repro_hook_sendfile)
+registerCopyFileRangeHook(repro_hook_copy_file_range)
+registerSpliceHook(repro_hook_splice)
 registerDlopenHook(repro_hook_dlopen)
 registerDlmopenHook(repro_hook_dlmopen)
 registerMmapHook(repro_hook_mmap)

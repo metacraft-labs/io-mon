@@ -94,10 +94,13 @@ to start as an honest stub today.
   anonymous executable `mprotect` transitions are scanned only when every live
   executable anonymous byte in the requested range is covered by that lifecycle,
   and partial-overlap `mremap` ownership escapes fail closed instead of
-  inheriting stale ownership. Known residuals: startup DSOs
+  inheriting stale ownership. Linux libc-visible positioned/vector and
+  zero-copy content movers (`pread`, `readv`, `preadv`, `sendfile`,
+  `copy_file_range`, and `splice`) now record the source as a file read and
+  the destination as a file write when bytes move. Known residuals: startup DSOs
   under excluded system/runtime prefixes and executable mappings not owned by
-  the preload `mmap` lifecycle are not scanned yet; raw
-  zero-copy syscalls (`sendfile`, `splice`, raw `copy_file_range`), hardlink
+  the preload `mmap` lifecycle are not scanned yet; direct raw zero-copy
+  syscalls (`sendfile`, `splice`, raw `copy_file_range`), hardlink
   aliases, and Linux non-file determinism inputs (`getenv`, `uname`, `sysconf`,
   time, `getrandom`) still need dedicated hooks or stackable-backed
   scanner/classifier integration. The default Linux profile is therefore an

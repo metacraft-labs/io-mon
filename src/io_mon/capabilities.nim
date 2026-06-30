@@ -299,6 +299,10 @@ proc linuxUnsupportedReason(capability: MonitorCapability): string =
     "Linux preload shim does not yet hook getenv/sysctl/uname as observed inputs"
   of mcapNonDeterminism:
     "Linux preload shim does not yet hook entropy/time sources for non-determinism"
+  of mcapExternalContent:
+    "Linux preload shim records libc-visible positioned/vector and zero-copy " &
+      "file movers, but broader external content channels and direct raw " &
+      "zero-copy syscalls are not advertised by this profile"
   else:
     "capability is not advertised by the selected Linux preload profile"
 
@@ -409,7 +413,9 @@ proc linuxPreloadMonitorProfile*(
       "startup non-system application-DSO, and late dlopen/dlmopen " &
       "application-DSO raw syscall sites, plus tracked anonymous/private " &
       "mmap/mprotect executable ranges with munmap/mremap lifecycle " &
-      "bookkeeping, and fails closed for unsupported raw syscall numbers, " &
+      "bookkeeping; libc-visible pread/readv/preadv/sendfile/" &
+      "copy_file_range/splice content movers record source reads and " &
+      "destination writes, and io-mon fails closed for unsupported raw syscall numbers, " &
       "untracked or partially tracked anonymous executable mprotect, " &
       "partial-overlap mremap ownership escapes, or anonymous writable+" &
       "executable mappings")
@@ -418,7 +424,7 @@ proc linuxPreloadMonitorProfile*(
     message: "Linux LD_PRELOAD completeness excludes adversarial residuals " &
       "unless they are represented by event-loss at runtime: excluded-prefix " &
       "startup DSOs, executable mappings outside the preload mmap lifecycle, " &
-      "raw zero-copy/mutation syscalls, hardlink/path-identity aliases, and " &
+      "direct raw zero-copy/mutation syscalls, hardlink/path-identity aliases, and " &
       "non-file determinism inputs. Consumers that require those threat models " &
       "must request the corresponding capability and treat the gap as incomplete.")
 
