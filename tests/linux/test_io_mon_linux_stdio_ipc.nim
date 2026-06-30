@@ -47,6 +47,12 @@ proc hasRawDependency(dep: MonitorDepFile; path: string): bool =
   dep.records.anyIt((it.kind == mrFileOpen or it.kind == mrFileRead) and
     path in it.path)
 
+proc hasFileRead(dep: MonitorDepFile; path: string): bool =
+  dep.records.anyIt(it.kind == mrFileRead and path in it.path)
+
+proc hasFileWrite(dep: MonitorDepFile; path: string): bool =
+  dep.records.anyIt(it.kind == mrFileWrite and path in it.path)
+
 proc hasPathProbe(dep: MonitorDepFile; path: string): bool =
   dep.records.anyIt(it.kind == mrPathProbe and path in it.path)
 
@@ -94,6 +100,102 @@ int main(int argc, char **argv) {
     let dep = readMonitorDepFile(depfile)
     check dep.completeness == mcComplete
     check dep.records.anyIt(it.kind == mrFileRead and marker in it.path)
+
+  test "positioned vector and zero-copy libc reads capture source dependency":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let mover = buildC(work, "linux_content_channels", """
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/sendfile.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
+static ssize_t xsplice(int in, int out) {
+  int p[2];
+  if (pipe(p) != 0) return -1;
+  ssize_t n = splice(in, NULL, p[1], NULL, 4096, 0);
+  if (n > 0) {
+    ssize_t m = splice(p[0], NULL, out, NULL, (size_t)n, 0);
+    if (m < 0) n = -1;
+  }
+  close(p[0]);
+  close(p[1]);
+  return n;
+}
+
+int main(int argc, char **argv) {
+  if (argc != 4) return 2;
+  const char *mode = argv[1];
+  int in = open(argv[2], O_RDONLY);
+  if (in < 0) return 3;
+  int out = open(argv[3], O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if (out < 0) return 4;
+  char a[32] = {0};
+  char b[32] = {0};
+  ssize_t n = -1;
+  if (strcmp(mode, "pread") == 0) {
+    n = pread(in, a, sizeof(a), 0);
+    if (n > 0 && write(out, a, (size_t)n) != n) return 5;
+  } else if (strcmp(mode, "readv") == 0) {
+    struct iovec iov[2] = {{a, 16}, {b, 16}};
+    n = readv(in, iov, 2);
+    if (n > 0 && write(out, a, 16) < 0) return 6;
+  } else if (strcmp(mode, "preadv") == 0) {
+    struct iovec iov[2] = {{a, 16}, {b, 16}};
+    n = preadv(in, iov, 2, 0);
+    if (n > 0 && write(out, a, 16) < 0) return 7;
+  } else if (strcmp(mode, "sendfile") == 0) {
+    n = sendfile(out, in, NULL, 4096);
+  } else if (strcmp(mode, "copy_file_range") == 0) {
+    n = copy_file_range(in, NULL, out, NULL, 4096, 0);
+  } else if (strcmp(mode, "splice") == 0) {
+    n = xsplice(in, out);
+  } else {
+    return 8;
+  }
+  close(out);
+  close(in);
+  if (n < 0) {
+    fprintf(stderr, "%s failed: %s\n", mode, strerror(errno));
+    return 9;
+  }
+  return n > 0 ? 0 : 10;
+}
+""")
+    let source = work / "content-channel-source.txt"
+    writeFile(source, "content channel marker bytes for positioned and zero-copy reads\n")
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+
+    for mode in ["pread", "readv", "preadv", "sendfile",
+                 "copy_file_range", "splice"]:
+      let outPath = work / ("content-channel-" & mode & ".out")
+      let depfile = work / ("content-channel-" & mode & ".rdep")
+      let cap = run(snoopBin, @["run", "--depfile", depfile, "--", mover,
+        mode, source, outPath], childEnv)
+      checkpoint(mode & " output: " & cap.output)
+      check cap.code == 0
+      let dep = readMonitorDepFile(depfile)
+      check dep.completeness == mcComplete
+      check hasFileRead(dep, source)
+      check hasFileWrite(dep, outPath)
 
   test "out-of-tree Unix socket daemon downgrades completeness":
     let snoopBin = work / "io-mon"

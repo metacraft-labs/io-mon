@@ -24,7 +24,8 @@ type
     lhsOpen, lhsOpen64, lhsOpenat, lhsOpenat64, lhsClose, lhsRead, lhsWrite,
     lhsStat, lhsLstat, lhsOpendir, lhsReaddir, lhsClosedir, lhsFork,
     lhsExecve, lhsPosixSpawn, lhsPosixSpawnp, lhsFopen, lhsFopen64, lhsConnect,
-    lhsDlopen, lhsDlmopen
+    lhsDlopen, lhsDlmopen, lhsPread, lhsReadv, lhsPreadv, lhsSendfile,
+    lhsCopyFileRange, lhsSplice
 
   OpenContext* = object
     path*: cstring
@@ -52,6 +53,29 @@ type
     fd*: cint
     buf*: pointer
     count*: csize_t
+    result*: clong
+    nextIndex: int
+
+  PreadContext* = object
+    fd*: cint
+    buf*: pointer
+    count*: csize_t
+    offset*: clong
+    result*: clong
+    nextIndex: int
+
+  ReadvContext* = object
+    fd*: cint
+    iov*: pointer
+    iovcnt*: cint
+    result*: clong
+    nextIndex: int
+
+  PreadvContext* = object
+    fd*: cint
+    iov*: pointer
+    iovcnt*: cint
+    offset*: clong
     result*: clong
     nextIndex: int
 
@@ -109,6 +133,34 @@ type
     address*: pointer
     addrLen*: uint32
     result*: cint
+    nextIndex: int
+
+  SendfileContext* = object
+    outFd*: cint
+    inFd*: cint
+    offset*: pointer
+    count*: csize_t
+    result*: clong
+    nextIndex: int
+
+  CopyFileRangeContext* = object
+    inFd*: cint
+    offIn*: pointer
+    outFd*: cint
+    offOut*: pointer
+    length*: csize_t
+    flags*: cuint
+    result*: clong
+    nextIndex: int
+
+  SpliceContext* = object
+    fdIn*: cint
+    offIn*: pointer
+    fdOut*: cint
+    offOut*: pointer
+    length*: csize_t
+    flags*: cuint
+    result*: clong
     nextIndex: int
 
   DlopenContext* = object
@@ -204,6 +256,9 @@ type
   OpenatHook* = proc(ctx: var OpenatContext) {.raises: [].}
   CloseHook* = proc(ctx: var CloseContext) {.raises: [].}
   ReadHook* = proc(ctx: var ReadContext) {.raises: [].}
+  PreadHook* = proc(ctx: var PreadContext) {.raises: [].}
+  ReadvHook* = proc(ctx: var ReadvContext) {.raises: [].}
+  PreadvHook* = proc(ctx: var PreadvContext) {.raises: [].}
   WriteHook* = proc(ctx: var WriteContext) {.raises: [].}
   StatHook* = proc(ctx: var StatContext) {.raises: [].}
   OpendirHook* = proc(ctx: var OpendirContext) {.raises: [].}
@@ -213,6 +268,9 @@ type
   FreadHook* = proc(ctx: var FreadContext) {.raises: [].}
   FcloseHook* = proc(ctx: var FcloseContext) {.raises: [].}
   ConnectHook* = proc(ctx: var ConnectContext) {.raises: [].}
+  SendfileHook* = proc(ctx: var SendfileContext) {.raises: [].}
+  CopyFileRangeHook* = proc(ctx: var CopyFileRangeContext) {.raises: [].}
+  SpliceHook* = proc(ctx: var SpliceContext) {.raises: [].}
   DlopenHook* = proc(ctx: var DlopenContext) {.raises: [].}
   DlmopenHook* = proc(ctx: var DlmopenContext) {.raises: [].}
   MmapHook* = proc(ctx: var MmapContext) {.raises: [].}
@@ -237,6 +295,15 @@ type
   ReadHookEntry = object
     priority: int
     callback: ReadHook
+  PreadHookEntry = object
+    priority: int
+    callback: PreadHook
+  ReadvHookEntry = object
+    priority: int
+    callback: ReadvHook
+  PreadvHookEntry = object
+    priority: int
+    callback: PreadvHook
   WriteHookEntry = object
     priority: int
     callback: WriteHook
@@ -264,6 +331,15 @@ type
   ConnectHookEntry = object
     priority: int
     callback: ConnectHook
+  SendfileHookEntry = object
+    priority: int
+    callback: SendfileHook
+  CopyFileRangeHookEntry = object
+    priority: int
+    callback: CopyFileRangeHook
+  SpliceHookEntry = object
+    priority: int
+    callback: SpliceHook
   DlopenHookEntry = object
     priority: int
     callback: DlopenHook
@@ -306,8 +382,10 @@ type
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -317,6 +395,9 @@ typedef int (*ct_open_hook_fn)(char *, int, int);
 typedef int (*ct_openat_hook_fn)(int, char *, int, int);
 typedef int (*ct_close_hook_fn)(int);
 typedef ssize_like_t (*ct_read_hook_fn)(int, void *, size_t);
+typedef ssize_like_t (*ct_pread_hook_fn)(int, void *, size_t, long);
+typedef ssize_like_t (*ct_readv_hook_fn)(int, void *, int);
+typedef ssize_like_t (*ct_preadv_hook_fn)(int, void *, int, long);
 typedef ssize_like_t (*ct_write_hook_fn)(int, void *, size_t);
 typedef int (*ct_stat_hook_fn)(char *, void *);
 typedef void *(*ct_opendir_hook_fn)(char *);
@@ -326,6 +407,11 @@ typedef void *(*ct_fopen_hook_fn)(char *, char *);
 typedef size_t (*ct_fread_hook_fn)(void *, size_t, size_t, void *);
 typedef int (*ct_fclose_hook_fn)(void *);
 typedef int (*ct_connect_hook_fn)(int, void *, unsigned int);
+typedef ssize_like_t (*ct_sendfile_hook_fn)(int, int, void *, size_t);
+typedef ssize_like_t (*ct_copy_file_range_hook_fn)(int, void *, int, void *,
+                                                   size_t, unsigned int);
+typedef ssize_like_t (*ct_splice_hook_fn)(int, void *, int, void *, size_t,
+                                          unsigned int);
 typedef void *(*ct_dlopen_hook_fn)(char *, int);
 typedef void *(*ct_dlmopen_hook_fn)(long, char *, int);
 typedef void *(*ct_mmap_hook_fn)(void *, size_t, int, int, int, long);
@@ -341,6 +427,9 @@ typedef int (*ct_open_real_fn)(const char *, int, ...);
 typedef int (*ct_openat_real_fn)(int, const char *, int, ...);
 typedef int (*ct_close_real_fn)(int);
 typedef ssize_t (*ct_read_real_fn)(int, void *, size_t);
+typedef ssize_t (*ct_pread_real_fn)(int, void *, size_t, off_t);
+typedef ssize_t (*ct_readv_real_fn)(int, const struct iovec *, int);
+typedef ssize_t (*ct_preadv_real_fn)(int, const struct iovec *, int, off_t);
 typedef ssize_t (*ct_write_real_fn)(int, const void *, size_t);
 typedef int (*ct_stat_real_fn)(const char *, struct stat *);
 typedef int (*ct_xstat_real_fn)(int, const char *, struct stat *);
@@ -351,6 +440,11 @@ typedef FILE *(*ct_fopen_real_fn)(const char *, const char *);
 typedef size_t (*ct_fread_real_fn)(void *, size_t, size_t, FILE *);
 typedef int (*ct_fclose_real_fn)(FILE *);
 typedef int (*ct_connect_real_fn)(int, const struct sockaddr *, socklen_t);
+typedef ssize_t (*ct_sendfile_real_fn)(int, int, off_t *, size_t);
+typedef ssize_t (*ct_copy_file_range_real_fn)(int, off64_t *, int, off64_t *,
+                                              size_t, unsigned int);
+typedef ssize_t (*ct_splice_real_fn)(int, loff_t *, int, loff_t *, size_t,
+                                     unsigned int);
 typedef void *(*ct_dlopen_real_fn)(const char *, int);
 typedef void *(*ct_dlmopen_real_fn)(Lmid_t, const char *, int);
 typedef void *(*ct_mmap_real_fn)(void *, size_t, int, int, int, off_t);
@@ -372,6 +466,9 @@ static ct_openat_hook_fn ct_openat_hook = NULL;
 static ct_openat_hook_fn ct_openat64_hook = NULL;
 static ct_close_hook_fn ct_close_hook = NULL;
 static ct_read_hook_fn ct_read_hook = NULL;
+static ct_pread_hook_fn ct_pread_hook = NULL;
+static ct_readv_hook_fn ct_readv_hook = NULL;
+static ct_preadv_hook_fn ct_preadv_hook = NULL;
 static ct_write_hook_fn ct_write_hook = NULL;
 static ct_stat_hook_fn ct_stat_hook = NULL;
 static ct_stat_hook_fn ct_lstat_hook = NULL;
@@ -383,6 +480,9 @@ static ct_fopen_hook_fn ct_fopen64_hook = NULL;
 static ct_fread_hook_fn ct_fread_hook = NULL;
 static ct_fclose_hook_fn ct_fclose_hook = NULL;
 static ct_connect_hook_fn ct_connect_hook = NULL;
+static ct_sendfile_hook_fn ct_sendfile_hook = NULL;
+static ct_copy_file_range_hook_fn ct_copy_file_range_hook = NULL;
+static ct_splice_hook_fn ct_splice_hook = NULL;
 static ct_dlopen_hook_fn ct_dlopen_hook = NULL;
 static ct_dlmopen_hook_fn ct_dlmopen_hook = NULL;
 static ct_mmap_hook_fn ct_mmap_hook = NULL;
@@ -417,6 +517,11 @@ static ct_openat_real_fn real_openat_ptr = NULL;
 static ct_openat_real_fn real_openat64_ptr = NULL;
 static ct_close_real_fn real_close_ptr = NULL;
 static ct_read_real_fn real_read_ptr = NULL;
+static ct_pread_real_fn real_pread_ptr = NULL;
+static ct_pread_real_fn real_pread64_ptr = NULL;
+static ct_readv_real_fn real_readv_ptr = NULL;
+static ct_preadv_real_fn real_preadv_ptr = NULL;
+static ct_preadv_real_fn real_preadv64_ptr = NULL;
 static ct_write_real_fn real_write_ptr = NULL;
 static ct_stat_real_fn real_stat_ptr = NULL;
 static ct_stat_real_fn real_lstat_ptr = NULL;
@@ -430,6 +535,9 @@ static ct_fopen_real_fn real_fopen64_ptr = NULL;
 static ct_fread_real_fn real_fread_ptr = NULL;
 static ct_fclose_real_fn real_fclose_ptr = NULL;
 static ct_connect_real_fn real_connect_ptr = NULL;
+static ct_sendfile_real_fn real_sendfile_ptr = NULL;
+static ct_copy_file_range_real_fn real_copy_file_range_ptr = NULL;
+static ct_splice_real_fn real_splice_ptr = NULL;
 static ct_dlopen_real_fn real_dlopen_ptr = NULL;
 static ct_dlmopen_real_fn real_dlmopen_ptr = NULL;
 static ct_mmap_real_fn real_mmap_ptr = NULL;
@@ -695,6 +803,9 @@ void ct_linux_preload_register_openat_hook(ct_openat_hook_fn hook) { ct_openat_h
 void ct_linux_preload_register_openat64_hook(ct_openat_hook_fn hook) { ct_openat64_hook = hook; }
 void ct_linux_preload_register_close_hook(ct_close_hook_fn hook) { ct_close_hook = hook; }
 void ct_linux_preload_register_read_hook(ct_read_hook_fn hook) { ct_read_hook = hook; }
+void ct_linux_preload_register_pread_hook(ct_pread_hook_fn hook) { ct_pread_hook = hook; }
+void ct_linux_preload_register_readv_hook(ct_readv_hook_fn hook) { ct_readv_hook = hook; }
+void ct_linux_preload_register_preadv_hook(ct_preadv_hook_fn hook) { ct_preadv_hook = hook; }
 void ct_linux_preload_register_write_hook(ct_write_hook_fn hook) { ct_write_hook = hook; }
 void ct_linux_preload_register_stat_hook(ct_stat_hook_fn hook) { ct_stat_hook = hook; }
 void ct_linux_preload_register_lstat_hook(ct_stat_hook_fn hook) { ct_lstat_hook = hook; }
@@ -706,6 +817,9 @@ void ct_linux_preload_register_fopen64_hook(ct_fopen_hook_fn hook) { ct_fopen64_
 void ct_linux_preload_register_fread_hook(ct_fread_hook_fn hook) { ct_fread_hook = hook; }
 void ct_linux_preload_register_fclose_hook(ct_fclose_hook_fn hook) { ct_fclose_hook = hook; }
 void ct_linux_preload_register_connect_hook(ct_connect_hook_fn hook) { ct_connect_hook = hook; }
+void ct_linux_preload_register_sendfile_hook(ct_sendfile_hook_fn hook) { ct_sendfile_hook = hook; }
+void ct_linux_preload_register_copy_file_range_hook(ct_copy_file_range_hook_fn hook) { ct_copy_file_range_hook = hook; }
+void ct_linux_preload_register_splice_hook(ct_splice_hook_fn hook) { ct_splice_hook = hook; }
 void ct_linux_preload_register_dlopen_hook(ct_dlopen_hook_fn hook) { ct_dlopen_hook = hook; }
 void ct_linux_preload_register_dlmopen_hook(ct_dlmopen_hook_fn hook) { ct_dlmopen_hook = hook; }
 void ct_linux_preload_register_mmap_hook(ct_mmap_hook_fn hook) { ct_mmap_hook = hook; }
@@ -790,6 +904,45 @@ ssize_like_t ct_linux_preload_real_read(int fd, void *buf, size_t count) {
   return (ssize_like_t)real_read_ptr(fd, buf, count);
 }
 
+ssize_like_t ct_linux_preload_real_pread(int fd, void *buf, size_t count,
+                                         long offset) {
+  CT_REAL("pread", real_pread_ptr, ct_pread_real_fn);
+  return (ssize_like_t)real_pread_ptr(fd, buf, count, (off_t)offset);
+}
+
+ssize_like_t ct_linux_preload_real_pread64(int fd, void *buf, size_t count,
+                                           long offset) {
+  if (real_pread64_ptr == NULL)
+    real_pread64_ptr = (ct_pread_real_fn)ct_resolve("pread64");
+  if (real_pread64_ptr == NULL)
+    real_pread64_ptr = (ct_pread_real_fn)ct_resolve("pread");
+  if (real_pread64_ptr == NULL) { errno = ENOSYS; return -1; }
+  return (ssize_like_t)real_pread64_ptr(fd, buf, count, (off_t)offset);
+}
+
+ssize_like_t ct_linux_preload_real_readv(int fd, void *iov, int iovcnt) {
+  CT_REAL("readv", real_readv_ptr, ct_readv_real_fn);
+  return (ssize_like_t)real_readv_ptr(fd, (const struct iovec *)iov, iovcnt);
+}
+
+ssize_like_t ct_linux_preload_real_preadv(int fd, void *iov, int iovcnt,
+                                          long offset) {
+  CT_REAL("preadv", real_preadv_ptr, ct_preadv_real_fn);
+  return (ssize_like_t)real_preadv_ptr(fd, (const struct iovec *)iov, iovcnt,
+                                       (off_t)offset);
+}
+
+ssize_like_t ct_linux_preload_real_preadv64(int fd, void *iov, int iovcnt,
+                                            long offset) {
+  if (real_preadv64_ptr == NULL)
+    real_preadv64_ptr = (ct_preadv_real_fn)ct_resolve("preadv64");
+  if (real_preadv64_ptr == NULL)
+    real_preadv64_ptr = (ct_preadv_real_fn)ct_resolve("preadv");
+  if (real_preadv64_ptr == NULL) { errno = ENOSYS; return -1; }
+  return (ssize_like_t)real_preadv64_ptr(fd, (const struct iovec *)iov, iovcnt,
+                                         (off_t)offset);
+}
+
 ssize_like_t ct_linux_preload_real_write(int fd, void *buf, size_t count) {
   CT_REAL("write", real_write_ptr, ct_write_real_fn);
   return (ssize_like_t)real_write_ptr(fd, buf, count);
@@ -856,6 +1009,31 @@ int ct_linux_preload_real_fclose(void *stream) {
 int ct_linux_preload_real_connect(int fd, void *addr, unsigned int addrlen) {
   CT_REAL("connect", real_connect_ptr, ct_connect_real_fn);
   return real_connect_ptr(fd, (const struct sockaddr *)addr, (socklen_t)addrlen);
+}
+
+ssize_like_t ct_linux_preload_real_sendfile(int out_fd, int in_fd, void *offset,
+                                            size_t count) {
+  CT_REAL("sendfile", real_sendfile_ptr, ct_sendfile_real_fn);
+  return (ssize_like_t)real_sendfile_ptr(out_fd, in_fd, (off_t *)offset, count);
+}
+
+ssize_like_t ct_linux_preload_real_copy_file_range(int in_fd, void *off_in,
+                                                   int out_fd, void *off_out,
+                                                   size_t length,
+                                                   unsigned int flags) {
+  CT_REAL("copy_file_range", real_copy_file_range_ptr,
+          ct_copy_file_range_real_fn);
+  return (ssize_like_t)real_copy_file_range_ptr(in_fd, (off64_t *)off_in,
+                                                out_fd, (off64_t *)off_out,
+                                                length, flags);
+}
+
+ssize_like_t ct_linux_preload_real_splice(int fd_in, void *off_in, int fd_out,
+                                          void *off_out, size_t length,
+                                          unsigned int flags) {
+  CT_REAL("splice", real_splice_ptr, ct_splice_real_fn);
+  return (ssize_like_t)real_splice_ptr(fd_in, (loff_t *)off_in, fd_out,
+                                       (loff_t *)off_out, length, flags);
 }
 
 void *ct_linux_preload_real_dlopen(char *path, int flags) {
@@ -930,6 +1108,50 @@ ssize_t read(int fd, void *buf, size_t count) {
   if (CT_BYPASS() || ct_read_hook == NULL)
     return (ssize_t)ct_linux_preload_real_read(fd, buf, count);
   return (ssize_t)CT_CALL_HOOK(ct_read_hook(fd, buf, count));
+}
+
+ssize_t pread(int fd, void *buf, size_t count, off_t offset)
+    __attribute__((visibility("default")));
+ssize_t pread(int fd, void *buf, size_t count, off_t offset) {
+  if (CT_BYPASS() || ct_pread_hook == NULL)
+    return (ssize_t)ct_linux_preload_real_pread(fd, buf, count, (long)offset);
+  return (ssize_t)CT_CALL_HOOK(ct_pread_hook(fd, buf, count, (long)offset));
+}
+
+ssize_t pread64(int fd, void *buf, size_t count, off64_t offset)
+    __attribute__((visibility("default")));
+ssize_t pread64(int fd, void *buf, size_t count, off64_t offset) {
+  if (CT_BYPASS() || ct_pread_hook == NULL)
+    return (ssize_t)ct_linux_preload_real_pread64(fd, buf, count, (long)offset);
+  return (ssize_t)CT_CALL_HOOK(ct_pread_hook(fd, buf, count, (long)offset));
+}
+
+ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
+    __attribute__((visibility("default")));
+ssize_t readv(int fd, const struct iovec *iov, int iovcnt) {
+  if (CT_BYPASS() || ct_readv_hook == NULL)
+    return (ssize_t)ct_linux_preload_real_readv(fd, (void *)iov, iovcnt);
+  return (ssize_t)CT_CALL_HOOK(ct_readv_hook(fd, (void *)iov, iovcnt));
+}
+
+ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset)
+    __attribute__((visibility("default")));
+ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset) {
+  if (CT_BYPASS() || ct_preadv_hook == NULL)
+    return (ssize_t)ct_linux_preload_real_preadv(fd, (void *)iov, iovcnt,
+                                                 (long)offset);
+  return (ssize_t)CT_CALL_HOOK(ct_preadv_hook(fd, (void *)iov, iovcnt,
+                                              (long)offset));
+}
+
+ssize_t preadv64(int fd, const struct iovec *iov, int iovcnt, off64_t offset)
+    __attribute__((visibility("default")));
+ssize_t preadv64(int fd, const struct iovec *iov, int iovcnt, off64_t offset) {
+  if (CT_BYPASS() || ct_preadv_hook == NULL)
+    return (ssize_t)ct_linux_preload_real_preadv64(fd, (void *)iov, iovcnt,
+                                                   (long)offset);
+  return (ssize_t)CT_CALL_HOOK(ct_preadv_hook(fd, (void *)iov, iovcnt,
+                                              (long)offset));
 }
 
 ssize_t write(int fd, const void *buf, size_t count) __attribute__((visibility("default")));
@@ -1082,6 +1304,38 @@ int connect(int fd, const struct sockaddr *addr, socklen_t addrlen) {
   return CT_CALL_HOOK(ct_connect_hook(fd, (void *)addr, (unsigned int)addrlen));
 }
 
+ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count)
+    __attribute__((visibility("default")));
+ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count) {
+  if (CT_BYPASS() || ct_sendfile_hook == NULL)
+    return (ssize_t)ct_linux_preload_real_sendfile(out_fd, in_fd, offset, count);
+  return (ssize_t)CT_CALL_HOOK(ct_sendfile_hook(out_fd, in_fd, offset, count));
+}
+
+ssize_t copy_file_range(int in_fd, loff_t *off_in, int out_fd,
+                        loff_t *off_out, size_t len, unsigned int flags)
+    __attribute__((visibility("default")));
+ssize_t copy_file_range(int in_fd, loff_t *off_in, int out_fd,
+                        loff_t *off_out, size_t len, unsigned int flags) {
+  if (CT_BYPASS() || ct_copy_file_range_hook == NULL)
+    return (ssize_t)ct_linux_preload_real_copy_file_range(
+      in_fd, off_in, out_fd, off_out, len, flags);
+  return (ssize_t)CT_CALL_HOOK(ct_copy_file_range_hook(
+    in_fd, off_in, out_fd, off_out, len, flags));
+}
+
+ssize_t splice(int fd_in, loff_t *off_in, int fd_out, loff_t *off_out,
+               size_t len, unsigned int flags)
+    __attribute__((visibility("default")));
+ssize_t splice(int fd_in, loff_t *off_in, int fd_out, loff_t *off_out,
+               size_t len, unsigned int flags) {
+  if (CT_BYPASS() || ct_splice_hook == NULL)
+    return (ssize_t)ct_linux_preload_real_splice(
+      fd_in, off_in, fd_out, off_out, len, flags);
+  return (ssize_t)CT_CALL_HOOK(ct_splice_hook(
+    fd_in, off_in, fd_out, off_out, len, flags));
+}
+
 void *dlopen(const char *path, int flags) __attribute__((visibility("default")));
 void *dlopen(const char *path, int flags) {
   if (CT_BYPASS() || ct_dlopen_hook == NULL)
@@ -1228,6 +1482,12 @@ proc realClose*(fd: cint): cint {.importc: "ct_linux_preload_real_close",
     raises: [].}
 proc realRead*(fd: cint; buf: pointer; count: csize_t): clong
   {.importc: "ct_linux_preload_real_read", raises: [].}
+proc realPread*(fd: cint; buf: pointer; count: csize_t; offset: clong): clong
+  {.importc: "ct_linux_preload_real_pread", raises: [].}
+proc realReadv*(fd: cint; iov: pointer; iovcnt: cint): clong
+  {.importc: "ct_linux_preload_real_readv", raises: [].}
+proc realPreadv*(fd: cint; iov: pointer; iovcnt: cint; offset: clong): clong
+  {.importc: "ct_linux_preload_real_preadv", raises: [].}
 proc realWrite*(fd: cint; buf: pointer; count: csize_t): clong
   {.importc: "ct_linux_preload_real_write", raises: [].}
 proc realStat*(path: cstring; buf: pointer): cint
@@ -1250,6 +1510,15 @@ proc realFclose*(stream: pointer): cint
   {.importc: "ct_linux_preload_real_fclose", raises: [].}
 proc realConnect*(fd: cint; address: pointer; addrLen: uint32): cint
   {.importc: "ct_linux_preload_real_connect", raises: [].}
+proc realSendfile*(outFd, inFd: cint; offset: pointer; count: csize_t): clong
+  {.importc: "ct_linux_preload_real_sendfile", raises: [].}
+proc realCopyFileRange*(inFd: cint; offIn: pointer; outFd: cint;
+                        offOut: pointer; length: csize_t;
+                        flags: cuint): clong
+  {.importc: "ct_linux_preload_real_copy_file_range", raises: [].}
+proc realSplice*(fdIn: cint; offIn: pointer; fdOut: cint; offOut: pointer;
+                 length: csize_t; flags: cuint): clong
+  {.importc: "ct_linux_preload_real_splice", raises: [].}
 proc realDlopen*(path: cstring; flags: cint): pointer
   {.importc: "ct_linux_preload_real_dlopen", raises: [].}
 proc realDlmopen*(namespaceId: clong; path: cstring; flags: cint): pointer
@@ -1282,6 +1551,12 @@ type
   CloseDispatch = proc(fd: cint): cint {.cdecl, raises: [].}
   ReadDispatch = proc(fd: cint; buf: pointer; count: csize_t): clong
     {.cdecl, raises: [].}
+  PreadDispatch = proc(fd: cint; buf: pointer; count: csize_t;
+                       offset: clong): clong {.cdecl, raises: [].}
+  ReadvDispatch = proc(fd: cint; iov: pointer; iovcnt: cint): clong
+    {.cdecl, raises: [].}
+  PreadvDispatch = proc(fd: cint; iov: pointer; iovcnt: cint;
+                        offset: clong): clong {.cdecl, raises: [].}
   WriteDispatch = proc(fd: cint; buf: pointer; count: csize_t): clong
     {.cdecl, raises: [].}
   StatDispatch = proc(path: cstring; buf: pointer): cint {.cdecl, raises: [].}
@@ -1294,6 +1569,14 @@ type
   FcloseDispatch = proc(stream: pointer): cint {.cdecl, raises: [].}
   ConnectDispatch = proc(fd: cint; address: pointer; addrLen: uint32): cint
     {.cdecl, raises: [].}
+  SendfileDispatch = proc(outFd, inFd: cint; offset: pointer;
+                          count: csize_t): clong {.cdecl, raises: [].}
+  CopyFileRangeDispatch = proc(inFd: cint; offIn: pointer; outFd: cint;
+                               offOut: pointer; length: csize_t;
+                               flags: cuint): clong {.cdecl, raises: [].}
+  SpliceDispatch = proc(fdIn: cint; offIn: pointer; fdOut: cint;
+                        offOut: pointer; length: csize_t;
+                        flags: cuint): clong {.cdecl, raises: [].}
   DlopenDispatch = proc(path: cstring; flags: cint): pointer
     {.cdecl, raises: [].}
   DlmopenDispatch = proc(namespaceId: clong; path: cstring; flags: cint): pointer
@@ -1357,6 +1640,12 @@ proc installCloseDispatcher(dispatch: CloseDispatch)
   {.importc: "ct_linux_preload_register_close_hook", raises: [].}
 proc installReadDispatcher(dispatch: ReadDispatch)
   {.importc: "ct_linux_preload_register_read_hook", raises: [].}
+proc installPreadDispatcher(dispatch: PreadDispatch)
+  {.importc: "ct_linux_preload_register_pread_hook", raises: [].}
+proc installReadvDispatcher(dispatch: ReadvDispatch)
+  {.importc: "ct_linux_preload_register_readv_hook", raises: [].}
+proc installPreadvDispatcher(dispatch: PreadvDispatch)
+  {.importc: "ct_linux_preload_register_preadv_hook", raises: [].}
 proc installWriteDispatcher(dispatch: WriteDispatch)
   {.importc: "ct_linux_preload_register_write_hook", raises: [].}
 proc installStatDispatcher(dispatch: StatDispatch)
@@ -1379,6 +1668,12 @@ proc installFcloseDispatcher(dispatch: FcloseDispatch)
   {.importc: "ct_linux_preload_register_fclose_hook", raises: [].}
 proc installConnectDispatcher(dispatch: ConnectDispatch)
   {.importc: "ct_linux_preload_register_connect_hook", raises: [].}
+proc installSendfileDispatcher(dispatch: SendfileDispatch)
+  {.importc: "ct_linux_preload_register_sendfile_hook", raises: [].}
+proc installCopyFileRangeDispatcher(dispatch: CopyFileRangeDispatch)
+  {.importc: "ct_linux_preload_register_copy_file_range_hook", raises: [].}
+proc installSpliceDispatcher(dispatch: SpliceDispatch)
+  {.importc: "ct_linux_preload_register_splice_hook", raises: [].}
 proc installDlopenDispatcher(dispatch: DlopenDispatch)
   {.importc: "ct_linux_preload_register_dlopen_hook", raises: [].}
 proc installDlmopenDispatcher(dispatch: DlmopenDispatch)
@@ -1409,6 +1704,9 @@ var
   openat64Hooks: seq[OpenatHookEntry] = @[]
   closeHooks: seq[CloseHookEntry] = @[]
   readHooks: seq[ReadHookEntry] = @[]
+  preadHooks: seq[PreadHookEntry] = @[]
+  readvHooks: seq[ReadvHookEntry] = @[]
+  preadvHooks: seq[PreadvHookEntry] = @[]
   writeHooks: seq[WriteHookEntry] = @[]
   statHooks: seq[StatHookEntry] = @[]
   lstatHooks: seq[StatHookEntry] = @[]
@@ -1420,6 +1718,9 @@ var
   freadHooks: seq[FreadHookEntry] = @[]
   fcloseHooks: seq[FcloseHookEntry] = @[]
   connectHooks: seq[ConnectHookEntry] = @[]
+  sendfileHooks: seq[SendfileHookEntry] = @[]
+  copyFileRangeHooks: seq[CopyFileRangeHookEntry] = @[]
+  spliceHooks: seq[SpliceHookEntry] = @[]
   dlopenHooks: seq[DlopenHookEntry] = @[]
   dlmopenHooks: seq[DlmopenHookEntry] = @[]
   mmapHooks: seq[MmapHookEntry] = @[]
@@ -1484,6 +1785,24 @@ proc registerReadHook*(hook: ReadHook; priority = 100) {.raises: [].} =
     return
   readHooks.add(ReadHookEntry(priority: priority, callback: hook))
   readHooks.sort(proc(a, b: ReadHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerPreadHook*(hook: PreadHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  preadHooks.add(PreadHookEntry(priority: priority, callback: hook))
+  preadHooks.sort(proc(a, b: PreadHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerReadvHook*(hook: ReadvHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  readvHooks.add(ReadvHookEntry(priority: priority, callback: hook))
+  readvHooks.sort(proc(a, b: ReadvHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerPreadvHook*(hook: PreadvHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  preadvHooks.add(PreadvHookEntry(priority: priority, callback: hook))
+  preadvHooks.sort(proc(a, b: PreadvHookEntry): int = cmp(a.priority, b.priority))
 
 proc registerWriteHook*(hook: WriteHook; priority = 100) {.raises: [].} =
   if hook == nil:
@@ -1550,6 +1869,27 @@ proc registerConnectHook*(hook: ConnectHook; priority = 100) {.raises: [].} =
     return
   connectHooks.add(ConnectHookEntry(priority: priority, callback: hook))
   connectHooks.sort(proc(a, b: ConnectHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerSendfileHook*(hook: SendfileHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  sendfileHooks.add(SendfileHookEntry(priority: priority, callback: hook))
+  sendfileHooks.sort(proc(a, b: SendfileHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerCopyFileRangeHook*(hook: CopyFileRangeHook; priority = 100)
+    {.raises: [].} =
+  if hook == nil:
+    return
+  copyFileRangeHooks.add(CopyFileRangeHookEntry(priority: priority,
+    callback: hook))
+  copyFileRangeHooks.sort(proc(a, b: CopyFileRangeHookEntry): int =
+    cmp(a.priority, b.priority))
+
+proc registerSpliceHook*(hook: SpliceHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  spliceHooks.add(SpliceHookEntry(priority: priority, callback: hook))
+  spliceHooks.sort(proc(a, b: SpliceHookEntry): int = cmp(a.priority, b.priority))
 
 proc registerDlopenHook*(hook: DlopenHook; priority = 100) {.raises: [].} =
   if hook == nil:
@@ -2146,6 +2486,15 @@ proc callReal*(ctx: var CloseContext) {.raises: [].} =
 proc callReal*(ctx: var ReadContext) {.raises: [].} =
   ctx.result = realRead(ctx.fd, ctx.buf, ctx.count)
 
+proc callReal*(ctx: var PreadContext) {.raises: [].} =
+  ctx.result = realPread(ctx.fd, ctx.buf, ctx.count, ctx.offset)
+
+proc callReal*(ctx: var ReadvContext) {.raises: [].} =
+  ctx.result = realReadv(ctx.fd, ctx.iov, ctx.iovcnt)
+
+proc callReal*(ctx: var PreadvContext) {.raises: [].} =
+  ctx.result = realPreadv(ctx.fd, ctx.iov, ctx.iovcnt, ctx.offset)
+
 proc callReal*(ctx: var WriteContext) {.raises: [].} =
   ctx.result = realWrite(ctx.fd, ctx.buf, ctx.count)
 
@@ -2180,6 +2529,17 @@ proc callReal*(ctx: var FcloseContext) {.raises: [].} =
 
 proc callReal*(ctx: var ConnectContext) {.raises: [].} =
   ctx.result = realConnect(ctx.fd, ctx.address, ctx.addrLen)
+
+proc callReal*(ctx: var SendfileContext) {.raises: [].} =
+  ctx.result = realSendfile(ctx.outFd, ctx.inFd, ctx.offset, ctx.count)
+
+proc callReal*(ctx: var CopyFileRangeContext) {.raises: [].} =
+  ctx.result = realCopyFileRange(ctx.inFd, ctx.offIn, ctx.outFd, ctx.offOut,
+    ctx.length, ctx.flags)
+
+proc callReal*(ctx: var SpliceContext) {.raises: [].} =
+  ctx.result = realSplice(ctx.fdIn, ctx.offIn, ctx.fdOut, ctx.offOut,
+    ctx.length, ctx.flags)
 
 proc callReal*(ctx: var DlopenContext) {.raises: [].} =
   ctx.result = realDlopen(ctx.path, ctx.flags)
@@ -2263,6 +2623,30 @@ proc callNext*(ctx: var ReadContext) {.raises: [].} =
     let index = ctx.nextIndex
     inc ctx.nextIndex
     readHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var PreadContext) {.raises: [].} =
+  if ctx.nextIndex < preadHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    preadHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var ReadvContext) {.raises: [].} =
+  if ctx.nextIndex < readvHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    readvHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var PreadvContext) {.raises: [].} =
+  if ctx.nextIndex < preadvHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    preadvHooks[index].callback(ctx)
   else:
     callReal(ctx)
 
@@ -2353,6 +2737,30 @@ proc callNext*(ctx: var ConnectContext) {.raises: [].} =
     let index = ctx.nextIndex
     inc ctx.nextIndex
     connectHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var SendfileContext) {.raises: [].} =
+  if ctx.nextIndex < sendfileHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    sendfileHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var CopyFileRangeContext) {.raises: [].} =
+  if ctx.nextIndex < copyFileRangeHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    copyFileRangeHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var SpliceContext) {.raises: [].} =
+  if ctx.nextIndex < spliceHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    spliceHooks[index].callback(ctx)
   else:
     callReal(ctx)
 
@@ -2474,6 +2882,26 @@ proc dispatchRead(fd: cint; buf: pointer; count: csize_t): clong
   callNext(ctx)
   result = ctx.result
 
+proc dispatchPread(fd: cint; buf: pointer; count: csize_t;
+                   offset: clong): clong {.cdecl, raises: [].} =
+  var ctx = PreadContext(fd: fd, buf: buf, count: count, offset: offset,
+                         result: -1)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchReadv(fd: cint; iov: pointer; iovcnt: cint): clong
+    {.cdecl, raises: [].} =
+  var ctx = ReadvContext(fd: fd, iov: iov, iovcnt: iovcnt, result: -1)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchPreadv(fd: cint; iov: pointer; iovcnt: cint;
+                    offset: clong): clong {.cdecl, raises: [].} =
+  var ctx = PreadvContext(fd: fd, iov: iov, iovcnt: iovcnt, offset: offset,
+                          result: -1)
+  callNext(ctx)
+  result = ctx.result
+
 proc dispatchWrite(fd: cint; buf: pointer; count: csize_t): clong
     {.cdecl, raises: [].} =
   var ctx = WriteContext(fd: fd, buf: buf, count: count, result: -1)
@@ -2531,6 +2959,31 @@ proc dispatchConnect(fd: cint; address: pointer; addrLen: uint32): cint
     {.cdecl, raises: [].} =
   var ctx = ConnectContext(fd: fd, address: address, addrLen: addrLen,
                            result: -1)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchSendfile(outFd, inFd: cint; offset: pointer;
+                      count: csize_t): clong {.cdecl, raises: [].} =
+  var ctx = SendfileContext(outFd: outFd, inFd: inFd, offset: offset,
+                            count: count, result: -1)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchCopyFileRange(inFd: cint; offIn: pointer; outFd: cint;
+                           offOut: pointer; length: csize_t;
+                           flags: cuint): clong {.cdecl, raises: [].} =
+  var ctx = CopyFileRangeContext(inFd: inFd, offIn: offIn, outFd: outFd,
+                                 offOut: offOut, length: length,
+                                 flags: flags, result: -1)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchSplice(fdIn: cint; offIn: pointer; fdOut: cint; offOut: pointer;
+                    length: csize_t; flags: cuint): clong
+    {.cdecl, raises: [].} =
+  var ctx = SpliceContext(fdIn: fdIn, offIn: offIn, fdOut: fdOut,
+                          offOut: offOut, length: length, flags: flags,
+                          result: -1)
   callNext(ctx)
   result = ctx.result
 
@@ -2607,6 +3060,9 @@ installOpenatDispatcher(dispatchOpenat)
 installOpenat64Dispatcher(dispatchOpenat64)
 installCloseDispatcher(dispatchClose)
 installReadDispatcher(dispatchRead)
+installPreadDispatcher(dispatchPread)
+installReadvDispatcher(dispatchReadv)
+installPreadvDispatcher(dispatchPreadv)
 installWriteDispatcher(dispatchWrite)
 installStatDispatcher(dispatchStat)
 installLstatDispatcher(dispatchLstat)
@@ -2618,6 +3074,9 @@ installFopen64Dispatcher(dispatchFopen64)
 installFreadDispatcher(dispatchFread)
 installFcloseDispatcher(dispatchFclose)
 installConnectDispatcher(dispatchConnect)
+installSendfileDispatcher(dispatchSendfile)
+installCopyFileRangeDispatcher(dispatchCopyFileRange)
+installSpliceDispatcher(dispatchSplice)
 installDlopenDispatcher(dispatchDlopen)
 installDlmopenDispatcher(dispatchDlmopen)
 installMmapDispatcher(dispatchMmap)
