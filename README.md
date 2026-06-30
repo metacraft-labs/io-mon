@@ -85,9 +85,18 @@ to start as an honest stub today.
   Main-executable, startup non-system application-owned shared-object, and
   post-constructor `dlopen`/`dlmopen` application-DSO inline `0f 05` syscall
   sites are scanned and patched through the same stackable raw-syscall
-  INT3/SIGTRAP substrate. Known residuals: anonymous JIT executable mappings
-  and startup DSOs under excluded system/runtime prefixes are not incrementally
-  scanned yet; raw
+  INT3/SIGTRAP substrate. Anonymous/private executable mappings created through
+  the preload `mmap` wrapper, or made executable later through tracked
+  `mprotect`, are incrementally scanned with the same substrate; anonymous
+  writable+executable mappings fail closed because code can be written after
+  the immediate scan. The anonymous ownership table is maintained across
+  `munmap` removal/splitting and fully tracked `mremap` moves/resizes; live
+  anonymous executable `mprotect` transitions are scanned only when every live
+  executable anonymous byte in the requested range is covered by that lifecycle,
+  and partial-overlap `mremap` ownership escapes fail closed instead of
+  inheriting stale ownership. Known residuals: startup DSOs
+  under excluded system/runtime prefixes and executable mappings not owned by
+  the preload `mmap` lifecycle are not scanned yet; raw
   zero-copy syscalls (`sendfile`, `splice`, raw `copy_file_range`), hardlink
   aliases, and Linux non-file determinism inputs (`getenv`, `uname`, `sysconf`,
   time, `getrandom`) still need dedicated hooks or stackable-backed

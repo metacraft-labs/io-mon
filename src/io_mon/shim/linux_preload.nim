@@ -760,6 +760,85 @@ proc repro_hook_dlmopen*(ctx: var DlmopenContext) {.raises: [].} =
     recordLateInlineSyscallScanCoverage(status, "dlmopen")
   c_set_errno(savedErrno)
 
+proc repro_hook_mmap*(ctx: var MmapContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if isAnonymousPrivateMmap(ctx.flags, ctx.fd):
+    recordAnonymousPrivateMmap(ctx.result, ctx.length)
+    if protIncludesExec(ctx.prot):
+      if protIncludesWrite(ctx.prot):
+        emitEventLoss("linux anonymous executable mmap is writable; " &
+          "raw syscall scan requires a later mprotect transition " &
+          "source=mmap-anonymous-exec")
+      let status = scanInlineSyscallPatchesForOwnedAnonymousRange(
+        ctx.result, ctx.length)
+      recordLateInlineSyscallScanCoverage(status, "mmap-anonymous-exec")
+  c_set_errno(savedErrno)
+
+proc repro_hook_mprotect*(ctx: var MprotectContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0 and protIncludesExec(ctx.prot):
+    let coverage = liveAnonymousExecutableCoverage(ctx.address, ctx.length)
+    if coverage.liveIntersects and coverage.mapsAvailable and
+        coverage.fullyTracked:
+      let status = scanInlineSyscallPatchesForTrackedMprotectRange(
+        ctx.address, ctx.length)
+      recordLateInlineSyscallScanCoverage(status, "mprotect-anonymous-exec")
+    elif coverage.liveIntersects:
+      emitEventLoss("linux anonymous executable mprotect is not owned by " &
+        "the preload mmap lifecycle source=mprotect-anonymous-untracked")
+  c_set_errno(savedErrno)
+
+proc repro_hook_munmap*(ctx: var MunmapContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0:
+    removeAnonymousPrivateRange(ctx.address, ctx.length)
+  c_set_errno(savedErrno)
+
+proc repro_hook_mremap*(ctx: var MremapContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  let oldWasTracked = anonymousPrivateRangeFullyTracked(
+    ctx.oldAddress, ctx.oldSize)
+  let oldHadTrackedOverlap = anonymousPrivateRangeIntersects(
+    ctx.oldAddress, ctx.oldSize)
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if isSuccessfulMmapResult(ctx.result):
+    var movedPrecisely = false
+    if oldWasTracked:
+      movedPrecisely = remapAnonymousPrivateRange(
+        ctx.oldAddress, ctx.oldSize, ctx.result, ctx.newSize)
+      if not movedPrecisely:
+        emitEventLoss("linux anonymous executable mremap could not preserve " &
+          "precise mmap lifecycle ownership source=mremap-anonymous")
+    elif oldHadTrackedOverlap:
+      removeAnonymousPrivateRange(ctx.oldAddress, ctx.oldSize)
+      emitEventLoss("linux anonymous executable mremap touched only part of " &
+        "a preload-owned mapping source=mremap-anonymous")
+    if movedPrecisely and liveAnonymousExecutableMappingIntersects(
+        ctx.result, ctx.newSize):
+      let status = scanInlineSyscallPatchesForTrackedMprotectRange(
+        ctx.result, ctx.newSize)
+      recordLateInlineSyscallScanCoverage(status, "mremap-anonymous-exec")
+  c_set_errno(savedErrno)
+
 proc repro_hook_raw_syscall*(number, a1, a2, a3, a4, a5, a6,
                              callResult: clong; inlineTrap: cint)
     {.raises: [].} =
@@ -902,6 +981,10 @@ registerFcloseHook(repro_hook_fclose)
 registerConnectHook(repro_hook_connect)
 registerDlopenHook(repro_hook_dlopen)
 registerDlmopenHook(repro_hook_dlmopen)
+registerMmapHook(repro_hook_mmap)
+registerMprotectHook(repro_hook_mprotect)
+registerMunmapHook(repro_hook_munmap)
+registerMremapHook(repro_hook_mremap)
 registerForkHook(repro_hook_fork)
 registerExecveHook(repro_hook_execve)
 registerPosixSpawnHook(repro_hook_posix_spawn)
