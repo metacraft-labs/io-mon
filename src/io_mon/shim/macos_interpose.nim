@@ -2198,11 +2198,38 @@ proc repro_hook_getattrlistbulk*(dirfd: cint; al, buf: pointer; size: csize_t;
 
 proc repro_hook_getdirentries*(fd: cint; buf: pointer; nbytes: cint;
     basep: ptr clong): cint {.exportc, cdecl, dynlib.} =
+  ## Hook for the LEGACY 32-bit-inode `getdirentries` (#196) entry. Forwards via
+  ## the matching legacy raw syscall so a 32-bit-inode caller's buffer keeps the
+  ## layout it expects. NOTE: modern `readdir`/`readdir_r`/`scandir` do NOT reach
+  ## here — they use `__getdirentries64` (see repro_hook_getdirentries64).
   if not initialized or disabled > 0:
     return ct_macos_real_getdirentries(fd, buf, nbytes, basep)
   result = ct_macos_real_getdirentries(fd, buf, nbytes, basep)
   if result > 0:
     recordDirEnumByFd(fd, "getdirentries")
+
+proc repro_hook_getdirentries64*(fd: cint; buf: pointer; bufsize: csize_t;
+    basep: ptr clong): clong {.exportc, cdecl, dynlib.} =
+  ## Hook for the PRIVATE 64-bit-inode `___getdirentries64` (#344) entry that
+  ## modern `readdir$INODE64`/`readdir_r`/`scandir` use to refill their buffer.
+  ##
+  ## ROUND-4 TRANSPARENCY FIX (P0 correctness): the body-patch backend overwrites
+  ## `___getdirentries64` in place. The earlier code routed BOTH `getdirentries`
+  ## and `__getdirentries64` through ONE hook that forwarded via the LEGACY
+  ## 32-bit-inode `SYS_getdirentries` (#196). The 32-bit record layout is
+  ## incompatible with the 64-bit one `readdir` then parses, so under the shim a
+  ## monitored program's directory listing was CORRUPTED — every entry name lost
+  ## its leading byte, `..` was dropped, and large directories lost entries. That
+  ## is a transparency violation (a monitor must not change observable behavior):
+  ## it broke real tools (CPython 3.12 failed to import `encodings`; GNU `ls`
+  ## returned garbage). Forwarding via the matching `SYS_getdirentries64` here
+  ## makes the buffer BYTE-IDENTICAL to an unmonitored call while still recording
+  ## the directory-enumerate dependency.
+  if not initialized or disabled > 0:
+    return ct_macos_real_getdirentries64(fd, buf, bufsize, basep)
+  result = ct_macos_real_getdirentries64(fd, buf, bufsize, basep)
+  if result > 0:
+    recordDirEnumByFd(fd, "getdirentries64")
 
 # --- Unified connect hook (IPC / breakaway detection, T3a / break #1) -----
 # There is exactly ONE connect hook, used by BOTH the static __DATA,__interpose
@@ -2971,9 +2998,28 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
     BodypatchHookSpec(
       names: @["getattrlistbulk"],
       hook: cast[pointer](repro_hook_getattrlistbulk)),
+    # Directory enumeration is split by inode width into TWO separate specs: the
+    # LEGACY 32-bit-inode `getdirentries` (#196) and the PRIVATE 64-bit-inode
+    # `__getdirentries64` (#344) return INCOMPATIBLE record layouts (d_ino:4 vs
+    # d_ino:8, and a different field order/sizes), so each MUST be branched to the
+    # hook that forwards via its MATCHING raw syscall and exposes its MATCHING ABI
+    # (`int(int,void*,int,long*)` vs `ssize_t(int,void*,size_t,off_t*)`).
+    #
+    # ROUND-4 TRANSPARENCY FIX (P0 correctness): the earlier code listed BOTH
+    # names in ONE spec branching to `repro_hook_getdirentries`, so the patched
+    # `__getdirentries64` body — the entry modern `readdir$INODE64`/`readdir_r`/
+    # `scandir` use to refill their buffer — refilled it through the LEGACY 32-bit
+    # `SYS_getdirentries`. `readdir` then parsed those 32-bit records as 64-bit,
+    # mis-laying-out every entry (each name lost its leading byte, `..` dropped,
+    # large dirs truncated). That changed monitored programs' directory listings
+    # (a transparency violation) and broke real tools: CPython 3.12 failed to
+    # import `encodings`, GNU `ls` returned garbage. See repro_hook_getdirentries64.
     BodypatchHookSpec(
-      names: @["getdirentries", "__getdirentries64"],
+      names: @["getdirentries"],
       hook: cast[pointer](repro_hook_getdirentries)),
+    BodypatchHookSpec(
+      names: @["__getdirentries64"],
+      hook: cast[pointer](repro_hook_getdirentries64)),
     # T3a IPC-breakaway hook (findings doc break #1). connect is a thin syscall
     # wrapper, so the hook forwards via raw SYS_connect and the PLAIN body patch
     # (no trampoline) suffices — catching shared-cache-internal callers (e.g. a
