@@ -246,6 +246,83 @@ int repro_macos_real_connect_syscall(int fd, void *addr,
 }
 
 /*
+ * ROUND-3 S1 content-channel raw-syscall forwarders. Each reaches the kernel via
+ * the RAW syscall (the xattr/shm/sendfile/pread/readv entries are thin libsystem
+ * wrappers over their syscalls), exactly like the connect/stat/rename forwarders,
+ * so they are reentrancy-free and never re-enter the shim's own interpose
+ * wrapper of the same name. These hooks are INTERPOSE-ONLY (see the thunks /
+ * interpose tuple), so a not-ready or muted call forwards straight through here.
+ *
+ * macOS xattr ABI: the path/fd variants take a trailing (u_int32_t position,
+ * int options) pair — see <sys/xattr.h>. listxattr/flistxattr take (buf, size,
+ * options); removexattr/fremovexattr take (name, options). getxattrat does NOT
+ * exist as a macOS syscall (no SYS_getxattrat in <sys/syscall.h>), so it is
+ * intentionally not hooked here (the corpus exercises getxattr/fgetxattr/
+ * listxattr only).
+ */
+ssize_t repro_macos_real_getxattr_syscall(char *path, char *name, void *value,
+                                          size_t size, unsigned int position,
+                                          int options) {
+  return (ssize_t)syscall(SYS_getxattr, path, name, value, size, position,
+                          options);
+}
+ssize_t repro_macos_real_fgetxattr_syscall(int fd, char *name, void *value,
+                                           size_t size, unsigned int position,
+                                           int options) {
+  return (ssize_t)syscall(SYS_fgetxattr, fd, name, value, size, position,
+                          options);
+}
+ssize_t repro_macos_real_listxattr_syscall(char *path, void *namebuf,
+                                           size_t size, int options) {
+  return (ssize_t)syscall(SYS_listxattr, path, namebuf, size, options);
+}
+ssize_t repro_macos_real_flistxattr_syscall(int fd, void *namebuf, size_t size,
+                                            int options) {
+  return (ssize_t)syscall(SYS_flistxattr, fd, namebuf, size, options);
+}
+int repro_macos_real_setxattr_syscall(char *path, char *name, void *value,
+                                      size_t size, unsigned int position,
+                                      int options) {
+  return (int)syscall(SYS_setxattr, path, name, value, size, position, options);
+}
+int repro_macos_real_fsetxattr_syscall(int fd, char *name, void *value,
+                                       size_t size, unsigned int position,
+                                       int options) {
+  return (int)syscall(SYS_fsetxattr, fd, name, value, size, position, options);
+}
+int repro_macos_real_removexattr_syscall(char *path, char *name, int options) {
+  return (int)syscall(SYS_removexattr, path, name, options);
+}
+int repro_macos_real_fremovexattr_syscall(int fd, char *name, int options) {
+  return (int)syscall(SYS_fremovexattr, fd, name, options);
+}
+
+/* POSIX shm_open: third arg (mode) is meaningful only with O_CREAT; passing it
+ * unconditionally is harmless for a non-creating open (the kernel ignores it). */
+int repro_macos_real_shm_open_syscall(char *name, int oflag, int mode) {
+  return (int)syscall(SYS_shm_open, name, oflag, mode);
+}
+
+/* sendfile(2): SOURCE fd is arg 1; offset/len are off_t (64-bit, in a register
+ * on arm64). hdtr may be NULL. */
+int repro_macos_real_sendfile_syscall(int fd, int s, long long offset,
+                                      long long *len, void *hdtr, int flags) {
+  return (int)syscall(SYS_sendfile, fd, s, offset, len, hdtr, flags);
+}
+
+ssize_t repro_macos_real_pread_syscall(int fd, void *buf, size_t n,
+                                       long long offset) {
+  return (ssize_t)syscall(SYS_pread, fd, buf, n, offset);
+}
+ssize_t repro_macos_real_preadv_syscall(int fd, void *iov, int iovcnt,
+                                        long long offset) {
+  return (ssize_t)syscall(SYS_preadv, fd, iov, iovcnt, offset);
+}
+ssize_t repro_macos_real_readv_syscall(int fd, void *iov, int iovcnt) {
+  return (ssize_t)syscall(SYS_readv, fd, iov, iovcnt);
+}
+
+/*
  * Describe a connect() target for the IPC-breakaway hook. Returns the address
  * family (AF_UNIX / AF_INET / AF_INET6 / …) or -1 on bad args. Fills `out_dest`
  * with the AF_UNIX socket path or an "ip:port" / "[ip6]:port" string. Sets
@@ -429,6 +506,41 @@ int repro_macos_fd_dev_ino(int fd, unsigned long long *out_dev,
   if (syscall(SYS_fstat64, fd, &st) != 0) return 0;
   *out_dev = (unsigned long long)st.st_dev;
   *out_ino = (unsigned long long)st.st_ino;
+  return 1;
+}
+
+/*
+ * ROUND-3 S1 — (dev, ino, FILE-TYPE) for an open fd in a SINGLE raw fstat
+ * (unhooked → reentrancy-free). A superset of repro_macos_fd_dev_ino that ALSO
+ * classifies the fd's underlying object so the open hook can detect a FIFO
+ * (S1d — out-of-tree FIFO feeder) and the empty-path read hook can tell a real
+ * file (resolve + record) from a socket/pipe (out-of-tree → downgrade), WITHOUT
+ * paying a second fstat (the open hot path already pays this one for the dev/ino
+ * stamp). `*out_kind` receives one of the REPRO_FD_KIND_* codes below.
+ */
+#define REPRO_FD_KIND_OTHER 0
+#define REPRO_FD_KIND_REG   1   /* regular file                                */
+#define REPRO_FD_KIND_FIFO  2   /* named FIFO or anonymous pipe                */
+#define REPRO_FD_KIND_SOCK  3   /* socket                                      */
+#define REPRO_FD_KIND_CHR   4   /* character device (tty, /dev/null, /dev/zero)*/
+#define REPRO_FD_KIND_BLK   5   /* block device                                */
+#define REPRO_FD_KIND_DIR   6   /* directory                                   */
+int repro_macos_fd_dev_ino_kind(int fd, unsigned long long *out_dev,
+                                unsigned long long *out_ino, int *out_kind) {
+  if (fd < 0) return 0;
+  struct stat st;
+  if (syscall(SYS_fstat64, fd, &st) != 0) return 0;
+  if (out_dev) *out_dev = (unsigned long long)st.st_dev;
+  if (out_ino) *out_ino = (unsigned long long)st.st_ino;
+  if (out_kind) {
+    mode_t m = st.st_mode;
+    *out_kind = S_ISREG(m)  ? REPRO_FD_KIND_REG  :
+                S_ISFIFO(m) ? REPRO_FD_KIND_FIFO :
+                S_ISSOCK(m) ? REPRO_FD_KIND_SOCK :
+                S_ISCHR(m)  ? REPRO_FD_KIND_CHR  :
+                S_ISBLK(m)  ? REPRO_FD_KIND_BLK  :
+                S_ISDIR(m)  ? REPRO_FD_KIND_DIR  : REPRO_FD_KIND_OTHER;
+  }
   return 1;
 }
 
@@ -1913,6 +2025,102 @@ proc ct_macos_fd_dev_ino*(fd: cint; outDev, outIno: ptr uint64): bool =
   proc fdDevIno(fd: cint; outDev, outIno: ptr uint64): cint
     {.importc: "repro_macos_fd_dev_ino", cdecl.}
   fdDevIno(fd, outDev, outIno) != 0
+
+type
+  FdKind* = enum
+    ## ROUND-3 S1 — the underlying-object class of an open fd, returned by
+    ## `ct_macos_fd_dev_ino_kind`. Mirrors the REPRO_FD_KIND_* C codes 1:1.
+    fkOther = 0, fkRegular = 1, fkFifo = 2, fkSocket = 3,
+    fkCharDevice = 4, fkBlockDevice = 5, fkDirectory = 6
+
+proc ct_macos_fd_dev_ino_kind*(fd: cint; outDev, outIno: ptr uint64;
+    outKind: ptr FdKind): bool =
+  ## ROUND-3 S1 — (st_dev, st_ino, file-type) for an open fd in ONE raw fstat
+  ## (reentrancy-free). Superset of ct_macos_fd_dev_ino; lets the open hot path
+  ## stamp inode identity AND detect a FIFO without a second stat, and lets the
+  ## empty-path read hook tell a real file from a socket/pipe. True on success.
+  proc impl(fd: cint; outDev, outIno: ptr uint64; outKind: ptr cint): cint
+    {.importc: "repro_macos_fd_dev_ino_kind", cdecl.}
+  var k: cint
+  result = impl(fd, outDev, outIno, addr k) != 0
+  if result and outKind != nil:
+    outKind[] = FdKind(k)
+
+proc ct_macos_real_getxattr*(path, name: cstring; value: pointer; size: csize_t;
+    position: uint32; options: cint): int =
+  proc impl(path, name: cstring; value: pointer; size: csize_t; position: uint32;
+      options: cint): clong
+    {.importc: "repro_macos_real_getxattr_syscall", cdecl.}
+  int(impl(path, name, value, size, position, options))
+
+proc ct_macos_real_fgetxattr*(fd: cint; name: cstring; value: pointer;
+    size: csize_t; position: uint32; options: cint): int =
+  proc impl(fd: cint; name: cstring; value: pointer; size: csize_t;
+      position: uint32; options: cint): clong
+    {.importc: "repro_macos_real_fgetxattr_syscall", cdecl.}
+  int(impl(fd, name, value, size, position, options))
+
+proc ct_macos_real_listxattr*(path: cstring; namebuf: pointer; size: csize_t;
+    options: cint): int =
+  proc impl(path: cstring; namebuf: pointer; size: csize_t; options: cint): clong
+    {.importc: "repro_macos_real_listxattr_syscall", cdecl.}
+  int(impl(path, namebuf, size, options))
+
+proc ct_macos_real_flistxattr*(fd: cint; namebuf: pointer; size: csize_t;
+    options: cint): int =
+  proc impl(fd: cint; namebuf: pointer; size: csize_t; options: cint): clong
+    {.importc: "repro_macos_real_flistxattr_syscall", cdecl.}
+  int(impl(fd, namebuf, size, options))
+
+proc ct_macos_real_setxattr*(path, name: cstring; value: pointer; size: csize_t;
+    position: uint32; options: cint): cint =
+  proc impl(path, name: cstring; value: pointer; size: csize_t; position: uint32;
+      options: cint): cint {.importc: "repro_macos_real_setxattr_syscall", cdecl.}
+  impl(path, name, value, size, position, options)
+
+proc ct_macos_real_fsetxattr*(fd: cint; name: cstring; value: pointer;
+    size: csize_t; position: uint32; options: cint): cint =
+  proc impl(fd: cint; name: cstring; value: pointer; size: csize_t;
+      position: uint32; options: cint): cint
+    {.importc: "repro_macos_real_fsetxattr_syscall", cdecl.}
+  impl(fd, name, value, size, position, options)
+
+proc ct_macos_real_removexattr*(path, name: cstring; options: cint): cint =
+  proc impl(path, name: cstring; options: cint): cint
+    {.importc: "repro_macos_real_removexattr_syscall", cdecl.}
+  impl(path, name, options)
+
+proc ct_macos_real_fremovexattr*(fd: cint; name: cstring; options: cint): cint =
+  proc impl(fd: cint; name: cstring; options: cint): cint
+    {.importc: "repro_macos_real_fremovexattr_syscall", cdecl.}
+  impl(fd, name, options)
+
+proc ct_macos_real_shm_open*(name: cstring; oflag, mode: cint): cint =
+  proc impl(name: cstring; oflag, mode: cint): cint
+    {.importc: "repro_macos_real_shm_open_syscall", cdecl.}
+  impl(name, oflag, mode)
+
+proc ct_macos_real_sendfile*(fd, s: cint; offset: int64; len: ptr int64;
+    hdtr: pointer; flags: cint): cint =
+  proc impl(fd, s: cint; offset: int64; len: ptr int64; hdtr: pointer;
+      flags: cint): cint {.importc: "repro_macos_real_sendfile_syscall", cdecl.}
+  impl(fd, s, offset, len, hdtr, flags)
+
+proc ct_macos_real_pread*(fd: cint; buf: pointer; n: csize_t; offset: int64): int =
+  proc impl(fd: cint; buf: pointer; n: csize_t; offset: int64): clong
+    {.importc: "repro_macos_real_pread_syscall", cdecl.}
+  int(impl(fd, buf, n, offset))
+
+proc ct_macos_real_preadv*(fd: cint; iov: pointer; iovcnt: cint;
+    offset: int64): int =
+  proc impl(fd: cint; iov: pointer; iovcnt: cint; offset: int64): clong
+    {.importc: "repro_macos_real_preadv_syscall", cdecl.}
+  int(impl(fd, iov, iovcnt, offset))
+
+proc ct_macos_real_readv*(fd: cint; iov: pointer; iovcnt: cint): int =
+  proc impl(fd: cint; iov: pointer; iovcnt: cint): clong
+    {.importc: "repro_macos_real_readv_syscall", cdecl.}
+  int(impl(fd, iov, iovcnt))
 
 proc ct_macos_dyld_image_dep_path*(mh: pointer; outBuf: pointer;
     outLen: csize_t): cint =

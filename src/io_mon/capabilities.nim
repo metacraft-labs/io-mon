@@ -43,7 +43,10 @@ const
     # gettimeofday / time / mach_absolute_time are recorded-not-downgraded
     # (mcapNonDeterminism).
     mcapObservedEnv,
-    mcapNonDeterminism
+    mcapNonDeterminism,
+    # ROUND-3 S1 — content-channel coverage: xattr metadata reads, POSIX shared
+    # memory, FIFO / inherited socket-pipe content, and sendfile/pread/readv.
+    mcapExternalContent
   }
 
   MacosInterposeKnownUnsupportedCapabilities* = {
@@ -84,7 +87,9 @@ const
     mcapLibraryLoad,
     # ROUND-2 R-D — non-file determinism inputs (see MacosInterposeSupportedCapabilities).
     mcapObservedEnv,
-    mcapNonDeterminism
+    mcapNonDeterminism,
+    # ROUND-3 S1 — content-channel coverage (see MacosInterposeSupportedCapabilities).
+    mcapExternalContent
   }
 
   LinuxPreloadSupportedCapabilities* = {
@@ -116,7 +121,9 @@ const
     # ROUND-2 R-D — the Linux preload shim does not yet hook getenv/sysctl/uname or
     # the entropy/time sources; non-file determinism handling is macOS-only so far.
     mcapObservedEnv,
-    mcapNonDeterminism
+    mcapNonDeterminism,
+    # ROUND-3 S1 — xattr/shm/FIFO/sendfile content-channel hooks are macOS-only so far.
+    mcapExternalContent
   }
 
 proc backendFamilyId*(family: MonitorBackendFamily): string =
@@ -178,6 +185,8 @@ proc capabilityId*(capability: MonitorCapability): string =
     "observed-env"
   of mcapNonDeterminism:
     "non-determinism"
+  of mcapExternalContent:
+    "external-content"
 
 proc capabilityFromId*(value: string): MonitorCapability =
   for capability in MonitorCapability:
