@@ -3,6 +3,12 @@ when not defined(linux):
 
 import std/algorithm
 
+import stackable_hooks/platform/linux_preload
+
+const linuxPreloadBackend* = "stackable_hooks/platform/linux_preload"
+static:
+  doAssert compiles(currentPreloadHookDepth())
+
 type
   PidT* = int32
 
@@ -241,7 +247,6 @@ typedef int (*ct_posix_spawn_real_fn)(pid_t *, const char *,
                                       const posix_spawnattr_t *,
                                       char *const [], char *const []);
 
-static __thread int ct_linux_preload_hook_depth = 0;
 static const char *ct_linux_preload_shim_env_name = NULL;
 
 static ct_open_hook_fn ct_open_hook = NULL;
@@ -290,18 +295,20 @@ static ct_execve_real_fn real_execve_ptr = NULL;
 static ct_posix_spawn_real_fn real_posix_spawn_ptr = NULL;
 static ct_posix_spawn_real_fn real_posix_spawnp_ptr = NULL;
 
+extern void *stackable_linux_preload_resolve_next(const char *name);
+extern int stackable_linux_preload_hooks_allowed(void);
+extern void stackable_linux_preload_enter_hook(void);
+extern void stackable_linux_preload_exit_hook(void);
+
 static void *ct_resolve(const char *name) {
-  ct_linux_preload_hook_depth++;
-  void *result = dlsym(RTLD_NEXT, name);
-  ct_linux_preload_hook_depth--;
-  return result;
+  return stackable_linux_preload_resolve_next(name);
 }
 
-#define CT_BYPASS() (ct_linux_preload_hook_depth > 0)
+#define CT_BYPASS() (!stackable_linux_preload_hooks_allowed())
 #define CT_CALL_HOOK(expr) ({ \
-  ct_linux_preload_hook_depth++; \
+  stackable_linux_preload_enter_hook(); \
   __typeof__(expr) _ct_result = (expr); \
-  ct_linux_preload_hook_depth--; \
+  stackable_linux_preload_exit_hook(); \
   _ct_result; \
 })
 
