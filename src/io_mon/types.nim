@@ -189,6 +189,14 @@ type
     # zero-copy / positioned reads (content read on the source). Appended at the END
     # (the enum is serialized by capabilityId STRING, so appending is wire-safe).
     mcapExternalContent
+    # M-FW-5 — production-sensitive Linux residuals. These are intentionally
+    # separate from the positive raw-syscall slices io-mon can already cover:
+    # a consumer that needs adversarial/direct-syscall completeness can require
+    # these IDs and receive an explicit capability gap instead of trusting a
+    # default LD_PRELOAD depfile as production-complete for that threat model.
+    mcapAdversarialRawSyscall
+    mcapExecutableMappingLifecycle
+    mcapPathIdentity
 
   MonitorDiagnosticLevel* = enum
     mdlInfo
