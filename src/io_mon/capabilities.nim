@@ -377,8 +377,9 @@ proc linuxPreloadMonitorProfile*(
     level: mdlInfo,
     message: "Linux raw syscall coverage is stackable-backed; io-mon " &
       "classifies common file/probe syscalls from libc, main-executable, " &
-      "and startup non-system application-DSO raw syscall sites and fails " &
-      "closed for unsupported raw syscall numbers")
+      "startup non-system application-DSO, and late dlopen/dlmopen " &
+      "application-DSO raw syscall sites and fails closed for unsupported " &
+      "raw syscall numbers")
 
   var gapCapabilities = LinuxPreloadKnownUnsupportedCapabilities
   for capability in required:
