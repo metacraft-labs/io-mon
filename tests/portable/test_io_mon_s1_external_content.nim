@@ -3,12 +3,14 @@
 ## `mrExternalContent` record sets, independent of any platform/shim.
 ##
 ## Locks in the CARDINAL-SIN GUARD that is the whole point of routing the
-## shm/FIFO downgrade through the merge rather than the shim: the in-tree
+## shm/FIFO/opaque downgrade through the merge rather than the shim: the in-tree
 ## create/write side and the attach/read side are paired CROSS-PROCESS, so an
-## entirely self-produced shm object / FIFO pipeline does NOT downgrade, while a
-## channel fed by an out-of-tree producer yields exactly one event-loss (a
-## conservative re-run). Mirrors the shim's `recordExternalContent` detail
-## tokens (`chan=… role=…`) so a drift in either side is caught here on every OS.
+## entirely self-produced shm object / FIFO pipeline / in-tree pipe-socket pipeline
+## does NOT downgrade, while a channel fed by an out-of-tree producer yields exactly
+## one event-loss (a conservative re-run). Mirrors the shim's
+## `recordExternalContent` detail tokens (`chan=… role=…`) so a drift in either side
+## is caught here on every OS. ROUND-4 IP1 added the `opaque`/`localfd` pairing (an
+## inherited pipe/socket with no in-tree create downgrades; an in-tree one pairs).
 
 import std/[os, sets, unittest]
 import io_mon
@@ -50,11 +52,27 @@ suite "io-mon ROUND-3 S1 external-content downgrade (externalContentLossCount)":
       ext("fifo", "read", "/tmp/own.fifo", pid = 101)]
     check externalContentLossCount(recs) == 0
 
-  test "inherited socket/pipe (opaque) is record-not-downgrade (IPC owns it)":
-    # The cardinal-sin guard for intra-tree socket IPC / anonymous pipelines:
-    # socket provenance is owned by the IPC-connect machinery, so an opaque marker
-    # must NOT add a content-channel downgrade.
+  test "ROUND-4 IP1: opaque read with NO inode key is record-not-downgrade":
+    # An opaque read whose fd (dev,ino) was UNOBTAINABLE (fstat failed) carries an
+    # EMPTY key and is NOT downgraded — the fail-safe toward mcComplete (a possible
+    # missed dep, never a false re-run of a normal build).
     check externalContentLossCount(@[ext("opaque", "read", "")]) == 0
+
+  test "ROUND-4 IP1: inherited pipe/socket (no in-tree create) DOWNGRADES":
+    # The IP1 re-break closed: an opaque read keyed on the fd's (dev,ino) with NO
+    # matching in-tree pipe/socketpair/socket/accept CREATE is an fd inherited from
+    # an OUT-OF-TREE parent → one loss (a conservative re-run).
+    check externalContentLossCount(@[ext("opaque", "read", "localfd:0:9001")]) == 1
+
+  test "ROUND-4 IP1: in-tree pipe/socket pipeline does NOT downgrade (cardinal sin)":
+    # The IP1 cardinal-sin guard: a monitored process created the pipe/socket
+    # in-tree (recordLocalFdCreate), so an inherited read of the SAME object — even
+    # in a forked child — PAIRS by (dev,ino) and does NOT downgrade. This keeps the
+    # clang driver↔cc1 pipes and intra-tree socket IPC mcComplete.
+    let recs = @[
+      ext("localfd", "create", "localfd:0:9001", pid = 100),
+      ext("opaque", "read", "localfd:0:9001", pid = 101)]
+    check externalContentLossCount(recs) == 0
 
   test "repeated touches of one channel collapse to a single loss (dedup)":
     let recs = @[
@@ -69,7 +87,7 @@ suite "io-mon ROUND-3 S1 external-content downgrade (externalContentLossCount)":
       ext("shm", "attach", "shm:/r3shm"),                 # out-of-tree → loss
       ext("fifo", "write", "/tmp/p.fifo", pid = 100),     # paired ↓
       ext("fifo", "read", "/tmp/p.fifo", pid = 101),      # in-tree → no loss
-      ext("opaque", "read", "", pid = 101, fd = 3)]       # opaque → no loss
+      ext("opaque", "read", "", pid = 101, fd = 3)]       # opaque (no key) → no loss
     check externalContentLossCount(recs) == 1
 
   test "mergeFragments folds an out-of-tree shm attach to mcIncomplete":

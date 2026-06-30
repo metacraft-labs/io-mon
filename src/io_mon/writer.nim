@@ -935,27 +935,35 @@ proc externalContentLossCount*(records: openArray[MonitorRecord]): int =
   ##     out-of-tree feeder of probeD) downgrades.
   ## Dedup keys collapse a channel touched many times to a single loss.
   ##
-  ## DELIBERATELY NOT a downgrade signal: `chan=opaque` (an inherited socket/pipe
-  ## read with no in-tree open). Socket provenance is OWNED by the IPC-connect
-  ## machinery (`unmonitoredSubtreeLossCount`), which correctly leaves INTRA-TREE
-  ## socket IPC `mcComplete` while downgrading an out-of-tree breakaway peer — so
-  ## a second downgrade here would FALSE-FLAG every legitimate intra-tree socket
-  ## IPC / anonymous pipeline (the cardinal sin; see the macOS ipc-breakaway
-  ## intra-tree test). An inherited socket/pipe from an OUT-OF-TREE parent is
-  ## already caught by the un-injected-subtree check. The opaque marker is
-  ## therefore RECORD-not-downgrade (a diagnostic a consumer MAY act on), mirroring
-  ## the round-2 `mrTimeRead` stance.
+  ## ROUND-4 IP1 — `chan=opaque` (an inherited socket/pipe read with no in-tree
+  ## open) is NOW a downgrade signal WHEN UNPAIRED, paired against an in-tree
+  ## `chan=localfd role=create` (a pipe/socketpair/socket/accept a monitored
+  ## process made itself, keyed by the fd's `dev:ino` identity). This closes the
+  ## round-4 IP1 re-break: an inherited pipe from an OUT-OF-TREE writer
+  ## (r4_residual/pipe_launcher) has NO in-tree create ⇒ it downgrades; an entirely
+  ## in-tree pipeline — the clang driver↔cc1 pipes, an in-tree `pipe()+fork`, an
+  ## intra-tree socket IPC whose parent accept()s — IS paired ⇒ NO downgrade (the
+  ## cardinal-sin guard). The round-3 stance ("socket provenance is owned by the
+  ## IPC-connect machinery") still holds for the out-of-tree-PEER socket case: the
+  ## socket fd a monitored client created itself is paired here (no IP1 downgrade),
+  ## while `unmonitoredSubtreeLossCount` independently downgrades a connect to an
+  ## out-of-tree breakaway peer. An opaque read whose fd's (dev,ino) was
+  ## unobtainable carries an EMPTY key and is NOT downgraded (fail-safe toward
+  ## mcComplete — a possible missed dep, never a false re-run of a normal build).
   var shmCreates = initHashSet[string]()
   var fifoWrites = initHashSet[string]()
+  var localFdCreates = initHashSet[string]()
   for r in records:
-    if r.kind == mrExternalContent and
-        detailToken(r.detail, ChanToken) == "shm" and
-        detailToken(r.detail, RoleToken) == "create":
+    if r.kind != mrExternalContent:
+      continue
+    let chan = detailToken(r.detail, ChanToken)
+    let role = detailToken(r.detail, RoleToken)
+    if chan == "shm" and role == "create":
       shmCreates.incl r.path
-    elif r.kind == mrExternalContent and
-        detailToken(r.detail, ChanToken) == "fifo" and
-        detailToken(r.detail, RoleToken) == "write":
+    elif chan == "fifo" and role == "write":
       fifoWrites.incl r.path
+    elif chan == "localfd" and role == "create":
+      localFdCreates.incl r.path
   result = 0
   var flagged = initHashSet[string]()
   for r in records:
@@ -970,6 +978,12 @@ proc externalContentLossCount*(records: openArray[MonitorRecord]): int =
     elif chan == "fifo" and role == "read":
       if r.path notin fifoWrites:
         key = "fifo:" & r.path
+    elif chan == "opaque" and role == "read":
+      # ROUND-4 IP1 — an inherited pipe/socket read. Downgrade ONLY when it has a
+      # resolved (dev,ino) key (r.path non-empty) AND no in-tree create produced
+      # that object. An empty key (fstat failed) never downgrades (fail-safe).
+      if r.path.len > 0 and r.path notin localFdCreates:
+        key = r.path
     if key.len > 0 and key notin flagged:
       flagged.incl key
       inc result
@@ -1484,8 +1498,8 @@ proc mergeFragments*(fragmentDir, outputPath: string;
     records.add MonitorRecord(kind: mrEventLoss,
       observationKind: moEventLoss,
       detail: "out-of-tree content channel consumed (POSIX shm not created " &
-        "in-tree, or FIFO with no in-tree writer) — the real input is " &
-        "invisible, re-run")
+        "in-tree, FIFO with no in-tree writer, or an inherited pipe/socket with " &
+        "no in-tree create) — the real input is invisible, re-run")
   records.add profileRecords(defaultHooksMonitorProfile(
     when defined(linux): LinuxPreloadSupportedCapabilities
     else: MacosMonitorShimTaxonomyCapabilities))
