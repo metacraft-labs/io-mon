@@ -82,11 +82,12 @@ to start as an honest stub today.
   `read` after fd mapping, `close`, and `access`/`readlink`/`statx`-style
   probes); unsupported raw syscalls still emit event-loss and downgrade to
   `mcIncomplete`.
-  Main-executable and startup non-system application-owned shared-object inline
-  `0f 05` syscall sites are scanned and patched through the same stackable
-  raw-syscall INT3/SIGTRAP substrate. Known residuals: post-constructor
-  `dlopen` DSOs, anonymous JIT executable mappings, and startup DSOs under
-  excluded system/runtime prefixes are not incrementally scanned yet; raw
+  Main-executable, startup non-system application-owned shared-object, and
+  post-constructor `dlopen`/`dlmopen` application-DSO inline `0f 05` syscall
+  sites are scanned and patched through the same stackable raw-syscall
+  INT3/SIGTRAP substrate. Known residuals: anonymous JIT executable mappings
+  and startup DSOs under excluded system/runtime prefixes are not incrementally
+  scanned yet; raw
   zero-copy syscalls (`sendfile`, `splice`, raw `copy_file_range`), hardlink
   aliases, and Linux non-file determinism inputs (`getenv`, `uname`, `sysconf`,
   time, `getrandom`) still need dedicated hooks or stackable-backed

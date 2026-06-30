@@ -217,6 +217,19 @@ proc recordInlineSyscallCoverage(status: InlineSyscallPatchStatus) {.raises: [].
     " stage=" & $status.firstPatchStage &
     " errno=" & $status.firstPatchErrno)
 
+proc recordLateInlineSyscallScanCoverage(status: InlineSyscallPatchStatus;
+                                         source: string) {.raises: [].} =
+  if status.handlerInstalled and status.scanDiagnostic == lrsOk and
+      status.firstPatchDiagnostic == lrsOk:
+    return
+  emitEventLoss("linux late inline raw-syscall scanner unavailable source=" &
+    source & " scan=" & $status.scanDiagnostic &
+    " install=" & $status.installDiagnostic &
+    " patched-sites=" & $status.patchedSites &
+    " first-patch=" & $status.firstPatchDiagnostic &
+    " stage=" & $status.firstPatchStage &
+    " errno=" & $status.firstPatchErrno)
+
 proc recordInlineSyscallTrapCoverage() {.raises: [].} =
   if inlineSyscallTrapCoverageRecorded:
     return
@@ -723,6 +736,30 @@ proc repro_hook_connect*(ctx: var ConnectContext) {.raises: [].} =
     recordIpcConnect(ctx.fd, ctx.address, ctx.addrLen)
   c_set_errno(savedErrno)
 
+proc repro_hook_dlopen*(ctx: var DlopenContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result != nil:
+    let status = scanInlineSyscallPatchesForNewMappings()
+    recordLateInlineSyscallScanCoverage(status, "dlopen")
+  c_set_errno(savedErrno)
+
+proc repro_hook_dlmopen*(ctx: var DlmopenContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result != nil:
+    let status = scanInlineSyscallPatchesForNewMappings()
+    recordLateInlineSyscallScanCoverage(status, "dlmopen")
+  c_set_errno(savedErrno)
+
 proc repro_hook_raw_syscall*(number, a1, a2, a3, a4, a5, a6,
                              callResult: clong; inlineTrap: cint)
     {.raises: [].} =
@@ -863,6 +900,8 @@ registerFopen64Hook(repro_hook_fopen64)
 registerFreadHook(repro_hook_fread)
 registerFcloseHook(repro_hook_fclose)
 registerConnectHook(repro_hook_connect)
+registerDlopenHook(repro_hook_dlopen)
+registerDlmopenHook(repro_hook_dlmopen)
 registerForkHook(repro_hook_fork)
 registerExecveHook(repro_hook_execve)
 registerPosixSpawnHook(repro_hook_posix_spawn)

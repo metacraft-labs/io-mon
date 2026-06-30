@@ -17,7 +17,8 @@ type
   LinuxHookSymbol = enum
     lhsOpen, lhsOpen64, lhsOpenat, lhsOpenat64, lhsClose, lhsRead, lhsWrite,
     lhsStat, lhsLstat, lhsOpendir, lhsReaddir, lhsClosedir, lhsFork,
-    lhsExecve, lhsPosixSpawn, lhsPosixSpawnp, lhsFopen, lhsFopen64, lhsConnect
+    lhsExecve, lhsPosixSpawn, lhsPosixSpawnp, lhsFopen, lhsFopen64, lhsConnect,
+    lhsDlopen, lhsDlmopen
 
   OpenContext* = object
     path*: cstring
@@ -104,6 +105,19 @@ type
     result*: cint
     nextIndex: int
 
+  DlopenContext* = object
+    path*: cstring
+    flags*: cint
+    result*: pointer
+    nextIndex: int
+
+  DlmopenContext* = object
+    namespaceId*: clong
+    path*: cstring
+    flags*: cint
+    result*: pointer
+    nextIndex: int
+
   ForkContext* = object
     result*: PidT
     nextIndex: int
@@ -157,6 +171,8 @@ type
   FreadHook* = proc(ctx: var FreadContext) {.raises: [].}
   FcloseHook* = proc(ctx: var FcloseContext) {.raises: [].}
   ConnectHook* = proc(ctx: var ConnectContext) {.raises: [].}
+  DlopenHook* = proc(ctx: var DlopenContext) {.raises: [].}
+  DlmopenHook* = proc(ctx: var DlmopenContext) {.raises: [].}
   ForkHook* = proc(ctx: var ForkContext) {.raises: [].}
   ExecveHook* = proc(ctx: var ExecveContext) {.raises: [].}
   PosixSpawnHook* = proc(ctx: var PosixSpawnContext) {.raises: [].}
@@ -202,6 +218,12 @@ type
   ConnectHookEntry = object
     priority: int
     callback: ConnectHook
+  DlopenHookEntry = object
+    priority: int
+    callback: DlopenHook
+  DlmopenHookEntry = object
+    priority: int
+    callback: DlmopenHook
   ForkHookEntry = object
     priority: int
     callback: ForkHook
@@ -244,6 +266,8 @@ typedef void *(*ct_fopen_hook_fn)(char *, char *);
 typedef size_t (*ct_fread_hook_fn)(void *, size_t, size_t, void *);
 typedef int (*ct_fclose_hook_fn)(void *);
 typedef int (*ct_connect_hook_fn)(int, void *, unsigned int);
+typedef void *(*ct_dlopen_hook_fn)(char *, int);
+typedef void *(*ct_dlmopen_hook_fn)(long, char *, int);
 typedef pid_t (*ct_fork_hook_fn)(void);
 typedef int (*ct_execve_hook_fn)(char *, char **, char **);
 typedef int (*ct_posix_spawn_hook_fn)(pid_t *, char *, void *, void *,
@@ -263,6 +287,8 @@ typedef FILE *(*ct_fopen_real_fn)(const char *, const char *);
 typedef size_t (*ct_fread_real_fn)(void *, size_t, size_t, FILE *);
 typedef int (*ct_fclose_real_fn)(FILE *);
 typedef int (*ct_connect_real_fn)(int, const struct sockaddr *, socklen_t);
+typedef void *(*ct_dlopen_real_fn)(const char *, int);
+typedef void *(*ct_dlmopen_real_fn)(Lmid_t, const char *, int);
 typedef pid_t (*ct_fork_real_fn)(void);
 typedef int (*ct_execve_real_fn)(const char *, char *const [], char *const []);
 typedef int (*ct_posix_spawn_real_fn)(pid_t *, const char *,
@@ -289,6 +315,8 @@ static ct_fopen_hook_fn ct_fopen64_hook = NULL;
 static ct_fread_hook_fn ct_fread_hook = NULL;
 static ct_fclose_hook_fn ct_fclose_hook = NULL;
 static ct_connect_hook_fn ct_connect_hook = NULL;
+static ct_dlopen_hook_fn ct_dlopen_hook = NULL;
+static ct_dlmopen_hook_fn ct_dlmopen_hook = NULL;
 static ct_fork_hook_fn ct_fork_hook = NULL;
 static ct_execve_hook_fn ct_execve_hook = NULL;
 static ct_posix_spawn_hook_fn ct_posix_spawn_hook = NULL;
@@ -330,6 +358,8 @@ static ct_fopen_real_fn real_fopen64_ptr = NULL;
 static ct_fread_real_fn real_fread_ptr = NULL;
 static ct_fclose_real_fn real_fclose_ptr = NULL;
 static ct_connect_real_fn real_connect_ptr = NULL;
+static ct_dlopen_real_fn real_dlopen_ptr = NULL;
+static ct_dlmopen_real_fn real_dlmopen_ptr = NULL;
 static ct_fork_real_fn real_fork_ptr = NULL;
 static ct_execve_real_fn real_execve_ptr = NULL;
 static ct_posix_spawn_real_fn real_posix_spawn_ptr = NULL;
@@ -600,6 +630,8 @@ void ct_linux_preload_register_fopen64_hook(ct_fopen_hook_fn hook) { ct_fopen64_
 void ct_linux_preload_register_fread_hook(ct_fread_hook_fn hook) { ct_fread_hook = hook; }
 void ct_linux_preload_register_fclose_hook(ct_fclose_hook_fn hook) { ct_fclose_hook = hook; }
 void ct_linux_preload_register_connect_hook(ct_connect_hook_fn hook) { ct_connect_hook = hook; }
+void ct_linux_preload_register_dlopen_hook(ct_dlopen_hook_fn hook) { ct_dlopen_hook = hook; }
+void ct_linux_preload_register_dlmopen_hook(ct_dlmopen_hook_fn hook) { ct_dlmopen_hook = hook; }
 void ct_linux_preload_register_fork_hook(ct_fork_hook_fn hook) { ct_fork_hook = hook; }
 void ct_linux_preload_register_execve_hook(ct_execve_hook_fn hook) { ct_execve_hook = hook; }
 void ct_linux_preload_register_posix_spawn_hook(ct_posix_spawn_hook_fn hook) { ct_posix_spawn_hook = hook; }
@@ -744,6 +776,20 @@ int ct_linux_preload_real_fclose(void *stream) {
 int ct_linux_preload_real_connect(int fd, void *addr, unsigned int addrlen) {
   CT_REAL("connect", real_connect_ptr, ct_connect_real_fn);
   return real_connect_ptr(fd, (const struct sockaddr *)addr, (socklen_t)addrlen);
+}
+
+void *ct_linux_preload_real_dlopen(char *path, int flags) {
+  if (real_dlopen_ptr == NULL)
+    real_dlopen_ptr = (ct_dlopen_real_fn)ct_resolve("dlopen");
+  if (real_dlopen_ptr == NULL) { errno = ENOSYS; return NULL; }
+  return real_dlopen_ptr(path, flags);
+}
+
+void *ct_linux_preload_real_dlmopen(long namespace_id, char *path, int flags) {
+  if (real_dlmopen_ptr == NULL)
+    real_dlmopen_ptr = (ct_dlmopen_real_fn)ct_resolve("dlmopen");
+  if (real_dlmopen_ptr == NULL) { errno = ENOSYS; return NULL; }
+  return real_dlmopen_ptr((Lmid_t)namespace_id, path, flags);
 }
 
 pid_t ct_linux_preload_real_fork(void) {
@@ -927,6 +973,21 @@ int connect(int fd, const struct sockaddr *addr, socklen_t addrlen) {
   return CT_CALL_HOOK(ct_connect_hook(fd, (void *)addr, (unsigned int)addrlen));
 }
 
+void *dlopen(const char *path, int flags) __attribute__((visibility("default")));
+void *dlopen(const char *path, int flags) {
+  if (CT_BYPASS() || ct_dlopen_hook == NULL)
+    return ct_linux_preload_real_dlopen((char *)path, flags);
+  return CT_CALL_HOOK(ct_dlopen_hook((char *)path, flags));
+}
+
+void *dlmopen(Lmid_t namespace_id, const char *path, int flags)
+    __attribute__((visibility("default")));
+void *dlmopen(Lmid_t namespace_id, const char *path, int flags) {
+  if (CT_BYPASS() || ct_dlmopen_hook == NULL)
+    return ct_linux_preload_real_dlmopen((long)namespace_id, (char *)path, flags);
+  return CT_CALL_HOOK(ct_dlmopen_hook((long)namespace_id, (char *)path, flags));
+}
+
 pid_t fork(void) __attribute__((visibility("default")));
 pid_t fork(void) {
   if (CT_BYPASS() || ct_fork_hook == NULL)
@@ -1041,6 +1102,10 @@ proc realFclose*(stream: pointer): cint
   {.importc: "ct_linux_preload_real_fclose", raises: [].}
 proc realConnect*(fd: cint; address: pointer; addrLen: uint32): cint
   {.importc: "ct_linux_preload_real_connect", raises: [].}
+proc realDlopen*(path: cstring; flags: cint): pointer
+  {.importc: "ct_linux_preload_real_dlopen", raises: [].}
+proc realDlmopen*(namespaceId: clong; path: cstring; flags: cint): pointer
+  {.importc: "ct_linux_preload_real_dlmopen", raises: [].}
 proc realFork*(): PidT {.importc: "ct_linux_preload_real_fork", raises: [].}
 proc realExecve*(path: cstring; argv, envp: cstringArray): cint
   {.importc: "ct_linux_preload_real_execve", raises: [].}
@@ -1070,6 +1135,10 @@ type
     csize_t {.cdecl, raises: [].}
   FcloseDispatch = proc(stream: pointer): cint {.cdecl, raises: [].}
   ConnectDispatch = proc(fd: cint; address: pointer; addrLen: uint32): cint
+    {.cdecl, raises: [].}
+  DlopenDispatch = proc(path: cstring; flags: cint): pointer
+    {.cdecl, raises: [].}
+  DlmopenDispatch = proc(namespaceId: clong; path: cstring; flags: cint): pointer
     {.cdecl, raises: [].}
   ForkDispatch = proc(): PidT {.cdecl, raises: [].}
   ExecveDispatch = proc(path: cstring; argv, envp: cstringArray): cint
@@ -1143,6 +1212,10 @@ proc installFcloseDispatcher(dispatch: FcloseDispatch)
   {.importc: "ct_linux_preload_register_fclose_hook", raises: [].}
 proc installConnectDispatcher(dispatch: ConnectDispatch)
   {.importc: "ct_linux_preload_register_connect_hook", raises: [].}
+proc installDlopenDispatcher(dispatch: DlopenDispatch)
+  {.importc: "ct_linux_preload_register_dlopen_hook", raises: [].}
+proc installDlmopenDispatcher(dispatch: DlmopenDispatch)
+  {.importc: "ct_linux_preload_register_dlmopen_hook", raises: [].}
 proc installForkDispatcher(dispatch: ForkDispatch)
   {.importc: "ct_linux_preload_register_fork_hook", raises: [].}
 proc installExecveDispatcher(dispatch: ExecveDispatch)
@@ -1172,6 +1245,8 @@ var
   freadHooks: seq[FreadHookEntry] = @[]
   fcloseHooks: seq[FcloseHookEntry] = @[]
   connectHooks: seq[ConnectHookEntry] = @[]
+  dlopenHooks: seq[DlopenHookEntry] = @[]
+  dlmopenHooks: seq[DlmopenHookEntry] = @[]
   forkHooks: seq[ForkHookEntry] = @[]
   execveHooks: seq[ExecveHookEntry] = @[]
   posixSpawnHooks: seq[PosixSpawnHookEntry] = @[]
@@ -1292,6 +1367,18 @@ proc registerConnectHook*(hook: ConnectHook; priority = 100) {.raises: [].} =
     return
   connectHooks.add(ConnectHookEntry(priority: priority, callback: hook))
   connectHooks.sort(proc(a, b: ConnectHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerDlopenHook*(hook: DlopenHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  dlopenHooks.add(DlopenHookEntry(priority: priority, callback: hook))
+  dlopenHooks.sort(proc(a, b: DlopenHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerDlmopenHook*(hook: DlmopenHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  dlmopenHooks.add(DlmopenHookEntry(priority: priority, callback: hook))
+  dlmopenHooks.sort(proc(a, b: DlmopenHookEntry): int = cmp(a.priority, b.priority))
 
 proc registerForkHook*(hook: ForkHook; priority = 100) {.raises: [].} =
   if hook == nil:
@@ -1424,6 +1511,23 @@ proc shouldPatchInlineSyscallMapping(mapping: LinuxExecutableMapping;
     return false
   normalized.endsWith(".so") or normalized.contains(".so.")
 
+proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
+                               status: var InlineSyscallPatchStatus)
+    {.raises: [].} =
+  let statusPtr = addr status
+  visitLinuxExecutableMappingSyscalls(mapping, proc(site: LinuxSyscallSite): bool =
+    let tx = installInt3SyscallPatchTransaction(cast[pointer](site.address))
+    if tx.diagnostic == lrsOk and tx.patchLive:
+      if cInlineSyscallRecordSite(culong(site.address)) == 0:
+        inc statusPtr[].patchedSites
+    elif statusPtr[].firstPatchDiagnostic == lrsOk:
+      statusPtr[].firstPatchDiagnostic = tx.diagnostic
+      statusPtr[].firstPatchStage = tx.stage
+      statusPtr[].firstPatchErrno = tx.osErrno
+      statusPtr[].firstPatchAddress = site.address
+    true
+  )
+
 proc installInlineSyscallPatches*(): InlineSyscallPatchStatus {.raises: [].} =
   if inlineSyscallPatchAttempted:
     return inlineSyscallPatchStatus
@@ -1464,18 +1568,37 @@ proc installInlineSyscallPatches*(): InlineSyscallPatchStatus {.raises: [].} =
   for mapping in mappings.mappings:
     if not shouldPatchInlineSyscallMapping(mapping, executablePath):
       continue
-    visitLinuxExecutableMappingSyscalls(mapping, proc(site: LinuxSyscallSite): bool =
-      let tx = installInt3SyscallPatchTransaction(cast[pointer](site.address))
-      if tx.diagnostic == lrsOk and tx.patchLive:
-        if cInlineSyscallRecordSite(culong(site.address)) == 0:
-          inc status.patchedSites
-      elif status.firstPatchDiagnostic == lrsOk:
-        status.firstPatchDiagnostic = tx.diagnostic
-        status.firstPatchStage = tx.stage
-        status.firstPatchErrno = tx.osErrno
-        status.firstPatchAddress = site.address
-      true
-    )
+    patchInlineSyscallMapping(mapping, status)
+  status.patchedSites = int(cInlineSyscallSiteCount())
+  if cInlineSyscallOverflowed() != 0 and status.firstPatchDiagnostic == lrsOk:
+    status.firstPatchDiagnostic = lrsInvalidArgument
+  inlineSyscallPatchStatus = status
+  status
+
+proc scanInlineSyscallPatchesForNewMappings*(): InlineSyscallPatchStatus
+    {.raises: [].} =
+  ## Incremental post-loader scan. The startup installer owns handler setup and
+  ## event-buffer initialization; this pass must not reset either, because a
+  ## dlopen hook can run after earlier inline raw syscalls have already trapped.
+  if not inlineSyscallPatchAttempted:
+    return installInlineSyscallPatches()
+  var status = inlineSyscallPatchStatus
+  if not status.handlerInstalled or status.scanDiagnostic != lrsOk:
+    return status
+  let executablePath = currentExecutablePath()
+  let mappings =
+    try:
+      enumerateLinuxExecutableMappings()
+    except CatchableError:
+      (diagnostic: lrsInvalidArgument, mappings: newSeq[LinuxExecutableMapping]())
+  status.scanDiagnostic = mappings.diagnostic
+  if mappings.diagnostic != lrsOk:
+    inlineSyscallPatchStatus = status
+    return status
+  for mapping in mappings.mappings:
+    if not shouldPatchInlineSyscallMapping(mapping, executablePath):
+      continue
+    patchInlineSyscallMapping(mapping, status)
   status.patchedSites = int(cInlineSyscallSiteCount())
   if cInlineSyscallOverflowed() != 0 and status.firstPatchDiagnostic == lrsOk:
     status.firstPatchDiagnostic = lrsInvalidArgument
@@ -1551,6 +1674,12 @@ proc callReal*(ctx: var FcloseContext) {.raises: [].} =
 
 proc callReal*(ctx: var ConnectContext) {.raises: [].} =
   ctx.result = realConnect(ctx.fd, ctx.address, ctx.addrLen)
+
+proc callReal*(ctx: var DlopenContext) {.raises: [].} =
+  ctx.result = realDlopen(ctx.path, ctx.flags)
+
+proc callReal*(ctx: var DlmopenContext) {.raises: [].} =
+  ctx.result = realDlmopen(ctx.namespaceId, ctx.path, ctx.flags)
 
 proc callReal*(ctx: var ForkContext) {.raises: [].} =
   ctx.result = realFork()
@@ -1707,6 +1836,22 @@ proc callNext*(ctx: var ConnectContext) {.raises: [].} =
   else:
     callReal(ctx)
 
+proc callNext*(ctx: var DlopenContext) {.raises: [].} =
+  if ctx.nextIndex < dlopenHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    dlopenHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var DlmopenContext) {.raises: [].} =
+  if ctx.nextIndex < dlmopenHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    dlmopenHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
 proc callNext*(ctx: var ForkContext) {.raises: [].} =
   if ctx.nextIndex < forkHooks.len:
     let index = ctx.nextIndex
@@ -1837,6 +1982,18 @@ proc dispatchConnect(fd: cint; address: pointer; addrLen: uint32): cint
   callNext(ctx)
   result = ctx.result
 
+proc dispatchDlopen(path: cstring; flags: cint): pointer {.cdecl, raises: [].} =
+  var ctx = DlopenContext(path: path, flags: flags, result: nil)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchDlmopen(namespaceId: clong; path: cstring; flags: cint): pointer
+    {.cdecl, raises: [].} =
+  var ctx = DlmopenContext(namespaceId: namespaceId, path: path, flags: flags,
+                           result: nil)
+  callNext(ctx)
+  result = ctx.result
+
 proc dispatchFork(): PidT {.cdecl, raises: [].} =
   var ctx = ForkContext(result: -1)
   callNext(ctx)
@@ -1881,6 +2038,8 @@ installFopen64Dispatcher(dispatchFopen64)
 installFreadDispatcher(dispatchFread)
 installFcloseDispatcher(dispatchFclose)
 installConnectDispatcher(dispatchConnect)
+installDlopenDispatcher(dispatchDlopen)
+installDlmopenDispatcher(dispatchDlmopen)
 installForkDispatcher(dispatchFork)
 installExecveDispatcher(dispatchExecve)
 installPosixSpawnDispatcher(dispatchPosixSpawn)
