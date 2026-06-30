@@ -68,6 +68,7 @@ proc repro_macos_get_sandbox_tools_dir*(): cstring
 #include <mach/mach.h>
 #include <servers/bootstrap.h>
 #include <xpc/xpc.h>
+#include <bsm/audit.h>          /* ROUND-4 S0' — audit_token_t (peer identity) */
 
 extern char **environ;
 extern char *repro_macos_rewrite_sip_path(char *path);
@@ -1345,6 +1346,59 @@ void *repro_macos_resolve_libsystem_symbol(const char *symbol) {
   return repro_macos_lookup_image_symbol(symbol);
 }
 
+/*
+ * ROUND-4 IP1 — genuine-entry forwarders for the LOCAL-IPC-fd creation hooks
+ * (pipe / socket / socketpair / accept). The interpose hooks that wrap these
+ * record the created fd's (dev,ino) as an IN-TREE CREATE so the merge can PAIR
+ * an inherited `chan=opaque role=read` against it: an inherited pipe/socket from
+ * an OUT-OF-TREE parent has NO in-tree create ⇒ it downgrades, while an entirely
+ * in-tree pipe/socketpair pipeline (or an accept/connect a monitored process
+ * made itself) is paired and stays mcComplete (the cardinal-sin guard). See
+ * macos_interpose.nim recordLocalFdCreate / classifyEmptyFdRead and
+ * writer.externalContentLossCount.
+ *
+ * socket/socketpair/accept are thin syscall wrappers, so each forwards via the
+ * RAW syscall (reentrancy-free, never re-enters its own interpose wrapper) —
+ * exactly like the connect forwarder above.
+ */
+int repro_macos_real_socket_syscall(int domain, int type, int protocol) {
+  return (int)syscall(SYS_socket, domain, type, protocol);
+}
+int repro_macos_real_socketpair_syscall(int domain, int type, int protocol,
+                                        int sv[2]) {
+  return (int)syscall(SYS_socketpair, domain, type, protocol, sv);
+}
+int repro_macos_real_accept_syscall(int s, void *addr, unsigned int *addrlen) {
+  return (int)syscall(SYS_accept, s, addr, (socklen_t *)addrlen);
+}
+/*
+ * pipe is SPECIAL: on the Darwin arm64 ABI the `pipe` syscall returns the TWO
+ * fds in x0 and x1 (it does NOT fill the caller's array), and the libsystem
+ * `pipe(int[2])` wrapper marshals x0/x1 into the array. The variadic syscall()
+ * stub returns only x0, so a raw `syscall(SYS_pipe)` would LOSE the write-end fd
+ * and corrupt the caller (a transparency violation). We therefore forward
+ * through the GENUINE libsystem `pipe` entry resolved via the shim-skipping
+ * image walk (like bootstrap_look_up) — a by-name call would re-enter the shim's
+ * own `__interpose` binding of `pipe` and loop. The pointer is cached after the
+ * first resolve.
+ */
+typedef int (*repro_macos_pipe_fn)(int fds[2]);
+static repro_macos_pipe_fn repro_macos_real_pipe_ptr = 0;
+int repro_macos_real_pipe_call(int fds[2]) {
+  if (!repro_macos_real_pipe_ptr) {
+    repro_macos_real_pipe_ptr =
+      (repro_macos_pipe_fn)repro_macos_lookup_image_symbol("_pipe");
+  }
+  /* The image walk reliably resolves a libsystem export (same mechanism as
+   * _opendir/_posix_spawn); if it ever could not, we must NOT fabricate a
+   * broken pipe, so fall through to the raw syscall (degraded: see above) only
+   * as an absolute last resort rather than crash. */
+  if (repro_macos_real_pipe_ptr) {
+    return repro_macos_real_pipe_ptr(fds);
+  }
+  return (int)syscall(SYS_pipe);
+}
+
 static void repro_macos_resolve_spawn(void) {
   if (repro_macos_real_posix_spawn_ptr && repro_macos_real_posix_spawnp_ptr) return;
   repro_macos_real_posix_spawn_ptr =
@@ -1646,6 +1700,85 @@ void *repro_macos_real_xpc_create_mach_service_call(char *name,
   if (!repro_real_xpc_create_ptr) return NULL;
   return (void *)repro_real_xpc_create_ptr(name, (dispatch_queue_t)targetq,
                                            (uint64_t)flags);
+}
+
+/*
+ * ROUND-4 S0' — PLATFORM-BINARY (Apple/OS-signed) owner verification.
+ *
+ * The round-3 S0 fix exempted a `com.apple.*` lookup IFF its name is a whole
+ * token in the SIP-protected launchd plists. The round-4 S0' re-break shows that
+ * is still EXEMPT-BY-NAME: an attacker `bootstrap_register`s a genuine declared
+ * name (e.g. `com.apple.cfprefsd.daemon`, a real <MachServices> key) from an
+ * UNSIGNED binary, so the whole-token check exempts an ATTACKER-owned responder.
+ * The robust discriminator is the RESPONDER'S OWNER signature, not its name.
+ *
+ * EMPIRICAL macOS-26 finding (verified, see the S0' report): the owner is
+ * UNOBTAINABLE from a raw `bootstrap_look_up` send port (`pid_for_task` →
+ * KERN_FAILURE; `mach_port_kobject` is identical for a genuine vs an attacker
+ * port). For an XPC connection it is obtainable VIA THE AUDIT TOKEN — but the
+ * token is 0 until a message round-trips (the connection is lazy at create/resume
+ * time). So we VERIFY on the monitored program's OWN synchronous reply (we never
+ * inject a message), where `xpc_connection_get_audit_token` yields the peer pid →
+ * `csops(CS_OPS_STATUS)` → CS_PLATFORM_BINARY.
+ *
+ * `repro_macos_pid_is_platform_binary`: 1 = platform (Apple/OS), 0 = NON-platform
+ * (AUTHORITATIVE: csops succeeded and the flag is clear), -1 = UNKNOWN (invalid
+ * pid or csops failed). ONLY an authoritative 0 ever drives a downgrade — every
+ * uncertain result is the fail-safe (no downgrade), so a normal build is never
+ * falsely re-run by a transient csops failure.
+ */
+extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
+#define REPRO_CS_OPS_STATUS 0
+#define REPRO_CS_PLATFORM_BINARY 0x04000000U
+
+int repro_macos_pid_is_platform_binary(int pid) {
+  if (pid <= 0) return -1;
+  uint32_t status = 0;
+  if (csops((pid_t)pid, REPRO_CS_OPS_STATUS, &status, sizeof status) != 0)
+    return -1;
+  return (status & REPRO_CS_PLATFORM_BINARY) ? 1 : 0;
+}
+
+/*
+ * Platform status of an XPC connection's PEER (the responder). Returns 1
+ * platform, 0 non-platform (authoritative), -1 unknown. The pid comes from the
+ * peer audit token (val[5] == audit_token_to_pid); -1 when the token is not yet
+ * established (lazy connection before any reply) — so a caller that downgrades
+ * only on an AUTHORITATIVE 0 never downgrades a genuine, not-yet-spoken-to
+ * service. We never force a round-trip; the caller verifies AFTER the program's
+ * own reply.
+ */
+extern void xpc_connection_get_audit_token(xpc_connection_t, audit_token_t *);
+int repro_macos_xpc_peer_pid(void *conn) {
+  if (!conn) return 0;
+  audit_token_t tok;
+  for (int i = 0; i < 8; i++) ((unsigned int *)&tok)[i] = 0;
+  xpc_connection_get_audit_token((xpc_connection_t)conn, &tok);
+  return (int)((unsigned int *)&tok)[5];       /* audit_token_to_pid */
+}
+int repro_macos_xpc_peer_platform_status(void *conn) {
+  int pid = repro_macos_xpc_peer_pid(conn);
+  if (pid <= 0) return -1;
+  return repro_macos_pid_is_platform_binary(pid);
+}
+
+typedef xpc_object_t (*repro_xpc_reply_sync_fn)(xpc_connection_t, xpc_object_t);
+static repro_xpc_reply_sync_fn repro_real_xpc_reply_sync_ptr = NULL;
+
+/* Forward to the GENUINE libxpc `xpc_connection_send_message_with_reply_sync`
+ * (interpose-only; resolved via the shim-skipping image walk + dlsym fallback)
+ * so the recording hook never re-enters its own interpose binding. */
+void *repro_macos_real_xpc_reply_sync_call(void *conn, void *message) {
+  if (!repro_real_xpc_reply_sync_ptr)
+    repro_real_xpc_reply_sync_ptr = (repro_xpc_reply_sync_fn)
+      repro_macos_lookup_image_symbol(
+        "_xpc_connection_send_message_with_reply_sync");
+  if (!repro_real_xpc_reply_sync_ptr)
+    repro_real_xpc_reply_sync_ptr = (repro_xpc_reply_sync_fn)
+      dlsym(RTLD_NEXT, "xpc_connection_send_message_with_reply_sync");
+  if (!repro_real_xpc_reply_sync_ptr) return NULL;
+  return (void *)repro_real_xpc_reply_sync_ptr((xpc_connection_t)conn,
+                                               (xpc_object_t)message);
 }
 
 /*
@@ -2224,6 +2357,32 @@ proc ct_macos_real_connect*(fd: cint; address: pointer; addrLen: uint32): cint =
     {.importc: "repro_macos_real_connect_syscall", cdecl.}
   realConnect(fd, address, addrLen)
 
+proc ct_macos_real_socket*(domain, typ, protocol: cint): cint =
+  ## ROUND-4 IP1 — raw `SYS_socket` forwarder for the socket-create interpose hook.
+  proc real(domain, typ, protocol: cint): cint
+    {.importc: "repro_macos_real_socket_syscall", cdecl.}
+  real(domain, typ, protocol)
+
+proc ct_macos_real_socketpair*(domain, typ, protocol: cint; sv: ptr cint): cint =
+  ## ROUND-4 IP1 — raw `SYS_socketpair` forwarder (fills `sv[2]` via the pointer).
+  proc real(domain, typ, protocol: cint; sv: ptr cint): cint
+    {.importc: "repro_macos_real_socketpair_syscall", cdecl.}
+  real(domain, typ, protocol, sv)
+
+proc ct_macos_real_accept*(s: cint; address: pointer; addrLen: ptr uint32): cint =
+  ## ROUND-4 IP1 — raw `SYS_accept` forwarder for the accept interpose hook.
+  proc real(s: cint; address: pointer; addrLen: ptr uint32): cint
+    {.importc: "repro_macos_real_accept_syscall", cdecl.}
+  real(s, address, addrLen)
+
+proc ct_macos_real_pipe*(fds: ptr cint): cint =
+  ## ROUND-4 IP1 — forward to the GENUINE libsystem `pipe` (resolved via the
+  ## shim-skipping image walk; the Darwin arm64 `pipe` returns both fds in
+  ## registers, so a raw-syscall forward cannot be used — see the C forwarder).
+  proc real(fds: ptr cint): cint
+    {.importc: "repro_macos_real_pipe_call", cdecl.}
+  real(fds)
+
 proc ct_macos_real_bootstrap_look_up*(bp: uint32; serviceName: cstring;
     sp: ptr uint32): cint =
   ## ROUND-2 R-C — forward to the GENUINE libsystem `bootstrap_look_up` (resolved
@@ -2241,6 +2400,38 @@ proc ct_macos_real_xpc_create_mach_service*(name: cstring; targetq: pointer;
   proc realCreate(name: cstring; targetq: pointer; flags: uint64): pointer
     {.importc: "repro_macos_real_xpc_create_mach_service_call", cdecl.}
   realCreate(name, targetq, flags)
+
+proc ct_macos_pid_is_platform_binary*(pid: cint): cint =
+  ## ROUND-4 S0' — is `pid` a PLATFORM BINARY (Apple/OS-signed)? 1 = yes,
+  ## 0 = NO (authoritative), -1 = UNKNOWN (invalid pid / csops failed). Only an
+  ## authoritative 0 should drive a downgrade (see the C helper).
+  proc real(pid: cint): cint
+    {.importc: "repro_macos_pid_is_platform_binary", cdecl.}
+  real(pid)
+
+proc ct_macos_xpc_peer_platform_status*(conn: pointer): cint =
+  ## ROUND-4 S0' — platform-binary status of an XPC connection's PEER: 1 platform,
+  ## 0 non-platform (authoritative), -1 unknown (no peer yet — the connection is
+  ## lazy until the program's own message round-trips). Reads the peer audit token;
+  ## never injects a message.
+  proc real(conn: pointer): cint
+    {.importc: "repro_macos_xpc_peer_platform_status", cdecl.}
+  real(conn)
+
+proc ct_macos_xpc_peer_pid*(conn: pointer): cint =
+  ## ROUND-4 S0' — the peer (responder) pid of an XPC connection from its audit
+  ## token, or 0 when no peer is established yet. For diagnostics in the breakaway
+  ## record.
+  proc real(conn: pointer): cint
+    {.importc: "repro_macos_xpc_peer_pid", cdecl.}
+  real(conn)
+
+proc ct_macos_real_xpc_reply_sync*(conn, message: pointer): pointer =
+  ## ROUND-4 S0' — forward to the GENUINE libxpc
+  ## `xpc_connection_send_message_with_reply_sync` (interpose-only; shim-skipping).
+  proc real(conn, message: pointer): pointer
+    {.importc: "repro_macos_real_xpc_reply_sync_call", cdecl.}
+  real(conn, message)
 
 proc ct_macos_socket_describe*(fd: cint; address: pointer; addrLen: uint32;
     outDest: pointer; outDestLen: csize_t; outPeerPid: ptr cint): cint =

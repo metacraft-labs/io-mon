@@ -92,20 +92,45 @@ const
   MapShared = 0x0001.cint
   MapAnon = 0x1000.cint
 
-  # ROUND-3 S1b — SYSTEM POSIX shm objects the OS/libsystem maps on essentially
-  # every process (the notification center, cfprefsd, …). These are NOT build
-  # inputs — a build's output never depends on the notification-center contents —
-  # so recording them as out-of-tree content channels would DOWNGRADE EVERY
-  # cc/clang/tool run (the cardinal sin, observed: a trivial `cc -c` attaches
-  # `apple.shm.notification_center`). We exempt shm names under the Apple system
-  # namespaces from the downgrade, exactly as the round-2 R-D arm excludes the
-  # libsystem entropy baseline and the round-3 S0 arm excludes SIP-declared Apple
-  # services. The names are checked after stripping a leading '/'. RESIDUAL (the
-  # round-3 S0 lesson): a prefix exemption is in principle bypassable by an attacker
-  # naming their shm `apple.shm.evil`; that narrow residual (fail-safe: a missed
-  # dep, the structural endgame is the ES backend) is strictly preferable to a
-  # false downgrade of every real compile.
-  SystemShmPrefixes = ["apple.shm.", "com.apple."]
+  # ROUND-4 S1' — SYSTEM POSIX shm objects the OS/libsystem maps on essentially
+  # every process. These are NOT build inputs — a build's output never depends on
+  # the notification-center contents — so recording them as out-of-tree content
+  # channels would DOWNGRADE EVERY cc/clang/tool run (the cardinal sin).
+  #
+  # THE ROUND-4 S1' RE-BREAK (research/adversarial-2026-06-round4/r4_residual):
+  # round-3 exempted any shm whose name STARTS WITH `apple.shm.` / `com.apple.`.
+  # That is the SAME "exempt-by-name (prefix)" weakness that fell for the S0
+  # com.apple.* allowlist — an out-of-tree producer simply names its object
+  # `apple.shm.evil`, a monitored consumer mmaps+reads it, and the prefix carve-out
+  # exempts it → a false `mcComplete` with the secret input absent.
+  #
+  # THE FIX (apply the pair/verify lesson — EXACT, not prefix): we drop the prefix
+  # carve-out and exempt ONLY the EXACT, attacker-unforgeable WHOLE NAMES of the
+  # genuine system shm objects (the whole-name analog of S0's whole-token SIP
+  # check). The pairing in `externalContentLossCount` already keeps a self-produced
+  # shm (in-tree create+consume) `mcComplete`; the exact allowlist is needed ONLY
+  # for the system objects that have NO in-tree create (libsystem attaches them).
+  #
+  # ENUMERATION (empirical, macOS 26, 2026-06-30): the ONLY system shm name that
+  # reaches this INTERPOSE-ONLY hook (libsystem-INTERNAL shm attaches are
+  # shared-cache-internal and never cross an import stub; only a dylib like
+  # libnotify calling shm_open across a dylib boundary reaches here) across cc,
+  # c++, ld, node, nim, python3, make, git, bash, libdispatch and libnotify is
+  # `apple.shm.notification_center`. `com.apple.AppleDatabaseChanged` is the other
+  # documented system object (CFPreferences / cfprefsd change-notification);
+  # allowlisting it is purely conservative (it has no in-tree create either). A
+  # leading '/' is stripped before the match.
+  #
+  # RESIDUAL (documented, fail-safe direction differs from round-3): an attacker
+  # who could make a monitored build read BUILD CONTENT specifically through the
+  # genuine `apple.shm.notification_center` object would still bypass — but that is
+  # a far narrower, more contrived residual than the prefix carve-out (it must hit
+  # the EXACT real system name AND the consumer must read it as a build input), the
+  # whole-name analog of S0's "an attacker registers a real SIP-declared name"
+  # residual. The structural endgame remains the EndpointSecurity backend (T3c).
+  SystemShmExactNames = [
+    "apple.shm.notification_center",
+    "com.apple.AppleDatabaseChanged"]
   # ROUND-3 S1a — the macOS resource-fork access path. A read of
   # `<file>/..namedfork/rsrc` (FILE_FLAGS_OFFSET) opens the file's resource fork
   # (the com.apple.ResourceFork extended attribute) under a NON-CANONICAL path
@@ -176,6 +201,17 @@ var
   # Per-name decision memo (name → "is a genuine SIP-declared Apple service"),
   # bounded by MachServiceCacheCap.
   appleServiceDecision = initTable[string, bool]()
+  # ROUND-4 S0' — xpc_connection_t pointer → the SIP-declared `com.apple.*` service
+  # name it was created for and EXEMPTED at create time. Populated ONLY for an
+  # exempted com.apple.* XPC connection (a normal build creates none, so this stays
+  # empty and costs nothing). The S0' XPC reply hook consults it: when the
+  # monitored program's OWN synchronous reply reveals the peer is AUTHORITATIVELY
+  # non-platform (an attacker-owned `com.apple.*` responder), the create-time
+  # exemption was wrong, so the connection is recorded + downgrades. Guarded by
+  # `machServiceLock`; cleared wholesale at MachServiceCacheCap (a pointer may be
+  # reused after xpc release — a stale entry only risks re-recording an already
+  # paired-down breakaway, never a false skip). See repro_hook_xpc_*.
+  pendingAppleXpc = initTable[uint, string]()
   fragmentDir: string
   nextProcessSeq: uint64 = 0
   fdPaths = initTable[cint, string]()
@@ -584,6 +620,33 @@ proc recordExternalContent(chan, role, path: string; fd: cint) {.raises: [].} =
   record.detail = "chan=" & chan & " role=" & role
   emitRecord(record)
 
+proc localFdKey(dev, ino: uint64): string {.raises: [].} =
+  ## ROUND-4 IP1 — the cross-process pairing key for a LOCAL IPC fd (anonymous
+  ## pipe / socketpair / socket / accepted connection). Keyed on the kernel
+  ## (dev,ino) identity of the fd's underlying file object: an inherited read of
+  ## the SAME object — even in a different in-tree process — fstats the same
+  ## (dev,ino), so an in-tree CREATE and a later opaque READ pair regardless of
+  ## which process did each. Mirrors the `shm:`/`fifo:` channel-identity keys.
+  "localfd:" & $dev & ":" & $ino
+
+proc recordLocalFdCreate(fd: cint) {.raises: [].} =
+  ## ROUND-4 IP1 — record that a monitored (in-tree) process CREATED a local IPC
+  ## fd (via pipe/socketpair/socket/accept), stamping its (dev,ino) identity so
+  ## the merge can PAIR a later inherited `chan=opaque role=read` against it. This
+  ## is the cardinal-sin guard for IP1: an in-tree pipe/socketpair pipeline (or a
+  ## socket/accept a monitored process made itself) is paired and NEVER downgrades;
+  ## only an opaque read whose object has NO in-tree create — an fd inherited from
+  ## an OUT-OF-TREE parent — downgrades. The fstat is a raw syscall
+  ## (reentrancy-free); a failure is swallowed (at worst a missed pairing ⇒ a
+  ## conservative re-run, never a false skip).
+  if fd < 0:
+    return
+  var dev, ino: uint64
+  var kind: FdKind
+  if not ct_macos_fd_dev_ino_kind(fd, addr dev, addr ino, addr kind):
+    return
+  recordExternalContent("localfd", "create", localFdKey(dev, ino), fd)
+
 proc recordFifoChannel(fd: cint; path: cstring; flags: cint) {.raises: [].} =
   ## ROUND-3 S1d — a hooked open whose target is a FIFO. A FIFO read open consumes
   ## content from a WRITER: if the writer is an out-of-tree process the real input
@@ -953,6 +1016,35 @@ proc machServiceRecordable(serviceName: cstring): bool {.raises: [].} =
     return true
   not isDeclaredAppleService(n)
 
+proc emitMachBreakaway(serviceName: cstring; callResult: cint;
+    peerDetail: string) {.raises: [].} =
+  ## Emit the `mrIpcConnect` mach-service breakaway record (the shared body of
+  ## recordMachLookup, also reused by the ROUND-4 S0' XPC peer-verification path).
+  ## The CALLER owns the exemption decision (machServiceRecordable for the lookup
+  ## path; an authoritative non-platform peer for the S0' path), so this function
+  ## ALWAYS emits. `peerDetail` documents what is known about the peer
+  ## (`peer=unknown` for a launchd-brokered send port; `peer=non-platform pid=N`
+  ## for a verified forged `com.apple.*` XPC responder).
+  if serviceName == nil or serviceName[0] == '\0':
+    return
+  var record = baseRecord(mrIpcConnect, moIpcConnect)
+  record.result = callResult.int64
+  record.flags = 0                              # no socket family (Mach lookup)
+  record.childOsPid = 0                         # launchd-brokered peer ⇒ unknown
+  record.path = $serviceName                    # the mach service name
+  # ROUND-2 R8 — stamp the run id (report scoping) and an unguessable
+  # per-connection nonce, mirroring recordIpcConnect, so a future cooperating
+  # daemon could authenticate a breakaway report for this lookup.
+  var d = "connect mach-service " & peerDetail & " service=" & $serviceName
+  d.add runIdToken()
+  # ROUND-2 R-D — mute the shim's own nonce randomness (see recordIpcConnect).
+  inc disabled
+  let nonce = ct_macos_random_u64()
+  dec disabled
+  d.add " nonce=" & $nonce
+  record.detail = d
+  emitRecord(record)
+
 proc recordMachLookup(serviceName: cstring; callResult: cint) {.raises: [].} =
   ## ROUND-2 R-C — record a successful `bootstrap_look_up` / XPC mach-service
   ## connection-establishment to an OUT-OF-TREE service as an `mrIpcConnect`
@@ -983,24 +1075,7 @@ proc recordMachLookup(serviceName: cstring; callResult: cint) {.raises: [].} =
     return
   if not machServiceRecordable(serviceName):
     return
-  var record = baseRecord(mrIpcConnect, moIpcConnect)
-  record.result = callResult.int64
-  record.flags = 0                              # no socket family (Mach lookup)
-  record.childOsPid = 0                         # launchd-brokered peer ⇒ unknown
-  record.path = $serviceName                    # the mach service name
-  # ROUND-2 R8 — stamp the run id (report scoping) and an unguessable
-  # per-connection nonce, mirroring recordIpcConnect, so a future cooperating
-  # daemon could authenticate a breakaway report for this lookup. `peer=unknown`
-  # documents that the Mach peer pid is not obtainable from the send port.
-  var d = "connect mach-service peer=unknown service=" & $serviceName
-  d.add runIdToken()
-  # ROUND-2 R-D — mute the shim's own nonce randomness (see recordIpcConnect).
-  inc disabled
-  let nonce = ct_macos_random_u64()
-  dec disabled
-  d.add " nonce=" & $nonce
-  record.detail = d
-  emitRecord(record)
+  emitMachBreakaway(serviceName, callResult, "peer=unknown")
 
 proc recordLibraryLoad(path: cstring) {.raises: [].} =
   ## Record a dyld-mapped DEPENDENT DYLIB (or a dlopen'd image) as a CONTENT
@@ -1414,13 +1489,16 @@ const
 #     downgrades (see writer.externalContentLossCount).
 
 proc isSystemShmName(name: string): bool {.raises: [].} =
-  ## ROUND-3 S1b — true for a SYSTEM shm object the OS/libsystem maps on every
-  ## process (apple.shm.* / com.apple.*). Exempted from the out-of-tree downgrade
-  ## so a normal build is never falsely flagged (the cardinal-sin guard). A leading
-  ## '/' is stripped first (shm names are conventionally `/name`).
+  ## ROUND-4 S1' — true for a GENUINE SYSTEM shm object the OS/libsystem maps on
+  ## every process. Exempted from the out-of-tree downgrade so a normal build is
+  ## never falsely flagged (the cardinal-sin guard). Matches the EXACT whole name
+  ## against `SystemShmExactNames` — NOT a prefix — closing the round-4 S1' re-break
+  ## where an `apple.shm.evil` out-of-tree object slipped through the old prefix
+  ## carve-out (the same exempt-by-name weakness as S0). A leading '/' is stripped
+  ## first (shm names are conventionally `/name`).
   let n = if name.len > 0 and name[0] == '/': name[1 .. ^1] else: name
-  for prefix in SystemShmPrefixes:
-    if n.startsWith(prefix):
+  for sys in SystemShmExactNames:
+    if n == sys:
       return true
   false
 
@@ -1525,11 +1603,21 @@ proc classifyEmptyFdRead(fd: cint) {.raises: [].} =
     # Unresolvable regular/device fd: flag once (do not re-stat every read).
     markEmptyFdClassified(fd)
   of fkSocket, fkFifo, fkOther:
-    # Genuine out-of-tree content channel (an inherited socket or pipe whose peer
-    # is outside the monitored tree). A named FIFO opened in-tree goes through the
-    # open hook (recordFifoChannel) with its path, so reaching here means the fd
-    # was INHERITED with no in-tree open — out-of-tree. Emit once.
-    recordExternalContent("opaque", "read", "", fd)
+    # An inherited/dup'd socket or pipe whose source is not a named file. A named
+    # FIFO opened in-tree goes through the open hook (recordFifoChannel) with its
+    # path, so reaching here means the fd was INHERITED with no in-tree open.
+    #
+    # ROUND-4 IP1 — stamp the fd's (dev,ino) identity so the merge can PAIR this
+    # opaque read against an in-tree pipe/socketpair/socket/accept CREATE: an
+    # entirely in-tree pipeline (the clang driver↔cc1 pipes, an in-tree socket
+    # IPC, a `pipe()+fork` pipeline) is paired and stays mcComplete, while an
+    # opaque read whose object has NO in-tree create — an fd inherited from an
+    # OUT-OF-TREE parent (the r4_residual pipe_launcher feeder) — DOWNGRADES.
+    # This closes the round-4 IP1 re-break (an inherited pipe from an out-of-tree
+    # writer was recorded `chan=opaque` but, before the pairing, never paired so
+    # never downgraded). `dev`/`ino` are valid here (the fstat above succeeded).
+    # See writer.externalContentLossCount and recordLocalFdCreate.
+    recordExternalContent("opaque", "read", localFdKey(dev, ino), fd)
     markEmptyFdClassified(fd)
   of fkDirectory:
     markEmptyFdClassified(fd)
@@ -2643,6 +2731,92 @@ proc repro_hook_connect*(fd: cint; address: pointer; addrLen: uint32): cint
     recordIpcConnect(fd, address, addrLen, result)
   setErrno(savedErrno)
 
+# --- ROUND-4 IP1 — local-IPC-fd CREATE hooks (pipe/socket/socketpair/accept) ---
+#
+# Close the round-4 IP1 re-break (research/adversarial-2026-06-round4/r4_residual/
+# pipe_launcher.c + pipe_client.c): an out-of-tree launcher creates a pipe, writes
+# a build-relevant marker, clears CLOEXEC on the read end, and execs a MONITORED
+# client which reads the inherited fd and bakes it into its output. The read was
+# recorded `chan=opaque role=read` but — because an inherited pipe has NO connect()
+# (the IPC-connect machinery is blind) and NO in-tree create — nothing ever paired
+# it, so it never downgraded ⇒ a false `mcComplete` with the secret input absent.
+#
+# THE FIX (apply the pair-not-name lesson): these hooks record EVERY in-tree
+# creation of a local IPC fd, stamping the fd's (dev,ino) identity so the merge can
+# PAIR a later inherited opaque read against it. An opaque read whose object has an
+# in-tree create (the clang driver↔cc1 pipes, an in-tree `pipe()+fork` pipeline, an
+# in-tree socket IPC / accept) is paired and stays mcComplete — the CARDINAL-SIN
+# guard; an opaque read whose object has NO in-tree create (the out-of-tree
+# pipe_launcher's pipe) DOWNGRADES. The cardinal-sin guard rides entirely on the
+# pairing, exactly like shm (create vs attach) and FIFO (write vs read).
+#
+# All INTERPOSE-ONLY (like connect/shm_open): build tools call pipe/socket/
+# socketpair/accept DIRECTLY, so the interpose tuple captures the program's own
+# calls; a libsystem-INTERNAL pipe/socketpair (dispatch/xpc plumbing) is
+# shared-cache-internal and never reaches here — and even if one did, it would only
+# ADD an in-tree create (which can never CAUSE a downgrade — it only suppresses
+# one), so it is fail-safe. Each forwards via the genuine entry (raw syscall for the
+# thin wrappers; the shim-skipping image walk for `pipe`, whose Darwin arm64 ABI
+# returns both fds in registers) so it never re-enters its own interpose binding.
+
+proc repro_hook_pipe*(fds: ptr cint): cint {.exportc, cdecl, dynlib.} =
+  ## ROUND-4 IP1 — pipe(2). On success records BOTH fds as in-tree local-fd
+  ## creates (the two ends have DISTINCT inodes on macOS, and the inherited READ
+  ## end is what a downstream consumer fstats, so both must be paired).
+  if not initialized or disabled > 0:
+    return ct_macos_real_pipe(fds)
+  result = ct_macos_real_pipe(fds)
+  let savedErrno = getErrno()
+  if result == 0 and fds != nil:
+    let arr = cast[ptr UncheckedArray[cint]](fds)
+    recordLocalFdCreate(arr[0])
+    recordLocalFdCreate(arr[1])
+  setErrno(savedErrno)
+
+proc repro_hook_socketpair*(domain, typ, protocol: cint; sv: ptr cint): cint
+    {.exportc, cdecl, dynlib.} =
+  ## ROUND-4 IP1 — socketpair(2). Records BOTH ends as in-tree local-fd creates
+  ## (distinct inodes), so an inherited end read in-tree pairs and does not
+  ## downgrade while an out-of-tree socketpair inherited by a monitored child does.
+  if not initialized or disabled > 0:
+    return ct_macos_real_socketpair(domain, typ, protocol, sv)
+  result = ct_macos_real_socketpair(domain, typ, protocol, sv)
+  let savedErrno = getErrno()
+  if result == 0 and sv != nil:
+    let arr = cast[ptr UncheckedArray[cint]](sv)
+    recordLocalFdCreate(arr[0])
+    recordLocalFdCreate(arr[1])
+  setErrno(savedErrno)
+
+proc repro_hook_socket*(domain, typ, protocol: cint): cint
+    {.exportc, cdecl, dynlib.} =
+  ## ROUND-4 IP1 — socket(2). Records the new socket fd as an in-tree create so a
+  ## later read on a socket a monitored process created itself (a connect-client
+  ## reading its peer's reply, etc.) is paired — the IPC-connect machinery still
+  ## owns the out-of-tree-PEER downgrade decision; this only suppresses a SPURIOUS
+  ## IP1 opaque-read downgrade of an in-tree-created socket.
+  if not initialized or disabled > 0:
+    return ct_macos_real_socket(domain, typ, protocol)
+  result = ct_macos_real_socket(domain, typ, protocol)
+  let savedErrno = getErrno()
+  if result >= 0:
+    recordLocalFdCreate(result)
+  setErrno(savedErrno)
+
+proc repro_hook_accept*(s: cint; address: pointer; addrLen: ptr uint32): cint
+    {.exportc, cdecl, dynlib.} =
+  ## ROUND-4 IP1 — accept(2). The accepted connection is a NEW fd (distinct inode)
+  ## a monitored SERVER created itself; recording it keeps an in-tree server's
+  ## read of an accepted connection mcComplete (the cardinal-sin guard for the
+  ## intra-tree IPC pair probe, whose parent accept()s then read()s).
+  if not initialized or disabled > 0:
+    return ct_macos_real_accept(s, address, addrLen)
+  result = ct_macos_real_accept(s, address, addrLen)
+  let savedErrno = getErrno()
+  if result >= 0:
+    recordLocalFdCreate(result)
+  setErrno(savedErrno)
+
 # --- XPC / Mach-port breakaway hooks (R-C, round-2 break R2) --------------
 # XPC and raw Mach RPC bottom out in mach_msg to launchd's bootstrap port and
 # NEVER call connect(2), so the connect hook above is blind to a monitored
@@ -2679,6 +2853,27 @@ const
   # (recording it could falsely downgrade a monitored tool that hosts a service).
   XpcMachServiceListener = 1'u64
 
+proc trackPendingAppleXpc(conn: pointer; name: string) {.raises: [].} =
+  ## ROUND-4 S0' — remember that the exempted SIP-declared `com.apple.*` XPC
+  ## connection `conn` is for `name`, so the reply hook can later verify its peer's
+  ## signature. Bounded by MachServiceCacheCap (cleared wholesale when exceeded).
+  if conn == nil:
+    return
+  acquire(machServiceLock)
+  if pendingAppleXpc.len >= MachServiceCacheCap:
+    pendingAppleXpc.clear()
+  pendingAppleXpc[cast[uint](conn)] = name
+  release(machServiceLock)
+
+proc pendingAppleXpcName(conn: pointer): string {.raises: [].} =
+  ## ROUND-4 S0' — the exempted `com.apple.*` service name `conn` was created for,
+  ## or "" if `conn` is not a tracked exempted Apple XPC connection.
+  if conn == nil:
+    return ""
+  acquire(machServiceLock)
+  result = pendingAppleXpc.getOrDefault(cast[uint](conn), "")
+  release(machServiceLock)
+
 proc repro_hook_xpc_connection_create_mach_service*(name: cstring;
     targetq: pointer; flags: uint64): pointer {.exportc, cdecl, dynlib.} =
   ## xpc_connection_create_mach_service hook (R-C): the XPC CLIENT entry. XPC sits
@@ -2689,11 +2884,61 @@ proc repro_hook_xpc_connection_create_mach_service*(name: cstring;
   ## lazy; recording at create is conservative — write-intent style — and cannot
   ## miss a later send). A successful create returns a non-nil xpc_connection_t.
   ## A LISTENER connection (the server role) is skipped (see XpcMachServiceListener).
+  ##
+  ## ROUND-4 S0' — a SIP-declared `com.apple.*` connection is still EXEMPTED here
+  ## (machServiceRecordable returns false ⇒ recordMachLookup emits nothing), BUT it
+  ## is now TRACKED so the reply hook can VERIFY the peer's signature once the
+  ## monitored program's own traffic establishes it: the create-time exemption
+  ## trusts the NAME, and S0' showed an attacker can register a genuine declared
+  ## name, so the name-trust is provisional pending an owner check.
   if not initialized or disabled > 0:
     return ct_macos_real_xpc_create_mach_service(name, targetq, flags)
   result = ct_macos_real_xpc_create_mach_service(name, targetq, flags)
   if result != nil and (flags and XpcMachServiceListener) == 0:
     recordMachLookup(name, 0)
+    # Track the EXEMPTED SIP-declared com.apple.* connections for S0' peer
+    # verification (recordMachLookup recorded the non-exempt ones already).
+    if name != nil and ($name).startsWith(AppleServicePrefix) and
+        not machServiceRecordable(name):
+      trackPendingAppleXpc(result, $name)
+
+proc repro_hook_xpc_connection_send_message_with_reply_sync*(conn: pointer;
+    message: pointer): pointer {.exportc, cdecl, dynlib.} =
+  ## ROUND-4 S0' — XPC synchronous request/reply hook. This is the point where the
+  ## monitored program's OWN message round-trip establishes the connection's peer,
+  ## so `xpc_connection_get_audit_token` finally yields the responder's pid (it is 0
+  ## at create/resume — the connection is lazy). We NEVER inject a message: we
+  ## piggyback the program's own reply.
+  ##
+  ## If `conn` is a SIP-declared `com.apple.*` connection that was EXEMPTED at
+  ## create time, and the peer is now AUTHORITATIVELY NON-platform (csops succeeded
+  ## and CS_PLATFORM_BINARY is clear — an attacker-owned process serving a forged
+  ## `com.apple.*` name, the S0' break), the name-based exemption was WRONG: we
+  ## record the breakaway so it downgrades. A platform peer (genuine Apple service)
+  ## or any UNCERTAIN result (-1: no peer yet / csops failed) is the fail-safe — NO
+  ## downgrade — so a normal build talking to a real com.apple.* service is never
+  ## falsely re-run. Recorded once per connection (the entry is consumed).
+  if not initialized or disabled > 0:
+    return ct_macos_real_xpc_reply_sync(conn, message)
+  result = ct_macos_real_xpc_reply_sync(conn, message)
+  let name = pendingAppleXpcName(conn)
+  if name.len == 0:
+    return
+  let status = ct_macos_xpc_peer_platform_status(conn)
+  if status == 0:
+    # AUTHORITATIVE non-platform peer for a com.apple.* name → forged service.
+    var pid = 0
+    let audit = ct_macos_xpc_peer_pid(conn)
+    if audit > 0: pid = audit
+    emitMachBreakaway(cstring(name), 0,
+      "peer=non-platform pid=" & $pid & " forged-apple-xpc")
+  if status != -1:
+    # Verified (platform OR authoritative non-platform): drop the pending entry so
+    # the breakaway is recorded at most once. An UNKNOWN (-1) keeps it pending in
+    # case a later reply establishes the peer.
+    acquire(machServiceLock)
+    pendingAppleXpc.del(cast[uint](conn))
+    release(machServiceLock)
 
 # --- ROUND-2 R-D (break R10) non-file determinism hooks -------------------
 #
@@ -3537,6 +3782,11 @@ extern kern_return_t repro_macos_real_bootstrap_look_up_call(mach_port_t bp,
     char *name, mach_port_t *sp);
 extern void *repro_macos_real_xpc_create_mach_service_call(char *name,
     void *targetq, unsigned long long flags);
+/* ROUND-4 S0' — genuine xpc reply-sync forwarder (interpose-only; image walk). */
+extern void *repro_macos_real_xpc_reply_sync_call(void *conn, void *message);
+/* ROUND-4 IP1: genuine `pipe` forwarder (image-walk; defined in the
+ * macos_interpose_runtime TU). The not-ready pipe thunk forwards through it. */
+extern int repro_macos_real_pipe_call(int fds[2]);
 /* ROUND-2 R-D: genuine-entry forwarders for the non-file-determinism hooks
  * (defined in the macos_interpose_runtime TU). The not-ready interpose thunks
  * forward through these before the recording runtime is live; the ready thunks
@@ -4362,6 +4612,41 @@ static int repro_wrap_connect(int fd, const struct sockaddr *addr,
 }
 
 /*
+ * ROUND-4 IP1 local-IPC-fd CREATE interpose thunks (pipe/socket/socketpair/
+ * accept). Mirror the connect thunk: forward to the kernel before the recording
+ * runtime is live, then branch to the recording repro_hook_* (which forwards via
+ * the genuine entry — raw syscall, or the image walk for pipe — so it never
+ * re-enters its own wrapper). Recording an in-tree create can only SUPPRESS an
+ * IP1 downgrade, never cause one, so these are purely the cardinal-sin guard for
+ * the opaque-read pairing.
+ */
+static int repro_wrap_pipe(int fds[2]) {
+  if (!repro_monitor_runtime_ready) {
+    return repro_macos_real_pipe_call(fds);
+  }
+  return repro_hook_pipe(fds);
+}
+static int repro_wrap_socketpair(int domain, int type, int protocol,
+                                 int sv[2]) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_socketpair, domain, type, protocol, sv);
+  }
+  return repro_hook_socketpair(domain, type, protocol, sv);
+}
+static int repro_wrap_socket(int domain, int type, int protocol) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_socket, domain, type, protocol);
+  }
+  return repro_hook_socket(domain, type, protocol);
+}
+static int repro_wrap_accept(int s, struct sockaddr *addr, socklen_t *addrlen) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_accept, s, addr, addrlen);
+  }
+  return repro_hook_accept(s, (void *)addr, (unsigned int *)addrlen);
+}
+
+/*
  * R-C XPC / Mach-port breakaway interpose thunks (round-2 break R2). Mirror the
  * T3a connect thunk: forward to the GENUINE libsystem entry before the recording
  * runtime is live, then branch to the recording repro_hook_*. These are
@@ -4387,6 +4672,22 @@ static xpc_connection_t repro_wrap_xpc_connection_create_mach_service(
   }
   return (xpc_connection_t)repro_hook_xpc_connection_create_mach_service(
     (char *)name, (void *)targetq, (unsigned long long)flags);
+}
+
+/*
+ * ROUND-4 S0' XPC synchronous-reply interpose thunk. Interpose-only (like the
+ * create entry). Forwards via the shim-skipping genuine entry before the runtime
+ * is live, then branches to the recording hook (which verifies the peer's
+ * signature on the program's OWN reply and downgrades a forged com.apple.* peer).
+ */
+static xpc_object_t repro_wrap_xpc_connection_send_message_with_reply_sync(
+    xpc_connection_t conn, xpc_object_t message) {
+  if (!repro_monitor_runtime_ready) {
+    return (xpc_object_t)repro_macos_real_xpc_reply_sync_call(
+      (void *)conn, (void *)message);
+  }
+  return (xpc_object_t)repro_hook_xpc_connection_send_message_with_reply_sync(
+    (void *)conn, (void *)message);
 }
 
 /*
@@ -4769,6 +5070,15 @@ static struct {
   { (const void *)repro_wrap_getattrlistbulk, (const void *)getattrlistbulk },
   /* T3a IPC-breakaway hook (findings doc break #1). */
   { (const void *)repro_wrap_connect, (const void *)connect },
+  /* ROUND-4 IP1 local-IPC-fd CREATE hooks (pipe/socket/socketpair/accept). Record
+   * an in-tree create of a local IPC fd's (dev,ino) so the merge PAIRS an
+   * inherited `chan=opaque role=read` against it — an inherited pipe/socket from
+   * an OUT-OF-TREE parent (no in-tree create) downgrades, an in-tree pipeline
+   * stays mcComplete. Interpose-only (see the thunks). */
+  { (const void *)repro_wrap_pipe, (const void *)pipe },
+  { (const void *)repro_wrap_socketpair, (const void *)socketpair },
+  { (const void *)repro_wrap_socket, (const void *)socket },
+  { (const void *)repro_wrap_accept, (const void *)accept },
   /* R-C XPC / Mach-port breakaway hooks (round-2 break R2). bootstrap_look_up
    * (raw-Mach clients) + xpc_connection_create_mach_service (the XPC client
    * entry) — the connection-establishment boundary the connect(2) hook is blind
@@ -4777,6 +5087,11 @@ static struct {
     (const void *)bootstrap_look_up },
   { (const void *)repro_wrap_xpc_connection_create_mach_service,
     (const void *)xpc_connection_create_mach_service },
+  /* ROUND-4 S0' — XPC synchronous request/reply: verify the peer's signature on
+   * the monitored program's OWN reply (audit token → pid → csops platform check)
+   * and downgrade a forged com.apple.* peer. Interpose-only (see the thunk). */
+  { (const void *)repro_wrap_xpc_connection_send_message_with_reply_sync,
+    (const void *)xpc_connection_send_message_with_reply_sync },
   /* ROUND-2 R-D (break R10) non-file determinism hooks. Interpose-only (NOT
    * body-patched) so only the program's OWN direct calls are seen — the basis of
    * the cardinal-sin guard for the randomness arm. Env/sysctl/uname are observed
