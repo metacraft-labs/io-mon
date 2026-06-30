@@ -97,7 +97,11 @@ to start as an honest stub today.
   inheriting stale ownership. Linux libc-visible positioned/vector and
   zero-copy content movers (`pread`, `readv`, `preadv`, `sendfile`,
   `copy_file_range`, and `splice`) now record the source as a file read and
-  the destination as a file write when bytes move. Linux libc-visible
+  the destination as a file write when bytes move. Direct raw `syscall(2)`
+  variants of `sendfile`, `copy_file_range`, and `splice` are also classified
+  when the relevant file side is known from io-mon's fd table; unsafe or
+  unknown-fd cases remain fail-closed rather than being reported complete.
+  Linux libc-visible
   `link`/`linkat` records hardlink source identity and alias output evidence,
   and `rename`/`renameat`/`renameat2` records the final output path for
   rename-staged writes. Linux libc-visible `getenv`, `uname`, and `sysconf`
@@ -106,12 +110,11 @@ to start as an honest stub today.
   emit non-determinism evidence and downgrade through the existing
   `mcIncomplete` path. Known residuals: startup DSOs
   under excluded system/runtime prefixes and executable mappings not owned by
-  the preload `mmap` lifecycle are not scanned yet; direct raw zero-copy
-  syscalls (`sendfile`, `splice`, raw `copy_file_range`), direct raw
-  path-mutation syscalls, pre-existing hardlink aliases, direct raw/vDSO
-  clock/time paths, and broader Linux non-file APIs outside the current
-  libc-visible subset still need dedicated hooks or stackable-backed
-  scanner/classifier integration. The default Linux profile is therefore an
+  the preload `mmap` lifecycle are not scanned yet; direct raw path-mutation
+  syscalls, pre-existing hardlink aliases, direct raw/vDSO clock/time paths,
+  inherited/unknown-fd zero-copy cases, and broader Linux non-file APIs outside
+  the current libc-visible subset still need dedicated hooks or
+  stackable-backed scanner/classifier integration. The default Linux profile is therefore an
   `LD_PRELOAD` completeness profile, not a native/adversarial production
   profile: consumers that require those residual threat models must request the
   explicit capabilities (`adversarial-raw-syscall`,
