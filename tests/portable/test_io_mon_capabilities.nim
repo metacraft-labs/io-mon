@@ -15,9 +15,7 @@ suite "io-mon capability profiles":
       mcapExternalContent,
       mcapLibraryLoad,
       mcapPathMutation,
-      mcapPathIdentity,
-      mcapObservedEnv,
-      mcapNonDeterminism
+      mcapPathIdentity
     }
 
     let profile = linuxPreloadMonitorProfile(required)
@@ -62,5 +60,16 @@ suite "io-mon capability profiles":
     check mcapFileRead in profile.supportedCapabilities
     check mcapPathProbe in profile.supportedCapabilities
     check mcapIpcConnect in profile.supportedCapabilities
+    check mcapObservedEnv in profile.supportedCapabilities
+    check mcapNonDeterminism in profile.supportedCapabilities
     check mcapAdversarialRawSyscall notin profile.supportedCapabilities
     check mcapExecutableMappingLifecycle notin profile.supportedCapabilities
+
+  test "Linux profile advertises M-FW-6C libc-visible non-file subset":
+    let profile = linuxPreloadMonitorProfile({mcapObservedEnv, mcapNonDeterminism})
+
+    check profile.evidenceComplete
+    check mcapObservedEnv in profile.supportedCapabilities
+    check mcapNonDeterminism in profile.supportedCapabilities
+    check not profile.gaps.anyIt(it.capability == mcapObservedEnv and it.required)
+    check not profile.gaps.anyIt(it.capability == mcapNonDeterminism and it.required)

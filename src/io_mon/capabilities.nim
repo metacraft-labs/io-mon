@@ -106,7 +106,14 @@ const
     mcapFileTruncate,
     mcapFileAppend,
     mcapRename,
-    mcapIpcConnect
+    mcapIpcConnect,
+    # M-FW-6C — Linux libc-visible getenv/uname/sysconf are recorded as
+    # observed inputs; clock_gettime/gettimeofday/time are record-only time
+    # reads; getrandom is non-determinism and downgrades through the portable
+    # mrNonDeterministic merge path. Direct raw/vDSO variants remain outside
+    # this positive capability.
+    mcapObservedEnv,
+    mcapNonDeterminism
   }
 
   LinuxPreloadKnownUnsupportedCapabilities* = {
@@ -119,10 +126,6 @@ const
     mcapAdversarialRawSyscall,
     mcapExecutableMappingLifecycle,
     mcapPathIdentity,
-    # ROUND-2 R-D — the Linux preload shim does not yet hook getenv/sysctl/uname or
-    # the entropy/time sources; non-file determinism handling is macOS-only so far.
-    mcapObservedEnv,
-    mcapNonDeterminism,
     # ROUND-3 S1 — xattr/shm/FIFO/sendfile content-channel hooks are macOS-only so far.
     mcapExternalContent
   }
@@ -300,9 +303,13 @@ proc linuxUnsupportedReason(capability: MonitorCapability): string =
     "Linux preload shim hooks connect(2); this reason applies only where " &
       "IPC-connect is not advertised"
   of mcapObservedEnv:
-    "Linux preload shim does not yet hook getenv/sysctl/uname as observed inputs"
+    "Linux preload shim records libc-visible getenv/uname/sysconf observed " &
+      "inputs; this reason applies only where direct raw/vDSO or broader " &
+      "system-configuration coverage is required"
   of mcapNonDeterminism:
-    "Linux preload shim does not yet hook entropy/time sources for non-determinism"
+    "Linux preload shim records libc-visible clock_gettime/gettimeofday/time " &
+      "as time reads and getrandom as non-determinism; this reason applies " &
+      "only where direct raw/vDSO or broader entropy/time APIs are required"
   of mcapExternalContent:
     "Linux preload shim records libc-visible positioned/vector and zero-copy " &
       "file movers, but broader external content channels and direct raw " &
@@ -421,6 +428,9 @@ proc linuxPreloadMonitorProfile*(
       "copy_file_range/splice content movers record source reads and " &
       "destination writes; libc-visible link/linkat and rename/renameat/" &
       "renameat2 record hardlink source/alias and final rename destinations; " &
+      "libc-visible getenv/uname/sysconf are observed inputs, " &
+      "clock_gettime/gettimeofday/time are record-only time reads, and " &
+      "getrandom is non-determinism that downgrades completeness; " &
       "and io-mon fails closed for unsupported raw syscall numbers, " &
       "untracked or partially tracked anonymous executable mprotect, " &
       "partial-overlap mremap ownership escapes, or anonymous writable+" &
@@ -431,7 +441,9 @@ proc linuxPreloadMonitorProfile*(
       "unless they are represented by event-loss at runtime: excluded-prefix " &
       "startup DSOs, executable mappings outside the preload mmap lifecycle, " &
       "direct raw zero-copy/mutation syscalls, pre-existing hardlink/inode " &
-      "aliases, and non-file determinism inputs. Consumers that require those " &
+      "aliases, direct raw/vDSO non-file determinism paths, and broader Linux " &
+      "non-file APIs beyond getenv/uname/sysconf/clock/gettimeofday/time/" &
+      "getrandom. Consumers that require those " &
       "threat models must request the corresponding capability and treat the " &
       "gap as incomplete.")
 

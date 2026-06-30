@@ -1,6 +1,6 @@
 # Linux adversarial hardening round 4
 
-Date: 2026-06-30
+Date: 2026-06-30 through 2026-07-01
 Base: io-mon `dev` after M-FW-5.
 Harness: `run_round4.sh`; latest observed summary is preserved in `summary.tsv`.
 Scratch artifacts: `/tmp/io_mon_linux_round4`.
@@ -19,13 +19,14 @@ Scratch artifacts: `/tmp/io_mon_linux_round4`.
 | 8 | Direct raw `syscall(SYS_sendfile)` | Fail-closed: unsupported raw syscall event loss, `mcIncomplete`. |
 | 9 | Hardlink alias read | Captured by M-FW-6B for libc-visible `link`/`linkat`: source identity is recorded as a file read and the alias as a write. |
 | 10 | Rename staging write | Captured by M-FW-6B for libc-visible `rename`/`renameat`/`renameat2`: final destination path is recorded as a write. |
-| 11 | Non-file determinism (`getenv`, `uname`, `sysconf`, clock, `getrandom`) | Residual: no records emitted by default; covered by `observed-env` and `non-determinism` gaps. |
+| 11 | Non-file determinism (`getenv`, `uname`, `sysconf`, clock, `getrandom`) | Captured by M-FW-6C for the libc-visible subset: observed-input records for env/uname/sysconf/time diagnostics plus `getrandom` non-determinism, yielding `mcIncomplete`. |
 
 No new silent false-negative was confirmed in the newly targeted
-libc-visible positioned/vector/zero-copy file-content channels. The first fix
-implemented in this round closes that narrow surface with live regression
-coverage. The remaining residuals are existing capability-gated production
-limits rather than newly accepted completeness claims.
+libc-visible positioned/vector/zero-copy file-content channels. The first two
+accepted fixes closed those file and path-mutation surfaces with live
+regression coverage. M-FW-6C now closes the narrow libc-visible non-file
+determinism subset while leaving direct raw/vDSO and broader API coverage as
+capability-gated production residuals.
 
 ## First fix milestone
 
@@ -53,12 +54,30 @@ helpers now record successful path moves and hardlink creation:
 - Dirfd-relative `linkat`/`renameat` paths are resolved through the monitored
   fd table before recording.
 
+## Third fix milestone
+
+M-FW-6C is accepted after strict review: Linux libc-visible non-file
+determinism sources now use the existing observed-input/non-determinism record
+model:
+
+- `getenv` emits `mrEnvRead` with the queried variable name and does not
+  downgrade by itself.
+- `uname` and `sysconf` emit `mrSysctlRead` (`uname` and `sysconf:<id>`) and
+  do not downgrade by themselves.
+- `clock_gettime`, `gettimeofday`, and `time` emit `mrTimeRead` diagnostics
+  and do not auto-downgrade, preserving the cardinal-sin guard for normal
+  builds that read clocks benignly.
+- Successful `getrandom` emits `mrNonDeterministic`, which the existing merge
+  path maps to event-loss and `mcIncomplete`.
+- Direct raw syscall and vDSO clock/time paths are not claimed by this slice.
+
 ## Follow-up candidates
 
 - Pre-existing hardlink/inode aliases and direct raw `link*`/`rename*`
   syscall variants.
-- Linux observed-env and non-determinism hooks for `getenv`, `uname`,
-  `sysconf`, wall clock, and entropy.
+- Direct raw/vDSO and broader Linux non-file determinism APIs beyond the
+  current libc-visible `getenv`/`uname`/`sysconf`/clock/time/`getrandom`
+  subset.
 - Direct raw zero-copy syscall classification for `sendfile`, `splice`, and
   `copy_file_range` if it can be done safely through the existing raw syscall
   event path.

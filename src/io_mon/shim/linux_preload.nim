@@ -1,7 +1,7 @@
 when not defined(linux):
   {.error: "repro_monitor_shim/linux_preload is Linux-only".}
 
-import std/[locks, os, strutils, tables]
+import std/[locks, os, sets, strutils, tables]
 from io_mon/paths import extendedPath
 
 import io_mon/types
@@ -46,11 +46,13 @@ var
   fdLock: Lock
   dirLock: Lock
   streamLock: Lock
+  observedLock: Lock
   fragmentDir: string
   nextProcessSeq: uint64 = 0
   fdPaths = initTable[cint, string]()
   dirPaths = initTable[uint, string]()
   streamPaths = initTable[uint, string]()
+  observedNonFileInputs = initHashSet[string]()
   rawSyscallCoverageRecorded = false
   inlineSyscallCoverageRecorded = false
   inlineSyscallTrapCoverageRecorded = false
@@ -350,6 +352,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     initLock(fdLock)
     initLock(dirLock)
     initLock(streamLock)
+    initLock(observedLock)
     locksReady = true
   acquire(initLockVar)
   defer: release(initLockVar)
@@ -1033,6 +1036,121 @@ proc repro_hook_mremap*(ctx: var MremapContext) {.raises: [].} =
       recordLateInlineSyscallScanCoverage(status, "mremap-anonymous-exec")
   c_set_errno(savedErrno)
 
+proc recordObservedNonFile(kind: MonitorRecordKind;
+                           observationKind: MonitorObservationKind;
+                           path, detail: string) {.raises: [].} =
+  if path.len == 0:
+    return
+  let key = $ord(kind) & ":" & path
+  var shouldEmit = false
+  acquire(observedLock)
+  if not observedNonFileInputs.contains(key):
+    observedNonFileInputs.incl(key)
+    shouldEmit = true
+  release(observedLock)
+  if not shouldEmit:
+    return
+  var record = baseRecord(kind, observationKind)
+  record.path = path
+  record.detail = detail
+  emitRecord(record)
+
+proc recordEnvRead(name: cstring) {.raises: [].} =
+  if name == nil:
+    return
+  recordObservedNonFile(mrEnvRead, moEnvRead, $name, "linux getenv")
+
+proc recordSysconfRead(name: cint) {.raises: [].} =
+  recordObservedNonFile(mrSysctlRead, moSysctlRead, "sysconf:" & $name,
+    "linux sysconf")
+
+proc recordUnameRead() {.raises: [].} =
+  recordObservedNonFile(mrSysctlRead, moSysctlRead, "uname", "linux uname")
+
+proc recordTimeRead(source: string) {.raises: [].} =
+  recordObservedNonFile(mrTimeRead, moTimeRead, source, "linux time")
+
+proc recordNonDeterministic(source: string) {.raises: [].} =
+  var record = baseRecord(mrNonDeterministic, moNonDeterministic)
+  record.path = source
+  record.detail = "linux non-deterministic source"
+  emitRecord(record)
+
+proc repro_hook_getenv*(ctx: var GetenvContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  recordEnvRead(ctx.name)
+  c_set_errno(savedErrno)
+
+proc repro_hook_uname*(ctx: var UnameContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0:
+    recordUnameRead()
+  c_set_errno(savedErrno)
+
+proc repro_hook_sysconf*(ctx: var SysconfContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  recordSysconfRead(ctx.name)
+  c_set_errno(savedErrno)
+
+proc repro_hook_clock_gettime*(ctx: var ClockGettimeContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0:
+    recordTimeRead("clock_gettime:" & $ctx.clockId)
+  c_set_errno(savedErrno)
+
+proc repro_hook_gettimeofday*(ctx: var GettimeofdayContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0:
+    recordTimeRead("gettimeofday")
+  c_set_errno(savedErrno)
+
+proc repro_hook_time*(ctx: var TimeContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result != -1:
+    recordTimeRead("time")
+  c_set_errno(savedErrno)
+
+proc repro_hook_getrandom*(ctx: var GetrandomContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result >= 0:
+    recordNonDeterministic("getrandom")
+  c_set_errno(savedErrno)
+
 proc repro_hook_raw_syscall*(number, a1, a2, a3, a4, a5, a6,
                              callResult: clong; inlineTrap: cint)
     {.raises: [].} =
@@ -1190,6 +1308,13 @@ registerMmapHook(repro_hook_mmap)
 registerMprotectHook(repro_hook_mprotect)
 registerMunmapHook(repro_hook_munmap)
 registerMremapHook(repro_hook_mremap)
+registerGetenvHook(repro_hook_getenv)
+registerUnameHook(repro_hook_uname)
+registerSysconfHook(repro_hook_sysconf)
+registerClockGettimeHook(repro_hook_clock_gettime)
+registerGettimeofdayHook(repro_hook_gettimeofday)
+registerTimeHook(repro_hook_time)
+registerGetrandomHook(repro_hook_getrandom)
 registerForkHook(repro_hook_fork)
 registerExecveHook(repro_hook_execve)
 registerPosixSpawnHook(repro_hook_posix_spawn)

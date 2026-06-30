@@ -100,14 +100,18 @@ to start as an honest stub today.
   the destination as a file write when bytes move. Linux libc-visible
   `link`/`linkat` records hardlink source identity and alias output evidence,
   and `rename`/`renameat`/`renameat2` records the final output path for
-  rename-staged writes. Known residuals: startup DSOs
+  rename-staged writes. Linux libc-visible `getenv`, `uname`, and `sysconf`
+  are recorded as observed inputs; `clock_gettime`, `gettimeofday`, and
+  `time` are recorded as time-read diagnostics; successful `getrandom` calls
+  emit non-determinism evidence and downgrade through the existing
+  `mcIncomplete` path. Known residuals: startup DSOs
   under excluded system/runtime prefixes and executable mappings not owned by
   the preload `mmap` lifecycle are not scanned yet; direct raw zero-copy
   syscalls (`sendfile`, `splice`, raw `copy_file_range`), direct raw
-  path-mutation syscalls, pre-existing hardlink aliases, and Linux non-file
-  determinism inputs (`getenv`, `uname`, `sysconf`, time, `getrandom`) still
-  need dedicated hooks or stackable-backed scanner/classifier integration. The
-  default Linux profile is therefore an
+  path-mutation syscalls, pre-existing hardlink aliases, direct raw/vDSO
+  clock/time paths, and broader Linux non-file APIs outside the current
+  libc-visible subset still need dedicated hooks or stackable-backed
+  scanner/classifier integration. The default Linux profile is therefore an
   `LD_PRELOAD` completeness profile, not a native/adversarial production
   profile: consumers that require those residual threat models must request the
   explicit capabilities (`adversarial-raw-syscall`,
