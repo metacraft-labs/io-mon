@@ -376,8 +376,8 @@ proc linuxPreloadMonitorProfile*(
   result.diagnostics.add MonitorDiagnostic(
     level: mdlInfo,
     message: "Linux exported libc syscall(2) wrapper coverage is " &
-      "stackable-backed and fail-closed; inline executable 0f05 scanner " &
-      "coverage remains outside this profile")
+      "stackable-backed and fail-closed; main-executable inline 0f05 " &
+      "scanner/SIGTRAP coverage is stackable-backed and fail-closed")
 
   var gapCapabilities = LinuxPreloadKnownUnsupportedCapabilities
   for capability in required:

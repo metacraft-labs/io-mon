@@ -7,6 +7,7 @@ from io_mon/paths import extendedPath
 import io_mon/types
 import io_mon/writer
 import io_mon/hooks/linux_preload_runtime
+import stackable_hooks/platform/linux_raw_syscalls
 
 const
   OAccMode = 0x0003.cint
@@ -30,6 +31,8 @@ var
   dirPaths = initTable[uint, string]()
   streamPaths = initTable[uint, string]()
   rawSyscallCoverageRecorded = false
+  inlineSyscallCoverageRecorded = false
+  inlineSyscallTrapCoverageRecorded = false
   # Thread id of the thread that ran the preload constructor (the process
   # main thread). Its fragment batch is flushed by the process-exit
   # destructor; worker threads flush eagerly per record (see emitRecord),
@@ -175,6 +178,33 @@ proc recordRawSyscallCoverage(status: RawSyscallPatchStatus) {.raises: [].} =
     $status.diagnostic & " stage=" & $status.stage &
     " errno=" & $status.osErrno)
 
+proc recordInlineSyscallCoverage(status: InlineSyscallPatchStatus) {.raises: [].} =
+  if inlineSyscallCoverageRecorded:
+    return
+  inlineSyscallCoverageRecorded = true
+  if status.handlerInstalled and status.scanDiagnostic == lrsOk and
+      status.firstPatchDiagnostic == lrsOk:
+    return
+  emitEventLoss("linux inline raw-syscall scanner unavailable scan=" &
+    $status.scanDiagnostic & " install=" & $status.installDiagnostic &
+    " patched-sites=" & $status.patchedSites &
+    " first-patch=" & $status.firstPatchDiagnostic &
+    " stage=" & $status.firstPatchStage &
+    " errno=" & $status.firstPatchErrno)
+
+proc recordInlineSyscallTrapCoverage() {.raises: [].} =
+  if inlineSyscallTrapCoverageRecorded:
+    return
+  let traps = inlineSyscallTrapCount()
+  let failures = inlineSyscallFailureCount()
+  if traps == 0 and failures == 0:
+    return
+  inlineSyscallTrapCoverageRecorded = true
+  emitEventLoss("linux inline raw syscall trapped nr=" &
+    $inlineSyscallLastNumber() & " address=0x" &
+    toHex(inlineSyscallLastAddress()) & " traps=" & $traps &
+    " failures=" & $failures, int64(inlineSyscallLastNumber()))
+
 proc repro_monitor_shim_init*(configPath: cstring): cint
     {.exportc, dynlib, raises: [].}
 
@@ -282,6 +312,8 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   recordProcessStart()
   let rawStatus = installRawSyscallWrapperPatch()
   recordRawSyscallCoverage(rawStatus)
+  let inlineStatus = installInlineSyscallPatches()
+  recordInlineSyscallCoverage(inlineStatus)
   result = 0
 
 proc repro_monitor_shim_flush*(): cint {.exportc, dynlib, raises: [].} =
@@ -294,6 +326,7 @@ proc repro_monitor_shim_flush*(): cint {.exportc, dynlib, raises: [].} =
 proc repro_monitor_shim_shutdown*(): cint {.exportc, dynlib, raises: [].} =
   ## Process/thread shutdown: flush + close the calling thread's fragment
   ## slot. Invoked by the process-exit destructor for the main thread.
+  recordInlineSyscallTrapCoverage()
   withShimMuted:
     try: closeFragmentSlot()
     except CatchableError: discard

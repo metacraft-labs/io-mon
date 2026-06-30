@@ -221,4 +221,93 @@ int main(int argc, char **argv) {
     check dep.records.anyIt(it.kind == mrEventLoss and
       "raw syscall" in it.detail)
 
+  test "inline assembly syscall openat/read fails closed instead of complete depfile":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let reader = buildC(work, "inline_syscall_reader", """
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+static long raw6(long nr, long a0, long a1, long a2,
+                 long a3, long a4, long a5) {
+  register long r10 __asm__("r10") = a3;
+  register long r8 __asm__("r8") = a4;
+  register long r9 __asm__("r9") = a5;
+  long ret;
+  __asm__ volatile("syscall"
+                   : "=a"(ret)
+                   : "0"(nr), "D"(a0), "S"(a1), "d"(a2),
+                     "r"(r10), "r"(r8), "r"(r9)
+                   : "rcx", "r11", "memory");
+  return ret;
+}
+int main(int argc, char **argv) {
+  char buf[64];
+  int fd = (int)raw6(SYS_openat, AT_FDCWD, (long)argv[1], O_RDONLY, 0, 0, 0);
+  if (fd < 0) return 2;
+  long n = raw6(SYS_read, fd, (long)buf, sizeof(buf), 0, 0, 0);
+  raw6(SYS_close, fd, 0, 0, 0, 0, 0);
+  return n > 0 ? 0 : 3;
+}
+""")
+    let marker = work / "inline-raw-marker.txt"
+    writeFile(marker, "inline raw marker\n")
+    let depfile = work / "inline-raw-syscall.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", reader, marker],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcIncomplete
+    check dep.records.anyIt(it.kind == mrEventLoss and
+      "inline raw syscall" in it.detail)
+
+  test "unrelated SIGTRAP is not swallowed by inline syscall handler":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let trapper = buildC(work, "sigtrap_unrelated", """
+#include <signal.h>
+int main(void) {
+  raise(SIGTRAP);
+  return 77;
+}
+""")
+    let depfile = work / "sigtrap-unrelated.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", trapper],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code != 0
+    check cap.code != 77
+
   removeDir(work)

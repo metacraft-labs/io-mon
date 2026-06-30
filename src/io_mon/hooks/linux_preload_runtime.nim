@@ -1,7 +1,7 @@
 when not defined(linux):
   {.error: "repro_monitor_hooks/linux_preload_runtime is Linux-only".}
 
-import std/algorithm
+import std/[algorithm, os]
 
 import stackable_hooks/platform/linux_preload
 import stackable_hooks/platform/linux_raw_syscalls
@@ -133,6 +133,17 @@ type
     osErrno*: cint
     target*: pointer
 
+  InlineSyscallPatchStatus* = object
+    attempted*: bool
+    handlerInstalled*: bool
+    patchedSites*: int
+    scanDiagnostic*: LinuxRawSyscallDiagnostic
+    installDiagnostic*: LinuxRawSyscallDiagnostic
+    firstPatchDiagnostic*: LinuxRawSyscallDiagnostic
+    firstPatchStage*: LinuxPatchStage
+    firstPatchErrno*: cint
+    firstPatchAddress*: uint
+
   OpenHook* = proc(ctx: var OpenContext) {.raises: [].}
   OpenatHook* = proc(ctx: var OpenatContext) {.raises: [].}
   CloseHook* = proc(ctx: var CloseContext) {.raises: [].}
@@ -206,6 +217,7 @@ type
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <spawn.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -307,15 +319,123 @@ static ct_execve_real_fn real_execve_ptr = NULL;
 static ct_posix_spawn_real_fn real_posix_spawn_ptr = NULL;
 static ct_posix_spawn_real_fn real_posix_spawnp_ptr = NULL;
 
+#define CT_INLINE_SYSCALL_SITE_CAP 4096
+static unsigned long ct_inline_syscall_sites[CT_INLINE_SYSCALL_SITE_CAP];
+static volatile sig_atomic_t ct_inline_syscall_site_count_value = 0;
+static volatile sig_atomic_t ct_inline_syscall_trap_count_value = 0;
+static volatile sig_atomic_t ct_inline_syscall_failure_count_value = 0;
+static volatile sig_atomic_t ct_inline_syscall_last_nr_value = -1;
+static volatile sig_atomic_t ct_inline_syscall_overflow_value = 0;
+static volatile unsigned long ct_inline_syscall_last_address_value = 0;
+
 extern void *stackable_linux_preload_resolve_next(const char *name);
 extern int stackable_linux_preload_hooks_allowed(void);
 extern void stackable_linux_preload_enter_hook(void);
 extern void stackable_linux_preload_exit_hook(void);
 extern long stackable_linux_raw_syscall6(long nr, long a1, long a2, long a3,
                                          long a4, long a5, long a6);
+struct stackable_linux_syscall_regs {
+  long nr;
+  long args[6];
+  long result;
+  unsigned long trap_rip;
+  unsigned long syscall_address;
+  unsigned long resume_rip;
+};
+extern int stackable_linux_capture_syscall_regs_from_ucontext(
+    void *ucontext_ptr, struct stackable_linux_syscall_regs *out);
+extern long stackable_linux_replay_syscall_regs(
+    const struct stackable_linux_syscall_regs *regs);
+extern int stackable_linux_write_syscall_result_to_ucontext(
+    void *ucontext_ptr, long result, unsigned long resume_rip);
+extern int stackable_linux_chain_sigtrap(int signum, void *siginfo_ptr,
+                                         void *ucontext_ptr);
 
 static void *ct_resolve(const char *name) {
   return stackable_linux_preload_resolve_next(name);
+}
+
+static int ct_inline_syscall_site_index(unsigned long address) {
+  sig_atomic_t count = ct_inline_syscall_site_count_value;
+  for (sig_atomic_t i = 0; i < count; i++) {
+    if (ct_inline_syscall_sites[i] == address) return (int)i;
+  }
+  return -1;
+}
+
+void ct_linux_inline_syscall_reset(void) {
+  ct_inline_syscall_site_count_value = 0;
+  ct_inline_syscall_trap_count_value = 0;
+  ct_inline_syscall_failure_count_value = 0;
+  ct_inline_syscall_last_nr_value = -1;
+  ct_inline_syscall_overflow_value = 0;
+  ct_inline_syscall_last_address_value = 0;
+}
+
+int ct_linux_inline_syscall_record_site(unsigned long address) {
+  if (address == 0) return -1;
+  if (ct_inline_syscall_site_index(address) >= 0) return 0;
+  sig_atomic_t count = ct_inline_syscall_site_count_value;
+  if (count >= CT_INLINE_SYSCALL_SITE_CAP) {
+    ct_inline_syscall_overflow_value = 1;
+    return -2;
+  }
+  ct_inline_syscall_sites[count] = address;
+  ct_inline_syscall_site_count_value = count + 1;
+  return 0;
+}
+
+static void ct_linux_inline_syscall_sigtrap_handler(
+    int signum, siginfo_t *info, void *ucontext) {
+  struct stackable_linux_syscall_regs regs;
+  int rc = stackable_linux_capture_syscall_regs_from_ucontext(ucontext, &regs);
+  if (rc != 0 || ct_inline_syscall_site_index(regs.syscall_address) < 0) {
+    rc = stackable_linux_chain_sigtrap(signum, info, ucontext);
+    if (rc != 0) {
+      signal(signum, SIG_DFL);
+      raise(signum);
+    }
+    return;
+  }
+
+  ct_inline_syscall_last_nr_value = (sig_atomic_t)regs.nr;
+  ct_inline_syscall_last_address_value = regs.syscall_address;
+  long result = stackable_linux_replay_syscall_regs(&regs);
+  rc = stackable_linux_write_syscall_result_to_ucontext(
+      ucontext, result, regs.resume_rip);
+  if (rc == 0) {
+    ct_inline_syscall_trap_count_value++;
+  } else {
+    ct_inline_syscall_failure_count_value++;
+  }
+}
+
+void *ct_linux_inline_syscall_handler_address(void) {
+  return (void *)&ct_linux_inline_syscall_sigtrap_handler;
+}
+
+long ct_linux_inline_syscall_site_count(void) {
+  return (long)ct_inline_syscall_site_count_value;
+}
+
+long ct_linux_inline_syscall_trap_count(void) {
+  return (long)ct_inline_syscall_trap_count_value;
+}
+
+long ct_linux_inline_syscall_failure_count(void) {
+  return (long)ct_inline_syscall_failure_count_value;
+}
+
+long ct_linux_inline_syscall_last_nr(void) {
+  return (long)ct_inline_syscall_last_nr_value;
+}
+
+unsigned long ct_linux_inline_syscall_last_address(void) {
+  return ct_inline_syscall_last_address_value;
+}
+
+int ct_linux_inline_syscall_overflowed(void) {
+  return ct_inline_syscall_overflow_value != 0;
 }
 
 #define CT_BYPASS() (!stackable_linux_preload_hooks_allowed())
@@ -890,6 +1010,24 @@ type
 
 proc rawSyscallReplacement(number, a1, a2, a3, a4, a5, a6: clong): clong
   {.importc: "ct_linux_preload_syscall_replacement", cdecl, raises: [].}
+proc cInlineSyscallReset()
+  {.importc: "ct_linux_inline_syscall_reset", raises: [].}
+proc cInlineSyscallRecordSite(address: culong): cint
+  {.importc: "ct_linux_inline_syscall_record_site", raises: [].}
+proc cInlineSyscallHandlerAddress(): pointer
+  {.importc: "ct_linux_inline_syscall_handler_address", raises: [].}
+proc cInlineSyscallSiteCount(): clong
+  {.importc: "ct_linux_inline_syscall_site_count", raises: [].}
+proc cInlineSyscallTrapCount(): clong
+  {.importc: "ct_linux_inline_syscall_trap_count", raises: [].}
+proc cInlineSyscallFailureCount(): clong
+  {.importc: "ct_linux_inline_syscall_failure_count", raises: [].}
+proc cInlineSyscallLastNr(): clong
+  {.importc: "ct_linux_inline_syscall_last_nr", raises: [].}
+proc cInlineSyscallLastAddress(): culong
+  {.importc: "ct_linux_inline_syscall_last_address", raises: [].}
+proc cInlineSyscallOverflowed(): cint
+  {.importc: "ct_linux_inline_syscall_overflowed", raises: [].}
 
 proc installOpenDispatcher(dispatch: OpenDispatch)
   {.importc: "ct_linux_preload_register_open_hook", raises: [].}
@@ -964,6 +1102,14 @@ var
     installed: false,
     diagnostic: lrsInvalidArgument,
     stage: lpsNone)
+  inlineSyscallPatchAttempted = false
+  inlineSyscallPatchStatus = InlineSyscallPatchStatus(
+    attempted: false,
+    handlerInstalled: false,
+    scanDiagnostic: lrsInvalidArgument,
+    installDiagnostic: lrsInvalidArgument,
+    firstPatchDiagnostic: lrsOk,
+    firstPatchStage: lpsNone)
 
 proc registerOpenHook*(hook: OpenHook; priority = 100) {.raises: [].} =
   if hook == nil:
@@ -1130,6 +1276,105 @@ proc installRawSyscallWrapperPatch*(): RawSyscallPatchStatus {.raises: [].} =
 
 proc rawSyscallWrapperPatchStatus*(): RawSyscallPatchStatus {.raises: [].} =
   rawSyscallPatchStatus
+
+proc normalizeMappingPath(path: string): string {.raises: [].} =
+  if path.len == 0:
+    return ""
+  try:
+    result = expandSymlink(path)
+  except CatchableError:
+    result = path
+
+proc currentExecutablePath(): string {.raises: [].} =
+  try:
+    result = expandSymlink("/proc/self/exe")
+  except CatchableError:
+    result = ""
+
+proc shouldPatchInlineSyscallMapping(mapping: LinuxExecutableMapping;
+                                     executablePath: string): bool {.raises: [].} =
+  if not (mapping.readable and mapping.executable):
+    return false
+  if mapping.writable or mapping.path.len == 0:
+    return false
+  if mapping.path[0] == '[':
+    return false
+  if executablePath.len == 0:
+    return false
+  normalizeMappingPath(mapping.path) == executablePath
+
+proc installInlineSyscallPatches*(): InlineSyscallPatchStatus {.raises: [].} =
+  if inlineSyscallPatchAttempted:
+    return inlineSyscallPatchStatus
+  inlineSyscallPatchAttempted = true
+  var status = InlineSyscallPatchStatus(
+    attempted: true,
+    scanDiagnostic: linuxRawSyscallSupported(),
+    installDiagnostic: lrsInvalidArgument,
+    firstPatchDiagnostic: lrsOk,
+    firstPatchStage: lpsNone)
+  if status.scanDiagnostic != lrsOk:
+    inlineSyscallPatchStatus = status
+    return status
+
+  cInlineSyscallReset()
+  let handler = cInlineSyscallHandlerAddress()
+  if handler == nil:
+    status.installDiagnostic = lrsInvalidArgument
+    inlineSyscallPatchStatus = status
+    return status
+  status.installDiagnostic = installLinuxSigtrapHandler(handler)
+  status.handlerInstalled = status.installDiagnostic == lrsOk
+  if not status.handlerInstalled:
+    inlineSyscallPatchStatus = status
+    return status
+
+  let executablePath = currentExecutablePath()
+  let mappings =
+    try:
+      enumerateLinuxExecutableMappings()
+    except CatchableError:
+      (diagnostic: lrsInvalidArgument, mappings: newSeq[LinuxExecutableMapping]())
+  status.scanDiagnostic = mappings.diagnostic
+  if mappings.diagnostic != lrsOk:
+    inlineSyscallPatchStatus = status
+    return status
+
+  for mapping in mappings.mappings:
+    if not shouldPatchInlineSyscallMapping(mapping, executablePath):
+      continue
+    visitLinuxExecutableMappingSyscalls(mapping, proc(site: LinuxSyscallSite): bool =
+      let tx = installInt3SyscallPatchTransaction(cast[pointer](site.address))
+      if tx.diagnostic == lrsOk and tx.patchLive:
+        if cInlineSyscallRecordSite(culong(site.address)) == 0:
+          inc status.patchedSites
+      elif status.firstPatchDiagnostic == lrsOk:
+        status.firstPatchDiagnostic = tx.diagnostic
+        status.firstPatchStage = tx.stage
+        status.firstPatchErrno = tx.osErrno
+        status.firstPatchAddress = site.address
+      true
+    )
+  status.patchedSites = int(cInlineSyscallSiteCount())
+  if cInlineSyscallOverflowed() != 0 and status.firstPatchDiagnostic == lrsOk:
+    status.firstPatchDiagnostic = lrsInvalidArgument
+  inlineSyscallPatchStatus = status
+  status
+
+proc inlineSyscallPatchInstallStatus*(): InlineSyscallPatchStatus {.raises: [].} =
+  inlineSyscallPatchStatus
+
+proc inlineSyscallTrapCount*(): int {.raises: [].} =
+  int(cInlineSyscallTrapCount())
+
+proc inlineSyscallFailureCount*(): int {.raises: [].} =
+  int(cInlineSyscallFailureCount())
+
+proc inlineSyscallLastNumber*(): int {.raises: [].} =
+  int(cInlineSyscallLastNr())
+
+proc inlineSyscallLastAddress*(): uint {.raises: [].} =
+  uint(cInlineSyscallLastAddress())
 
 proc callReal*(ctx: var OpenContext) {.raises: [].} =
   case ctx.symbol

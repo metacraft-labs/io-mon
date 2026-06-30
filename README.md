@@ -78,9 +78,13 @@ to start as an honest stub today.
   establishment; a monitored process that talks to an out-of-tree Unix/TCP
   daemon now fails closed as `mcIncomplete`. Generic raw `syscall(2)` use also
   fails closed as `mcIncomplete` via an event-loss record until io-mon grows a
-  syscall-number classifier for precise file/event capture. Known residuals:
-  inline executable `0f 05` syscalls, raw `openat2`, raw zero-copy syscalls
-  (`sendfile`, `splice`, raw `copy_file_range`), path fidelity for
+  syscall-number classifier for precise file/event capture. Main-executable
+  inline `0f 05` syscall sites are scanned and patched through the same
+  stackable raw-syscall INT3/SIGTRAP substrate; a trapped inline syscall is
+  replayed to preserve target behavior and recorded as event-loss so it cannot
+  silently produce a complete depfile. Known residuals: DSO/JIT inline `0f 05`
+  sites, raw `openat2`, raw zero-copy syscalls (`sendfile`, `splice`, raw
+  `copy_file_range`), path fidelity for
   `access`/`readlink`/`statx` and hardlink aliases, and Linux non-file
   determinism inputs (`getenv`, `uname`, `sysconf`, time, `getrandom`) still
   need dedicated hooks or stackable-backed scanner/classifier integration.
