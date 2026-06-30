@@ -65,6 +65,12 @@ const
   # fstatat canonicalisation is applied only for ABSOLUTE paths or AT_FDCWD, since
   # realpath resolves a relative path against the CWD, not an arbitrary `dirfd`.
   AtFdCwd = -2.cint
+  # ROUND-3 S2d — fcntl(2) fd-duplication commands (<fcntl.h>, stable Darwin ABI:
+  # F_DUPFD=0, F_DUPFD_CLOEXEC=67). Both return a NEW fd that refers to the SAME
+  # open file as the source fd (so a read/write via it must be attributed to the
+  # source's path). Every OTHER fcntl command is passed through untouched.
+  FDupFd = 0.cint
+  FDupFdCloexec = 67.cint
   # ROUND-2 R4 — cap on the canonical-path memo; cleared wholesale when exceeded
   # (a crude but O(1)-amortised, memory-bounded eviction — the working set of a
   # build's probed inputs is far below this).
@@ -347,6 +353,36 @@ proc pathForFd(fd: cint): string =
   result = fdPaths.getOrDefault(fd, "")
   release(fdLock)
 
+proc copyFdPath(oldfd, newfd: cint) =
+  ## ROUND-3 S2d — after a successful dup/dup2/fcntl(F_DUPFD*), mirror the source
+  ## fd's recorded path (and shm name) onto the NEW fd, so a read/write through the
+  ## duplicate is attributed to the SAME file as the source (round-3 r3_fd
+  ## p_dup/p_dup2/p_fdupfd: a read via a dup'd fd otherwise had no path).
+  ##
+  ## CRITICAL for dup2/dup3-style reuse (p_dup2swap): `dup2(A, B)` where B is
+  ## already open makes B refer to A AND closes the OLD B INTERNALLY in the kernel —
+  ## that internal close NEVER reaches the hooked `close`, so the stale `fdPaths[B]`
+  ## (pointing at B's old file) would otherwise persist and MISATTRIBUTE a read of A
+  ## via B to B's old file. We therefore CLEAR all stale destination state first,
+  ## then copy the source's. The source is read BEFORE the clear so the dup2(fd, fd)
+  ## no-op (oldfd == newfd) preserves the entry. All under the single fdLock
+  ## critical section so a concurrent close/read sees a consistent table.
+  if newfd < 0:
+    return
+  acquire(fdLock)
+  let srcPath = fdPaths.getOrDefault(oldfd, "")
+  let srcShm = shmFds.getOrDefault(oldfd, "")
+  # Drop any stale destination state left by the kernel's internal close of an
+  # already-open destination fd (the hooked close never saw it).
+  fdPaths.del(newfd)
+  shmFds.del(newfd)
+  classifiedEmptyFds.excl newfd
+  if srcPath.len > 0:
+    fdPaths[newfd] = srcPath
+  if srcShm.len > 0:
+    shmFds[newfd] = srcShm
+  release(fdLock)
+
 proc addShmFd(fd: cint; name: string) =
   ## ROUND-3 S1b — remember that `fd` is backed by the POSIX shm object `name`,
   ## so a later read-only MAP_SHARED mmap of it is recorded as a content read.
@@ -599,6 +635,30 @@ proc recordSpawn(childPid: PidT; callResult: cint; path: cstring; detail: string
   if d.len > 0:
     record.detail = d
   emitRecord(record)
+  # ROUND-3 S2c — for posix_spawn(p) ALSO record the SYMLINK/realpath-RESOLVED
+  # launched binary's BYTES as a CONTENT read (the same path-fidelity hole as
+  # execve): the verbatim `path` may name a wrapper symlink whose real target's
+  # bytes the build truly depends on. canonicalPathFor realpath-resolves it (returns
+  # "" for a nil path — fork —, an already-canonical path, or a PATH-searched bare
+  # name realpath cannot resolve from the CWD, so posix_spawnp's PATH search is never
+  # mis-resolved here).
+  #
+  # Recorded as mrFileRead/moFileRead (a CONTENT dependency, like recordLibraryLoad),
+  # DELIBERATELY NOT a second mrProcessSpawn: a duplicate spawn naming the same
+  # `childOsPid` would look like an unmatched child to the merge
+  # (writer.unmonitoredSubtreeLossCount case (a)) and FALSELY downgrade a normal
+  # compile to mcIncomplete (the cardinal sin — observed: a real cc compile that
+  # posix_spawns its subprocesses). A content read participates in no process-tree
+  # check, so completeness is unchanged while the binary bytes bust the cache on a
+  # content swap.
+  if path != nil:
+    let canonical = canonicalPathFor($path)
+    if canonical.len > 0:
+      var resolved = baseRecord(mrFileRead, moFileRead)
+      resolved.result = 0
+      resolved.path = canonical
+      resolved.detail = "spawn resolved-target"
+      emitRecord(resolved)
 
 proc recordRename(callResult: cint; fromPath, toPath: cstring; detail: string) {.raises: [].} =
   ## Record a rename(2)/renameat(2) as an OUTPUT WRITE on the DESTINATION path.
@@ -1050,14 +1110,26 @@ proc recordDirEnumByFd(fd: cint; detail: string) {.raises: [].} =
   record.detail = detail
   emitRecord(record)
 
-proc recordCanonicalTarget(fd: cint; original: cstring) {.raises: [].} =
+proc recordCanonicalTarget(fd: cint; original: cstring;
+    obs: MonitorObservationKind) {.raises: [].} =
   ## After a successful open, resolve the fd's canonical real path via
   ## fcntl(F_GETPATH). When it differs from the caller-supplied path the open
-  ## traversed a SYMLINK or a /.vol/<dev>/<inode> firmlink (findings doc break #7,
-  ## mcapSymlink): record an ADDITIONAL file-open dependency on the resolved
-  ## target and re-point the fd→path map at it, so subsequent reads — and the
-  ## dependency set — name the REAL file, not the opaque link/inode path. fcntl is
-  ## not hooked (raw syscall), so this is reentrancy-free.
+  ## traversed a SYMLINK, a /.vol/<dev>/<inode> firmlink, OR — ROUND-3 S2a/S2b — a
+  ## `dirfd`-relative (`openat`) or cwd-relative path that names the file only by a
+  ## bare/relative component: record an ADDITIONAL file dependency on the resolved
+  ## ABSOLUTE target and re-point the fd→path map at it, so subsequent reads/writes
+  ## — and the dependency set — name the REAL canonical file, not the opaque
+  ## link/inode or unmatchable relative path. fcntl is not hooked (raw syscall), so
+  ## this is reentrancy-free.
+  ##
+  ## ROUND-3 S2b — this now runs for ALL successful opens (READ and WRITE), not only
+  ## read-ish opens. A WRITE open via `openat(dirfd, "rel/out", …)` or a relative
+  ## cwd path otherwise recorded its OUTPUT under a bare/relative path that no
+  ## consumer's canonical cache key matches (a false cache hit / stale artifact).
+  ## The companion carries the open's OWN observation kind (`obs`) so a write
+  ## target's canonical companion stays a WRITE (moFileWrite) and a read target's an
+  ## INPUT (moFileOpen) — the canonicalisation is ADDITIVE and never reclassifies.
+  ## F_GETPATH is a single cheap raw fcntl (no realpath cost on this hot path).
   if fd < 0:
     return
   var buf: array[1024, char]
@@ -1067,7 +1139,7 @@ proc recordCanonicalTarget(fd: cint; original: cstring) {.raises: [].} =
   if canonical.len == 0 or (original != nil and canonical == $original):
     return
   updateFdPath(fd, cstring(canonical))
-  var record = baseRecord(mrFileOpen, moFileOpen)
+  var record = baseRecord(mrFileOpen, obs)
   record.path = canonical
   record.result = fd.int64
   record.detail = "resolved-target"
@@ -1119,6 +1191,47 @@ proc recordCanonicalPathProbe(callResult: cint; path: cstring; mode: cint;
   if canonical.len == 0 or canonical == raw:
     return
   recordPathProbe(callResult, cstring(canonical), mode,
+    (if detail.len > 0: detail & " resolved-target" else: "resolved-target"))
+
+proc recordCanonicalAtProbe(callResult: cint; dirfd: cint; path: cstring;
+    mode: cint; detail: string) {.raises: [].} =
+  ## ROUND-3 S2a — canonical companion for the `*at` PROBE family (fstatat,
+  ## getattrlistat). Closes the round-2 dirfd-relative residual: round 2 only
+  ## canonicalised a probe whose path was ABSOLUTE or relative to AT_FDCWD (realpath
+  ## resolves against the CWD, not an arbitrary `dirfd`), so `fstatat(dirfd,
+  ## "rel/file", …)` with a REAL dirfd recorded only the BARE RELATIVE component —
+  ## unmatchable against a consumer's canonical cache key, and (unlike an open)
+  ## there is no fd to F_GETPATH and no open fallback, so a changed metadata
+  ## dependency was INVISIBLE → a false skip (r3_fd p_fstat).
+  ##
+  ##  * ABSOLUTE path or AT_FDCWD → defer to recordCanonicalPathProbe (realpath
+  ##    against the CWD is correct), exactly as round 2.
+  ##  * dirfd-RELATIVE → resolve the dirfd to its real directory via F_GETPATH (a
+  ##    raw fcntl, reentrancy-free), join the relative component, and record the
+  ##    realpath-canonical ABSOLUTE companion (memoised via canonicalPathFor, so the
+  ##    realpath cost is bounded on a probe storm).
+  if callResult != 0 or path == nil:
+    return
+  let raw = $path
+  if raw.len == 0:
+    return
+  if raw[0] == '/' or dirfd == AtFdCwd:
+    recordCanonicalPathProbe(callResult, path, mode, detail)
+    return
+  # dirfd-relative: recover the directory's real path, then realpath the join.
+  var dbuf: array[1024, char]
+  if ct_macos_fd_real_path(dirfd, addr dbuf[0], csize_t(dbuf.len)) == 0:
+    return
+  let dir = $cast[cstring](addr dbuf[0])
+  if dir.len == 0:
+    return
+  let joined = dir & "/" & raw
+  let canonical = canonicalPathFor(joined)
+  # Prefer the realpath-canonical form; fall back to the absolute join when
+  # realpath fails (e.g. a broken-symlink leaf an lstat-style probe still describes)
+  # so the companion is at worst absolute, never the bare relative component.
+  let p = if canonical.len > 0: canonical else: joined
+  recordPathProbe(callResult, cstring(p), mode,
     (if detail.len > 0: detail & " resolved-target" else: "resolved-target"))
 
 proc recordMmap(callResult: pointer; prot, flags, fd: cint) {.raises: [].} =
@@ -1479,11 +1592,12 @@ proc repro_hook_open*(path: cstring; flags, mode: cint): cint {.exportc, cdecl, 
   recordOpen(result, path, flags, "")
   if result >= 0:
     recordDirectoryEnumeration(path)
-    # Resolve symlink / .vol firmlink targets for read-ish opens only (an output
-    # create/write open of a fresh path has no target to resolve). One fcntl per
-    # read open; negligible next to the open itself.
-    if observationForOpen(flags) == moFileOpen:
-      recordCanonicalTarget(result, path)
+    # ROUND-3 S2b — canonicalise EVERY successful open (read AND write) via
+    # F_GETPATH, so a symlink/.vol target OR a relative-cwd OUTPUT is recorded
+    # under its canonical absolute path and the fd→path map names the real file.
+    # One cheap raw fcntl per open; the companion carries the open's own
+    # observation kind so the write/read classification is preserved.
+    recordCanonicalTarget(result, path, observationForOpen(flags))
   setErrno(savedErrno)
 
 proc repro_hook_openat*(dirfd: cint; path: cstring; flags, mode: cint): cint
@@ -1496,8 +1610,11 @@ proc repro_hook_openat*(dirfd: cint; path: cstring; flags, mode: cint): cint
   recordOpen(result, path, flags, "dirfd=" & $dirfd)
   if result >= 0:
     recordDirectoryEnumeration(path)
-    if observationForOpen(flags) == moFileOpen:
-      recordCanonicalTarget(result, path)
+    # ROUND-3 S2a/S2b — F_GETPATH on the resulting fd yields the canonical ABSOLUTE
+    # path regardless of `dirfd`, closing the round-2 dirfd-relative residual for
+    # BOTH read and write openat (r3_fd p_oat / p_oatw / p_normw): a dirfd-relative
+    # input or output is now recorded under, and its fd mapped to, the real file.
+    recordCanonicalTarget(result, path, observationForOpen(flags))
   setErrno(savedErrno)
 
 proc repro_hook_read*(fd: cint; buf: pointer; count: csize_t): int {.exportc, cdecl, dynlib.} =
@@ -1528,6 +1645,46 @@ proc repro_hook_close*(fd: cint): cint {.exportc, cdecl, dynlib.} =
     return ct_macos_interpose_real_close(fd)
   result = ct_macos_interpose_real_close(fd)
   removeFdPath(fd)
+
+proc repro_hook_dup*(fd: cint): cint {.exportc, cdecl, dynlib.} =
+  ## ROUND-3 S2d — dup(2): the new fd refers to the SAME open file as `fd`. Mirror
+  ## the source's path onto it so a read/write via the duplicate is attributed to
+  ## the right file (r3_fd p_dup). Errno is preserved across the bookkeeping.
+  if not initialized or disabled > 0:
+    return ct_macos_real_dup(fd)
+  result = ct_macos_real_dup(fd)
+  let savedErrno = getErrno()
+  if result >= 0:
+    copyFdPath(fd, result)
+  setErrno(savedErrno)
+
+proc repro_hook_dup2*(oldfd, newfd: cint): cint {.exportc, cdecl, dynlib.} =
+  ## ROUND-3 S2d — dup2(2): `newfd` is closed (INTERNALLY in the kernel, bypassing
+  ## the hooked close) and made to refer to `oldfd`'s file. copyFdPath clears the
+  ## stale destination entry first, so a read of A via a swapped fd B is attributed
+  ## to A, not B's old file (r3_fd p_dup2 / p_dup2swap). On success result == newfd.
+  if not initialized or disabled > 0:
+    return ct_macos_real_dup2(oldfd, newfd)
+  result = ct_macos_real_dup2(oldfd, newfd)
+  let savedErrno = getErrno()
+  if result >= 0:
+    copyFdPath(oldfd, result)
+  setErrno(savedErrno)
+
+proc repro_hook_fcntl*(fd, cmd: cint; arg: pointer): cint
+    {.exportc, cdecl, dynlib.} =
+  ## ROUND-3 S2d — fcntl(2): hooked ONLY to catch the fd-DUPLICATION commands
+  ## F_DUPFD / F_DUPFD_CLOEXEC (which return a NEW fd referring to `fd`'s file —
+  ## r3_fd p_fdupfd). EVERY other command is forwarded and PASSED THROUGH untouched
+  ## (the raw fcntl forwarder is faithful for all commands). The variadic third
+  ## argument is read as a void* by the interpose thunk and forwarded verbatim.
+  if not initialized or disabled > 0:
+    return ct_macos_real_fcntl(fd, cmd, arg)
+  result = ct_macos_real_fcntl(fd, cmd, arg)
+  let savedErrno = getErrno()
+  if result >= 0 and (cmd == FDupFd or cmd == FDupFdCloexec):
+    copyFdPath(fd, result)
+  setErrno(savedErrno)
 
 # --- ROUND-3 S1 content-channel hooks (interpose-only, like connect/copyfile) ---
 #
@@ -1849,12 +2006,11 @@ proc repro_hook_fstatat*(dirfd: cint; path: cstring; buf: pointer;
   let savedErrno = getErrno()
   let dino = statDetail("fstatat dirfd=" & $dirfd, buf, result == 0)
   recordPathProbe(result, path, 0, dino)
-  # ROUND-2 R4 — canonicalise only when the path is ABSOLUTE or relative to
-  # AT_FDCWD: realpath resolves a relative path against the CWD, not an arbitrary
-  # `dirfd`, so a dirfd-relative fstatat would canonicalise to the wrong file.
-  # (A dirfd-relative probe's canonical companion is a documented residual gap.)
-  if path != nil and (path[0] == '/' or dirfd == AtFdCwd):
-    recordCanonicalPathProbe(result, path, 0, dino)
+  # ROUND-3 S2a — canonicalise for ABSOLUTE / AT_FDCWD paths (realpath against the
+  # CWD) AND for the dirfd-RELATIVE case (resolve the dirfd via F_GETPATH, join,
+  # realpath), closing the round-2 residual where a dirfd-relative fstatat recorded
+  # only the bare relative component.
+  recordCanonicalAtProbe(result, dirfd, path, 0, dino)
   setErrno(savedErrno)
 
 proc repro_hook_access*(path: cstring; mode: cint): cint
@@ -1995,7 +2151,12 @@ proc repro_hook_getattrlistat*(fd: cint; path: cstring; al, buf: pointer;
     return ct_macos_real_getattrlistat(fd, path, al, buf, size, opts)
   result = ct_macos_real_getattrlistat(fd, path, al, buf, size, opts)
   let savedErrno = getErrno()
-  recordPathProbe(result, path, 0, "getattrlistat dirfd=" & $fd)
+  let d = "getattrlistat dirfd=" & $fd
+  recordPathProbe(result, path, 0, d)
+  # ROUND-3 S2a — same canonical companion as fstatat (absolute/AT_FDCWD via the
+  # CWD, dirfd-relative via F_GETPATH+realpath), so a dirfd-relative getattrlistat
+  # metadata probe is matchable against a canonical cache key.
+  recordCanonicalAtProbe(result, fd, path, 0, d)
   setErrno(savedErrno)
 
 proc repro_hook_fgetattrlist*(fd: cint; al, buf: pointer; size: csize_t;
@@ -2340,6 +2501,32 @@ proc repro_hook_execve*(path: cstring; argv, envp: cstringArray): cint
     record.path = $path
   record.detail = "execve"
   emitRecord(record)
+  # ROUND-3 S2c — ALSO record the SYMLINK/realpath-RESOLVED launched binary's BYTES
+  # as a CONTENT read. execve records `path` verbatim, so `execve("/dir/tool_link",
+  # …)` where tool_link→tool named only the LINK; swapping the real binary's bytes
+  # (toolchain wrapper symlinks, busybox-style multi-call dispatch, /usr/bin
+  # symlinks) was invisible → a false skip (r3_fd p_symexec). canonicalPathFor
+  # realpath-resolves the path (returns "" when already canonical or unresolvable —
+  # e.g. a non-existent / PATH-searched name — so no spurious companion).
+  #
+  # It is recorded as mrFileRead/moFileRead (the launched binary's CONTENT is the
+  # dependency — mirroring recordLibraryLoad), DELIBERATELY NOT a second
+  # mrProcessExec: a duplicate process-exec for this pid would inflate the merge's
+  # exec-coverage count (writer.unmonitoredSubtreeLossCount case (b)) and FALSELY
+  # downgrade a normal compile to mcIncomplete (the cardinal sin — observed). A
+  # content read participates in no process-tree check, so completeness is unchanged
+  # while the binary's bytes bust the cache on a content swap. Emitted BEFORE the
+  # flush below because execve does not return on success. (fexecve/execveat do not
+  # exist on macOS and /dev/fd/N exec fails natively, so the symlink is the live
+  # Darwin vector.)
+  if path != nil:
+    let canonical = canonicalPathFor($path)
+    if canonical.len > 0:
+      var resolved = baseRecord(mrFileRead, moFileRead)
+      resolved.result = 0
+      resolved.path = canonical
+      resolved.detail = "execve resolved-target"
+      emitRecord(resolved)
   discard repro_monitor_shim_flush()
   result = ct_macos_interpose_real_execve(path, argv, envp)
 
@@ -3106,6 +3293,48 @@ static int repro_wrap_close(int fd) {
 }
 
 /*
+ * ROUND-3 S2d — fd-duplication interpose thunks (dup/dup2/fcntl). Like the
+ * connect / content-channel thunks these are INTERPOSE-ONLY (dup/dup2/fcntl are
+ * thin syscall wrappers build tools call directly; never body-patched), so each
+ * forwards via the RAW syscall before the recording runtime is live and then
+ * branches to the recording repro_hook_*. They omit the debug-only
+ * interpose-DISABLE A/B forward (moot for an interpose-only hook).
+ */
+static int repro_wrap_dup(int fd) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_dup, fd);
+  }
+  return repro_hook_dup(fd);
+}
+
+static int repro_wrap_dup2(int oldfd, int newfd) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_dup2, oldfd, newfd);
+  }
+  return repro_hook_dup2(oldfd, newfd);
+}
+
+/*
+ * fcntl is VARIADIC (int fcntl(int, int, ...)). The optional third argument is an
+ * int for some commands (F_DUPFD, F_SETFD, …) and a pointer for others (F_GETPATH,
+ * F_PREALLOCATE, …); on the arm64 Apple ABI it lives on the STACK, so we read it
+ * via va_arg as a void*-sized value (libsystem's own fcntl stub marshals it the
+ * same way) and forward it verbatim — faithful for EVERY command. We hook fcntl
+ * solely to observe F_DUPFD/F_DUPFD_CLOEXEC fd duplication; all other commands
+ * pass straight through repro_hook_fcntl untouched.
+ */
+static int repro_wrap_fcntl(int fd, int cmd, ...) {
+  va_list ap;
+  va_start(ap, cmd);
+  void *arg = va_arg(ap, void *);
+  va_end(ap);
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_fcntl, fd, cmd, arg);
+  }
+  return repro_hook_fcntl(fd, cmd, arg);
+}
+
+/*
  * ROUND-2 R9 mmap interpose thunk. Like the T2/T3a thunks it forwards to the
  * kernel before the recording runtime is live, then branches to the recording
  * repro_hook_mmap (which forwards via the genuine libsystem mmap). It omits the
@@ -3829,6 +4058,9 @@ static struct {
   { (const void *)repro_wrap_read, (const void *)read },
   { (const void *)repro_wrap_write, (const void *)write },
   { (const void *)repro_wrap_close, (const void *)close },
+  { (const void *)repro_wrap_dup, (const void *)dup },
+  { (const void *)repro_wrap_dup2, (const void *)dup2 },
+  { (const void *)repro_wrap_fcntl, (const void *)fcntl },
   /* ROUND-2 R9 — mmap output-via-memory hook (MAP_SHARED|PROT_WRITE content
    * write with no write() syscall). Interpose-only (not body-patched). */
   { (const void *)repro_wrap_mmap, (const void *)mmap },
