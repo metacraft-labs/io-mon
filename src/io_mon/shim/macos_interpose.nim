@@ -84,6 +84,31 @@ const
   MapShared = 0x0001.cint
   MapAnon = 0x1000.cint
 
+  # ROUND-3 S0 — Mach/XPC service-name discrimination (close the round-2 R-C
+  # `com.apple.*` prefix-filter break, see machServiceRecordable). Every Apple
+  # service name begins with this prefix.
+  AppleServicePrefix = "com.apple."
+  # SIP-protected launchd plist directories. System Integrity Protection forbids
+  # ANY process (even root) from creating or modifying files here, so the set of
+  # `com.apple.*` MachServices DECLARED by these Apple-signed plists is an
+  # ATTACKER-UNFORGEABLE allowlist of genuine system services. The round-3 S0
+  # finding (research/adversarial-2026-06-round3/r3_residual): the round-2 blunt
+  # `com.apple.*` name-prefix exemption let ANY unsigned process
+  # `bootstrap_register` an UNUSED `com.apple.<custom>` name and serve a monitored
+  # client a delegated file read with NO downgrade (verified: bootstrap_register
+  # of an arbitrary com.apple.* name succeeds from an unsigned binary). We now
+  # exempt a `com.apple.*` lookup ONLY when its name is declared in these
+  # SIP-protected plists — a real system service the attacker cannot impersonate.
+  SipLaunchdDirs = [
+    "/System/Library/LaunchDaemons",
+    "/System/Library/LaunchAgents"]
+  # Cap on the per-process Mach-service decision memo; cleared wholesale when
+  # exceeded (the same O(1)-amortised, memory-bounded eviction as the other caps).
+  # The working set is tiny: a build's DIRECT com.apple.* lookups are rare (the
+  # pervasive system lookups are libsystem-INTERNAL and never reach this
+  # interpose-only hook), so this is essentially never hit.
+  MachServiceCacheCap = 4096
+
 var
   initialized = false
   locksReady = false
@@ -108,6 +133,19 @@ var
   # `observedLock`; cleared wholesale at ObservedInputCacheCap.
   observedLock: Lock
   seenObservedInputs = initHashSet[string]()
+  # ROUND-3 S0 — guards the lazily-built SIP-declared Apple-service set and the
+  # per-name decision memo used by machServiceRecordable / isDeclaredAppleService.
+  machServiceLock: Lock
+  # The concatenated raw bytes of every SIP-protected launchd plist (binary or
+  # XML), built ONCE lazily on the first DIRECT `com.apple.*` lookup that reaches
+  # the interpose hook (normal builds make none, so this stays empty and costs
+  # nothing). A service name present as a whole token in these bytes is a genuine,
+  # SIP-declared Apple system service. See buildAppleServiceBlob.
+  appleServiceBlobBuilt = false
+  appleServiceBlob: string = ""
+  # Per-name decision memo (name → "is a genuine SIP-declared Apple service"),
+  # bounded by MachServiceCacheCap.
+  appleServiceDecision = initTable[string, bool]()
   fragmentDir: string
   nextProcessSeq: uint64 = 0
   fdPaths = initTable[cint, string]()
@@ -507,6 +545,154 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32;
   record.detail = d
   emitRecord(record)
 
+# --- ROUND-3 S0 — Mach/XPC service-name discrimination ----------------------
+#
+# Close the round-2 R-C CRITICAL regression: the blunt `com.apple.*` name-prefix
+# exemption (the round-2 "system baseline" filter) is trivially bypassable. ANY
+# unsigned third-party process can `bootstrap_register` an arbitrary UNUSED
+# `com.apple.<custom>` name (verified on macOS 26: bootstrap_register of e.g.
+# `com.apple.r3residual.<pid>` returns KERN_SUCCESS from an unsigned binary). A
+# monitored client that looks that name up, and to which the registering daemon
+# serves a delegated file read over Mach IPC, produced NO `mrIpcConnect` record
+# (the com.apple.* prefix exempted it) → a false `mcComplete` with the secret
+# input absent. (research/adversarial-2026-06-round3/r3_residual.)
+#
+# THE DISCRIMINATOR (owner-identity vs allowlist — both evaluated):
+#  * OWNER IDENTITY is the gold standard but is NOT cheaply obtainable in-process
+#    for EITHER path: a `bootstrap_look_up` returns only a bare Mach SEND port,
+#    and `pid_for_task` on a service port fails (KERN_FAILURE, verified) — launchd
+#    brokers the connection and never exposes the server pid; `csops`/
+#    CS_PLATFORM_BINARY needs that pid. The XPC create entry is LAZY (no peer, no
+#    audit token until a message round-trips, which we must not force). So neither
+#    path yields the owner cheaply.
+#  * DATA-DRIVEN ALLOWLIST (chosen): a GENUINE `com.apple.*` service is DECLARED
+#    (as a MachServices key) inside an Apple-signed launchd plist under a
+#    SIP-protected directory (SipLaunchdDirs). System Integrity Protection forbids
+#    even root from writing those directories, so the attacker's runtime-registered
+#    name is provably ABSENT from them. We therefore exempt a `com.apple.*` lookup
+#    iff its name occurs as a WHOLE TOKEN in those plists' bytes. This is strictly
+#    more robust than a hand-curated allowlist (it auto-covers every real Apple
+#    launchd service and cannot be evaded by choosing an allowlisted prefix).
+#
+# WHY THIS DOES NOT FALSE-DOWNGRADE NORMAL BUILDS (the cardinal sin): the hooks
+# are INTERPOSE-ONLY (not body-patched), so they see ONLY the program's OWN direct
+# `bootstrap_look_up` / `xpc_connection_create_mach_service` calls crossing an
+# import stub — NEVER the pervasive libsystem-INTERNAL `com.apple.*` lookups every
+# process performs at startup (those are shared-cache-internal). Empirically a
+# trivial program, a normal file-reading program, and a real `cc`/`clang` compile
+# make ZERO direct `com.apple.*` lookups reaching this hook, so the SIP set is
+# never even built for them. The set is consulted only on the RARE deliberate
+# direct lookup (e.g. a tool that talks to cfprefsd / the notification center),
+# where it keeps the genuine Apple service exempt while catching the attacker's
+# undeclared name.
+#
+# RESIDUAL (documented): the SIP set covers the launchd LaunchDaemons/LaunchAgents
+# MachServices. A genuine Apple service declared ONLY in a framework XPCServices
+# bundle (not in those two dirs) and looked up DIRECTLY by a program would be
+# conservatively recorded → a redundant re-run (the FAIL-SAFE direction), never a
+# false skip. The structural endgame remains the EndpointSecurity backend (T3c).
+
+proc isSvcContinuationByte(c: char): bool {.inline.} =
+  ## True if `c` can continue a Mach service-name token to the RIGHT. Service
+  ## names use the reverse-DNS charset `[A-Za-z0-9._-]`; a binary-plist length/
+  ## type marker or a separator (NUL, tab, `<`, …) is NOT in it and ends a token.
+  c in {'A'..'Z', 'a'..'z', '0'..'9', '.', '_', '-'}
+
+proc isSvcLeftBoundaryByte(c: char): bool {.inline.} =
+  ## True if `c` extends a Mach service-name token to the LEFT (so the candidate
+  ## is a SUFFIX of a longer token, e.g. `com.apple.cfprefsd` inside
+  ## `…cfprefsd.daemon` — which must NOT count as a whole-token match). `_` is
+  ## DELIBERATELY excluded: the binary-plist ASCII-string marker is 0x5f (`_`) and
+  ## legitimately immediately precedes a stored service name, so it is a boundary.
+  c in {'A'..'Z', 'a'..'z', '0'..'9', '.', '-'}
+
+proc blobContainsWholeToken(blob, name: string): bool {.raises: [].} =
+  ## True iff `name` occurs in `blob` as a WHOLE service-name token — i.e. not as a
+  ## sub-token of a longer name. The byte before the match must not extend the
+  ## token left (isSvcLeftBoundaryByte) and the byte after must not extend it right
+  ## (isSvcContinuationByte). This prevents an attacker's `com.apple.cfprefsd`
+  ## (a prefix of the real `com.apple.cfprefsd.daemon`) from being falsely exempted
+  ## by a bare substring hit, and tolerates the binary-plist framing around a
+  ## genuine name.
+  if name.len == 0 or blob.len < name.len:
+    return false
+  var i = 0
+  while i <= blob.len - name.len:
+    let idx = blob.find(name, i)
+    if idx < 0:
+      break
+    let beforeOk = idx == 0 or not isSvcLeftBoundaryByte(blob[idx - 1])
+    let afterIdx = idx + name.len
+    let afterOk = afterIdx >= blob.len or not isSvcContinuationByte(blob[afterIdx])
+    if beforeOk and afterOk:
+      return true
+    i = idx + 1
+  false
+
+proc buildAppleServiceBlob() {.raises: [].} =
+  ## Lazily read every SIP-protected launchd plist into the cached `appleServiceBlob`
+  ## byte buffer, with the shim MUTED so the scan's OWN file I/O is not recorded as a
+  ## build dependency (and cannot recurse into recording). SIP guarantees an attacker
+  ## cannot inject a plist here, so a `com.apple.*` whole-token present in these bytes
+  ## is a genuine system service. Called ONCE, under `machServiceLock`. A per-file /
+  ## per-dir failure is swallowed (a missing/unreadable plist must never break the
+  ## decision — at worst a name is treated as undeclared ⇒ a conservative re-run).
+  # Capacity for the concatenated SIP plist bytes. The two launchd dirs hold
+  # ~1.3 MB of plist content today; 8 MB leaves generous headroom and is allocated
+  # ONLY when a direct com.apple.* lookup first reaches the hook (normal builds
+  # make none, so this is never allocated for them). A name truncated at the cap is
+  # treated as undeclared ⇒ a conservative re-run, never a false skip.
+  const SipBlobCap = 8 * 1024 * 1024
+  var buf = newString(SipBlobCap)
+  var pos: csize_t = 0
+  # The C helper enumerates + reads via PURE RAW SYSCALLS (SYS_open(O_DIRECTORY) +
+  # SYS_getdirentries64 + SYS_open/read/close), bypassing libsystem opendir/readdir
+  # entirely — under the shim BOTH dlsym and the image walk resolve a `readdir`
+  # whose record layout is off by one (drops d_name's first byte), and raw syscalls
+  # never fire a file-I/O hook. We still mute around the call as belt-and-suspenders.
+  withShimMuted:
+    for dir in SipLaunchdDirs:
+      pos = ct_macos_concat_sip_plists(cstring(dir), addr buf[0],
+        csize_t(SipBlobCap), pos)
+  buf.setLen(int(pos))
+  appleServiceBlob = buf
+  appleServiceBlobBuilt = true
+
+proc isDeclaredAppleService(name: string): bool {.raises: [].} =
+  ## True if `name` is a GENUINE `com.apple.*` system service declared (as a whole
+  ## token) in the SIP-protected launchd plists — and therefore EXEMPT from the
+  ## breakaway downgrade. The SIP set is built once, lazily; the decision is memoised
+  ## per name (bounded by MachServiceCacheCap). All under `machServiceLock`.
+  acquire(machServiceLock)
+  defer: release(machServiceLock)
+  if appleServiceDecision.hasKey(name):
+    return appleServiceDecision.getOrDefault(name, false)
+  if not appleServiceBlobBuilt:
+    buildAppleServiceBlob()
+  result = blobContainsWholeToken(appleServiceBlob, name)
+  if appleServiceDecision.len >= MachServiceCacheCap:
+    appleServiceDecision.clear()
+  appleServiceDecision[name] = result
+
+proc machServiceRecordable(serviceName: cstring): bool {.raises: [].} =
+  ## ROUND-3 S0 — decide whether a `bootstrap_look_up` / XPC connection to
+  ## `serviceName` must be RECORDED as a potential out-of-tree breakaway:
+  ##  * a NON-`com.apple.*` name is ALWAYS recorded (the round-2 behaviour:
+  ##    sccache/distcc/icecc/custom build daemons + the r2_xpc `com.example.*`
+  ##    break) — a normal compile/link/make never resolves one directly.
+  ##  * a `com.apple.*` name is recorded ONLY when it is NOT a genuine, SIP-declared
+  ##    Apple system service (isDeclaredAppleService). This closes the round-3 S0
+  ##    break: the attacker's unsigned-process `bootstrap_register`-ed
+  ##    `com.apple.<custom>` name is absent from the SIP-protected plists ⇒ recorded
+  ##    ⇒ downgrade; the real `com.apple.*` baseline stays exempt ⇒ no false
+  ##    downgrade. See the threat-model block above.
+  if serviceName == nil or serviceName[0] == '\0':
+    return false
+  let n = $serviceName
+  if not n.startsWith(AppleServicePrefix):
+    return true
+  not isDeclaredAppleService(n)
+
 proc recordMachLookup(serviceName: cstring; callResult: cint) {.raises: [].} =
   ## ROUND-2 R-C — record a successful `bootstrap_look_up` / XPC mach-service
   ## connection-establishment to an OUT-OF-TREE service as an `mrIpcConnect`
@@ -526,14 +712,16 @@ proc recordMachLookup(serviceName: cstring; callResult: cint) {.raises: [].} =
   ## `mcIncomplete` (a conservative RE-RUN, never a false skip) — the same
   ## downgrade-on-uncertainty stance as the INET-peer-unknown connect(2) case.
   ##
-  ## The CARDINAL-SIN guard lives in `ct_macos_mach_service_recordable`: only a
-  ## NON-`com.apple.*` service is recorded, so a normal build (whose only
-  ## Mach-service lookups are the pervasive system `com.apple.*` ones, including
-  ## any the shim itself triggers) is NEVER downgraded. Pre-init / muted lookups
-  ## never reach here (the hooks bail on `not initialized` / `disabled > 0`).
+  ## The CARDINAL-SIN guard lives in `machServiceRecordable` (ROUND-3 S0): a
+  ## NON-`com.apple.*` service, OR a `com.apple.*` name NOT declared in the
+  ## SIP-protected launchd plists (the attacker's forged name), is recorded; the
+  ## genuine SIP-declared `com.apple.*` baseline is exempt, so a normal build —
+  ## which makes NO direct `com.apple.*` lookups through this interpose-only hook —
+  ## is NEVER downgraded. Pre-init / muted lookups never reach here (the hooks bail
+  ## on `not initialized` / `disabled > 0`).
   if serviceName == nil or serviceName[0] == '\0':
     return
-  if not ct_macos_mach_service_recordable(serviceName):
+  if not machServiceRecordable(serviceName):
     return
   var record = baseRecord(mrIpcConnect, moIpcConnect)
   record.result = callResult.int64
@@ -620,6 +808,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
     initLock(dirLock)
     initLock(canonicalLock)   # ROUND-2 R4 — guards the realpath memo
     initLock(observedLock)    # ROUND-2 R-D — guards the observed-input dedup set
+    initLock(machServiceLock) # ROUND-3 S0 — guards the SIP Apple-service set/memo
     locksReady = true
   acquire(initLockVar)
   defer: release(initLockVar)
