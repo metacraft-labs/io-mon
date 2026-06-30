@@ -197,6 +197,112 @@ int main(int argc, char **argv) {
       check hasFileRead(dep, source)
       check hasFileWrite(dep, outPath)
 
+  test "Linux link and rename mutations preserve source and final-path evidence":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let mutator = buildC(work, "linux_path_mutations", """
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+static int read_file(const char *path) {
+  char buf[64];
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) return 20;
+  int ok = read(fd, buf, sizeof(buf)) > 0;
+  close(fd);
+  return ok ? 0 : 21;
+}
+
+int main(int argc, char **argv) {
+  if (argc != 11) return 2;
+  const char *source = argv[1];
+  const char *alias = argv[2];
+  const char *dir = argv[3];
+  const char *alias2_path = argv[4];
+  const char *alias2_name = argv[5];
+  const char *temp = argv[6];
+  const char *final = argv[7];
+  const char *final2_path = argv[8];
+  const char *final2_name = argv[9];
+  const char *missing = argv[10];
+  unlink(alias);
+  unlink(alias2_path);
+  unlink(temp);
+  unlink(final);
+  unlink(final2_path);
+  if (link(source, alias) != 0) return 3;
+  int dirfd = open(dir, O_RDONLY | O_DIRECTORY);
+  if (dirfd < 0) return 4;
+  if (linkat(AT_FDCWD, source, dirfd, alias2_name, 0) != 0) return 5;
+  int r = read_file(alias);
+  if (r != 0) return r;
+  r = read_file(alias2_path);
+  if (r != 0) return r;
+  int fd = open(temp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if (fd < 0) return 6;
+  if (write(fd, "renamed\n", 8) != 8) return 7;
+  close(fd);
+  if (rename(temp, final) != 0) return 8;
+  fd = open(temp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if (fd < 0) return 9;
+  if (write(fd, "renamedat\n", 10) != 10) return 10;
+  close(fd);
+  if (renameat(AT_FDCWD, temp, dirfd, final2_name) != 0) return 12;
+  close(dirfd);
+  if (link(missing, "io-mon-failed-link-alias") == 0) return 13;
+  if (rename(missing, "io-mon-failed-rename-final") == 0) return 14;
+  return 0;
+}
+""")
+    let source = work / "path-mutation-source.txt"
+    let alias = work / "path-mutation-alias.txt"
+    let alias2 = work / "path-mutation-linkat-alias.txt"
+    let alias2Name = "path-mutation-linkat-alias.txt"
+    let tempPath = work / "path-mutation.tmp"
+    let finalPath = work / "path-mutation.final"
+    let final2 = work / "path-mutation-renameat.final"
+    let final2Name = "path-mutation-renameat.final"
+    let missing = work / "path-mutation-missing.txt"
+    writeFile(source, "source identity marker\n")
+    let depfile = work / "path-mutation.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", mutator,
+      source, alias, work, alias2, alias2Name, tempPath, finalPath, final2,
+      final2Name, missing], childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check hasFileRead(dep, source)
+    check hasFileRead(dep, alias)
+    check hasFileRead(dep, alias2)
+    check hasFileWrite(dep, alias)
+    check hasFileWrite(dep, alias2)
+    check hasFileWrite(dep, finalPath)
+    check hasFileWrite(dep, final2)
+    check not dep.records.anyIt(it.kind == mrFileWrite and
+      "io-mon-failed-link-alias" in it.path)
+    check not dep.records.anyIt(it.kind == mrFileWrite and
+      "io-mon-failed-rename-final" in it.path)
+
   test "out-of-tree Unix socket daemon downgrades completeness":
     let snoopBin = work / "io-mon"
     if not fileExists(snoopBin):

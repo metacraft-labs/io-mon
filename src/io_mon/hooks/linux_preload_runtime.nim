@@ -25,7 +25,8 @@ type
     lhsStat, lhsLstat, lhsOpendir, lhsReaddir, lhsClosedir, lhsFork,
     lhsExecve, lhsPosixSpawn, lhsPosixSpawnp, lhsFopen, lhsFopen64, lhsConnect,
     lhsDlopen, lhsDlmopen, lhsPread, lhsReadv, lhsPreadv, lhsSendfile,
-    lhsCopyFileRange, lhsSplice
+    lhsCopyFileRange, lhsSplice, lhsLink, lhsLinkat, lhsRename, lhsRenameat,
+    lhsRenameat2
 
   OpenContext* = object
     path*: cstring
@@ -163,6 +164,39 @@ type
     result*: clong
     nextIndex: int
 
+  LinkContext* = object
+    oldPath*: cstring
+    newPath*: cstring
+    result*: cint
+    symbol: LinuxHookSymbol
+    nextIndex: int
+
+  LinkatContext* = object
+    oldDirfd*: cint
+    oldPath*: cstring
+    newDirfd*: cint
+    newPath*: cstring
+    flags*: cint
+    result*: cint
+    nextIndex: int
+
+  RenameContext* = object
+    oldPath*: cstring
+    newPath*: cstring
+    result*: cint
+    symbol: LinuxHookSymbol
+    nextIndex: int
+
+  RenameatContext* = object
+    oldDirfd*: cint
+    oldPath*: cstring
+    newDirfd*: cint
+    newPath*: cstring
+    flags*: cuint
+    result*: cint
+    symbol: LinuxHookSymbol
+    nextIndex: int
+
   DlopenContext* = object
     path*: cstring
     flags*: cint
@@ -271,6 +305,10 @@ type
   SendfileHook* = proc(ctx: var SendfileContext) {.raises: [].}
   CopyFileRangeHook* = proc(ctx: var CopyFileRangeContext) {.raises: [].}
   SpliceHook* = proc(ctx: var SpliceContext) {.raises: [].}
+  LinkHook* = proc(ctx: var LinkContext) {.raises: [].}
+  LinkatHook* = proc(ctx: var LinkatContext) {.raises: [].}
+  RenameHook* = proc(ctx: var RenameContext) {.raises: [].}
+  RenameatHook* = proc(ctx: var RenameatContext) {.raises: [].}
   DlopenHook* = proc(ctx: var DlopenContext) {.raises: [].}
   DlmopenHook* = proc(ctx: var DlmopenContext) {.raises: [].}
   MmapHook* = proc(ctx: var MmapContext) {.raises: [].}
@@ -340,6 +378,18 @@ type
   SpliceHookEntry = object
     priority: int
     callback: SpliceHook
+  LinkHookEntry = object
+    priority: int
+    callback: LinkHook
+  LinkatHookEntry = object
+    priority: int
+    callback: LinkatHook
+  RenameHookEntry = object
+    priority: int
+    callback: RenameHook
+  RenameatHookEntry = object
+    priority: int
+    callback: RenameatHook
   DlopenHookEntry = object
     priority: int
     callback: DlopenHook
@@ -412,6 +462,11 @@ typedef ssize_like_t (*ct_copy_file_range_hook_fn)(int, void *, int, void *,
                                                    size_t, unsigned int);
 typedef ssize_like_t (*ct_splice_hook_fn)(int, void *, int, void *, size_t,
                                           unsigned int);
+typedef int (*ct_link_hook_fn)(char *, char *);
+typedef int (*ct_linkat_hook_fn)(int, char *, int, char *, int);
+typedef int (*ct_rename_hook_fn)(char *, char *);
+typedef int (*ct_renameat_hook_fn)(int, char *, int, char *);
+typedef int (*ct_renameat2_hook_fn)(int, char *, int, char *, unsigned int);
 typedef void *(*ct_dlopen_hook_fn)(char *, int);
 typedef void *(*ct_dlmopen_hook_fn)(long, char *, int);
 typedef void *(*ct_mmap_hook_fn)(void *, size_t, int, int, int, long);
@@ -445,6 +500,12 @@ typedef ssize_t (*ct_copy_file_range_real_fn)(int, off64_t *, int, off64_t *,
                                               size_t, unsigned int);
 typedef ssize_t (*ct_splice_real_fn)(int, loff_t *, int, loff_t *, size_t,
                                      unsigned int);
+typedef int (*ct_link_real_fn)(const char *, const char *);
+typedef int (*ct_linkat_real_fn)(int, const char *, int, const char *, int);
+typedef int (*ct_rename_real_fn)(const char *, const char *);
+typedef int (*ct_renameat_real_fn)(int, const char *, int, const char *);
+typedef int (*ct_renameat2_real_fn)(int, const char *, int, const char *,
+                                    unsigned int);
 typedef void *(*ct_dlopen_real_fn)(const char *, int);
 typedef void *(*ct_dlmopen_real_fn)(Lmid_t, const char *, int);
 typedef void *(*ct_mmap_real_fn)(void *, size_t, int, int, int, off_t);
@@ -483,6 +544,11 @@ static ct_connect_hook_fn ct_connect_hook = NULL;
 static ct_sendfile_hook_fn ct_sendfile_hook = NULL;
 static ct_copy_file_range_hook_fn ct_copy_file_range_hook = NULL;
 static ct_splice_hook_fn ct_splice_hook = NULL;
+static ct_link_hook_fn ct_link_hook = NULL;
+static ct_linkat_hook_fn ct_linkat_hook = NULL;
+static ct_rename_hook_fn ct_rename_hook = NULL;
+static ct_renameat_hook_fn ct_renameat_hook = NULL;
+static ct_renameat2_hook_fn ct_renameat2_hook = NULL;
 static ct_dlopen_hook_fn ct_dlopen_hook = NULL;
 static ct_dlmopen_hook_fn ct_dlmopen_hook = NULL;
 static ct_mmap_hook_fn ct_mmap_hook = NULL;
@@ -538,6 +604,11 @@ static ct_connect_real_fn real_connect_ptr = NULL;
 static ct_sendfile_real_fn real_sendfile_ptr = NULL;
 static ct_copy_file_range_real_fn real_copy_file_range_ptr = NULL;
 static ct_splice_real_fn real_splice_ptr = NULL;
+static ct_link_real_fn real_link_ptr = NULL;
+static ct_linkat_real_fn real_linkat_ptr = NULL;
+static ct_rename_real_fn real_rename_ptr = NULL;
+static ct_renameat_real_fn real_renameat_ptr = NULL;
+static ct_renameat2_real_fn real_renameat2_ptr = NULL;
 static ct_dlopen_real_fn real_dlopen_ptr = NULL;
 static ct_dlmopen_real_fn real_dlmopen_ptr = NULL;
 static ct_mmap_real_fn real_mmap_ptr = NULL;
@@ -820,6 +891,11 @@ void ct_linux_preload_register_connect_hook(ct_connect_hook_fn hook) { ct_connec
 void ct_linux_preload_register_sendfile_hook(ct_sendfile_hook_fn hook) { ct_sendfile_hook = hook; }
 void ct_linux_preload_register_copy_file_range_hook(ct_copy_file_range_hook_fn hook) { ct_copy_file_range_hook = hook; }
 void ct_linux_preload_register_splice_hook(ct_splice_hook_fn hook) { ct_splice_hook = hook; }
+void ct_linux_preload_register_link_hook(ct_link_hook_fn hook) { ct_link_hook = hook; }
+void ct_linux_preload_register_linkat_hook(ct_linkat_hook_fn hook) { ct_linkat_hook = hook; }
+void ct_linux_preload_register_rename_hook(ct_rename_hook_fn hook) { ct_rename_hook = hook; }
+void ct_linux_preload_register_renameat_hook(ct_renameat_hook_fn hook) { ct_renameat_hook = hook; }
+void ct_linux_preload_register_renameat2_hook(ct_renameat2_hook_fn hook) { ct_renameat2_hook = hook; }
 void ct_linux_preload_register_dlopen_hook(ct_dlopen_hook_fn hook) { ct_dlopen_hook = hook; }
 void ct_linux_preload_register_dlmopen_hook(ct_dlmopen_hook_fn hook) { ct_dlmopen_hook = hook; }
 void ct_linux_preload_register_mmap_hook(ct_mmap_hook_fn hook) { ct_mmap_hook = hook; }
@@ -1034,6 +1110,34 @@ ssize_like_t ct_linux_preload_real_splice(int fd_in, void *off_in, int fd_out,
   CT_REAL("splice", real_splice_ptr, ct_splice_real_fn);
   return (ssize_like_t)real_splice_ptr(fd_in, (loff_t *)off_in, fd_out,
                                        (loff_t *)off_out, length, flags);
+}
+
+int ct_linux_preload_real_link(char *oldpath, char *newpath) {
+  CT_REAL("link", real_link_ptr, ct_link_real_fn);
+  return real_link_ptr(oldpath, newpath);
+}
+
+int ct_linux_preload_real_linkat(int olddirfd, char *oldpath, int newdirfd,
+                                 char *newpath, int flags) {
+  CT_REAL("linkat", real_linkat_ptr, ct_linkat_real_fn);
+  return real_linkat_ptr(olddirfd, oldpath, newdirfd, newpath, flags);
+}
+
+int ct_linux_preload_real_rename(char *oldpath, char *newpath) {
+  CT_REAL("rename", real_rename_ptr, ct_rename_real_fn);
+  return real_rename_ptr(oldpath, newpath);
+}
+
+int ct_linux_preload_real_renameat(int olddirfd, char *oldpath, int newdirfd,
+                                   char *newpath) {
+  CT_REAL("renameat", real_renameat_ptr, ct_renameat_real_fn);
+  return real_renameat_ptr(olddirfd, oldpath, newdirfd, newpath);
+}
+
+int ct_linux_preload_real_renameat2(int olddirfd, char *oldpath, int newdirfd,
+                                    char *newpath, unsigned int flags) {
+  CT_REAL("renameat2", real_renameat2_ptr, ct_renameat2_real_fn);
+  return real_renameat2_ptr(olddirfd, oldpath, newdirfd, newpath, flags);
 }
 
 void *ct_linux_preload_real_dlopen(char *path, int flags) {
@@ -1336,6 +1440,58 @@ ssize_t splice(int fd_in, loff_t *off_in, int fd_out, loff_t *off_out,
     fd_in, off_in, fd_out, off_out, len, flags));
 }
 
+int link(const char *oldpath, const char *newpath)
+    __attribute__((visibility("default")));
+int link(const char *oldpath, const char *newpath) {
+  if (CT_BYPASS() || ct_link_hook == NULL)
+    return ct_linux_preload_real_link((char *)oldpath, (char *)newpath);
+  return CT_CALL_HOOK(ct_link_hook((char *)oldpath, (char *)newpath));
+}
+
+int linkat(int olddirfd, const char *oldpath, int newdirfd,
+           const char *newpath, int flags)
+    __attribute__((visibility("default")));
+int linkat(int olddirfd, const char *oldpath, int newdirfd,
+           const char *newpath, int flags) {
+  if (CT_BYPASS() || ct_linkat_hook == NULL)
+    return ct_linux_preload_real_linkat(
+      olddirfd, (char *)oldpath, newdirfd, (char *)newpath, flags);
+  return CT_CALL_HOOK(ct_linkat_hook(
+    olddirfd, (char *)oldpath, newdirfd, (char *)newpath, flags));
+}
+
+int rename(const char *oldpath, const char *newpath)
+    __attribute__((visibility("default")));
+int rename(const char *oldpath, const char *newpath) {
+  if (CT_BYPASS() || ct_rename_hook == NULL)
+    return ct_linux_preload_real_rename((char *)oldpath, (char *)newpath);
+  return CT_CALL_HOOK(ct_rename_hook((char *)oldpath, (char *)newpath));
+}
+
+int renameat(int olddirfd, const char *oldpath, int newdirfd,
+             const char *newpath)
+    __attribute__((visibility("default")));
+int renameat(int olddirfd, const char *oldpath, int newdirfd,
+             const char *newpath) {
+  if (CT_BYPASS() || ct_renameat_hook == NULL)
+    return ct_linux_preload_real_renameat(
+      olddirfd, (char *)oldpath, newdirfd, (char *)newpath);
+  return CT_CALL_HOOK(ct_renameat_hook(
+    olddirfd, (char *)oldpath, newdirfd, (char *)newpath));
+}
+
+int renameat2(int olddirfd, const char *oldpath, int newdirfd,
+              const char *newpath, unsigned int flags)
+    __attribute__((visibility("default")));
+int renameat2(int olddirfd, const char *oldpath, int newdirfd,
+              const char *newpath, unsigned int flags) {
+  if (CT_BYPASS() || ct_renameat2_hook == NULL)
+    return ct_linux_preload_real_renameat2(
+      olddirfd, (char *)oldpath, newdirfd, (char *)newpath, flags);
+  return CT_CALL_HOOK(ct_renameat2_hook(
+    olddirfd, (char *)oldpath, newdirfd, (char *)newpath, flags));
+}
+
 void *dlopen(const char *path, int flags) __attribute__((visibility("default")));
 void *dlopen(const char *path, int flags) {
   if (CT_BYPASS() || ct_dlopen_hook == NULL)
@@ -1519,6 +1675,19 @@ proc realCopyFileRange*(inFd: cint; offIn: pointer; outFd: cint;
 proc realSplice*(fdIn: cint; offIn: pointer; fdOut: cint; offOut: pointer;
                  length: csize_t; flags: cuint): clong
   {.importc: "ct_linux_preload_real_splice", raises: [].}
+proc realLink*(oldPath, newPath: cstring): cint
+  {.importc: "ct_linux_preload_real_link", raises: [].}
+proc realLinkat*(oldDirfd: cint; oldPath: cstring; newDirfd: cint;
+                 newPath: cstring; flags: cint): cint
+  {.importc: "ct_linux_preload_real_linkat", raises: [].}
+proc realRename*(oldPath, newPath: cstring): cint
+  {.importc: "ct_linux_preload_real_rename", raises: [].}
+proc realRenameat*(oldDirfd: cint; oldPath: cstring; newDirfd: cint;
+                   newPath: cstring): cint
+  {.importc: "ct_linux_preload_real_renameat", raises: [].}
+proc realRenameat2*(oldDirfd: cint; oldPath: cstring; newDirfd: cint;
+                    newPath: cstring; flags: cuint): cint
+  {.importc: "ct_linux_preload_real_renameat2", raises: [].}
 proc realDlopen*(path: cstring; flags: cint): pointer
   {.importc: "ct_linux_preload_real_dlopen", raises: [].}
 proc realDlmopen*(namespaceId: clong; path: cstring; flags: cint): pointer
@@ -1577,6 +1746,16 @@ type
   SpliceDispatch = proc(fdIn: cint; offIn: pointer; fdOut: cint;
                         offOut: pointer; length: csize_t;
                         flags: cuint): clong {.cdecl, raises: [].}
+  LinkDispatch = proc(oldPath, newPath: cstring): cint {.cdecl, raises: [].}
+  LinkatDispatch = proc(oldDirfd: cint; oldPath: cstring; newDirfd: cint;
+                        newPath: cstring; flags: cint): cint
+    {.cdecl, raises: [].}
+  RenameDispatch = proc(oldPath, newPath: cstring): cint {.cdecl, raises: [].}
+  RenameatDispatch = proc(oldDirfd: cint; oldPath: cstring; newDirfd: cint;
+                          newPath: cstring): cint {.cdecl, raises: [].}
+  Renameat2Dispatch = proc(oldDirfd: cint; oldPath: cstring; newDirfd: cint;
+                           newPath: cstring; flags: cuint): cint
+    {.cdecl, raises: [].}
   DlopenDispatch = proc(path: cstring; flags: cint): pointer
     {.cdecl, raises: [].}
   DlmopenDispatch = proc(namespaceId: clong; path: cstring; flags: cint): pointer
@@ -1674,6 +1853,16 @@ proc installCopyFileRangeDispatcher(dispatch: CopyFileRangeDispatch)
   {.importc: "ct_linux_preload_register_copy_file_range_hook", raises: [].}
 proc installSpliceDispatcher(dispatch: SpliceDispatch)
   {.importc: "ct_linux_preload_register_splice_hook", raises: [].}
+proc installLinkDispatcher(dispatch: LinkDispatch)
+  {.importc: "ct_linux_preload_register_link_hook", raises: [].}
+proc installLinkatDispatcher(dispatch: LinkatDispatch)
+  {.importc: "ct_linux_preload_register_linkat_hook", raises: [].}
+proc installRenameDispatcher(dispatch: RenameDispatch)
+  {.importc: "ct_linux_preload_register_rename_hook", raises: [].}
+proc installRenameatDispatcher(dispatch: RenameatDispatch)
+  {.importc: "ct_linux_preload_register_renameat_hook", raises: [].}
+proc installRenameat2Dispatcher(dispatch: Renameat2Dispatch)
+  {.importc: "ct_linux_preload_register_renameat2_hook", raises: [].}
 proc installDlopenDispatcher(dispatch: DlopenDispatch)
   {.importc: "ct_linux_preload_register_dlopen_hook", raises: [].}
 proc installDlmopenDispatcher(dispatch: DlmopenDispatch)
@@ -1721,6 +1910,11 @@ var
   sendfileHooks: seq[SendfileHookEntry] = @[]
   copyFileRangeHooks: seq[CopyFileRangeHookEntry] = @[]
   spliceHooks: seq[SpliceHookEntry] = @[]
+  linkHooks: seq[LinkHookEntry] = @[]
+  linkatHooks: seq[LinkatHookEntry] = @[]
+  renameHooks: seq[RenameHookEntry] = @[]
+  renameatHooks: seq[RenameatHookEntry] = @[]
+  renameat2Hooks: seq[RenameatHookEntry] = @[]
   dlopenHooks: seq[DlopenHookEntry] = @[]
   dlmopenHooks: seq[DlmopenHookEntry] = @[]
   mmapHooks: seq[MmapHookEntry] = @[]
@@ -1890,6 +2084,36 @@ proc registerSpliceHook*(hook: SpliceHook; priority = 100) {.raises: [].} =
     return
   spliceHooks.add(SpliceHookEntry(priority: priority, callback: hook))
   spliceHooks.sort(proc(a, b: SpliceHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerLinkHook*(hook: LinkHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  linkHooks.add(LinkHookEntry(priority: priority, callback: hook))
+  linkHooks.sort(proc(a, b: LinkHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerLinkatHook*(hook: LinkatHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  linkatHooks.add(LinkatHookEntry(priority: priority, callback: hook))
+  linkatHooks.sort(proc(a, b: LinkatHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerRenameHook*(hook: RenameHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  renameHooks.add(RenameHookEntry(priority: priority, callback: hook))
+  renameHooks.sort(proc(a, b: RenameHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerRenameatHook*(hook: RenameatHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  renameatHooks.add(RenameatHookEntry(priority: priority, callback: hook))
+  renameatHooks.sort(proc(a, b: RenameatHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerRenameat2Hook*(hook: RenameatHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  renameat2Hooks.add(RenameatHookEntry(priority: priority, callback: hook))
+  renameat2Hooks.sort(proc(a, b: RenameatHookEntry): int = cmp(a.priority, b.priority))
 
 proc registerDlopenHook*(hook: DlopenHook; priority = 100) {.raises: [].} =
   if hook == nil:
@@ -2541,6 +2765,25 @@ proc callReal*(ctx: var SpliceContext) {.raises: [].} =
   ctx.result = realSplice(ctx.fdIn, ctx.offIn, ctx.fdOut, ctx.offOut,
     ctx.length, ctx.flags)
 
+proc callReal*(ctx: var LinkContext) {.raises: [].} =
+  ctx.result = realLink(ctx.oldPath, ctx.newPath)
+
+proc callReal*(ctx: var LinkatContext) {.raises: [].} =
+  ctx.result = realLinkat(ctx.oldDirfd, ctx.oldPath, ctx.newDirfd,
+    ctx.newPath, ctx.flags)
+
+proc callReal*(ctx: var RenameContext) {.raises: [].} =
+  ctx.result = realRename(ctx.oldPath, ctx.newPath)
+
+proc callReal*(ctx: var RenameatContext) {.raises: [].} =
+  case ctx.symbol
+  of lhsRenameat2:
+    ctx.result = realRenameat2(ctx.oldDirfd, ctx.oldPath, ctx.newDirfd,
+      ctx.newPath, ctx.flags)
+  else:
+    ctx.result = realRenameat(ctx.oldDirfd, ctx.oldPath, ctx.newDirfd,
+      ctx.newPath)
+
 proc callReal*(ctx: var DlopenContext) {.raises: [].} =
   ctx.result = realDlopen(ctx.path, ctx.flags)
 
@@ -2763,6 +3006,47 @@ proc callNext*(ctx: var SpliceContext) {.raises: [].} =
     spliceHooks[index].callback(ctx)
   else:
     callReal(ctx)
+
+proc callNext*(ctx: var LinkContext) {.raises: [].} =
+  if ctx.nextIndex < linkHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    linkHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var LinkatContext) {.raises: [].} =
+  if ctx.nextIndex < linkatHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    linkatHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var RenameContext) {.raises: [].} =
+  if ctx.nextIndex < renameHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    renameHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var RenameatContext) {.raises: [].} =
+  case ctx.symbol
+  of lhsRenameat2:
+    if ctx.nextIndex < renameat2Hooks.len:
+      let index = ctx.nextIndex
+      inc ctx.nextIndex
+      renameat2Hooks[index].callback(ctx)
+    else:
+      callReal(ctx)
+  else:
+    if ctx.nextIndex < renameatHooks.len:
+      let index = ctx.nextIndex
+      inc ctx.nextIndex
+      renameatHooks[index].callback(ctx)
+    else:
+      callReal(ctx)
 
 proc callNext*(ctx: var DlopenContext) {.raises: [].} =
   if ctx.nextIndex < dlopenHooks.len:
@@ -2987,6 +3271,44 @@ proc dispatchSplice(fdIn: cint; offIn: pointer; fdOut: cint; offOut: pointer;
   callNext(ctx)
   result = ctx.result
 
+proc dispatchLink(oldPath, newPath: cstring): cint {.cdecl, raises: [].} =
+  var ctx = LinkContext(oldPath: oldPath, newPath: newPath, result: -1,
+                        symbol: lhsLink)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchLinkat(oldDirfd: cint; oldPath: cstring; newDirfd: cint;
+                    newPath: cstring; flags: cint): cint
+    {.cdecl, raises: [].} =
+  var ctx = LinkatContext(oldDirfd: oldDirfd, oldPath: oldPath,
+                          newDirfd: newDirfd, newPath: newPath, flags: flags,
+                          result: -1)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchRename(oldPath, newPath: cstring): cint {.cdecl, raises: [].} =
+  var ctx = RenameContext(oldPath: oldPath, newPath: newPath, result: -1,
+                          symbol: lhsRename)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchRenameat(oldDirfd: cint; oldPath: cstring; newDirfd: cint;
+                      newPath: cstring): cint {.cdecl, raises: [].} =
+  var ctx = RenameatContext(oldDirfd: oldDirfd, oldPath: oldPath,
+                            newDirfd: newDirfd, newPath: newPath, flags: 0,
+                            result: -1, symbol: lhsRenameat)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchRenameat2(oldDirfd: cint; oldPath: cstring; newDirfd: cint;
+                       newPath: cstring; flags: cuint): cint
+    {.cdecl, raises: [].} =
+  var ctx = RenameatContext(oldDirfd: oldDirfd, oldPath: oldPath,
+                            newDirfd: newDirfd, newPath: newPath,
+                            flags: flags, result: -1, symbol: lhsRenameat2)
+  callNext(ctx)
+  result = ctx.result
+
 proc dispatchDlopen(path: cstring; flags: cint): pointer {.cdecl, raises: [].} =
   var ctx = DlopenContext(path: path, flags: flags, result: nil)
   callNext(ctx)
@@ -3077,6 +3399,11 @@ installConnectDispatcher(dispatchConnect)
 installSendfileDispatcher(dispatchSendfile)
 installCopyFileRangeDispatcher(dispatchCopyFileRange)
 installSpliceDispatcher(dispatchSplice)
+installLinkDispatcher(dispatchLink)
+installLinkatDispatcher(dispatchLinkat)
+installRenameDispatcher(dispatchRename)
+installRenameatDispatcher(dispatchRenameat)
+installRenameat2Dispatcher(dispatchRenameat2)
 installDlopenDispatcher(dispatchDlopen)
 installDlmopenDispatcher(dispatchDlmopen)
 installMmapDispatcher(dispatchMmap)
