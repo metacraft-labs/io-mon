@@ -83,6 +83,25 @@ type
     #    baking `__DATE__`) is the build's responsibility to declare or to drive via
     #    SOURCE_DATE_EPOCH (which, being an env read, IS now an observed input).
     mrTimeRead = 17
+    # ROUND-3 S1 (content-channel hooks) — a CONTENT CHANNEL whose in-tree
+    # provenance must be decided AT MERGE TIME, because the cardinal-sin guard for
+    # it is cross-process: a POSIX shm object / FIFO created+consumed ENTIRELY
+    # within the monitored tree is fine (no downgrade), but one fed by an
+    # OUT-OF-TREE producer is an invisible content dependency that must downgrade.
+    # The shim emits one of these to DESCRIBE a channel event; the merge
+    # (`externalContentLossCount`) pairs the create/write side against the
+    # attach/read side and injects an event-loss ONLY for an unpaired (out-of-tree)
+    # consume — the SAME conservative-re-run machinery as the IPC-breakaway /
+    # un-injected-subtree downgrade. APPENDED AT THE END to preserve RMDF
+    # wire-compat (the dgNoRuntimeDependencies / mrIpcConnect / mrLibraryLoad lesson
+    # — never renumber an existing case). The channel identity (shm name / FIFO
+    # path / "" for an anonymous socket/pipe) is in `path`; `detail` carries a
+    # `chan=<shm|fifo|opaque> role=<create|attach|write|read>` classification the
+    # merge reads via `detailToken`. Round-3 finding S1b/S1c/S1d
+    # (research/adversarial-2026-06-round3/r3_channel): an out-of-tree shm producer
+    # + a monitored mmap-PROT_READ consumer, a FIFO fed by an out-of-tree writer,
+    # and an inherited socket/pipe read each produced ZERO downgrade.
+    mrExternalContent = 18
 
   MonitorObservationKind* = enum
     moProcessStart = 1
@@ -107,6 +126,11 @@ type
     moSysctlRead = 13
     moNonDeterministic = 14
     moTimeRead = 15
+    # ROUND-3 S1 — observation kind for the content-channel record (appended for
+    # wire-compat, see mrExternalContent). A consumer that keys on the observation
+    # kind treats moExternalContent as a provenance marker the merge resolves; it is
+    # NOT itself a read/write of a named file.
+    moExternalContent = 16
 
   ProbeResult* = enum
     prUnknown = 0
@@ -158,6 +182,13 @@ type
     # is serialized by capabilityId STRING, so appending is wire-safe).
     mcapObservedEnv
     mcapNonDeterminism
+    # ROUND-3 S1 — content-channel coverage: xattr-family metadata reads
+    # (getxattr/listxattr → path-probe), POSIX shared memory (shm_open + an shm-fd
+    # PROT_READ mapping → content read / out-of-tree downgrade), FIFO and inherited
+    # socket/pipe content (out-of-tree → downgrade), and the sendfile/pread/readv
+    # zero-copy / positioned reads (content read on the source). Appended at the END
+    # (the enum is serialized by capabilityId STRING, so appending is wire-safe).
+    mcapExternalContent
 
   MonitorDiagnosticLevel* = enum
     mdlInfo

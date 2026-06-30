@@ -30,7 +30,9 @@ import io_mon/writer
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/utsname.h>
+#include <sys/xattr.h>
 #include <time.h>
 #include <mach/mach_time.h>
 #include <unistd.h>
@@ -83,6 +85,28 @@ const
   ProtWrite = 0x02.cint
   MapShared = 0x0001.cint
   MapAnon = 0x1000.cint
+
+  # ROUND-3 S1b — SYSTEM POSIX shm objects the OS/libsystem maps on essentially
+  # every process (the notification center, cfprefsd, …). These are NOT build
+  # inputs — a build's output never depends on the notification-center contents —
+  # so recording them as out-of-tree content channels would DOWNGRADE EVERY
+  # cc/clang/tool run (the cardinal sin, observed: a trivial `cc -c` attaches
+  # `apple.shm.notification_center`). We exempt shm names under the Apple system
+  # namespaces from the downgrade, exactly as the round-2 R-D arm excludes the
+  # libsystem entropy baseline and the round-3 S0 arm excludes SIP-declared Apple
+  # services. The names are checked after stripping a leading '/'. RESIDUAL (the
+  # round-3 S0 lesson): a prefix exemption is in principle bypassable by an attacker
+  # naming their shm `apple.shm.evil`; that narrow residual (fail-safe: a missed
+  # dep, the structural endgame is the ES backend) is strictly preferable to a
+  # false downgrade of every real compile.
+  SystemShmPrefixes = ["apple.shm.", "com.apple."]
+  # ROUND-3 S1a — the macOS resource-fork access path. A read of
+  # `<file>/..namedfork/rsrc` (FILE_FLAGS_OFFSET) opens the file's resource fork
+  # (the com.apple.ResourceFork extended attribute) under a NON-CANONICAL path
+  # whose fd carries the FORK's inode, so the dependency would be attributed to an
+  # opaque fork path rather than the underlying file. We normalise it to the base
+  # `<file>` (research/adversarial-2026-06-round3/r3_xattr/rsrc_read.c).
+  ResourceForkSuffix = "/..namedfork/rsrc"
 
   # ROUND-3 S0 — Mach/XPC service-name discrimination (close the round-2 R-C
   # `com.apple.*` prefix-filter break, see machServiceRecordable). Every Apple
@@ -150,6 +174,18 @@ var
   nextProcessSeq: uint64 = 0
   fdPaths = initTable[cint, string]()
   dirPaths = initTable[uint, string]()
+  # ROUND-3 S1b — fds returned by shm_open, mapped to their shm object name. Lets
+  # recordMmap record a CONTENT READ for a read-only MAP_SHARED mapping of an
+  # shm-backed fd (a plain memory load, no read(2)). Guarded by `fdLock` (same
+  # critical sections as fdPaths/the empty-fd set — all fd-keyed shim state).
+  shmFds = initTable[cint, string]()
+  # ROUND-3 S1c — fds whose EMPTY-PATH read has already been classified as an
+  # out-of-tree opaque source (socket / pipe). Once flagged we emit the downgrade
+  # signal ONCE and then skip the fstat/F_GETPATH on every subsequent read of that
+  # fd — keeping the hot read path a single set lookup. A regular-file empty-path
+  # fd is instead given its resolved path via updateFdPath, so it naturally takes
+  # the fast (non-empty) path thereafter. Guarded by `fdLock`.
+  classifiedEmptyFds = initHashSet[cint]()
   # The OS thread id of the thread that ran the dyld constructor (the "main"
   # thread). Captured once at init. The fragment writer batches a thread's
   # records into a per-thread buffer that is otherwise flushed only on overflow /
@@ -300,11 +336,44 @@ proc updateFdPath(fd: cint; path: cstring) =
 proc removeFdPath(fd: cint) =
   acquire(fdLock)
   fdPaths.del(fd)
+  # ROUND-3 S1 — drop any shm / empty-fd-classification state on close so a
+  # recycled fd number never inherits a stale shm name or opaque classification.
+  shmFds.del(fd)
+  classifiedEmptyFds.excl fd
   release(fdLock)
 
 proc pathForFd(fd: cint): string =
   acquire(fdLock)
   result = fdPaths.getOrDefault(fd, "")
+  release(fdLock)
+
+proc addShmFd(fd: cint; name: string) =
+  ## ROUND-3 S1b — remember that `fd` is backed by the POSIX shm object `name`,
+  ## so a later read-only MAP_SHARED mmap of it is recorded as a content read.
+  if fd < 0:
+    return
+  acquire(fdLock)
+  shmFds[fd] = name
+  release(fdLock)
+
+proc shmNameForFd(fd: cint): string =
+  ## The shm object name `fd` was shm_open'd against, or "" if `fd` is not shm.
+  acquire(fdLock)
+  result = shmFds.getOrDefault(fd, "")
+  release(fdLock)
+
+proc markEmptyFdClassified(fd: cint) =
+  ## ROUND-3 S1c — record that `fd`'s empty-path read was classified opaque, so
+  ## subsequent reads skip the (re-)classification on the hot path.
+  if fd < 0:
+    return
+  acquire(fdLock)
+  classifiedEmptyFds.incl fd
+  release(fdLock)
+
+proc emptyFdAlreadyClassified(fd: cint): bool =
+  acquire(fdLock)
+  result = fd in classifiedEmptyFds
   release(fdLock)
 
 proc dirKey(dirp: pointer): uint =
@@ -403,6 +472,62 @@ proc canonicalPathFor(rawPath: string): string {.raises: [].} =
   release(canonicalLock)
   if stored == rawPath: "" else: stored
 
+proc recordExternalContent(chan, role, path: string; fd: cint) {.raises: [].} =
+  ## ROUND-3 S1 — emit one `mrExternalContent` describing a content-channel event.
+  ## `chan` is the channel class (shm/fifo/opaque), `role` the side
+  ## (create/attach/write/read), `path` the channel identity (shm name / FIFO path
+  ## / "" for an anonymous socket-pipe). The fd is stamped into `flags` so the merge
+  ## can dedup an anonymous source by (pid, fd). The merge — NOT the shim — decides
+  ## whether this downgrades (the in-tree-provenance pairing is cross-process); the
+  ## shim only reports the observed fact, so a self-produced channel stays
+  ## mcComplete. See writer.externalContentLossCount.
+  var record = baseRecord(mrExternalContent, moExternalContent)
+  record.path = path
+  record.flags = uint32(fd)
+  record.detail = "chan=" & chan & " role=" & role
+  emitRecord(record)
+
+proc recordFifoChannel(fd: cint; path: cstring; flags: cint) {.raises: [].} =
+  ## ROUND-3 S1d — a hooked open whose target is a FIFO. A FIFO read open consumes
+  ## content from a WRITER: if the writer is an out-of-tree process the real input
+  ## is invisible. We record the open's DIRECTION (read/write) keyed on the FIFO
+  ## path; the merge downgrades a FIFO READ whose path has NO in-tree WRITE open
+  ## (an out-of-tree feeder) and leaves an entirely in-tree pipeline alone (the
+  ## cardinal-sin guard). `path` is the as-opened path; an empty path is skipped.
+  if path == nil:
+    return
+  let p = $path
+  if p.len == 0:
+    return
+  let acc = flags and OAccMode
+  # A FIFO opened O_WRONLY (or O_RDWR — the writer end) is the in-tree feeder; any
+  # other access (O_RDONLY) is a read/consume that may pull out-of-tree content.
+  let role = if acc == OWrOnly or acc == ORdWr: "write" else: "read"
+  recordExternalContent("fifo", role, p, fd)
+
+proc recordResourceForkBase(path: cstring) {.raises: [].} =
+  ## ROUND-3 S1a — when a hooked open targets `<file>/..namedfork/rsrc`, ALSO record
+  ## a content read on the underlying `<file>` (the resource fork is the
+  ## com.apple.ResourceFork extended attribute of that file). Without this the
+  ## dependency is attributed only to the opaque fork path carrying the fork's
+  ## inode, so editing the resource fork would not match a consumer keyed on the
+  ## real file. No-op for any other path.
+  if path == nil:
+    return
+  let raw = $path
+  if not raw.endsWith(ResourceForkSuffix):
+    return
+  let base = raw[0 ..< raw.len - ResourceForkSuffix.len]
+  if base.len == 0:
+    return
+  let canonical = canonicalPathFor(base)
+  let p = if canonical.len > 0: canonical else: base
+  var record = baseRecord(mrFileRead, moFileRead)
+  record.path = p
+  record.result = 0
+  record.detail = "resource-fork com.apple.ResourceFork"
+  emitRecord(record)
+
 proc recordOpen(callResult: cint; path: cstring; flags: cint; detail: string) {.raises: [].} =
   ## Record an mrFileOpen observation. Shared by the open/openat hooks. The
   ## fd→path map update and directory-enumeration follow-up are done by the
@@ -410,11 +535,16 @@ proc recordOpen(callResult: cint; path: cstring; flags: cint; detail: string) {.
   var d = detail
   # ROUND-2 R4 — stamp the opened file's (dev, ino) via a raw fstat
   # (reentrancy-free) so a hardlink-alternate-name open is matchable by inode
-  # identity (realpath cannot collapse a hardlink). Only on a successful open.
+  # identity (realpath cannot collapse a hardlink). ROUND-3 S1d — the SAME fstat
+  # also classifies the fd so a FIFO open is detected with NO extra syscall on the
+  # hot open path. Only on a successful open.
+  var isFifo = false
   if callResult >= 0:
     var dev, ino: uint64
-    if ct_macos_fd_dev_ino(callResult, addr dev, addr ino):
+    var kind: FdKind
+    if ct_macos_fd_dev_ino_kind(callResult, addr dev, addr ino, addr kind):
       d = devInoSuffix(d, dev, ino)
+      isFifo = kind == fkFifo
   var record = baseRecord(mrFileOpen, observationForOpen(flags))
   record.result = callResult.int64
   record.flags = uint32(flags)
@@ -423,6 +553,15 @@ proc recordOpen(callResult: cint; path: cstring; flags: cint; detail: string) {.
   if d.len > 0:
     record.detail = d
   emitRecord(record)
+  if callResult >= 0:
+    # ROUND-3 S1d — a FIFO open: record its direction so the merge can downgrade a
+    # read whose out-of-tree feeder is invisible (an entirely in-tree pipeline is
+    # paired and left alone — the cardinal-sin guard).
+    if isFifo:
+      recordFifoChannel(callResult, path, flags)
+    # ROUND-3 S1a — a `<file>/..namedfork/rsrc` open is a resource-fork read; also
+    # record the dependency against the underlying file (com.apple.ResourceFork).
+    recordResourceForkBase(path)
 
 proc recordPathProbe(callResult: cint; path: cstring; mode: cint; detail: string) {.raises: [].} =
   ## Record an mrPathProbe observation for the stat/lstat/fstatat/access family.
@@ -1003,8 +1142,23 @@ proc recordMmap(callResult: pointer; prot, flags, fd: cint) {.raises: [].} =
     return
   if (flags and MapShared) == 0:                  # private: writes don't hit disk
     return
-  if (prot and ProtWrite) == 0:                   # read-only: open already covers
-    return
+  # ROUND-3 S1b — a read-only MAP_SHARED mapping of an shm-backed fd IS a content
+  # read (the consumer reads the producer's bytes via a plain memory load, no
+  # read(2)). For a regular FILE a read mapping is already covered by the open, but
+  # an shm object is NOT a file the open hook saw, so without this the consumed
+  # content is invisible (research/.../r3_channel/probeC_shm_consumer.c). Record it
+  # as a content read on the shm name; the shm_open already emitted the out-of-tree
+  # provenance signal that the merge downgrades on.
+  if (prot and ProtWrite) == 0:                   # read-only mapping
+    let shm = shmNameForFd(fd)
+    if shm.len > 0:
+      var rd = baseRecord(mrFileRead, moFileRead)
+      rd.path = "shm:" & shm
+      rd.result = 0
+      rd.flags = uint32(fd)
+      rd.detail = "shm-mmap MAP_SHARED|PROT_READ"
+      emitRecord(rd)
+    return                                        # read-only file: open covers it
   let p = pathForFd(fd)
   if p.len == 0:
     return
@@ -1043,6 +1197,163 @@ const
   # double-counting (findings doc §"Coverage wins").
   CopyfileClone = 1'u32 shl 24
   CopyfileCloneForce = 1'u32 shl 25
+
+# --- ROUND-3 S1 — content-channel recorders ---------------------------------
+#
+# Close the round-3 S1 false negatives (research/adversarial-2026-06-round3):
+# CONTENT that reaches a build WITHOUT a hooked read(2) of a named file —
+# extended-attribute values (S1a), POSIX shared memory (S1b), inherited
+# socket/pipe fds (S1c), FIFOs and the sendfile/pread/readv zero-copy/positioned
+# reads (S1d). Two response classes, mirroring the round-2 split:
+#   * RECORD (no downgrade): an xattr read is a precise, attributable dependency
+#     (resolved path + attr name) and a sendfile/pread/readv is a normal content
+#     read on a NAMED in-tree file — these are added to the dependency set exactly
+#     like a read(2), never downgraded.
+#   * DOWNGRADE (reuse the IPC-breakaway machinery): a shm object / FIFO / inherited
+#     socket-pipe whose producer is OUT OF THE MONITORED TREE is an INVISIBLE input
+#     ⇒ emit an `mrExternalContent` the merge pairs against the in-tree create/write
+#     side; an UNPAIRED consume injects one event-loss ⇒ `mcIncomplete` (a
+#     conservative re-run). The CARDINAL-SIN GUARD is the pairing: an shm/FIFO a
+#     monitored process itself created+fed is fully accounted for and NEVER
+#     downgrades (see writer.externalContentLossCount).
+
+proc isSystemShmName(name: string): bool {.raises: [].} =
+  ## ROUND-3 S1b — true for a SYSTEM shm object the OS/libsystem maps on every
+  ## process (apple.shm.* / com.apple.*). Exempted from the out-of-tree downgrade
+  ## so a normal build is never falsely flagged (the cardinal-sin guard). A leading
+  ## '/' is stripped first (shm names are conventionally `/name`).
+  let n = if name.len > 0 and name[0] == '/': name[1 .. ^1] else: name
+  for prefix in SystemShmPrefixes:
+    if n.startsWith(prefix):
+      return true
+  false
+
+proc recordShmOpen(fd: cint; name: cstring; flags: cint) {.raises: [].} =
+  ## ROUND-3 S1b — record a POSIX `shm_open`. An shm_open WITH O_CREAT is the
+  ## CREATE side (in-tree provenance evidence; the cardinal-sin guard data); WITHOUT
+  ## O_CREAT it is an ATTACH/consume side. The fd→name map lets a subsequent
+  ## read-only MAP_SHARED mmap of the object be recorded as a content read
+  ## (recordMmap). Only a successful open (fd >= 0) is recorded. A SYSTEM shm
+  ## (apple.shm.* / com.apple.*) is NOT recorded as a content channel at all (it is
+  ## not a build input — see isSystemShmName), so it neither downgrades nor adds a
+  ## spurious content read.
+  if fd < 0 or name == nil:
+    return
+  let shmName = $name
+  if isSystemShmName(shmName):
+    return
+  addShmFd(fd, shmName)
+  let role = if (flags and OCreat) != 0: "create" else: "attach"
+  recordExternalContent("shm", role, "shm:" & shmName, fd)
+
+proc recordXattr(callResult: int; path: cstring; attrName: cstring;
+    valueLen: int; isList, isWrite: bool; detail: string) {.raises: [].} =
+  ## ROUND-3 S1a — record an extended-attribute access as a DEPENDENCY keyed on the
+  ## (resolved path, attribute name). An xattr VALUE is build-relevant content the
+  ## round-2 hook set missed entirely (getxattr never even open(2)s the file), so a
+  ## build that reads a dep from an xattr produced ZERO records → a proven false
+  ## cache hit (research/.../r3_xattr). We classify it as a PATH-PROBE on the file
+  ## with the attr name (and the value LENGTH for content sensitivity) in `detail`,
+  ## so a consumer folds the attr's value into its cache key. A READ xattr
+  ## (getxattr/listxattr) is a probe/input; a WRITE (setxattr/removexattr) is
+  ## additionally recorded as an output write on the file. Only a successful read
+  ## (callResult >= 0) / successful write (callResult == 0) is recorded.
+  if path == nil:
+    return
+  let raw = $path
+  if raw.len == 0:
+    return
+  # Normalise to the realpath so the dependency matches a consumer keyed on the
+  # canonical path (mirrors the round-2 path-probe canonicalisation). Muted inside
+  # canonicalPathFor; falls back to the raw path when realpath cannot resolve it.
+  let canonical = canonicalPathFor(raw)
+  let p = if canonical.len > 0: canonical else: raw
+  var d = detail
+  if isList:
+    if d.len > 0: d.add ' '
+    d.add "xattr-list"
+  elif attrName != nil and ($attrName).len > 0:
+    if d.len > 0: d.add ' '
+    d.add "xattr=" & $attrName
+  if valueLen >= 0:
+    d.add " vlen=" & $valueLen
+  if isWrite and callResult == 0:
+    var wr = baseRecord(mrFileWrite, moFileWrite)
+    wr.path = p
+    wr.result = callResult.int64
+    wr.detail = d
+    emitRecord(wr)
+  else:
+    recordPathProbe(cint(if callResult >= 0: 0 else: -1), cstring(p), 0, d)
+
+proc classifyEmptyFdRead(fd: cint) {.raises: [].} =
+  ## ROUND-3 S1c — a read on an fd with NO in-tree open record (`pathForFd` empty):
+  ## an inherited / dup'd fd the monitored process never open(2)'d (e.g. `tool <
+  ## input` redirected by an out-of-tree launcher, or process substitution).
+  ## Resolve the fd:
+  ##   * a REGULAR file or a CHAR/BLOCK device (stdin redirected from a file, a
+  ##     dup'd fd, /dev/null, a tty) → recover the backing path via F_GETPATH,
+  ##     record a CONTENT READ on it, and re-point the fd→path map so subsequent
+  ##     reads take the fast path. NO downgrade — the real input is now named.
+  ##   * a SOCKET / PIPE (FIFO/anonymous) → the source cannot be named. We emit an
+  ##     opaque `mrExternalContent` marker (RECORD-not-downgrade): socket provenance
+  ##     is owned by the IPC-connect machinery, which keeps intra-tree socket IPC
+  ##     mcComplete and downgrades only an out-of-tree breakaway peer — so flagging
+  ##     a downgrade here too would FALSE-FLAG every intra-tree socket/pipe exchange
+  ##     (the cardinal sin). See writer.externalContentLossCount. Flagged ONCE per
+  ##     fd so the hot read path stays cheap.
+  ## The fstat + F_GETPATH are raw syscalls (reentrancy-free) and run ONLY on the
+  ## empty-path branch (never on a normal in-tree read), so the hot path is intact.
+  if fd < 0 or emptyFdAlreadyClassified(fd):
+    return
+  var dev, ino: uint64
+  var kind: FdKind
+  if not ct_macos_fd_dev_ino_kind(fd, addr dev, addr ino, addr kind):
+    # fstat failed: cannot classify. Flag once so we do not retry per read.
+    markEmptyFdClassified(fd)
+    return
+  case kind
+  of fkRegular, fkCharDevice, fkBlockDevice:
+    var buf: array[1024, char]
+    if ct_macos_fd_real_path(fd, addr buf[0], csize_t(buf.len)) != 0:
+      let resolved = $cast[cstring](addr buf[0])
+      if resolved.len > 0:
+        updateFdPath(fd, cstring(resolved))   # future reads take the fast path
+        var record = baseRecord(mrFileRead, moFileRead)
+        record.path = resolved
+        record.result = 0
+        record.flags = uint32(fd)
+        record.detail = "inherited-fd"
+        emitRecord(record)
+        return
+    # Unresolvable regular/device fd: flag once (do not re-stat every read).
+    markEmptyFdClassified(fd)
+  of fkSocket, fkFifo, fkOther:
+    # Genuine out-of-tree content channel (an inherited socket or pipe whose peer
+    # is outside the monitored tree). A named FIFO opened in-tree goes through the
+    # open hook (recordFifoChannel) with its path, so reaching here means the fd
+    # was INHERITED with no in-tree open — out-of-tree. Emit once.
+    recordExternalContent("opaque", "read", "", fd)
+    markEmptyFdClassified(fd)
+  of fkDirectory:
+    markEmptyFdClassified(fd)
+
+proc recordFdRead(fd: cint; nbytes: int) {.raises: [].} =
+  ## ROUND-3 S1c/S1d — shared content-read recorder for read/pread/preadv/readv/
+  ## sendfile. When the fd has an in-tree open path, record a normal mrFileRead
+  ## (the round-2 behaviour, now reused by the positioned/zero-copy reads so
+  ## pread/readv/sendfile carry a file-READ, not just the file-open). When the path
+  ## is EMPTY, classify the inherited/dup'd fd (resolve a real file, else downgrade
+  ## an opaque source). Hot path: a single table lookup for the common in-tree fd.
+  let p = pathForFd(fd)
+  if p.len > 0:
+    var record = baseRecord(mrFileRead, moFileRead)
+    record.path = p
+    record.result = nbytes.int64
+    record.flags = uint32(fd)
+    emitRecord(record)
+  else:
+    classifyEmptyFdRead(fd)
 
 # --- ROUND-2 R-D (break R10) non-file determinism recorders -----------------
 #
@@ -1193,12 +1504,13 @@ proc repro_hook_read*(fd: cint; buf: pointer; count: csize_t): int {.exportc, cd
   if not initialized or disabled > 0:
     return ct_macos_interpose_real_read(fd, buf, count)
   result = ct_macos_interpose_real_read(fd, buf, count)
+  let savedErrno = getErrno()
   if result >= 0:
-    var record = baseRecord(mrFileRead, moFileRead)
-    record.path = pathForFd(fd)
-    record.result = result.int64
-    record.flags = uint32(fd)
-    emitRecord(record)
+    # ROUND-3 S1c — recordFdRead names an in-tree fd's read normally and resolves /
+    # downgrades an inherited empty-path fd (the F_GETPATH work runs ONLY on the
+    # empty-path branch, so the common in-tree read stays a single table lookup).
+    recordFdRead(fd, result)
+  setErrno(savedErrno)
 
 proc repro_hook_write*(fd: cint; buf: pointer; count: csize_t): int {.exportc, cdecl, dynlib.} =
   if not initialized or disabled > 0:
@@ -1216,6 +1528,198 @@ proc repro_hook_close*(fd: cint): cint {.exportc, cdecl, dynlib.} =
     return ct_macos_interpose_real_close(fd)
   result = ct_macos_interpose_real_close(fd)
   removeFdPath(fd)
+
+# --- ROUND-3 S1 content-channel hooks (interpose-only, like connect/copyfile) ---
+#
+# These are thin libsystem wrappers over their syscalls, so each forwards via the
+# RAW syscall (reentrancy-free, never re-enters its own interpose wrapper) and
+# then records. They are INTERPOSE-only: build tools call getxattr/shm_open/
+# sendfile/pread/readv DIRECTLY (not via shared-cache-internal libsystem paths the
+# way fopen reaches read), so the interpose tuple captures the program's own calls
+# and body-patching them would add early-init risk for no coverage gain — the same
+# rationale as the connect / R-D hooks.
+
+proc repro_hook_getxattr*(path, name: cstring; value: pointer; size: csize_t;
+    position: uint32; options: cint): int {.exportc, cdecl, dynlib.} =
+  ## ROUND-3 S1a — getxattr(2): reads an extended-attribute VALUE (codesign /
+  ## quarantine / ditto / custom build metadata). Recorded as a (resolved path,
+  ## attr name, value length) dependency so a consumer folds the value into its key.
+  if not initialized or disabled > 0:
+    return ct_macos_real_getxattr(path, name, value, size, position, options)
+  result = ct_macos_real_getxattr(path, name, value, size, position, options)
+  let savedErrno = getErrno()
+  recordXattr(result, path, name, (if result >= 0: result else: -1),
+    isList = false, isWrite = false, detail = "")
+  setErrno(savedErrno)
+
+proc repro_hook_fgetxattr*(fd: cint; name: cstring; value: pointer;
+    size: csize_t; position: uint32; options: cint): int
+    {.exportc, cdecl, dynlib.} =
+  ## ROUND-3 S1a — fgetxattr(2): the fd variant. Resolve fd→path (the open's
+  ## recorded path, else F_GETPATH) so the dependency names the real file.
+  if not initialized or disabled > 0:
+    return ct_macos_real_fgetxattr(fd, name, value, size, position, options)
+  result = ct_macos_real_fgetxattr(fd, name, value, size, position, options)
+  let savedErrno = getErrno()
+  var p = pathForFd(fd)
+  if p.len == 0:
+    var buf: array[1024, char]
+    if ct_macos_fd_real_path(fd, addr buf[0], csize_t(buf.len)) != 0:
+      p = $cast[cstring](addr buf[0])
+  if p.len > 0:
+    recordXattr(result, cstring(p), name, (if result >= 0: result else: -1),
+      isList = false, isWrite = false, detail = "fd")
+  setErrno(savedErrno)
+
+proc repro_hook_listxattr*(path: cstring; namebuf: pointer; size: csize_t;
+    options: cint): int {.exportc, cdecl, dynlib.} =
+  ## ROUND-3 S1a — listxattr(2): a NAMESET dependency on the file (the output may
+  ## branch on whether an attr is present, as in r3_xattr/list_read.c).
+  if not initialized or disabled > 0:
+    return ct_macos_real_listxattr(path, namebuf, size, options)
+  result = ct_macos_real_listxattr(path, namebuf, size, options)
+  let savedErrno = getErrno()
+  recordXattr(result, path, nil, (if result >= 0: result else: -1),
+    isList = true, isWrite = false, detail = "")
+  setErrno(savedErrno)
+
+proc repro_hook_flistxattr*(fd: cint; namebuf: pointer; size: csize_t;
+    options: cint): int {.exportc, cdecl, dynlib.} =
+  ## ROUND-3 S1a — flistxattr(2): the fd variant of the nameset dependency.
+  if not initialized or disabled > 0:
+    return ct_macos_real_flistxattr(fd, namebuf, size, options)
+  result = ct_macos_real_flistxattr(fd, namebuf, size, options)
+  let savedErrno = getErrno()
+  var p = pathForFd(fd)
+  if p.len == 0:
+    var buf: array[1024, char]
+    if ct_macos_fd_real_path(fd, addr buf[0], csize_t(buf.len)) != 0:
+      p = $cast[cstring](addr buf[0])
+  if p.len > 0:
+    recordXattr(result, cstring(p), nil, (if result >= 0: result else: -1),
+      isList = true, isWrite = false, detail = "fd")
+  setErrno(savedErrno)
+
+proc repro_hook_setxattr*(path, name: cstring; value: pointer; size: csize_t;
+    position: uint32; options: cint): cint {.exportc, cdecl, dynlib.} =
+  ## ROUND-3 S1a (output side) — setxattr(2) writes an xattr VALUE: an OUTPUT write
+  ## on the file keyed on the attr name (so a build that emits a dep into an xattr
+  ## is matchable too).
+  if not initialized or disabled > 0:
+    return ct_macos_real_setxattr(path, name, value, size, position, options)
+  result = ct_macos_real_setxattr(path, name, value, size, position, options)
+  let savedErrno = getErrno()
+  recordXattr(int(result), path, name, int(size), isList = false,
+    isWrite = true, detail = "xattr-set")
+  setErrno(savedErrno)
+
+proc repro_hook_fsetxattr*(fd: cint; name: cstring; value: pointer;
+    size: csize_t; position: uint32; options: cint): cint
+    {.exportc, cdecl, dynlib.} =
+  ## ROUND-3 S1a (output side) — fsetxattr(2): the fd variant.
+  if not initialized or disabled > 0:
+    return ct_macos_real_fsetxattr(fd, name, value, size, position, options)
+  result = ct_macos_real_fsetxattr(fd, name, value, size, position, options)
+  let savedErrno = getErrno()
+  var p = pathForFd(fd)
+  if p.len == 0:
+    var buf: array[1024, char]
+    if ct_macos_fd_real_path(fd, addr buf[0], csize_t(buf.len)) != 0:
+      p = $cast[cstring](addr buf[0])
+  if p.len > 0:
+    recordXattr(int(result), cstring(p), name, int(size), isList = false,
+      isWrite = true, detail = "xattr-set fd")
+  setErrno(savedErrno)
+
+proc repro_hook_removexattr*(path, name: cstring; options: cint): cint
+    {.exportc, cdecl, dynlib.} =
+  ## ROUND-3 S1a (output side) — removexattr(2): an OUTPUT mutation of the file.
+  if not initialized or disabled > 0:
+    return ct_macos_real_removexattr(path, name, options)
+  result = ct_macos_real_removexattr(path, name, options)
+  let savedErrno = getErrno()
+  recordXattr(int(result), path, name, -1, isList = false, isWrite = true,
+    detail = "xattr-remove")
+  setErrno(savedErrno)
+
+proc repro_hook_fremovexattr*(fd: cint; name: cstring; options: cint): cint
+    {.exportc, cdecl, dynlib.} =
+  ## ROUND-3 S1a (output side) — fremovexattr(2): the fd variant.
+  if not initialized or disabled > 0:
+    return ct_macos_real_fremovexattr(fd, name, options)
+  result = ct_macos_real_fremovexattr(fd, name, options)
+  let savedErrno = getErrno()
+  var p = pathForFd(fd)
+  if p.len == 0:
+    var buf: array[1024, char]
+    if ct_macos_fd_real_path(fd, addr buf[0], csize_t(buf.len)) != 0:
+      p = $cast[cstring](addr buf[0])
+  if p.len > 0:
+    recordXattr(int(result), cstring(p), name, -1, isList = false,
+      isWrite = true, detail = "xattr-remove fd")
+  setErrno(savedErrno)
+
+proc repro_hook_shm_open*(name: cstring; oflag, mode: cint): cint
+    {.exportc, cdecl, dynlib.} =
+  ## ROUND-3 S1b — shm_open(3). An shm object NOT created in-tree (no in-tree
+  ## shm_open(O_CREAT) for that name) is an OUT-OF-TREE content source the merge
+  ## downgrades on; a self-produced shm (create AND consume in-tree) is paired and
+  ## stays mcComplete (the cardinal-sin guard). See recordShmOpen.
+  if not initialized or disabled > 0:
+    return ct_macos_real_shm_open(name, oflag, mode)
+  result = ct_macos_real_shm_open(name, oflag, mode)
+  let savedErrno = getErrno()
+  recordShmOpen(result, name, oflag)
+  setErrno(savedErrno)
+
+proc repro_hook_sendfile*(fd, s: cint; offset: int64; len: ptr int64;
+    hdtr: pointer; flags: cint): cint {.exportc, cdecl, dynlib.} =
+  ## ROUND-3 S1d — sendfile(2) zero-copy: the kernel reads the SOURCE fd's content
+  ## (arg 1) and writes it to the socket with NO read(2). Record a content read on
+  ## the source so its classification matches a normal read (today the source left
+  ## only its open record). research/.../r3_channel/probeB_sendfile.c.
+  if not initialized or disabled > 0:
+    return ct_macos_real_sendfile(fd, s, offset, len, hdtr, flags)
+  result = ct_macos_real_sendfile(fd, s, offset, len, hdtr, flags)
+  let savedErrno = getErrno()
+  if result == 0:
+    let moved = if len != nil: int(len[]) else: 0
+    recordFdRead(fd, moved)
+  setErrno(savedErrno)
+
+proc repro_hook_pread*(fd: cint; buf: pointer; count: csize_t;
+    offset: int64): int {.exportc, cdecl, dynlib.} =
+  ## ROUND-3 S1d — pread(2) positioned read: content via the source fd with NO
+  ## read(2). Record an mrFileRead on the fd's path (probeA_pread.c).
+  if not initialized or disabled > 0:
+    return ct_macos_real_pread(fd, buf, count, offset)
+  result = ct_macos_real_pread(fd, buf, count, offset)
+  let savedErrno = getErrno()
+  if result >= 0:
+    recordFdRead(fd, result)
+  setErrno(savedErrno)
+
+proc repro_hook_preadv*(fd: cint; iov: pointer; iovcnt: cint;
+    offset: int64): int {.exportc, cdecl, dynlib.} =
+  ## ROUND-3 S1d — preadv(2): positioned scatter read.
+  if not initialized or disabled > 0:
+    return ct_macos_real_preadv(fd, iov, iovcnt, offset)
+  result = ct_macos_real_preadv(fd, iov, iovcnt, offset)
+  let savedErrno = getErrno()
+  if result >= 0:
+    recordFdRead(fd, result)
+  setErrno(savedErrno)
+
+proc repro_hook_readv*(fd: cint; iov: pointer; iovcnt: cint): int
+    {.exportc, cdecl, dynlib.} =
+  ## ROUND-3 S1d — readv(2): scatter read (NOT the hooked read(2)). probeA_pread.c.
+  if not initialized or disabled > 0:
+    return ct_macos_real_readv(fd, iov, iovcnt)
+  result = ct_macos_real_readv(fd, iov, iovcnt)
+  let savedErrno = getErrno()
+  if result >= 0:
+    recordFdRead(fd, result)
+  setErrno(savedErrno)
 
 proc repro_hook_mmap*(adr: pointer; length: csize_t; prot, flags, fd: cint;
     offset: int64): pointer {.exportc, cdecl, dynlib.} =
@@ -3124,6 +3628,106 @@ static time_t repro_wrap_time(time_t *tloc) {
  * hazard; monotonic counter, not a wall clock). See the Nim/runtime R-D notes. */
 
 /*
+ * ROUND-3 S1 content-channel interpose thunks. Each forwards to the GENUINE entry
+ * (the raw-syscall forwarder) before the recording runtime is live, then branches
+ * to the recording repro_hook_* (which itself forwards via the raw syscall, so it
+ * never re-enters this wrapper). INTERPOSE-ONLY (see the Nim hook docs); like the
+ * other hardening thunks they omit the debug-only interpose-DISABLE A/B forward.
+ */
+static ssize_t repro_wrap_getxattr(const char *path, const char *name,
+    void *value, size_t size, uint32_t position, int options) {
+  if (!repro_monitor_runtime_ready)
+    return (ssize_t)syscall(SYS_getxattr, path, name, value, size, position,
+      options);
+  return repro_hook_getxattr((char *)path, (char *)name, value, size, position,
+    options);
+}
+static ssize_t repro_wrap_fgetxattr(int fd, const char *name, void *value,
+    size_t size, uint32_t position, int options) {
+  if (!repro_monitor_runtime_ready)
+    return (ssize_t)syscall(SYS_fgetxattr, fd, name, value, size, position,
+      options);
+  return repro_hook_fgetxattr(fd, (char *)name, value, size, position, options);
+}
+static ssize_t repro_wrap_listxattr(const char *path, char *namebuf,
+    size_t size, int options) {
+  if (!repro_monitor_runtime_ready)
+    return (ssize_t)syscall(SYS_listxattr, path, namebuf, size, options);
+  return repro_hook_listxattr((char *)path, namebuf, size, options);
+}
+static ssize_t repro_wrap_flistxattr(int fd, char *namebuf, size_t size,
+    int options) {
+  if (!repro_monitor_runtime_ready)
+    return (ssize_t)syscall(SYS_flistxattr, fd, namebuf, size, options);
+  return repro_hook_flistxattr(fd, namebuf, size, options);
+}
+static int repro_wrap_setxattr(const char *path, const char *name, void *value,
+    size_t size, uint32_t position, int options) {
+  if (!repro_monitor_runtime_ready)
+    return (int)syscall(SYS_setxattr, path, name, value, size, position,
+      options);
+  return repro_hook_setxattr((char *)path, (char *)name, value, size, position,
+    options);
+}
+static int repro_wrap_fsetxattr(int fd, const char *name, void *value,
+    size_t size, uint32_t position, int options) {
+  if (!repro_monitor_runtime_ready)
+    return (int)syscall(SYS_fsetxattr, fd, name, value, size, position, options);
+  return repro_hook_fsetxattr(fd, (char *)name, value, size, position, options);
+}
+static int repro_wrap_removexattr(const char *path, const char *name,
+    int options) {
+  if (!repro_monitor_runtime_ready)
+    return (int)syscall(SYS_removexattr, path, name, options);
+  return repro_hook_removexattr((char *)path, (char *)name, options);
+}
+static int repro_wrap_fremovexattr(int fd, const char *name, int options) {
+  if (!repro_monitor_runtime_ready)
+    return (int)syscall(SYS_fremovexattr, fd, name, options);
+  return repro_hook_fremovexattr(fd, (char *)name, options);
+}
+
+/* shm_open is VARIADIC (int shm_open(const char *, int, ...)); mode is supplied
+ * only with O_CREAT and — on the arm64 Apple ABI — lives on the STACK, so we read
+ * it via va_arg (exactly like repro_wrap_open). */
+static int repro_wrap_shm_open(const char *name, int oflag, ...) {
+  int mode = 0;
+  if (oflag & O_CREAT) {
+    va_list ap;
+    va_start(ap, oflag);
+    mode = va_arg(ap, int);
+    va_end(ap);
+  }
+  if (!repro_monitor_runtime_ready)
+    return (int)syscall(SYS_shm_open, name, oflag, mode);
+  return repro_hook_shm_open((char *)name, oflag, mode);
+}
+
+static int repro_wrap_sendfile(int fd, int s, off_t offset, off_t *len,
+    void *hdtr, int flags) {
+  if (!repro_monitor_runtime_ready)
+    return (int)syscall(SYS_sendfile, fd, s, offset, len, hdtr, flags);
+  return repro_hook_sendfile(fd, s, (long long)offset, (long long *)len, hdtr,
+    flags);
+}
+static ssize_t repro_wrap_pread(int fd, void *buf, size_t count, off_t offset) {
+  if (!repro_monitor_runtime_ready)
+    return (ssize_t)syscall(SYS_pread, fd, buf, count, offset);
+  return repro_hook_pread(fd, buf, count, (long long)offset);
+}
+static ssize_t repro_wrap_preadv(int fd, const struct iovec *iov, int iovcnt,
+    off_t offset) {
+  if (!repro_monitor_runtime_ready)
+    return (ssize_t)syscall(SYS_preadv, fd, iov, iovcnt, offset);
+  return repro_hook_preadv(fd, (void *)iov, iovcnt, (long long)offset);
+}
+static ssize_t repro_wrap_readv(int fd, const struct iovec *iov, int iovcnt) {
+  if (!repro_monitor_runtime_ready)
+    return (ssize_t)syscall(SYS_readv, fd, iov, iovcnt);
+  return repro_hook_readv(fd, (void *)iov, iovcnt);
+}
+
+/*
  * Body-patch hook ADDRESS accessors for the VARIADIC open/openat wrappers.
  *
  * Why the body-patch backend MUST use the variadic repro_wrap_open(at) thunks --
@@ -3279,7 +3883,25 @@ static struct {
   { (const void *)repro_wrap_arc4random, (const void *)arc4random },
   { (const void *)repro_wrap_arc4random_buf, (const void *)arc4random_buf },
   { (const void *)repro_wrap_arc4random_uniform,
-    (const void *)arc4random_uniform }
+    (const void *)arc4random_uniform },
+  /* ROUND-3 S1 content-channel hooks. xattr family (S1a — metadata reads/writes),
+   * shm_open (S1b — POSIX shared memory), and the sendfile/pread/preadv/readv
+   * zero-copy/positioned reads (S1d — content classification). Interpose-only
+   * (see the thunks). The FIFO (S1d) and inherited socket/pipe (S1c) downgrades
+   * ride the existing open/read hooks, so they need no new tuple entry. */
+  { (const void *)repro_wrap_getxattr, (const void *)getxattr },
+  { (const void *)repro_wrap_fgetxattr, (const void *)fgetxattr },
+  { (const void *)repro_wrap_listxattr, (const void *)listxattr },
+  { (const void *)repro_wrap_flistxattr, (const void *)flistxattr },
+  { (const void *)repro_wrap_setxattr, (const void *)setxattr },
+  { (const void *)repro_wrap_fsetxattr, (const void *)fsetxattr },
+  { (const void *)repro_wrap_removexattr, (const void *)removexattr },
+  { (const void *)repro_wrap_fremovexattr, (const void *)fremovexattr },
+  { (const void *)repro_wrap_shm_open, (const void *)shm_open },
+  { (const void *)repro_wrap_sendfile, (const void *)sendfile },
+  { (const void *)repro_wrap_pread, (const void *)pread },
+  { (const void *)repro_wrap_preadv, (const void *)preadv },
+  { (const void *)repro_wrap_readv, (const void *)readv }
   /* getdirentries is intentionally NOT in the interpose tuple: the SDK header
    * poisons the symbol under 64-bit inodes (`getdirentries_is_not_available…`),
    * so it cannot be referenced here. It is body-patched by string name instead

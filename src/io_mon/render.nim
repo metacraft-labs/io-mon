@@ -23,6 +23,7 @@ proc recordKindName(record: MonitorRecord): string =
   of mrSysctlRead: "sysctl-read"
   of mrNonDeterministic: "non-deterministic"
   of mrTimeRead: "time-read"
+  of mrExternalContent: "external-content"
 
 proc observationKindName(record: MonitorRecord): string =
   case record.observationKind
@@ -41,6 +42,7 @@ proc observationKindName(record: MonitorRecord): string =
   of moSysctlRead: "sysctl-read"
   of moNonDeterministic: "non-deterministic"
   of moTimeRead: "time-read"
+  of moExternalContent: "external-content"
 
 proc itemKindName(kind: FsSnoopStreamItemKind): string =
   case kind

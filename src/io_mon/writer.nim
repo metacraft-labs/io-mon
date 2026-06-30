@@ -723,6 +723,8 @@ const
   PeerStartTimeToken = "peerstart"  ## ipc-connect: the PEER pid's kernel start usec
   RunIdToken = "run"                ## process-start / ipc-connect: invocation run id
   NonceToken = "nonce"              ## ipc-connect: per-connection nonce (R8)
+  ChanToken = "chan"                ## ROUND-3 S1: external-content channel class
+  RoleToken = "role"                ## ROUND-3 S1: external-content channel side
 
 proc detailToken*(detail, key: string): string =
   ## Extract the value of a `key=value` token from a record's `detail` field
@@ -910,6 +912,66 @@ proc nonDeterminismLossCount*(records: openArray[MonitorRecord]): int =
   result = 0
   for r in records:
     if r.kind == mrNonDeterministic:
+      inc result
+
+proc externalContentLossCount*(records: openArray[MonitorRecord]): int =
+  ## ROUND-3 S1 (content-channel downgrade) — returns the number of synthetic
+  ## event-loss records to inject because the merged evidence proves the build
+  ## CONSUMED CONTENT from a channel whose producer is OUTSIDE the monitored tree:
+  ## a POSIX shm object it did not create in-tree (S1b), a FIFO with no in-tree
+  ## writer (S1d), or an inherited socket/pipe (S1c). Each is an INVISIBLE input
+  ## (no read(2) of a named file), so — reusing the IPC-breakaway machinery — one
+  ## loss forces `mcIncomplete`, a conservative re-run.
+  ##
+  ## THE CARDINAL-SIN GUARD is cross-process PAIRING (the whole point of routing
+  ## this through the merge rather than downgrading at the shim): a channel a
+  ## MONITORED process itself created/fed is fully accounted for and must NEVER
+  ## downgrade —
+  ##   * shm: an `attach` (consume) whose name has a matching in-tree `create`
+  ##     (shm_open with O_CREAT) is self-produced ⇒ no loss. Only an UNPAIRED
+  ##     attach (the out-of-tree producer of probeC) downgrades.
+  ##   * fifo: a `read` whose path has a matching in-tree `write` open is an
+  ##     in-tree pipeline ⇒ no loss. Only a read with no in-tree writer (the
+  ##     out-of-tree feeder of probeD) downgrades.
+  ## Dedup keys collapse a channel touched many times to a single loss.
+  ##
+  ## DELIBERATELY NOT a downgrade signal: `chan=opaque` (an inherited socket/pipe
+  ## read with no in-tree open). Socket provenance is OWNED by the IPC-connect
+  ## machinery (`unmonitoredSubtreeLossCount`), which correctly leaves INTRA-TREE
+  ## socket IPC `mcComplete` while downgrading an out-of-tree breakaway peer — so
+  ## a second downgrade here would FALSE-FLAG every legitimate intra-tree socket
+  ## IPC / anonymous pipeline (the cardinal sin; see the macOS ipc-breakaway
+  ## intra-tree test). An inherited socket/pipe from an OUT-OF-TREE parent is
+  ## already caught by the un-injected-subtree check. The opaque marker is
+  ## therefore RECORD-not-downgrade (a diagnostic a consumer MAY act on), mirroring
+  ## the round-2 `mrTimeRead` stance.
+  var shmCreates = initHashSet[string]()
+  var fifoWrites = initHashSet[string]()
+  for r in records:
+    if r.kind == mrExternalContent and
+        detailToken(r.detail, ChanToken) == "shm" and
+        detailToken(r.detail, RoleToken) == "create":
+      shmCreates.incl r.path
+    elif r.kind == mrExternalContent and
+        detailToken(r.detail, ChanToken) == "fifo" and
+        detailToken(r.detail, RoleToken) == "write":
+      fifoWrites.incl r.path
+  result = 0
+  var flagged = initHashSet[string]()
+  for r in records:
+    if r.kind != mrExternalContent:
+      continue
+    let chan = detailToken(r.detail, ChanToken)
+    let role = detailToken(r.detail, RoleToken)
+    var key = ""
+    if chan == "shm" and role == "attach":
+      if r.path notin shmCreates:
+        key = "shm:" & r.path
+    elif chan == "fifo" and role == "read":
+      if r.path notin fifoWrites:
+        key = "fifo:" & r.path
+    if key.len > 0 and key notin flagged:
+      flagged.incl key
       inc result
 
 const
@@ -1246,6 +1308,22 @@ proc mergeFragments*(fragmentDir, outputPath: string;
       observationKind: moEventLoss,
       detail: "non-deterministic input consumed (the program's own code called " &
         "getentropy/arc4random) — build is not reproducible, always re-run")
+  # ROUND-3 S1 — DOWNGRADE on out-of-tree CONTENT CHANNELS: a POSIX shm object not
+  # created in-tree, or a FIFO with no in-tree writer. The producer is outside the
+  # monitored tree so the consumed content is an invisible input. One synthetic
+  # event-loss per unpaired channel forces `mcIncomplete` via the SAME machinery as
+  # the IPC-breakaway / non-determinism downgrades — a conservative re-run. A
+  # channel a monitored process itself created+fed is paired and does NOT downgrade
+  # (the cardinal-sin guard); an inherited socket/pipe is record-not-downgrade
+  # (socket provenance is owned by the IPC-connect machinery). See
+  # externalContentLossCount.
+  let externalContentLosses = externalContentLossCount(records)
+  for _ in 0 ..< externalContentLosses:
+    records.add MonitorRecord(kind: mrEventLoss,
+      observationKind: moEventLoss,
+      detail: "out-of-tree content channel consumed (POSIX shm not created " &
+        "in-tree, or FIFO with no in-tree writer) — the real input is " &
+        "invisible, re-run")
   records.add profileRecords(defaultHooksMonitorProfile(
     when defined(linux): LinuxPreloadSupportedCapabilities
     else: MacosMonitorShimTaxonomyCapabilities))
