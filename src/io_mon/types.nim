@@ -102,6 +102,20 @@ type
     # + a monitored mmap-PROT_READ consumer, a FIFO fed by an out-of-tree writer,
     # and an inherited socket/pipe read each produced ZERO downgrade.
     mrExternalContent = 18
+    # ROUND-4 RW2 (break D3): an OUTPUT-DIRECTORY MUTATION — mkdir / mkdirat /
+    # rmdir / unlink / unlinkat. These take real effect on the output tree but
+    # round-3 produced NO record at all (the shim hooked only rename among the
+    # mutation surface), and the depfile self-declared a `path-mutation` capability
+    # gap marked required=false, so completeness stayed mcComplete despite the
+    # unhooked surface (research/adversarial-2026-06-round4/r4_dir/misc_probe.c).
+    # The shim now records each successful mutation against the canonical path so
+    # the output-dir state is tracked. APPENDED AT THE END to preserve RMDF
+    # wire-compat (the dgNoRuntimeDependencies / mrIpcConnect / mrExternalContent
+    # lesson — never renumber an existing case). `detail` names the syscall
+    # (`mkdir`/`mkdirat`/`rmdir`/`unlink`/`unlinkat`). This is an OUTPUT-side fact,
+    # NOT a determinism input: the merge does not downgrade on it (a normal build
+    # creates dirs + removes temp files), so a NORMAL build stays mcComplete.
+    mrPathMutation = 19
 
   MonitorObservationKind* = enum
     moProcessStart = 1
@@ -131,6 +145,12 @@ type
     # kind treats moExternalContent as a provenance marker the merge resolves; it is
     # NOT itself a read/write of a named file.
     moExternalContent = 16
+    # ROUND-4 RW2 — observation kind for the output-directory mutation record
+    # (appended for wire-compat, see mrPathMutation). A consumer that keys on the
+    # observation kind treats moPathMutation as an OUTPUT-side mutation of the named
+    # path (the dir/file was created or removed); it is recorded for output-tree
+    # state tracking and is NOT a determinism downgrade.
+    moPathMutation = 17
 
   ProbeResult* = enum
     prUnknown = 0
