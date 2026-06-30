@@ -369,3 +369,174 @@ suite "io-mon R5 kill-before-flush durability (reading-sentinel)":
     let dep = mergeFragments(frag, work / "out.rdep")
     check dep.completeness == mcComplete
     removeDir(work)
+
+suite "io-mon S3a self-authored breakaway-report forgery (write provenance)":
+  # ROUND-3 S3a — the res4_forge break: an in-tree client reads REPRO_MONITOR_SESSION
+  # from its env, REALLY connects to an out-of-tree daemon (so the connection is
+  # observed), then forges a `complete` report listing a DECOY read and OMITTING the
+  # file the daemon truly served — defeating every R8 auth criterion (a client-side
+  # nonce is recorded in the client's OWN fragment, so it is no secret from an
+  # in-tree forger). The structural closure: a genuine cooperating daemon is OUT OF
+  # TREE, so the shim never records it writing its report; an in-tree forger IS
+  # monitored, so the shim DID record the write of its report file. A report whose
+  # own file is an in-tree output write is therefore rejected as a forgery. These
+  # platform-independent tests drive the exact write-provenance discriminator.
+  const runId = "session-s3a-xyz"
+
+  proc clientFragWithWrite(work, reportPath: string;
+      clientPid, daemonPid: uint64): string =
+    ## A client fragment: process-start + an ipc-connect to an OUT-OF-TREE daemon
+    ## (so without a valid report the merge downgrades) + a WRITE of `reportPath`
+    ## (the forger authoring its own report file — the in-tree provenance signal).
+    let frag = work / "frags"
+    createDir(frag)
+    appendFragmentRecord(frag, startAt(clientPid, "7000", runId))
+    appendFragmentRecord(frag, ipcPeerAt(clientPid, daemonPid, "8000",
+      "/tmp/sccache.sock", runId, "noncedeadbeef"))
+    # The forger's own report-file WRITE, recorded by the shim (moFileWrite). Carries
+    # a (dev, ino) so the alias-proof backstop is exercised too.
+    appendFragmentRecord(frag, MonitorRecord(kind: mrFileWrite,
+      observationKind: moFileWrite, osPid: clientPid, path: reportPath,
+      detail: "dev=99 ino=12345"))
+    frag
+
+  test "FORGED: an in-tree-AUTHORED complete report is rejected (mcIncomplete)":
+    let work = getTempDir() / ("io-mon-s3a-forge-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let reportDir = work / "reports"
+    createDir(reportDir)
+    let reportPath = reportDir / "forged.io-mon-report"
+    let frag = clientFragWithWrite(work, reportPath, 4242'u64, 9999'u64)
+    # A report passing ALL R8 criteria (run, observed peer, complete, a read) — but
+    # its own file was written in-tree, so it is a forgery.
+    writeFile(reportPath,
+      "io-mon-breakaway-report v1\nrun " & runId & "\nclient 4242\ndaemon 9999\n" &
+        "read /tmp/DECOY.txt\ncomplete\n")
+    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    check dep.completeness == mcIncomplete
+    # The decoy must NOT have been folded as a dependency.
+    for r in dep.records:
+      check r.path != "/tmp/DECOY.txt"
+    removeDir(work)
+
+  test "FORGED by (dev,ino) alias: a /private vs /tmp spelling is still rejected":
+    # The report path the shim recorded differs in spelling from the walked path, so
+    # only the (dev, ino) backstop can catch it. We point the recorded WRITE path at
+    # a non-matching string but stamp the SAME (dev, ino) the report file will have.
+    let work = getTempDir() / ("io-mon-s3a-ino-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let reportDir = work / "reports"
+    createDir(reportDir)
+    let reportPath = reportDir / "aliased.io-mon-report"
+    writeFile(reportPath,
+      "io-mon-breakaway-report v1\nrun " & runId & "\nclient 4242\ndaemon 9999\n" &
+        "read /tmp/DECOY.txt\ncomplete\n")
+    let info = getFileInfo(reportPath)
+    let dev = $cast[uint64](info.id.device)
+    let ino = $cast[uint64](info.id.file)
+    let frag = work / "frags"
+    createDir(frag)
+    appendFragmentRecord(frag, startAt(4242'u64, "7000", runId))
+    appendFragmentRecord(frag, ipcPeerAt(4242'u64, 9999'u64, "8000",
+      "/tmp/sccache.sock", runId, "noncedeadbeef"))
+    # A DIFFERENT path spelling, but the SAME (dev, ino) as the report file.
+    appendFragmentRecord(frag, MonitorRecord(kind: mrFileWrite,
+      observationKind: moFileWrite, osPid: 4242'u64,
+      path: "/some/other/spelling.io-mon-report",
+      detail: "dev=" & dev & " ino=" & ino))
+    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    check dep.completeness == mcIncomplete
+    removeDir(work)
+
+  test "CARDINAL SIN: an out-of-tree daemon's report (no in-tree write) is honored":
+    # The legitimate trusted-daemon path: the daemon is out of tree, so NO write
+    # record for its report file exists; the report stays authenticated, the build
+    # stays mcComplete, and the served read is folded.
+    let work = getTempDir() / ("io-mon-s3a-legit-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let reportDir = work / "reports"
+    createDir(reportDir)
+    let frag = work / "frags"
+    createDir(frag)
+    appendFragmentRecord(frag, startAt(4242'u64, "7000", runId))
+    appendFragmentRecord(frag, ipcPeerAt(4242'u64, 9999'u64, "8000",
+      "/tmp/sccache.sock", runId, "noncedeadbeef"))
+    let served = "/some/served/header.h"
+    writeFile(reportDir / "report-4242-9999-0.io-mon-report",
+      "io-mon-breakaway-report v1\nrun " & runId & "\nclient 4242\ndaemon 9999\n" &
+        "read " & served & "\ncomplete\n")
+    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    check dep.completeness == mcComplete
+    var sawServed = false
+    for r in dep.records:
+      if r.path == served and r.observationKind == moFileRead: sawServed = true
+    check sawServed
+    removeDir(work)
+
+suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
+  # ROUND-3 S3c — mergeFragments consumes the kill-sentinels but does NOT delete the
+  # `.rmdf-frag` files, so a library caller that RE-MERGES a reused fragment dir
+  # (a warm restart) would fold a PRIOR run's records (merge_attack.nim): a stale
+  # run-1 process-start makes a run-2 out-of-tree breakaway peer look in-tree ⇒ a
+  # FALSE mcComplete, plus the stale reads pollute the depfile. The guard namespaces
+  # by the invocation run id and drops records owned by a different run.
+  proc readRec(pid: uint64; path: string): MonitorRecord =
+    MonitorRecord(kind: mrFileRead, observationKind: moFileRead,
+      osPid: pid, path: path)
+
+  test "a stale prior-run fragment is NOT folded; the breakaway downgrades":
+    let work = getTempDir() / ("io-mon-s3c-warm-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let frag = work / "frags"
+    createDir(frag)
+    # RUN 1: pid 500 is a monitored in-tree process of run "r1" that reads /fileA.
+    appendFragmentRecord(frag, startAt(500'u64, "111", "r1"))
+    appendFragmentRecord(frag, readRec(500'u64, "/fileA"))
+    closeFragmentSlot()
+    check mergeFragments(frag, work / "r1.rdep", currentRunId = "r1").completeness ==
+      mcComplete
+    # RUN 2 reuses the SAME dir (warm restart). A DIFFERENT client pid 600 connects
+    # to an OUT-OF-TREE daemon whose pid is 500 (recycled) — the stale run-1
+    # process-start for pid 500 would otherwise mask the out-of-tree peer.
+    appendFragmentRecord(frag, startAt(600'u64, "222", "r2"))
+    appendFragmentRecord(frag, ipcPeerAt(600'u64, 500'u64, "", "/tmp/d.sock", "r2"))
+    closeFragmentSlot()
+    let dep = mergeFragments(frag, work / "r2.rdep", currentRunId = "r2")
+    # The stale run-1 start for pid 500 is dropped, so peer 500 is out-of-tree…
+    check dep.completeness == mcIncomplete
+    # …and the stale run-1 read /fileA is NOT folded into run-2's depfile.
+    for r in dep.records:
+      check r.path != "/fileA"
+    removeDir(work)
+
+  test "a clean current-run dir is unaffected (no false downgrade)":
+    # The fresh-dir guarantee the CLI relies on: every fragment belongs to the
+    # current run, so nothing is dropped and a fully-monitored read stays complete.
+    let work = getTempDir() / ("io-mon-s3c-fresh-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let frag = work / "frags"
+    createDir(frag)
+    appendFragmentRecord(frag, startAt(700'u64, "1000", "r2"))
+    appendFragmentRecord(frag, readRec(700'u64, "/dep/header.h"))
+    closeFragmentSlot()
+    let dep = mergeFragments(frag, work / "out.rdep", currentRunId = "r2")
+    check dep.completeness == mcComplete
+    var sawDep = false
+    for r in dep.records:
+      if r.path == "/dep/header.h": sawDep = true
+    check sawDep
+    removeDir(work)
+
+  test "without a run id (legacy fresh-dir callers) nothing is filtered":
+    # Empty currentRunId + no env ⇒ legacy behaviour: the merge folds every fragment
+    # exactly as before, so a single-run dir is unaffected.
+    let work = getTempDir() / ("io-mon-s3c-legacy-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let frag = work / "frags"
+    createDir(frag)
+    appendFragmentRecord(frag, startAt(800'u64, "1000", "r9"))
+    appendFragmentRecord(frag, readRec(800'u64, "/dep/x.h"))
+    closeFragmentSlot()
+    let dep = mergeFragments(frag, work / "out.rdep")
+    check dep.completeness == mcComplete
+    removeDir(work)
