@@ -376,8 +376,9 @@ proc linuxPreloadMonitorProfile*(
   result.diagnostics.add MonitorDiagnostic(
     level: mdlInfo,
     message: "Linux raw syscall coverage is stackable-backed; io-mon " &
-      "classifies common file/probe syscalls and fails closed for " &
-      "unsupported raw syscall numbers")
+      "classifies common file/probe syscalls from libc, main-executable, " &
+      "and startup non-system application-DSO raw syscall sites and fails " &
+      "closed for unsupported raw syscall numbers")
 
   var gapCapabilities = LinuxPreloadKnownUnsupportedCapabilities
   for capability in required:

@@ -77,16 +77,20 @@ to start as an honest stub today.
   `open`/`read` paths, glibc `fopen`/`fread` stream reads, and `connect(2)` IPC
   establishment; a monitored process that talks to an out-of-tree Unix/TCP
   daemon now fails closed as `mcIncomplete`. Raw `syscall(2)` and safe
-  main-executable inline `0f 05` paths are classified by io-mon for common file
-  dependencies (`open`/`openat`/`openat2`, `read` after fd mapping,
-  `close`, and `access`/`readlink`/`statx`-style probes); unsupported raw
-  syscalls still emit event-loss and downgrade to `mcIncomplete`. Main-executable
-  inline `0f 05` syscall sites are scanned and patched through the same
-  stackable raw-syscall INT3/SIGTRAP substrate. Known residuals: DSO/JIT inline
-  `0f 05` sites, raw zero-copy syscalls (`sendfile`, `splice`, raw
-  `copy_file_range`), hardlink aliases, and Linux non-file
-  determinism inputs (`getenv`, `uname`, `sysconf`, time, `getrandom`) still
-  need dedicated hooks or stackable-backed scanner/classifier integration.
+  main-executable/startup non-system application-DSO inline `0f 05` paths are
+  classified by io-mon for common file dependencies (`open`/`openat`/`openat2`,
+  `read` after fd mapping, `close`, and `access`/`readlink`/`statx`-style
+  probes); unsupported raw syscalls still emit event-loss and downgrade to
+  `mcIncomplete`.
+  Main-executable and startup non-system application-owned shared-object inline
+  `0f 05` syscall sites are scanned and patched through the same stackable
+  raw-syscall INT3/SIGTRAP substrate. Known residuals: post-constructor
+  `dlopen` DSOs, anonymous JIT executable mappings, and startup DSOs under
+  excluded system/runtime prefixes are not incrementally scanned yet; raw
+  zero-copy syscalls (`sendfile`, `splice`, raw `copy_file_range`), hardlink
+  aliases, and Linux non-file determinism inputs (`getenv`, `uname`, `sysconf`,
+  time, `getrandom`) still need dedicated hooks or stackable-backed
+  scanner/classifier integration.
 - **Windows** — injected hooks via `CreateRemoteThread`+`LoadLibraryW` (needs
   validation under the DIY toolchain).
 - **EndpointSecurity** — designed/skeletoned (see above), not yet a shipping
