@@ -1,7 +1,7 @@
 when not defined(linux):
   {.error: "repro_monitor_hooks/linux_preload_runtime is Linux-only".}
 
-import std/[algorithm, os]
+import std/[algorithm, os, strutils]
 
 import stackable_hooks/platform/linux_preload
 import stackable_hooks/platform/linux_raw_syscalls
@@ -1393,17 +1393,36 @@ proc currentExecutablePath(): string {.raises: [].} =
   except CatchableError:
     result = ""
 
+proc isSystemRuntimeMappingPath(path: string): bool {.raises: [].} =
+  ## Keep startup DSO scanning out of loader/libc/toolchain runtime mappings.
+  ## io-mon can safely classify file syscalls once a selected site traps, but
+  ## broad runtime-library patching would turn ordinary libc/loader internals
+  ## into false raw-syscall event-loss for every monitored process.
+  path.startsWith("/lib/") or path.startsWith("/lib64/") or
+    path.startsWith("/usr/lib/") or path.startsWith("/usr/lib64/") or
+    path.startsWith("/nix/store/")
+
+proc isMonitorShimMappingPath(path: string): bool {.raises: [].} =
+  path.contains("/librepro_monitor_shim.") or
+    path.endsWith("/librepro_monitor_shim.so") or
+    path.endsWith("/librepro_monitor_shim.so (deleted)")
+
 proc shouldPatchInlineSyscallMapping(mapping: LinuxExecutableMapping;
                                      executablePath: string): bool {.raises: [].} =
   if not (mapping.readable and mapping.executable):
     return false
-  if mapping.writable or mapping.path.len == 0:
+  if mapping.writable or mapping.path.len == 0 or not mapping.privateMapping:
     return false
-  if mapping.path[0] == '[':
+  if mapping.path[0] == '[' or mapping.path[0] != '/':
     return false
   if executablePath.len == 0:
     return false
-  normalizeMappingPath(mapping.path) == executablePath
+  let normalized = normalizeMappingPath(mapping.path)
+  if normalized == executablePath:
+    return true
+  if isMonitorShimMappingPath(normalized) or isSystemRuntimeMappingPath(normalized):
+    return false
+  normalized.endsWith(".so") or normalized.contains(".so.")
 
 proc installInlineSyscallPatches*(): InlineSyscallPatchStatus {.raises: [].} =
   if inlineSyscallPatchAttempted:
