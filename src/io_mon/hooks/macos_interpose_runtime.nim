@@ -252,6 +252,32 @@ int repro_macos_real_getdirentries_syscall(int fd, void *buf, int nbytes,
                                            long *basep) {
   return (int)syscall(SYS_getdirentries, fd, buf, nbytes, basep);
 }
+/*
+ * 64-BIT-INODE directory enumeration forwarder (round-4 transparency fix).
+ *
+ * On modern macOS (always on arm64, where 64-bit inodes are the unconditional
+ * default) libsystem's `readdir`/`readdir_r`/`scandir` are the `$INODE64`
+ * implementations, and they fill their internal buffer by calling the PRIVATE
+ * `__getdirentries64` libsystem entry, which traps to the 64-bit-inode
+ * `SYS_getdirentries64` (trap #344). That syscall returns a self-describing
+ * record with the modern layout (d_ino,8 · d_seekoff,8 · d_reclen,2 ·
+ * d_namlen,2 · d_type,1 · d_name[…]). The LEGACY `SYS_getdirentries` (trap #196)
+ * returns an INCOMPATIBLE 32-bit-inode record (d_ino,4 · d_reclen,2 · d_type,1 ·
+ * d_namlen,1 · d_name[…]). The two are NOT interchangeable.
+ *
+ * The body-patch backend overwrites `__getdirentries64` in place, so its hook
+ * MUST refill the caller's buffer with the IDENTICAL 64-bit-inode records the
+ * caller's `readdir` parses; forwarding through the legacy `SYS_getdirentries`
+ * here mis-lays-out every entry (each d_name shifted, ".." dropped, large dirs
+ * truncated), which broke real tools (CPython could not import `encodings`, GNU
+ * `ls` returned garbage). See `repro_hook_getdirentries64`. The ABI mirrors the
+ * private libsystem entry: ssize_t __getdirentries64(int, void *, size_t,
+ * off_t *). For the dirent ABI see Darwin sys/dirent.h in the xnu sources.
+ */
+ssize_t repro_macos_real_getdirentries64_syscall(int fd, void *buf,
+                                                 size_t bufsize, long *basep) {
+  return (ssize_t)syscall(SYS_getdirentries64, fd, buf, bufsize, basep);
+}
 
 /*
  * T3a (Phase 2 / findings-doc break #1): the DAEMON-OVER-SOCKET / out-of-tree
@@ -2054,6 +2080,20 @@ proc ct_macos_real_getdirentries*(fd: cint; buf: pointer; nbytes: cint;
       basep: ptr clong): cint
     {.importc: "repro_macos_real_getdirentries_syscall", cdecl.}
   realGetdirentries(fd, buf, nbytes, basep)
+
+proc ct_macos_real_getdirentries64*(fd: cint; buf: pointer; bufsize: csize_t;
+    basep: ptr clong): clong =
+  ## 64-bit-inode directory-enumeration forwarder. Refills the caller's buffer
+  ## via the raw SYS_getdirentries64 (#344) so the records carry the modern
+  ## 64-bit-inode layout that readdir parses. Used by the __getdirentries64
+  ## body-patch hook; forwarding via the legacy 32-bit ct_macos_real_getdirentries
+  ## here would corrupt every dirent the caller reads (round-4 transparency fix).
+  ## The csize_t/clong ABI matches the private libsystem
+  ## __getdirentries64(int, void *, size_t, off_t *) entry.
+  proc realGetdirentries64(fd: cint; buf: pointer; bufsize: csize_t;
+      basep: ptr clong): clong
+    {.importc: "repro_macos_real_getdirentries64_syscall", cdecl.}
+  realGetdirentries64(fd, buf, bufsize, basep)
 
 proc ct_macos_real_connect*(fd: cint; address: pointer; addrLen: uint32): cint =
   ## Raw `SYS_connect` forwarder shared by the interpose + body-patch connect
