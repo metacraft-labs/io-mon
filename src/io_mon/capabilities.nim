@@ -373,6 +373,11 @@ proc linuxPreloadMonitorProfile*(
     level: mdlInfo,
     message: "selected Linux LD_PRELOAD/hooks backend; future native eBPF " &
       "backend is unavailable in M14")
+  result.diagnostics.add MonitorDiagnostic(
+    level: mdlInfo,
+    message: "Linux exported libc syscall(2) wrapper coverage is " &
+      "stackable-backed and fail-closed; inline executable 0f05 scanner " &
+      "coverage remains outside this profile")
 
   var gapCapabilities = LinuxPreloadKnownUnsupportedCapabilities
   for capability in required:

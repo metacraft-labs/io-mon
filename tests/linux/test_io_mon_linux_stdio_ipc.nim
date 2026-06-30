@@ -176,4 +176,49 @@ int main(int argc, char **argv) {
         daemonProc.terminate()
       daemonProc.close()
 
+  test "raw libc syscall openat/read fails closed instead of complete depfile":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let reader = buildC(work, "raw_syscall_reader", """
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  char buf[64];
+  int fd = (int)syscall(SYS_openat, AT_FDCWD, argv[1], O_RDONLY, 0);
+  if (fd < 0) return 2;
+  long n = syscall(SYS_read, fd, buf, sizeof(buf));
+  syscall(SYS_close, fd);
+  return n > 0 ? 0 : 3;
+}
+""")
+    let marker = work / "raw-marker.txt"
+    writeFile(marker, "raw marker\n")
+    let depfile = work / "raw-syscall.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", reader, marker],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcIncomplete
+    check dep.records.anyIt(it.kind == mrEventLoss and
+      "raw syscall" in it.detail)
+
   removeDir(work)

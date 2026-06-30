@@ -71,15 +71,19 @@ to start as an honest stub today.
   produces.
 - **Linux** — `LD_PRELOAD` shim. The exported wrapper symbols and monitor hook
   bodies are io-mon-owned, while reusable `RTLD_NEXT` lookup and reentrancy
-  mechanics come from `stackable_hooks/platform/linux_preload`. It captures
-  direct `open`/`read` paths, glibc `fopen`/`fread` stream reads, and
-  `connect(2)` IPC establishment; a monitored process that talks to an
-  out-of-tree Unix/TCP daemon now fails closed as `mcIncomplete`. Known
-  residuals: raw `syscall(2)` / `openat2`, raw zero-copy syscalls (`sendfile`,
-  `splice`, raw `copy_file_range`), path fidelity for
+  mechanics come from `stackable_hooks/platform/linux_preload`; exported libc
+  `syscall(2)` wrapper patching comes from
+  `stackable_hooks/platform/linux_raw_syscalls`. It captures direct
+  `open`/`read` paths, glibc `fopen`/`fread` stream reads, and `connect(2)` IPC
+  establishment; a monitored process that talks to an out-of-tree Unix/TCP
+  daemon now fails closed as `mcIncomplete`. Generic raw `syscall(2)` use also
+  fails closed as `mcIncomplete` via an event-loss record until io-mon grows a
+  syscall-number classifier for precise file/event capture. Known residuals:
+  inline executable `0f 05` syscalls, raw `openat2`, raw zero-copy syscalls
+  (`sendfile`, `splice`, raw `copy_file_range`), path fidelity for
   `access`/`readlink`/`statx` and hardlink aliases, and Linux non-file
   determinism inputs (`getenv`, `uname`, `sysconf`, time, `getrandom`) still
-  need dedicated hooks or stackable-backed raw-syscall integration.
+  need dedicated hooks or stackable-backed scanner/classifier integration.
 - **Windows** — injected hooks via `CreateRemoteThread`+`LoadLibraryW` (needs
   validation under the DIY toolchain).
 - **EndpointSecurity** — designed/skeletoned (see above), not yet a shipping
@@ -112,9 +116,9 @@ See [docs/usage.md](docs/usage.md) for the CLI and library usage guides, and
 - **`io_mon/shim/*`** + **`io_mon/hooks/*`** — the syscall-interpose shim
   (built on `nim-stackable-hooks`) that actually injects into a monitored
   process and captures the read/written paths. macOS body-patch installation
-  and Linux preload resolver/reentrancy mechanics are stackable-owned; io-mon
-  owns target decisions, hook bodies, RMDF/event writing, and completeness
-  policy. The platform entry points
+  and Linux preload resolver/reentrancy plus exported `syscall(2)` patch
+  mechanics are stackable-owned; io-mon owns target decisions, hook bodies,
+  RMDF/event writing, and completeness policy. The platform entry points
   (`shim/macos_interpose`, `shim/linux_preload`, `shim/windows_interpose`)
   build as a shared library (`--app:lib`); `fs_snoop` loads it at runtime.
   These are NOT imported by `import io_mon` — they are `--app:lib` entry

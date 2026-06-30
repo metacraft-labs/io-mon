@@ -29,6 +29,7 @@ var
   fdPaths = initTable[cint, string]()
   dirPaths = initTable[uint, string]()
   streamPaths = initTable[uint, string]()
+  rawSyscallCoverageRecorded = false
   # Thread id of the thread that ran the preload constructor (the process
   # main thread). Its fragment batch is flushed by the process-exit
   # destructor; worker threads flush eagerly per record (see emitRecord),
@@ -158,6 +159,22 @@ proc recordProcessStart() {.raises: [].} =
   record.detail = "linux-preload-hooks"
   emitRecord(record)
 
+proc emitEventLoss(detail: string; result: int64 = 0) {.raises: [].} =
+  var record = baseRecord(mrEventLoss, moEventLoss)
+  record.detail = detail
+  record.result = result
+  emitRecord(record)
+
+proc recordRawSyscallCoverage(status: RawSyscallPatchStatus) {.raises: [].} =
+  if rawSyscallCoverageRecorded:
+    return
+  rawSyscallCoverageRecorded = true
+  if status.installed:
+    return
+  emitEventLoss("linux raw-syscall wrapper patch unavailable diagnostic=" &
+    $status.diagnostic & " stage=" & $status.stage &
+    " errno=" & $status.osErrno)
+
 proc repro_monitor_shim_init*(configPath: cstring): cint
     {.exportc, dynlib, raises: [].}
 
@@ -263,6 +280,8 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   initialized = true
   mainThreadId = currentThreadId()
   recordProcessStart()
+  let rawStatus = installRawSyscallWrapperPatch()
+  recordRawSyscallCoverage(rawStatus)
   result = 0
 
 proc repro_monitor_shim_flush*(): cint {.exportc, dynlib, raises: [].} =
@@ -540,6 +559,14 @@ proc repro_hook_connect*(ctx: var ConnectContext) {.raises: [].} =
     recordIpcConnect(ctx.fd, ctx.address, ctx.addrLen)
   c_set_errno(savedErrno)
 
+proc repro_hook_raw_syscall*(number: clong) {.raises: [].} =
+  if shouldBypass():
+    return
+  let savedErrno = c_get_errno()
+  emitEventLoss("linux raw syscall via libc syscall(2) wrapper nr=" & $number,
+    int64(number))
+  c_set_errno(savedErrno)
+
 proc processIsSingleThreaded(): bool {.raises: [].} =
   ## True iff the current process has exactly one thread. Read in the PARENT
   ## BEFORE fork so the child — which inherits the answer copy-on-write — knows
@@ -674,3 +701,4 @@ registerForkHook(repro_hook_fork)
 registerExecveHook(repro_hook_execve)
 registerPosixSpawnHook(repro_hook_posix_spawn)
 registerPosixSpawnpHook(repro_hook_posix_spawnp)
+registerRawSyscallHook(repro_hook_raw_syscall)
