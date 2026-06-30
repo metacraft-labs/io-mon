@@ -33,6 +33,13 @@ proc pathExists(path: string): bool =
   except OSError:
     false
 
+proc hasRawDependency(dep: MonitorDepFile; path: string): bool =
+  dep.records.anyIt((it.kind == mrFileOpen or it.kind == mrFileRead) and
+    path in it.path)
+
+proc hasPathProbe(dep: MonitorDepFile; path: string): bool =
+  dep.records.anyIt(it.kind == mrPathProbe and path in it.path)
+
 suite "io-mon Linux LD_PRELOAD live gaps":
   let work = getTempDir() / ("io-mon-linux-live-" & $getCurrentProcessId())
   createDir(work)
@@ -176,7 +183,7 @@ int main(int argc, char **argv) {
         daemonProc.terminate()
       daemonProc.close()
 
-  test "raw libc syscall openat/read fails closed instead of complete depfile":
+  test "raw libc syscall openat/read captures dependency":
     let snoopBin = work / "io-mon"
     if not fileExists(snoopBin):
       let cli = run("nim", @[
@@ -217,11 +224,67 @@ int main(int argc, char **argv) {
     check cap.code == 0
 
     let dep = readMonitorDepFile(depfile)
-    check dep.completeness == mcIncomplete
-    check dep.records.anyIt(it.kind == mrEventLoss and
-      "raw syscall" in it.detail)
+    check dep.completeness == mcComplete
+    check hasRawDependency(dep, marker)
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      "libc raw syscall unsupported" in it.detail)
 
-  test "inline assembly syscall openat/read fails closed instead of complete depfile":
+  test "raw libc syscall openat2/read captures dependency":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let reader = buildC(work, "raw_syscall_openat2_reader", """
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <linux/openat2.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#ifndef SYS_openat2
+#define SYS_openat2 437
+#endif
+int main(int argc, char **argv) {
+  char buf[64];
+  struct open_how how = {
+    .flags = O_RDONLY,
+    .mode = 0,
+    .resolve = 0,
+  };
+  int fd = (int)syscall(SYS_openat2, AT_FDCWD, argv[1], &how, sizeof(how));
+  if (fd < 0) return 2;
+  long n = syscall(SYS_read, fd, buf, sizeof(buf));
+  syscall(SYS_close, fd);
+  return n > 0 ? 0 : 3;
+}
+""")
+    let marker = work / "raw-openat2-marker.txt"
+    writeFile(marker, "raw openat2 marker\n")
+    let depfile = work / "raw-openat2.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", reader, marker],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check hasRawDependency(dep, marker)
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      "libc raw syscall unsupported" in it.detail)
+
+  test "inline assembly syscall openat/read captures dependency":
     let snoopBin = work / "io-mon"
     if not fileExists(snoopBin):
       let cli = run("nim", @[
@@ -274,9 +337,102 @@ int main(int argc, char **argv) {
     check cap.code == 0
 
     let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check hasRawDependency(dep, marker)
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      "inline raw syscall unsupported" in it.detail)
+
+  test "raw libc statx/access/readlink probes capture path dependencies":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let probe = buildC(work, "raw_syscall_probe", """
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#ifndef SYS_statx
+#define SYS_statx 332
+#endif
+int main(int argc, char **argv) {
+  char linkbuf[256];
+  struct statx stx;
+  long a = syscall(SYS_access, argv[1], R_OK);
+  long s = syscall(SYS_statx, AT_FDCWD, argv[1], AT_STATX_SYNC_AS_STAT,
+                   STATX_BASIC_STATS, &stx);
+  long l = syscall(SYS_readlink, argv[2], linkbuf, sizeof(linkbuf));
+  if (a != 0 || l <= 0) return 2;
+  if (s != 0 && errno != ENOSYS) return 3;
+  return 0;
+}
+""")
+    let marker = work / "raw-probe-marker.txt"
+    let linkPath = work / "raw-probe-link.txt"
+    writeFile(marker, "raw probe marker\n")
+    createSymlink(marker, linkPath)
+    let depfile = work / "raw-probe.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", probe,
+      marker, linkPath], childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check hasPathProbe(dep, marker)
+    check hasPathProbe(dep, linkPath)
+
+  test "unsupported raw libc syscall still fails closed":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let probe = buildC(work, "raw_unknown_syscall", """
+#include <sys/syscall.h>
+#include <unistd.h>
+int main(void) {
+  long pid = syscall(SYS_getpid);
+  return pid > 0 ? 0 : 2;
+}
+""")
+    let depfile = work / "raw-unknown.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", probe],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
     check dep.completeness == mcIncomplete
     check dep.records.anyIt(it.kind == mrEventLoss and
-      "inline raw syscall" in it.detail)
+      "libc raw syscall unsupported" in it.detail)
 
   test "unrelated SIGTRAP is not swallowed by inline syscall handler":
     let snoopBin = work / "io-mon"

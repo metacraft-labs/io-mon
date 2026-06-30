@@ -16,6 +16,26 @@ const
   OCreat = 0x0040.cint
   OTrunc = 0x0200.cint
   OAppend = 0x0400.cint
+  LinuxSysRead = 0.clong
+  LinuxSysOpen = 2.clong
+  LinuxSysClose = 3.clong
+  LinuxSysStat = 4.clong
+  LinuxSysLstat = 6.clong
+  LinuxSysAccess = 21.clong
+  LinuxSysReadlink = 89.clong
+  LinuxSysOpenat = 257.clong
+  LinuxSysNewfstatat = 262.clong
+  LinuxSysReadlinkat = 267.clong
+  LinuxSysFaccessat = 269.clong
+  LinuxSysStatx = 332.clong
+  LinuxSysOpenat2 = 437.clong
+  LinuxEfault = 14.clong
+
+type
+  LinuxOpenHow = object
+    flags: uint64
+    mode: uint64
+    resolve: uint64
 
 var
   initialized = false
@@ -53,8 +73,11 @@ var
 #include <unistd.h>
 #include <errno.h>
 
+extern long stackable_linux_raw_syscall6(long nr, long a1, long a2, long a3,
+                                         long a4, long a5, long a6);
+
 long repro_linux_gettid(void) {
-  return syscall(SYS_gettid);
+  return stackable_linux_raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
 }
 
 int repro_linux_get_errno(void) {
@@ -168,6 +191,8 @@ proc emitEventLoss(detail: string; result: int64 = 0) {.raises: [].} =
   record.result = result
   emitRecord(record)
 
+proc drainInlineRawSyscallEvents() {.raises: [].}
+
 proc recordRawSyscallCoverage(status: RawSyscallPatchStatus) {.raises: [].} =
   if rawSyscallCoverageRecorded:
     return
@@ -200,10 +225,12 @@ proc recordInlineSyscallTrapCoverage() {.raises: [].} =
   if traps == 0 and failures == 0:
     return
   inlineSyscallTrapCoverageRecorded = true
-  emitEventLoss("linux inline raw syscall trapped nr=" &
-    $inlineSyscallLastNumber() & " address=0x" &
-    toHex(inlineSyscallLastAddress()) & " traps=" & $traps &
-    " failures=" & $failures, int64(inlineSyscallLastNumber()))
+  drainInlineRawSyscallEvents()
+  if failures != 0:
+    emitEventLoss("linux inline raw syscall replay failed nr=" &
+      $inlineSyscallLastNumber() & " address=0x" &
+      toHex(inlineSyscallLastAddress()) & " traps=" & $traps &
+      " failures=" & $failures, int64(inlineSyscallLastNumber()))
 
 proc repro_monitor_shim_init*(configPath: cstring): cint
     {.exportc, dynlib, raises: [].}
@@ -435,6 +462,110 @@ proc emitProbe(path: cstring; callResult: cint) {.raises: [].} =
     record.path = $path
   emitRecord(record)
 
+proc cstringArg(value: clong): cstring {.inline, raises: [].} =
+  if value == 0:
+    nil
+  else:
+    cast[cstring](cast[pointer](value))
+
+proc resultLooksFaulted(callResult: clong): bool {.inline, raises: [].} =
+  callResult == -LinuxEfault
+
+proc probeResultFromRaw(callResult: clong): cint {.inline, raises: [].} =
+  if callResult >= 0:
+    0.cint
+  else:
+    (-1).cint
+
+proc recordRawRead(fd: cint; callResult: clong): bool {.raises: [].} =
+  if callResult < 0:
+    return true
+  if fd <= 2:
+    return true
+  let path = pathForFd(fd)
+  if path.len == 0:
+    return false
+  var record = baseRecord(mrFileRead, moFileRead)
+  record.path = path
+  record.result = callResult.int64
+  record.flags = uint32(fd)
+  emitRecord(record)
+  true
+
+proc openHowFlags(howArg, callResult: clong; flags, mode: var cint): bool
+    {.raises: [].} =
+  if callResult < 0 or howArg == 0:
+    return false
+  let how = cast[ptr LinuxOpenHow](cast[pointer](howArg))
+  flags = cint(how.flags)
+  mode = cint(how.mode)
+  true
+
+proc rawSyscallSourceName(inlineTrap: cint): string {.raises: [].} =
+  if inlineTrap != 0:
+    "inline raw syscall"
+  else:
+    "libc raw syscall"
+
+proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
+                            inlineTrap: cint): bool {.raises: [].} =
+  case number
+  of LinuxSysOpen:
+    if callResult < 0 or resultLooksFaulted(callResult):
+      return true
+    recordOpen(cstringArg(a1), cint(a2), cint(a3), cint(callResult))
+    true
+  of LinuxSysOpenat:
+    if callResult < 0 or resultLooksFaulted(callResult):
+      return true
+    recordOpen(cstringArg(a2), cint(a3), cint(a4), cint(callResult))
+    true
+  of LinuxSysOpenat2:
+    var flags, mode: cint
+    if not openHowFlags(a3, callResult, flags, mode):
+      return false
+    recordOpen(cstringArg(a2), flags, mode, cint(callResult))
+    true
+  of LinuxSysRead:
+    recordRawRead(cint(a1), callResult)
+  of LinuxSysClose:
+    if callResult >= 0:
+      removeFdPath(cint(a1))
+    true
+  of LinuxSysStat, LinuxSysLstat, LinuxSysAccess, LinuxSysReadlink:
+    if resultLooksFaulted(callResult):
+      return false
+    emitProbe(cstringArg(a1), probeResultFromRaw(callResult))
+    true
+  of LinuxSysNewfstatat, LinuxSysFaccessat, LinuxSysReadlinkat, LinuxSysStatx:
+    if resultLooksFaulted(callResult):
+      return false
+    emitProbe(cstringArg(a2), probeResultFromRaw(callResult))
+    true
+  else:
+    false
+
+proc recordRawSyscallClassification(number, a1, a2, a3, a4, a5, a6,
+                                    callResult: clong; inlineTrap: cint)
+    {.raises: [].} =
+  if classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult,
+                            inlineTrap):
+    return
+  emitEventLoss(rawSyscallSourceName(inlineTrap) &
+    " unsupported nr=" & $number, int64(number))
+
+proc drainInlineRawSyscallEvents() {.raises: [].} =
+  if rawSyscallEventOverflowed():
+    emitEventLoss("inline raw syscall event buffer overflow")
+  let count = rawSyscallEventCount()
+  for i in 0 ..< count:
+    let event = rawSyscallEventAt(i)
+    if not event.ok:
+      emitEventLoss("inline raw syscall event read failed index=" & $i)
+      continue
+    recordRawSyscallClassification(event.number, event.a1, event.a2, event.a3,
+      event.a4, event.a5, event.a6, event.result, event.source)
+
 proc repro_hook_stat*(ctx: var StatContext) {.raises: [].} =
   if shouldBypass():
     callNext(ctx)
@@ -592,12 +723,14 @@ proc repro_hook_connect*(ctx: var ConnectContext) {.raises: [].} =
     recordIpcConnect(ctx.fd, ctx.address, ctx.addrLen)
   c_set_errno(savedErrno)
 
-proc repro_hook_raw_syscall*(number: clong) {.raises: [].} =
+proc repro_hook_raw_syscall*(number, a1, a2, a3, a4, a5, a6,
+                             callResult: clong; inlineTrap: cint)
+    {.raises: [].} =
   if shouldBypass():
     return
   let savedErrno = c_get_errno()
-  emitEventLoss("linux raw syscall via libc syscall(2) wrapper nr=" & $number,
-    int64(number))
+  recordRawSyscallClassification(number, a1, a2, a3, a4, a5, a6, callResult,
+    inlineTrap)
   c_set_errno(savedErrno)
 
 proc processIsSingleThreaded(): bool {.raises: [].} =

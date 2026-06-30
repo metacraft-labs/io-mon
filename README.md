@@ -76,16 +76,15 @@ to start as an honest stub today.
   `stackable_hooks/platform/linux_raw_syscalls`. It captures direct
   `open`/`read` paths, glibc `fopen`/`fread` stream reads, and `connect(2)` IPC
   establishment; a monitored process that talks to an out-of-tree Unix/TCP
-  daemon now fails closed as `mcIncomplete`. Generic raw `syscall(2)` use also
-  fails closed as `mcIncomplete` via an event-loss record until io-mon grows a
-  syscall-number classifier for precise file/event capture. Main-executable
+  daemon now fails closed as `mcIncomplete`. Raw `syscall(2)` and safe
+  main-executable inline `0f 05` paths are classified by io-mon for common file
+  dependencies (`open`/`openat`/`openat2`, `read` after fd mapping,
+  `close`, and `access`/`readlink`/`statx`-style probes); unsupported raw
+  syscalls still emit event-loss and downgrade to `mcIncomplete`. Main-executable
   inline `0f 05` syscall sites are scanned and patched through the same
-  stackable raw-syscall INT3/SIGTRAP substrate; a trapped inline syscall is
-  replayed to preserve target behavior and recorded as event-loss so it cannot
-  silently produce a complete depfile. Known residuals: DSO/JIT inline `0f 05`
-  sites, raw `openat2`, raw zero-copy syscalls (`sendfile`, `splice`, raw
-  `copy_file_range`), path fidelity for
-  `access`/`readlink`/`statx` and hardlink aliases, and Linux non-file
+  stackable raw-syscall INT3/SIGTRAP substrate. Known residuals: DSO/JIT inline
+  `0f 05` sites, raw zero-copy syscalls (`sendfile`, `splice`, raw
+  `copy_file_range`), hardlink aliases, and Linux non-file
   determinism inputs (`getenv`, `uname`, `sysconf`, time, `getrandom`) still
   need dedicated hooks or stackable-backed scanner/classifier integration.
 - **Windows** — injected hooks via `CreateRemoteThread`+`LoadLibraryW` (needs
