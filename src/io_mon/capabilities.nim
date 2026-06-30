@@ -46,7 +46,25 @@ const
     mcapNonDeterminism,
     # ROUND-3 S1 — content-channel coverage: xattr metadata reads, POSIX shared
     # memory, FIFO / inherited socket-pipe content, and sendfile/pread/readv.
-    mcapExternalContent
+    mcapExternalContent,
+    # ROUND-4 RW2 (break D3): the output-directory MUTATION surface — mkdir /
+    # mkdirat / rmdir / unlink / unlinkat / symlink / symlinkat (rename/renameat
+    # were already covered) — is now hooked (interpose + body-patch) and recorded as
+    # an `mrPathMutation` output record on the canonical path. symlink/symlinkat ADD
+    # a directory entry exactly as unlink REMOVES one, so they belong to the same
+    # surface. Round-3 hooked NONE of these, so a mkdir/unlink/rmdir/symlink took
+    # real effect with NO record while the depfile self-declared this as an
+    # unsupported gap marked required=false — completeness stayed mcComplete despite
+    # the unhooked surface (research/adversarial-2026-06-round4/r4_dir/misc_probe.c).
+    # Now that the full COMMON mutation surface is hooked it is an ADVERTISED
+    # capability (no gap), so an unhooked-mutation surface no longer silently
+    # coexists with mcComplete. The remaining tail — mknod/mkfifo (device/FIFO
+    # nodes) and the macOS-only atomic renamex_np/renameatx_np swap variants — is
+    # NOT hooked, but it is exotic (a build essentially never creates a device node
+    # or uses RENAME_SWAP) and is OUTPUT-side only: a missed mutation record is
+    # never an INPUT false-complete (the cardinal sin), it only leaves the
+    # output-tree view of that rare op uncaptured.
+    mcapPathMutation
   }
 
   MacosInterposeKnownUnsupportedCapabilities* = {
@@ -63,8 +81,7 @@ const
     # interpose backend's break-#6 default conservative.
     mcapEndpointSecurity,
     mcapHybrid,
-    mcapAuthorizationEnforcement,
-    mcapPathMutation
+    mcapAuthorizationEnforcement
   }
 
   MacosMonitorShimTaxonomyCapabilities* = {
@@ -89,7 +106,9 @@ const
     mcapObservedEnv,
     mcapNonDeterminism,
     # ROUND-3 S1 — content-channel coverage (see MacosInterposeSupportedCapabilities).
-    mcapExternalContent
+    mcapExternalContent,
+    # ROUND-4 RW2 — output-directory mutation surface (mkdir/rmdir/unlink/unlinkat).
+    mcapPathMutation
   }
 
   LinuxPreloadSupportedCapabilities* = {
@@ -229,7 +248,14 @@ proc unsupportedReason(capability: MonitorCapability): string =
   of mcapAuthorizationEnforcement:
     "macOS interpose shim observes only and cannot authorize or deny operations"
   of mcapPathMutation:
-    "macOS interpose shim does not cover the full mutation surface yet"
+    # ROUND-4 RW2: mkdir/mkdirat/rmdir/unlink/unlinkat/symlink/symlinkat (and
+    # rename/renameat) ARE now hooked on the macOS interpose+body-patch shim and
+    # recorded as `mrPathMutation` output records; this branch is retained only for
+    # profiles that share this enum and have not wired the mutation surface, and as
+    # a defensive default.
+    "mkdir/rmdir/unlink/unlinkat/symlink are hooked on the macOS " &
+      "interpose+body-patch shim; this reason applies only where path-mutation " &
+      "is not yet advertised"
   of mcapIpcConnect:
     # connect(2) IS hooked on the macOS interpose+body-patch shim; this branch is
     # retained only for profiles that share this enum and have not wired it, and

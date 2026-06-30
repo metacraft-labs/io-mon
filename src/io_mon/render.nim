@@ -24,6 +24,7 @@ proc recordKindName(record: MonitorRecord): string =
   of mrNonDeterministic: "non-deterministic"
   of mrTimeRead: "time-read"
   of mrExternalContent: "external-content"
+  of mrPathMutation: "path-mutation"
 
 proc observationKindName(record: MonitorRecord): string =
   case record.observationKind
@@ -43,6 +44,7 @@ proc observationKindName(record: MonitorRecord): string =
   of moNonDeterministic: "non-deterministic"
   of moTimeRead: "time-read"
   of moExternalContent: "external-content"
+  of moPathMutation: "path-mutation"
 
 proc itemKindName(kind: FsSnoopStreamItemKind): string =
   case kind

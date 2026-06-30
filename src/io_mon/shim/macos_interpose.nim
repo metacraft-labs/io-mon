@@ -180,6 +180,16 @@ var
   nextProcessSeq: uint64 = 0
   fdPaths = initTable[cint, string]()
   dirPaths = initTable[uint, string]()
+  # ROUND-4 RW2 (break D1) — per-DIR* enumerated-directory metadata, captured ONCE
+  # at opendir (a ` mtime=<n> size=<n>` token string) and reused on every readdir
+  # record for that DIR*. This is the cardinal-sin guard for D1: the dir stat fires
+  # ONCE PER ENUMERATION (at opendir), NOT per readdir() return, so a 10k-entry
+  # directory pays one fstat, not ten thousand. The dir's mtime BUMPS on any
+  # add/remove, so a net-zero swap (remove b.c, add x.c — same entry count) changes
+  # the recorded directory dependency that the bare per-readdir count signal hid
+  # (research/adversarial-2026-06-round4/r4_dir/glob_probe.c). Guarded by `dirLock`
+  # (same critical section as dirPaths — all DIR*-keyed shim state).
+  dirMeta = initTable[uint, string]()
   # ROUND-3 S1b — fds returned by shm_open, mapped to their shm object name. Lets
   # recordMmap record a CONTENT READ for a read-only MAP_SHARED mapping of an
   # shm-backed fd (a plain memory load, no read(2)). Guarded by `fdLock` (same
@@ -323,13 +333,32 @@ proc observationForOpen(flags: cint): MonitorObservationKind =
       # actual write/mmap-write is later observed on the fd — see above).
       moFileOpen
 
+proc metaSuffix(detail: string; mtime, size: uint64): string {.raises: [].} =
+  ## ROUND-4 RW2 (break D2/D1) — append a ` mtime=<n> size=<n>` token pair to
+  ## `detail`. mtime is the full-resolution (nanosecond) modification time. Unlike
+  ## (dev, ino) — which are STABLE across content/mtime changes — mtime+size CHANGE
+  ## when a directory gains/loses an entry or a stat-only file's content changes,
+  ## so the consumer (folding mtime/size into its key) re-runs iff they changed.
+  ## Same whitespace-separated `key=value` wire encoding as devInoSuffix (read back
+  ## via writer.detailToken), so no RMDF wire-format field is added.
+  result = detail
+  if result.len > 0: result.add ' '
+  result.add "mtime=" & $mtime & " size=" & $size
+
 proc recordDirectoryEnumeration(path: cstring) {.raises: [].} =
   if path == nil or not ct_macos_interpose_path_is_dir(path):
     return
   var record = baseRecord(mrDirectoryEnumerate, moDirectoryEnumerate)
   record.path = $path
   record.result = 1
-  record.detail = "directory-open"
+  # ROUND-4 RW2 (break D1) — stamp the directory's mtime+size (raw stat, once per
+  # open) so a directory dependency observed via a plain open() of the dir carries
+  # the add/remove-sensitive signal too.
+  var mtime, size: uint64
+  if ct_macos_stat_path_mtime_size(path, addr mtime, addr size):
+    record.detail = metaSuffix("directory-open", mtime, size)
+  else:
+    record.detail = "directory-open"
   emitRecord(record)
 
 proc updateFdPath(fd: cint; path: cstring) =
@@ -425,11 +454,37 @@ proc updateDirPath(dirp: pointer; path: cstring) =
 proc removeDirPath(dirp: pointer) =
   acquire(dirLock)
   dirPaths.del(dirKey(dirp))
+  # ROUND-4 RW2 (break D1) — drop the cached dir-mtime metadata on closedir so a
+  # recycled DIR* pointer never inherits a stale enumeration's mtime/size.
+  dirMeta.del(dirKey(dirp))
   release(dirLock)
 
 proc pathForDir(dirp: pointer): string =
   acquire(dirLock)
   result = dirPaths.getOrDefault(dirKey(dirp), "")
+  release(dirLock)
+
+proc updateDirMeta(dirp: pointer; path: cstring) {.raises: [].} =
+  ## ROUND-4 RW2 (break D1) — capture the enumerated directory's (mtime, size)
+  ## ONCE at opendir and remember it keyed by the DIR* pointer, so every readdir
+  ## record for this enumeration can carry it WITHOUT a per-readdir stat (the
+  ## cardinal-sin guard — one fstat per enumeration, not per entry). The raw
+  ## SYS_stat64 is reentrancy-free (it bypasses every hook), so no muting is
+  ## needed. A failed stat simply leaves no metadata (the record falls back to the
+  ## pre-existing count signal).
+  if dirp == nil or path == nil:
+    return
+  var mtime, size: uint64
+  if not ct_macos_stat_path_mtime_size(path, addr mtime, addr size):
+    return
+  let meta = metaSuffix("", mtime, size)
+  acquire(dirLock)
+  dirMeta[dirKey(dirp)] = meta
+  release(dirLock)
+
+proc metaForDir(dirp: pointer): string =
+  acquire(dirLock)
+  result = dirMeta.getOrDefault(dirKey(dirp), "")
   release(dirLock)
 
 proc probeFromResult(callResult: cint): ProbeResult =
@@ -458,15 +513,21 @@ proc devInoSuffix(detail: string; dev, ino: uint64): string {.raises: [].} =
   result.add "dev=" & $dev & " ino=" & $ino
 
 proc statDetail(detail: string; buf: pointer; ok: bool): string {.raises: [].} =
-  ## `detail` with the stat buffer's (dev, ino) appended when the probe succeeded
-  ## and a buffer is available (ROUND-2 R4). Single source of truth for the
-  ## stat-family hooks.
+  ## `detail` with the stat buffer's (dev, ino) (ROUND-2 R4) AND its (mtime, size)
+  ## (ROUND-4 RW2 / break D2) appended when the probe succeeded and a buffer is
+  ## available. Single source of truth for the stat-family hooks. (dev, ino) give
+  ## hardlink identity; mtime+size make a dir mtime bump / a stat-only content
+  ## change detectable (a make/ninja "source newer than target" dependency that
+  ## (dev, ino) alone hid — r4_dir/{mtime_probe,scope_probe}.c).
   if not ok or buf == nil:
     return detail
+  result = detail
   var dev, ino: uint64
-  if not ct_macos_stat_dev_ino(buf, addr dev, addr ino):
-    return detail
-  devInoSuffix(detail, dev, ino)
+  if ct_macos_stat_dev_ino(buf, addr dev, addr ino):
+    result = devInoSuffix(result, dev, ino)
+  var mtime, size: uint64
+  if ct_macos_stat_mtime_size(buf, addr mtime, addr size):
+    result = metaSuffix(result, mtime, size)
 
 proc canonicalPathFor(rawPath: string): string {.raises: [].} =
   ## ROUND-2 R4 — the realpath of `rawPath`, memoised in a bounded per-process LRU
@@ -1119,7 +1180,17 @@ proc recordDirEnumByFd(fd: cint; detail: string) {.raises: [].} =
   var record = baseRecord(mrDirectoryEnumerate, moDirectoryEnumerate)
   record.path = p
   record.result = 1
-  record.detail = detail
+  # ROUND-4 RW2 (break D1) — stamp the enumerated directory's mtime+size via a raw
+  # fstat on the dir fd (reentrancy-free). getdirentries/getattrlistbulk refill in
+  # BATCHES (this fires once per syscall, not per entry), so the cost is bounded —
+  # and scandir's libsystem-internal opendir is body-patch-only (no DIR* tracked),
+  # so this fd arm is what carries the dir-mtime for the scandir/bulk path. A
+  # net-zero add+remove bumps the mtime, making the swap detectable.
+  var mtime, size: uint64
+  if ct_macos_fd_mtime_size(fd, addr mtime, addr size):
+    record.detail = metaSuffix(detail, mtime, size)
+  else:
+    record.detail = detail
   emitRecord(record)
 
 proc recordCanonicalTarget(fd: cint; original: cstring;
@@ -1530,6 +1601,85 @@ proc recordPathWrite(path: cstring; size: int64; detail: string) {.raises: [].} 
   if detail.len > 0:
     record.detail = detail
   emitRecord(record)
+
+# --- ROUND-4 RW2 (break D3) output-directory mutation recorders --------------
+#
+# mkdir/mkdirat/rmdir/unlink/unlinkat take real effect on the output tree but
+# round-3 produced NO record (only rename among the mutation surface was hooked),
+# and the depfile self-declared a path-mutation gap marked required=false, so an
+# unhooked mutation silently coexisted with mcComplete
+# (research/adversarial-2026-06-round4/r4_dir/misc_probe.c). These record each
+# successful mutation as an `mrPathMutation`/`moPathMutation` OUTPUT fact on the
+# canonical path. Recording (not downgrading) is correct: a normal build creates
+# dirs + removes temp files, so downgrading on a mutation would re-run every build
+# (the cardinal sin); the merge ignores the kind, so a normal build stays
+# mcComplete while the output-dir state is now tracked.
+
+proc canonicalChildPath(raw: string): string {.raises: [].} =
+  ## Canonicalise a path whose LEAF may not exist after the call (a removed
+  ## file/dir post-unlink/rmdir) by canonicalising the PARENT directory — which
+  ## always still exists — and rejoining the basename. For mkdir the created leaf
+  ## also canonicalises this way. Falls back to the raw path when the parent
+  ## cannot be resolved, so the record is at worst the as-passed path, never empty.
+  ## Reuses the bounded realpath memo (canonicalPathFor, which mutes the shim).
+  if raw.len == 0:
+    return raw
+  let slash = raw.rfind('/')
+  if slash < 0:
+    # A bare name resolved against the CWD: canonicalise "." and join.
+    let dir = canonicalPathFor(".")
+    return (if dir.len > 0: dir & "/" & raw else: raw)
+  if slash == 0:
+    return raw                       # "/leaf" — parent is root, already absolute
+  let parent = raw[0 ..< slash]
+  let base = raw[slash + 1 .. ^1]
+  let cdir = canonicalPathFor(parent)
+  (if cdir.len > 0: cdir & "/" & base else: raw)
+
+proc emitPathMutation(absOrRaw: string; callResult: cint;
+    detail: string) {.raises: [].} =
+  ## Emit one `mrPathMutation` output record on the canonicalised path. Shared by
+  ## the path- and `*at`-form mutation hooks.
+  if absOrRaw.len == 0:
+    return
+  var record = baseRecord(mrPathMutation, moPathMutation)
+  record.path = canonicalChildPath(absOrRaw)
+  record.result = callResult.int64
+  record.detail = detail
+  emitRecord(record)
+
+proc recordPathMutation(callResult: cint; path: cstring;
+    detail: string) {.raises: [].} =
+  ## Record a mkdir/rmdir/unlink output mutation (path form). Only a SUCCESSFUL
+  ## call (result == 0) actually mutates the output tree.
+  if path == nil or callResult != 0:
+    return
+  emitPathMutation($path, callResult, detail)
+
+proc recordPathMutationAt(callResult: cint; dirfd: cint; path: cstring;
+    detail: string) {.raises: [].} =
+  ## Record a mkdirat/unlinkat output mutation (`*at` form). An ABSOLUTE path or
+  ## AT_FDCWD resolves against the CWD; a dirfd-relative path is joined onto the
+  ## dirfd's real directory (recovered via F_GETPATH — a raw fcntl, reentrancy-free
+  ## — and still open at the call), mirroring recordCanonicalAtProbe. Only a
+  ## successful call mutates the tree.
+  if path == nil or callResult != 0:
+    return
+  let raw = $path
+  if raw.len == 0:
+    return
+  if raw[0] == '/' or dirfd == AtFdCwd:
+    emitPathMutation(raw, callResult, detail)
+    return
+  var dbuf: array[1024, char]
+  if ct_macos_fd_real_path(dirfd, addr dbuf[0], csize_t(dbuf.len)) != 0:
+    let dir = $cast[cstring](addr dbuf[0])
+    if dir.len > 0:
+      emitPathMutation(dir & "/" & raw, callResult, detail)
+      return
+  # Could not resolve the dirfd — record the bare relative leaf rather than drop
+  # the mutation entirely (fail-safe: a less-canonical record beats none).
+  emitPathMutation(raw, callResult, detail)
 
 # --- ROUND-2 R-D (break R10) non-file determinism recorders -----------------
 #
@@ -2064,11 +2214,18 @@ proc repro_hook_opendir*(path: cstring): pointer {.exportc, cdecl, dynlib.} =
     dec disabled
   if result != nil:
     updateDirPath(result, path)
+    # ROUND-4 RW2 (break D1) — snapshot the directory's mtime+size ONCE here so
+    # every readdir record can carry it without a per-entry stat.
+    updateDirMeta(result, path)
 
 proc repro_hook_readdir*(dirp: pointer): pointer {.exportc, cdecl, dynlib.} =
   if not initialized or disabled > 0:
     return ct_macos_interpose_real_readdir(dirp)
   let dirPath = pathForDir(dirp)
+  # ROUND-4 RW2 (break D1) — the dir's mtime+size, captured once at opendir (NOT
+  # re-stat'd per readdir). A net-zero add+remove bumps the dir mtime, so this
+  # makes a glob-based dependency that the bare count signal hid detectable.
+  let dirMetaStr = metaForDir(dirp)
   inc disabled
   try:
     result = ct_macos_interpose_real_readdir(dirp)
@@ -2078,7 +2235,7 @@ proc repro_hook_readdir*(dirp: pointer): pointer {.exportc, cdecl, dynlib.} =
     var record = baseRecord(mrDirectoryEnumerate, moDirectoryEnumerate)
     record.path = dirPath
     record.result = 1
-    record.detail = "readdir"
+    record.detail = if dirMetaStr.len > 0: "readdir " & dirMetaStr else: "readdir"
     emitRecord(record)
 
 proc repro_hook_closedir*(dirp: pointer): cint {.exportc, cdecl, dynlib.} =
@@ -2164,10 +2321,20 @@ proc repro_hook_access*(path: cstring; mode: cint): cint
     return ct_macos_bodypatch_real_access(path, mode)
   result = ct_macos_bodypatch_real_access(path, mode)
   let savedErrno = getErrno()
-  # access has no stat buffer, so no (dev, ino) is available — record the raw
-  # probe and, on success, the canonical companion (ROUND-2 R4).
-  recordPathProbe(result, path, mode, "")
-  recordCanonicalPathProbe(result, path, mode, "")
+  # access has no stat buffer, so no (dev, ino) is available. ROUND-4 RW2 (break
+  # D2): on SUCCESS, raw-stat the path (reentrancy-free, bounded — only on success,
+  # so the ENOENT probe storm is skipped) to fold in the same mtime+size signal a
+  # stat() probe gets, making a stat-only file's content change / a dir's mtime
+  # bump detectable through an access()-based existence probe too
+  # (r4_dir/neg_probe.c, misc_probe.c). Record the raw probe and, on success, the
+  # canonical companion (ROUND-2 R4).
+  var detail = ""
+  if result == 0:
+    var mtime, size: uint64
+    if ct_macos_stat_path_mtime_size(path, addr mtime, addr size):
+      detail = metaSuffix("", mtime, size)
+  recordPathProbe(result, path, mode, detail)
+  recordCanonicalPathProbe(result, path, mode, detail)
   setErrno(savedErrno)
 
 # --- Unified rename-family hooks (interpose + body-patch share ONE hook) ---
@@ -2199,6 +2366,96 @@ proc repro_hook_renameat*(fromfd: cint; fromPath: cstring; tofd: cint;
   let savedErrno = getErrno()
   recordRename(result, fromPath, toPath,
     "renameat fromfd=" & $fromfd & " tofd=" & $tofd)
+  setErrno(savedErrno)
+
+# --- Unified path-mutation hooks (ROUND-4 RW2 / break D3) -----------------
+#
+# mkdir / mkdirat / rmdir / unlink / unlinkat are the output-directory MUTATION
+# surface round-3 left entirely unhooked (only rename was covered), so a build's
+# mkdir/unlink/rmdir took real effect with NO record while the depfile declared a
+# `path-mutation` gap marked required=false — letting an unhooked mutation
+# coexist with mcComplete (r4_dir/misc_probe.c). Like the stat/rename family each
+# is a thin syscall wrapper, so the hook forwards via the RAW syscall
+# (ct_macos_real_*), NOT the named symbol, so a single mutation records EXACTLY
+# ONCE on every backend and never re-enters a body-patched entry. Each records an
+# `mrPathMutation` OUTPUT fact (it does NOT downgrade — a normal build mutates its
+# output tree, so flagging it would re-run everything: the cardinal sin).
+
+proc repro_hook_mkdir*(path: cstring; mode: cint): cint
+    {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_mkdir(path, mode)
+  result = ct_macos_real_mkdir(path, mode)
+  let savedErrno = getErrno()
+  recordPathMutation(result, path, "mkdir")
+  setErrno(savedErrno)
+
+proc repro_hook_mkdirat*(dirfd: cint; path: cstring; mode: cint): cint
+    {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_mkdirat(dirfd, path, mode)
+  result = ct_macos_real_mkdirat(dirfd, path, mode)
+  let savedErrno = getErrno()
+  recordPathMutationAt(result, dirfd, path, "mkdirat dirfd=" & $dirfd)
+  setErrno(savedErrno)
+
+proc repro_hook_rmdir*(path: cstring): cint {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_rmdir(path)
+  result = ct_macos_real_rmdir(path)
+  let savedErrno = getErrno()
+  recordPathMutation(result, path, "rmdir")
+  setErrno(savedErrno)
+
+proc repro_hook_unlink*(path: cstring): cint {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_unlink(path)
+  result = ct_macos_real_unlink(path)
+  let savedErrno = getErrno()
+  recordPathMutation(result, path, "unlink")
+  setErrno(savedErrno)
+
+proc repro_hook_unlinkat*(dirfd: cint; path: cstring; flags: cint): cint
+    {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_unlinkat(dirfd, path, flags)
+  result = ct_macos_real_unlinkat(dirfd, path, flags)
+  let savedErrno = getErrno()
+  # AT_REMOVEDIR (flags & 0x80 on Darwin) makes unlinkat behave like rmdir; the
+  # detail records the flags for provenance either way.
+  recordPathMutationAt(result, dirfd, path,
+    "unlinkat dirfd=" & $dirfd & " flags=" & $flags)
+  setErrno(savedErrno)
+
+# symlink / symlinkat ADD a directory entry — the create-side mirror of the
+# unlink/rmdir remove-side: a build that lays down a versioned-library symlink
+# (libfoo.dylib -> libfoo.N.dylib), an `ln -s` install step, or any tool that
+# materializes a symlink into the output tree mutates the namespace exactly as
+# unlink does. They were the one common mutation the round-4 RW2 surface still
+# left unhooked, so without them advertising mcapPathMutation as "supported" (no
+# required=false gap) would overclaim the mutation coverage. The MUTATION is the
+# newly created LINK path (`symlink(target, linkpath)` — arg 2; `symlinkat(target,
+# dirfd, linkpath)` — arg 3); `target` is the link's CONTENTS, kept in the detail
+# for provenance. Each forwards via the RAW syscall (body-patch-safe) and records
+# an `mrPathMutation` OUTPUT fact (no downgrade — same rationale as mkdir/unlink).
+
+proc repro_hook_symlink*(target, linkpath: cstring): cint
+    {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_symlink(target, linkpath)
+  result = ct_macos_real_symlink(target, linkpath)
+  let savedErrno = getErrno()
+  recordPathMutation(result, linkpath, "symlink target=" & $target)
+  setErrno(savedErrno)
+
+proc repro_hook_symlinkat*(target: cstring; dirfd: cint; linkpath: cstring): cint
+    {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return ct_macos_real_symlinkat(target, dirfd, linkpath)
+  result = ct_macos_real_symlinkat(target, dirfd, linkpath)
+  let savedErrno = getErrno()
+  recordPathMutationAt(result, dirfd, linkpath,
+    "symlinkat dirfd=" & $dirfd & " target=" & $target)
   setErrno(savedErrno)
 
 # --- Unified clonefile / link / copyfile hooks (content dependency, #3) ---
@@ -3084,6 +3341,34 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
     BodypatchHookSpec(
       names: @["renameat"],
       hook: cast[pointer](repro_hook_renameat)),
+    # ROUND-4 RW2 (break D3) output-directory mutation surface. Like rename these
+    # are thin syscall wrappers, so the hook forwards via the RAW syscall and the
+    # PLAIN body patch (no trampoline) suffices — catching shared-cache-internal
+    # callers too (e.g. libc `remove(3)`, which calls unlink/rmdir INSIDE
+    # libsystem and never crosses the program's import stubs the interpose tuple
+    # sees). Each records an `mrPathMutation` output fact.
+    BodypatchHookSpec(
+      names: @["mkdir"],
+      hook: cast[pointer](repro_hook_mkdir)),
+    BodypatchHookSpec(
+      names: @["mkdirat"],
+      hook: cast[pointer](repro_hook_mkdirat)),
+    BodypatchHookSpec(
+      names: @["rmdir"],
+      hook: cast[pointer](repro_hook_rmdir)),
+    BodypatchHookSpec(
+      names: @["unlink"],
+      hook: cast[pointer](repro_hook_unlink)),
+    BodypatchHookSpec(
+      names: @["unlinkat"],
+      hook: cast[pointer](repro_hook_unlinkat)),
+    # symlink/symlinkat — the create-side mirror of unlink/rmdir (see the hooks).
+    BodypatchHookSpec(
+      names: @["symlink"],
+      hook: cast[pointer](repro_hook_symlink)),
+    BodypatchHookSpec(
+      names: @["symlinkat"],
+      hook: cast[pointer](repro_hook_symlinkat)),
     # Spawn family (spec §16.7.8): execve forwards via raw `SYS_execve` (it
     # replaces the process image and never returns on success, so no trampoline
     # and no malloc-fork concern); installed with the plain installer below.
@@ -3578,6 +3863,16 @@ static pid_t (*repro_libsystem_fork_fn)(void) = NULL;
 static int (*repro_libsystem_rename_fn)(const char *, const char *) = NULL;
 static int (*repro_libsystem_renameat_fn)(int, const char *, int,
                                           const char *) = NULL;
+/* ROUND-4 RW2 (break D3) — path-mutation entry resolvers (interpose-disable
+ * forward), same pattern as the rename resolvers above. */
+static int (*repro_libsystem_mkdir_fn)(const char *, mode_t) = NULL;
+static int (*repro_libsystem_mkdirat_fn)(int, const char *, mode_t) = NULL;
+static int (*repro_libsystem_rmdir_fn)(const char *) = NULL;
+static int (*repro_libsystem_unlink_fn)(const char *) = NULL;
+static int (*repro_libsystem_unlinkat_fn)(int, const char *, int) = NULL;
+static int (*repro_libsystem_symlink_fn)(const char *, const char *) = NULL;
+static int (*repro_libsystem_symlinkat_fn)(const char *, int,
+                                           const char *) = NULL;
 static int (*repro_libsystem_execve_fn)(const char *, char *const [],
                                         char *const []) = NULL;
 
@@ -3736,6 +4031,138 @@ static int repro_wrap_renameat(int fromfd, const char *from, int tofd,
     }
   }
   return repro_hook_renameat(fromfd, (char *)from, tofd, (char *)to);
+}
+
+/* ROUND-4 RW2 (break D3) — path-mutation thunks. Like rename/renameat these are
+ * body-patched too, so they use the REPRO_INTERPOSE_FORWARD_BEGIN diagnostic path
+ * (forward to the resolved libsystem entry WITHOUT recording when interpose is
+ * disabled for A/B, so body-patch records instead); otherwise they branch to the
+ * recording repro_hook_*, which forwards via the raw syscall. */
+static int repro_wrap_mkdir(const char *path, mode_t mode) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_mkdir, path, mode);
+  }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    if (!repro_libsystem_mkdir_fn)
+      repro_libsystem_mkdir_fn = (int (*)(const char *, mode_t))
+        repro_macos_resolve_libsystem_symbol("_mkdir");
+    if (repro_libsystem_mkdir_fn) {
+      repro_wrap_reentry++;
+      int r = repro_libsystem_mkdir_fn(path, mode);
+      repro_wrap_reentry--;
+      return r;
+    }
+  }
+  return repro_hook_mkdir((char *)path, (int)mode);
+}
+
+static int repro_wrap_mkdirat(int dirfd, const char *path, mode_t mode) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_mkdirat, dirfd, path, mode);
+  }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    if (!repro_libsystem_mkdirat_fn)
+      repro_libsystem_mkdirat_fn = (int (*)(int, const char *, mode_t))
+        repro_macos_resolve_libsystem_symbol("_mkdirat");
+    if (repro_libsystem_mkdirat_fn) {
+      repro_wrap_reentry++;
+      int r = repro_libsystem_mkdirat_fn(dirfd, path, mode);
+      repro_wrap_reentry--;
+      return r;
+    }
+  }
+  return repro_hook_mkdirat(dirfd, (char *)path, (int)mode);
+}
+
+static int repro_wrap_rmdir(const char *path) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_rmdir, path);
+  }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    if (!repro_libsystem_rmdir_fn)
+      repro_libsystem_rmdir_fn = (int (*)(const char *))
+        repro_macos_resolve_libsystem_symbol("_rmdir");
+    if (repro_libsystem_rmdir_fn) {
+      repro_wrap_reentry++;
+      int r = repro_libsystem_rmdir_fn(path);
+      repro_wrap_reentry--;
+      return r;
+    }
+  }
+  return repro_hook_rmdir((char *)path);
+}
+
+static int repro_wrap_unlink(const char *path) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_unlink, path);
+  }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    if (!repro_libsystem_unlink_fn)
+      repro_libsystem_unlink_fn = (int (*)(const char *))
+        repro_macos_resolve_libsystem_symbol("_unlink");
+    if (repro_libsystem_unlink_fn) {
+      repro_wrap_reentry++;
+      int r = repro_libsystem_unlink_fn(path);
+      repro_wrap_reentry--;
+      return r;
+    }
+  }
+  return repro_hook_unlink((char *)path);
+}
+
+static int repro_wrap_unlinkat(int dirfd, const char *path, int flags) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_unlinkat, dirfd, path, flags);
+  }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    if (!repro_libsystem_unlinkat_fn)
+      repro_libsystem_unlinkat_fn = (int (*)(int, const char *, int))
+        repro_macos_resolve_libsystem_symbol("_unlinkat");
+    if (repro_libsystem_unlinkat_fn) {
+      repro_wrap_reentry++;
+      int r = repro_libsystem_unlinkat_fn(dirfd, path, flags);
+      repro_wrap_reentry--;
+      return r;
+    }
+  }
+  return repro_hook_unlinkat(dirfd, (char *)path, flags);
+}
+
+static int repro_wrap_symlink(const char *target, const char *linkpath) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_symlink, target, linkpath);
+  }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    if (!repro_libsystem_symlink_fn)
+      repro_libsystem_symlink_fn = (int (*)(const char *, const char *))
+        repro_macos_resolve_libsystem_symbol("_symlink");
+    if (repro_libsystem_symlink_fn) {
+      repro_wrap_reentry++;
+      int r = repro_libsystem_symlink_fn(target, linkpath);
+      repro_wrap_reentry--;
+      return r;
+    }
+  }
+  return repro_hook_symlink((char *)target, (char *)linkpath);
+}
+
+static int repro_wrap_symlinkat(const char *target, int dirfd,
+                                const char *linkpath) {
+  if (!repro_monitor_runtime_ready) {
+    return (int)syscall(SYS_symlinkat, target, dirfd, linkpath);
+  }
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    if (!repro_libsystem_symlinkat_fn)
+      repro_libsystem_symlinkat_fn = (int (*)(const char *, int, const char *))
+        repro_macos_resolve_libsystem_symbol("_symlinkat");
+    if (repro_libsystem_symlinkat_fn) {
+      repro_wrap_reentry++;
+      int r = repro_libsystem_symlinkat_fn(target, dirfd, linkpath);
+      repro_wrap_reentry--;
+      return r;
+    }
+  }
+  return repro_hook_symlinkat((char *)target, dirfd, (char *)linkpath);
 }
 
 static int repro_wrap_execve(const char *path, char *const argv[], char *const envp[]) {
@@ -4315,6 +4742,16 @@ static struct {
   { (const void *)repro_wrap_fork, (const void *)fork },
   { (const void *)repro_wrap_rename, (const void *)rename },
   { (const void *)repro_wrap_renameat, (const void *)renameat },
+  /* ROUND-4 RW2 (break D3) output-directory mutation hooks. mkdir/mkdirat/rmdir/
+   * unlink/unlinkat/symlink/symlinkat take real effect on the output tree;
+   * round-3 recorded none. symlink/symlinkat ADD an entry as unlink REMOVES one. */
+  { (const void *)repro_wrap_mkdir, (const void *)mkdir },
+  { (const void *)repro_wrap_mkdirat, (const void *)mkdirat },
+  { (const void *)repro_wrap_rmdir, (const void *)rmdir },
+  { (const void *)repro_wrap_unlink, (const void *)unlink },
+  { (const void *)repro_wrap_unlinkat, (const void *)unlinkat },
+  { (const void *)repro_wrap_symlink, (const void *)symlink },
+  { (const void *)repro_wrap_symlinkat, (const void *)symlinkat },
   { (const void *)repro_wrap_execve, (const void *)execve },
   { (const void *)repro_wrap_posix_spawn, (const void *)posix_spawn },
   { (const void *)repro_wrap_posix_spawnp, (const void *)posix_spawnp },

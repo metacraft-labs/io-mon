@@ -403,6 +403,40 @@ int repro_macos_real_truncate_syscall(char *path, long long length) {
 }
 
 /*
+ * ROUND-4 RW2 (break D3) — raw forwarders for the OUTPUT-DIRECTORY MUTATION
+ * surface (mkdir / mkdirat / rmdir / unlink / unlinkat, plus symlink / symlinkat
+ * which ADD a directory entry exactly as unlink REMOVES one). Round-3 hooked NONE
+ * of these, so a build's mkdir/unlink/rmdir/symlink took real effect with NO
+ * record (research/adversarial-2026-06-round4/r4_dir/misc_probe.c). Each is a thin
+ * syscall wrapper, so — like the rename/truncate forwarders above — the hook
+ * reaches the kernel via the RAW syscall (NOT the named symbol / dlsym, which the
+ * body-patch backend may have replaced in place → a by-name forward would
+ * re-enter the hook). This makes a single mutation record EXACTLY ONCE regardless
+ * of whether it arrived through the interpose tuple or a body-patched entry.
+ */
+int repro_macos_real_mkdir_syscall(char *path, int mode) {
+  return (int)syscall(SYS_mkdir, path, mode);
+}
+int repro_macos_real_mkdirat_syscall(int dirfd, char *path, int mode) {
+  return (int)syscall(SYS_mkdirat, dirfd, path, mode);
+}
+int repro_macos_real_rmdir_syscall(char *path) {
+  return (int)syscall(SYS_rmdir, path);
+}
+int repro_macos_real_unlink_syscall(char *path) {
+  return (int)syscall(SYS_unlink, path);
+}
+int repro_macos_real_symlink_syscall(char *target, char *linkpath) {
+  return (int)syscall(SYS_symlink, target, linkpath);
+}
+int repro_macos_real_symlinkat_syscall(char *target, int dirfd, char *linkpath) {
+  return (int)syscall(SYS_symlinkat, target, dirfd, linkpath);
+}
+int repro_macos_real_unlinkat_syscall(int dirfd, char *path, int flags) {
+  return (int)syscall(SYS_unlinkat, dirfd, path, flags);
+}
+
+/*
  * Describe a connect() target for the IPC-breakaway hook. Returns the address
  * family (AF_UNIX / AF_INET / AF_INET6 / …) or -1 on bad args. Fills `out_dest`
  * with the AF_UNIX socket path or an "ip:port" / "[ip6]:port" string. Sets
@@ -571,6 +605,71 @@ int repro_macos_stat_dev_ino(void *buf, unsigned long long *out_dev,
   struct stat *st = (struct stat *)buf;
   *out_dev = (unsigned long long)st->st_dev;
   *out_ino = (unsigned long long)st->st_ino;
+  return 1;
+}
+
+/*
+ * ROUND-4 RW2 (break D2) — extract (MTIME, SIZE) from a (64-bit-inode) struct
+ * stat buffer. The round-2/3 path-probe recorded only (dev, ino), which are
+ * STABLE across content/mtime changes — so a directory's mtime bump (a file was
+ * added/removed) or a regular file's content change (when only stat'd, not read)
+ * produced IDENTICAL records, making any make/ninja-style mtime
+ * ("source newer than target") dependency INVISIBLE
+ * (research/adversarial-2026-06-round4/r4_dir/{mtime_probe,scope_probe}.c). We
+ * fold the FULL-RESOLUTION mtime (st_mtimespec: tv_sec*1e9 + tv_nsec — APFS
+ * timestamps are nanosecond, so a sub-second change is still detectable) plus the
+ * size into the probe detail; the consumer then re-runs iff the mtime/size
+ * changed. Returns 1 and fills *out_mtime/*out_size on success.
+ */
+int repro_macos_stat_mtime_size(void *buf, unsigned long long *out_mtime,
+                                unsigned long long *out_size) {
+  if (!buf) return 0;
+  struct stat *st = (struct stat *)buf;
+  if (out_mtime)
+    *out_mtime = (unsigned long long)st->st_mtimespec.tv_sec * 1000000000ULL +
+                 (unsigned long long)st->st_mtimespec.tv_nsec;
+  if (out_size) *out_size = (unsigned long long)st->st_size;
+  return 1;
+}
+
+/*
+ * ROUND-4 RW2 (break D2, access arm) — (MTIME, SIZE) for a PATH via a RAW
+ * SYS_stat64 syscall (unhooked → reentrancy-free, no muting needed). access(2)
+ * carries no struct stat result, so its success path raw-stats the path to obtain
+ * the same mtime/size signal a stat() probe already gets. Bounded: the caller
+ * invokes this ONLY on a SUCCESSFUL access (the ENOENT probe storm is skipped).
+ * Returns 1 and fills *out_mtime/*out_size on success.
+ */
+int repro_macos_stat_path_mtime_size(char *path, unsigned long long *out_mtime,
+                                     unsigned long long *out_size) {
+  if (!path) return 0;
+  struct stat st;
+  if (syscall(SYS_stat64, path, &st) != 0) return 0;
+  if (out_mtime)
+    *out_mtime = (unsigned long long)st.st_mtimespec.tv_sec * 1000000000ULL +
+                 (unsigned long long)st.st_mtimespec.tv_nsec;
+  if (out_size) *out_size = (unsigned long long)st.st_size;
+  return 1;
+}
+
+/*
+ * ROUND-4 RW2 (break D1, fd arm) — (MTIME, SIZE) for an open fd via a RAW
+ * SYS_fstat64 syscall (unhooked → reentrancy-free). Used by the fd-based
+ * directory-enumerate recorder (getdirentries/getattrlistbulk) to stamp the
+ * enumerated directory's mtime+size so a net-zero add+remove (same entry count)
+ * is detectable: a directory's mtime BUMPS on any add/remove, so the recorded
+ * dependency changes even when the entry COUNT does not
+ * (research/adversarial-2026-06-round4/r4_dir/glob_probe.c). Returns 1 on success.
+ */
+int repro_macos_fd_mtime_size(int fd, unsigned long long *out_mtime,
+                              unsigned long long *out_size) {
+  if (fd < 0) return 0;
+  struct stat st;
+  if (syscall(SYS_fstat64, fd, &st) != 0) return 0;
+  if (out_mtime)
+    *out_mtime = (unsigned long long)st.st_mtimespec.tv_sec * 1000000000ULL +
+                 (unsigned long long)st.st_mtimespec.tv_nsec;
+  if (out_size) *out_size = (unsigned long long)st.st_size;
   return 1;
 }
 
@@ -2261,6 +2360,30 @@ proc ct_macos_fd_dev_ino*(fd: cint; outDev, outIno: ptr uint64): bool =
     {.importc: "repro_macos_fd_dev_ino", cdecl.}
   fdDevIno(fd, outDev, outIno) != 0
 
+proc ct_macos_stat_mtime_size*(buf: pointer; outMtime, outSize: ptr uint64): bool =
+  ## ROUND-4 RW2 (break D2) — read (mtime, size) from a struct stat buffer. mtime
+  ## is full-resolution (nanoseconds). Lets the path-probe detect a dir mtime bump
+  ## / a stat-only file content change that (dev, ino) alone could not.
+  proc impl(buf: pointer; outMtime, outSize: ptr uint64): cint
+    {.importc: "repro_macos_stat_mtime_size", cdecl.}
+  impl(buf, outMtime, outSize) != 0
+
+proc ct_macos_stat_path_mtime_size*(path: cstring;
+    outMtime, outSize: ptr uint64): bool =
+  ## ROUND-4 RW2 (break D2, access arm) — (mtime, size) for a PATH via a raw
+  ## SYS_stat64 (reentrancy-free). Call ONLY on a successful access(2).
+  proc impl(path: cstring; outMtime, outSize: ptr uint64): cint
+    {.importc: "repro_macos_stat_path_mtime_size", cdecl.}
+  impl(path, outMtime, outSize) != 0
+
+proc ct_macos_fd_mtime_size*(fd: cint; outMtime, outSize: ptr uint64): bool =
+  ## ROUND-4 RW2 (break D1, fd arm) — (mtime, size) for an open dir fd via a raw
+  ## SYS_fstat64 (reentrancy-free). Stamps the enumerated directory's mtime so a
+  ## net-zero add+remove (same entry count) is detectable.
+  proc impl(fd: cint; outMtime, outSize: ptr uint64): cint
+    {.importc: "repro_macos_fd_mtime_size", cdecl.}
+  impl(fd, outMtime, outSize) != 0
+
 type
   FdKind* = enum
     ## ROUND-3 S1 — the underlying-object class of an open fd, returned by
@@ -2385,6 +2508,46 @@ proc ct_macos_real_truncate*(path: cstring; length: int64): cint =
   proc impl(path: cstring; length: int64): cint
     {.importc: "repro_macos_real_truncate_syscall", cdecl.}
   impl(path, length)
+
+# ROUND-4 RW2 (break D3) — raw-syscall forwarders for the output-directory
+# mutation surface, shared by the interpose + body-patch mkdir/rmdir/unlink/
+# unlinkat hooks (each reaches the kernel directly so a body-patched named entry
+# is never re-entered — see the C forwarders).
+proc ct_macos_real_mkdir*(path: cstring; mode: cint): cint =
+  proc impl(path: cstring; mode: cint): cint
+    {.importc: "repro_macos_real_mkdir_syscall", cdecl.}
+  impl(path, mode)
+
+proc ct_macos_real_mkdirat*(dirfd: cint; path: cstring; mode: cint): cint =
+  proc impl(dirfd: cint; path: cstring; mode: cint): cint
+    {.importc: "repro_macos_real_mkdirat_syscall", cdecl.}
+  impl(dirfd, path, mode)
+
+proc ct_macos_real_rmdir*(path: cstring): cint =
+  proc impl(path: cstring): cint
+    {.importc: "repro_macos_real_rmdir_syscall", cdecl.}
+  impl(path)
+
+proc ct_macos_real_unlink*(path: cstring): cint =
+  proc impl(path: cstring): cint
+    {.importc: "repro_macos_real_unlink_syscall", cdecl.}
+  impl(path)
+
+proc ct_macos_real_unlinkat*(dirfd: cint; path: cstring; flags: cint): cint =
+  proc impl(dirfd: cint; path: cstring; flags: cint): cint
+    {.importc: "repro_macos_real_unlinkat_syscall", cdecl.}
+  impl(dirfd, path, flags)
+
+proc ct_macos_real_symlink*(target, linkpath: cstring): cint =
+  proc impl(target, linkpath: cstring): cint
+    {.importc: "repro_macos_real_symlink_syscall", cdecl.}
+  impl(target, linkpath)
+
+proc ct_macos_real_symlinkat*(target: cstring; dirfd: cint;
+    linkpath: cstring): cint =
+  proc impl(target: cstring; dirfd: cint; linkpath: cstring): cint
+    {.importc: "repro_macos_real_symlinkat_syscall", cdecl.}
+  impl(target, dirfd, linkpath)
 
 proc ct_macos_dyld_image_dep_path*(mh: pointer; outBuf: pointer;
     outLen: csize_t): cint =
