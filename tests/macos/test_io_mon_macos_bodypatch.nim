@@ -15,7 +15,7 @@
 ## The body-patch mechanism replaces the libsystem ``open`` / ``open$NOCANCEL`` /
 ## ``__open_nocancel`` *entry points* themselves (the Dobby / substrate
 ## ``mach_vm_remap`` overwrite technique — see
-## ``src/io_mon/hooks/macos_bodypatch.nim`` and
+## ``stackable_hooks/platform/macos_bodypatch.nim`` and
 ## ``research/macos-bodypatch/internal3.c``), so it catches the call regardless
 ## of who makes it. With interpose DISABLED for diagnosis
 ## (``IO_MON_DEBUG_DISABLE_INTERPOSE=1``, the "body-patch-only" arm) and under

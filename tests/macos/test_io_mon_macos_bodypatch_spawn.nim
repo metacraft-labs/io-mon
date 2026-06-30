@@ -17,7 +17,8 @@
 ## The body-patch mechanism replaces the libsystem ``posix_spawn`` / ``fork`` /
 ## ``execve`` ENTRY points themselves (the ``mach_vm_remap`` overwrite technique,
 ## with a relocatable-prologue TRAMPOLINE so the original ``posix_spawn``
-## marshalling body still runs — see ``src/io_mon/hooks/macos_bodypatch.nim``).
+## marshalling body still runs — see
+## ``stackable_hooks/platform/macos_bodypatch.nim``).
 ## Patching the callee catches the internal caller, re-applies env-propagation +
 ## SIP-rewrite, and so the child IS injected and monitored.
 ##

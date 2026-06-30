@@ -141,7 +141,8 @@ mechanisms — there is no user-facing backend selector. It "just works":
   callers (e.g. `fopen` → `open$NOCANCEL` *inside* `libsystem_c`).
 - **body-patch** — replaces the libsystem syscall-wrapper entry points
   themselves (the `mach_vm_remap` overwrite / Dobby-style technique; see
-  `src/io_mon/hooks/macos_bodypatch.nim` and `research/macos-bodypatch/`). The
+  `stackable_hooks/platform/macos_bodypatch.nim` and
+  `research/macos-bodypatch/`). The
   constructor ALWAYS installs it, so it catches ALL callers, closing the
   interpose blind spot.
 
