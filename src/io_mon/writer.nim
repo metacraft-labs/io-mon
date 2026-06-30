@@ -1008,6 +1008,21 @@ type
     validNonces*: HashSet[string]
       ## The per-connection nonces the shim recorded on `mrIpcConnect`. A report
       ## that carries a `nonce` must echo one of these.
+    inTreeOutputPaths*: HashSet[string]
+      ## ROUND-3 S3a — every path WRITTEN by a monitored in-tree process
+      ## (`observationKind == moFileWrite`, both the raw and the F_GETPATH-canonical
+      ## spelling the shim records). A breakaway report whose OWN file path is in
+      ## this set was AUTHORED INSIDE the monitored tree — but a genuine
+      ## out-of-tree daemon's report write is INVISIBLE to the shim — so such a
+      ## report is a SELF-AUTHORED FORGERY and is rejected. This is the structural
+      ## discriminator that closes res4_forge: an in-tree client can read the run id
+      ## / nonce and forge every field, but it cannot write its report file without
+      ## the shim recording that write.
+    inTreeOutputInos*: HashSet[string]
+      ## ROUND-3 S3a — `dev:ino` identities of in-tree-written files (the shim
+      ## stamps `dev=`/`ino=` on write opens). An alias-proof backstop to the path
+      ## set so a `/tmp` vs `/private/tmp` (or symlink) spelling of the report path
+      ## is still recognised as in-tree-authored.
 
 const
   BreakawayReportCompleteToken* = "complete"
@@ -1023,7 +1038,21 @@ proc breakawayAuthContext*(records: openArray[MonitorRecord]):
   ## records (DRY: one source of truth shared by `mergeFragments`).
   result.connectedPeers = initHashSet[string]()
   result.validNonces = initHashSet[string]()
+  result.inTreeOutputPaths = initHashSet[string]()
+  result.inTreeOutputInos = initHashSet[string]()
   for r in records:
+    # ROUND-3 S3a — any path a monitored process WROTE is an in-tree-authored
+    # identity. A breakaway report file with such an identity is a self-authored
+    # forgery (an honest out-of-tree daemon's report write is never recorded). Both
+    # the raw and the F_GETPATH-canonical write records carry `moFileWrite`, so this
+    # captures both spellings; the (dev, ino) the shim stamps gives an alias-proof
+    # backstop.
+    if r.observationKind == moFileWrite and r.path.len > 0:
+      result.inTreeOutputPaths.incl r.path
+      let dev = detailToken(r.detail, "dev")
+      let ino = detailToken(r.detail, "ino")
+      if dev.len > 0 and ino.len > 0:
+        result.inTreeOutputInos.incl(dev & ":" & ino)
     case r.kind
     of mrProcessStart:
       if result.runId.len == 0:
@@ -1041,6 +1070,39 @@ proc breakawayAuthContext*(records: openArray[MonitorRecord]):
         if run.len > 0:
           result.runId = run
     else: discard
+
+proc reportAuthoredInTree(reportPath: string;
+    auth: BreakawayAuthContext): bool =
+  ## ROUND-3 S3a — true iff `reportPath` was WRITTEN by a monitored in-tree process
+  ## (and is therefore a self-authored forgery, not a genuine out-of-tree daemon's
+  ## report). Matches on the path in any spelling (the verbatim walked path, plus
+  ## its realpath, against the raw AND F_GETPATH-canonical write paths the shim
+  ## records) and, as an alias-proof backstop, on the file's (dev, ino) identity.
+  ## Defensive: a stat/realpath failure (a vanished report, a permission quirk) is
+  ## treated as NOT-in-tree so a benign race never spuriously rejects an honest
+  ## report — the fail-safe direction here is to fall through to the existing R8
+  ## auth criteria, which still gate the report.
+  if auth.inTreeOutputPaths.len == 0 and auth.inTreeOutputInos.len == 0:
+    return false
+  if reportPath in auth.inTreeOutputPaths:
+    return true
+  # Realpath the report so a /tmp vs /private/tmp (or symlink) spelling matches the
+  # shim's F_GETPATH-canonical write record.
+  try:
+    let real = expandFilename(reportPath)
+    if real in auth.inTreeOutputPaths:
+      return true
+  except OSError, IOError, ValueError:
+    discard
+  if auth.inTreeOutputInos.len > 0:
+    try:
+      let info = getFileInfo(extendedPath(reportPath), followSymlink = true)
+      let key = $cast[uint64](info.id.device) & ":" & $cast[uint64](info.id.file)
+      if key in auth.inTreeOutputInos:
+        return true
+    except OSError, IOError:
+      discard
+  false
 
 proc loadBreakawayReports*(reportDir: string; monitored: HashSet[uint64];
     auth: BreakawayAuthContext): BreakawayFold =
@@ -1082,22 +1144,46 @@ proc loadBreakawayReports*(reportDir: string; monitored: HashSet[uint64];
   ##      no completeness claim or accounts for nothing is not evidence of coverage
   ##      (defeats 3b: the no-reads forgery).
   ##
-  ## HONEST LIMITATION (documented, not hidden): criteria 2–4 bind a report to this
-  ## run and to an observed connection, but an in-tree process can read
-  ## REPRO_MONITOR_SESSION from its environment and could, in principle, forge a
-  ## `complete` report that lists DIFFERENT reads than the daemon truly performed
-  ## (omitting the real dependency). Fully closing that requires either a secret
-  ## per-connection nonce HANDED to the daemon over an out-of-band channel the
-  ## client cannot read (a shim↔daemon handshake), or out-of-band kernel
-  ## observation (the EndpointSecurity backend). Both are tracked follow-ups; the
-  ## checks here close the round-2 probes and every report that does not
-  ## non-trivially and run-correctly account for an observed connection.
+  ## ROUND-3 S3a — criteria 1–5 were DEFEATED by the res4_forge probe
+  ## (research/.../r3_residual): an in-tree client reads REPRO_MONITOR_SESSION from
+  ## its env, REALLY connects to the daemon (so the connection is observed), then
+  ## forges a `complete` report that lists a DECOY read and OMITS the file the daemon
+  ## truly served — a false `mcComplete` with the real input invisible. The nonce
+  ## (criterion 4) did not help: the shim records the nonce in the CLIENT's own
+  ## fragment, which the in-tree client can read, so no client-side nonce is ever a
+  ## secret from an in-tree forger. We close this STRUCTURALLY instead
+  ## (`reportAuthoredInTree`, applied FIRST): a genuine cooperating daemon is OUT OF
+  ## TREE, so the shim never sees it WRITE its report; an in-tree forger IS
+  ## monitored, so the shim DID record it writing this very report file. A report
+  ## whose own file is an in-tree output write is therefore rejected as a forgery.
+  ##
+  ## HONEST LIMITATION (documented, not hidden): this closes a forger that writes the
+  ## report through the ordinary file API the shim hooks. A forger that writes its
+  ## report via a RAW write(2) syscall (bypassing the libsystem entry the shim
+  ## interposes — the structurally-unfixable raw-syscall gap, finding #6), or that
+  ## delegates the report write to an out-of-tree helper it spawns, would still slip
+  ## a forged report past this check. Fully closing those requires out-of-band kernel
+  ## observation (the EndpointSecurity backend, which accounts the daemon's reads
+  ## directly and needs no client-authored report at all). That is the tracked
+  ## structural endgame; the checks here reject the res4_forge probe and every report
+  ## that does not non-trivially and run-correctly account for an observed connection.
   result.reads = @[]
   result.trustedPeerPids = initHashSet[uint64]()
   if reportDir.len == 0 or not dirExists(extendedPath(reportDir)):
     return
   for kind, path in walkDir(extendedPath(reportDir)):
     if kind != pcFile or not path.endsWith(BreakawayReportExt):
+      continue
+    # ---- ROUND-3 S3a: reject a SELF-AUTHORED (in-tree-written) report ----------
+    # The strongest in-process closure of the res4_forge break: a genuine
+    # cooperating daemon is OUT OF TREE, so the shim never records it writing its
+    # report file; an in-tree forger, by contrast, IS monitored, so the shim DID
+    # record the write of this very report file. If this report's path (in any
+    # spelling) — or its (dev, ino) identity — appears among the in-tree output
+    # writes, it was authored inside the monitored tree and is a forgery, so we skip
+    # it (the client's connect then still downgrades). See the HONEST LIMITATION
+    # note below for the residual (a raw-syscall / out-of-tree-helper write).
+    if reportAuthoredInTree(path, auth):
       continue
     var content = ""
     try:
@@ -1167,8 +1253,73 @@ proc loadBreakawayReports*(reportDir: string; monitored: HashSet[uint64];
         observationKind: moFileRead, osPid: clientPid, path: rp,
         detail: "breakaway-daemon-report daemon=" & $daemonPid)
 
+proc fragmentRunIds(records: openArray[MonitorRecord]): Table[uint64, string] =
+  ## ROUND-3 S3c — map each monitored osPid to the run id its `mrProcessStart`
+  ## carries (the `run=` token the shim stamps from REPRO_MONITOR_SESSION). Used by
+  ## the warm-restart stale-fragment guard to recognise records left in a REUSED
+  ## fragment dir by a PRIOR invocation. A pid that started under the CURRENT run
+  ## wins over a stale start for the same (recycled) pid, so a legitimately-current
+  ## process is never dropped.
+  result = initTable[uint64, string]()
+  for r in records:
+    if r.kind == mrProcessStart:
+      let run = detailToken(r.detail, RunIdToken)
+      if run.len == 0:
+        continue
+      # Once a pid is seen with the current run we keep that; otherwise record the
+      # (possibly stale) run. The caller resolves "current beats stale".
+      if not result.hasKey(r.osPid):
+        result[r.osPid] = run
+
+proc dropStaleRunRecords(records: seq[MonitorRecord];
+    currentRunId: string): seq[MonitorRecord] =
+  ## ROUND-3 S3c — drop records left in a REUSED fragment dir by a PRIOR run.
+  ##
+  ## `mergeFragments` consumes the `.io-mon-reading` kill-sentinels but does NOT
+  ## delete the `.rmdf-frag` fragment files, so a caller that RE-MERGES a fragment
+  ## dir (a warm restart, a library `mergeFragments` over a reused dir) would fold a
+  ## prior run's records into THIS verdict (research/.../r3_merge/merge_attack.nim:
+  ## a stale run-1 process-start makes a run-2 out-of-tree breakaway peer look
+  ## in-tree ⇒ a FALSE mcComplete, plus the stale reads pollute the depfile). We
+  ## namespace by the invocation run id (approach (b), non-destructive and
+  ## re-merge-idempotent): a record whose owning process started under a DIFFERENT
+  ## run — and NOT also under the current run (pid recycling) — is dropped. Records
+  ## with no determinable run (no run-stamped process-start for their pid, e.g. a
+  ## worker thread of a process whose start carried no run id) are KEPT, so a
+  ## fresh-dir merge with no run ids behaves exactly as before. The CLI is unaffected
+  ## (it uses a fresh temp dir per run); this protects library callers that reuse a
+  ## dir, per the contract documented on `mergeFragments`.
+  if currentRunId.len == 0:
+    return records
+  let runOf = fragmentRunIds(records)
+  # A pid is CURRENT if any of its process-starts carries the current run id.
+  var currentPids = initHashSet[uint64]()
+  for r in records:
+    if r.kind == mrProcessStart and
+        detailToken(r.detail, RunIdToken) == currentRunId:
+      currentPids.incl r.osPid
+  result = @[]
+  for r in records:
+    let owner = runOf.getOrDefault(r.osPid, "")
+    if r.osPid != 0 and owner.len > 0 and owner != currentRunId and
+        r.osPid notin currentPids:
+      continue # stale prior-run record in a reused dir — do not fold
+    result.add r
+
 proc mergeFragments*(fragmentDir, outputPath: string;
-    breakawayReportDir = ""; expectedRootPid: uint64 = 0): MonitorDepFile =
+    breakawayReportDir = ""; expectedRootPid: uint64 = 0;
+    currentRunId = ""): MonitorDepFile =
+  ## ROUND-3 S3c (warm-restart stale-fragment guard) — `currentRunId` scopes the
+  ## merge to THIS invocation's run id (the value the launcher put in
+  ## REPRO_MONITOR_SESSION). When non-empty (or, if empty, when the env var is set),
+  ## records left in a REUSED fragment dir by a PRIOR run are dropped before the
+  ## completeness check, so a re-merge / warm restart cannot fold a stale
+  ## process-start (masking an out-of-tree breakaway) or stale reads. Empty + no env
+  ## var ⇒ legacy behaviour (no filtering), which is correct for the CLI's fresh
+  ## per-run temp dir. CONTRACT FOR LIBRARY CALLERS that REUSE a fragment dir
+  ## (reprobuild's `monitoredAction`, the codetracer runner): pass the invocation's
+  ## run id as `currentRunId` (or export REPRO_MONITOR_SESSION) so the guard engages.
+  ##
   ## ROUND-2 R1 (ROOT-process completeness guard) — `expectedRootPid` is the pid of
   ## the top-level process the LAUNCHER spawned (io-mon's own `run` driver, the
   ## reprobuild engine's `monitoredAction`, or the codetracer runner). The shim
@@ -1225,6 +1376,17 @@ proc mergeFragments*(fragmentDir, outputPath: string;
             inc corruptFragments
         except IOError, OSError:
           discard
+  # ROUND-3 S3c — warm-restart stale-fragment guard. `mergeFragments` does not
+  # delete `.rmdf-frag` files, so a REUSED fragment dir can carry a PRIOR run's
+  # records (merge_attack.nim). Drop records whose owning process started under a
+  # DIFFERENT run id before any completeness reasoning sees them. The run id is the
+  # explicit `currentRunId` arg, else REPRO_MONITOR_SESSION (the launcher's value,
+  # still set at merge time). Empty ⇒ no filtering (the CLI's fresh-dir case). This
+  # runs BEFORE the corrupt-fragment loss injection below so a real corrupt fragment
+  # of the CURRENT run is still counted.
+  let runScope =
+    if currentRunId.len > 0: currentRunId else: getEnv("REPRO_MONITOR_SESSION")
+  records = dropStaleRunRecords(records, runScope)
   if corruptFragments > 0:
     # One synthetic event-loss record per corrupt fragment. ``mrEventLoss``
     # makes ``summarizeRecords`` count event loss, forcing ``mcIncomplete``.

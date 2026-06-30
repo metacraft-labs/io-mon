@@ -821,6 +821,127 @@ int repro_macos_addr_in_program(void *retaddr) {
     ? 1 : 0;
 }
 
+/* ROUND-3 S3b — NON-SYSTEM IMAGE __TEXT registry for the entropy CALLER
+ * ATTRIBUTION.
+ *
+ * The round-2 R-D attribution (repro_macos_addr_in_program above) flagged an
+ * entropy call ONLY when its caller lay in the MAIN EXECUTABLE's __TEXT. That left
+ * a confirmed hole (round-3 research/.../r3_residual/res1_dylib_entropy): a
+ * NON-SYSTEM dylib the program loads — a compiler pass-plugin, a toolchain dylib,
+ * whether a LINK-TIME dependency or a DLOPEN'd image (librnd.c via tool_dlopen.c) —
+ * that itself calls arc4random/getentropy and bakes the result into the build
+ * output was NOT flagged, so its non-determinism was invisible ⇒ a FALSE CACHE HIT.
+ *
+ * The fix attributes entropy to ANY NON-SYSTEM image: the main executable OR any
+ * non-system dylib/bundle the program loaded — exactly the set the library-load
+ * filter (repro_macos_dyld_image_dep_path) already classifies (NOT /usr/lib, NOT
+ * /System, NOT the dyld shared cache, NOT our injected shim). The
+ * libsystem/libobjc/libswift/libcorecrypto STARTUP BASELINE stays EXCLUDED — the
+ * CARDINAL-SIN guard R-D established: every program's (and every cc/clang compile's)
+ * startup entropy from those shared-cache/usr-lib images must NOT flag, or every
+ * build re-runs.
+ *
+ * HOT-PATH SAFETY (the design constraint the milestone calls out): arc4random is
+ * HOT, and dladdr on the entropy path is BOTH a per-call cost AND a documented
+ * dyld-loader-lock re-entry hazard (these hooks can fire under the loader lock
+ * during image init). So we do NOT dladdr per call. Instead each non-system image's
+ * slid __TEXT [start,end) range is PRE-REGISTERED ONCE, from the dyld add-image
+ * callback (repro_hook_dyld_add_image), which already classifies the image. The
+ * entropy hot path is then a pure pointer-range scan over a handful of ranges (a
+ * real clang link loads ~24 non-system dylibs) — no dladdr, no dyld, no lock, no
+ * allocation, re-entry-safe at any lifecycle point. The add-image callback fires for
+ * the program's full dependency closure at registration AND for every later dlopen,
+ * so a plugin's range is registered before it runs (res1 dlopen: plugin_emit is
+ * called from main(), long after the dlopen callback registered librnd's range).
+ *
+ * CONCURRENCY: the WRITER (register, from add-image) is serialized by dyld's loader
+ * lock, so the read-modify-write of the count needs no CAS. A RELEASE store of the
+ * count publishes the slot writes before the bump; the READER (entropy hot path)
+ * does an ACQUIRE load, so a concurrent entropy call on another thread sees only
+ * fully-written ranges. The cap is a FAIL-SAFE: an overflow simply drops a range ⇒
+ * at worst a FALSE NEGATIVE (a missed downgrade), never a crash and never the
+ * cardinal-sin false positive. */
+#define REPRO_NONSYS_RANGE_CAP 8192
+static const void *repro_nonsys_text_start[REPRO_NONSYS_RANGE_CAP];
+static const void *repro_nonsys_text_end[REPRO_NONSYS_RANGE_CAP];
+static volatile uint32_t repro_nonsys_range_count = 0;
+
+/* ROUND-3 S3b — LINK-TIME vs DLOPEN discrimination for the entropy range set.
+ *
+ * The add-image callback fires SYNCHRONOUSLY for every image ALREADY loaded when
+ * `_dyld_register_func_for_add_image` is called (the program's full LINK-TIME
+ * dependency closure — dyld maps all static dependencies before our constructor),
+ * and AGAIN for every later `dlopen`. The constructor sets this flag to 1 the
+ * instant the register call returns, so a callback fired DURING the initial burst
+ * (flag == 0) is a link-time dependency and a callback fired afterwards (flag == 1)
+ * is a dlopen'd image.
+ *
+ * WHY this gates the entropy range set (but NOT recordLibraryLoad): on a real
+ * toolchain the program's LINK-TIME runtime dylibs draw BENIGN entropy — a Nix/
+ * Homebrew clang's libLLVM/libc++ call arc4random for a random TEMP-FILE NAME and
+ * for hash-seed randomization, neither of which reaches the build OUTPUT (the same
+ * benign pattern the /dev/urandom-for-mktemp cardinal-sin guard already exempts).
+ * Those dylibs are NON-SYSTEM (they live in /nix/store, not /usr/lib or the shared
+ * cache), so attributing their entropy would FALSE-DOWNGRADE every cc/clang compile
+ * (the cardinal sin — observed: a real `cc -c` draws libLLVM temp-name entropy). A
+ * DLOPEN'd image, by contrast, is an EXPLICITLY-loaded extension — a compiler
+ * pass-plugin, the res1_dylib_entropy plugin — far more likely to bake entropy into
+ * output, and NOT part of the trusted, pinned toolchain runtime. So we attribute
+ * entropy to the MAIN EXECUTABLE (always) and to DLOPEN'd images, but NOT to
+ * link-time dependency dylibs. recordLibraryLoad still records ALL non-system images
+ * as content deps (break #4 unchanged); only the ENTROPY attribution is gated.
+ *
+ * DOCUMENTED RESIDUAL: a non-system dylib LINKED (not dlopen'd) into a build tool
+ * that draws output-affecting entropy (res1's link-time `tool` variant) is NOT
+ * flagged — it is structurally indistinguishable from the trusted toolchain runtime
+ * (libLLVM/libc++), so the cardinal-sin guard wins. The structural endgame is the
+ * EndpointSecurity backend (kernel-side accounting). */
+static volatile int repro_addimage_burst_done = 0;
+
+void repro_macos_mark_addimage_burst_done(void) {
+  __atomic_store_n(&repro_addimage_burst_done, 1, __ATOMIC_RELEASE);
+}
+
+int repro_macos_addimage_burst_done(void) {
+  return __atomic_load_n(&repro_addimage_burst_done, __ATOMIC_ACQUIRE);
+}
+
+void repro_macos_register_nonsystem_image(void *mh_raw) {
+  if (mh_raw == NULL) return;
+  const struct mach_header *mh = (const struct mach_header *)mh_raw;
+  /* getsegmentdata returns the actual (slid) mapped __TEXT address + size, so the
+   * range already accounts for ASLR — exactly as repro_macos_capture_main_image
+   * does for the main executable. Lock-free memory walk: safe in the add-image
+   * callback (no dyld re-entry). */
+  unsigned long size = 0;
+  uint8_t *p = getsegmentdata((const struct mach_header_64 *)mh, "__TEXT", &size);
+  if (p == NULL || size == 0) return;
+  uint32_t n = __atomic_load_n(&repro_nonsys_range_count, __ATOMIC_RELAXED);
+  if (n >= REPRO_NONSYS_RANGE_CAP) return; /* cap ⇒ false negative, never a crash */
+  repro_nonsys_text_start[n] = (const void *)p;
+  repro_nonsys_text_end[n] = (const void *)(p + size);
+  __atomic_store_n(&repro_nonsys_range_count, n + 1, __ATOMIC_RELEASE);
+}
+
+/* Return 1 iff `retaddr` lies in a NON-SYSTEM image's __TEXT — the main executable
+ * (round-2 R-D range) OR any registered non-system dylib/bundle (round-3 S3b) ⇒ the
+ * program's (or its plugin's) OWN entropy use ⇒ flag. 0 otherwise (the
+ * libsystem/libobjc/libswift baseline, or an unknown caller ⇒ do NOT flag — the
+ * cardinal-sin guard). Pure pointer-range scan; no dyld, no lock, no allocation. */
+int repro_macos_addr_in_nonsystem(void *retaddr) {
+  if (retaddr == NULL) return 0;
+  if (repro_main_text_start != NULL &&
+      retaddr >= repro_main_text_start && retaddr < repro_main_text_end)
+    return 1;
+  uint32_t n = __atomic_load_n(&repro_nonsys_range_count, __ATOMIC_ACQUIRE);
+  for (uint32_t i = 0; i < n; i++) {
+    if (retaddr >= repro_nonsys_text_start[i] &&
+        retaddr < repro_nonsys_text_end[i])
+      return 1;
+  }
+  return 0;
+}
+
 int repro_macos_path_is_dir(char *path) {
   struct stat st;
 #ifdef SYS_stat64
@@ -2247,8 +2368,52 @@ proc ct_macos_addr_in_program*(caller: pointer): bool =
   ## flag). False for the benign libsystem/libobjc/libswift baseline or an unknown
   ## caller (do NOT flag — conservative against the cardinal sin). A pure pointer
   ## compare: safe under dyld's loader lock where dladdr would crash. See the C note.
+  ##
+  ## ROUND-3 S3b — superseded on the entropy path by `ct_macos_addr_in_nonsystem`
+  ## (which also attributes a NON-SYSTEM dylib/plugin's entropy). Kept for any
+  ## main-exe-only caller that wants the narrower test.
   proc impl(caller: pointer): cint
     {.importc: "repro_macos_addr_in_program", cdecl.}
+  impl(caller) != 0
+
+proc ct_macos_register_nonsystem_image*(mh: pointer) =
+  ## ROUND-3 S3b — register a non-system image's slid __TEXT range so the entropy
+  ## hooks attribute that image's OWN arc4random/getentropy as non-determinism.
+  ## Called from the dyld add-image hook when the image is a recordable non-system
+  ## dylib/bundle (the SAME classification the library-load filter uses). Deadlock-
+  ## safe inside the add-image callback: a pure getsegmentdata memory walk, no dyld
+  ## re-entry, no allocation.
+  proc impl(mh: pointer)
+    {.importc: "repro_macos_register_nonsystem_image", cdecl.}
+  impl(mh)
+
+proc ct_macos_mark_addimage_burst_done*() =
+  ## ROUND-3 S3b — mark dyld's initial add-image burst (the link-time dependency
+  ## closure) complete, so subsequent add-image callbacks are dlopen'd images. The
+  ## constructor calls this the instant `_dyld_register_func_for_add_image` returns.
+  proc impl() {.importc: "repro_macos_mark_addimage_burst_done", cdecl.}
+  impl()
+
+proc ct_macos_addimage_burst_done*(): bool =
+  ## ROUND-3 S3b — true once the initial (link-time) add-image burst has finished,
+  ## i.e. the current add-image callback is for a DLOPEN'd image. Used to gate the
+  ## entropy range set to dlopen'd images (the toolchain's link-time runtime dylibs
+  ## draw benign entropy and must NOT be attributed — the cardinal-sin guard).
+  proc impl(): cint {.importc: "repro_macos_addimage_burst_done", cdecl.}
+  impl() != 0
+
+proc ct_macos_addr_in_nonsystem*(caller: pointer): bool =
+  ## ROUND-3 S3b — CALLER ATTRIBUTION for the entropy auto-downgrade, widened from
+  ## the round-2 main-exe-only test to ANY NON-SYSTEM image. True iff `caller` lies
+  ## in the main executable's __TEXT OR any registered non-system dylib/bundle's
+  ## __TEXT (a compiler pass-plugin, a toolchain dylib, a dlopen'd image) ⇒ the
+  ## program's (or its plugin's) OWN entropy use ⇒ flag. False for the
+  ## libsystem/libobjc/libswift/libcorecrypto startup baseline or an unknown caller
+  ## (do NOT flag — the cardinal-sin guard). A pure pointer-range scan over a handful
+  ## of registered ranges: no dladdr, no dyld, no lock, no allocation — safe under
+  ## dyld's loader lock and cheap on the hot arc4random path. See the C note.
+  proc impl(caller: pointer): cint
+    {.importc: "repro_macos_addr_in_nonsystem", cdecl.}
   impl(caller) != 0
 
 proc ct_macos_real_getentropy*(buf: pointer; len: csize_t): cint =
