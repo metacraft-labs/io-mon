@@ -105,13 +105,13 @@ const
     mcapFileCreate,
     mcapFileTruncate,
     mcapFileAppend,
+    mcapRename,
     mcapIpcConnect
   }
 
   LinuxPreloadKnownUnsupportedCapabilities* = {
     mcapEndpointSecurity,
     mcapHybrid,
-    mcapRename,
     mcapSymlink,
     mcapLibraryLoad,
     mcapAuthorizationEnforcement,
@@ -270,7 +270,8 @@ proc linuxUnsupportedReason(capability: MonitorCapability): string =
   of mcapHybrid:
     "hybrid native plus preload profile is not implemented"
   of mcapRename:
-    "Linux preload shim does not yet normalize rename/renameat as path mutations"
+    "Linux preload shim hooks libc-visible rename/renameat/renameat2; this " &
+      "reason applies only where rename is not advertised"
   of mcapSymlink:
     "Linux preload shim does not yet normalize symlink/readlink as path mutations"
   of mcapLibraryLoad:
@@ -278,7 +279,9 @@ proc linuxUnsupportedReason(capability: MonitorCapability): string =
   of mcapAuthorizationEnforcement:
     "Linux preload shim observes only and cannot authorize or deny operations"
   of mcapPathMutation:
-    "Linux preload shim does not cover the full mutation surface yet"
+    "Linux preload shim records libc-visible link/linkat and " &
+      "rename/renameat/renameat2 path mutations, but does not cover the full " &
+      "raw mutation surface yet"
   of mcapAdversarialRawSyscall:
     "Linux LD_PRELOAD covers libc syscall(2), selected application inline " &
       "syscall sites, and tracked anonymous executable mappings, but does " &
@@ -290,8 +293,9 @@ proc linuxUnsupportedReason(capability: MonitorCapability): string =
       "the preload mmap/mprotect/munmap/mremap lifecycle; mappings created " &
       "outside that lifecycle are not production-complete"
   of mcapPathIdentity:
-    "Linux preload shim does not yet provide full hardlink/inode alias and " &
-      "rename-staging path identity fidelity"
+    "Linux preload shim records libc-visible hardlink creation source/alias " &
+      "and rename-staging final paths, but does not yet provide full " &
+      "pre-existing hardlink/inode alias or raw-mutation identity fidelity"
   of mcapIpcConnect:
     "Linux preload shim hooks connect(2); this reason applies only where " &
       "IPC-connect is not advertised"
@@ -415,7 +419,9 @@ proc linuxPreloadMonitorProfile*(
       "mmap/mprotect executable ranges with munmap/mremap lifecycle " &
       "bookkeeping; libc-visible pread/readv/preadv/sendfile/" &
       "copy_file_range/splice content movers record source reads and " &
-      "destination writes, and io-mon fails closed for unsupported raw syscall numbers, " &
+      "destination writes; libc-visible link/linkat and rename/renameat/" &
+      "renameat2 record hardlink source/alias and final rename destinations; " &
+      "and io-mon fails closed for unsupported raw syscall numbers, " &
       "untracked or partially tracked anonymous executable mprotect, " &
       "partial-overlap mremap ownership escapes, or anonymous writable+" &
       "executable mappings")
@@ -424,9 +430,10 @@ proc linuxPreloadMonitorProfile*(
     message: "Linux LD_PRELOAD completeness excludes adversarial residuals " &
       "unless they are represented by event-loss at runtime: excluded-prefix " &
       "startup DSOs, executable mappings outside the preload mmap lifecycle, " &
-      "direct raw zero-copy/mutation syscalls, hardlink/path-identity aliases, and " &
-      "non-file determinism inputs. Consumers that require those threat models " &
-      "must request the corresponding capability and treat the gap as incomplete.")
+      "direct raw zero-copy/mutation syscalls, pre-existing hardlink/inode " &
+      "aliases, and non-file determinism inputs. Consumers that require those " &
+      "threat models must request the corresponding capability and treat the " &
+      "gap as incomplete.")
 
   var gapCapabilities = LinuxPreloadKnownUnsupportedCapabilities
   for capability in required:

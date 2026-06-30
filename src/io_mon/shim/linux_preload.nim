@@ -16,6 +16,7 @@ const
   OCreat = 0x0040.cint
   OTrunc = 0x0200.cint
   OAppend = 0x0400.cint
+  LinuxAtFdcwd = -100.cint
   LinuxSysRead = 0.clong
   LinuxSysOpen = 2.clong
   LinuxSysClose = 3.clong
@@ -283,6 +284,17 @@ proc pathForFd(fd: cint): string =
   acquire(fdLock)
   result = fdPaths.getOrDefault(fd, "")
   release(fdLock)
+
+proc pathForAt(dirfd: cint; path: cstring): string {.raises: [].} =
+  if path == nil:
+    return ""
+  let raw = $path
+  if raw.len == 0 or raw.isAbsolute or dirfd == LinuxAtFdcwd:
+    return raw
+  let base = pathForFd(dirfd)
+  if base.len == 0:
+    return raw
+  result = base / raw
 
 proc dirKey(dirp: pointer): uint =
   cast[uint](dirp)
@@ -808,6 +820,116 @@ proc repro_hook_splice*(ctx: var SpliceContext) {.raises: [].} =
     recordFdWrite(ctx.fdOut, ctx.result)
   c_set_errno(savedErrno)
 
+proc recordPathRead(path, detail: string) {.raises: [].} =
+  if path.len == 0:
+    return
+  var record = baseRecord(mrFileRead, moFileRead)
+  record.path = path
+  record.result = 0
+  record.detail = detail
+  emitRecord(record)
+
+proc recordPathRead(path: cstring; detail: string) {.raises: [].} =
+  if path == nil:
+    return
+  recordPathRead($path, detail)
+
+proc recordPathWrite(path, detail: string) {.raises: [].} =
+  if path.len == 0:
+    return
+  var record = baseRecord(mrFileWrite, moFileWrite)
+  record.path = path
+  record.result = 0
+  record.detail = detail
+  emitRecord(record)
+
+proc recordPathWrite(path: cstring; detail: string) {.raises: [].} =
+  if path == nil:
+    return
+  recordPathWrite($path, detail)
+
+proc recordLinkMutation(resultCode: cint; oldPath, newPath: cstring;
+                        detail: string) {.raises: [].} =
+  if resultCode != 0:
+    return
+  recordPathRead(oldPath, detail & " source")
+  recordPathWrite(newPath, detail & " alias")
+
+proc recordRenameMutation(resultCode: cint; oldPath, newPath: cstring;
+                          detail: string) {.raises: [].} =
+  if resultCode != 0:
+    return
+  recordPathRead(oldPath, detail & " source")
+  recordPathWrite(newPath, detail & " destination")
+
+proc repro_hook_link*(ctx: var LinkContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  recordLinkMutation(ctx.result, ctx.oldPath, ctx.newPath, "link")
+  c_set_errno(savedErrno)
+
+proc repro_hook_linkat*(ctx: var LinkatContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0:
+    let oldPath = pathForAt(ctx.oldDirfd, ctx.oldPath)
+    let newPath = pathForAt(ctx.newDirfd, ctx.newPath)
+    let detail = "linkat olddirfd=" & $ctx.oldDirfd & " newdirfd=" &
+      $ctx.newDirfd & " flags=" & $ctx.flags
+    recordPathRead(oldPath, detail & " source")
+    recordPathWrite(newPath, detail & " alias")
+  c_set_errno(savedErrno)
+
+proc repro_hook_rename*(ctx: var RenameContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  recordRenameMutation(ctx.result, ctx.oldPath, ctx.newPath, "rename")
+  c_set_errno(savedErrno)
+
+proc repro_hook_renameat*(ctx: var RenameatContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0:
+    let oldPath = pathForAt(ctx.oldDirfd, ctx.oldPath)
+    let newPath = pathForAt(ctx.newDirfd, ctx.newPath)
+    let detail = "renameat olddirfd=" & $ctx.oldDirfd & " newdirfd=" &
+      $ctx.newDirfd
+    recordPathRead(oldPath, detail & " source")
+    recordPathWrite(newPath, detail & " destination")
+  c_set_errno(savedErrno)
+
+proc repro_hook_renameat2*(ctx: var RenameatContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0:
+    let oldPath = pathForAt(ctx.oldDirfd, ctx.oldPath)
+    let newPath = pathForAt(ctx.newDirfd, ctx.newPath)
+    let detail = "renameat2 olddirfd=" & $ctx.oldDirfd & " newdirfd=" &
+      $ctx.newDirfd & " flags=" & $ctx.flags
+    recordPathRead(oldPath, detail & " source")
+    recordPathWrite(newPath, detail & " destination")
+  c_set_errno(savedErrno)
+
 proc repro_hook_dlopen*(ctx: var DlopenContext) {.raises: [].} =
   if shouldBypass():
     callNext(ctx)
@@ -1057,6 +1179,11 @@ registerConnectHook(repro_hook_connect)
 registerSendfileHook(repro_hook_sendfile)
 registerCopyFileRangeHook(repro_hook_copy_file_range)
 registerSpliceHook(repro_hook_splice)
+registerLinkHook(repro_hook_link)
+registerLinkatHook(repro_hook_linkat)
+registerRenameHook(repro_hook_rename)
+registerRenameatHook(repro_hook_renameat)
+registerRenameat2Hook(repro_hook_renameat2)
 registerDlopenHook(repro_hook_dlopen)
 registerDlmopenHook(repro_hook_dlmopen)
 registerMmapHook(repro_hook_mmap)

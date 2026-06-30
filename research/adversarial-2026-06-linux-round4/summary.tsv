@@ -7,6 +7,6 @@ sendfile	0	mcComplete	yes	yes	no	captured
 copy_file_range	0	mcComplete	yes	yes	no	captured
 splice	0	mcComplete	yes	yes	no	captured
 raw_sendfile	0	mcIncomplete	no	no	yes	fail-closed/incomplete
-hardlink_alias	0	mcComplete	no	no	no	unsupported-capability-gated
-rename_staging	0	mcComplete	no	no	no	unsupported-capability-gated
+hardlink_alias	0	mcComplete	yes	yes	no	captured
+rename_staging	0	mcComplete	yes	yes	no	captured
 nonfile	0	mcComplete	no	no	no	unsupported-capability-gated

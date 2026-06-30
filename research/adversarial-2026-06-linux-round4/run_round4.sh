@@ -98,11 +98,17 @@ int main(int argc, char **argv) {
 C
 
 cat >"$RUN_DIR/probes/hardlink_alias.c" <<'C'
+#define _GNU_SOURCE
 #include <fcntl.h>
 #include <unistd.h>
 int main(int argc, char **argv) {
   unlink(argv[2]);
   if (link(argv[1], argv[2]) != 0) return 2;
+  int dirfd = open(argv[3], O_RDONLY | O_DIRECTORY);
+  if (dirfd < 0) return 5;
+  unlink(argv[4]);
+  if (linkat(AT_FDCWD, argv[1], dirfd, argv[5], 0) != 0) return 6;
+  close(dirfd);
   int fd = open(argv[2], O_RDONLY);
   if (fd < 0) return 3;
   char buf[64];
@@ -113,6 +119,7 @@ int main(int argc, char **argv) {
 C
 
 cat >"$RUN_DIR/probes/rename_staging.c" <<'C'
+#define _GNU_SOURCE
 #include <fcntl.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -121,7 +128,16 @@ int main(int argc, char **argv) {
   if (fd < 0) return 2;
   if (write(fd, "renamed\n", 8) != 8) return 3;
   close(fd);
-  return rename(argv[1], argv[2]) == 0 ? 0 : 4;
+  if (rename(argv[1], argv[2]) != 0) return 4;
+  fd = open(argv[1], O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if (fd < 0) return 5;
+  if (write(fd, "renamedat\n", 10) != 10) return 6;
+  close(fd);
+  int dirfd = open(argv[3], O_RDONLY | O_DIRECTORY);
+  if (dirfd < 0) return 7;
+  int rc = renameat(AT_FDCWD, argv[1], dirfd, argv[4]);
+  close(dirfd);
+  return rc == 0 ? 0 : 8;
 }
 C
 
@@ -172,6 +188,9 @@ run_probe() {
   completeness="$(sed -n '1s/.*completeness=//p' "$inspect" | awk '{print $1}')"
   awk -v src="$src" '/^#[0-9]+ .*file-read/ && index($0, src) { found=1 } END { exit(found ? 0 : 1) }' "$inspect" && file_read=yes || file_read=no
   awk -v out="$out" '/^#[0-9]+ .*file-write/ && index($0, out) { found=1 } END { exit(found ? 0 : 1) }' "$inspect" && file_write=yes || file_write=no
+  if [ "$name" = "rename_staging" ]; then
+    awk -v p="$RUN_DIR/out/rename_staging.tmp" '/^#[0-9]+ .*file-read/ && index($0, p) { found=1 } END { exit(found ? 0 : 1) }' "$inspect" && file_read=yes || file_read=no
+  fi
   grep -Eq '^#[0-9]+ event-loss' "$inspect" && event_loss=yes || event_loss=no
   classification="captured"
   if [ "$completeness" = "mcIncomplete" ]; then
@@ -192,8 +211,12 @@ run_probe sendfile "$RUN_DIR/content_channels" sendfile "$src" "$RUN_DIR/out/sen
 run_probe copy_file_range "$RUN_DIR/content_channels" copy_file_range "$src" "$RUN_DIR/out/copy_file_range.out"
 run_probe splice "$RUN_DIR/content_channels" splice "$src" "$RUN_DIR/out/splice.out"
 run_probe raw_sendfile "$RUN_DIR/raw_sendfile" "$src" "$RUN_DIR/out/raw_sendfile.out"
-run_probe hardlink_alias "$RUN_DIR/hardlink_alias" "$src" "$RUN_DIR/out/hardlink_alias.link"
-run_probe rename_staging "$RUN_DIR/rename_staging" "$RUN_DIR/out/rename_staging.tmp" "$RUN_DIR/out/rename_staging.final"
+run_probe hardlink_alias "$RUN_DIR/hardlink_alias" "$src" \
+  "$RUN_DIR/out/hardlink_alias.out" "$RUN_DIR/out" \
+  "$RUN_DIR/out/hardlink_alias_linkat.out" "hardlink_alias_linkat.out"
+run_probe rename_staging "$RUN_DIR/rename_staging" \
+  "$RUN_DIR/out/rename_staging.tmp" "$RUN_DIR/out/rename_staging.out" \
+  "$RUN_DIR/out" "rename_staging_renameat.out"
 IO_MON_ROUND4_ENV=secret run_probe nonfile "$RUN_DIR/nonfile"
 
 cp "$RUN_DIR/summary.tsv" "$ROUND/summary.tsv"
