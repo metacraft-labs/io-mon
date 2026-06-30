@@ -94,6 +94,38 @@ int repro_macos_real_close_syscall(int fd) {
 }
 
 /*
+ * ROUND-3 S2d — raw-syscall forwarders for the fd-DUPLICATION family
+ * (dup/dup2/fcntl(F_DUPFD*)). A read/write via a DUPLICATE of an open fd must be
+ * attributed to the SAME file as the source, and a dup2 onto an already-open
+ * destination closes the old destination INTERNALLY in the kernel (bypassing the
+ * hooked close), so the shim's fd->path table must mirror the duplication.
+ *
+ * Each forwards via the RAW syscall (reentrancy-free; never re-enters its own
+ * interpose wrapper). macOS has NO dup3 (and no SYS_dup3), so only dup/dup2 and
+ * fcntl's F_DUPFD/F_DUPFD_CLOEXEC commands duplicate an fd here.
+ */
+int repro_macos_real_dup_syscall(int fd) {
+  return (int)syscall(SYS_dup, fd);
+}
+
+int repro_macos_real_dup2_syscall(int oldfd, int newfd) {
+  return (int)syscall(SYS_dup2, oldfd, newfd);
+}
+
+/*
+ * Raw `fcntl` forwarder. fcntl is variadic (int fcntl(int, int, ...)); on Darwin
+ * libsystem marshals the single optional argument into the third syscall slot
+ * regardless of whether the command takes an int (F_DUPFD, F_SETFD, …) or a
+ * pointer (F_GETPATH, F_PREALLOCATE, …). Forwarding the argument as a void*-sized
+ * value through SYS_fcntl is therefore faithful for EVERY command — the kernel
+ * reads only the bits the command defines — so a single forwarder both duplicates
+ * (F_DUPFD*) and passes through every other command untouched. The interpose
+ * wrapper reads the variadic argument via va_arg and hands it here. */
+int repro_macos_real_fcntl_syscall(int fd, int cmd, void *arg) {
+  return (int)syscall(SYS_fcntl, fd, cmd, arg);
+}
+
+/*
  * Raw-syscall stat/lstat/access/fstatat forwarders for the body-patch backend.
  *
  * The body-patch backend replaces the high-level libsystem `stat`/`lstat`/...
@@ -1672,6 +1704,26 @@ proc ct_macos_interpose_real_close*(fd: cint): cint =
   proc realCloseSyscall(fd: cint): cint
     {.importc: "repro_macos_real_close_syscall", cdecl.}
   realCloseSyscall(fd)
+
+proc ct_macos_real_dup*(fd: cint): cint =
+  ## ROUND-3 S2d — raw `SYS_dup` forwarder for the fd-duplication hook.
+  proc realDup(fd: cint): cint
+    {.importc: "repro_macos_real_dup_syscall", cdecl.}
+  realDup(fd)
+
+proc ct_macos_real_dup2*(oldfd, newfd: cint): cint =
+  ## ROUND-3 S2d — raw `SYS_dup2` forwarder for the fd-duplication hook.
+  proc realDup2(oldfd, newfd: cint): cint
+    {.importc: "repro_macos_real_dup2_syscall", cdecl.}
+  realDup2(oldfd, newfd)
+
+proc ct_macos_real_fcntl*(fd, cmd: cint; arg: pointer): cint =
+  ## ROUND-3 S2d — raw `SYS_fcntl` forwarder. Faithful for EVERY command (the
+  ## kernel reads only the bits the command defines), so the fcntl hook can
+  ## duplicate on F_DUPFD/F_DUPFD_CLOEXEC and pass every other command through.
+  proc realFcntl(fd, cmd: cint; arg: pointer): cint
+    {.importc: "repro_macos_real_fcntl_syscall", cdecl.}
+  realFcntl(fd, cmd, arg)
 
 proc ct_macos_interpose_real_opendir*(path: cstring): pointer =
   proc realOpendir(path: cstring): pointer
