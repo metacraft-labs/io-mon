@@ -53,6 +53,7 @@ var
   observedLock: Lock
   emptyFdLock: Lock
   fragmentDir: string
+  runId: string
   nextProcessSeq: uint64 = 0
   fdPaths = initTable[cint, string]()
   dirPaths = initTable[uint, string]()
@@ -248,11 +249,22 @@ proc baseRecord(kind: MonitorRecordKind;
     threadId: currentThreadId(),
     probeResult: prUnknown)
 
+proc stampRunId(record: var MonitorRecord) {.raises: [].} =
+  ## Scope Linux records to the launcher's run id so reused fragment directories
+  ## can be filtered without relying only on pid ownership.
+  if runId.len == 0 or detailToken(record.detail, "run").len > 0:
+    return
+  if record.detail.len > 0:
+    record.detail.add " "
+  record.detail.add "run=" & runId
+
 proc emitRecord(record: MonitorRecord) {.raises: [].} =
   if not initialized or fragmentDir.len == 0 or shouldBypass():
     return
   withShimMuted:
-    appendFragmentRecord(fragmentDir, record)
+    var stamped = record
+    stampRunId(stamped)
+    appendFragmentRecord(fragmentDir, stamped)
     # The main thread keeps the batching win (flushed by the process-exit
     # destructor); a worker thread that exits early cannot be reached by the
     # destructor and has no safe pthread-key flush, so flush its batch eagerly
@@ -515,6 +527,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     return 0
   withShimMuted:
     fragmentDir = getEnv("REPRO_MONITOR_FRAGMENT_DIR")
+    runId = getEnv("REPRO_MONITOR_SESSION")
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))
     rememberInheritedOpenFds()

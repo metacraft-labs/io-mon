@@ -6,7 +6,7 @@
 ## un-injectable image, each yields one event-loss so `mergeFragments` downgrades
 ## completeness to `mcIncomplete` — while a fully-monitored tree stays clean.
 
-import std/[os, sets, unittest]
+import std/[os, sets, strutils, unittest]
 import io_mon
 
 proc start(pid: uint64): MonitorRecord =
@@ -557,6 +557,63 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
     for r in dep.records:
       if r.path == "/dep/header.h": sawDep = true
     check sawDep
+    removeDir(work)
+
+  test "same-pid stale/current reuse drops ambiguous prior reads and fails closed":
+    # RUN OLD and CURRENT both have pid 500 in a reused fragment dir. A stale read
+    # from OLD lacks its own run token, so pid ownership alone cannot prove it
+    # belongs to CURRENT. The merge must not fold it into CURRENT as mcComplete.
+    let work = getTempDir() / ("io-mon-s3c-samepid-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let frag = work / "frags"
+    createDir(frag)
+    appendFragmentRecord(frag, startAt(500'u64, "111", "OLD"))
+    appendFragmentRecord(frag, readRec(500'u64, "/old/stale.h"))
+    closeFragmentSlot()
+    appendFragmentRecord(frag, startAt(500'u64, "222", "CURRENT"))
+    closeFragmentSlot()
+    let dep = mergeFragments(frag, work / "current.rdep",
+      currentRunId = "CURRENT")
+    check dep.completeness == mcIncomplete
+    var sawAmbiguousLoss = false
+    for r in dep.records:
+      check r.path != "/old/stale.h"
+      if r.kind == mrEventLoss and
+          "ambiguous unstamped fragment record" in r.detail:
+        sawAmbiguousLoss = true
+    check sawAmbiguousLoss
+    removeDir(work)
+
+  test "same-pid explicit current records survive stale records":
+    # Linux stamps each emitted record with the current run. A same-pid stale
+    # fragment from a prior run must not force a downgrade when the current read
+    # is explicitly scoped to CURRENT and therefore unambiguous.
+    let work = getTempDir() / ("io-mon-s3c-samepid-stamped-" &
+      $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let frag = work / "frags"
+    createDir(frag)
+    appendFragmentRecord(frag, startAt(501'u64, "111", "OLD"))
+    var staleRead = readRec(501'u64, "/old/stale.h")
+    staleRead.detail = "run=OLD"
+    appendFragmentRecord(frag, staleRead)
+    closeFragmentSlot()
+    appendFragmentRecord(frag, startAt(501'u64, "222", "CURRENT"))
+    var currentRead = readRec(501'u64, "/current/header.h")
+    currentRead.detail = "run=CURRENT"
+    appendFragmentRecord(frag, currentRead)
+    closeFragmentSlot()
+    let dep = mergeFragments(frag, work / "current.rdep",
+      currentRunId = "CURRENT")
+    check dep.completeness == mcComplete
+    var sawCurrent = false
+    for r in dep.records:
+      check r.path != "/old/stale.h"
+      if r.path == "/current/header.h":
+        sawCurrent = true
+      check not (r.kind == mrEventLoss and
+        "ambiguous unstamped fragment record" in r.detail)
+    check sawCurrent
     removeDir(work)
 
   test "without a run id (legacy fresh-dir callers) nothing is filtered":
