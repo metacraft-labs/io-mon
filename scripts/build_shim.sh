@@ -70,8 +70,15 @@ case "$(uname -s)" in
       src/io_mon/shim/macos_interpose.nim
     ;;
   Linux)
+    linux_shim_link_flags=()
+    if getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+      linux_shim_link_flags+=(
+        "--passL:-Wl,--version-script=${here}/src/io_mon/hooks/linux_preload_versions.map"
+      )
+    fi
     nim c \
       ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
+      ${linux_shim_link_flags[@]+"${linux_shim_link_flags[@]}"} \
       --app:lib \
       --threads:on \
       --path:src \

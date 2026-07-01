@@ -211,6 +211,12 @@ type
     result*: pointer
     nextIndex: int
 
+  DlsymContext* = object
+    handle*: pointer
+    name*: cstring
+    result*: pointer
+    nextIndex: int
+
   MmapContext* = object
     address*: pointer
     length*: csize_t
@@ -351,6 +357,7 @@ type
   RenameatHook* = proc(ctx: var RenameatContext) {.raises: [].}
   DlopenHook* = proc(ctx: var DlopenContext) {.raises: [].}
   DlmopenHook* = proc(ctx: var DlmopenContext) {.raises: [].}
+  DlsymHook* = proc(ctx: var DlsymContext) {.raises: [].}
   MmapHook* = proc(ctx: var MmapContext) {.raises: [].}
   MprotectHook* = proc(ctx: var MprotectContext) {.raises: [].}
   MunmapHook* = proc(ctx: var MunmapContext) {.raises: [].}
@@ -443,6 +450,9 @@ type
   DlmopenHookEntry = object
     priority: int
     callback: DlmopenHook
+  DlsymHookEntry = object
+    priority: int
+    callback: DlsymHook
   MmapHookEntry = object
     priority: int
     callback: MmapHook
@@ -541,6 +551,7 @@ typedef int (*ct_renameat_hook_fn)(int, char *, int, char *);
 typedef int (*ct_renameat2_hook_fn)(int, char *, int, char *, unsigned int);
 typedef void *(*ct_dlopen_hook_fn)(char *, int);
 typedef void *(*ct_dlmopen_hook_fn)(long, char *, int);
+typedef void *(*ct_dlsym_hook_fn)(void *, char *);
 typedef void *(*ct_mmap_hook_fn)(void *, size_t, int, int, int, long);
 typedef int (*ct_mprotect_hook_fn)(void *, size_t, int);
 typedef int (*ct_munmap_hook_fn)(void *, size_t);
@@ -587,6 +598,7 @@ typedef int (*ct_renameat2_real_fn)(int, const char *, int, const char *,
                                     unsigned int);
 typedef void *(*ct_dlopen_real_fn)(const char *, int);
 typedef void *(*ct_dlmopen_real_fn)(Lmid_t, const char *, int);
+typedef void *(*ct_dlsym_real_fn)(void *, const char *);
 typedef void *(*ct_mmap_real_fn)(void *, size_t, int, int, int, off_t);
 typedef int (*ct_mprotect_real_fn)(void *, size_t, int);
 typedef int (*ct_munmap_real_fn)(void *, size_t);
@@ -637,6 +649,7 @@ static ct_renameat_hook_fn ct_renameat_hook = NULL;
 static ct_renameat2_hook_fn ct_renameat2_hook = NULL;
 static ct_dlopen_hook_fn ct_dlopen_hook = NULL;
 static ct_dlmopen_hook_fn ct_dlmopen_hook = NULL;
+static ct_dlsym_hook_fn ct_dlsym_hook = NULL;
 static ct_mmap_hook_fn ct_mmap_hook = NULL;
 static ct_mprotect_hook_fn ct_mprotect_hook = NULL;
 static ct_munmap_hook_fn ct_munmap_hook = NULL;
@@ -704,6 +717,7 @@ static ct_renameat_real_fn real_renameat_ptr = NULL;
 static ct_renameat2_real_fn real_renameat2_ptr = NULL;
 static ct_dlopen_real_fn real_dlopen_ptr = NULL;
 static ct_dlmopen_real_fn real_dlmopen_ptr = NULL;
+static ct_dlsym_real_fn real_dlsym_ptr = NULL;
 static ct_mmap_real_fn real_mmap_ptr = NULL;
 static ct_mprotect_real_fn real_mprotect_ptr = NULL;
 static ct_munmap_real_fn real_munmap_ptr = NULL;
@@ -998,6 +1012,7 @@ void ct_linux_preload_register_renameat_hook(ct_renameat_hook_fn hook) { ct_rena
 void ct_linux_preload_register_renameat2_hook(ct_renameat2_hook_fn hook) { ct_renameat2_hook = hook; }
 void ct_linux_preload_register_dlopen_hook(ct_dlopen_hook_fn hook) { ct_dlopen_hook = hook; }
 void ct_linux_preload_register_dlmopen_hook(ct_dlmopen_hook_fn hook) { ct_dlmopen_hook = hook; }
+void ct_linux_preload_register_dlsym_hook(ct_dlsym_hook_fn hook) { ct_dlsym_hook = hook; }
 void ct_linux_preload_register_mmap_hook(ct_mmap_hook_fn hook) { ct_mmap_hook = hook; }
 void ct_linux_preload_register_mprotect_hook(ct_mprotect_hook_fn hook) { ct_mprotect_hook = hook; }
 void ct_linux_preload_register_munmap_hook(ct_munmap_hook_fn hook) { ct_munmap_hook = hook; }
@@ -1259,6 +1274,17 @@ void *ct_linux_preload_real_dlmopen(long namespace_id, char *path, int flags) {
     real_dlmopen_ptr = (ct_dlmopen_real_fn)ct_resolve("dlmopen");
   if (real_dlmopen_ptr == NULL) { errno = ENOSYS; return NULL; }
   return real_dlmopen_ptr((Lmid_t)namespace_id, path, flags);
+}
+
+void *ct_linux_preload_real_dlsym(void *handle, char *name) {
+#ifdef __GLIBC__
+  if (real_dlsym_ptr == NULL)
+    real_dlsym_ptr = (ct_dlsym_real_fn)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+#endif
+  if (real_dlsym_ptr == NULL)
+    real_dlsym_ptr = (ct_dlsym_real_fn)ct_resolve("dlsym");
+  if (real_dlsym_ptr == NULL) { errno = ENOSYS; return NULL; }
+  return real_dlsym_ptr(handle, name);
 }
 
 void *ct_linux_preload_real_mmap(void *addr, size_t length, int prot, int flags,
@@ -1656,6 +1682,28 @@ void *dlmopen(Lmid_t namespace_id, const char *path, int flags) {
   return CT_CALL_HOOK(ct_dlmopen_hook((long)namespace_id, (char *)path, flags));
 }
 
+void *ct_linux_preload_public_dlsym(void *handle, const char *name)
+    __attribute__((visibility("default")));
+void *ct_linux_preload_public_dlsym(void *handle, const char *name) {
+  if (CT_BYPASS() || ct_dlsym_hook == NULL)
+    return ct_linux_preload_real_dlsym(handle, (char *)name);
+  return CT_CALL_HOOK(ct_dlsym_hook(handle, (char *)name));
+}
+#ifdef __GLIBC__
+void *ct_linux_preload_public_dlsym_glibc_2_2_5(void *handle, const char *name)
+    __attribute__((alias("ct_linux_preload_public_dlsym"),
+                   visibility("default")));
+void *ct_linux_preload_public_dlsym_glibc_2_34(void *handle, const char *name)
+    __attribute__((alias("ct_linux_preload_public_dlsym"),
+                   visibility("default")));
+__asm__(".symver ct_linux_preload_public_dlsym_glibc_2_2_5,dlsym@GLIBC_2.2.5");
+__asm__(".symver ct_linux_preload_public_dlsym_glibc_2_34,dlsym@@GLIBC_2.34");
+#else
+void *dlsym(void *handle, const char *name)
+    __attribute__((alias("ct_linux_preload_public_dlsym"),
+                   visibility("default")));
+#endif
+
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
     __attribute__((visibility("default")));
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
@@ -1893,6 +1941,8 @@ proc realDlopen*(path: cstring; flags: cint): pointer
   {.importc: "ct_linux_preload_real_dlopen", raises: [].}
 proc realDlmopen*(namespaceId: clong; path: cstring; flags: cint): pointer
   {.importc: "ct_linux_preload_real_dlmopen", raises: [].}
+proc realDlsym*(handle: pointer; name: cstring): pointer
+  {.importc: "ct_linux_preload_real_dlsym", raises: [].}
 proc realMmap*(address: pointer; length: csize_t; prot, flags, fd: cint;
                offset: clong): pointer
   {.importc: "ct_linux_preload_real_mmap", raises: [].}
@@ -1974,6 +2024,8 @@ type
   DlopenDispatch = proc(path: cstring; flags: cint): pointer
     {.cdecl, raises: [].}
   DlmopenDispatch = proc(namespaceId: clong; path: cstring; flags: cint): pointer
+    {.cdecl, raises: [].}
+  DlsymDispatch = proc(handle: pointer; name: cstring): pointer
     {.cdecl, raises: [].}
   MmapDispatch = proc(address: pointer; length: csize_t; prot, flags, fd: cint;
                       offset: clong): pointer {.cdecl, raises: [].}
@@ -2092,6 +2144,8 @@ proc installDlopenDispatcher(dispatch: DlopenDispatch)
   {.importc: "ct_linux_preload_register_dlopen_hook", raises: [].}
 proc installDlmopenDispatcher(dispatch: DlmopenDispatch)
   {.importc: "ct_linux_preload_register_dlmopen_hook", raises: [].}
+proc installDlsymDispatcher(dispatch: DlsymDispatch)
+  {.importc: "ct_linux_preload_register_dlsym_hook", raises: [].}
 proc installMmapDispatcher(dispatch: MmapDispatch)
   {.importc: "ct_linux_preload_register_mmap_hook", raises: [].}
 proc installMprotectDispatcher(dispatch: MprotectDispatch)
@@ -2156,6 +2210,7 @@ var
   renameat2Hooks: seq[RenameatHookEntry] = @[]
   dlopenHooks: seq[DlopenHookEntry] = @[]
   dlmopenHooks: seq[DlmopenHookEntry] = @[]
+  dlsymHooks: seq[DlsymHookEntry] = @[]
   mmapHooks: seq[MmapHookEntry] = @[]
   mprotectHooks: seq[MprotectHookEntry] = @[]
   munmapHooks: seq[MunmapHookEntry] = @[]
@@ -2372,6 +2427,12 @@ proc registerDlmopenHook*(hook: DlmopenHook; priority = 100) {.raises: [].} =
     return
   dlmopenHooks.add(DlmopenHookEntry(priority: priority, callback: hook))
   dlmopenHooks.sort(proc(a, b: DlmopenHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerDlsymHook*(hook: DlsymHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  dlsymHooks.add(DlsymHookEntry(priority: priority, callback: hook))
+  dlsymHooks.sort(proc(a, b: DlsymHookEntry): int = cmp(a.priority, b.priority))
 
 proc registerMmapHook*(hook: MmapHook; priority = 100) {.raises: [].} =
   if hook == nil:
@@ -3086,6 +3147,9 @@ proc callReal*(ctx: var DlopenContext) {.raises: [].} =
 proc callReal*(ctx: var DlmopenContext) {.raises: [].} =
   ctx.result = realDlmopen(ctx.namespaceId, ctx.path, ctx.flags)
 
+proc callReal*(ctx: var DlsymContext) {.raises: [].} =
+  ctx.result = realDlsym(ctx.handle, ctx.name)
+
 proc callReal*(ctx: var MmapContext) {.raises: [].} =
   ctx.result = realMmap(ctx.address, ctx.length, ctx.prot, ctx.flags, ctx.fd,
     ctx.offset)
@@ -3370,6 +3434,14 @@ proc callNext*(ctx: var DlopenContext) {.raises: [].} =
     let index = ctx.nextIndex
     inc ctx.nextIndex
     dlopenHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var DlsymContext) {.raises: [].} =
+  if ctx.nextIndex < dlsymHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    dlsymHooks[index].callback(ctx)
   else:
     callReal(ctx)
 
@@ -3694,6 +3766,12 @@ proc dispatchDlmopen(namespaceId: clong; path: cstring; flags: cint): pointer
   callNext(ctx)
   result = ctx.result
 
+proc dispatchDlsym(handle: pointer; name: cstring): pointer
+    {.cdecl, raises: [].} =
+  var ctx = DlsymContext(handle: handle, name: name, result: nil)
+  callNext(ctx)
+  result = ctx.result
+
 proc dispatchMmap(address: pointer; length: csize_t; prot, flags, fd: cint;
                   offset: clong): pointer {.cdecl, raises: [].} =
   var ctx = MmapContext(address: address, length: length, prot: prot, flags: flags,
@@ -3819,6 +3897,7 @@ installRenameatDispatcher(dispatchRenameat)
 installRenameat2Dispatcher(dispatchRenameat2)
 installDlopenDispatcher(dispatchDlopen)
 installDlmopenDispatcher(dispatchDlmopen)
+installDlsymDispatcher(dispatchDlsym)
 installMmapDispatcher(dispatchMmap)
 installMprotectDispatcher(dispatchMprotect)
 installMunmapDispatcher(dispatchMunmap)

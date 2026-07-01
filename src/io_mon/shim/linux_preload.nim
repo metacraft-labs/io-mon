@@ -24,12 +24,18 @@ const
   LinuxSysLstat = 6.clong
   LinuxSysAccess = 21.clong
   LinuxSysSendfile = 40.clong
+  LinuxSysGettimeofday = 96.clong
+  LinuxSysTime = 201.clong
+  LinuxSysClockGettime = 228.clong
+  LinuxSysClockGetres = 229.clong
   LinuxSysReadlink = 89.clong
   LinuxSysOpenat = 257.clong
   LinuxSysNewfstatat = 262.clong
   LinuxSysReadlinkat = 267.clong
   LinuxSysFaccessat = 269.clong
   LinuxSysSplice = 275.clong
+  LinuxSysGetcpu = 309.clong
+  LinuxSysGetrandom = 318.clong
   LinuxSysCopyFileRange = 326.clong
   LinuxSysStatx = 332.clong
   LinuxSysOpenat2 = 437.clong
@@ -64,6 +70,8 @@ var
   rawSyscallCoverageRecorded = false
   inlineSyscallCoverageRecorded = false
   inlineSyscallTrapCoverageRecorded = false
+  linuxVdsoPatchFailureDetails: seq[string] = @[]
+  linuxVdsoPatchFailureEmitted = false
   # Thread id of the thread that ran the preload constructor (the process
   # main thread). Its fragment batch is flushed by the process-exit
   # destructor; worker threads flush eagerly per record (see emitRecord),
@@ -206,6 +214,8 @@ proc c_fd_identity_kind(fd: cint; dev, ino: ptr uint64; kind: ptr cint): cint
   {.importc: "repro_linux_fd_identity_kind", raises: [].}
 proc c_fd_proc_path(fd: cint; buf: pointer; len: csize_t): cint
   {.importc: "repro_linux_fd_proc_path", raises: [].}
+proc c_raw_syscall6(nr, a1, a2, a3, a4, a5, a6: clong): clong
+  {.importc: "stackable_linux_raw_syscall6", cdecl, raises: [].}
 
 type
   FdKind = enum
@@ -284,6 +294,20 @@ proc emitEventLoss(detail: string; result: int64 = 0) {.raises: [].} =
   emitRecord(record)
 
 proc drainInlineRawSyscallEvents() {.raises: [].}
+proc installLinuxVdsoPatches() {.raises: [].}
+proc emitLinuxVdsoPatchFailures(source: string) {.raises: [].}
+proc repro_vdso_clock_gettime*(clockId: cint; tp: pointer): cint
+    {.exportc, cdecl, dynlib, raises: [].}
+proc repro_vdso_gettimeofday*(tv, tz: pointer): cint
+    {.exportc, cdecl, dynlib, raises: [].}
+proc repro_vdso_time*(tloc: ptr clong): clong
+    {.exportc, cdecl, dynlib, raises: [].}
+proc repro_vdso_clock_getres*(clockId: cint; res: pointer): cint
+    {.exportc, cdecl, dynlib, raises: [].}
+proc repro_vdso_getcpu*(cpu, node: ptr cuint; unused: pointer): cint
+    {.exportc, cdecl, dynlib, raises: [].}
+proc repro_vdso_getrandom*(buf: pointer; buflen: csize_t; flags: cuint): clong
+    {.exportc, cdecl, dynlib, raises: [].}
 
 proc recordRawSyscallCoverage(status: RawSyscallPatchStatus) {.raises: [].} =
   if rawSyscallCoverageRecorded:
@@ -542,6 +566,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   recordRawSyscallCoverage(rawStatus)
   let inlineStatus = installInlineSyscallPatches()
   recordInlineSyscallCoverage(inlineStatus)
+  installLinuxVdsoPatches()
   result = 0
 
 proc repro_monitor_shim_flush*(): cint {.exportc, dynlib, raises: [].} =
@@ -1178,6 +1203,9 @@ proc repro_hook_dlopen*(ctx: var DlopenContext) {.raises: [].} =
   if ctx.result != nil:
     let status = scanInlineSyscallPatchesForNewMappings()
     recordLateInlineSyscallScanCoverage(status, "dlopen")
+    if ctx.path != nil and ($ctx.path == "linux-vdso.so.1" or
+        ($ctx.path).endsWith("/linux-vdso.so.1")):
+      emitLinuxVdsoPatchFailures("dlopen")
   c_set_errno(savedErrno)
 
 proc repro_hook_dlmopen*(ctx: var DlmopenContext) {.raises: [].} =
@@ -1193,6 +1221,42 @@ proc repro_hook_dlmopen*(ctx: var DlmopenContext) {.raises: [].} =
     if ctx.namespaceId != 0:
       emitEventLoss("linux dlmopen non-base namespace unmonitored " &
         "namespace-id=" & $ctx.namespaceId)
+  c_set_errno(savedErrno)
+
+proc linuxVdsoReplacementFor(name: cstring): pointer {.raises: [].} =
+  if name == nil:
+    return nil
+  when defined(amd64):
+    case $name
+    of "__vdso_clock_gettime":
+      cast[pointer](repro_vdso_clock_gettime)
+    of "__vdso_gettimeofday":
+      cast[pointer](repro_vdso_gettimeofday)
+    of "__vdso_time":
+      cast[pointer](repro_vdso_time)
+    of "__vdso_clock_getres":
+      cast[pointer](repro_vdso_clock_getres)
+    of "__vdso_getcpu":
+      cast[pointer](repro_vdso_getcpu)
+    of "__vdso_getrandom":
+      cast[pointer](repro_vdso_getrandom)
+    else:
+      nil
+  else:
+    nil
+
+proc repro_hook_dlsym*(ctx: var DlsymContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  let replacement = linuxVdsoReplacementFor(ctx.name)
+  if replacement != nil and ctx.result != nil:
+    if linuxVdsoPatchFailureDetails.len > 0:
+      emitLinuxVdsoPatchFailures("dlsym")
+    ctx.result = replacement
   c_set_errno(savedErrno)
 
 proc repro_hook_mmap*(ctx: var MmapContext) {.raises: [].} =
@@ -1313,6 +1377,140 @@ proc recordNonDeterministic(source: string) {.raises: [].} =
   record.path = source
   record.detail = "linux non-deterministic source"
   emitRecord(record)
+
+proc ptrArg(value: pointer): clong {.inline, raises: [].} =
+  clong(cast[int](value))
+
+proc syscallResultToCint(ret: clong): cint {.inline, raises: [].} =
+  if ret < 0 and ret >= -4095:
+    c_set_errno(cint(-ret))
+    return -1
+  cint(ret)
+
+proc syscallResultToClong(ret: clong): clong {.inline, raises: [].} =
+  if ret < 0 and ret >= -4095:
+    c_set_errno(cint(-ret))
+    return -1
+  ret
+
+proc queueLinuxVdsoPatchFailure(detail: string) {.raises: [].} =
+  linuxVdsoPatchFailureDetails.add detail
+
+proc emitLinuxVdsoPatchFailures(source: string) {.raises: [].} =
+  if linuxVdsoPatchFailureEmitted or linuxVdsoPatchFailureDetails.len == 0:
+    return
+  linuxVdsoPatchFailureEmitted = true
+  for detail in linuxVdsoPatchFailureDetails:
+    emitEventLoss(detail & " source=" & source)
+
+proc queueLinuxVdsoPatchFailure(name: string; tx: LinuxVdsoPatchTransaction)
+    {.raises: [].} =
+  queueLinuxVdsoPatchFailure("linux vdso patch failed symbol=" & name &
+    " diagnostic=" & $tx.diagnostic &
+    " direct=" & $tx.directDiagnostic &
+    " overlay=" & $tx.overlayDiagnostic &
+    " path=" & $tx.path &
+    " errno=" & $tx.osErrno)
+
+proc queueLinuxVdsoResolveFailure(name: string;
+                                   diagnostic: LinuxRawSyscallDiagnostic)
+    {.raises: [].} =
+  queueLinuxVdsoPatchFailure("linux vdso symbol resolve failed symbol=" & name &
+    " diagnostic=" & $diagnostic)
+
+proc installLinuxVdsoReplacement(image: LinuxVdsoImage; name: string;
+                                 replacement: pointer) {.raises: [].} =
+  let cname = cstring(name)
+  let sym = resolveLinuxVdsoSymbol(image, cname)
+  if sym.diagnostic == lrsVdsoSymbolNotFound:
+    return
+  if sym.diagnostic != lrsOk or sym.address == nil:
+    queueLinuxVdsoResolveFailure(name, sym.diagnostic)
+    return
+  let tx = installLinuxVdsoSymbolPatchTransaction(image, cname, replacement,
+    allowOverlay = true)
+  if tx.diagnostic != lrsOk:
+    queueLinuxVdsoPatchFailure(name, tx)
+
+proc installLinuxVdsoPatches() {.raises: [].} =
+  let image = locateLinuxVdsoImage()
+  if image.diagnostic == lrsVdsoNotFound:
+    return
+  if image.diagnostic != lrsOk:
+    queueLinuxVdsoPatchFailure("linux vdso image locate failed diagnostic=" &
+      $image.diagnostic & " errno=" & $image.osErrno)
+    return
+  installLinuxVdsoReplacement(image, "__vdso_clock_gettime",
+    cast[pointer](repro_vdso_clock_gettime))
+  installLinuxVdsoReplacement(image, "__vdso_gettimeofday",
+    cast[pointer](repro_vdso_gettimeofday))
+  installLinuxVdsoReplacement(image, "__vdso_time",
+    cast[pointer](repro_vdso_time))
+  installLinuxVdsoReplacement(image, "__vdso_clock_getres",
+    cast[pointer](repro_vdso_clock_getres))
+  installLinuxVdsoReplacement(image, "__vdso_getcpu",
+    cast[pointer](repro_vdso_getcpu))
+  installLinuxVdsoReplacement(image, "__vdso_getrandom",
+    cast[pointer](repro_vdso_getrandom))
+
+proc repro_vdso_clock_gettime*(clockId: cint; tp: pointer): cint
+    {.exportc, cdecl, dynlib, raises: [].} =
+  let ret = c_raw_syscall6(LinuxSysClockGettime, clong(clockId), ptrArg(tp),
+    0, 0, 0, 0)
+  result = syscallResultToCint(ret)
+  let savedErrno = c_get_errno()
+  if not shouldBypass() and result == 0:
+    recordTimeRead("clock_gettime:" & $clockId)
+  c_set_errno(savedErrno)
+
+proc repro_vdso_gettimeofday*(tv, tz: pointer): cint
+    {.exportc, cdecl, dynlib, raises: [].} =
+  let ret = c_raw_syscall6(LinuxSysGettimeofday, ptrArg(tv), ptrArg(tz),
+    0, 0, 0, 0)
+  result = syscallResultToCint(ret)
+  let savedErrno = c_get_errno()
+  if not shouldBypass() and result == 0:
+    recordTimeRead("gettimeofday")
+  c_set_errno(savedErrno)
+
+proc repro_vdso_time*(tloc: ptr clong): clong
+    {.exportc, cdecl, dynlib, raises: [].} =
+  result = syscallResultToClong(c_raw_syscall6(LinuxSysTime, ptrArg(tloc),
+    0, 0, 0, 0, 0))
+  let savedErrno = c_get_errno()
+  if not shouldBypass() and result != -1:
+    recordTimeRead("time")
+  c_set_errno(savedErrno)
+
+proc repro_vdso_clock_getres*(clockId: cint; res: pointer): cint
+    {.exportc, cdecl, dynlib, raises: [].} =
+  let ret = c_raw_syscall6(LinuxSysClockGetres, clong(clockId), ptrArg(res),
+    0, 0, 0, 0)
+  result = syscallResultToCint(ret)
+  let savedErrno = c_get_errno()
+  if not shouldBypass() and result == 0:
+    recordTimeRead("clock_getres:" & $clockId)
+  c_set_errno(savedErrno)
+
+proc repro_vdso_getcpu*(cpu, node: ptr cuint; unused: pointer): cint
+    {.exportc, cdecl, dynlib, raises: [].} =
+  let ret = c_raw_syscall6(LinuxSysGetcpu, ptrArg(cpu), ptrArg(node),
+    ptrArg(unused), 0, 0, 0)
+  result = syscallResultToCint(ret)
+  let savedErrno = c_get_errno()
+  if not shouldBypass() and result == 0:
+    recordObservedNonFile(mrSysctlRead, moSysctlRead, "getcpu",
+      "linux vdso getcpu")
+  c_set_errno(savedErrno)
+
+proc repro_vdso_getrandom*(buf: pointer; buflen: csize_t; flags: cuint): clong
+    {.exportc, cdecl, dynlib, raises: [].} =
+  result = syscallResultToClong(c_raw_syscall6(LinuxSysGetrandom, ptrArg(buf),
+    clong(buflen), clong(flags), 0, 0, 0))
+  let savedErrno = c_get_errno()
+  if not shouldBypass() and result >= 0:
+    recordNonDeterministic("getrandom")
+  c_set_errno(savedErrno)
 
 proc repro_hook_getenv*(ctx: var GetenvContext) {.raises: [].} =
   if shouldBypass():
@@ -1542,6 +1740,7 @@ registerRenameatHook(repro_hook_renameat)
 registerRenameat2Hook(repro_hook_renameat2)
 registerDlopenHook(repro_hook_dlopen)
 registerDlmopenHook(repro_hook_dlmopen)
+registerDlsymHook(repro_hook_dlsym)
 registerMmapHook(repro_hook_mmap)
 registerMprotectHook(repro_hook_mprotect)
 registerMunmapHook(repro_hook_munmap)
