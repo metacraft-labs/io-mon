@@ -1186,6 +1186,9 @@ proc repro_hook_dlmopen*(ctx: var DlmopenContext) {.raises: [].} =
   if ctx.result != nil:
     let status = scanInlineSyscallPatchesForNewMappings()
     recordLateInlineSyscallScanCoverage(status, "dlmopen")
+    if ctx.namespaceId != 0:
+      emitEventLoss("linux dlmopen non-base namespace unmonitored " &
+        "namespace-id=" & $ctx.namespaceId)
   c_set_errno(savedErrno)
 
 proc repro_hook_mmap*(ctx: var MmapContext) {.raises: [].} =
