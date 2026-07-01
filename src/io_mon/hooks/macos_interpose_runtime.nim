@@ -873,6 +873,66 @@ void *repro_macos_real_mmap_syscall(void *addr, size_t len, int prot, int flags,
 #endif
 }
 
+/* ROUND-5 D — faithful forward for the `syscall(2)` hook: issue the BSD syscall
+ * `number` with up to six register args (arm64: x16=number, x0..x5=args, result in
+ * x0, carry flag = error → errno). Mirrors libsystem's own `syscall` wrapper, so
+ * forwarding through it is transparent. Used by repro_hook_syscall to record/flag a
+ * file syscall a monitored program issued via the (non-inlined) `syscall(2)` escape
+ * hatch and then complete it. NOT a raw-svc the interpose can't see — this IS the
+ * interposed path; the un-hookable case is an INLINE svc in the program's own code,
+ * caught instead by repro_macos_scan_main_text_for_raw_syscall. */
+long repro_macos_real_syscall(long number, long a1, long a2, long a3,
+                              long a4, long a5, long a6) {
+#if defined(__arm64__) || defined(__aarch64__)
+  register long x0 __asm__("x0") = a1;
+  register long x1 __asm__("x1") = a2;
+  register long x2 __asm__("x2") = a3;
+  register long x3 __asm__("x3") = a4;
+  register long x4 __asm__("x4") = a5;
+  register long x5 __asm__("x5") = a6;
+  register long x16 __asm__("x16") = number;
+  register long err __asm__("x6");
+  __asm__ volatile(
+    "svc #0x80\n\t"
+    "cset x6, cs\n"
+    : "+r"(x0), "=r"(err)
+    : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x16)
+    : "cc", "memory");
+  if (err) { errno = (int)x0; return -1; }
+  return x0;
+#else
+  (void)number; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+  errno = ENOSYS;
+  return -1;
+#endif
+}
+
+/* ROUND-5 D — 1 iff `number` is a FILE-content/existence syscall that, issued via
+ * the `syscall(2)` escape hatch, would bypass the named-symbol hooks. The syscall
+ * numbers are the Darwin BSD trap numbers (bsd/kern/syscalls.master). We flag the
+ * open / read / directory / stat family — a monitored program reaching a file this
+ * way is a dependency the interpose cannot attribute, so the merge downgrades. */
+int repro_macos_syscall_is_file_op(long number) {
+  switch (number) {
+    case SYS_open: case SYS_openat: case SYS_read: case SYS_pread:
+    case SYS_readv: case SYS_getdirentries: case SYS_lstat: case SYS_stat:
+    case SYS_open_nocancel: case SYS_openat_nocancel: case SYS_read_nocancel:
+    case SYS_pread_nocancel:
+#ifdef SYS_getdirentries64
+    case SYS_getdirentries64:
+#endif
+#ifdef SYS_lstat64
+    case SYS_lstat64: case SYS_stat64:
+#endif
+#ifdef SYS_fstatat64
+    case SYS_fstatat64:
+#endif
+      return 1;
+    default:
+      return 0;
+  }
+}
+
 /*
  * T3b (findings-doc break #4 + the dlopen arm of #7): classify a dyld IMAGE — a
  * dependent dylib dyld mapped via low-level kernel mmap, OR a dlopen'd one — as
@@ -1072,6 +1132,55 @@ int repro_macos_addr_in_program(void *retaddr) {
   if (retaddr == NULL || repro_main_text_start == NULL) return 0;
   return (retaddr >= repro_main_text_start && retaddr < repro_main_text_end)
     ? 1 : 0;
+}
+
+/* ROUND-5 D — return 1 iff the MAIN executable's own code (__TEXT,__text section)
+ * contains an inline `svc #0x80` instruction (arm64 encoding 0xD4001001). Such a
+ * binary can issue file syscalls DIRECTLY, bypassing every interpose + body-patch
+ * hook (which only see calls routed through libsystem's named entries) — so the
+ * monitor cannot prove it observed the binary's file I/O. The merge treats a set
+ * flag as a completeness downgrade (mcIncomplete → conservative re-run), which is
+ * the honest fail-safe for the interpose backend's structural raw-syscall blind
+ * spot (the EndpointSecurity backend is the kernel-sourced fix).
+ *
+ * Scans the __text SECTION (executable code) ONLY — NOT the whole __TEXT segment,
+ * whose read-only data (__const/__cstring) could coincidentally hold the 4 bytes.
+ * arm64 instructions are 4-byte aligned, so we test aligned words for the exact
+ * encoding; a benign non-syscall instruction can never equal 0xD4001001 (it is a
+ * complete, unambiguous `svc #0x80`). libsystem's OWN svc's live in libsystem's
+ * __text, not the main image, so a normal dynamically-linked build tool (which
+ * routes every syscall through libsystem) scans clean — verified: cc/clang/ld/rustc
+ * contain zero inline svc; only static / raw-syscall binaries (Go, musl-static, an
+ * adversarial probe) trip it, and those genuinely cannot be monitored in-process.
+ * Called single-threaded at init (like capture_main_image); one linear pass over a
+ * few MB, no allocation. */
+static int repro_main_text_has_raw_syscall_flag = -1;  /* -1 = not yet scanned */
+void repro_macos_scan_main_text_for_raw_syscall(void) {
+  repro_main_text_has_raw_syscall_flag = 0;
+  uint32_t count = _dyld_image_count();
+  for (uint32_t i = 0; i < count; i++) {
+    const struct mach_header *mh = _dyld_get_image_header(i);
+    if (mh == NULL || mh->filetype != MH_EXECUTE) continue;
+    unsigned long size = 0;
+    uint8_t *p = getsectiondata((const struct mach_header_64 *)mh, "__TEXT",
+                                "__text", &size);
+    if (p != NULL && size >= 4) {
+      const uint32_t SVC_0x80 = 0xD4001001u;  /* arm64 `svc #0x80` */
+      unsigned long words = size / 4;
+      const uint32_t *code = (const uint32_t *)p;
+      for (unsigned long w = 0; w < words; w++) {
+        if (code[w] == SVC_0x80) {
+          repro_main_text_has_raw_syscall_flag = 1;
+          break;
+        }
+      }
+    }
+    return;  /* exactly one MH_EXECUTE image */
+  }
+}
+
+int repro_macos_main_text_has_raw_syscall(void) {
+  return repro_main_text_has_raw_syscall_flag == 1 ? 1 : 0;
 }
 
 /* ROUND-3 S3b — NON-SYSTEM IMAGE __TEXT registry for the entropy CALLER
@@ -3018,6 +3127,34 @@ proc ct_macos_capture_main_image*() =
   ## shim init, before runtime_ready.
   proc impl() {.importc: "repro_macos_capture_main_image", cdecl.}
   impl()
+
+proc ct_macos_real_syscall*(number, a1, a2, a3, a4, a5, a6: clong): clong =
+  ## ROUND-5 D — faithful forward of a `syscall(2)` indirect call (see the C note).
+  proc impl(number, a1, a2, a3, a4, a5, a6: clong): clong
+    {.importc: "repro_macos_real_syscall", cdecl.}
+  impl(number, a1, a2, a3, a4, a5, a6)
+
+proc ct_macos_syscall_is_file_op*(number: clong): bool =
+  ## ROUND-5 D — true iff `number` is a file open/read/dir/stat syscall that, issued
+  ## via `syscall(2)`, bypasses the named-symbol hooks (see the C note).
+  proc impl(number: clong): cint
+    {.importc: "repro_macos_syscall_is_file_op", cdecl.}
+  impl(number) != 0
+
+proc ct_macos_scan_main_text_for_raw_syscall*() =
+  ## ROUND-5 D — scan the main executable's own code for an inline `svc #0x80` ONCE
+  ## at init. Single-threaded, before runtime_ready. See the C note.
+  proc impl() {.importc: "repro_macos_scan_main_text_for_raw_syscall", cdecl.}
+  impl()
+
+proc ct_macos_main_text_has_raw_syscall*(): bool =
+  ## ROUND-5 D — true iff the main executable issues inline raw syscalls (bypassing
+  ## every interpose/body-patch hook). The merge downgrades such a process to
+  ## mcIncomplete: the interpose backend cannot prove it observed the binary's file
+  ## I/O (the structural raw-syscall blind spot; EndpointSecurity is the fix).
+  proc impl(): cint
+    {.importc: "repro_macos_main_text_has_raw_syscall", cdecl.}
+  impl() != 0
 
 proc ct_macos_addr_in_program*(caller: pointer): bool =
   ## ROUND-2 R-D — CALLER ATTRIBUTION for entropy observations. True iff
