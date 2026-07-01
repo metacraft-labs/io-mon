@@ -23,6 +23,7 @@ import io_mon/writer
 #include <sys/attr.h>
 #include <sys/clonefile.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -36,6 +37,25 @@ import io_mon/writer
 #include <time.h>
 #include <mach/mach_time.h>
 #include <unistd.h>
+
+/*
+ * ROUND-5 P2 — SecRandomCopyBytes (Security.framework) and CCRandomGenerateBytes
+ * (libcommonCrypto) are framework entropy APIs. We forward-declare them
+ * `weak_import` so the __DATA,__interpose tuple that references their address
+ * LINKS without adding a hard `-framework Security` / CommonCrypto dependency to
+ * the shim's own closure (which we must not grow). At load, dyld fixes up the
+ * `(const void *)Sec…/CC…` interpose replacee: if the monitored program imports
+ * the symbol (the only case where interposing it matters) it resolves to the
+ * genuine framework address and the tuple fires; if the program does NOT link the
+ * framework the reference is NULL and dyld silently interposes nothing — exactly
+ * the desired "only fires for programs that use it" behaviour. The forward path
+ * still resolves the real entry via the shim-skipping image walk (see the runtime
+ * forwarders), never by name, to avoid re-entering our own interpose binding.
+ */
+extern int SecRandomCopyBytes(const void *rnd, size_t count, void *bytes)
+  __attribute__((weak_import));
+extern int CCRandomGenerateBytes(void *bytes, size_t count)
+  __attribute__((weak_import));
 
 static int repro_monitor_get_errno(void) {
   return errno;
@@ -2549,6 +2569,42 @@ proc repro_hook_access*(path: cstring; mode: cint): cint
   recordCanonicalPathProbe(result, path, mode, detail)
   setErrno(savedErrno)
 
+proc repro_hook_statfs*(path: cstring; buf: pointer): cint
+    {.exportc, cdecl, dynlib.} =
+  ## ROUND-5 P2 — statfs(path) probes the filesystem containing `path` (fstype,
+  ## mount point, block counts). The metadata gap is that the TARGET PATH was
+  ## unrecorded, so a build gated on `statfs` (e.g. picking a code path by
+  ## filesystem type) named no dependency at all. Record the path as an
+  ## mrPathProbe, canonicalised exactly like stat/access: the raw probe AND —
+  ## success or ENOENT — the realpath / lexical-canonical companion (reusing the
+  ## Phase-1 lexical helper for the missing-path case) so a canonical-keying
+  ## consumer matches. `struct statfs` is NOT a `struct stat`, so no (dev,ino) is
+  ## extracted; the detail tags the source.
+  if not initialized or disabled > 0:
+    return ct_macos_bodypatch_real_statfs(path, buf)
+  result = ct_macos_bodypatch_real_statfs(path, buf)
+  let savedErrno = getErrno()
+  recordPathProbe(result, path, 0, "statfs")
+  recordCanonicalPathProbe(result, path, 0, "statfs")
+  setErrno(savedErrno)
+
+proc repro_hook_fstatfs*(fd: cint; buf: pointer): cint
+    {.exportc, cdecl, dynlib.} =
+  ## ROUND-5 P2 — fstatfs(fd) is the fd form; recover the fd's canonical path via
+  ## F_GETPATH (a raw fcntl, reentrancy-free) and record it as an mrPathProbe so
+  ## the filesystem probe names the same canonical path the by-path form would.
+  ## An fd with no recoverable path (e.g. a socket/pipe) records nothing.
+  if not initialized or disabled > 0:
+    return ct_macos_bodypatch_real_fstatfs(fd, buf)
+  result = ct_macos_bodypatch_real_fstatfs(fd, buf)
+  let savedErrno = getErrno()
+  var pbuf: array[1024, char]
+  if fd >= 0 and ct_macos_fd_real_path(fd, addr pbuf[0], csize_t(pbuf.len)) != 0:
+    let p = $cast[cstring](addr pbuf[0])
+    if p.len > 0:
+      recordPathProbe(result, cstring(p), 0, "fstatfs fd=" & $fd)
+  setErrno(savedErrno)
+
 # --- Unified rename-family hooks (interpose + body-patch share ONE hook) ---
 #
 # gnulib/autotools makefiles materialise outputs atomically via the
@@ -3208,6 +3264,35 @@ proc repro_hook_arc4random_uniform*(upper: cuint; caller: pointer): cuint
   if ct_macos_addr_in_nonsystem(caller):
     recordNonDeterministic("arc4random_uniform")
 
+proc repro_hook_secrandom*(rnd: pointer; count: csize_t; bytes: pointer;
+    caller: pointer): cint {.exportc, cdecl, dynlib.} =
+  ## ROUND-5 P2 — SecRandomCopyBytes (Security.framework, Apple's RECOMMENDED
+  ## entropy API). NON-DETERMINISM (entropy) evidence, recorded like
+  ## getentropy/arc4random and — same as them — ONLY when the caller lies in a
+  ## NON-SYSTEM image (caller attribution), so a libsystem/framework startup
+  ## baseline is excluded and a normal cc/clang compile is never falsely flagged
+  ## (the cardinal-sin guard). Deduped once per process.
+  if not initialized or disabled > 0:
+    return ct_macos_real_secrandom(rnd, count, bytes)
+  result = ct_macos_real_secrandom(rnd, count, bytes)
+  let savedErrno = getErrno()
+  if ct_macos_addr_in_nonsystem(caller):
+    recordNonDeterministic("SecRandomCopyBytes")
+  setErrno(savedErrno)
+
+proc repro_hook_ccrandom*(bytes: pointer; count: csize_t;
+    caller: pointer): cint {.exportc, cdecl, dynlib.} =
+  ## ROUND-5 P2 — CCRandomGenerateBytes (CommonCrypto). NON-DETERMINISM (entropy)
+  ## evidence, recorded like SecRandomCopyBytes with the same caller attribution +
+  ## per-process dedup.
+  if not initialized or disabled > 0:
+    return ct_macos_real_ccrandom(bytes, count)
+  result = ct_macos_real_ccrandom(bytes, count)
+  let savedErrno = getErrno()
+  if ct_macos_addr_in_nonsystem(caller):
+    recordNonDeterministic("CCRandomGenerateBytes")
+  setErrno(savedErrno)
+
 proc repro_hook_clock_gettime*(clk: cint; ts: pointer): cint
     {.exportc, cdecl, dynlib.} =
   ## WALL-CLOCK read — RECORD but do NOT downgrade (the cardinal-sin guard: almost
@@ -3239,10 +3324,19 @@ proc repro_hook_time*(tloc: pointer): clonglong {.exportc, cdecl, dynlib.} =
   recordTimeRead("time")
   setErrno(savedErrno)
 
-# NOTE: mach_absolute_time is intentionally NOT hooked — libdispatch calls it
-# cross-dylib during early libSystem init (a not-ready forward hazard with no safe
-# raw-syscall path), and it is a monotonic tick counter rather than a wall clock,
-# so it is almost never baked into a build's output. See the runtime C note (R-D).
+# NOTE: mach_absolute_time / mach_continuous_time are intentionally NOT hooked.
+# ROUND-5 P2 attempted to record them as TIME evidence but the interpose is FATAL:
+# dyld's __DATA,__interpose binding is GLOBAL, so it rebinds libdispatch/libsystem's
+# OWN mach_absolute_time calls (their hottest inner loops, and early libSystem init)
+# to our wrapper, which deterministically SIGKILLs rustc/clang (the mmap-reentrancy
+# cardinal guard, tests/macos/test_io_mon_macos_mmap_reentrancy). This was
+# empirically re-confirmed across every mitigation — a dlsym-free inline CNTVCT
+# early forward, C-side caller attribution keeping system callers entirely in C,
+# and a pure-inline system forward all still crash — so the intervention is fatal
+# regardless of what the wrapper does. mach_*_time is also a monotonic tick counter
+# (not a wall clock) with no raw-syscall forward, so the gettimeofday/time/
+# clock_gettime wall-clock signals cover the surface that matters. See the runtime
+# C note (R-D) — this is a documented residual.
 
 # --- Unified spawn-family hooks ------------------------------------------
 #
@@ -3729,6 +3823,17 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
     BodypatchHookSpec(
       names: @["access"],
       hook: cast[pointer](repro_hook_access)),
+    # ROUND-5 P2 — statfs/fstatfs filesystem probes. Thin syscall wrappers like
+    # the stat family, so the hook forwards via the RAW *64 syscall and the PLAIN
+    # body patch (no trampoline) suffices, catching shared-cache-internal callers
+    # too. The 64-bit-inode userland entry is `statfs$INODE64` (the default), with
+    # the legacy `statfs`/`statfs64` names patched too when present.
+    BodypatchHookSpec(
+      names: @["statfs", "statfs64", "statfs$INODE64"],
+      hook: cast[pointer](repro_hook_statfs)),
+    BodypatchHookSpec(
+      names: @["fstatfs", "fstatfs64", "fstatfs$INODE64"],
+      hook: cast[pointer](repro_hook_fstatfs)),
     # rename / renameat: the gnulib/autotools atomic-output move
     # (`chmod a-w $@t; mv $@t $@`). These are thin syscall wrappers, so — like
     # open/read/stat — the hook forwards via the RAW rename/renameat syscall and
@@ -3976,6 +4081,10 @@ extern unsigned int repro_macos_real_arc4random_uniform_call(unsigned int upper)
 extern int repro_macos_real_clock_gettime_call(int clk, void *ts);
 extern int repro_macos_real_gettimeofday_call(void *tp, void *tzp);
 extern long long repro_macos_real_time_call(void *tloc);
+/* ROUND-5 P2 — framework-entropy genuine-entry forwarders. */
+extern int repro_macos_real_secrandom_call(void *rnd, size_t count,
+    void *bytes);
+extern int repro_macos_real_ccrandom_call(void *bytes, size_t count);
 /* ROUND-3 S3b — defined in the runtime module's emit; the constructor calls it the
  * instant the add-image registration's initial (link-time) burst finishes. */
 extern void repro_macos_mark_addimage_burst_done(void);
@@ -4295,6 +4404,8 @@ static struct dirent *(*repro_libsystem_readdir_fn)(DIR *) = NULL;
 static int (*repro_libsystem_closedir_fn)(DIR *) = NULL;
 static int (*repro_libsystem_stat_fn)(const char *, struct stat *) = NULL;
 static int (*repro_libsystem_lstat_fn)(const char *, struct stat *) = NULL;
+static int (*repro_libsystem_statfs_fn)(const char *, struct statfs *) = NULL;
+static int (*repro_libsystem_fstatfs_fn)(int, struct statfs *) = NULL;
 static pid_t (*repro_libsystem_fork_fn)(void) = NULL;
 static int (*repro_libsystem_rename_fn)(const char *, const char *) = NULL;
 static int (*repro_libsystem_renameat_fn)(int, const char *, int,
@@ -4992,8 +5103,74 @@ static time_t repro_wrap_time(time_t *tloc) {
   return (time_t)repro_hook_time((void *)tloc);
 }
 
-/* mach_absolute_time is intentionally NOT interposed (libdispatch early-init
- * hazard; monotonic counter, not a wall clock). See the Nim/runtime R-D notes. */
+/* mach_absolute_time / mach_continuous_time are intentionally NOT interposed:
+ * dyld's __interpose is GLOBAL and rebinds libdispatch/libsystem's own hot
+ * mach-clock calls to our wrapper, which deterministically SIGKILLs rustc/clang.
+ * See the Nim/runtime R-D notes (a documented residual). */
+
+/* ROUND-5 P2 — SecRandomCopyBytes / CCRandomGenerateBytes entropy APIs. Like the
+ * getentropy/arc4random wrappers they capture __builtin_return_address(0) for
+ * CALLER-IMAGE ATTRIBUTION so only the program's OWN entropy use is flagged (the
+ * framework/libsystem baseline is excluded — the cardinal-sin guard). Not-ready
+ * forwards via the image-walk resolver. */
+static int repro_wrap_secrandom(const void *rnd, size_t count, void *bytes) {
+  void *ra = __builtin_return_address(0);
+  if (!repro_monitor_runtime_ready)
+    return repro_macos_real_secrandom_call(rnd, count, bytes);
+  return repro_hook_secrandom((void *)rnd, count, bytes, ra);
+}
+
+static int repro_wrap_ccrandom(void *bytes, size_t count) {
+  void *ra = __builtin_return_address(0);
+  if (!repro_monitor_runtime_ready)
+    return repro_macos_real_ccrandom_call(bytes, count);
+  return repro_hook_ccrandom(bytes, count, ra);
+}
+
+/* ROUND-5 P2 — statfs / fstatfs. Thin syscall wrappers like stat/fstatat, so the
+ * not-ready path forwards via the RAW *64 syscall and the interpose-disable A/B
+ * forward resolves the genuine libsystem entry (re-entry-guarded), else the
+ * recording hook runs (which itself forwards via the raw syscall). Both backends
+ * (interpose + body-patch) share the recording hook. */
+static int repro_wrap_statfs(const char *path, struct statfs *buf) {
+  if (!repro_monitor_runtime_ready)
+    return (int)syscall(SYS_statfs64, path, buf);
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    if (!repro_libsystem_statfs_fn)
+      repro_libsystem_statfs_fn = (int (*)(const char *, struct statfs *))
+        repro_macos_resolve_libsystem_symbol("_statfs$INODE64");
+    if (!repro_libsystem_statfs_fn)
+      repro_libsystem_statfs_fn = (int (*)(const char *, struct statfs *))
+        repro_macos_resolve_libsystem_symbol("_statfs");
+    if (repro_libsystem_statfs_fn) {
+      repro_wrap_reentry++;
+      int r = repro_libsystem_statfs_fn(path, buf);
+      repro_wrap_reentry--;
+      return r;
+    }
+  }
+  return repro_hook_statfs((char *)path, buf);
+}
+
+static int repro_wrap_fstatfs(int fd, struct statfs *buf) {
+  if (!repro_monitor_runtime_ready)
+    return (int)syscall(SYS_fstatfs64, fd, buf);
+  if (REPRO_INTERPOSE_FORWARD_BEGIN) {
+    if (!repro_libsystem_fstatfs_fn)
+      repro_libsystem_fstatfs_fn = (int (*)(int, struct statfs *))
+        repro_macos_resolve_libsystem_symbol("_fstatfs$INODE64");
+    if (!repro_libsystem_fstatfs_fn)
+      repro_libsystem_fstatfs_fn = (int (*)(int, struct statfs *))
+        repro_macos_resolve_libsystem_symbol("_fstatfs");
+    if (repro_libsystem_fstatfs_fn) {
+      repro_wrap_reentry++;
+      int r = repro_libsystem_fstatfs_fn(fd, buf);
+      repro_wrap_reentry--;
+      return r;
+    }
+  }
+  return repro_hook_fstatfs(fd, buf);
+}
 
 /*
  * ROUND-3 S1 content-channel interpose thunks. Each forwards to the GENUINE entry
@@ -5246,6 +5423,11 @@ static struct {
   { (const void *)repro_wrap_closedir, (const void *)closedir },
   { (const void *)repro_wrap_stat, (const void *)stat },
   { (const void *)repro_wrap_lstat, (const void *)lstat },
+  /* ROUND-5 P2 — statfs/fstatfs filesystem probes. The target path was
+   * previously unrecorded; record it as a path-probe (canonicalised like the stat
+   * family). Also body-patched (thin syscall wrappers). */
+  { (const void *)repro_wrap_statfs, (const void *)statfs },
+  { (const void *)repro_wrap_fstatfs, (const void *)fstatfs },
   { (const void *)repro_wrap_fork, (const void *)fork },
   { (const void *)repro_wrap_rename, (const void *)rename },
   { (const void *)repro_wrap_renameat, (const void *)renameat },
@@ -5313,6 +5495,9 @@ static struct {
   { (const void *)repro_wrap_clock_gettime, (const void *)clock_gettime },
   { (const void *)repro_wrap_gettimeofday, (const void *)gettimeofday },
   { (const void *)repro_wrap_time, (const void *)time },
+  /* mach_absolute_time / mach_continuous_time are DELIBERATELY absent: the global
+   * interpose rebinds libdispatch's own hot mach-clock calls and SIGKILLs
+   * rustc/clang. A documented residual — see the Nim/runtime R-D notes. */
   { (const void *)repro_wrap_sysctlbyname, (const void *)sysctlbyname },
   { (const void *)repro_wrap_sysctl, (const void *)sysctl },
   { (const void *)repro_wrap_uname, (const void *)uname },
@@ -5323,6 +5508,15 @@ static struct {
   { (const void *)repro_wrap_arc4random_buf, (const void *)arc4random_buf },
   { (const void *)repro_wrap_arc4random_uniform,
     (const void *)arc4random_uniform },
+  /* ROUND-5 P2 — SecRandomCopyBytes (Security.framework) / CCRandomGenerateBytes
+   * (libcommonCrypto) entropy APIs. The replacee is a weak_import reference
+   * (declared at the top of this file): dyld fixes it up to the genuine address
+   * when the program links the framework and to NULL (a no-op interpose) when it
+   * does not — so the tuple fires ONLY for programs that use the API and the shim
+   * gains NO hard framework link dependency. Recorded as entropy evidence with
+   * caller attribution. */
+  { (const void *)repro_wrap_secrandom, (const void *)SecRandomCopyBytes },
+  { (const void *)repro_wrap_ccrandom, (const void *)CCRandomGenerateBytes },
   /* ROUND-3 S1 content-channel hooks. xattr family (S1a — metadata reads/writes),
    * shm_open (S1b — POSIX shared memory), and the sendfile/pread/preadv/readv
    * zero-copy/positioned reads (S1d — content classification). Interpose-only
