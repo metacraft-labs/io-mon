@@ -1,0 +1,14 @@
+probe	exit	completeness	file_read_source	file_write_output	observed_nonfile	nondeterminism	event_loss	classification
+baseline_read	0	mcComplete	yes	yes	no	no	no	captured
+pread	0	mcComplete	yes	yes	no	no	no	captured
+readv	0	mcComplete	yes	yes	no	no	no	captured
+preadv	0	mcComplete	yes	yes	no	no	no	captured
+sendfile	0	mcComplete	yes	yes	no	no	no	captured
+copy_file_range	0	mcComplete	yes	yes	no	no	no	captured
+splice	0	mcComplete	yes	yes	no	no	no	captured
+raw_sendfile	0	mcComplete	yes	yes	no	no	no	captured
+raw_copy_file_range	0	mcComplete	yes	yes	no	no	no	captured
+raw_splice	0	mcComplete	yes	yes	no	no	no	captured
+hardlink_alias	0	mcComplete	yes	yes	no	no	no	captured
+rename_staging	0	mcComplete	yes	yes	no	no	no	captured
+nonfile	0	mcComplete	no	no	yes	yes	no	captured

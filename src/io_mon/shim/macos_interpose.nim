@@ -1778,21 +1778,19 @@ proc recordPathMutationAt(callResult: cint; dirfd: cint; path: cstring;
 
 # --- ROUND-2 R-D (break R10) non-file determinism recorders -----------------
 #
-# THE THREE-WAY SPLIT (the crux — different non-file inputs need DIFFERENT
-# handling, or we cause the cardinal sin of a false downgrade that re-runs every
-# build). All four categories route through ONE shared per-process DEDUP
+# THE NON-FILE OBSERVATION SPLIT (the crux — io-mon records evidence and leaves
+# invalidation policy to callers). All four categories route through ONE shared
+# per-process DEDUP
 # (`recordObservedOnce`) so a HOT source (getenv, clock_gettime) records each
 # DISTINCT key ONCE — cheap, bounded, muted:
 #   1. env vars / sysctl / uname → OBSERVED DECLARED INPUTS (record, do NOT
 #      downgrade). The consumer folds the queried value into its cache key
 #      (BuildXL observed-environment model). Closes SOURCE_DATE_EPOCH / $CFLAGS /
 #      hw.ncpu / uname PRECISELY — a benign PATH read just adds PATH to the key.
-#   2. randomness (getentropy/arc4random*//dev/urandom) → AUTO-DOWNGRADE
-#      (non-deterministic ⇒ always re-run). Rare in builds; low false-positive
-#      (interpose-only ⇒ only the program's OWN direct entropy use is seen).
-#   3. wall clock (clock_gettime/gettimeofday/time/mach_absolute_time) → RECORD but
-#      do NOT auto-downgrade (almost every program times a loop benignly — flagging
-#      that would re-run everything, the cardinal sin).
+#   2. randomness (getentropy/arc4random*) → OBSERVED ENTROPY evidence. Caller
+#      attribution avoids reporting the system-library startup baseline.
+#   3. wall clock (clock_gettime/gettimeofday/time/mach_absolute_time) → OBSERVED
+#      TIME evidence.
 
 const
   # The shim's OWN monitoring / injection environment variables are NOT build
@@ -1859,10 +1857,9 @@ proc recordSysctlRead(name: string) {.raises: [].} =
     "sysctl-read")
 
 proc recordNonDeterministic(source: string) {.raises: [].} =
-  ## Flag the program's consumption of ENTROPY (getentropy/arc4random*/a
-  ## /dev/urandom open) as NON-DETERMINISTIC ⇒ the merge AUTO-DOWNGRADES to
-  ## mcIncomplete (always re-run; never a cache hit). Deduped per process (one flag
-  ## per distinct source suffices for the downgrade).
+  ## Record the program's consumption of ENTROPY (getentropy/arc4random*) as
+  ## policy evidence. This does not mean monitoring was incomplete; callers decide
+  ## whether their cache/build policy invalidates on this observation.
   if source.len == 0:
     return
   recordObservedOnce(mrNonDeterministic, moNonDeterministic, "nd:" & source,
@@ -1878,18 +1875,18 @@ proc recordTimeRead(source: string) {.raises: [].} =
   recordObservedOnce(mrTimeRead, moTimeRead, "time:" & source, source, "time-read")
 
 # ROUND-2 R-D CARDINAL-SIN FIX — a /dev/urandom / /dev/random OPEN is DELIBERATELY
-# NOT auto-downgraded. The original R-D flagged it non-deterministic on the premise
+# NOT recorded as mrNonDeterministic. The original R-D flagged it on the premise
 # that opening it signals intent to consume entropy. Measured against a real
 # toolchain that premise is unsafe: a normal `cc`/`clang` compile opens /dev/urandom
 # via `mktemp` (coreutils) to pick a RANDOM TEMP-FILE NAME — a build intermediate
-# whose name never reaches the output — so auto-downgrading on a /dev/urandom open
-# would re-run essentially every build that uses a temp file (the cardinal sin).
+# whose name never reaches the output — so treating a /dev/urandom open as an
+# entropy observation would pollute essentially every build that uses a temp file.
 # Caller-image attribution does not help here (mktemp is a non-system /nix/store
 # binary opening it from its OWN code). The /dev/urandom open/read is STILL captured
 # as a normal file dependency; we just do not treat it as a non-determinism
 # downgrade. A program that embeds /dev/urandom bytes in its output is therefore a
-# documented FALSE NEGATIVE (it should use getentropy/arc4random, which ARE flagged,
-# or declare the dependency) — far cheaper than the cardinal-sin false positive.
+# documented observation gap (it should use getentropy/arc4random, which ARE
+# flagged, or declare the dependency) — far cheaper than the false positive.
 
 proc repro_hook_open*(path: cstring; flags, mode: cint): cint {.exportc, cdecl, dynlib.} =
   if not initialized or disabled > 0:
@@ -3024,18 +3021,18 @@ proc repro_hook_gethostuuid*(uuid: pointer; timeout: pointer): cint
   recordSysctlRead("gethostuuid")
   setErrno(savedErrno)
 
-# ROUND-2 R-D CARDINAL-SIN FIX — the entropy hooks AUTO-DOWNGRADE, so they are the
-# one place a false positive is catastrophic. The original "interpose only sees the
+# ROUND-2 R-D CARDINAL-SIN FIX — the entropy hooks emit policy evidence, so false
+# positives still matter. The original "interpose only sees the
 # program's own call" premise was WRONG: /usr/lib/libobjc, /usr/lib/swift,
 # /usr/lib/system/libsystem_malloc / _trace call arc4random_buf and
 # /usr/lib/system/libcorecrypto calls getentropy on EVERY process startup, all
 # cross-dylib (so they DO cross the interpose stub) — which downgraded every real
-# program (cc/clang/ld/bash → mcIncomplete, every build re-runs). We therefore
+# program. We therefore
 # ATTRIBUTE each entropy call to its CALLER (the `caller` return address the C
 # wrapper passes via __builtin_return_address) and flag ONLY when the caller lies in
 # a NON-SYSTEM image's __TEXT. The benign libsystem/libobjc/libswift baseline lands
 # in a system dylib and is excluded; the program's own (or its plugins'/toolchain
-# dylibs') direct arc4random/getentropy still downgrades. The check is a pure
+# dylibs') direct arc4random/getentropy is still recorded. The check is a pure
 # pointer-range scan (ct_macos_addr_in_nonsystem) — these hooks fire UNDER dyld's
 # loader lock during image init, where a dladdr-based check would risk re-entering
 # dyld; a range scan touches no dyld/malloc/lock and is re-entry-safe.
@@ -3050,7 +3047,7 @@ proc repro_hook_gethostuuid*(uuid: pointer; timeout: pointer): cint
 
 proc repro_hook_getentropy*(buf: pointer; len: csize_t; caller: pointer): cint
     {.exportc, cdecl, dynlib.} =
-  ## NON-DETERMINISM (entropy) ⇒ AUTO-DOWNGRADE, but ONLY for the program's own use
+  ## NON-DETERMINISM (entropy) evidence, but ONLY for the program's own use
   ## (ROUND-3 S3b: caller in ANY non-system image — the main exe OR a dylib/plugin).
   ## Forward genuine, conditionally flag.
   if not initialized or disabled > 0:
@@ -3062,7 +3059,7 @@ proc repro_hook_getentropy*(buf: pointer; len: csize_t; caller: pointer): cint
   setErrno(savedErrno)
 
 proc repro_hook_arc4random*(caller: pointer): cuint {.exportc, cdecl, dynlib.} =
-  ## NON-DETERMINISM (entropy) ⇒ AUTO-DOWNGRADE for the program's own use only.
+  ## NON-DETERMINISM (entropy) evidence for the program's own use only.
   if not initialized or disabled > 0:
     return ct_macos_real_arc4random()
   result = ct_macos_real_arc4random()
@@ -3071,7 +3068,7 @@ proc repro_hook_arc4random*(caller: pointer): cuint {.exportc, cdecl, dynlib.} =
 
 proc repro_hook_arc4random_buf*(buf: pointer; n: csize_t; caller: pointer)
     {.exportc, cdecl, dynlib.} =
-  ## NON-DETERMINISM (entropy) ⇒ AUTO-DOWNGRADE for the program's own use only. The
+  ## NON-DETERMINISM (entropy) evidence for the program's own use only. The
   ## shim's OWN nonce randomness bypasses this wrapper (repro_macos_random_u64
   ## resolves the genuine entry); the libsystem/libobjc/libswift startup baseline is
   ## excluded by the caller-image check (its caller is in /usr/lib).
@@ -3084,7 +3081,7 @@ proc repro_hook_arc4random_buf*(buf: pointer; n: csize_t; caller: pointer)
 
 proc repro_hook_arc4random_uniform*(upper: cuint; caller: pointer): cuint
     {.exportc, cdecl, dynlib.} =
-  ## NON-DETERMINISM (entropy) ⇒ AUTO-DOWNGRADE for the program's own use only.
+  ## NON-DETERMINISM (entropy) evidence for the program's own use only.
   if not initialized or disabled > 0:
     return ct_macos_real_arc4random_uniform(upper)
   result = ct_macos_real_arc4random_uniform(upper)
@@ -5168,11 +5165,12 @@ static struct {
    * and downgrade a forged com.apple.* peer. Interpose-only (see the thunk). */
   { (const void *)repro_wrap_xpc_connection_send_message_with_reply_sync,
     (const void *)xpc_connection_send_message_with_reply_sync },
-  /* ROUND-2 R-D (break R10) non-file determinism hooks. Interpose-only (NOT
-   * body-patched) so only the program's OWN direct calls are seen — the basis of
-   * the cardinal-sin guard for the randomness arm. Env/sysctl/uname are observed
-   * declared INPUTS (no downgrade); getentropy/arc4random* are AUTO-DOWNGRADE;
-   * clock_gettime/gettimeofday/time/mach_absolute_time are recorded-not-downgraded. */
+  /* ROUND-2 R-D (break R10) non-file observation hooks. Interpose-only (NOT
+   * body-patched) so only the program's OWN direct calls are seen. Env/sysctl/uname
+   * are observed declared INPUTS; getentropy/arc4random* are entropy evidence;
+   * clock_gettime/gettimeofday/time/mach_absolute_time are time evidence. Under the
+   * evidence model the monitor RECORDS these (mrNonDeterministic / observed inputs);
+   * the CONSUMER folds them into its cache-key / invalidation policy. */
   { (const void *)repro_wrap_getenv, (const void *)getenv },
   { (const void *)repro_wrap_clock_gettime, (const void *)clock_gettime },
   { (const void *)repro_wrap_gettimeofday, (const void *)gettimeofday },
