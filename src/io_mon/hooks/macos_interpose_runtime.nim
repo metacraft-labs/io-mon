@@ -157,6 +157,25 @@ int repro_macos_real_access_syscall(char *path, int mode) {
 }
 
 /*
+ * ROUND-5 P2 — raw-syscall statfs/fstatfs forwarders for BOTH backends.
+ *
+ * statfs/fstatfs are thin syscall wrappers (like stat/rename), so — as with the
+ * stat family — the hook forwards via the RAW kernel syscall and NEVER through
+ * the named `statfs`/`fstatfs` symbol or dlsym (which the body-patch backend may
+ * have replaced, which would re-enter the hook infinitely). We use the *64
+ * variants (SYS_statfs64/SYS_fstatfs64), which fill the modern 64-bit `struct
+ * statfs` the userland `statfs$INODE64` family exposes to callers, so the
+ * caller's `struct statfs *buf` is filled with the layout it expects.
+ */
+int repro_macos_real_statfs64_syscall(char *path, void *buf) {
+  return (int)syscall(SYS_statfs64, path, buf);
+}
+
+int repro_macos_real_fstatfs64_syscall(int fd, void *buf) {
+  return (int)syscall(SYS_fstatfs64, fd, buf);
+}
+
+/*
  * Raw-syscall rename/renameat forwarders for BOTH backends.
  *
  * gnulib's atomic-write idiom (`chmod a-w $@t; mv $@t $@`) issues a rename(2) to
@@ -2203,14 +2222,47 @@ long long repro_macos_real_time_call(void *tloc) {
   return fn(tloc);
 }
 
-/* NOTE on mach_absolute_time: it is DELIBERATELY NOT interposed. libdispatch calls
- * it CROSS-DYLIB during early libSystem init (before our constructor), so a
- * not-ready forward would be exercised then; it has no raw syscall (it is a
- * commpage / CNTVCT read), so a safe early-init forward is impractical, and
- * interposing it destabilises libdispatch. It is also a MONOTONIC TICK COUNTER, not
- * a wall clock — a relative interval value almost never baked into a build's output
- * as a determinism input — so the gettimeofday / time / clock_gettime wall-clock
- * signals cover the surface that matters. This is a documented residual (R-D). */
+/* NOTE on mach_absolute_time / mach_continuous_time: they are DELIBERATELY NOT
+ * interposed. dyld's __DATA,__interpose binding is GLOBAL — it rebinds EVERY
+ * image's reference to the symbol, including libdispatch/libsystem, which call
+ * mach_absolute_time CROSS-DYLIB in their HOTTEST inner loops (and during early
+ * libSystem init, before our constructor). Routing those calls through our
+ * wrapper deterministically destabilises libdispatch: rustc/clang are SIGKILL'd
+ * (the mmap-reentrancy regression, tests/macos/test_io_mon_macos_mmap_reentrancy).
+ * ROUND-5 P2 empirically re-confirmed this across every mitigation — a dlsym-free
+ * inline CNTVCT early forward, C-side caller attribution that keeps system callers
+ * entirely in C, and a pure-inline system forward all still crash, proving the
+ * intervention is fatal regardless of what the wrapper does. mach_*_time is also a
+ * commpage (CNTVCT) read with NO raw syscall, so there is no dlsym-free safe
+ * forward for the early-init calls anyway. It is a MONOTONIC TICK COUNTER, not a
+ * wall clock — almost never baked into a build's output — so the gettimeofday /
+ * time / clock_gettime wall-clock signals cover the surface that matters. This is
+ * a documented residual (R-D). */
+
+/* ROUND-5 P2 — SecRandomCopyBytes (Security.framework) / CCRandomGenerateBytes
+ * (libcommonCrypto) forwarders. Both are framework symbols; when the wrapper
+ * runs the program HAS imported the symbol (that is the only way the interpose
+ * binding fires), so the image walk resolves the genuine entry. Forwarding by
+ * NAME would re-enter our own interpose binding and loop, so we resolve the real
+ * address via the shim-skipping image walk (exactly like the other R-D
+ * forwarders). A resolution failure returns the API's error convention (-1 /
+ * errSecParam is non-zero) so a caller sees failure rather than fabricated
+ * "random" zero bytes. */
+int repro_macos_real_secrandom_call(void *rnd, size_t count, void *bytes) {
+  static int (*fn)(const void *, size_t, void *) = NULL;
+  REPRO_RD_RESOLVE_GUARD(fn, int (*)(const void *, size_t, void *),
+    "_SecRandomCopyBytes", { return -1; });
+  if (!fn) return -1;
+  return fn(rnd, count, bytes);
+}
+
+int repro_macos_real_ccrandom_call(void *bytes, size_t count) {
+  static int (*fn)(void *, size_t) = NULL;
+  REPRO_RD_RESOLVE_GUARD(fn, int (*)(void *, size_t), "_CCRandomGenerateBytes",
+    { return -1; });
+  if (!fn) return -1;
+  return fn(bytes, count);
+}
 
 #undef REPRO_RD_RESOLVE_GUARD
 """.}
@@ -3067,5 +3119,31 @@ proc ct_macos_real_time*(tloc: pointer): clonglong =
   proc impl(tloc: pointer): clonglong
     {.importc: "repro_macos_real_time_call", cdecl.}
   impl(tloc)
-# NOTE: mach_absolute_time is intentionally NOT hooked — see the C forwarder note
-# (libdispatch early-init hazard + it is a monotonic counter, not a wall clock).
+
+proc ct_macos_real_secrandom*(rnd: pointer; count: csize_t;
+    bytes: pointer): cint =
+  ## ROUND-5 P2 — genuine SecRandomCopyBytes (Security.framework resolver).
+  proc impl(rnd: pointer; count: csize_t; bytes: pointer): cint
+    {.importc: "repro_macos_real_secrandom_call", cdecl.}
+  impl(rnd, count, bytes)
+
+proc ct_macos_real_ccrandom*(bytes: pointer; count: csize_t): cint =
+  ## ROUND-5 P2 — genuine CCRandomGenerateBytes (libcommonCrypto resolver).
+  proc impl(bytes: pointer; count: csize_t): cint
+    {.importc: "repro_macos_real_ccrandom_call", cdecl.}
+  impl(bytes, count)
+
+proc ct_macos_bodypatch_real_statfs*(path: cstring; buf: pointer): cint =
+  ## ROUND-5 P2 — raw `SYS_statfs64` forwarder shared by the interpose +
+  ## body-patch statfs hook. Bypasses the named symbol so it never re-enters a
+  ## body-patched `statfs`.
+  proc realStatfs64(path: cstring; buf: pointer): cint
+    {.importc: "repro_macos_real_statfs64_syscall", cdecl.}
+  realStatfs64(path, buf)
+
+proc ct_macos_bodypatch_real_fstatfs*(fd: cint; buf: pointer): cint =
+  ## ROUND-5 P2 — raw `SYS_fstatfs64` forwarder shared by the interpose +
+  ## body-patch fstatfs hook.
+  proc realFstatfs64(fd: cint; buf: pointer): cint
+    {.importc: "repro_macos_real_fstatfs64_syscall", cdecl.}
+  realFstatfs64(fd, buf)
