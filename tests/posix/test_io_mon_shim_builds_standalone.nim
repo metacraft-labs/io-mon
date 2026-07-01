@@ -10,9 +10,10 @@
 ## runner; instead this test drives `nim c --app:lib` on the platform shim
 ## module and asserts:
 ##
-##   1. it COMPILES with ONLY `--path:src` (io-mon) + `--path:../nim-stackable-hooks/src`
-##      and NO reprobuild path — a lingering `repro_*` import would fail to
-##      resolve (the standalone contract: stackable_hooks yes, reprobuild no);
+##   1. it COMPILES with ONLY `--path:src` (io-mon) + the nim-stackable-hooks
+##      source path (direnv's `STACKABLE_HOOKS_SRC` or the sibling checkout) and
+##      NO reprobuild path — a lingering `repro_*` import would fail to resolve
+##      (the standalone contract: stackable_hooks yes, reprobuild no);
 ##   2. the produced shared library exports the historical interpose-control
 ##      ABI (`repro_monitor_shim_init` / `_version`), kept byte-identical so the
 ##      M7 swap into reprobuild is drop-in;
@@ -30,7 +31,9 @@ import std/[os, osproc, strutils, tempfiles, unittest]
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
-  hooksSrc = repoRoot.parentDir() / "nim-stackable-hooks" / "src"
+
+let hooksSrc = getEnv("STACKABLE_HOOKS_SRC",
+  repoRoot.parentDir() / "nim-stackable-hooks" / "src")
 
 proc platformShimModule(): string =
   ## The `--app:lib` entry point for the current platform's interpose shim.
@@ -50,7 +53,7 @@ proc sharedLibExt(): string =
 
 suite "io-mon shim standalone relocation":
 
-  test "nim-stackable-hooks sibling checkout is present":
+  test "nim-stackable-hooks source path is present":
     # The shim builds ON nim-stackable-hooks. Without it the relocation can't be
     # validated, so make the prerequisite explicit rather than silently skipping.
     check dirExists(hooksSrc)
@@ -82,6 +85,10 @@ suite "io-mon shim standalone relocation":
         # — preserved from the relocated build recipe.
         args.add(["--passC:-arch arm64", "--passC:-arch arm64e",
                   "--passL:-arch arm64", "--passL:-arch arm64e"])
+    when defined(linux):
+      let versionScript =
+        repoRoot / "src" / "io_mon" / "hooks" / "linux_preload_versions.map"
+      args.add("--passL:-Wl,--version-script=" & versionScript)
     args.add(shimModule)
 
     # Deliberately do NOT put any reprobuild path on the command line: the only

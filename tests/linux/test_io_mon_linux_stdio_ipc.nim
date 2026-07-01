@@ -115,6 +115,49 @@ int main(int argc, char **argv) {
     check dep.completeness == mcComplete
     check dep.records.anyIt(it.kind == mrFileRead and marker in it.path)
 
+  test "read batch is flushed when a process exits through _exit":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let reader = buildC(work, "direct_exit_reader", """
+#include <fcntl.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  char buf[64];
+  int fd = open(argv[1], O_RDONLY);
+  if (fd < 0) _exit(2);
+  ssize_t n = read(fd, buf, sizeof(buf));
+  _exit(n > 0 ? 0 : 3);
+}
+""")
+    let marker = work / "direct-exit-marker.txt"
+    writeFile(marker, "direct exit marker\n")
+    let depfile = work / "direct-exit.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", reader, marker],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check hasFileRead(dep, marker)
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      "kill-before-flush" in it.detail)
+
   test "daemonized injected descendant after root exit is waited or fails closed":
     let snoopBin = work / "io-mon"
     if not fileExists(snoopBin):
