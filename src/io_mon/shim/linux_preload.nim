@@ -1,12 +1,13 @@
 when not defined(linux):
   {.error: "repro_monitor_shim/linux_preload is Linux-only".}
 
-import std/[locks, os, strutils, tables]
+import std/[locks, os, sets, strutils, tables]
 from io_mon/paths import extendedPath
 
 import io_mon/types
 import io_mon/writer
 import io_mon/hooks/linux_preload_runtime
+import stackable_hooks/platform/linux_raw_syscalls
 
 const
   OAccMode = 0x0003.cint
@@ -15,6 +16,30 @@ const
   OCreat = 0x0040.cint
   OTrunc = 0x0200.cint
   OAppend = 0x0400.cint
+  LinuxAtFdcwd = -100.cint
+  LinuxSysRead = 0.clong
+  LinuxSysOpen = 2.clong
+  LinuxSysClose = 3.clong
+  LinuxSysStat = 4.clong
+  LinuxSysLstat = 6.clong
+  LinuxSysAccess = 21.clong
+  LinuxSysSendfile = 40.clong
+  LinuxSysReadlink = 89.clong
+  LinuxSysOpenat = 257.clong
+  LinuxSysNewfstatat = 262.clong
+  LinuxSysReadlinkat = 267.clong
+  LinuxSysFaccessat = 269.clong
+  LinuxSysSplice = 275.clong
+  LinuxSysCopyFileRange = 326.clong
+  LinuxSysStatx = 332.clong
+  LinuxSysOpenat2 = 437.clong
+  LinuxEfault = 14.clong
+
+type
+  LinuxOpenHow = object
+    flags: uint64
+    mode: uint64
+    resolve: uint64
 
 var
   initialized = false
@@ -24,11 +49,16 @@ var
   fdLock: Lock
   dirLock: Lock
   streamLock: Lock
+  observedLock: Lock
   fragmentDir: string
   nextProcessSeq: uint64 = 0
   fdPaths = initTable[cint, string]()
   dirPaths = initTable[uint, string]()
   streamPaths = initTable[uint, string]()
+  observedNonFileInputs = initHashSet[string]()
+  rawSyscallCoverageRecorded = false
+  inlineSyscallCoverageRecorded = false
+  inlineSyscallTrapCoverageRecorded = false
   # Thread id of the thread that ran the preload constructor (the process
   # main thread). Its fragment batch is flushed by the process-exit
   # destructor; worker threads flush eagerly per record (see emitRecord),
@@ -49,8 +79,11 @@ var
 #include <unistd.h>
 #include <errno.h>
 
+extern long stackable_linux_raw_syscall6(long nr, long a1, long a2, long a3,
+                                         long a4, long a5, long a6);
+
 long repro_linux_gettid(void) {
-  return syscall(SYS_gettid);
+  return stackable_linux_raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
 }
 
 int repro_linux_get_errno(void) {
@@ -158,6 +191,66 @@ proc recordProcessStart() {.raises: [].} =
   record.detail = "linux-preload-hooks"
   emitRecord(record)
 
+proc emitEventLoss(detail: string; result: int64 = 0) {.raises: [].} =
+  var record = baseRecord(mrEventLoss, moEventLoss)
+  record.detail = detail
+  record.result = result
+  emitRecord(record)
+
+proc drainInlineRawSyscallEvents() {.raises: [].}
+
+proc recordRawSyscallCoverage(status: RawSyscallPatchStatus) {.raises: [].} =
+  if rawSyscallCoverageRecorded:
+    return
+  rawSyscallCoverageRecorded = true
+  if status.installed:
+    return
+  emitEventLoss("linux raw-syscall wrapper patch unavailable diagnostic=" &
+    $status.diagnostic & " stage=" & $status.stage &
+    " errno=" & $status.osErrno)
+
+proc recordInlineSyscallCoverage(status: InlineSyscallPatchStatus) {.raises: [].} =
+  if inlineSyscallCoverageRecorded:
+    return
+  inlineSyscallCoverageRecorded = true
+  if status.handlerInstalled and status.scanDiagnostic == lrsOk and
+      status.firstPatchDiagnostic == lrsOk:
+    return
+  emitEventLoss("linux inline raw-syscall scanner unavailable scan=" &
+    $status.scanDiagnostic & " install=" & $status.installDiagnostic &
+    " patched-sites=" & $status.patchedSites &
+    " first-patch=" & $status.firstPatchDiagnostic &
+    " stage=" & $status.firstPatchStage &
+    " errno=" & $status.firstPatchErrno)
+
+proc recordLateInlineSyscallScanCoverage(status: InlineSyscallPatchStatus;
+                                         source: string) {.raises: [].} =
+  if status.handlerInstalled and status.scanDiagnostic == lrsOk and
+      status.firstPatchDiagnostic == lrsOk:
+    return
+  emitEventLoss("linux late inline raw-syscall scanner unavailable source=" &
+    source & " scan=" & $status.scanDiagnostic &
+    " install=" & $status.installDiagnostic &
+    " patched-sites=" & $status.patchedSites &
+    " first-patch=" & $status.firstPatchDiagnostic &
+    " stage=" & $status.firstPatchStage &
+    " errno=" & $status.firstPatchErrno)
+
+proc recordInlineSyscallTrapCoverage() {.raises: [].} =
+  if inlineSyscallTrapCoverageRecorded:
+    return
+  let traps = inlineSyscallTrapCount()
+  let failures = inlineSyscallFailureCount()
+  if traps == 0 and failures == 0:
+    return
+  inlineSyscallTrapCoverageRecorded = true
+  drainInlineRawSyscallEvents()
+  if failures != 0:
+    emitEventLoss("linux inline raw syscall replay failed nr=" &
+      $inlineSyscallLastNumber() & " address=0x" &
+      toHex(inlineSyscallLastAddress()) & " traps=" & $traps &
+      " failures=" & $failures, int64(inlineSyscallLastNumber()))
+
 proc repro_monitor_shim_init*(configPath: cstring): cint
     {.exportc, dynlib, raises: [].}
 
@@ -196,6 +289,17 @@ proc pathForFd(fd: cint): string =
   acquire(fdLock)
   result = fdPaths.getOrDefault(fd, "")
   release(fdLock)
+
+proc pathForAt(dirfd: cint; path: cstring): string {.raises: [].} =
+  if path == nil:
+    return ""
+  let raw = $path
+  if raw.len == 0 or raw.isAbsolute or dirfd == LinuxAtFdcwd:
+    return raw
+  let base = pathForFd(dirfd)
+  if base.len == 0:
+    return raw
+  result = base / raw
 
 proc dirKey(dirp: pointer): uint =
   cast[uint](dirp)
@@ -251,6 +355,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     initLock(fdLock)
     initLock(dirLock)
     initLock(streamLock)
+    initLock(observedLock)
     locksReady = true
   acquire(initLockVar)
   defer: release(initLockVar)
@@ -263,6 +368,10 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   initialized = true
   mainThreadId = currentThreadId()
   recordProcessStart()
+  let rawStatus = installRawSyscallWrapperPatch()
+  recordRawSyscallCoverage(rawStatus)
+  let inlineStatus = installInlineSyscallPatches()
+  recordInlineSyscallCoverage(inlineStatus)
   result = 0
 
 proc repro_monitor_shim_flush*(): cint {.exportc, dynlib, raises: [].} =
@@ -275,6 +384,7 @@ proc repro_monitor_shim_flush*(): cint {.exportc, dynlib, raises: [].} =
 proc repro_monitor_shim_shutdown*(): cint {.exportc, dynlib, raises: [].} =
   ## Process/thread shutdown: flush + close the calling thread's fragment
   ## slot. Invoked by the process-exit destructor for the main thread.
+  recordInlineSyscallTrapCoverage()
   withShimMuted:
     try: closeFragmentSlot()
     except CatchableError: discard
@@ -336,6 +446,22 @@ proc repro_hook_openat64*(ctx: var OpenatContext) {.raises: [].} =
   recordOpen(ctx.path, ctx.flags, ctx.mode, ctx.result)
   c_set_errno(savedErrno)
 
+proc recordFdRead(fd: cint; bytes: clong) {.raises: [].} =
+  if bytes >= 0:
+    var record = baseRecord(mrFileRead, moFileRead)
+    record.path = pathForFd(fd)
+    record.result = bytes.int64
+    record.flags = uint32(fd)
+    emitRecord(record)
+
+proc recordFdWrite(fd: cint; bytes: clong) {.raises: [].} =
+  if bytes >= 0 and fd > 2:
+    var record = baseRecord(mrFileWrite, moFileWrite)
+    record.path = pathForFd(fd)
+    record.result = bytes.int64
+    record.flags = uint32(fd)
+    emitRecord(record)
+
 proc repro_hook_read*(ctx: var ReadContext) {.raises: [].} =
   if shouldBypass():
     callNext(ctx)
@@ -343,12 +469,37 @@ proc repro_hook_read*(ctx: var ReadContext) {.raises: [].} =
   ensureInitializedPreservingErrno()
   callNext(ctx)
   let savedErrno = c_get_errno()
-  if ctx.result >= 0:
-    var record = baseRecord(mrFileRead, moFileRead)
-    record.path = pathForFd(ctx.fd)
-    record.result = ctx.result.int64
-    record.flags = uint32(ctx.fd)
-    emitRecord(record)
+  recordFdRead(ctx.fd, ctx.result)
+  c_set_errno(savedErrno)
+
+proc repro_hook_pread*(ctx: var PreadContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  recordFdRead(ctx.fd, ctx.result)
+  c_set_errno(savedErrno)
+
+proc repro_hook_readv*(ctx: var ReadvContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  recordFdRead(ctx.fd, ctx.result)
+  c_set_errno(savedErrno)
+
+proc repro_hook_preadv*(ctx: var PreadvContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  recordFdRead(ctx.fd, ctx.result)
   c_set_errno(savedErrno)
 
 proc repro_hook_write*(ctx: var WriteContext) {.raises: [].} =
@@ -358,12 +509,7 @@ proc repro_hook_write*(ctx: var WriteContext) {.raises: [].} =
   ensureInitializedPreservingErrno()
   callNext(ctx)
   let savedErrno = c_get_errno()
-  if ctx.result >= 0 and ctx.fd > 2:
-    var record = baseRecord(mrFileWrite, moFileWrite)
-    record.path = pathForFd(ctx.fd)
-    record.result = ctx.result.int64
-    record.flags = uint32(ctx.fd)
-    emitRecord(record)
+  recordFdWrite(ctx.fd, ctx.result)
   c_set_errno(savedErrno)
 
 proc repro_hook_close*(ctx: var CloseContext) {.raises: [].} =
@@ -382,6 +528,164 @@ proc emitProbe(path: cstring; callResult: cint) {.raises: [].} =
   if path != nil:
     record.path = $path
   emitRecord(record)
+
+proc cstringArg(value: clong): cstring {.inline, raises: [].} =
+  if value == 0:
+    nil
+  else:
+    cast[cstring](cast[pointer](value))
+
+proc resultLooksFaulted(callResult: clong): bool {.inline, raises: [].} =
+  callResult == -LinuxEfault
+
+proc probeResultFromRaw(callResult: clong): cint {.inline, raises: [].} =
+  if callResult >= 0:
+    0.cint
+  else:
+    (-1).cint
+
+proc recordRawRead(fd: cint; callResult: clong): bool {.raises: [].} =
+  if callResult < 0:
+    return true
+  if fd <= 2:
+    return true
+  let path = pathForFd(fd)
+  if path.len == 0:
+    return false
+  var record = baseRecord(mrFileRead, moFileRead)
+  record.path = path
+  record.result = callResult.int64
+  record.flags = uint32(fd)
+  emitRecord(record)
+  true
+
+proc recordRawWrite(fd: cint; callResult: clong): bool {.raises: [].} =
+  if callResult < 0:
+    return true
+  if fd <= 2:
+    return true
+  let path = pathForFd(fd)
+  if path.len == 0:
+    return false
+  var record = baseRecord(mrFileWrite, moFileWrite)
+  record.path = path
+  record.result = callResult.int64
+  record.flags = uint32(fd)
+  emitRecord(record)
+  true
+
+proc recordRawFileCopy(inFd, outFd: cint; callResult: clong): bool
+    {.raises: [].} =
+  if callResult <= 0:
+    return callResult >= 0
+  let readOk = recordRawRead(inFd, callResult)
+  let writeOk = recordRawWrite(outFd, callResult)
+  readOk and writeOk
+
+proc recordRawSplice(fdIn, fdOut: cint; callResult: clong): bool
+    {.raises: [].} =
+  if callResult <= 0:
+    return callResult >= 0
+  var recorded = false
+  if fdIn > 2:
+    let inPath = pathForFd(fdIn)
+    if inPath.len > 0:
+      var record = baseRecord(mrFileRead, moFileRead)
+      record.path = inPath
+      record.result = callResult.int64
+      record.flags = uint32(fdIn)
+      emitRecord(record)
+      recorded = true
+  if fdOut > 2:
+    let outPath = pathForFd(fdOut)
+    if outPath.len > 0:
+      var record = baseRecord(mrFileWrite, moFileWrite)
+      record.path = outPath
+      record.result = callResult.int64
+      record.flags = uint32(fdOut)
+      emitRecord(record)
+      recorded = true
+  recorded
+
+proc openHowFlags(howArg, callResult: clong; flags, mode: var cint): bool
+    {.raises: [].} =
+  if callResult < 0 or howArg == 0:
+    return false
+  let how = cast[ptr LinuxOpenHow](cast[pointer](howArg))
+  flags = cint(how.flags)
+  mode = cint(how.mode)
+  true
+
+proc rawSyscallSourceName(inlineTrap: cint): string {.raises: [].} =
+  if inlineTrap != 0:
+    "inline raw syscall"
+  else:
+    "libc raw syscall"
+
+proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
+                            inlineTrap: cint): bool {.raises: [].} =
+  case number
+  of LinuxSysOpen:
+    if callResult < 0 or resultLooksFaulted(callResult):
+      return true
+    recordOpen(cstringArg(a1), cint(a2), cint(a3), cint(callResult))
+    true
+  of LinuxSysOpenat:
+    if callResult < 0 or resultLooksFaulted(callResult):
+      return true
+    recordOpen(cstringArg(a2), cint(a3), cint(a4), cint(callResult))
+    true
+  of LinuxSysOpenat2:
+    var flags, mode: cint
+    if not openHowFlags(a3, callResult, flags, mode):
+      return false
+    recordOpen(cstringArg(a2), flags, mode, cint(callResult))
+    true
+  of LinuxSysRead:
+    recordRawRead(cint(a1), callResult)
+  of LinuxSysSendfile:
+    recordRawFileCopy(cint(a2), cint(a1), callResult)
+  of LinuxSysCopyFileRange:
+    recordRawFileCopy(cint(a1), cint(a3), callResult)
+  of LinuxSysSplice:
+    recordRawSplice(cint(a1), cint(a3), callResult)
+  of LinuxSysClose:
+    if callResult >= 0:
+      removeFdPath(cint(a1))
+    true
+  of LinuxSysStat, LinuxSysLstat, LinuxSysAccess, LinuxSysReadlink:
+    if resultLooksFaulted(callResult):
+      return false
+    emitProbe(cstringArg(a1), probeResultFromRaw(callResult))
+    true
+  of LinuxSysNewfstatat, LinuxSysFaccessat, LinuxSysReadlinkat, LinuxSysStatx:
+    if resultLooksFaulted(callResult):
+      return false
+    emitProbe(cstringArg(a2), probeResultFromRaw(callResult))
+    true
+  else:
+    false
+
+proc recordRawSyscallClassification(number, a1, a2, a3, a4, a5, a6,
+                                    callResult: clong; inlineTrap: cint)
+    {.raises: [].} =
+  if classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult,
+                            inlineTrap):
+    return
+  emitEventLoss(rawSyscallSourceName(inlineTrap) &
+    " unsupported nr=" & $number, int64(number))
+
+proc drainInlineRawSyscallEvents() {.raises: [].} =
+  if rawSyscallEventOverflowed():
+    emitEventLoss("inline raw syscall event buffer overflow")
+  let count = rawSyscallEventCount()
+  for i in 0 ..< count:
+    let event = rawSyscallEventAt(i)
+    if not event.ok:
+      emitEventLoss("inline raw syscall event read failed index=" & $i)
+      continue
+    recordRawSyscallClassification(event.number, event.a1, event.a2, event.a3,
+      event.a4, event.a5, event.a6, event.result, event.source)
 
 proc repro_hook_stat*(ctx: var StatContext) {.raises: [].} =
   if shouldBypass():
@@ -540,6 +844,380 @@ proc repro_hook_connect*(ctx: var ConnectContext) {.raises: [].} =
     recordIpcConnect(ctx.fd, ctx.address, ctx.addrLen)
   c_set_errno(savedErrno)
 
+proc repro_hook_sendfile*(ctx: var SendfileContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result > 0:
+    recordFdRead(ctx.inFd, ctx.result)
+    recordFdWrite(ctx.outFd, ctx.result)
+  c_set_errno(savedErrno)
+
+proc repro_hook_copy_file_range*(ctx: var CopyFileRangeContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result > 0:
+    recordFdRead(ctx.inFd, ctx.result)
+    recordFdWrite(ctx.outFd, ctx.result)
+  c_set_errno(savedErrno)
+
+proc repro_hook_splice*(ctx: var SpliceContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result > 0:
+    recordFdRead(ctx.fdIn, ctx.result)
+    recordFdWrite(ctx.fdOut, ctx.result)
+  c_set_errno(savedErrno)
+
+proc recordPathRead(path, detail: string) {.raises: [].} =
+  if path.len == 0:
+    return
+  var record = baseRecord(mrFileRead, moFileRead)
+  record.path = path
+  record.result = 0
+  record.detail = detail
+  emitRecord(record)
+
+proc recordPathRead(path: cstring; detail: string) {.raises: [].} =
+  if path == nil:
+    return
+  recordPathRead($path, detail)
+
+proc recordPathWrite(path, detail: string) {.raises: [].} =
+  if path.len == 0:
+    return
+  var record = baseRecord(mrFileWrite, moFileWrite)
+  record.path = path
+  record.result = 0
+  record.detail = detail
+  emitRecord(record)
+
+proc recordPathWrite(path: cstring; detail: string) {.raises: [].} =
+  if path == nil:
+    return
+  recordPathWrite($path, detail)
+
+proc recordLinkMutation(resultCode: cint; oldPath, newPath: cstring;
+                        detail: string) {.raises: [].} =
+  if resultCode != 0:
+    return
+  recordPathRead(oldPath, detail & " source")
+  recordPathWrite(newPath, detail & " alias")
+
+proc recordRenameMutation(resultCode: cint; oldPath, newPath: cstring;
+                          detail: string) {.raises: [].} =
+  if resultCode != 0:
+    return
+  recordPathRead(oldPath, detail & " source")
+  recordPathWrite(newPath, detail & " destination")
+
+proc repro_hook_link*(ctx: var LinkContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  recordLinkMutation(ctx.result, ctx.oldPath, ctx.newPath, "link")
+  c_set_errno(savedErrno)
+
+proc repro_hook_linkat*(ctx: var LinkatContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0:
+    let oldPath = pathForAt(ctx.oldDirfd, ctx.oldPath)
+    let newPath = pathForAt(ctx.newDirfd, ctx.newPath)
+    let detail = "linkat olddirfd=" & $ctx.oldDirfd & " newdirfd=" &
+      $ctx.newDirfd & " flags=" & $ctx.flags
+    recordPathRead(oldPath, detail & " source")
+    recordPathWrite(newPath, detail & " alias")
+  c_set_errno(savedErrno)
+
+proc repro_hook_rename*(ctx: var RenameContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  recordRenameMutation(ctx.result, ctx.oldPath, ctx.newPath, "rename")
+  c_set_errno(savedErrno)
+
+proc repro_hook_renameat*(ctx: var RenameatContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0:
+    let oldPath = pathForAt(ctx.oldDirfd, ctx.oldPath)
+    let newPath = pathForAt(ctx.newDirfd, ctx.newPath)
+    let detail = "renameat olddirfd=" & $ctx.oldDirfd & " newdirfd=" &
+      $ctx.newDirfd
+    recordPathRead(oldPath, detail & " source")
+    recordPathWrite(newPath, detail & " destination")
+  c_set_errno(savedErrno)
+
+proc repro_hook_renameat2*(ctx: var RenameatContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0:
+    let oldPath = pathForAt(ctx.oldDirfd, ctx.oldPath)
+    let newPath = pathForAt(ctx.newDirfd, ctx.newPath)
+    let detail = "renameat2 olddirfd=" & $ctx.oldDirfd & " newdirfd=" &
+      $ctx.newDirfd & " flags=" & $ctx.flags
+    recordPathRead(oldPath, detail & " source")
+    recordPathWrite(newPath, detail & " destination")
+  c_set_errno(savedErrno)
+
+proc repro_hook_dlopen*(ctx: var DlopenContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result != nil:
+    let status = scanInlineSyscallPatchesForNewMappings()
+    recordLateInlineSyscallScanCoverage(status, "dlopen")
+  c_set_errno(savedErrno)
+
+proc repro_hook_dlmopen*(ctx: var DlmopenContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result != nil:
+    let status = scanInlineSyscallPatchesForNewMappings()
+    recordLateInlineSyscallScanCoverage(status, "dlmopen")
+  c_set_errno(savedErrno)
+
+proc repro_hook_mmap*(ctx: var MmapContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if isAnonymousPrivateMmap(ctx.flags, ctx.fd):
+    recordAnonymousPrivateMmap(ctx.result, ctx.length)
+    if protIncludesExec(ctx.prot):
+      if protIncludesWrite(ctx.prot):
+        emitEventLoss("linux anonymous executable mmap is writable; " &
+          "raw syscall scan requires a later mprotect transition " &
+          "source=mmap-anonymous-exec")
+      let status = scanInlineSyscallPatchesForOwnedAnonymousRange(
+        ctx.result, ctx.length)
+      recordLateInlineSyscallScanCoverage(status, "mmap-anonymous-exec")
+  c_set_errno(savedErrno)
+
+proc repro_hook_mprotect*(ctx: var MprotectContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0 and protIncludesExec(ctx.prot):
+    let coverage = liveAnonymousExecutableCoverage(ctx.address, ctx.length)
+    if coverage.liveIntersects and coverage.mapsAvailable and
+        coverage.fullyTracked:
+      let status = scanInlineSyscallPatchesForTrackedMprotectRange(
+        ctx.address, ctx.length)
+      recordLateInlineSyscallScanCoverage(status, "mprotect-anonymous-exec")
+    elif coverage.liveIntersects:
+      emitEventLoss("linux anonymous executable mprotect is not owned by " &
+        "the preload mmap lifecycle source=mprotect-anonymous-untracked")
+  c_set_errno(savedErrno)
+
+proc repro_hook_munmap*(ctx: var MunmapContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0:
+    removeAnonymousPrivateRange(ctx.address, ctx.length)
+  c_set_errno(savedErrno)
+
+proc repro_hook_mremap*(ctx: var MremapContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  let oldWasTracked = anonymousPrivateRangeFullyTracked(
+    ctx.oldAddress, ctx.oldSize)
+  let oldHadTrackedOverlap = anonymousPrivateRangeIntersects(
+    ctx.oldAddress, ctx.oldSize)
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if isSuccessfulMmapResult(ctx.result):
+    var movedPrecisely = false
+    if oldWasTracked:
+      movedPrecisely = remapAnonymousPrivateRange(
+        ctx.oldAddress, ctx.oldSize, ctx.result, ctx.newSize)
+      if not movedPrecisely:
+        emitEventLoss("linux anonymous executable mremap could not preserve " &
+          "precise mmap lifecycle ownership source=mremap-anonymous")
+    elif oldHadTrackedOverlap:
+      removeAnonymousPrivateRange(ctx.oldAddress, ctx.oldSize)
+      emitEventLoss("linux anonymous executable mremap touched only part of " &
+        "a preload-owned mapping source=mremap-anonymous")
+    if movedPrecisely and liveAnonymousExecutableMappingIntersects(
+        ctx.result, ctx.newSize):
+      let status = scanInlineSyscallPatchesForTrackedMprotectRange(
+        ctx.result, ctx.newSize)
+      recordLateInlineSyscallScanCoverage(status, "mremap-anonymous-exec")
+  c_set_errno(savedErrno)
+
+proc recordObservedNonFile(kind: MonitorRecordKind;
+                           observationKind: MonitorObservationKind;
+                           path, detail: string) {.raises: [].} =
+  if path.len == 0:
+    return
+  let key = $ord(kind) & ":" & path
+  var shouldEmit = false
+  acquire(observedLock)
+  if not observedNonFileInputs.contains(key):
+    observedNonFileInputs.incl(key)
+    shouldEmit = true
+  release(observedLock)
+  if not shouldEmit:
+    return
+  var record = baseRecord(kind, observationKind)
+  record.path = path
+  record.detail = detail
+  emitRecord(record)
+
+proc recordEnvRead(name: cstring) {.raises: [].} =
+  if name == nil:
+    return
+  recordObservedNonFile(mrEnvRead, moEnvRead, $name, "linux getenv")
+
+proc recordSysconfRead(name: cint) {.raises: [].} =
+  recordObservedNonFile(mrSysctlRead, moSysctlRead, "sysconf:" & $name,
+    "linux sysconf")
+
+proc recordUnameRead() {.raises: [].} =
+  recordObservedNonFile(mrSysctlRead, moSysctlRead, "uname", "linux uname")
+
+proc recordTimeRead(source: string) {.raises: [].} =
+  recordObservedNonFile(mrTimeRead, moTimeRead, source, "linux time")
+
+proc recordNonDeterministic(source: string) {.raises: [].} =
+  var record = baseRecord(mrNonDeterministic, moNonDeterministic)
+  record.path = source
+  record.detail = "linux non-deterministic source"
+  emitRecord(record)
+
+proc repro_hook_getenv*(ctx: var GetenvContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  recordEnvRead(ctx.name)
+  c_set_errno(savedErrno)
+
+proc repro_hook_uname*(ctx: var UnameContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0:
+    recordUnameRead()
+  c_set_errno(savedErrno)
+
+proc repro_hook_sysconf*(ctx: var SysconfContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  recordSysconfRead(ctx.name)
+  c_set_errno(savedErrno)
+
+proc repro_hook_clock_gettime*(ctx: var ClockGettimeContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0:
+    recordTimeRead("clock_gettime:" & $ctx.clockId)
+  c_set_errno(savedErrno)
+
+proc repro_hook_gettimeofday*(ctx: var GettimeofdayContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0:
+    recordTimeRead("gettimeofday")
+  c_set_errno(savedErrno)
+
+proc repro_hook_time*(ctx: var TimeContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result != -1:
+    recordTimeRead("time")
+  c_set_errno(savedErrno)
+
+proc repro_hook_getrandom*(ctx: var GetrandomContext) {.raises: [].} =
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result >= 0:
+    recordNonDeterministic("getrandom")
+  c_set_errno(savedErrno)
+
+proc repro_hook_raw_syscall*(number, a1, a2, a3, a4, a5, a6,
+                             callResult: clong; inlineTrap: cint)
+    {.raises: [].} =
+  if shouldBypass():
+    return
+  let savedErrno = c_get_errno()
+  recordRawSyscallClassification(number, a1, a2, a3, a4, a5, a6, callResult,
+    inlineTrap)
+  c_set_errno(savedErrno)
+
 proc processIsSingleThreaded(): bool {.raises: [].} =
   ## True iff the current process has exactly one thread. Read in the PARENT
   ## BEFORE fork so the child — which inherits the answer copy-on-write — knows
@@ -658,6 +1336,9 @@ registerOpen64Hook(repro_hook_open64)
 registerOpenatHook(repro_hook_openat)
 registerOpenat64Hook(repro_hook_openat64)
 registerReadHook(repro_hook_read)
+registerPreadHook(repro_hook_pread)
+registerReadvHook(repro_hook_readv)
+registerPreadvHook(repro_hook_preadv)
 registerWriteHook(repro_hook_write)
 registerCloseHook(repro_hook_close)
 registerStatHook(repro_hook_stat)
@@ -670,7 +1351,29 @@ registerFopen64Hook(repro_hook_fopen64)
 registerFreadHook(repro_hook_fread)
 registerFcloseHook(repro_hook_fclose)
 registerConnectHook(repro_hook_connect)
+registerSendfileHook(repro_hook_sendfile)
+registerCopyFileRangeHook(repro_hook_copy_file_range)
+registerSpliceHook(repro_hook_splice)
+registerLinkHook(repro_hook_link)
+registerLinkatHook(repro_hook_linkat)
+registerRenameHook(repro_hook_rename)
+registerRenameatHook(repro_hook_renameat)
+registerRenameat2Hook(repro_hook_renameat2)
+registerDlopenHook(repro_hook_dlopen)
+registerDlmopenHook(repro_hook_dlmopen)
+registerMmapHook(repro_hook_mmap)
+registerMprotectHook(repro_hook_mprotect)
+registerMunmapHook(repro_hook_munmap)
+registerMremapHook(repro_hook_mremap)
+registerGetenvHook(repro_hook_getenv)
+registerUnameHook(repro_hook_uname)
+registerSysconfHook(repro_hook_sysconf)
+registerClockGettimeHook(repro_hook_clock_gettime)
+registerGettimeofdayHook(repro_hook_gettimeofday)
+registerTimeHook(repro_hook_time)
+registerGetrandomHook(repro_hook_getrandom)
 registerForkHook(repro_hook_fork)
 registerExecveHook(repro_hook_execve)
 registerPosixSpawnHook(repro_hook_posix_spawn)
 registerPosixSpawnpHook(repro_hook_posix_spawnp)
+registerRawSyscallHook(repro_hook_raw_syscall)

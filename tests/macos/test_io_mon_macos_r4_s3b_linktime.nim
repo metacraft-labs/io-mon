@@ -3,22 +3,31 @@
 ##
 ## CONFIRMED ROUND-4 BREAK (research/.../r4_residual/entropy_main_link.c +
 ## entropy_lib.c): a build tool LINKED (not dlopen'd) against a CUSTOM dylib that
-## draws arc4random and bakes the value into its file output was NOT flagged. The
-## round-3 attribution BLANKET-exempted the ENTIRE link-time add-image burst (to keep
-## a real cc/clang compile — whose link-time libLLVM/libc++ draw benign temp-name
-## entropy — mcComplete), so a custom link-time entropy dylib slipped through ⇒ a
-## false cache hit on a NON-deterministic build.
+## draws arc4random and bakes the value into its file output was NOT flagged — no
+## entropy record was emitted at all. The round-3 attribution BLANKET-exempted the
+## ENTIRE link-time add-image burst (to avoid attributing a real cc/clang compile's
+## benign link-time libLLVM/libc++ temp-name entropy), so a custom link-time entropy
+## dylib's draws produced NO evidence ⇒ a non-deterministic build looked identical to
+## a deterministic one.
 ##
 ## ROUND-4 FIX: narrow the exemption from "all link-time images" to "link-time images
 ## under a recognized TOOLCHAIN prefix" (/nix/store, /opt/homebrew, /usr/local, the
 ## Xcode/Developer trees — ct_macos_path_is_toolchain). A link-time CUSTOM dylib in
 ## the BUILD/PROJECT tree (NOT under a toolchain prefix) is now registered for entropy
-## caller-attribution and IS flagged.
+## caller-attribution, so its arc4random draws ARE recorded as an mrNonDeterministic
+## EVIDENCE record.
 ##
-## CARDINAL SIN (dominates): a real cc compile MUST stay mcComplete. cc here is a Nix
-## clang whose libLLVM/libc++/libffi/libxml2 all live under /nix/store (confirmed via
-## DYLD_PRINT_LIBRARIES) — i.e. under a toolchain prefix — so their benign startup
-## entropy stays EXEMPT and the compile is NOT downgraded.
+## DETERMINISM MODEL (canonical, cross-platform): entropy is recorded as EVIDENCE, not
+## a completeness loss — the depfile stays mcComplete (the monitor observed everything)
+## and the CONSUMER folds the mrNonDeterministic record into its cache-key/invalidation
+## policy (a build that drew entropy is not served from cache). S3b's contribution is
+## therefore the EVIDENCE DISTINCTION: a custom link-time entropy dylib emits an
+## arc4random evidence record; a toolchain compile emits NONE. Both stay mcComplete.
+##
+## CARDINAL SIN (dominates): a real cc compile MUST emit ZERO entropy evidence. cc here
+## is a Nix clang whose libLLVM/libc++/libffi/libxml2 all live under /nix/store (under
+## a toolchain prefix), so their benign startup entropy stays EXEMPT — no spurious
+## evidence record that would make the consumer needlessly re-run every compile.
 ##
 ## macOS-only; a no-op pass elsewhere.
 
@@ -112,24 +121,30 @@ suite "io-mon macOS R4 S3b link-time dylib entropy attribution":
     ccExe(r4Residual / "entropy_main_link.c", linkTool,
       extra = quoteShell(entropyDylib))
 
-    test "REGRESSION: a LINK-TIME custom entropy dylib downgrades to mcIncomplete":
+    test "REGRESSION: a LINK-TIME custom entropy dylib emits an arc4random evidence record":
       let outPath = work / "linktime_out.txt"
       let dep = runProbe(shim, linkTool, @[outPath])
       doAssert fileExists(outPath), "tool produced no output"
-      # The linked custom dylib's OWN arc4random is now flagged (round-4 fix)…
+      # The keystone: the linked custom dylib's OWN arc4random is now ATTRIBUTED and
+      # recorded as an mrNonDeterministic EVIDENCE record (round-4 fix). This is the
+      # cache-busting signal the consumer folds into its invalidation policy so a
+      # non-deterministic build is not served from cache.
       check countNonDeterministic(dep) >= 1
       var sawArc = false
       for r in dep.records:
         if r.kind == mrNonDeterministic and r.path == "arc4random": sawArc = true
       check sawArc
-      # …so the non-deterministic build is a conservative re-run.
-      check dep.completeness == mcIncomplete
+      # Determinism model: entropy is evidence, not a completeness loss — the monitor
+      # observed everything, so completeness stays mcComplete. The protection lives in
+      # the EVIDENCE record above, contrasted with the toolchain compile's ZERO below.
+      check dep.completeness == mcComplete
 
-    test "CARDINAL SIN: a real cc compile (toolchain libLLVM entropy) stays mcComplete":
+    test "CARDINAL SIN: a real cc compile (toolchain libLLVM entropy) emits NO evidence":
       # The keystone: cc is a Nix clang whose link-time libLLVM/libc++ live under
       # /nix/store (a toolchain prefix) and draw benign temp-name/hash entropy. The
-      # round-4 fix keeps that exempt, so a normal compile is NOT downgraded — a false
-      # downgrade here would re-run EVERY compile in a build.
+      # round-4 fix keeps that exempt, so a normal compile emits ZERO entropy evidence
+      # — a spurious evidence record here would make the consumer needlessly re-run
+      # EVERY compile in a build. Completeness is mcComplete (monitor saw everything).
       let srcFile = work / "hello.c"
       writeFile(srcFile, "int main(void){ return 0; }\n")
       let objOut = work / "hello.o"

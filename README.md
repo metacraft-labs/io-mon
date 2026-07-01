@@ -69,14 +69,59 @@ to start as an honest stub today.
   (`mach_vm_remap` overwrite) always run together, additively, working under SIP
   with no entitlements/root for the ad-hoc-signed binaries the build/test system
   produces.
-- **Linux** — `LD_PRELOAD` shim. It captures direct `open`/`read` paths,
-  glibc `fopen`/`fread` stream reads, and `connect(2)` IPC establishment; a
-  monitored process that talks to an out-of-tree Unix/TCP daemon now fails
-  closed as `mcIncomplete`. Known residuals: raw `syscall(2)` / `openat2`,
-  raw zero-copy syscalls (`sendfile`, `splice`, raw `copy_file_range`), path
-  fidelity for `access`/`readlink`/`statx` and hardlink aliases, and Linux
-  non-file determinism inputs (`getenv`, `uname`, `sysconf`, time,
-  `getrandom`) still need dedicated hooks or a native backend.
+- **Linux** — `LD_PRELOAD` shim. The exported wrapper symbols and monitor hook
+  bodies are io-mon-owned, while reusable `RTLD_NEXT` lookup and reentrancy
+  mechanics come from `stackable_hooks/platform/linux_preload`; exported libc
+  `syscall(2)` wrapper patching comes from
+  `stackable_hooks/platform/linux_raw_syscalls`. It captures direct
+  `open`/`read` paths, glibc `fopen`/`fread` stream reads, and `connect(2)` IPC
+  establishment; a monitored process that talks to an out-of-tree Unix/TCP
+  daemon now fails closed as `mcIncomplete`. Raw `syscall(2)` and safe
+  main-executable/startup non-system application-DSO inline `0f 05` paths are
+  classified by io-mon for common file dependencies (`open`/`openat`/`openat2`,
+  `read` after fd mapping, `close`, and `access`/`readlink`/`statx`-style
+  probes); unsupported raw syscalls still emit event-loss and downgrade to
+  `mcIncomplete`.
+  Main-executable, startup non-system application-owned shared-object, and
+  post-constructor `dlopen`/`dlmopen` application-DSO inline `0f 05` syscall
+  sites are scanned and patched through the same stackable raw-syscall
+  INT3/SIGTRAP substrate. Anonymous/private executable mappings created through
+  the preload `mmap` wrapper, or made executable later through tracked
+  `mprotect`, are incrementally scanned with the same substrate; anonymous
+  writable+executable mappings fail closed because code can be written after
+  the immediate scan. The anonymous ownership table is maintained across
+  `munmap` removal/splitting and fully tracked `mremap` moves/resizes; live
+  anonymous executable `mprotect` transitions are scanned only when every live
+  executable anonymous byte in the requested range is covered by that lifecycle,
+  and partial-overlap `mremap` ownership escapes fail closed instead of
+  inheriting stale ownership. Linux libc-visible positioned/vector and
+  zero-copy content movers (`pread`, `readv`, `preadv`, `sendfile`,
+  `copy_file_range`, and `splice`) now record the source as a file read and
+  the destination as a file write when bytes move. Direct raw `syscall(2)`
+  variants of `sendfile`, `copy_file_range`, and `splice` are also classified
+  when the relevant file side is known from io-mon's fd table; unsafe or
+  unknown-fd cases remain fail-closed rather than being reported complete.
+  Linux libc-visible
+  `link`/`linkat` records hardlink source identity and alias output evidence,
+  and `rename`/`renameat`/`renameat2` records the final output path for
+  rename-staged writes. Linux libc-visible `getenv`, `uname`, and `sysconf`
+  are recorded as observed inputs; `clock_gettime`, `gettimeofday`, and
+  `time` are recorded as time-read evidence; successful `getrandom` calls
+  emit non-determinism evidence. These non-file observations do not by
+  themselves make monitoring incomplete; callers decide whether their policy
+  invalidates on them. Known residuals: startup DSOs
+  under excluded system/runtime prefixes and executable mappings not owned by
+  the preload `mmap` lifecycle are not scanned yet; direct raw path-mutation
+  syscalls, pre-existing hardlink aliases, direct raw/vDSO clock/time paths,
+  inherited/unknown-fd zero-copy cases, and broader Linux non-file APIs outside
+  the current libc-visible subset still need dedicated hooks or
+  stackable-backed scanner/classifier integration. The default Linux profile is therefore an
+  `LD_PRELOAD` completeness profile, not a native/adversarial production
+  profile: consumers that require those residual threat models must request the
+  explicit capabilities (`adversarial-raw-syscall`,
+  `executable-mapping-lifecycle`, `external-content`, `library-load`,
+  `path-mutation`, `path-identity`, `observed-env`, `non-determinism`) and
+  treat the resulting required capability gap as `mcIncomplete`.
 - **Windows** — injected hooks via `CreateRemoteThread`+`LoadLibraryW` (needs
   validation under the DIY toolchain).
 - **EndpointSecurity** — designed/skeletoned (see above), not yet a shipping
@@ -108,7 +153,10 @@ See [docs/usage.md](docs/usage.md) for the CLI and library usage guides, and
   `DYLD_INSERT_LIBRARIES` env-var injection).
 - **`io_mon/shim/*`** + **`io_mon/hooks/*`** — the syscall-interpose shim
   (built on `nim-stackable-hooks`) that actually injects into a monitored
-  process and captures the read/written paths. The platform entry points
+  process and captures the read/written paths. macOS body-patch installation
+  and Linux preload resolver/reentrancy plus exported `syscall(2)` patch
+  mechanics are stackable-owned; io-mon owns target decisions, hook bodies,
+  RMDF/event writing, and completeness policy. The platform entry points
   (`shim/macos_interpose`, `shim/linux_preload`, `shim/windows_interpose`)
   build as a shared library (`--app:lib`); `fs_snoop` loads it at runtime.
   These are NOT imported by `import io_mon` — they are `--app:lib` entry

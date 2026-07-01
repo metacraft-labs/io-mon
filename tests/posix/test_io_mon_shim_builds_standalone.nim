@@ -102,3 +102,9 @@ suite "io-mon shim standalone relocation":
       check symRc == 0
       check syms.contains("repro_monitor_shim_init")
       check syms.contains("repro_monitor_shim_version")
+      when defined(linux):
+        check syms.contains("stackable_linux_preload_resolve_next")
+        check syms.contains("stackable_linux_preload_enter_hook")
+        check syms.contains("stackable_linux_preload_exit_hook")
+        check syms.contains("stackable_linux_raw_syscall6")
+        check syms.contains("stackable_linux_patch_absolute_jump_tx")

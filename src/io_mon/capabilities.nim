@@ -36,11 +36,11 @@ const
     # content (read) dependencies, so an in-place toolchain-library upgrade busts
     # a content-addressed cache instead of serving a stale result.
     mcapLibraryLoad,
-    # ROUND-2 R-D (break R10) — non-file determinism inputs. getenv / sysctlbyname /
+    # ROUND-2 R-D (break R10) — non-file input observations. getenv / sysctlbyname /
     # sysctl / uname / gethostname / gethostuuid are hooked and recorded as OBSERVED
-    # DECLARED INPUTS (mcapObservedEnv); getentropy / arc4random* / a /dev/urandom
-    # open are flagged non-deterministic (auto-downgrade) and clock_gettime /
-    # gettimeofday / time / mach_absolute_time are recorded-not-downgraded
+    # DECLARED INPUTS (mcapObservedEnv); getentropy / arc4random* are recorded as
+    # entropy evidence and clock_gettime / gettimeofday / time / mach_absolute_time
+    # are recorded as time-read evidence. Caller policy decides invalidation
     # (mcapNonDeterminism).
     mcapObservedEnv,
     mcapNonDeterminism,
@@ -124,21 +124,26 @@ const
     mcapFileCreate,
     mcapFileTruncate,
     mcapFileAppend,
-    mcapIpcConnect
+    mcapRename,
+    mcapIpcConnect,
+    # M-FW-6C — Linux libc-visible getenv/uname/sysconf are recorded as
+    # observed inputs; clock_gettime/gettimeofday/time are time-read evidence;
+    # getrandom is entropy evidence. Direct raw/vDSO variants remain outside
+    # this positive capability.
+    mcapObservedEnv,
+    mcapNonDeterminism
   }
 
   LinuxPreloadKnownUnsupportedCapabilities* = {
     mcapEndpointSecurity,
     mcapHybrid,
-    mcapRename,
     mcapSymlink,
     mcapLibraryLoad,
     mcapAuthorizationEnforcement,
     mcapPathMutation,
-    # ROUND-2 R-D — the Linux preload shim does not yet hook getenv/sysctl/uname or
-    # the entropy/time sources; non-file determinism handling is macOS-only so far.
-    mcapObservedEnv,
-    mcapNonDeterminism,
+    mcapAdversarialRawSyscall,
+    mcapExecutableMappingLifecycle,
+    mcapPathIdentity,
     # ROUND-3 S1 — xattr/shm/FIFO/sendfile content-channel hooks are macOS-only so far.
     mcapExternalContent
   }
@@ -204,6 +209,12 @@ proc capabilityId*(capability: MonitorCapability): string =
     "non-determinism"
   of mcapExternalContent:
     "external-content"
+  of mcapAdversarialRawSyscall:
+    "adversarial-raw-syscall"
+  of mcapExecutableMappingLifecycle:
+    "executable-mapping-lifecycle"
+  of mcapPathIdentity:
+    "path-identity"
 
 proc capabilityFromId*(value: string): MonitorCapability =
   for capability in MonitorCapability:
@@ -256,6 +267,12 @@ proc unsupportedReason(capability: MonitorCapability): string =
     "mkdir/rmdir/unlink/unlinkat/symlink are hooked on the macOS " &
       "interpose+body-patch shim; this reason applies only where path-mutation " &
       "is not yet advertised"
+  of mcapAdversarialRawSyscall:
+    "direct/raw syscall completeness requires a native kernel-sourced backend"
+  of mcapExecutableMappingLifecycle:
+    "executable mapping lifecycle completeness requires a native mapping source"
+  of mcapPathIdentity:
+    "path identity coverage for hardlink/inode aliases is not advertised by this profile"
   of mcapIpcConnect:
     # connect(2) IS hooked on the macOS interpose+body-patch shim; this branch is
     # retained only for profiles that share this enum and have not wired it, and
@@ -281,7 +298,8 @@ proc linuxUnsupportedReason(capability: MonitorCapability): string =
   of mcapHybrid:
     "hybrid native plus preload profile is not implemented"
   of mcapRename:
-    "Linux preload shim does not yet normalize rename/renameat as path mutations"
+    "Linux preload shim hooks libc-visible rename/renameat/renameat2; this " &
+      "reason applies only where rename is not advertised"
   of mcapSymlink:
     "Linux preload shim does not yet normalize symlink/readlink as path mutations"
   of mcapLibraryLoad:
@@ -289,13 +307,38 @@ proc linuxUnsupportedReason(capability: MonitorCapability): string =
   of mcapAuthorizationEnforcement:
     "Linux preload shim observes only and cannot authorize or deny operations"
   of mcapPathMutation:
-    "Linux preload shim does not cover the full mutation surface yet"
+    "Linux preload shim records libc-visible link/linkat and " &
+      "rename/renameat/renameat2 path mutations, but does not cover the full " &
+      "raw mutation surface yet"
+  of mcapAdversarialRawSyscall:
+    "Linux LD_PRELOAD covers libc syscall(2), selected application inline " &
+      "syscall sites, and tracked anonymous executable mappings, but does " &
+      "not claim adversarial/direct raw-syscall completeness for excluded " &
+      "runtime-prefix DSOs, executable mappings outside the preload mmap " &
+      "lifecycle, or unclassified syscall families"
+  of mcapExecutableMappingLifecycle:
+    "Linux LD_PRELOAD scans executable mappings only when they are owned by " &
+      "the preload mmap/mprotect/munmap/mremap lifecycle; mappings created " &
+      "outside that lifecycle are not production-complete"
+  of mcapPathIdentity:
+    "Linux preload shim records libc-visible hardlink creation source/alias " &
+      "and rename-staging final paths, but does not yet provide full " &
+      "pre-existing hardlink/inode alias or raw-mutation identity fidelity"
   of mcapIpcConnect:
-    "Linux preload shim does not yet hook connect(2) for IPC-breakaway detection"
+    "Linux preload shim hooks connect(2); this reason applies only where " &
+      "IPC-connect is not advertised"
   of mcapObservedEnv:
-    "Linux preload shim does not yet hook getenv/sysctl/uname as observed inputs"
+    "Linux preload shim records libc-visible getenv/uname/sysconf observed " &
+      "inputs; this reason applies only where direct raw/vDSO or broader " &
+      "system-configuration coverage is required"
   of mcapNonDeterminism:
-    "Linux preload shim does not yet hook entropy/time sources for non-determinism"
+    "Linux preload shim records libc-visible clock_gettime/gettimeofday/time " &
+      "as time reads and getrandom as non-determinism; this reason applies " &
+      "only where direct raw/vDSO or broader entropy/time APIs are required"
+  of mcapExternalContent:
+    "Linux preload shim records libc-visible positioned/vector and zero-copy " &
+      "file movers, but broader external content channels and direct raw " &
+      "zero-copy syscalls are not advertised by this profile"
   else:
     "capability is not advertised by the selected Linux preload profile"
 
@@ -399,6 +442,35 @@ proc linuxPreloadMonitorProfile*(
     level: mdlInfo,
     message: "selected Linux LD_PRELOAD/hooks backend; future native eBPF " &
       "backend is unavailable in M14")
+  result.diagnostics.add MonitorDiagnostic(
+    level: mdlInfo,
+    message: "Linux raw syscall coverage is stackable-backed; io-mon " &
+      "classifies common file/probe syscalls from libc, main-executable, " &
+      "startup non-system application-DSO, and late dlopen/dlmopen " &
+      "application-DSO raw syscall sites, plus tracked anonymous/private " &
+      "mmap/mprotect executable ranges with munmap/mremap lifecycle " &
+      "bookkeeping; libc-visible pread/readv/preadv/sendfile/" &
+      "copy_file_range/splice content movers record source reads and " &
+      "destination writes; libc-visible link/linkat and rename/renameat/" &
+      "renameat2 record hardlink source/alias and final rename destinations; " &
+      "libc-visible getenv/uname/sysconf are observed inputs, " &
+      "clock_gettime/gettimeofday/time are time-read evidence, and " &
+      "getrandom is entropy evidence left to caller invalidation policy; " &
+      "and io-mon fails closed for unsupported raw syscall numbers, " &
+      "untracked or partially tracked anonymous executable mprotect, " &
+      "partial-overlap mremap ownership escapes, or anonymous writable+" &
+      "executable mappings")
+  result.diagnostics.add MonitorDiagnostic(
+    level: mdlWarning,
+    message: "Linux LD_PRELOAD completeness excludes adversarial residuals " &
+      "unless they are represented by event-loss at runtime: excluded-prefix " &
+      "startup DSOs, executable mappings outside the preload mmap lifecycle, " &
+      "direct raw zero-copy/mutation syscalls, pre-existing hardlink/inode " &
+      "aliases, direct raw/vDSO non-file determinism paths, and broader Linux " &
+      "non-file APIs beyond getenv/uname/sysconf/clock/gettimeofday/time/" &
+      "getrandom. Consumers that require those " &
+      "threat models must request the corresponding capability and treat the " &
+      "gap as incomplete.")
 
   var gapCapabilities = LinuxPreloadKnownUnsupportedCapabilities
   for capability in required:

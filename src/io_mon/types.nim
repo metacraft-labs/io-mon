@@ -34,11 +34,11 @@ type
     # observation kind — directly closing the stale-cache hole. The distinct record
     # kind keeps a library-load identifiable for inspection + the no-flooding tests.
     mrLibraryLoad = 13
-    # ROUND-2 R-D (findings-doc break R10): NON-FILE DETERMINISM INPUTS — things a
-    # build's output depends on that are NOT file reads, so a depfile-only
-    # fingerprint false-cache-hits when they change. Handled by a THREE-WAY split
-    # (the crux — get the classification right or cause the cardinal sin of a false
-    # downgrade). All four APPENDED AT THE END for RMDF wire-compat (never renumber).
+    # ROUND-2 R-D (findings-doc break R10): NON-FILE INPUT OBSERVATIONS — things a
+    # build's output may depend on that are NOT file reads, so a depfile-only
+    # fingerprint can false-cache-hit when they change. io-mon records evidence
+    # only; callers decide whether a given observation invalidates their cache key.
+    # All four APPENDED AT THE END for RMDF wire-compat (never renumber).
     #
     # 1. mrEnvRead / mrSysctlRead — OBSERVED DECLARED INPUTS (record, do NOT
     #    downgrade). The shim hooks getenv / sysctlbyname / sysctl / uname /
@@ -53,14 +53,13 @@ type
     #    note (MacOS-Monitoring-Adversarial-Hardening.milestones.org §R-D).
     mrEnvRead = 14
     mrSysctlRead = 15
-    # 2. mrNonDeterministic — AUTO-DOWNGRADE (non-deterministic ⇒ always re-run),
-    #    GATED BY CALLER ATTRIBUTION. The shim hooks getentropy / arc4random /
-    #    arc4random_buf / arc4random_uniform and emits this record ONLY when the
-    #    call's CALLER lies in the monitored program's OWN main-executable __TEXT
-    #    range (`path` names the source). A process that consumes entropy in its own
-    #    code is genuinely non-reproducible, so the merge maps each such record to one
-    #    synthetic event-loss ⇒ `mcIncomplete` (a conservative RE-RUN, never a cache
-    #    hit) via the SAME downgrade machinery as an un-injected subtree.
+    # 2. mrNonDeterministic — OBSERVED ENTROPY INPUT, GATED BY CALLER ATTRIBUTION.
+    #    The shim hooks getentropy / arc4random / arc4random_buf /
+    #    arc4random_uniform and emits this record ONLY when the call's CALLER lies
+    #    in the monitored program's OWN main-executable __TEXT range (`path` names
+    #    the source). This does NOT force `mcIncomplete`: io-mon monitored the
+    #    entropy read successfully, and caller policy decides whether that evidence
+    #    invalidates the build/cache result.
     #    CALLER ATTRIBUTION IS ESSENTIAL (a round-1 cardinal-sin defect): an
     #    interpose hook is NOT limited to the program's own calls — on every process
     #    startup /usr/lib/libobjc, /usr/lib/swift, libsystem_malloc/_trace call
@@ -69,7 +68,8 @@ type
     #    bash run (the cardinal sin); attributing to the program's main-exe __TEXT
     #    excludes the /usr/lib baseline. A /dev/random or /dev/urandom OPEN is
     #    DELIBERATELY NOT flagged (mktemp opens /dev/urandom for a random temp name on
-    #    essentially every build). See `nonDeterminismLossCount` (writer.nim) and
+    #    essentially every build). See `nonDeterminismObservationCount`
+    #    (writer.nim) and
     #    `ct_macos_addr_in_program`.
     mrNonDeterministic = 16
     # 3. mrTimeRead — RECORD but do NOT auto-downgrade (high benign false-positive).
@@ -134,8 +134,8 @@ type
     # (appended for wire-compat, see mrEnvRead/mrSysctlRead/mrNonDeterministic/
     # mrTimeRead). A consumer that keys on the observation kind treats moEnvRead /
     # moSysctlRead as OBSERVED DECLARED INPUTS (fold the value into the cache key),
-    # moNonDeterministic as a never-cache signal, and moTimeRead as a
-    # record-only diagnostic marker (NOT a downgrade).
+    # moNonDeterministic as entropy evidence, and moTimeRead as a record-only
+    # diagnostic marker. None of these is a monitoring-loss downgrade by itself.
     moEnvRead = 12
     moSysctlRead = 13
     moNonDeterministic = 14
@@ -194,11 +194,11 @@ type
     # peer (with its pid when obtainable) so the merge can prove whether a socket
     # peer is a monitored in-tree process or an out-of-tree breakaway daemon.
     mcapIpcConnect
-    # ROUND-2 R-D (break R10) — non-file determinism inputs. mcapObservedEnv covers
+    # ROUND-2 R-D (break R10) — non-file input observations. mcapObservedEnv covers
     # the OBSERVED-DECLARED-INPUT recording of env-var / sysctl / uname queries
     # (mrEnvRead/mrSysctlRead; the BuildXL observed-environment model). mcapNonDeterminism
-    # covers the auto-downgrade on entropy consumption (mrNonDeterministic) plus the
-    # record-not-downgrade time markers (mrTimeRead). Appended at the END (the enum
+    # covers entropy observations (mrNonDeterministic) plus time markers
+    # (mrTimeRead). Appended at the END (the enum
     # is serialized by capabilityId STRING, so appending is wire-safe).
     mcapObservedEnv
     mcapNonDeterminism
@@ -209,6 +209,14 @@ type
     # zero-copy / positioned reads (content read on the source). Appended at the END
     # (the enum is serialized by capabilityId STRING, so appending is wire-safe).
     mcapExternalContent
+    # M-FW-5 — production-sensitive Linux residuals. These are intentionally
+    # separate from the positive raw-syscall slices io-mon can already cover:
+    # a consumer that needs adversarial/direct-syscall completeness can require
+    # these IDs and receive an explicit capability gap instead of trusting a
+    # default LD_PRELOAD depfile as production-complete for that threat model.
+    mcapAdversarialRawSyscall
+    mcapExecutableMappingLifecycle
+    mcapPathIdentity
 
   MonitorDiagnosticLevel* = enum
     mdlInfo

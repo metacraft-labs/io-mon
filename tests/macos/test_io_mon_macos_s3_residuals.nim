@@ -139,7 +139,7 @@ suite "io-mon macOS S3b dylib/plugin entropy attribution (res1_dylib_entropy)":
     let trivial = work / "trivial"
     ccExe(trivialSrc, trivial)
 
-    test "REGRESSION: a dlopen'd plugin's arc4random downgrades to mcIncomplete":
+    test "REGRESSION: a dlopen'd plugin's arc4random is attributed and recorded":
       let outPath = work / "plugin_out.txt"
       let dep = runProbe(shim, dlopenTool, @[plugin, outPath])
       # The plugin's OWN (non-system, dlopen'd image) entropy is now flagged…
@@ -148,8 +148,9 @@ suite "io-mon macOS S3b dylib/plugin entropy attribution (res1_dylib_entropy)":
       for r in dep.records:
         if r.kind == mrNonDeterministic and r.path == "arc4random": sawArc = true
       check sawArc
-      # …so the build is non-reproducible ⇒ a conservative re-run.
-      check dep.completeness == mcIncomplete
+      # …and io-mon reports that evidence without treating caller cache policy as
+      # monitoring loss.
+      check dep.completeness == mcComplete
 
     test "CARDINAL SIN: a trivial program (libsystem-only entropy) stays mcComplete":
       let dep = runProbe(shim, trivial, @[])
