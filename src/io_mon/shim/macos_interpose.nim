@@ -1134,17 +1134,24 @@ proc repro_hook_dyld_add_image*(mh: pointer; slide: int)
   dec disabled
   if recordable:
     recordLibraryLoad(cast[cstring](addr buf[0]))
-    # ROUND-3 S3b — this image is NON-SYSTEM (it passed the same /usr/lib + /System
+    # ROUND-4 S3b — this image is NON-SYSTEM (it passed the same /usr/lib + /System
     # + shared-cache + shim filter the library-load record uses). Register its slid
-    # __TEXT range for entropy caller-attribution ONLY when it is a DLOPEN'd image
-    # (the initial link-time burst is done): a dlopen'd compiler pass-plugin is the
-    # res1_dylib_entropy threat, while the program's LINK-TIME runtime dylibs (a Nix
-    # clang's libLLVM/libc++) draw BENIGN temp-name/hash entropy that must NOT
-    # downgrade a normal compile (the cardinal-sin guard). The entropy hooks then
-    # flag an arc4random/getentropy call made by THIS dlopen'd plugin; recordLibraryLoad
+    # __TEXT range for entropy caller-attribution when:
+    #   * it is a DLOPEN'd image (the initial link-time burst is done) — an explicitly
+    #     loaded extension such as the res1 dlopen pass-plugin, the stronger threat
+    #     and never a trusted pinned runtime; OR
+    #   * it is a LINK-TIME image whose path is NOT under a recognized toolchain
+    #     prefix (ct_macos_path_is_toolchain) — a CUSTOM dylib in the build/project
+    #     tree (round-4 r4_residual/entropy_main_link: libentropy.dylib drawing
+    #     arc4random and baking it into output) that the round-3 blanket link-time
+    #     exemption let slip through → a false cache hit.
+    # The program's LINK-TIME TOOLCHAIN runtime dylibs (a Nix clang's libLLVM/libc++
+    # in /nix/store) draw BENIGN temp-name/hash entropy and stay EXEMPT, so a normal
+    # cc/clang compile is NOT downgraded (the cardinal-sin guard). recordLibraryLoad
     # above still records EVERY non-system image as a content dep (break #4).
     # getsegmentdata is a lock-free memory walk, safe in the dyld add-image callback.
-    if ct_macos_addimage_burst_done():
+    if ct_macos_addimage_burst_done() or
+        not ct_macos_path_is_toolchain(cast[cstring](addr buf[0])):
       ct_macos_register_nonsystem_image(mh)
 
 proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
@@ -3213,6 +3220,39 @@ proc repro_hook_execve*(path: cstring; argv, envp: cstringArray): cint
   discard repro_monitor_shim_flush()
   result = ct_macos_interpose_real_execve(path, argv, envp)
 
+proc repro_hook_exit*(status: cint) {.exportc, cdecl, dynlib, noreturn.} =
+  ## ROUND-4 V1 — unified `_exit`/`_Exit` hook (interpose + body-patch). `_exit(2)`
+  ## terminates the process IMMEDIATELY, running NEITHER libc atexit handlers NOR
+  ## the dyld destructor — so the destructor's fragment flush (which closes the
+  ## kill-before-flush window for a normal `exit()`/`return`) never fires, and any
+  ## records this process buffered but did not yet flush are lost. The dominant
+  ## real case is a `vfork` child: it shares the parent's address space (and the
+  ## shim's per-thread fragment batch), does a little file I/O, and is REQUIRED by
+  ## POSIX to leave only via `_exit`/exec. Its buffered reads then vanished ~1/3 of
+  ## the time while the merge still reported mcComplete — a false-completeness
+  ## integrity gap (the cardinal sin). The `vfork`+exec case already held because
+  ## the exec hook flushes first; this closes the `vfork`+`_exit` (no-exec) case.
+  ##
+  ## FIX: flush the in-flight batch SYNCHRONOUSLY, then forward via the raw
+  ## `SYS_exit` trap. We flush the BATCH ONLY (`flushFragmentBatch`, under the
+  ## shim mute so its own `write()` does not recurse) — NOT `closeFragmentSlot`:
+  ## in a vfork child the slot state and fragment fd are SHARED with the suspended
+  ## parent, so closing/resetting the slot would yank the parent's open fragment.
+  ## Flushing the batch writes the buffered frames to the still-open fd and only
+  ## resets `batchLen`, leaving the parent's slot intact to keep appending. The
+  ## flush is allocation-free (a `writeBuffer` into an already-open file), hence
+  ## async-signal-safe enough for the vfork-child context. Forwarding via the raw
+  ## syscall (not the possibly body-patched libsystem `_exit`) avoids re-entry.
+  if initialized and disabled == 0:
+    withShimMuted:
+      try:
+        flushFragmentBatch()
+      except CatchableError, Defect:
+        # Never let a flush failure prevent termination — degrade to the
+        # (already-broken) prior behaviour rather than hang the exiting process.
+        discard
+  ct_macos_real_exit(status)
+
 var bodypatchForkTramp: pointer = nil
   ## Trampoline into the ORIGINAL libsystem `fork` body (set at install time,
   ## before the entry is patched). The fork hook forwards through this so
@@ -3625,6 +3665,17 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
     BodypatchHookSpec(
       names: @["execve"],
       hook: cast[pointer](repro_hook_execve)),
+    # ROUND-4 V1 immediate-termination flush hook. `_exit`/`_Exit` end the process
+    # WITHOUT atexit handlers or the dyld destructor, so the destructor's fragment
+    # flush never runs and a short-lived process' (esp. a `vfork` child's) buffered
+    # reads were lost while the merge still reported mcComplete. The hook flushes
+    # the batch then forwards via raw `SYS_exit`. Names are the C symbols `_exit`
+    # (installer resolves asm `__exit`) and `_Exit` (`__Exit`) — DELIBERATELY NOT
+    # `exit` (asm `_exit` = C `exit`), which runs atexit + destructors: bypassing
+    # THOSE would drop the monitored program's own cleanup (a transparency break).
+    BodypatchHookSpec(
+      names: @["_exit", "_Exit"],
+      hook: cast[pointer](repro_hook_exit)),
     # T2 content/metadata hooks (findings doc breaks #3/#5/#7). Like the
     # stat/rename family these are thin syscall wrappers, so the hook forwards
     # via the RAW syscall and the PLAIN body patch (no trampoline) suffices —
@@ -4433,6 +4484,26 @@ static int repro_wrap_execve(const char *path, char *const argv[], char *const e
   return repro_hook_execve((char *)path, (char **)argv, (char **)envp);
 }
 
+/*
+ * ROUND-4 V1 — `_exit`/`_Exit` interpose thunk. Both public symbols map to the
+ * same immediate-termination syscall (no atexit, no dyld destructor), so both
+ * rebind here. Unlike the recording thunks there is nothing to record and no
+ * REPRO_INTERPOSE_FORWARD_BEGIN reentry dance: the hook only FLUSHES the
+ * in-flight fragment batch (durability) and terminates. The flush is wanted
+ * even when interpose recording is diagnostically disabled — it is not a record,
+ * it is the last chance to persist a buffered read before a `vfork` child dies.
+ * If the runtime is not yet ready (constructor not run) forward the raw syscall
+ * so termination is never blocked. noreturn matches `_exit`'s ABI.
+ */
+__attribute__((noreturn))
+static void repro_wrap_exit_(int status) {
+  if (repro_monitor_runtime_ready) {
+    repro_hook_exit(status); /* flushes, then raw SYS_exit — never returns */
+  }
+  syscall(SYS_exit, status);
+  __builtin_unreachable();
+}
+
 static repro_real_posix_spawn_fn repro_libsystem_posix_spawn_fn = NULL;
 static repro_real_posix_spawn_fn repro_libsystem_posix_spawnp_fn = NULL;
 
@@ -5054,6 +5125,11 @@ static struct {
   { (const void *)repro_wrap_symlink, (const void *)symlink },
   { (const void *)repro_wrap_symlinkat, (const void *)symlinkat },
   { (const void *)repro_wrap_execve, (const void *)execve },
+  /* ROUND-4 V1 — flush the fragment batch before an atexit/destructor-less
+   * `_exit`/`_Exit` (esp. a vfork child's mandatory `_exit`). Both public symbols
+   * map to the same immediate-termination syscall. */
+  { (const void *)repro_wrap_exit_, (const void *)_exit },
+  { (const void *)repro_wrap_exit_, (const void *)_Exit },
   { (const void *)repro_wrap_posix_spawn, (const void *)posix_spawn },
   { (const void *)repro_wrap_posix_spawnp, (const void *)posix_spawnp },
   /* T2 content/metadata hooks (findings doc breaks #3/#5/#7). */
