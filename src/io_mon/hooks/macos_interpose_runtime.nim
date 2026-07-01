@@ -1071,6 +1071,39 @@ void repro_macos_register_nonsystem_image(void *mh_raw) {
   __atomic_store_n(&repro_nonsys_range_count, n + 1, __ATOMIC_RELEASE);
 }
 
+/* ROUND-4 S3b: is path under a recognized TOOLCHAIN / installed-software prefix
+ * whose LINK-TIME runtime dylibs draw BENIGN entropy (libLLVM/libc++ temp-name and
+ * hash-seed randomness that never reaches build OUTPUT)? Such an image is EXEMPT
+ * from link-time entropy attribution — flagging it would FALSE-DOWNGRADE every
+ * cc/clang compile (the cardinal sin). A non-system dylib NOT under any of these
+ * prefixes (a CUSTOM dylib in the BUILD/PROJECT tree) is the threat and IS attributed.
+ *
+ * The /usr/lib + /System + dyld-shared-cache system baseline is already excluded
+ * upstream by repro_macos_dyld_image_dep_path, so this need only name the NON-system
+ * toolchain stores: /nix/store (Nix), /opt/homebrew + /usr/local (Homebrew), and the
+ * Xcode / Command-Line-Tools / Developer trees. The path is already realpath-
+ * canonicalised by the caller, so a dot-dot or symlink path cannot dodge these
+ * prefixes. Pure string compares — no dyld, no allocation, callable in the add-image
+ * callback. */
+int repro_macos_path_is_toolchain(char *path) {
+  if (path == NULL) return 0;
+  static const char *const repro_toolchain_prefixes[] = {
+    "/nix/store/",
+    "/opt/homebrew/",
+    "/usr/local/",
+    "/Library/Developer/",
+    "/Applications/Xcode.app/",
+    "/Library/Apple/",
+  };
+  size_t count =
+    sizeof(repro_toolchain_prefixes) / sizeof(repro_toolchain_prefixes[0]);
+  for (size_t i = 0; i < count; i++) {
+    size_t n = strlen(repro_toolchain_prefixes[i]);
+    if (strncmp(path, repro_toolchain_prefixes[i], n) == 0) return 1;
+  }
+  return 0;
+}
+
 /* Return 1 iff `retaddr` lies in a NON-SYSTEM image's __TEXT — the main executable
  * (round-2 R-D range) OR any registered non-system dylib/bundle (round-3 S3b) ⇒ the
  * program's (or its plugin's) OWN entropy use ⇒ flag. 0 otherwise (the
@@ -1213,6 +1246,24 @@ int repro_macos_real_execve_syscall(char *path, char **argv, char **envp) {
   char **effective_envp = repro_macos_env_with_preload(envp);
   char *effective_path = repro_macos_rewrite_sip_path(path);
   return (int)syscall(SYS_execve, effective_path, argv, effective_envp);
+}
+
+/*
+ * ROUND-4 V1 — raw `_exit(2)` forwarder for the `_exit`/`_Exit` hook. `_exit`
+ * terminates the process WITHOUT running libc atexit handlers or the dyld
+ * destructor, so the destructor's fragment-flush (which closes the
+ * kill-before-flush window for a normal `exit()`/return) NEVER runs. The hook
+ * flushes the in-flight batch first, then forwards here. We issue the raw
+ * `SYS_exit` trap rather than call the (possibly body-patched) libsystem
+ * `_exit` entry so there is no re-entry under the body-patch backend, and so
+ * the termination is faithful even mid-vfork-child (where only async-signal-safe
+ * calls are legal — a raw syscall is). `__attribute__((noreturn))` matches the
+ * ABI and lets the caller elide dead code after the forward.
+ */
+__attribute__((noreturn))
+void repro_macos_real_exit_syscall(int status) {
+  syscall(SYS_exit, status);
+  __builtin_unreachable();
 }
 
 /*
@@ -2160,6 +2211,16 @@ proc ct_macos_interpose_real_execve*(path: cstring; argv, envp: cstringArray): c
     {.importc: "repro_macos_real_execve_syscall", cdecl.}
   realExecveSyscall(path, argv, envp)
 
+proc ct_macos_real_exit*(status: cint) {.noreturn.} =
+  ## ROUND-4 V1 — forward `_exit(2)` via the raw `SYS_exit` trap (no atexit /
+  ## destructor, no re-entry into the possibly body-patched libsystem `_exit`).
+  ## The `_exit`/`_Exit` hook calls this AFTER flushing the fragment batch so a
+  ## short-lived process (e.g. a vfork child that reads a dependency then
+  ## `_exit`s WITHOUT exec) durably records its buffered reads before dying.
+  proc realExitSyscall(status: cint) {.importc: "repro_macos_real_exit_syscall",
+    cdecl, noreturn.}
+  realExitSyscall(status)
+
 proc ct_macos_interpose_path_is_dir*(path: cstring): bool =
   proc pathIsDir(path: cstring): cint
     {.importc: "repro_macos_path_is_dir", cdecl.}
@@ -2846,6 +2907,18 @@ proc ct_macos_addimage_burst_done*(): bool =
   ## draw benign entropy and must NOT be attributed — the cardinal-sin guard).
   proc impl(): cint {.importc: "repro_macos_addimage_burst_done", cdecl.}
   impl() != 0
+
+proc ct_macos_path_is_toolchain*(path: cstring): bool =
+  ## ROUND-4 S3b — true iff `path` is under a recognized toolchain/installed-software
+  ## prefix (/nix/store, /opt/homebrew, /usr/local, the Xcode/Developer trees) whose
+  ## LINK-TIME runtime dylibs draw BENIGN entropy. Such a link-time image is EXEMPT
+  ## from entropy attribution (the cardinal-sin guard: a Nix clang's libLLVM/libc++
+  ## must not downgrade a normal compile). A non-system dylib NOT under any of these
+  ## prefixes — a CUSTOM dylib in the build/project tree — is attributed instead.
+  ## Pure string compares; safe in the dyld add-image callback. See the C note.
+  proc impl(p: cstring): cint
+    {.importc: "repro_macos_path_is_toolchain", cdecl.}
+  impl(path) != 0
 
 proc ct_macos_addr_in_nonsystem*(caller: pointer): bool =
   ## ROUND-3 S3b — CALLER ATTRIBUTION for the entropy auto-downgrade, widened from
