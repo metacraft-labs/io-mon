@@ -791,7 +791,7 @@ int main(int argc, char **argv) {
     check not dep.records.anyIt(it.kind == mrEventLoss and
       "inline raw syscall unsupported" in it.detail)
 
-  test "late dlopen shared library inline syscall openat/read captures dependency":
+  test "late dlopen and base dlmopen capture plugin libc reads; new namespace fails closed":
     let snoopBin = work / "io-mon"
     if not fileExists(snoopBin):
       let cli = run("nim", @[
@@ -805,41 +805,38 @@ int main(int argc, char **argv) {
     check buildShim.code == 0
     let shimLib = findShimLibrary()
 
-    let plugin = buildSharedC(work, "rawlate", """
-#include <fcntl.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-static long raw6(long nr, long a0, long a1, long a2,
-                 long a3, long a4, long a5) {
-  register long r10 __asm__("r10") = a3;
-  register long r8 __asm__("r8") = a4;
-  register long r9 __asm__("r9") = a5;
-  long ret;
-  __asm__ volatile("syscall"
-                   : "=a"(ret)
-                   : "0"(nr), "D"(a0), "S"(a1), "d"(a2),
-                     "r"(r10), "r"(r8), "r"(r9)
-                   : "rcx", "r11", "memory");
-  return ret;
-}
+    let plugin = buildSharedC(work, "late", """
+#include <stdio.h>
 int late_read_marker(const char *path) {
   char buf[64];
-  int fd = (int)raw6(SYS_openat, AT_FDCWD, (long)path, O_RDONLY, 0, 0, 0);
-  if (fd < 0) return 2;
-  long n = raw6(SYS_read, fd, (long)buf, sizeof(buf), 0, 0, 0);
-  raw6(SYS_close, fd, 0, 0, 0, 0, 0);
+  FILE *f = fopen(path, "rb");
+  if (!f) return 2;
+  size_t n = fread(buf, 1, sizeof(buf), f);
+  fclose(f);
   return n > 0 ? 0 : 3;
 }
 """)
     let loader = buildC(work, "late_dlopen_reader", """
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <link.h>
 #include <stdio.h>
+#include <string.h>
 typedef int (*late_read_marker_fn)(const char *);
 int main(int argc, char **argv) {
-  void *h = dlopen(argv[1], RTLD_NOW);
+  void *h = NULL;
+  if (argc != 4) return 9;
+  if (strcmp(argv[1], "dlopen") == 0) {
+    h = dlopen(argv[2], RTLD_NOW);
+  } else if (strcmp(argv[1], "dlmopen-base") == 0) {
+    h = dlmopen(LM_ID_BASE, argv[2], RTLD_NOW);
+  } else if (strcmp(argv[1], "dlmopen-newlm") == 0) {
+    h = dlmopen(LM_ID_NEWLM, argv[2], RTLD_NOW);
+  } else {
+    return 8;
+  }
   if (!h) {
-    fprintf(stderr, "dlopen: %s\n", dlerror());
+    fprintf(stderr, "load: %s\n", dlerror());
     return 2;
   }
   late_read_marker_fn f = (late_read_marker_fn)dlsym(h, "late_read_marker");
@@ -847,28 +844,41 @@ int main(int argc, char **argv) {
     fprintf(stderr, "dlsym: %s\n", dlerror());
     return 3;
   }
-  return f(argv[2]);
+  return f(argv[3]);
 }
 """, @["-ldl"])
-    let marker = work / "late-dlopen-marker.txt"
-    writeFile(marker, "late dlopen marker\n")
-    let depfile = work / "late-dlopen-syscall.rdep"
+    let marker = work / "late-load-marker.txt"
+    writeFile(marker, "late load marker\n")
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
     childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
-    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", loader,
-      plugin, marker], childEnv)
-    checkpoint(cap.output)
-    check cap.code == 0
 
-    let dep = readMonitorDepFile(depfile)
-    check dep.completeness == mcComplete
-    check hasRawDependency(dep, marker)
-    check not dep.records.anyIt(it.kind == mrEventLoss and
-      "inline raw syscall unsupported" in it.detail)
-    check not dep.records.anyIt(it.kind == mrEventLoss and
-      "late inline raw-syscall scanner unavailable" in it.detail)
+    for mode in ["dlopen", "dlmopen-base"]:
+      let depfile = work / ("late-load-" & mode & ".rdep")
+      let cap = run(snoopBin, @["run", "--depfile", depfile, "--", loader,
+        mode, plugin, marker], childEnv)
+      checkpoint(mode & ": " & cap.output)
+      check cap.code == 0
+
+      let dep = readMonitorDepFile(depfile)
+      check dep.completeness == mcComplete
+      check hasRawDependency(dep, marker)
+      check not dep.records.anyIt(it.kind == mrEventLoss and
+        "linux dlmopen non-base namespace unmonitored" in it.detail)
+      check not dep.records.anyIt(it.kind == mrEventLoss and
+        "late inline raw-syscall scanner unavailable" in it.detail)
+
+    let newlmDepfile = work / "late-load-dlmopen-newlm.rdep"
+    let newlm = run(snoopBin, @["run", "--depfile", newlmDepfile, "--",
+      loader, "dlmopen-newlm", plugin, marker], childEnv)
+    checkpoint("dlmopen-newlm: " & newlm.output)
+    check newlm.code == 0
+
+    let newlmDep = readMonitorDepFile(newlmDepfile)
+    check newlmDep.completeness == mcIncomplete
+    check newlmDep.records.anyIt(it.kind == mrEventLoss and
+      "linux dlmopen non-base namespace unmonitored" in it.detail)
 
   test "anonymous executable mmap mprotect inline syscall captures dependency":
     let snoopBin = work / "io-mon"
