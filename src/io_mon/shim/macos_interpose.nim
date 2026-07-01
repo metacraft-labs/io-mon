@@ -2287,6 +2287,16 @@ proc repro_hook_mmap*(adr: pointer; length: csize_t; prot, flags, fd: cint;
   ## records exactly once and the inner allocations just map. The global `disabled`
   ## guard is NOT reused for this because emitRecord bails when disabled>0 (it would
   ## suppress the very record we want); `inMmapHook` gates ONLY the re-entry.
+  # Only MAP_SHARED-with-a-real-fd mappings reach this Nim hook — the C thunk
+  # `repro_wrap_mmap` forwards every anonymous/private/fd-less mapping (incl. every
+  # libmalloc arena-grow mmap) via the raw syscall WITHOUT entering Nim. That gate is
+  # load-bearing: touching the `inMmapHook` {.threadvar.} below from inside libmalloc
+  # (a macOS dyld-TLV first-touch mallocs) re-enters the allocator under its own lock
+  # and corrupts the heap → SIGSEGV (see repro_wrap_mmap). MAP_SHARED-with-fd mappings
+  # are never issued from within libmalloc, so this hook — and its threadvar — only
+  # runs in a re-entrancy-safe context. `inMmapHook` still guards the recording path's
+  # own allocations (recordMmap → baseRecord/emitRecord mmap → this hook) from
+  # recursion.
   if not initialized or disabled > 0 or inMmapHook > 0:
     return ct_macos_real_mmap(adr, length, prot, flags, fd, offset)
   inc inMmapHook
@@ -4136,12 +4146,30 @@ extern void *repro_macos_real_mmap_syscall(void *addr, size_t len, int prot,
 
 static void *repro_wrap_mmap(void *addr, size_t len, int prot, int flags,
                              int fd, off_t offset) {
-  if (!repro_monitor_runtime_ready) {
-    /* Forward via the inline-asm BSD mmap syscall (full 64-bit return). MUST be
-     * allocation-free here: the interpose tuple is live from image-load, so this
-     * thunk fires for libsystem-internal mmaps BEFORE our constructor, and a
-     * dlsym/resolve forward would malloc → mmap → re-enter this thunk → recurse.
-     * NOT the libc syscall() shim either (it truncates the pointer → crash). */
+  /* CRITICAL — the common mmap MUST NOT reach any Nim code (fixes a deterministic
+   * rustc/clang/LLVM SIGSEGV). mmap is issued from INSIDE libmalloc, which grows an
+   * arena via mmap WHILE HOLDING its arena lock. The Nim hook `repro_hook_mmap`
+   * touches the `inMmapHook` {.threadvar.} (a re-entrancy guard). On macOS a
+   * threadvar / `__thread` in a dlopen'd dylib is a dyld TLV, and the FIRST access
+   * on a given thread calls tlv_get_addr → tlv_allocate_and_initialize_for_key →
+   * malloc. So a rustc worker thread's first mmap re-enters libmalloc while it
+   * already holds its lock → heap corruption → SIGSEGV. This is an APPLICATION-level
+   * threadvar access, not compiler-injected proc-entry machinery, which is why it
+   * survives --stackTrace:off, --exceptions:quirky, --tlsEmulation:off and -d:danger
+   * (all verified on the generated C). Heavy multi-threaded allocators reproduce it;
+   * light programs and the read/write/open thunks — never called from inside malloc
+   * — do not.
+   *
+   * Decide from the FLAGS ALONE — pure C, no threadvar, no allocation — whether this
+   * mapping could EVER be recorded. Only a MAP_SHARED mapping with a real fd can
+   * carry a recordable fact (a MAP_SHARED|PROT_WRITE file content-write, or a
+   * MAP_SHARED shm read — see recordMmap). Everything else (every anonymous
+   * allocator map, every private file map, every fd-less map) forwards via the raw
+   * inline-asm syscall — the same threadvar-free path the pre-constructor fast path
+   * takes. libmalloc NEVER issues a MAP_SHARED-with-fd mapping, so the Nim hook (and
+   * its threadvar) only ever runs OUTSIDE a libmalloc-reentrant context, and ALL
+   * recording behaviour is preserved. */
+  if (!repro_monitor_runtime_ready || (flags & MAP_SHARED) == 0 || fd < 0) {
     return repro_macos_real_mmap_syscall(addr, len, prot, flags, fd,
                                          (long long)offset);
   }
