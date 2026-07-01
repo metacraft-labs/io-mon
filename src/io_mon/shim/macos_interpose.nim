@@ -605,6 +605,32 @@ proc canonicalPathFor(rawPath: string): string {.raises: [].} =
   release(canonicalLock)
   if stored == rawPath: "" else: stored
 
+proc lexicalCanonicalPathFor(rawPath: string): string {.raises: [].} =
+  ## ROUND-5 P1 — the LEXICAL canonical form of a path recorded WITHOUT a live fd
+  ## (an ENOENT stat/lstat/access/fstatat probe, or a failed open). For an EXISTENT
+  ## file the shim canonicalises via F_GETPATH (recordCanonicalTarget) / realpath
+  ## (canonicalPathFor); a NON-existent target has no fd and realpath would itself
+  ## ENOENT, so the RAW caller string was recorded verbatim — a relative path left
+  ## UNANCHORED (no cwd record anywhere ⇒ un-re-anchorable) and an absolute path left
+  ## un-firmlinked (/tmp vs io-mon's own /private/tmp), so the SAME logical file got
+  ## two key strings depending on existence ⇒ a realpath-keying consumer could not
+  ## match ⇒ a false cache hit once the absent file appears (research/.../pathfidelity).
+  ##
+  ## This anchors relatives against the cwd, resolves the /tmp,/var,/etc firmlinks,
+  ## and collapses "."/".."/"//" — purely lexically (no filesystem access), so it is
+  ## safe and cheap on the ENOENT probe storm. Returns "" when unresolvable OR already
+  ## canonical (== rawPath), so a clean absolute probe (the common case) emits NO
+  ## companion. NOT memoised: the lexical pass is far cheaper than realpath and the
+  ## cwd can change under us (chdir), which a memo keyed on the raw path would miss.
+  if rawPath.len == 0:
+    return ""
+  var buf: array[1024, char]
+  if ct_macos_lexical_canonical_path(cstring(rawPath), addr buf[0],
+      csize_t(buf.len)) == 0:
+    return ""
+  let canonical = $cast[cstring](addr buf[0])
+  if canonical.len == 0 or canonical == rawPath: "" else: canonical
+
 proc recordExternalContent(chan, role, path: string; fd: cint) {.raises: [].} =
   ## ROUND-3 S1 — emit one `mrExternalContent` describing a content-channel event.
   ## `chan` is the channel class (shm/fifo/opaque), `role` the side
@@ -1310,6 +1336,43 @@ proc recordCanonicalTarget(fd: cint; original: cstring;
   record.detail = "resolved-target"
   emitRecord(record)
 
+proc recordFailedOpenCanonical(callResult: cint; dirfd: cint; path: cstring;
+    flags: cint) {.raises: [].} =
+  ## ROUND-5 P1 — a FAILED open (ENOENT) is a negative-existence dependency: an
+  ## `open("foo.h")` that misses now, but whose later appearance changes the build
+  ## (the include-search miss/hit universal to compilers). recordOpen already emits
+  ## the RAW failed open (result < 0), but — with no fd — the F_GETPATH companion
+  ## (recordCanonicalTarget, live-fd only) never runs, so the raw string is recorded
+  ## verbatim: unanchored (relative) or un-firmlinked (/tmp vs /private/tmp). We add a
+  ## LEXICAL-canonical companion matching the F_GETPATH spelling the file would get
+  ## once it exists, so a realpath-keying consumer matches the SAME key across the
+  ## absent-open → present-read transition. Absolute/AT_FDCWD anchors against the cwd;
+  ## a dirfd-relative miss recovers the dir via F_GETPATH (the dirfd is still open).
+  if callResult >= 0 or path == nil:
+    return
+  let raw = $path
+  if raw.len == 0:
+    return
+  var target = raw
+  if not (raw[0] == '/' or dirfd == AtFdCwd):
+    # dirfd-relative failed openat: resolve the directory, then join the leaf.
+    var dbuf: array[1024, char]
+    if ct_macos_fd_real_path(dirfd, addr dbuf[0], csize_t(dbuf.len)) == 0:
+      return
+    let dir = $cast[cstring](addr dbuf[0])
+    if dir.len == 0:
+      return
+    target = dir & "/" & raw
+  let canonical = lexicalCanonicalPathFor(target)
+  if canonical.len == 0 or canonical == raw:
+    return
+  var record = baseRecord(mrFileOpen, observationForOpen(flags))
+  record.result = callResult.int64
+  record.flags = uint32(flags)
+  record.path = canonical
+  record.detail = "canon=lexical"
+  emitRecord(record)
+
 proc recordCanonicalProbe(callResult: cint; path: cstring) {.raises: [].} =
   ## For a successful lstat of a SYMLINK, ALSO record a path-probe on the
   ## realpath-resolved target (findings doc break #7 / mcapSymlink): editing the
@@ -1345,18 +1408,36 @@ proc recordCanonicalPathProbe(callResult: cint; path: cstring; mode: cint;
   ## caller) AND the canonical path here, mirroring the open #7/#8 dual record, so a
   ## consumer keyed on EITHER matches.
   ##
-  ## Perf is bounded (stat storms are large): only on SUCCESS (callResult == 0 — the
-  ## ENOENT probe storm is skipped) and via the realpath memo in canonicalPathFor.
-  ## `detail` carries the as-passed probe's (dev, ino) so the canonical companion is
-  ## inode-matchable too.
-  if callResult != 0 or path == nil:
+  ## Perf is bounded (stat storms are large): a SUCCESS resolves via the realpath
+  ## memo in canonicalPathFor. `detail` carries the as-passed probe's (dev, ino) so
+  ## the canonical companion is inode-matchable too.
+  ##
+  ## ROUND-5 P1 — a FAILED probe (ENOENT: stat/lstat/access of a MISSING file — a
+  ## real negative-existence dependency, universal in compiler include-path search)
+  ## has no fd and realpath would itself ENOENT, so we canonicalise it LEXICALLY
+  ## (cwd anchor + firmlink + dot-collapse) to the SAME spelling F_GETPATH yields for
+  ## the file once it appears. Without this the raw string was recorded verbatim —
+  ## unanchored (relative) or un-firmlinked (/tmp vs /private/tmp) — so the absent
+  ## probe and a later existent read keyed differently ⇒ false cache hit. Tagged
+  ## `canon=lexical` (vs the success `resolved-target`) so the two are distinguishable
+  ## on the wire.
+  if path == nil:
     return
   let raw = $path
-  let canonical = canonicalPathFor(raw)
-  if canonical.len == 0 or canonical == raw:
+  if raw.len == 0:
     return
-  recordPathProbe(callResult, cstring(canonical), mode,
-    (if detail.len > 0: detail & " resolved-target" else: "resolved-target"))
+  if callResult == 0:
+    let canonical = canonicalPathFor(raw)
+    if canonical.len == 0 or canonical == raw:
+      return
+    recordPathProbe(callResult, cstring(canonical), mode,
+      (if detail.len > 0: detail & " resolved-target" else: "resolved-target"))
+  else:
+    let canonical = lexicalCanonicalPathFor(raw)
+    if canonical.len == 0 or canonical == raw:
+      return
+    recordPathProbe(callResult, cstring(canonical), mode,
+      (if detail.len > 0: detail & " canon=lexical" else: "canon=lexical"))
 
 proc recordCanonicalAtProbe(callResult: cint; dirfd: cint; path: cstring;
     mode: cint; detail: string) {.raises: [].} =
@@ -1375,7 +1456,14 @@ proc recordCanonicalAtProbe(callResult: cint; dirfd: cint; path: cstring;
   ##    raw fcntl, reentrancy-free), join the relative component, and record the
   ##    realpath-canonical ABSOLUTE companion (memoised via canonicalPathFor, so the
   ##    realpath cost is bounded on a probe storm).
-  if callResult != 0 or path == nil:
+  ##
+  ## ROUND-5 P1 — the ENOENT case (a MISSING `*at` target — a negative-existence dep)
+  ## now flows through the SAME two branches: an absolute/AT_FDCWD miss defers to
+  ## recordCanonicalPathProbe (which canonicalises a failed probe LEXICALLY), and a
+  ## dirfd-relative miss recovers the dir via F_GETPATH (the dirfd is still open even
+  ## though the leaf is absent), joins, and canonicalises LEXICALLY — matching the
+  ## F_GETPATH spelling the file would get once it appears.
+  if path == nil:
     return
   let raw = $path
   if raw.len == 0:
@@ -1383,7 +1471,7 @@ proc recordCanonicalAtProbe(callResult: cint; dirfd: cint; path: cstring;
   if raw[0] == '/' or dirfd == AtFdCwd:
     recordCanonicalPathProbe(callResult, path, mode, detail)
     return
-  # dirfd-relative: recover the directory's real path, then realpath the join.
+  # dirfd-relative: recover the directory's real path, then canonicalise the join.
   var dbuf: array[1024, char]
   if ct_macos_fd_real_path(dirfd, addr dbuf[0], csize_t(dbuf.len)) == 0:
     return
@@ -1391,13 +1479,16 @@ proc recordCanonicalAtProbe(callResult: cint; dirfd: cint; path: cstring;
   if dir.len == 0:
     return
   let joined = dir & "/" & raw
-  let canonical = canonicalPathFor(joined)
-  # Prefer the realpath-canonical form; fall back to the absolute join when
-  # realpath fails (e.g. a broken-symlink leaf an lstat-style probe still describes)
-  # so the companion is at worst absolute, never the bare relative component.
+  # A SUCCESSFUL probe realpath-resolves the join (symlink-aware); a FAILED probe
+  # (absent leaf) resolves it LEXICALLY (realpath would ENOENT). Both fall back to
+  # the absolute join so the companion is at worst absolute, never the bare relative
+  # component.
+  let canonical = if callResult == 0: canonicalPathFor(joined)
+                  else: lexicalCanonicalPathFor(joined)
   let p = if canonical.len > 0: canonical else: joined
+  let tag = if callResult == 0: "resolved-target" else: "canon=lexical"
   recordPathProbe(callResult, cstring(p), mode,
-    (if detail.len > 0: detail & " resolved-target" else: "resolved-target"))
+    (if detail.len > 0: detail & " " & tag else: tag))
 
 proc recordMmap(callResult: pointer; prot, flags, fd: cint) {.raises: [].} =
   ## ROUND-2 R9 — classify an `mmap` of a FILE-backed fd. A MAP_SHARED|PROT_WRITE
@@ -1747,6 +1838,17 @@ proc recordPathMutation(callResult: cint; path: cstring;
     detail: string) {.raises: [].} =
   ## Record a mkdir/rmdir/unlink output mutation (path form). Only a SUCCESSFUL
   ## call (result == 0) actually mutates the output tree.
+  ##
+  ## ROUND-5 P1 (deliberate) — a FAILED mutation against an absent target (an
+  ## `unlink`/`rmdir` returning ENOENT) is NOT recorded. It mutated nothing, so an
+  ## `mrPathMutation` (an OUTPUT record) would be a false output; and it names the
+  ## build's OWN output/temp namespace (the ubiquitous `rm -f $@t` clean idiom), where
+  ## a negative-existence dep is noise, not a build-input the output depends on. It
+  ## creates no false `mcComplete` (the process read nothing), so omitting it does not
+  ## violate the correctness contract. Genuine negative-existence INPUT deps are the
+  ## stat/access/open ENOENT probes, which ARE recorded (see recordCanonicalPathProbe /
+  ## recordFailedOpenCanonical). A build that branches on unlink's errno is pathological
+  ## and would stat/access the same path anyway.
   if path == nil or callResult != 0:
     return
   emitPathMutation($path, callResult, detail)
@@ -1903,6 +2005,10 @@ proc repro_hook_open*(path: cstring; flags, mode: cint): cint {.exportc, cdecl, 
     # One cheap raw fcntl per open; the companion carries the open's own
     # observation kind so the write/read classification is preserved.
     recordCanonicalTarget(result, path, observationForOpen(flags))
+  else:
+    # ROUND-5 P1 — a FAILED open (ENOENT) is a negative-existence dep; with no fd the
+    # F_GETPATH companion cannot run, so add the LEXICAL-canonical companion.
+    recordFailedOpenCanonical(result, AtFdCwd, path, flags)
   setErrno(savedErrno)
 
 proc repro_hook_openat*(dirfd: cint; path: cstring; flags, mode: cint): cint
@@ -1920,6 +2026,10 @@ proc repro_hook_openat*(dirfd: cint; path: cstring; flags, mode: cint): cint
     # BOTH read and write openat (r3_fd p_oat / p_oatw / p_normw): a dirfd-relative
     # input or output is now recorded under, and its fd mapped to, the real file.
     recordCanonicalTarget(result, path, observationForOpen(flags))
+  else:
+    # ROUND-5 P1 — a FAILED openat (ENOENT) is a negative-existence dep; with no fd,
+    # canonicalise LEXICALLY (dirfd resolved via F_GETPATH when dirfd-relative).
+    recordFailedOpenCanonical(result, dirfd, path, flags)
   setErrno(savedErrno)
 
 proc repro_hook_read*(fd: cint; buf: pointer; count: csize_t): int {.exportc, cdecl, dynlib.} =

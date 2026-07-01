@@ -580,6 +580,92 @@ int repro_macos_canonical_path(char *path, void *out, size_t outlen) {
   return 1;
 }
 
+/*
+ * ROUND-5 P1 (path fidelity, negative-existence deps): LEXICAL canonicalisation
+ * for a path recorded WITHOUT a live fd — the ENOENT stat/lstat/access/fstatat
+ * probe path and the failed-open path. For an EXISTENT file the shim canonicalises
+ * via fcntl(F_GETPATH) (repro_macos_fd_real_path), which yields an ABSOLUTE,
+ * firmlink-resolved path (e.g. /tmp/x -> /private/tmp/x). A NON-existent target has
+ * no fd and realpath(3) would itself ENOENT, so we reproduce the SAME spelling
+ * purely lexically, matching what F_GETPATH would have produced once the file
+ * appears:
+ *   1. anchor a RELATIVE path against the process cwd (getcwd), so a bare
+ *      `stat("nope.h")` after chdir("/build") is anchored, not left unresolvable;
+ *   2. collapse "." segments, resolve ".." lexically, and squeeze "//";
+ *   3. resolve the standard macOS firmlink prefixes /tmp,/var,/etc -> /private/...
+ *      (the ones a build actually hits, incl. $TMPDIR=/var/folders/...). These are
+ *      the top-level synthetic firmlinks in /usr/share/firmlinks; hardcoding the
+ *      three a build touches keeps this filesystem-free.
+ * This is a PURELY LEXICAL transform + cwd anchor: it NEVER touches the filesystem
+ * (no realpath, no lstat), so unlike realpath it cannot ENOENT and is cheap enough
+ * for the ENOENT probe hot path. getcwd is not a hooked function (no reentrancy)
+ * and, given a caller buffer, does not allocate. Returns 1 and fills `out`
+ * (>= 1024 bytes) on success, 0 otherwise.
+ */
+int repro_macos_lexical_canonical_path(char *path, void *out, size_t outlen) {
+  if (!path || !out || outlen < 1024) return 0;
+  if (path[0] == '\0') return 0;
+  /* Step 1: build an ABSOLUTE path (anchor relatives against the cwd). */
+  char absbuf[1024]; /* MAXPATHLEN */
+  if (path[0] == '/') {
+    size_t pl = strlen(path);
+    if (pl + 1 > sizeof absbuf) return 0;
+    memcpy(absbuf, path, pl + 1);
+  } else {
+    char cwd[1024];
+    if (getcwd(cwd, sizeof cwd) == NULL) return 0;
+    int n = snprintf(absbuf, sizeof absbuf, "%s/%s", cwd, path);
+    if (n < 0 || (size_t)n >= sizeof absbuf) return 0;
+  }
+  /* Step 2: collapse lexically into `norm`. comp_off[] records the start offset
+   * (the leading '/') of each KEPT component so ".." can pop the previous one. */
+  char norm[1024];
+  size_t comp_off[256];
+  size_t ncomp = 0;
+  size_t ni = 0;
+  const char *s = absbuf;
+  while (*s) {
+    while (*s == '/') s++;               /* squeeze "//" and skip leading slash */
+    if (!*s) break;
+    const char *c = s;
+    size_t clen = 0;
+    while (c[clen] && c[clen] != '/') clen++;
+    s = c + clen;
+    if (clen == 1 && c[0] == '.') {
+      continue;                          /* "." — drop */
+    } else if (clen == 2 && c[0] == '.' && c[1] == '.') {
+      if (ncomp > 0) { ncomp--; ni = comp_off[ncomp]; }
+      /* at root, a leading ".." is a no-op (matches realpath/F_GETPATH) */
+      continue;
+    }
+    if (ncomp >= 256) return 0;
+    if (ni + 1 + clen + 1 > sizeof norm) return 0;
+    comp_off[ncomp++] = ni;
+    norm[ni++] = '/';
+    memcpy(norm + ni, c, clen);
+    ni += clen;
+  }
+  if (ni == 0) norm[ni++] = '/';         /* everything collapsed to root */
+  norm[ni] = '\0';
+  /* Step 3: apply the macOS firmlink prefix (/tmp,/var,/etc -> /private/<same>).
+   * norm is now clean+absolute, so a component-boundary prefix test is exact. */
+  static const char *firmlinks[3] = { "/tmp", "/var", "/etc" };
+  for (int i = 0; i < 3; i++) {
+    size_t l = strlen(firmlinks[i]);
+    if (strncmp(norm, firmlinks[i], l) == 0 && (norm[l] == '/' || norm[l] == '\0')) {
+      char tmp[1024];
+      int n = snprintf(tmp, sizeof tmp, "/private%s", norm);
+      if (n < 0 || (size_t)n >= sizeof tmp) return 0;
+      memcpy(norm, tmp, (size_t)n + 1);
+      break;
+    }
+  }
+  size_t nn = strlen(norm);
+  if (nn + 1 > outlen) return 0;
+  memcpy(out, norm, nn + 1);
+  return 1;
+}
+
 /* True if the (64-bit-inode) struct stat buffer describes a symlink. Used to
  * gate the lstat hook's symlink-target resolution so realpath() is only paid for
  * actual symlinks, not every probe. The SYS_lstat64-filled buffer is the modern
@@ -2564,6 +2650,20 @@ proc ct_macos_canonical_path*(path: cstring; outBuf: pointer;
   proc canonicalPath(path: cstring; outBuf: pointer; outLen: csize_t): cint
     {.importc: "repro_macos_canonical_path", cdecl.}
   canonicalPath(path, outBuf, outLen)
+
+proc ct_macos_lexical_canonical_path*(path: cstring; outBuf: pointer;
+    outLen: csize_t): cint =
+  ## ROUND-5 P1 — purely LEXICAL canonicalisation (cwd anchor for relatives +
+  ## "."/".."/"//" collapse + /tmp,/var,/etc firmlink prefix) for a path recorded
+  ## WITHOUT a live fd (the ENOENT stat/lstat/access/fstatat probe and the failed
+  ## open). Unlike ct_macos_canonical_path it NEVER touches the filesystem (no
+  ## realpath/lstat), so it cannot ENOENT and needs NO shim muting — safe and cheap
+  ## on the negative-existence probe hot path. Reproduces the spelling F_GETPATH
+  ## would yield for the same file once it exists (symlink-free common case).
+  ## Returns non-zero + canonical path on success.
+  proc lexCanon(path: cstring; outBuf: pointer; outLen: csize_t): cint
+    {.importc: "repro_macos_lexical_canonical_path", cdecl.}
+  lexCanon(path, outBuf, outLen)
 
 proc ct_macos_spawnattr_has_setexec*(attrp: pointer): bool =
   ## True if the spawn attributes set POSIX_SPAWN_SETEXEC (break #2). A SETEXEC

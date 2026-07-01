@@ -1,0 +1,20 @@
+warning: unhandled Platform key FamilyDisplayName
+p_rawurandom.c:7:12: warning: 'syscall' is deprecated: first deprecated in macOS 10.12 - syscall(2) is unsupported; please switch to a supported interface. For SYS_kdebug_trace use kdebug_signpost(). [-Wdeprecated-declarations]
+    7 |   int fd = syscall(SYS_open, "/dev/urandom", O_RDONLY, 0);
+      |            ^
+/nix/store/1b9inc48934yzc0m2w8j9sbva9svqhfy-apple-sdk-14.4/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.4.sdk/usr/include/unistd.h:748:6: note: 'syscall' has been explicitly marked deprecated here
+  748 | int      syscall(int, ...);
+      |          ^
+p_rawurandom.c:9:3: warning: 'syscall' is deprecated: first deprecated in macOS 10.12 - syscall(2) is unsupported; please switch to a supported interface. For SYS_kdebug_trace use kdebug_signpost(). [-Wdeprecated-declarations]
+    9 |   syscall(SYS_read, fd, b, sizeof b);
+      |   ^
+/nix/store/1b9inc48934yzc0m2w8j9sbva9svqhfy-apple-sdk-14.4/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.4.sdk/usr/include/unistd.h:748:6: note: 'syscall' has been explicitly marked deprecated here
+  748 | int      syscall(int, ...);
+      |          ^
+p_rawurandom.c:10:3: warning: 'syscall' is deprecated: first deprecated in macOS 10.12 - syscall(2) is unsupported; please switch to a supported interface. For SYS_kdebug_trace use kdebug_signpost(). [-Wdeprecated-declarations]
+   10 |   syscall(SYS_close, fd);
+      |   ^
+/nix/store/1b9inc48934yzc0m2w8j9sbva9svqhfy-apple-sdk-14.4/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.4.sdk/usr/include/unistd.h:748:6: note: 'syscall' has been explicitly marked deprecated here
+  748 | int      syscall(int, ...);
+      |          ^
+3 warnings generated.

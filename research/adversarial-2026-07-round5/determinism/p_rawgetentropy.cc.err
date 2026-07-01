@@ -1,0 +1,8 @@
+warning: unhandled Platform key FamilyDisplayName
+p_rawgetentropy.c:7:12: warning: 'syscall' is deprecated: first deprecated in macOS 10.12 - syscall(2) is unsupported; please switch to a supported interface. For SYS_kdebug_trace use kdebug_signpost(). [-Wdeprecated-declarations]
+    7 |   long r = syscall(SYS_getentropy, b, sizeof b);
+      |            ^
+/nix/store/1b9inc48934yzc0m2w8j9sbva9svqhfy-apple-sdk-14.4/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.4.sdk/usr/include/unistd.h:748:6: note: 'syscall' has been explicitly marked deprecated here
+  748 | int      syscall(int, ...);
+      |          ^
+1 warning generated.
