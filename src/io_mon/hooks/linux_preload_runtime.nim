@@ -506,6 +506,7 @@ type
 
 {.emit: """
 #define _GNU_SOURCE
+#include <alloca.h>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -1823,12 +1824,81 @@ pid_t fork(void) {
   return CT_CALL_HOOK(ct_fork_hook());
 }
 
-int execve(const char *path, char *const argv[], char *const envp[])
-    __attribute__((visibility("default")));
-int execve(const char *path, char *const argv[], char *const envp[]) {
+static int ct_linux_preload_dispatch_execve(const char *path,
+                                            char *const argv[],
+                                            char *const envp[]) {
   if (CT_BYPASS() || ct_execve_hook == NULL)
     return ct_linux_preload_real_execve((char *)path, (char **)argv, (char **)envp);
   return CT_CALL_HOOK(ct_execve_hook((char *)path, (char **)argv, (char **)envp));
+}
+
+int execve(const char *path, char *const argv[], char *const envp[])
+    __attribute__((visibility("default")));
+int execve(const char *path, char *const argv[], char *const envp[]) {
+  return ct_linux_preload_dispatch_execve(path, argv, envp);
+}
+
+int execv(const char *path, char *const argv[])
+    __attribute__((visibility("default")));
+int execv(const char *path, char *const argv[]) {
+  return ct_linux_preload_dispatch_execve(path, argv, environ);
+}
+
+int execl(const char *path, const char *arg, ...)
+    __attribute__((visibility("default")));
+int execl(const char *path, const char *arg, ...) {
+  size_t argc = 0;
+  if (arg != NULL) {
+    argc = 1;
+    va_list count_ap;
+    va_start(count_ap, arg);
+    while (va_arg(count_ap, char *) != NULL) {
+      argc++;
+    }
+    va_end(count_ap);
+  }
+
+  char **argv = (char **)alloca((argc + 1) * sizeof(char *));
+  if (arg != NULL) {
+    argv[0] = (char *)arg;
+    va_list fill_ap;
+    va_start(fill_ap, arg);
+    for (size_t i = 1; i < argc; i++) {
+      argv[i] = va_arg(fill_ap, char *);
+    }
+    va_end(fill_ap);
+  }
+  argv[argc] = NULL;
+  return ct_linux_preload_dispatch_execve(path, argv, environ);
+}
+
+int execle(const char *path, const char *arg, ...)
+    __attribute__((visibility("default")));
+int execle(const char *path, const char *arg, ...) {
+  size_t argc = 0;
+  va_list count_ap;
+  va_start(count_ap, arg);
+  if (arg != NULL) {
+    argc = 1;
+    while (va_arg(count_ap, char *) != NULL) {
+      argc++;
+    }
+  }
+  char **envp = va_arg(count_ap, char **);
+  va_end(count_ap);
+
+  char **argv = (char **)alloca((argc + 1) * sizeof(char *));
+  if (arg != NULL) {
+    argv[0] = (char *)arg;
+    va_list fill_ap;
+    va_start(fill_ap, arg);
+    for (size_t i = 1; i < argc; i++) {
+      argv[i] = va_arg(fill_ap, char *);
+    }
+    va_end(fill_ap);
+  }
+  argv[argc] = NULL;
+  return ct_linux_preload_dispatch_execve(path, argv, envp);
 }
 
 int posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *file_actions,

@@ -1671,6 +1671,7 @@ proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
     record.path = $ctx.path
   emitRecord(record)
   ctx.envp = envWithPreload(ctx.envp)
+  discard repro_monitor_shim_flush()
   callNext(ctx)
 
 proc repro_hook_posix_spawn*(ctx: var PosixSpawnContext) {.raises: [].} =
