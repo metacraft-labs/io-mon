@@ -1,0 +1,4 @@
+io-mon: macOS body-patch installed=51 failed=0 absent=3 fork_tramp=ok spawn_tramp=ok spawnp_tramp=ok
+MARKER-CONTENT-v5
+io-mon: error: Permission denied
+Additional info: /var/folders/by/qdc078sx5bn6m3xv734qrjg40000gn/T/repro-fs-snoop-fragments-16142-1782918021-381626000-16143/repro-reading-16157-51528157.io-mon-reading

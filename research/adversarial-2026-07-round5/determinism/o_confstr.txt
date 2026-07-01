@@ -1,0 +1,1 @@
+n=30 path=/usr/bin:/bin:/usr/sbin:/sbin
