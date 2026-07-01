@@ -261,6 +261,38 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
       mcIncomplete
     removeDir(work)
 
+  test "MALFORMED: otherwise-valid report without magic header is ignored":
+    let work = getTempDir() / ("io-mon-r8-nohdr-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let reportDir = work / "reports"
+    createDir(reportDir)
+    let frag = clientFrag(work, 4242'u64, 9999'u64)
+    let decoy = "/tmp/io-mon-breakaway-decoy.h"
+    writeFile(reportDir / "no-header.io-mon-report",
+      "run " & runId & "\nclient 4242\ndaemon 9999\n" &
+        "read " & decoy & "\ncomplete\n")
+    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    check dep.completeness == mcIncomplete
+    for r in dep.records:
+      check r.path != decoy
+    removeDir(work)
+
+  test "MALFORMED: whitespace-padded magic header is ignored":
+    let work = getTempDir() / ("io-mon-r8-paddedhdr-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let reportDir = work / "reports"
+    createDir(reportDir)
+    let frag = clientFrag(work, 4242'u64, 9999'u64)
+    let decoy = "/tmp/io-mon-breakaway-padded-decoy.h"
+    writeFile(reportDir / "padded-header.io-mon-report",
+      " " & BreakawayReportMagic & "\nrun " & runId &
+        "\nclient 4242\ndaemon 9999\nread " & decoy & "\ncomplete\n")
+    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    check dep.completeness == mcIncomplete
+    for r in dep.records:
+      check r.path != decoy
+    removeDir(work)
+
   test "3c STALE: a report from ANOTHER run is not folded (run mismatch)":
     let work = getTempDir() / ("io-mon-r8-stale-" & $getCurrentProcessId())
     removeDir(work); createDir(work)

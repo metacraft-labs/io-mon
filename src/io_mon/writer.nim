@@ -980,6 +980,8 @@ const
     ## File extension a COOPERATING daemon writes its breakaway report under,
     ## inside the `IO_MON_BREAKAWAY_REPORT_DIR`. Distinct from `.rmdf-frag` so the
     ## report scan never collides with the per-process fragment files.
+  BreakawayReportMagic* = "io-mon-breakaway-report v1"
+    ## Required first non-empty line of a trusted-daemon breakaway report.
   IoMonBreakawayReportDirEnv* = "IO_MON_BREAKAWAY_REPORT_DIR"
     ## Env var naming the directory a trusted daemon drops breakaway reports into
     ## (and that the merge folds them from). See `loadBreakawayReports` and the
@@ -1192,6 +1194,14 @@ proc loadBreakawayReports*(reportDir: string; monitored: HashSet[uint64];
     except IOError, OSError:
       # A report that vanished / is unreadable carries no evidence; skip it
       # rather than abort the whole merge (benign producer race).
+      continue
+    var hasMagic = false
+    for rawLine in content.splitLines():
+      if rawLine.strip().len == 0:
+        continue
+      hasMagic = rawLine == BreakawayReportMagic
+      break
+    if not hasMagic:
       continue
     var clientPid, daemonPid: uint64 = 0
     var reportRun, reportNonce: string = ""
