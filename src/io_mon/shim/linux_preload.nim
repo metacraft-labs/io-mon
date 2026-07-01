@@ -1709,6 +1709,11 @@ proc repro_hook_posix_spawnp*(ctx: var PosixSpawnContext) {.raises: [].} =
     emitRecord(record)
   c_set_errno(savedErrno)
 
+proc repro_hook_exit*(ctx: var ExitContext) {.raises: [].} =
+  if not shouldBypass():
+    discard repro_monitor_shim_shutdown()
+  callNext(ctx)
+
 setPreloadShimEnvVar("REPRO_MONITOR_SHIM_LIB")
 registerOpenHook(repro_hook_open)
 registerOpen64Hook(repro_hook_open64)
@@ -1756,4 +1761,5 @@ registerForkHook(repro_hook_fork)
 registerExecveHook(repro_hook_execve)
 registerPosixSpawnHook(repro_hook_posix_spawn)
 registerPosixSpawnpHook(repro_hook_posix_spawnp)
+registerExitHook(repro_hook_exit)
 registerRawSyscallHook(repro_hook_raw_syscall)

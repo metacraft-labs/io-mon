@@ -310,6 +310,10 @@ type
     symbol: LinuxHookSymbol
     nextIndex: int
 
+  ExitContext* = object
+    status*: cint
+    nextIndex: int
+
   RawSyscallPatchStatus* = object
     installed*: bool
     diagnostic*: LinuxRawSyscallDiagnostic
@@ -372,6 +376,7 @@ type
   ForkHook* = proc(ctx: var ForkContext) {.raises: [].}
   ExecveHook* = proc(ctx: var ExecveContext) {.raises: [].}
   PosixSpawnHook* = proc(ctx: var PosixSpawnContext) {.raises: [].}
+  ExitHook* = proc(ctx: var ExitContext) {.raises: [].}
   RawSyscallHook* = proc(number, a1, a2, a3, a4, a5, a6, result: clong;
                          inlineTrap: cint) {.raises: [].}
 
@@ -495,6 +500,9 @@ type
   PosixSpawnHookEntry = object
     priority: int
     callback: PosixSpawnHook
+  ExitHookEntry = object
+    priority: int
+    callback: ExitHook
 
 {.emit: """
 #define _GNU_SOURCE
@@ -513,6 +521,7 @@ type
 #include <sys/random.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/utsname.h>
@@ -567,6 +576,7 @@ typedef pid_t (*ct_fork_hook_fn)(void);
 typedef int (*ct_execve_hook_fn)(char *, char **, char **);
 typedef int (*ct_posix_spawn_hook_fn)(pid_t *, char *, void *, void *,
                                       char **, char **);
+typedef void (*ct_exit_hook_fn)(int);
 
 typedef int (*ct_open_real_fn)(const char *, int, ...);
 typedef int (*ct_openat_real_fn)(int, const char *, int, ...);
@@ -665,6 +675,7 @@ static ct_fork_hook_fn ct_fork_hook = NULL;
 static ct_execve_hook_fn ct_execve_hook = NULL;
 static ct_posix_spawn_hook_fn ct_posix_spawn_hook = NULL;
 static ct_posix_spawn_hook_fn ct_posix_spawnp_hook = NULL;
+static ct_exit_hook_fn ct_exit_hook = NULL;
 typedef void (*ct_raw_syscall_hook_fn)(long, long, long, long, long, long, long,
                                        long, int);
 static ct_raw_syscall_hook_fn ct_raw_syscall_hook = NULL;
@@ -1028,7 +1039,17 @@ void ct_linux_preload_register_fork_hook(ct_fork_hook_fn hook) { ct_fork_hook = 
 void ct_linux_preload_register_execve_hook(ct_execve_hook_fn hook) { ct_execve_hook = hook; }
 void ct_linux_preload_register_posix_spawn_hook(ct_posix_spawn_hook_fn hook) { ct_posix_spawn_hook = hook; }
 void ct_linux_preload_register_posix_spawnp_hook(ct_posix_spawn_hook_fn hook) { ct_posix_spawnp_hook = hook; }
+void ct_linux_preload_register_exit_hook(ct_exit_hook_fn hook) { ct_exit_hook = hook; }
 void ct_linux_preload_register_raw_syscall_hook(ct_raw_syscall_hook_fn hook) { ct_raw_syscall_hook = hook; }
+
+void ct_linux_preload_real_exit(int status) __attribute__((noreturn));
+void ct_linux_preload_real_exit(int status) {
+#ifdef SYS_exit_group
+  syscall(SYS_exit_group, status);
+#endif
+  syscall(SYS_exit, status);
+  __builtin_unreachable();
+}
 
 static long ct_linux_preload_raw_syscall6(long nr, long a1, long a2, long a3,
                                           long a4, long a5, long a6) {
@@ -1834,6 +1855,19 @@ int posix_spawnp(pid_t *pid, const char *file, const posix_spawn_file_actions_t 
                                            (void *)attrp, (char **)argv, (char **)envp));
 }
 
+void _exit(int status) __attribute__((visibility("default"), noreturn));
+void _exit(int status) {
+  if (!CT_BYPASS() && ct_exit_hook != NULL) {
+    CT_CALL_HOOK((ct_exit_hook(status), 0));
+  }
+  ct_linux_preload_real_exit(status);
+}
+
+void _Exit(int status) __attribute__((visibility("default"), noreturn));
+void _Exit(int status) {
+  _exit(status);
+}
+
 /* glibc's <fcntl.h> and <unistd.h> expand to the __*_2 / __*_chk
  * fortify entry points whenever the compiler can prove the safety
  * invariants at compile time (e.g. _FORTIFY_SOURCE >= 1, a constant
@@ -1976,6 +2010,8 @@ proc realPosixSpawn*(pid: ptr PidT; path: cstring; fileActions, attrp: pointer;
 proc realPosixSpawnp*(pid: ptr PidT; path: cstring; fileActions, attrp: pointer;
                       argv, envp: cstringArray): cint
   {.importc: "ct_linux_preload_real_posix_spawnp", raises: [].}
+proc realExit*(status: cint) {.importc: "ct_linux_preload_real_exit",
+  raises: [], noreturn.}
 
 type
   OpenDispatch = proc(path: cstring; flags, mode: cint): cint
@@ -2052,6 +2088,7 @@ type
   PosixSpawnDispatch = proc(pid: ptr PidT; path: cstring; fileActions,
                            attrp: pointer; argv, envp: cstringArray): cint
     {.cdecl, raises: [].}
+  ExitDispatch = proc(status: cint) {.cdecl, raises: [].}
   RawSyscallDispatch = proc(number, a1, a2, a3, a4, a5, a6, result: clong;
                             inlineTrap: cint) {.cdecl, raises: [].}
 
@@ -2176,6 +2213,8 @@ proc installPosixSpawnDispatcher(dispatch: PosixSpawnDispatch)
   {.importc: "ct_linux_preload_register_posix_spawn_hook", raises: [].}
 proc installPosixSpawnpDispatcher(dispatch: PosixSpawnDispatch)
   {.importc: "ct_linux_preload_register_posix_spawnp_hook", raises: [].}
+proc installExitDispatcher(dispatch: ExitDispatch)
+  {.importc: "ct_linux_preload_register_exit_hook", raises: [].}
 proc installRawSyscallDispatcher(dispatch: RawSyscallDispatch)
   {.importc: "ct_linux_preload_register_raw_syscall_hook", raises: [].}
 
@@ -2226,6 +2265,7 @@ var
   execveHooks: seq[ExecveHookEntry] = @[]
   posixSpawnHooks: seq[PosixSpawnHookEntry] = @[]
   posixSpawnpHooks: seq[PosixSpawnHookEntry] = @[]
+  exitHooks: seq[ExitHookEntry] = @[]
   rawSyscallHook: RawSyscallHook = nil
   rawSyscallPatchAttempted = false
   rawSyscallPatchStatus = RawSyscallPatchStatus(
@@ -2533,6 +2573,12 @@ proc registerPosixSpawnpHook*(hook: PosixSpawnHook; priority = 100) {.raises: []
   posixSpawnpHooks.add(PosixSpawnHookEntry(priority: priority, callback: hook))
   posixSpawnpHooks.sort(proc(a, b: PosixSpawnHookEntry): int =
     cmp(a.priority, b.priority))
+
+proc registerExitHook*(hook: ExitHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  exitHooks.add(ExitHookEntry(priority: priority, callback: hook))
+  exitHooks.sort(proc(a, b: ExitHookEntry): int = cmp(a.priority, b.priority))
 
 proc registerRawSyscallHook*(hook: RawSyscallHook) {.raises: [].} =
   rawSyscallHook = hook
@@ -3200,6 +3246,9 @@ proc callReal*(ctx: var PosixSpawnContext) {.raises: [].} =
     ctx.result = realPosixSpawn(ctx.pid, ctx.path, ctx.fileActions,
                                 ctx.attrp, ctx.argv, ctx.envp)
 
+proc callReal*(ctx: var ExitContext) {.raises: [], noreturn.} =
+  realExit(ctx.status)
+
 proc callNext*(ctx: var OpenContext) {.raises: [].} =
   case ctx.symbol
   of lhsOpen64:
@@ -3574,6 +3623,14 @@ proc callNext*(ctx: var PosixSpawnContext) {.raises: [].} =
     else:
       callReal(ctx)
 
+proc callNext*(ctx: var ExitContext) {.raises: [].} =
+  if ctx.nextIndex < exitHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    exitHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
 proc dispatchOpen(path: cstring; flags, mode: cint): cint {.cdecl, raises: [].} =
   var ctx = OpenContext(path: path, flags: flags, mode: mode, result: -1,
                         symbol: lhsOpen)
@@ -3867,6 +3924,10 @@ proc dispatchPosixSpawnp(pid: ptr PidT; path: cstring; fileActions, attrp: point
   callNext(ctx)
   result = ctx.result
 
+proc dispatchExit(status: cint) {.cdecl, raises: [].} =
+  var ctx = ExitContext(status: status)
+  callNext(ctx)
+
 installOpenDispatcher(dispatchOpen)
 installOpen64Dispatcher(dispatchOpen64)
 installOpenatDispatcher(dispatchOpenat)
@@ -3913,4 +3974,5 @@ installForkDispatcher(dispatchFork)
 installExecveDispatcher(dispatchExecve)
 installPosixSpawnDispatcher(dispatchPosixSpawn)
 installPosixSpawnpDispatcher(dispatchPosixSpawnp)
+installExitDispatcher(dispatchExit)
 installRawSyscallDispatcher(rawSyscallDispatcher)
