@@ -683,11 +683,16 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
     removeDir(work); createDir(work)
     let frag = work / "frags"
     createDir(frag)
+    # Each simulated run's shim stamps the read-tail markers with its own run token
+    # (as the real per-invocation shim does), so dropStaleRunRecords drops the OLD
+    # run's markers in this reused dir and keeps only CURRENT's.
+    setFragmentRunToken(" run=OLD")
     appendFragmentRecord(frag, startAt(501'u64, "111", "OLD"))
     var staleRead = readRec(501'u64, "/old/stale.h")
     staleRead.detail = "run=OLD"
     appendFragmentRecord(frag, staleRead)
     closeFragmentSlot()
+    setFragmentRunToken(" run=CURRENT")
     appendFragmentRecord(frag, startAt(501'u64, "222", "CURRENT"))
     var currentRead = readRec(501'u64, "/current/header.h")
     currentRead.detail = "run=CURRENT"
@@ -704,6 +709,7 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
       check not (r.kind == mrEventLoss and
         "ambiguous unstamped fragment record" in r.detail)
     check sawCurrent
+    setFragmentRunToken("")   # reset the process-global for later tests
     removeDir(work)
 
   test "duplicate-run stale read is not accepted as a current dependency":

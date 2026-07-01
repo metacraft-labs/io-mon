@@ -198,19 +198,34 @@ proc encodeFrame*(record: MonitorRecord): seq[byte] {.raises: [].}
   ## explicit `{.raises: [].}` keeps effect inference from pessimistically assuming
   ## the not-yet-seen body can raise (which would poison every caller's raises list).
 
+var fragmentRunToken: string
+  ## ROUND-5 F — the ` run=<id>` suffix (from the shim's REPRO_MONITOR_SESSION) that
+  ## the read-tail markers carry so `dropStaleRunRecords` scopes them to their run,
+  ## exactly like process-start. Without it an unstamped marker for a pid that spans
+  ## two runs in a REUSED fragment dir is "ambiguous" (dropped + a spurious
+  ## downgrade), and a stale killed run could false-downgrade the current one. Set
+  ## once by the shim at init via `setFragmentRunToken`; empty for legacy callers.
+
+proc setFragmentRunToken*(token: string) =
+  ## Publish the current invocation's ` run=<id>` token (or "") to the fragment
+  ## writer so the kill-before-flush markers are run-scoped. Idempotent; call once.
+  fragmentRunToken = token
+
 proc writeReadTailMarker(detail: string) =
   ## ROUND-5 F — write a kill-before-flush bookkeeping marker (`mrEventLoss` with
-  ## `detail`) DIRECTLY to the calling thread's already-open fragment file and flush
-  ## it, so it is durable independently of the batch buffer. Keyed on the slot's
-  ## (osPid, threadId) so `mergeFragments` can net pending vs committed per thread.
-  ## Best-effort at the syscall level (a short write / flush failure is swallowed —
-  ## it never aborts the monitored process), but UNLIKE the round-2 sidecar it does
-  ## not depend on a writable directory: the fd is already open, so a tracee that
-  ## chmod's the fragment dir cannot block it.
+  ## `detail`, stamped with the current run token) DIRECTLY to the calling thread's
+  ## already-open fragment file and flush it, so it is durable independently of the
+  ## batch buffer. Keyed on the slot's (osPid, threadId) — and run-scoped via the
+  ## token — so `mergeFragments` can net pending vs committed per thread within the
+  ## run. Best-effort at the syscall level (a short write / flush failure is
+  ## swallowed — it never aborts the monitored process), but UNLIKE the round-2
+  ## sidecar it does not depend on a writable directory: the fd is already open, so a
+  ## tracee that chmod's the fragment dir cannot block it.
   if not fragmentSlot.isOpen:
     return
   let marker = MonitorRecord(kind: mrEventLoss, observationKind: moEventLoss,
-    osPid: fragmentSlot.osPid, threadId: fragmentSlot.threadId, detail: detail)
+    osPid: fragmentSlot.osPid, threadId: fragmentSlot.threadId,
+    detail: detail & fragmentRunToken)
   let frame = encodeFrame(marker)
   try:
     let n = fragmentSlot.file.writeBuffer(unsafeAddr frame[0], frame.len)
@@ -1582,10 +1597,13 @@ proc mergeFragments*(fragmentDir, outputPath: string;
     var pendingByThread = initCountTable[(uint64, uint64)]()
     var committedByThread = initCountTable[(uint64, uint64)]()
     var cleaned = newSeqOfCap[MonitorRecord](records.len)
+    # The marker detail is "<kind> run=<id>" (run-stamped), so match by PREFIX. The
+    # run scoping is already applied by dropStaleRunRecords above, so only this run's
+    # markers reach here.
     for r in records:
-      if r.kind == mrEventLoss and r.detail == ReadTailPendingDetail:
+      if r.kind == mrEventLoss and r.detail.startsWith(ReadTailPendingDetail):
         pendingByThread.inc((r.osPid, r.threadId))
-      elif r.kind == mrEventLoss and r.detail == ReadTailCommittedDetail:
+      elif r.kind == mrEventLoss and r.detail.startsWith(ReadTailCommittedDetail):
         committedByThread.inc((r.osPid, r.threadId))
       else:
         cleaned.add r
