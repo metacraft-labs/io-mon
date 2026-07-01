@@ -34,6 +34,7 @@ const
   LinuxSysStatx = 332.clong
   LinuxSysOpenat2 = 437.clong
   LinuxEfault = 14.clong
+  LinuxRenameExchange = 2'u32
 
 type
   LinuxOpenHow = object
@@ -986,8 +987,12 @@ proc repro_hook_renameat2*(ctx: var RenameatContext) {.raises: [].} =
     let newPath = pathForAt(ctx.newDirfd, ctx.newPath)
     let detail = "renameat2 olddirfd=" & $ctx.oldDirfd & " newdirfd=" &
       $ctx.newDirfd & " flags=" & $ctx.flags
-    recordPathRead(oldPath, detail & " source")
-    recordPathWrite(newPath, detail & " destination")
+    if (uint32(ctx.flags) and LinuxRenameExchange) != 0'u32:
+      recordPathWrite(oldPath, detail & " exchange-left")
+      recordPathWrite(newPath, detail & " exchange-right")
+    else:
+      recordPathRead(oldPath, detail & " source")
+      recordPathWrite(newPath, detail & " destination")
   c_set_errno(savedErrno)
 
 proc repro_hook_dlopen*(ctx: var DlopenContext) {.raises: [].} =
