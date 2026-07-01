@@ -51,7 +51,8 @@ proc hasFileRead(dep: MonitorDepFile; path: string): bool =
   dep.records.anyIt(it.kind == mrFileRead and path in it.path)
 
 proc hasFileWrite(dep: MonitorDepFile; path: string): bool =
-  dep.records.anyIt(it.kind == mrFileWrite and path in it.path)
+  dep.records.anyIt(it.kind == mrFileWrite and
+    it.observationKind == moFileWrite and path in it.path)
 
 proc hasPathProbe(dep: MonitorDepFile; path: string): bool =
   dep.records.anyIt(it.kind == mrPathProbe and path in it.path)
@@ -221,6 +222,10 @@ int main(int argc, char **argv) {
 #include <string.h>
 #include <unistd.h>
 
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE (1U << 1)
+#endif
+
 static int read_file(const char *path) {
   char buf[64];
   int fd = open(path, O_RDONLY);
@@ -231,7 +236,7 @@ static int read_file(const char *path) {
 }
 
 int main(int argc, char **argv) {
-  if (argc != 11) return 2;
+  if (argc != 13) return 2;
   const char *source = argv[1];
   const char *alias = argv[2];
   const char *dir = argv[3];
@@ -242,6 +247,8 @@ int main(int argc, char **argv) {
   const char *final2_path = argv[8];
   const char *final2_name = argv[9];
   const char *missing = argv[10];
+  const char *exchange_left = argv[11];
+  const char *exchange_right = argv[12];
   unlink(alias);
   unlink(alias2_path);
   unlink(temp);
@@ -265,6 +272,8 @@ int main(int argc, char **argv) {
   if (write(fd, "renamedat\n", 10) != 10) return 10;
   close(fd);
   if (renameat(AT_FDCWD, temp, dirfd, final2_name) != 0) return 12;
+  if (renameat2(AT_FDCWD, exchange_left, AT_FDCWD, exchange_right,
+                RENAME_EXCHANGE) != 0) return 15;
   close(dirfd);
   if (link(missing, "io-mon-failed-link-alias") == 0) return 13;
   if (rename(missing, "io-mon-failed-rename-final") == 0) return 14;
@@ -280,7 +289,11 @@ int main(int argc, char **argv) {
     let final2 = work / "path-mutation-renameat.final"
     let final2Name = "path-mutation-renameat.final"
     let missing = work / "path-mutation-missing.txt"
+    let exchangeLeft = work / "path-mutation-exchange-left.txt"
+    let exchangeRight = work / "path-mutation-exchange-right.txt"
     writeFile(source, "source identity marker\n")
+    writeFile(exchangeLeft, "exchange left marker\n")
+    writeFile(exchangeRight, "exchange right marker\n")
     let depfile = work / "path-mutation.rdep"
 
     var childEnv = newStringTable(modeCaseSensitive)
@@ -288,9 +301,11 @@ int main(int argc, char **argv) {
     childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
     let cap = run(snoopBin, @["run", "--depfile", depfile, "--", mutator,
       source, alias, work, alias2, alias2Name, tempPath, finalPath, final2,
-      final2Name, missing], childEnv)
+      final2Name, missing, exchangeLeft, exchangeRight], childEnv)
     checkpoint(cap.output)
     check cap.code == 0
+    check readFile(exchangeLeft) == "exchange right marker\n"
+    check readFile(exchangeRight) == "exchange left marker\n"
 
     let dep = readMonitorDepFile(depfile)
     check dep.completeness == mcComplete
@@ -301,6 +316,8 @@ int main(int argc, char **argv) {
     check hasFileWrite(dep, alias2)
     check hasFileWrite(dep, finalPath)
     check hasFileWrite(dep, final2)
+    check hasFileWrite(dep, exchangeLeft)
+    check hasFileWrite(dep, exchangeRight)
     check not dep.records.anyIt(it.kind == mrFileWrite and
       "io-mon-failed-link-alias" in it.path)
     check not dep.records.anyIt(it.kind == mrFileWrite and
