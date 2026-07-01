@@ -1275,6 +1275,10 @@ proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
       createDir(extendedPath(fragmentDir))
     # ROUND-2 R8 — capture the invocation run id for report authentication.
     runId = getEnv("REPRO_MONITOR_SESSION")
+    # ROUND-5 F — publish the run token to the fragment writer so the kill-before-
+    # flush markers are run-scoped (dropStaleRunRecords drops a stale run's markers
+    # in a reused fragment dir, so a prior killed run cannot false-downgrade this one).
+    setFragmentRunToken(runIdToken())
   # Record the constructor thread as the "main" thread. Its fragment batch is
   # flushed by the dyld process-exit destructor; worker threads (which the
   # destructor cannot reach safely) flush eagerly per record in emitRecord. Init
