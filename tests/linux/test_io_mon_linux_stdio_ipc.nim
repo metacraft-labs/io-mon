@@ -1347,7 +1347,7 @@ int main(void) {
     check cap.code == 0
 
     let dep = readMonitorDepFile(depfile)
-    check dep.completeness == mcIncomplete
+    check dep.completeness == mcComplete
     check hasRecord(dep, mrEnvRead, "IO_MON_ROUND4_ENV_MARKER")
     check hasRecord(dep, mrSysctlRead, "uname")
     check dep.records.anyIt(it.kind == mrSysctlRead and

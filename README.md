@@ -106,9 +106,10 @@ to start as an honest stub today.
   and `rename`/`renameat`/`renameat2` records the final output path for
   rename-staged writes. Linux libc-visible `getenv`, `uname`, and `sysconf`
   are recorded as observed inputs; `clock_gettime`, `gettimeofday`, and
-  `time` are recorded as time-read diagnostics; successful `getrandom` calls
-  emit non-determinism evidence and downgrade through the existing
-  `mcIncomplete` path. Known residuals: startup DSOs
+  `time` are recorded as time-read evidence; successful `getrandom` calls
+  emit non-determinism evidence. These non-file observations do not by
+  themselves make monitoring incomplete; callers decide whether their policy
+  invalidates on them. Known residuals: startup DSOs
   under excluded system/runtime prefixes and executable mappings not owned by
   the preload `mmap` lifecycle are not scanned yet; direct raw path-mutation
   syscalls, pre-existing hardlink aliases, direct raw/vDSO clock/time paths,

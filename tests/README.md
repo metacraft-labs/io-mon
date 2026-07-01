@@ -21,7 +21,7 @@ applies. The directories form the contract:
 
 A test is **portable** if it only exercises shared logic (`mergeFragments`,
 `readMonitorDepFile`, `encodeFrame`/`decodeFrame`, `MonitorRecord` construction,
-`unmonitoredSubtreeLossCount`/`nonDeterminismLossCount`/`depFileFromRecords`,
+`unmonitoredSubtreeLossCount`/`nonDeterminismObservationCount`/`depFileFromRecords`,
 capabilities/render) on **synthetic** records — no `build_shim`, no
 `DYLD_INSERT`/`LD_PRELOAD`, no `clang -o` probe, no `io-mon run` live capture, no
 macOS-only API/import. It is **platform-specific** if it builds/injects the shim

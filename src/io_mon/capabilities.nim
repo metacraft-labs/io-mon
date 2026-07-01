@@ -36,11 +36,11 @@ const
     # content (read) dependencies, so an in-place toolchain-library upgrade busts
     # a content-addressed cache instead of serving a stale result.
     mcapLibraryLoad,
-    # ROUND-2 R-D (break R10) — non-file determinism inputs. getenv / sysctlbyname /
+    # ROUND-2 R-D (break R10) — non-file input observations. getenv / sysctlbyname /
     # sysctl / uname / gethostname / gethostuuid are hooked and recorded as OBSERVED
-    # DECLARED INPUTS (mcapObservedEnv); getentropy / arc4random* / a /dev/urandom
-    # open are flagged non-deterministic (auto-downgrade) and clock_gettime /
-    # gettimeofday / time / mach_absolute_time are recorded-not-downgraded
+    # DECLARED INPUTS (mcapObservedEnv); getentropy / arc4random* are recorded as
+    # entropy evidence and clock_gettime / gettimeofday / time / mach_absolute_time
+    # are recorded as time-read evidence. Caller policy decides invalidation
     # (mcapNonDeterminism).
     mcapObservedEnv,
     mcapNonDeterminism,
@@ -108,9 +108,8 @@ const
     mcapRename,
     mcapIpcConnect,
     # M-FW-6C — Linux libc-visible getenv/uname/sysconf are recorded as
-    # observed inputs; clock_gettime/gettimeofday/time are record-only time
-    # reads; getrandom is non-determinism and downgrades through the portable
-    # mrNonDeterministic merge path. Direct raw/vDSO variants remain outside
+    # observed inputs; clock_gettime/gettimeofday/time are time-read evidence;
+    # getrandom is entropy evidence. Direct raw/vDSO variants remain outside
     # this positive capability.
     mcapObservedEnv,
     mcapNonDeterminism
@@ -429,8 +428,8 @@ proc linuxPreloadMonitorProfile*(
       "destination writes; libc-visible link/linkat and rename/renameat/" &
       "renameat2 record hardlink source/alias and final rename destinations; " &
       "libc-visible getenv/uname/sysconf are observed inputs, " &
-      "clock_gettime/gettimeofday/time are record-only time reads, and " &
-      "getrandom is non-determinism that downgrades completeness; " &
+      "clock_gettime/gettimeofday/time are time-read evidence, and " &
+      "getrandom is entropy evidence left to caller invalidation policy; " &
       "and io-mon fails closed for unsupported raw syscall numbers, " &
       "untracked or partially tracked anonymous executable mprotect, " &
       "partial-overlap mremap ownership escapes, or anonymous writable+" &
