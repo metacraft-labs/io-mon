@@ -64,6 +64,43 @@ static int repro_monitor_get_errno(void) {
 static void repro_monitor_set_errno(int value) {
   errno = value;
 }
+
+/*
+ * ROUND-5 Break B — a PURE-C mirror of "does this fd have an in-tree open record"
+ * (the Nim `fdPaths` table's membership). The mmap thunk (`repro_wrap_mmap`)
+ * consults it to keep a MAP_PRIVATE file mapping of an IN-TREE-opened fd OUT of the
+ * Nim runtime: entering a Nim proc for such a mapping re-triggers the deterministic
+ * rustc/clang dyld-TLV mmap crash (a rustc worker maps its own in-tree-opened rlibs
+ * MAP_PRIVATE from a context where the `inMmapHook` threadvar first-touch mallocs —
+ * verified: routing fd>=0 MAP_PRIVATE maps into Nim SIGSEGVs rustc 8/8). Only an
+ * OUT-OF-TREE fd (inherited across exec / passed via SCM_RIGHTS, never opened
+ * through the hooked open) is ABSENT from this table, and ONLY those private
+ * mappings enter the Nim hook to be F_GETPATH-recovered and recorded (the Break-B
+ * fix). Those are the program's own explicit `mmap()` calls in a benign context,
+ * never a libmalloc-reentrant one, so entering Nim there is crash-safe.
+ *
+ * A fixed byte array indexed by fd: mark/clear/has are lock-free plain stores/loads
+ * — no malloc, no threadvar, no lock — so they are safe to call from the mmap thunk
+ * and cheap on the open/close hot path. The Nim `updateFdPath`/`removeFdPath`/
+ * `copyFdPath` procs (the SOLE mutators of `fdPaths`) mirror every membership change
+ * here, so the table is complete for in-tree fds. An fd at/above the cap is reported
+ * PRESENT (skip) so a pathological fd count can never route a map into Nim and
+ * re-crash — the fail-safe direction is "don't enter Nim," at worst missing a
+ * Break-B capture for an absurdly high fd number.
+ */
+#define REPRO_INTREE_FD_CAP 65536
+static volatile unsigned char repro_intree_fd_table[REPRO_INTREE_FD_CAP];
+void repro_intree_fd_mark(int fd) {
+  if (fd >= 0 && fd < REPRO_INTREE_FD_CAP) repro_intree_fd_table[fd] = 1;
+}
+void repro_intree_fd_clear(int fd) {
+  if (fd >= 0 && fd < REPRO_INTREE_FD_CAP) repro_intree_fd_table[fd] = 0;
+}
+static int repro_intree_fd_has(int fd) {
+  if (fd < 0) return 0;
+  if (fd >= REPRO_INTREE_FD_CAP) return 1;
+  return repro_intree_fd_table[fd];
+}
 """.}
 
 const
@@ -109,6 +146,11 @@ const
   # private/anon mapping never reaches the backing file).
   ProtRead = 0x01.cint
   ProtWrite = 0x02.cint
+  # PROT_EXEC (<sys/mman.h>) — dyld maps a dylib's __TEXT and a JIT maps its code
+  # buffer with PROT_EXEC. A ROUND-5 Break-B file-read capture skips these: a code
+  # mapping is never a plain data input, and dependent-dylib loads are already the
+  # T3b `_dyld` add-image library-load capture's job (avoid a per-image flood).
+  ProtExec = 0x04.cint
   MapShared = 0x0001.cint
   MapAnon = 0x1000.cint
 
@@ -417,16 +459,25 @@ proc recordDirectoryEnumeration(path: cstring) {.raises: [].} =
     record.detail = "directory-open"
   emitRecord(record)
 
+# ROUND-5 Break B — the pure-C in-tree-fd mirror the mmap thunk consults (defined in
+# the top emit block). `fdPaths` membership is mirrored here from its SOLE mutators
+# below so a MAP_PRIVATE mapping of an in-tree-opened fd is decided-and-skipped in C,
+# never entering the Nim runtime (the rustc/clang mmap crash guard).
+proc reproIntreeFdMark(fd: cint) {.importc: "repro_intree_fd_mark", cdecl.}
+proc reproIntreeFdClear(fd: cint) {.importc: "repro_intree_fd_clear", cdecl.}
+
 proc updateFdPath(fd: cint; path: cstring) =
   if fd < 0 or path == nil:
     return
   acquire(fdLock)
   fdPaths[fd] = $path
   release(fdLock)
+  reproIntreeFdMark(fd)
 
 proc removeFdPath(fd: cint) =
   acquire(fdLock)
   fdPaths.del(fd)
+  reproIntreeFdClear(fd)
   # ROUND-3 S1 — drop any shm / empty-fd-classification state on close so a
   # recycled fd number never inherits a stale shm name or opaque classification.
   shmFds.del(fd)
@@ -467,6 +518,10 @@ proc copyFdPath(oldfd, newfd: cint) =
   if srcShm.len > 0:
     shmFds[newfd] = srcShm
   release(fdLock)
+  # ROUND-5 Break B — mirror the newfd's fdPaths membership into the C in-tree table
+  # (a dup of an in-tree fd is itself in-tree; a dup of an out-of-tree fd stays out).
+  if srcPath.len > 0: reproIntreeFdMark(newfd)
+  else: reproIntreeFdClear(newfd)
 
 proc addShmFd(fd: cint; name: string) =
   ## ROUND-3 S1b — remember that `fd` is backed by the POSIX shm object `name`,
@@ -1510,53 +1565,130 @@ proc recordCanonicalAtProbe(callResult: cint; dirfd: cint; path: cstring;
   recordPathProbe(callResult, cstring(p), mode,
     (if detail.len > 0: detail & " " & tag else: tag))
 
+proc recoverNamedFdFile(fd: cint; kind: FdKind; detail: string): bool
+    {.raises: [].} =
+  ## ROUND-3 S1c / ROUND-5 Break B — resolve an fd that has NO in-tree open record to
+  ## its backing NAMEABLE file (a regular file or a char/block device) via F_GETPATH,
+  ## record a content READ on the recovered canonical path, and re-point the fd→path
+  ## map so later reads take the fast path. Returns true iff a named file was
+  ## recorded. Returns false — WITHOUT any record — for a socket / pipe / directory /
+  ## unnameable object (kind not file-like) or a failed F_GETPATH; the CALLER decides
+  ## what a non-file means in its context: a read(2) of an inherited unnameable source
+  ## is an opaque IPC channel (classifyEmptyFdRead downgrades), whereas an mmap simply
+  ## has nothing to name and records nothing (an mmap is not an IPC channel — it must
+  ## NOT trigger the IPC-channel downgrade). ONE F_GETPATH-recovery recorder shared by
+  ## both paths (DRY). `kind` is passed in so the caller's single fstat is reused.
+  if kind notin {fkRegular, fkCharDevice, fkBlockDevice}:
+    return false
+  var buf: array[1024, char]
+  if ct_macos_fd_real_path(fd, addr buf[0], csize_t(buf.len)) == 0:
+    return false
+  let resolved = $cast[cstring](addr buf[0])
+  if resolved.len == 0:
+    return false
+  updateFdPath(fd, cstring(resolved))   # future reads/writes take the fast path
+  var record = baseRecord(mrFileRead, moFileRead)
+  record.path = resolved
+  record.result = 0
+  record.flags = uint32(fd)
+  record.detail = detail
+  emitRecord(record)
+  true
+
 proc recordMmap(callResult: pointer; prot, flags, fd: cint) {.raises: [].} =
-  ## ROUND-2 R9 — classify an `mmap` of a FILE-backed fd. A MAP_SHARED|PROT_WRITE
-  ## mapping changes the file's CONTENT with NO write(2)/pwrite(2) syscall (ld64
-  ## writes its output executable this way; r2_mmap probeC), so the open alone does
-  ## not convey the write → the output is INVISIBLE to a write-only-via-syscall
-  ## monitor. We record an output WRITE on the mapped fd's path at mmap time
-  ## (write-INTENT — conservative: a mapped-writable-but-never-written file is
-  ## over-recorded as an output, the SAFE direction, never a missed output).
+  ## Classify an `mmap` of a FILE-backed fd (fd >= 0). An mmap can carry THREE facts
+  ## no other syscall does, all handled here:
   ##
-  ## A read-only / private / anonymous mapping is NOT recorded: the round-1 finding
-  ## showed mmap-AFTER-open is already covered by the captured open (the file is in
-  ## the input set), so recording a read mapping would be a gratuitous double-record
-  ## (and an O_RDWR-then-PROT_READ-mmap input is already captured as an input by the
-  ## R3 open classification). Only the MAP_SHARED|PROT_WRITE content write is a
-  ## genuine fact the open does not carry.
+  ##  * ROUND-5 Break B — a mapping READS the file's bytes straight through the page
+  ##    cache with NO read(2). When the fd was opened IN-TREE the open hook already
+  ##    recorded the dependency, but an fd opened OUT-OF-TREE (inherited across exec
+  ##    or passed via SCM_RIGHTS) and consumed ONLY via mmap left the dependency
+  ##    INVISIBLE → a false `mcComplete` with the input absent (research/adversarial-
+  ##    2026-07-round5/ipc F3_client/F2_client). We recover the backing path via
+  ##    F_GETPATH (`classifyEmptyFdRead`, the SAME S1c machinery the read hook uses)
+  ##    and record a content READ. Anti-flood: PROT_EXEC maps (dyld/JIT code) are
+  ##    skipped — a code map is never a plain data input and dependent-dylib loads
+  ##    are already the T3b library-load capture's job; and an IN-TREE fd
+  ##    (`pathForFd` non-empty, e.g. G_intree_mmap) is skipped because its open
+  ##    already covers the read — no double-record.
+  ##  * ROUND-2 R9 — a MAP_SHARED|PROT_WRITE mapping mutates the file's CONTENT with
+  ##    NO write(2)/pwrite(2) (ld64 writes its output executable this way; r2_mmap
+  ##    probeC), so the open alone does not convey the write.
+  ##  * ROUND-5 Break G (DOCUMENTED RESIDUAL, not fixed here) — a MAP_SHARED mapping
+  ##    made read-only at mmap time can be turned writable LATER via
+  ##    `mprotect(PROT_WRITE)` and mutated with no write(2) and no PROT_WRITE-at-mmap
+  ##    (research/.../round5/machinery/mprotect_escalate). `mprotect` is UNHOOKED — it
+  ##    is called from inside libmalloc (guard pages) and dyld, so a Nim hook on it
+  ##    carries the SAME dyld-TLV crash hazard as mmap (docs/shim-build-policy.md). We
+  ##    do NOT over-record read-only MAP_SHARED as a write: that would misclassify a
+  ##    genuine INPUT as an output (an O_RDWR fd mmap'd MAP_SHARED|PROT_READ and only
+  ##    read — SQLite db / lockfile — is the round-1 R3 bug, tests/.../round2_rb
+  ##    probeA). So only a PROT_WRITE-at-mmap MAP_SHARED mapping is recorded as a
+  ##    write. The mprotect-escalation is a deliberate-adversary residual (a normal
+  ##    build never escalates a read map to writable then mutates it); it is SAFE in
+  ##    the cardinal sense — it can only misclassify an OUTPUT as an INPUT (a possibly
+  ##    stale output), never miss an INPUT (a false cache hit). Closing it needs a
+  ##    C-gated mprotect hook or the EndpointSecurity backend.
+  ##
+  ## Anonymous / fd-less mappings never reach here: the C thunk `repro_wrap_mmap`
+  ## forwards every `fd < 0` mapping via the raw syscall WITHOUT entering Nim — the
+  ## crash guard (libmalloc issues only anonymous maps; entering Nim there touches a
+  ## dyld TLV that re-enters the allocator → heap corruption). See that thunk.
   if callResult == cast[pointer](-1) or fd < 0:   # MAP_FAILED or no backing fd
     return
   if (flags and MapAnon) != 0:                    # anonymous: no file backing
     return
-  if (flags and MapShared) == 0:                  # private: writes don't hit disk
-    return
-  # ROUND-3 S1b — a read-only MAP_SHARED mapping of an shm-backed fd IS a content
-  # read (the consumer reads the producer's bytes via a plain memory load, no
-  # read(2)). For a regular FILE a read mapping is already covered by the open, but
-  # an shm object is NOT a file the open hook saw, so without this the consumed
-  # content is invisible (research/.../r3_channel/probeC_shm_consumer.c). Record it
-  # as a content read on the shm name; the shm_open already emitted the out-of-tree
-  # provenance signal that the merge downgrades on.
-  if (prot and ProtWrite) == 0:                   # read-only mapping
-    let shm = shmNameForFd(fd)
-    if shm.len > 0:
+  # ROUND-3 S1b — an shm object is NOT a regular file the open hook saw. A read-only
+  # MAP_SHARED mapping of one IS a content read (the consumer reads the producer's
+  # bytes via a plain memory load, no read(2) — research/.../r3_channel/
+  # probeC_shm_consumer.c); record it on the shm name (the shm_open already emitted
+  # the out-of-tree provenance the merge downgrades on). A writable shm mapping is
+  # the PRODUCER side and carries no file dependency. Either way an shm fd is fully
+  # handled here and is never treated as a regular file below.
+  let shm = shmNameForFd(fd)
+  if shm.len > 0:
+    if (prot and ProtWrite) == 0:
       var rd = baseRecord(mrFileRead, moFileRead)
       rd.path = "shm:" & shm
       rd.result = 0
       rd.flags = uint32(fd)
       rd.detail = "shm-mmap MAP_SHARED|PROT_READ"
       emitRecord(rd)
-    return                                        # read-only file: open covers it
-  let p = pathForFd(fd)
-  if p.len == 0:
     return
-  var record = baseRecord(mrFileWrite, moFileWrite)
-  record.path = p
-  record.result = 0
-  record.flags = uint32(fd)
-  record.detail = "mmap-write MAP_SHARED|PROT_WRITE"
-  emitRecord(record)
+  # ROUND-5 Break B — capture the file content a mapping reads. Skip PROT_EXEC code
+  # maps; an IN-TREE fd is already covered by its open, so recover + record ONLY the
+  # OUT-OF-TREE fd (pathForFd empty). recoverNamedFdFile F_GETPATH-resolves a NAMED
+  # regular/device fd, emits the read, AND re-points fdPaths — so the Break-G
+  # write-intent below (and any later read(2)) sees the resolved path on the fast
+  # path. Unlike classifyEmptyFdRead it does NOT downgrade a socket/pipe fd: an mmap
+  # of an unnameable object simply has nothing to name (an mmap is not an IPC
+  # channel), so it records nothing rather than false-flagging an opaque channel.
+  if (prot and ProtExec) == 0 and pathForFd(fd).len == 0:
+    var mdev, mino: uint64
+    var mkind: FdKind
+    if ct_macos_fd_dev_ino_kind(fd, addr mdev, addr mino, addr mkind):
+      discard recoverNamedFdFile(fd, mkind, "mmap-inherited-fd")
+  # ROUND-2 R9 — a MAP_SHARED|PROT_WRITE file mapping mutates the file's CONTENT with
+  # NO write(2) (ld64 writes its output executable this way). Record an output WRITE.
+  #
+  # Break G (mprotect-escalation) is DELIBERATELY NOT over-recorded here: recording a
+  # read-only MAP_SHARED mapping as a write breaks the R3 input classification — an
+  # O_RDWR fd mmap'd MAP_SHARED|PROT_READ and only READ (SQLite db, lockfile) would be
+  # mis-recorded as an OUTPUT (the round-1 bug, tests/.../round2_rb probeA). The write
+  # only becomes real if `mprotect(PROT_WRITE)` actually escalates it, and mprotect is
+  # unhooked (same dyld-TLV crash hazard as mmap — docs/shim-build-policy.md). So the
+  # mprotect-escalation path is a documented low-severity residual (deliberate
+  # adversary only; a normal build never mprotects a MAP_SHARED read map to writable
+  # then mutates it), NOT an over-record that would misclassify real inputs.
+  if (flags and MapShared) != 0 and (prot and ProtWrite) != 0:
+    let p = pathForFd(fd)
+    if p.len > 0:
+      var record = baseRecord(mrFileWrite, moFileWrite)
+      record.path = p
+      record.result = 0
+      record.flags = uint32(fd)
+      record.detail = "mmap-write MAP_SHARED|PROT_WRITE"
+      emitRecord(record)
 
 proc recordSetexecExec(attrp: pointer; path: cstring) {.raises: [].} =
   ## If a posix_spawn(p) sets POSIX_SPAWN_SETEXEC it REPLACES the calling
@@ -1706,20 +1838,11 @@ proc classifyEmptyFdRead(fd: cint) {.raises: [].} =
     return
   case kind
   of fkRegular, fkCharDevice, fkBlockDevice:
-    var buf: array[1024, char]
-    if ct_macos_fd_real_path(fd, addr buf[0], csize_t(buf.len)) != 0:
-      let resolved = $cast[cstring](addr buf[0])
-      if resolved.len > 0:
-        updateFdPath(fd, cstring(resolved))   # future reads take the fast path
-        var record = baseRecord(mrFileRead, moFileRead)
-        record.path = resolved
-        record.result = 0
-        record.flags = uint32(fd)
-        record.detail = "inherited-fd"
-        emitRecord(record)
-        return
-    # Unresolvable regular/device fd: flag once (do not re-stat every read).
-    markEmptyFdClassified(fd)
+    # Recover the backing path via F_GETPATH + record a content read (shared with
+    # the Break-B mmap path — recoverNamedFdFile is the single F_GETPATH-recover
+    # recorder). If it cannot be named, flag once (do not re-stat every read).
+    if not recoverNamedFdFile(fd, kind, "inherited-fd"):
+      markEmptyFdClassified(fd)
   of fkSocket, fkFifo, fkOther:
     # An inherited/dup'd socket or pipe whose source is not a named file. A named
     # FIFO opened in-tree goes through the open hook (recordFifoChannel) with its
@@ -2417,16 +2540,16 @@ proc repro_hook_mmap*(adr: pointer; length: csize_t; prot, flags, fd: cint;
   ## records exactly once and the inner allocations just map. The global `disabled`
   ## guard is NOT reused for this because emitRecord bails when disabled>0 (it would
   ## suppress the very record we want); `inMmapHook` gates ONLY the re-entry.
-  # Only MAP_SHARED-with-a-real-fd mappings reach this Nim hook — the C thunk
-  # `repro_wrap_mmap` forwards every anonymous/private/fd-less mapping (incl. every
-  # libmalloc arena-grow mmap) via the raw syscall WITHOUT entering Nim. That gate is
+  # Only FILE-backed (fd >= 0) mappings reach this Nim hook — the C thunk
+  # `repro_wrap_mmap` forwards every anonymous/fd-less mapping (incl. every libmalloc
+  # arena-grow mmap) via the raw syscall WITHOUT entering Nim. That gate is
   # load-bearing: touching the `inMmapHook` {.threadvar.} below from inside libmalloc
   # (a macOS dyld-TLV first-touch mallocs) re-enters the allocator under its own lock
-  # and corrupts the heap → SIGSEGV (see repro_wrap_mmap). MAP_SHARED-with-fd mappings
-  # are never issued from within libmalloc, so this hook — and its threadvar — only
-  # runs in a re-entrancy-safe context. `inMmapHook` still guards the recording path's
-  # own allocations (recordMmap → baseRecord/emitRecord mmap → this hook) from
-  # recursion.
+  # and corrupts the heap → SIGSEGV (see repro_wrap_mmap). libmalloc issues ONLY
+  # anonymous (fd < 0) mappings, so a fd >= 0 mapping is never issued from within
+  # libmalloc and this hook — and its threadvar — only runs in a re-entrancy-safe
+  # context. `inMmapHook` still guards the recording path's own allocations
+  # (recordMmap → baseRecord/emitRecord mmap → this hook) from recursion.
   if not initialized or disabled > 0 or inMmapHook > 0:
     return ct_macos_real_mmap(adr, length, prot, flags, fd, offset)
   inc inMmapHook
@@ -4379,16 +4502,38 @@ static void *repro_wrap_mmap(void *addr, size_t len, int prot, int flags,
    * light programs and the read/write/open thunks — never called from inside malloc
    * — do not.
    *
-   * Decide from the FLAGS ALONE — pure C, no threadvar, no allocation — whether this
-   * mapping could EVER be recorded. Only a MAP_SHARED mapping with a real fd can
-   * carry a recordable fact (a MAP_SHARED|PROT_WRITE file content-write, or a
-   * MAP_SHARED shm read — see recordMmap). Everything else (every anonymous
-   * allocator map, every private file map, every fd-less map) forwards via the raw
-   * inline-asm syscall — the same threadvar-free path the pre-constructor fast path
-   * takes. libmalloc NEVER issues a MAP_SHARED-with-fd mapping, so the Nim hook (and
-   * its threadvar) only ever runs OUTSIDE a libmalloc-reentrant context, and ALL
-   * recording behaviour is preserved. */
-  if (!repro_monitor_runtime_ready || (flags & MAP_SHARED) == 0 || fd < 0) {
+   * Decide in PURE C — no threadvar, no allocation, no Nim — whether this mapping
+   * must enter the Nim hook, keeping every crash-hazardous mapping out of the Nim
+   * runtime. Three exclusions, each empirically load-bearing:
+   *
+   *   1. fd < 0 (ANONYMOUS). libmalloc grows its arena via an anonymous mmap WHILE
+   *      HOLDING its arena lock; entering Nim there touches the `inMmapHook` dyld
+   *      TLV whose first per-thread access mallocs → re-enters libmalloc under its
+   *      own lock → heap corruption → SIGSEGV. libmalloc issues ONLY anonymous maps,
+   *      so "never enter Nim for fd < 0" keeps the allocator-reentrant path in C.
+   *
+   *   2. A MAP_PRIVATE file map of an IN-TREE-opened fd (repro_intree_fd_has). This
+   *      is the SAME crash by a second route: a rustc worker maps its own
+   *      in-tree-opened rlibs MAP_PRIVATE from a context where the `inMmapHook` TLV
+   *      first-touch mallocs unsafely (verified: routing fd>=0 MAP_PRIVATE maps into
+   *      Nim SIGSEGVs rustc 8/8). The open already recorded the dependency, so there
+   *      is nothing to gain by entering Nim — we skip in C. A PROT_EXEC map (dyld
+   *      __TEXT / JIT code) is skipped for the same safety reason and because a code
+   *      map is never a plain data input (dependent dylibs are the T3b capture).
+   *
+   * What REMAINS and enters Nim: (a) ANY MAP_SHARED file mapping — the proven-safe
+   * ROUND-2 R9 path (a program's own MAP_SHARED content-write / mprotect-escalatable
+   * ROUND-5 Break-G intent / MAP_SHARED shm read); rustc issues none from a hostile
+   * context. (b) A MAP_PRIVATE, non-PROT_EXEC mapping of an OUT-OF-TREE fd (inherited
+   * / SCM_RIGHTS-passed, absent from the in-tree table) — the ROUND-5 Break-B input
+   * that no open ever saw. Both are the program's own explicit mmap() calls in a
+   * benign, non-allocator-reentrant context, so entering Nim there is crash-safe. */
+  if (!repro_monitor_runtime_ready || fd < 0) {
+    return repro_macos_real_mmap_syscall(addr, len, prot, flags, fd,
+                                         (long long)offset);
+  }
+  if ((flags & MAP_SHARED) == 0 &&
+      ((prot & PROT_EXEC) != 0 || repro_intree_fd_has(fd))) {
     return repro_macos_real_mmap_syscall(addr, len, prot, flags, fd,
                                          (long long)offset);
   }
