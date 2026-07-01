@@ -616,6 +616,67 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
     check sawCurrent
     removeDir(work)
 
+  test "duplicate-run stale read is not accepted as a current dependency":
+    # Old behavior accepted the first run token, so a stale record stamped
+    # "run=CURRENT run=OLD" was folded into CURRENT and could publish mcComplete
+    # with /old/stale.h in the dependency set. Duplicate identity tokens are now
+    # rejected as ambiguous evidence and force a conservative incomplete verdict.
+    let work = getTempDir() / ("io-mon-s3c-dup-read-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let frag = work / "frags"
+    createDir(frag)
+    appendFragmentRecord(frag, startAt(502'u64, "111", "OLD"))
+    var staleRead = readRec(502'u64, "/old/stale.h")
+    staleRead.detail = "run=CURRENT run=OLD"
+    appendFragmentRecord(frag, staleRead)
+    closeFragmentSlot()
+    appendFragmentRecord(frag, startAt(502'u64, "222", "CURRENT"))
+    var currentRead = readRec(502'u64, "/current/header.h")
+    currentRead.detail = "run=CURRENT"
+    appendFragmentRecord(frag, currentRead)
+    closeFragmentSlot()
+    let dep = mergeFragments(frag, work / "current.rdep",
+      currentRunId = "CURRENT")
+    check dep.completeness == mcIncomplete
+    var sawCurrent = false
+    var sawDuplicateLoss = false
+    for r in dep.records:
+      check r.path != "/old/stale.h"
+      if r.path == "/current/header.h":
+        sawCurrent = true
+      if r.kind == mrEventLoss and "duplicate identity token" in r.detail:
+        sawDuplicateLoss = true
+    check sawCurrent
+    check sawDuplicateLoss
+    removeDir(work)
+
+  test "duplicate-run stale process-start does not mask out-of-tree peer":
+    # Old behavior treated the stale process-start as CURRENT because the first
+    # run token matched, making a recycled daemon pid look in-tree and yielding a
+    # false mcComplete. The duplicate-run start is now untrusted and dropped.
+    let work = getTempDir() / ("io-mon-s3c-dup-start-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let frag = work / "frags"
+    createDir(frag)
+    var staleStart = startAt(900'u64, "111")
+    staleStart.detail.add " run=CURRENT run=OLD"
+    appendFragmentRecord(frag, staleStart)
+    closeFragmentSlot()
+    appendFragmentRecord(frag, startAt(503'u64, "222", "CURRENT"))
+    appendFragmentRecord(frag, ipcPeerAt(503'u64, 900'u64, "",
+      "/tmp/d.sock", "CURRENT"))
+    closeFragmentSlot()
+    let dep = mergeFragments(frag, work / "current.rdep",
+      currentRunId = "CURRENT")
+    check dep.completeness == mcIncomplete
+    var sawDuplicateLoss = false
+    for r in dep.records:
+      check r.path != "/old/stale.h"
+      if r.kind == mrEventLoss and "duplicate identity token" in r.detail:
+        sawDuplicateLoss = true
+    check sawDuplicateLoss
+    removeDir(work)
+
   test "without a run id (legacy fresh-dir callers) nothing is filtered":
     # Empty currentRunId + no env ⇒ legacy behaviour: the merge folds every fragment
     # exactly as before, so a single-run dir is unaffected.

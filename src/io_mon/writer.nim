@@ -738,6 +738,35 @@ proc detailToken*(detail, key: string): string =
       return tok[needle.len .. ^1]
   ""
 
+proc detailTokenDuplicate(detail, key: string): bool =
+  ## True when `detail` carries more than one `key=value` token. Identity tokens
+  ## with duplicates are ambiguous attacker-controlled evidence: callers that use
+  ## them for trust decisions must fail closed instead of accepting the first one.
+  let needle = key & "="
+  var seen = false
+  for tok in detail.splitWhitespace():
+    if tok.len > needle.len and tok.startsWith(needle):
+      if seen:
+        return true
+      seen = true
+  false
+
+proc trustedDetailToken(detail, key: string): string =
+  ## Extract a detail token only when it is unique. Duplicate identity tokens are
+  ## not equivalent to "missing": most trust checks must avoid falling back to a
+  ## weaker bare-pid match when this returns "" because a duplicate was present.
+  if detailTokenDuplicate(detail, key):
+    ""
+  else:
+    detailToken(detail, key)
+
+proc hasDuplicateIdentityToken(detail: string): bool =
+  for key in [RunIdToken, StartTimeToken, ChildStartTimeToken,
+      PeerStartTimeToken, NonceToken]:
+    if detailTokenDuplicate(detail, key):
+      return true
+  false
+
 type
   ProcIdentity = tuple[pid: uint64, startTime: string]
     ## ROUND-2 R7 — a process is identified by (osPid, kernel-start-time), NOT the
@@ -755,8 +784,10 @@ proc processStartIdentities(records: openArray[MonitorRecord]):
   result.pids = initHashSet[uint64]()
   for r in records:
     if r.kind == mrProcessStart:
+      if hasDuplicateIdentityToken(r.detail):
+        continue
       result.pids.incl r.osPid
-      result.idents.incl (r.osPid, detailToken(r.detail, StartTimeToken))
+      result.idents.incl (r.osPid, trustedDetailToken(r.detail, StartTimeToken))
 
 proc childIsMonitored(childPid: uint64; childStart: string;
     idents: HashSet[ProcIdentity]; pids: HashSet[uint64]): bool =
@@ -848,9 +879,11 @@ proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord];
   for r in records:
     if r.kind == mrProcessSpawn and r.childOsPid != 0 and
         r.childOsPid != r.osPid:
-      let childStart = detailToken(r.detail, ChildStartTimeToken)
+      let duplicateChildStart = detailTokenDuplicate(r.detail, ChildStartTimeToken)
+      let childStart = trustedDetailToken(r.detail, ChildStartTimeToken)
       let ident = (r.childOsPid, childStart)
-      if not childIsMonitored(r.childOsPid, childStart, startIdents, startPids) and
+      if (duplicateChildStart or
+          not childIsMonitored(r.childOsPid, childStart, startIdents, startPids)) and
           ident notin flaggedChildren:
         flaggedChildren.incl ident
         inc result
@@ -868,12 +901,13 @@ proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord];
   for r in records:
     if r.kind == mrIpcConnect:
       let peer = r.childOsPid
-      let peerStart = detailToken(r.detail, PeerStartTimeToken)
+      let duplicatePeerStart = detailTokenDuplicate(r.detail, PeerStartTimeToken)
+      let peerStart = trustedDetailToken(r.detail, PeerStartTimeToken)
       # A peer is INSIDE the tree iff its (pid, start-time) identity matches a
       # monitored process-start (R7 — a recycled peer pid with a different start
       # time is NOT in-tree), OR a trusted daemon accounted for its reads. Either
       # way: no downgrade (the cardinal-sin guard for legitimate intra-tree IPC).
-      if peer != 0 and
+      if peer != 0 and not duplicatePeerStart and
           (childIsMonitored(peer, peerStart, startIdents, startPids) or
            peer in trustedPeerPids):
         continue
@@ -1059,17 +1093,17 @@ proc breakawayAuthContext*(records: openArray[MonitorRecord]):
     case r.kind
     of mrProcessStart:
       if result.runId.len == 0:
-        let run = detailToken(r.detail, RunIdToken)
+        let run = trustedDetailToken(r.detail, RunIdToken)
         if run.len > 0:
           result.runId = run
     of mrIpcConnect:
       if r.childOsPid != 0:
         result.connectedPeers.incl($r.osPid & ":" & $r.childOsPid)
-      let nonce = detailToken(r.detail, NonceToken)
+      let nonce = trustedDetailToken(r.detail, NonceToken)
       if nonce.len > 0:
         result.validNonces.incl nonce
       if result.runId.len == 0:
-        let run = detailToken(r.detail, RunIdToken)
+        let run = trustedDetailToken(r.detail, RunIdToken)
         if run.len > 0:
           result.runId = run
     else: discard
@@ -1274,7 +1308,9 @@ proc fragmentRunIds(records: openArray[MonitorRecord]): Table[uint64, HashSet[st
   result = initTable[uint64, HashSet[string]]()
   for r in records:
     if r.kind == mrProcessStart:
-      let run = detailToken(r.detail, RunIdToken)
+      if hasDuplicateIdentityToken(r.detail):
+        continue
+      let run = trustedDetailToken(r.detail, RunIdToken)
       if run.len == 0:
         continue
       if not result.hasKey(r.osPid):
@@ -1301,14 +1337,31 @@ proc dropStaleRunRecords(records: seq[MonitorRecord];
   ##
   ## Records with no determinable run at all (no run-stamped process-start for
   ## their pid, e.g. legacy/no-run fresh-dir callers) are KEPT, preserving the
-  ## existing no-run behavior.
+  ## existing no-run behavior. Duplicate identity tokens are never kept: accepting
+  ## the first value would let stale records masquerade as current-run evidence.
   if currentRunId.len == 0:
-    return records
+    result = @[]
+    var duplicateIdentityLossPids = initHashSet[uint64]()
+    for r in records:
+      if hasDuplicateIdentityToken(r.detail):
+        duplicateIdentityLossPids.incl r.osPid
+        continue
+      result.add r
+    for pid in duplicateIdentityLossPids:
+      result.add MonitorRecord(kind: mrEventLoss,
+        observationKind: moEventLoss,
+        osPid: pid,
+        detail: "duplicate identity token in fragment record")
+    return
   let runsByPid = fragmentRunIds(records)
   var ambiguousLossPids = initHashSet[uint64]()
+  var duplicateIdentityLossPids = initHashSet[uint64]()
   result = @[]
   for r in records:
-    let recordRun = detailToken(r.detail, RunIdToken)
+    if hasDuplicateIdentityToken(r.detail):
+      duplicateIdentityLossPids.incl r.osPid
+      continue
+    let recordRun = trustedDetailToken(r.detail, RunIdToken)
     if recordRun.len > 0:
       if recordRun != currentRunId:
         continue
@@ -1327,6 +1380,12 @@ proc dropStaleRunRecords(records: seq[MonitorRecord];
       observationKind: moEventLoss,
       osPid: pid,
       detail: "ambiguous unstamped fragment record for reused pid in run " &
+        currentRunId)
+  for pid in duplicateIdentityLossPids:
+    result.add MonitorRecord(kind: mrEventLoss,
+      observationKind: moEventLoss,
+      osPid: pid,
+      detail: "duplicate identity token in fragment record for run " &
         currentRunId)
 
 proc mergeFragments*(fragmentDir, outputPath: string;
