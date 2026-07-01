@@ -260,6 +260,68 @@ int main(int argc, char **argv) {
     check dep.records.anyIt(it.kind == mrFileRead and marker in it.path and
       detailToken(it.detail, "run").len > 0)
 
+  test "inherited fd 3 deleted regular file does not become stable proc fd path":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let reader = buildC(work, "inherited_fd3_deleted_reader", """
+#include <unistd.h>
+int main(void) {
+  char buf[128];
+  ssize_t n = read(3, buf, sizeof(buf));
+  return n > 0 ? 0 : 2;
+}
+""")
+    let launcher = buildC(work, "inherited_fd3_deleted_launcher", """
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  if (argc < 4) return 2;
+  int fd = open(argv[1], O_RDONLY);
+  if (fd < 0) return 3;
+  if (fd != 3) {
+    if (dup2(fd, 3) != 3) return 4;
+    close(fd);
+  }
+  if (unlink(argv[1]) != 0) return 5;
+  execv(argv[2], &argv[2]);
+  perror("execv");
+  return 127;
+}
+""")
+    let marker = work / "inherited-fd3-deleted-marker.txt"
+    writeFile(marker, "deleted inherited fd marker\n")
+    let depfile = work / "inherited-fd3-deleted-file.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(launcher, @[marker, snoopBin, "run", "--depfile", depfile,
+      "--", reader], childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    let deletedFileReads = dep.records.filterIt(it.kind == mrFileRead and
+      it.path.endsWith(" (deleted)"))
+    check deletedFileReads.len == 0
+    check dep.completeness == mcIncomplete or
+      dep.records.anyIt(it.kind == mrExternalContent)
+    if dep.completeness == mcIncomplete:
+      check dep.records.anyIt(it.kind == mrEventLoss and
+        "linux inherited regular fd read unnamed key=" in it.detail)
+
   test "Linux link and rename mutations preserve source and final-path evidence":
     let snoopBin = work / "io-mon"
     if not fileExists(snoopBin):

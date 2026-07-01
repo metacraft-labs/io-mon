@@ -415,6 +415,9 @@ proc recordExternalContent(chan, role, path: string; fd: cint) {.raises: [].} =
   record.detail = "chan=" & chan & " role=" & role
   emitRecord(record)
 
+proc isLinuxDeletedProcFdTarget(path: string): bool {.raises: [].} =
+  path.endsWith(" (deleted)")
+
 proc classifyEmptyFdRead(fd: cint): bool {.raises: [].} =
   if fd < 0 or emptyFdAlreadyClassified(fd):
     return false
@@ -429,7 +432,8 @@ proc classifyEmptyFdRead(fd: cint): bool {.raises: [].} =
     var buf: array[4096, char]
     if c_fd_proc_path(fd, addr buf[0], csize_t(buf.len)) != 0:
       let resolved = $cast[cstring](addr buf[0])
-      if resolved.len > 0 and not resolved.startsWith("anon_inode:"):
+      if resolved.len > 0 and not resolved.startsWith("anon_inode:") and
+          not isLinuxDeletedProcFdTarget(resolved):
         updateFdPath(fd, cstring(resolved))
         var record = baseRecord(mrFileRead, moFileRead)
         record.path = resolved
