@@ -257,6 +257,8 @@ int main(int argc, char **argv) {
     check dep.completeness == mcComplete
     check hasFileRead(dep, marker)
     check not dep.records.anyIt(it.kind == mrFileRead and it.path.len == 0)
+    check dep.records.anyIt(it.kind == mrFileRead and marker in it.path and
+      detailToken(it.detail, "run").len > 0)
 
   test "Linux link and rename mutations preserve source and final-path evidence":
     let snoopBin = work / "io-mon"

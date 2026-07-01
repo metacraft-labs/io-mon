@@ -1264,23 +1264,22 @@ proc loadBreakawayReports*(reportDir: string; monitored: HashSet[uint64];
         observationKind: moFileRead, osPid: clientPid, path: rp,
         detail: "breakaway-daemon-report daemon=" & $daemonPid)
 
-proc fragmentRunIds(records: openArray[MonitorRecord]): Table[uint64, string] =
+proc fragmentRunIds(records: openArray[MonitorRecord]): Table[uint64, HashSet[string]] =
   ## ROUND-3 S3c — map each monitored osPid to the run id its `mrProcessStart`
   ## carries (the `run=` token the shim stamps from REPRO_MONITOR_SESSION). Used by
   ## the warm-restart stale-fragment guard to recognise records left in a REUSED
-  ## fragment dir by a PRIOR invocation. A pid that started under the CURRENT run
-  ## wins over a stale start for the same (recycled) pid, so a legitimately-current
-  ## process is never dropped.
-  result = initTable[uint64, string]()
+  ## fragment dir by a PRIOR invocation. A pid can appear under more than one run
+  ## when the OS recycles it and a caller reuses a fragment dir, so keep every run
+  ## id instead of collapsing pid ownership to one value.
+  result = initTable[uint64, HashSet[string]]()
   for r in records:
     if r.kind == mrProcessStart:
       let run = detailToken(r.detail, RunIdToken)
       if run.len == 0:
         continue
-      # Once a pid is seen with the current run we keep that; otherwise record the
-      # (possibly stale) run. The caller resolves "current beats stale".
       if not result.hasKey(r.osPid):
-        result[r.osPid] = run
+        result[r.osPid] = initHashSet[string]()
+      result[r.osPid].incl run
 
 proc dropStaleRunRecords(records: seq[MonitorRecord];
     currentRunId: string): seq[MonitorRecord] =
@@ -1293,29 +1292,42 @@ proc dropStaleRunRecords(records: seq[MonitorRecord];
   ## a stale run-1 process-start makes a run-2 out-of-tree breakaway peer look
   ## in-tree ⇒ a FALSE mcComplete, plus the stale reads pollute the depfile). We
   ## namespace by the invocation run id (approach (b), non-destructive and
-  ## re-merge-idempotent): a record whose owning process started under a DIFFERENT
-  ## run — and NOT also under the current run (pid recycling) — is dropped. Records
-  ## with no determinable run (no run-stamped process-start for their pid, e.g. a
-  ## worker thread of a process whose start carried no run id) are KEPT, so a
-  ## fresh-dir merge with no run ids behaves exactly as before. The CLI is unaffected
-  ## (it uses a fresh temp dir per run); this protects library callers that reuse a
-  ## dir, per the contract documented on `mergeFragments`.
+  ## re-merge-idempotent). Records that carry their own run token are kept only
+  ## when it matches `currentRunId`. Records without a per-record token are scoped
+  ## through their pid's run-stamped process-starts. If a reused dir contains the
+  ## same pid under both OLD and CURRENT runs, an unstamped record for that pid is
+  ## ambiguous: it might be stale, so we drop it and inject event-loss to fail
+  ## closed rather than fold a prior run's file reads into a false mcComplete.
+  ##
+  ## Records with no determinable run at all (no run-stamped process-start for
+  ## their pid, e.g. legacy/no-run fresh-dir callers) are KEPT, preserving the
+  ## existing no-run behavior.
   if currentRunId.len == 0:
     return records
-  let runOf = fragmentRunIds(records)
-  # A pid is CURRENT if any of its process-starts carries the current run id.
-  var currentPids = initHashSet[uint64]()
-  for r in records:
-    if r.kind == mrProcessStart and
-        detailToken(r.detail, RunIdToken) == currentRunId:
-      currentPids.incl r.osPid
+  let runsByPid = fragmentRunIds(records)
+  var ambiguousLossPids = initHashSet[uint64]()
   result = @[]
   for r in records:
-    let owner = runOf.getOrDefault(r.osPid, "")
-    if r.osPid != 0 and owner.len > 0 and owner != currentRunId and
-        r.osPid notin currentPids:
-      continue # stale prior-run record in a reused dir — do not fold
+    let recordRun = detailToken(r.detail, RunIdToken)
+    if recordRun.len > 0:
+      if recordRun != currentRunId:
+        continue
+      result.add r
+      continue
+    if r.osPid != 0 and runsByPid.hasKey(r.osPid):
+      let pidRuns = runsByPid[r.osPid]
+      if currentRunId notin pidRuns:
+        continue # stale prior-run record in a reused dir — do not fold
+      if pidRuns.len > 1:
+        ambiguousLossPids.incl r.osPid
+        continue
     result.add r
+  for pid in ambiguousLossPids:
+    result.add MonitorRecord(kind: mrEventLoss,
+      observationKind: moEventLoss,
+      osPid: pid,
+      detail: "ambiguous unstamped fragment record for reused pid in run " &
+        currentRunId)
 
 proc mergeFragments*(fragmentDir, outputPath: string;
     breakawayReportDir = ""; expectedRootPid: uint64 = 0;
