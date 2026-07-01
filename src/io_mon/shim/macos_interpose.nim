@@ -101,6 +101,88 @@ static int repro_intree_fd_has(int fd) {
   if (fd >= REPRO_INTREE_FD_CAP) return 1;
   return repro_intree_fd_table[fd];
 }
+
+/*
+ * ROUND-7 M1 — PURE-C mprotect/munmap range gate for file-backed MAP_SHARED
+ * mappings. The common mprotect path is crash-sensitive for the same reason as
+ * mmap: libmalloc/dyld use it internally, and entering Nim there can first-touch a
+ * dyld TLV and re-enter malloc. So the mprotect thunk forwards first, then checks
+ * this fixed table with plain integer loads only. It calls Nim only when a
+ * successful PROT_WRITE protection range intersects a tracked MAP_SHARED file map.
+ *
+ * The table intentionally stores only address ranges, not paths. Nim owns the
+ * stable-path table and emits records after the C gate proves the call is relevant.
+ * If the table is full we fail closed (no C entry, no later mprotect attribution)
+ * rather than risk false stable write evidence.
+ */
+#define REPRO_SHARED_MMAP_CAP 4096
+typedef struct {
+  uintptr_t start;
+  uintptr_t end;
+} repro_shared_mmap_range;
+static volatile repro_shared_mmap_range repro_shared_mmap_table[REPRO_SHARED_MMAP_CAP];
+
+static int repro_range_valid(uintptr_t start, uintptr_t end) {
+  return start != 0 && end > start;
+}
+
+static int repro_range_intersects(uintptr_t a0, uintptr_t a1,
+                                  uintptr_t b0, uintptr_t b1) {
+  return repro_range_valid(a0, a1) && repro_range_valid(b0, b1) &&
+         a0 < b1 && b0 < a1;
+}
+
+static int repro_range_from_addr_len(void *addr, size_t len,
+                                     uintptr_t *start, uintptr_t *end) {
+  uintptr_t s = (uintptr_t)addr;
+  uintptr_t e = s + (uintptr_t)len;
+  if (len == 0 || e <= s) return 0;
+  *start = s;
+  *end = e;
+  return 1;
+}
+
+int repro_shared_mmap_add(void *addr, size_t len) {
+  uintptr_t start, end;
+  if (!repro_range_from_addr_len(addr, len, &start, &end)) return 0;
+  for (int i = 0; i < REPRO_SHARED_MMAP_CAP; i++) {
+    uintptr_t s = repro_shared_mmap_table[i].start;
+    uintptr_t e = repro_shared_mmap_table[i].end;
+    if (s == start && e == end) return 1;
+  }
+  for (int i = 0; i < REPRO_SHARED_MMAP_CAP; i++) {
+    if (repro_shared_mmap_table[i].start == 0) {
+      repro_shared_mmap_table[i].end = end;
+      repro_shared_mmap_table[i].start = start;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int repro_shared_mmap_overlaps(void *addr, size_t len) {
+  uintptr_t start, end;
+  if (!repro_range_from_addr_len(addr, len, &start, &end)) return 0;
+  for (int i = 0; i < REPRO_SHARED_MMAP_CAP; i++) {
+    uintptr_t s = repro_shared_mmap_table[i].start;
+    uintptr_t e = repro_shared_mmap_table[i].end;
+    if (repro_range_intersects(start, end, s, e)) return 1;
+  }
+  return 0;
+}
+
+void repro_shared_mmap_remove_overlaps(void *addr, size_t len) {
+  uintptr_t start, end;
+  if (!repro_range_from_addr_len(addr, len, &start, &end)) return;
+  for (int i = 0; i < REPRO_SHARED_MMAP_CAP; i++) {
+    uintptr_t s = repro_shared_mmap_table[i].start;
+    uintptr_t e = repro_shared_mmap_table[i].end;
+    if (repro_range_intersects(start, end, s, e)) {
+      repro_shared_mmap_table[i].start = 0;
+      repro_shared_mmap_table[i].end = 0;
+    }
+  }
+}
 """.}
 
 const
@@ -226,6 +308,12 @@ const
   # interpose-only hook), so this is essentially never hit.
   MachServiceCacheCap = 4096
 
+type
+  SharedMmapRange = object
+    start, finish: uint
+    path: string
+    mprotectWriteEmitted: bool
+
 var
   initialized = false
   locksReady = false
@@ -233,6 +321,7 @@ var
   recordLock: Lock
   fdLock: Lock
   dirLock: Lock
+  mmapLock: Lock
   # ROUND-2 R4 — a bounded per-process realpath MEMO for the path-probe-family
   # canonicalisation. Maps a raw probe path → its realpath (the empty string when
   # realpath failed). Bounds the cost of canonicalising successful stat/lstat/
@@ -300,6 +389,10 @@ var
   # fd is instead given its resolved path via updateFdPath, so it naturally takes
   # the fast (non-empty) path thereafter. Guarded by `fdLock`.
   classifiedEmptyFds = initHashSet[cint]()
+  # ROUND-7 M1 — Nim side of the C-gated file-backed MAP_SHARED range table. The
+  # C table decides whether mprotect/munmap may enter Nim; this table carries the
+  # stable path and the per-mapping "promotion write already emitted" bit.
+  sharedMmaps: seq[SharedMmapRange] = @[]
   # The OS thread id of the thread that ran the dyld constructor (the "main"
   # thread). Captured once at init. The fragment writer batches a thread's
   # records into a per-thread buffer that is otherwise flushed only on overflow /
@@ -465,6 +558,8 @@ proc recordDirectoryEnumeration(path: cstring) {.raises: [].} =
 # never entering the Nim runtime (the rustc/clang mmap crash guard).
 proc reproIntreeFdMark(fd: cint) {.importc: "repro_intree_fd_mark", cdecl.}
 proc reproIntreeFdClear(fd: cint) {.importc: "repro_intree_fd_clear", cdecl.}
+proc reproSharedMmapAdd(adr: pointer; length: csize_t): cint
+  {.importc: "repro_shared_mmap_add", cdecl.}
 
 proc updateFdPath(fd: cint; path: cstring) =
   if fd < 0 or path == nil:
@@ -597,6 +692,12 @@ proc metaForDir(dirp: pointer): string =
   acquire(dirLock)
   result = dirMeta.getOrDefault(dirKey(dirp), "")
   release(dirLock)
+
+proc rangeEnd(start: uint; length: csize_t): uint {.inline.} =
+  start + uint(length)
+
+proc rangesIntersect(a0, a1, b0, b1: uint): bool {.inline.} =
+  a0 < b1 and b0 < a1
 
 proc probeFromResult(callResult: cint): ProbeResult =
   if callResult == 0:
@@ -1261,6 +1362,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
     initLock(recordLock)
     initLock(fdLock)
     initLock(dirLock)
+    initLock(mmapLock)
     initLock(canonicalLock)   # ROUND-2 R4 — guards the realpath memo
     initLock(observedLock)    # ROUND-2 R-D — guards the observed-input dedup set
     initLock(machServiceLock) # ROUND-3 S0 — guards the SIP Apple-service set/memo
@@ -1616,7 +1718,81 @@ proc recoverNamedFdFile(fd: cint; kind: FdKind; detail: string): bool
   emitRecord(record)
   true
 
-proc recordMmap(callResult: pointer; prot, flags, fd: cint) {.raises: [].} =
+proc rememberSharedMmap(callResult: pointer; length: csize_t; prot: cint;
+    path: string) {.raises: [].} =
+  ## ROUND-7 M1 — after a successful file-backed MAP_SHARED mmap with a stable
+  ## path, publish the range to the pure-C mprotect gate and remember the path in
+  ## Nim. The C publish can fail when the fixed table is full; that fails closed
+  ## (no later mprotect write evidence) rather than risking a false attribution.
+  if callResult == nil or length == 0 or path.len == 0:
+    return
+  let start = cast[uint](callResult)
+  let finish = rangeEnd(start, length)
+  if finish <= start:
+    return
+  if reproSharedMmapAdd(callResult, length) == 0:
+    return
+  acquire(mmapLock)
+  for m in sharedMmaps.mitems:
+    if m.start == start and m.finish == finish and m.path == path:
+      if (prot and ProtWrite) != 0:
+        m.mprotectWriteEmitted = true
+      release(mmapLock)
+      return
+  sharedMmaps.add SharedMmapRange(
+    start: start,
+    finish: finish,
+    path: path,
+    mprotectWriteEmitted: (prot and ProtWrite) != 0)
+  release(mmapLock)
+
+proc emitMprotectPromotions(adr: pointer; length: csize_t) {.raises: [].} =
+  ## Called ONLY from the C-gated mprotect thunk after a successful
+  ## mprotect(..., PROT_WRITE) intersects at least one tracked MAP_SHARED file
+  ## mapping. Deduping is per tracked mapping/path, so repeated mprotect calls on
+  ## the same range do not produce duplicate writes.
+  if adr == nil or length == 0:
+    return
+  let start = cast[uint](adr)
+  let finish = rangeEnd(start, length)
+  if finish <= start:
+    return
+  var writes: seq[SharedMmapRange] = @[]
+  acquire(mmapLock)
+  for m in sharedMmaps.mitems:
+    if not m.mprotectWriteEmitted and
+        rangesIntersect(start, finish, m.start, m.finish):
+      m.mprotectWriteEmitted = true
+      writes.add m
+  release(mmapLock)
+  for m in writes:
+    var record = baseRecord(mrFileWrite, moFileWrite)
+    record.path = m.path
+    record.result = 0
+    record.detail = "mprotect MAP_SHARED promoted writable"
+    emitRecord(record)
+
+proc forgetSharedMmaps(adr: pointer; length: csize_t) {.raises: [].} =
+  ## Cleanup for successful munmap calls that intersect the C range table. We drop
+  ## every intersecting Nim entry rather than trying to split partial unmaps:
+  ## losing future promotion evidence is safer than keeping stale same-address
+  ## attribution after the kernel has unmapped any part of the old range.
+  if adr == nil or length == 0:
+    return
+  let start = cast[uint](adr)
+  let finish = rangeEnd(start, length)
+  if finish <= start:
+    return
+  acquire(mmapLock)
+  var kept: seq[SharedMmapRange] = @[]
+  for m in sharedMmaps:
+    if not rangesIntersect(start, finish, m.start, m.finish):
+      kept.add m
+  sharedMmaps = kept
+  release(mmapLock)
+
+proc recordMmap(callResult: pointer; length: csize_t; prot, flags, fd: cint)
+    {.raises: [].} =
   ## Classify an `mmap` of a FILE-backed fd (fd >= 0). An mmap can carry THREE facts
   ## no other syscall does, all handled here:
   ##
@@ -1635,21 +1811,13 @@ proc recordMmap(callResult: pointer; prot, flags, fd: cint) {.raises: [].} =
   ##  * ROUND-2 R9 — a MAP_SHARED|PROT_WRITE mapping mutates the file's CONTENT with
   ##    NO write(2)/pwrite(2) (ld64 writes its output executable this way; r2_mmap
   ##    probeC), so the open alone does not convey the write.
-  ##  * ROUND-5 Break G (DOCUMENTED RESIDUAL, not fixed here) — a MAP_SHARED mapping
-  ##    made read-only at mmap time can be turned writable LATER via
-  ##    `mprotect(PROT_WRITE)` and mutated with no write(2) and no PROT_WRITE-at-mmap
-  ##    (research/.../round5/machinery/mprotect_escalate). `mprotect` is UNHOOKED — it
-  ##    is called from inside libmalloc (guard pages) and dyld, so a Nim hook on it
-  ##    carries the SAME dyld-TLV crash hazard as mmap (docs/shim-build-policy.md). We
-  ##    do NOT over-record read-only MAP_SHARED as a write: that would misclassify a
-  ##    genuine INPUT as an output (an O_RDWR fd mmap'd MAP_SHARED|PROT_READ and only
-  ##    read — SQLite db / lockfile — is the round-1 R3 bug, tests/.../round2_rb
-  ##    probeA). So only a PROT_WRITE-at-mmap MAP_SHARED mapping is recorded as a
-  ##    write. The mprotect-escalation is a deliberate-adversary residual (a normal
-  ##    build never escalates a read map to writable then mutates it); it is SAFE in
-  ##    the cardinal sense — it can only misclassify an OUTPUT as an INPUT (a possibly
-  ##    stale output), never miss an INPUT (a false cache hit). Closing it needs a
-  ##    C-gated mprotect hook or the EndpointSecurity backend.
+  ##  * ROUND-7 M1 — a MAP_SHARED mapping made read-only at mmap time can be turned
+  ##    writable LATER via `mprotect(PROT_WRITE)` and mutated with no write(2) and no
+  ##    PROT_WRITE-at-mmap. We still do NOT over-record read-only MAP_SHARED here:
+  ##    that would misclassify a genuine INPUT as an output. Instead, when a stable
+  ##    path exists, this proc tracks the mapping range in a fixed C gate and a Nim
+  ##    path table; the mprotect thunk forwards first and enters Nim only after the
+  ##    C gate proves the successful PROT_WRITE range intersects one of these maps.
   ##
   ## Anonymous / fd-less mappings never reach here: the C thunk `repro_wrap_mmap`
   ## forwards every `fd < 0` mapping via the raw syscall WITHOUT entering Nim — the
@@ -1689,27 +1857,32 @@ proc recordMmap(callResult: pointer; prot, flags, fd: cint) {.raises: [].} =
     var mkind: FdKind
     if ct_macos_fd_dev_ino_kind(fd, addr mdev, addr mino, addr mkind):
       discard recoverNamedFdFile(fd, mkind, "mmap-inherited-fd")
+  var mappedPath = pathForFd(fd)
+  if (flags and MapShared) != 0 and mappedPath.len > 0:
+    rememberSharedMmap(callResult, length, prot, mappedPath)
+
   # ROUND-2 R9 — a MAP_SHARED|PROT_WRITE file mapping mutates the file's CONTENT with
   # NO write(2) (ld64 writes its output executable this way). Record an output WRITE.
-  #
-  # Break G (mprotect-escalation) is DELIBERATELY NOT over-recorded here: recording a
-  # read-only MAP_SHARED mapping as a write breaks the R3 input classification — an
-  # O_RDWR fd mmap'd MAP_SHARED|PROT_READ and only READ (SQLite db, lockfile) would be
-  # mis-recorded as an OUTPUT (the round-1 bug, tests/.../round2_rb probeA). The write
-  # only becomes real if `mprotect(PROT_WRITE)` actually escalates it, and mprotect is
-  # unhooked (same dyld-TLV crash hazard as mmap — docs/shim-build-policy.md). So the
-  # mprotect-escalation path is a documented low-severity residual (deliberate
-  # adversary only; a normal build never mprotects a MAP_SHARED read map to writable
-  # then mutates it), NOT an over-record that would misclassify real inputs.
   if (flags and MapShared) != 0 and (prot and ProtWrite) != 0:
-    let p = pathForFd(fd)
-    if p.len > 0:
+    if mappedPath.len > 0:
       var record = baseRecord(mrFileWrite, moFileWrite)
-      record.path = p
+      record.path = mappedPath
       record.result = 0
       record.flags = uint32(fd)
       record.detail = "mmap-write MAP_SHARED|PROT_WRITE"
       emitRecord(record)
+
+proc repro_hook_mprotect_promote*(adr: pointer; length: csize_t; prot: cint)
+    {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0 or (prot and ProtWrite) == 0:
+    return
+  emitMprotectPromotions(adr, length)
+
+proc repro_hook_munmap_cleanup*(adr: pointer; length: csize_t)
+    {.exportc, cdecl, dynlib.} =
+  if not initialized or disabled > 0:
+    return
+  forgetSharedMmaps(adr, length)
 
 proc recordSetexecExec(attrp: pointer; path: cstring) {.raises: [].} =
   ## If a posix_spawn(p) sets POSIX_SPAWN_SETEXEC it REPLACES the calling
@@ -2576,7 +2749,7 @@ proc repro_hook_mmap*(adr: pointer; length: csize_t; prot, flags, fd: cint;
   inc inMmapHook
   result = ct_macos_real_mmap(adr, length, prot, flags, fd, offset)
   let savedErrno = getErrno()
-  recordMmap(result, prot, flags, fd)
+  recordMmap(result, length, prot, flags, fd)
   setErrno(savedErrno)
   dec inMmapHook
 
@@ -4537,6 +4710,8 @@ static int repro_wrap_fcntl(int fd, int cmd, ...) {
  */
 extern void *repro_macos_real_mmap_syscall(void *addr, size_t len, int prot,
                                            int flags, int fd, long long offset);
+extern void repro_hook_mprotect_promote(void *addr, size_t len, int prot);
+extern void repro_hook_munmap_cleanup(void *addr, size_t len);
 
 static void *repro_wrap_mmap(void *addr, size_t len, int prot, int flags,
                              int fd, off_t offset) {
@@ -4590,6 +4765,40 @@ static void *repro_wrap_mmap(void *addr, size_t len, int prot, int flags,
                                          (long long)offset);
   }
   return repro_hook_mmap(addr, len, prot, flags, fd, (long long)offset);
+}
+
+/*
+ * ROUND-7 M1 — mprotect promotion hook. The common path forwards via the raw
+ * syscall and returns without touching Nim. Only after a successful PROT_WRITE
+ * call does the pure-C fixed range table decide whether the protected range
+ * intersects a file-backed MAP_SHARED mapping recorded by repro_hook_mmap.
+ */
+static int repro_wrap_mprotect(void *addr, size_t len, int prot) {
+  int r = (int)syscall(SYS_mprotect, addr, len, prot);
+  int saved_errno = errno;
+  if (r == 0 && (prot & PROT_WRITE) != 0 &&
+      repro_shared_mmap_overlaps(addr, len)) {
+    repro_hook_mprotect_promote(addr, len, prot);
+  }
+  errno = saved_errno;
+  return r;
+}
+
+/*
+ * ROUND-7 M1 — munmap cleanup. Forward first; after a successful unmap, clean
+ * only if the C range table says the unmapped range intersects tracked MAP_SHARED
+ * state. Removing all intersecting ranges is fail-closed for partial unmaps and
+ * prevents same-address reuse from inheriting stale path attribution.
+ */
+static int repro_wrap_munmap(void *addr, size_t len) {
+  int r = (int)syscall(SYS_munmap, addr, len);
+  int saved_errno = errno;
+  if (r == 0 && repro_shared_mmap_overlaps(addr, len)) {
+    repro_shared_mmap_remove_overlaps(addr, len);
+    repro_hook_munmap_cleanup(addr, len);
+  }
+  errno = saved_errno;
+  return r;
 }
 
 /* Cached libsystem entry-address resolvers for the remaining wrap families
@@ -5627,6 +5836,10 @@ static struct {
   /* ROUND-2 R9 — mmap output-via-memory hook (MAP_SHARED|PROT_WRITE content
    * write with no write() syscall). Interpose-only (not body-patched). */
   { (const void *)repro_wrap_mmap, (const void *)mmap },
+  /* ROUND-7 M1 — C-gated mprotect promotion + munmap cleanup for file-backed
+   * MAP_SHARED mappings. Interpose-only; the common paths stay in C. */
+  { (const void *)repro_wrap_mprotect, (const void *)mprotect },
+  { (const void *)repro_wrap_munmap, (const void *)munmap },
   { (const void *)repro_wrap_opendir, (const void *)opendir },
   { (const void *)repro_wrap_readdir, (const void *)readdir },
   { (const void *)repro_wrap_closedir, (const void *)closedir },

@@ -16,10 +16,10 @@
 ## additionally guards that rustc/clang do not crash (the definitive proof lives in
 ## test_io_mon_macos_mmap_reentrancy.nim; here we re-assert it for the Phase-3 gate).
 ##
-## Break G (mprotect-escalation) is a DOCUMENTED RESIDUAL, not fixed here (see
-## recordMmap): over-recording a read-only MAP_SHARED as a write would misclassify a
-## genuine INPUT as output (the round-1 R3 bug); it is safe in the cardinal sense
-## (can only mis-mark an output, never miss an input).
+## Round-7 M1 closes the former Break G residual: a read-only MAP_SHARED file
+## mapping promoted writable via mprotect(PROT_WRITE) is recorded as a file write
+## through a C range gate, without routing ordinary malloc/dyld mprotect traffic
+## into Nim.
 ##
 ## macOS-only; a no-op pass elsewhere.
 
@@ -62,6 +62,13 @@ when defined(macosx):
     for r in dep.records:
       if r.kind == kind and r.path.contains(sub): inc result
 
+  proc countMprotectWrites(dep: MonitorDepFile; suffix: string): int =
+    for r in dep.records:
+      if r.kind == mrFileWrite and r.observationKind == moFileWrite and
+          r.path.endsWith(suffix) and
+          r.detail.contains("mprotect MAP_SHARED promoted writable"):
+        inc result
+
   proc runIomon(cli, shim, depfile: string; argv: seq[string]): MonitorDepFile =
     ## Run `io-mon run --depfile <depfile> -- <argv>` with the shim on DYLD, and
     ## read the resulting depfile. Used for the Break-B launcher which itself execs
@@ -79,6 +86,30 @@ when defined(macosx):
     p.close()
     checkpoint("launcher exit=" & $code & " out=" & outText)
     doAssert fileExists(depfile), "no depfile produced: " & outText
+    readMonitorDepFile(depfile)
+
+  proc runProbe(shim, probe: string; args: seq[string]; depfile: string):
+      MonitorDepFile =
+    let runWork = depfile.parentDir() / (probe.extractFilename() & "-frags")
+    removeDir(runWork)
+    createDir(runWork)
+    var env = newStringTable(modeCaseSensitive)
+    for k, v in envPairs():
+      if k == "CT_SANDBOX_TOOLS_DIR": continue
+      env[k] = v
+    env["DYLD_INSERT_LIBRARIES"] = shim
+    env["REPRO_MONITOR_SHIM_LIB"] = shim
+    env["REPRO_MONITOR_FRAGMENT_DIR"] = runWork
+    applyMacosBackendToggle(env, "both")
+    let p = startProcess(probe, args = args, env = env,
+      options = {poStdErrToStdOut})
+    let outText = p.outputStream.readAll()
+    let code = p.waitForExit()
+    p.close()
+    checkpoint("probe exit=" & $code & " out=" & outText)
+    doAssert code == 0, "probe failed: " & outText
+    discard mergeFragments(runWork, depfile)
+    doAssert fileExists(depfile), "no depfile produced for probe"
     readMonitorDepFile(depfile)
 
 suite "io-mon macOS R5 Phase-3 mmap of out-of-tree fd (Break B)":
@@ -148,6 +179,44 @@ suite "io-mon macOS R5 Phase-3 mmap of out-of-tree fd (Break B)":
         if r.detail.contains("mmap-inherited"): inc mmapInherited
       check mmapInherited == 0
       check dep.completeness == mcComplete
+
+    test "R7-M1: MAP_SHARED read mapping promoted writable via mprotect is a write":
+      let target = work / "mprotect_promote.bin"
+      writeFile(target, repeat("a", 4096))
+      let src = work / "mprotect_promote.c"
+      writeFile(src, """
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+  if (argc != 2) return 2;
+  int fd = open(argv[1], O_RDWR);
+  if (fd < 0) { perror("open"); return 3; }
+  size_t len = 4096;
+  void *p = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
+  if (p == MAP_FAILED) { perror("mmap"); return 4; }
+  if (mprotect(p, len, PROT_READ | PROT_WRITE) != 0) {
+    perror("mprotect1"); return 5;
+  }
+  ((char *)p)[0] = 'Z';
+  if (msync(p, len, MS_SYNC) != 0) { perror("msync"); return 6; }
+  if (mprotect(p, len, PROT_READ | PROT_WRITE) != 0) {
+    perror("mprotect2"); return 7;
+  }
+  if (munmap(p, len) != 0) { perror("munmap"); return 8; }
+  close(fd);
+  return 0;
+}
+""")
+      let bin = work / "mprotect_promote"
+      ccExe(src, bin)
+      let dep = runProbe(shim, bin, @[target], work / "mprotect.rdep")
+      check readFile(target).startsWith("Zaaaaa")
+      check dep.completeness == mcComplete
+      check countMprotectWrites(dep, "mprotect_promote.bin") == 1
 
     removeDir(work)
   else:
