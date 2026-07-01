@@ -77,7 +77,34 @@ const
     ## ROUND-2 R5 — extension of the per-thread "un-flushed read tail" sentinel
     ## file (see `FragmentSlot.readingSentinelActive`). Distinct from `.rmdf-frag`
     ## and `.io-mon-report` so the merge's fragment / report scans never collide
-    ## with it.
+    ## with it. RETAINED for warm-restart cleanup of any stale round-2 sidecars;
+    ## the live kill-before-flush guard is now the in-fragment marker below.
+  ReadTailPendingDetail* = "read-tail-pending"
+    ## ROUND-5 F — the in-fragment kill-before-flush marker. A monitored process
+    ## that buffers read records writes THIS marker (an `mrEventLoss` frame)
+    ## DIRECTLY to its fragment file and flushes it the instant a batch goes
+    ## empty→dirty — BEFORE the buffered reads are durable. A matching
+    ## `ReadTailCommittedDetail` marker is written after the batch flush makes the
+    ## reads durable. `mergeFragments` NETS pending vs committed per (osPid,
+    ## threadId): an unmatched pending means the process was killed (SIGKILL / raw
+    ## exit / abort — no destructor) with reads still buffered, so the reads were
+    ## lost and a real kill-before-flush event-loss is injected (downgrade).
+    ##
+    ## This replaces the round-2 sidecar sentinel FILE, which a monitored process
+    ## could DEFEAT: its path was world-predictable (`repro-reading-<pid>-<tid>`
+    ## in the inherited `REPRO_MONITOR_FRAGMENT_DIR`) so a tracee could `unlink`
+    ## it, and its create was best-effort so a tracee could `chmod` the dir to make
+    ## the create silently fail (research/adversarial-2026-07-round5/machinery
+    ## sab_overflow/sab_unlink/sab_chmod). The in-fragment marker rides in the same
+    ## file whose truncation/corruption ALREADY fails closed (the corrupt-fragment
+    ## downgrade), and it is written through the ALREADY-OPEN fragment fd so a dir
+    ## chmod cannot block it. Removing the marker requires corrupting the fragment
+    ## (fails closed) or forging a committed frame through the shim's private,
+    ## unpredictable fragment fd — far beyond `unlink(predictable-path)`.
+  ReadTailCommittedDetail* = "read-tail-committed"
+    ## ROUND-5 F — the durability-confirming counterpart of ReadTailPendingDetail;
+    ## written directly to the fragment (and flushed) AFTER a batch flush makes the
+    ## buffered reads durable. See ReadTailPendingDetail.
 
 type
   FragmentSlot = object
@@ -165,32 +192,50 @@ proc readingSentinelPath*(fragmentDir: string; osPid, threadId: uint64): string 
   ## itself so one process's worker threads never clobber each other's sentinel.
   fragmentDir / ("repro-reading-" & $osPid & "-" & $threadId & ReadingSentinelExt)
 
-proc markReadingSentinel() =
-  ## ROUND-2 R5 — record that this thread's batch now holds non-durable bytes, by
-  ## creating the sentinel file ONCE per dirty cycle. Best-effort: a failed create
-  ## merely loses the kill-before-flush guard for this cycle (degrades to the
-  ## pre-round-2 behaviour); it never aborts the monitored process.
-  if fragmentSlot.readingSentinelActive or not fragmentSlot.isOpen:
+proc encodeFrame*(record: MonitorRecord): seq[byte] {.raises: [].}
+  ## Forward declaration — `writeReadTailMarker` (the in-fragment kill-before-flush
+  ## marker, ROUND-5 F) encodes a single frame; the full definition is below. The
+  ## explicit `{.raises: [].}` keeps effect inference from pessimistically assuming
+  ## the not-yet-seen body can raise (which would poison every caller's raises list).
+
+proc writeReadTailMarker(detail: string) =
+  ## ROUND-5 F — write a kill-before-flush bookkeeping marker (`mrEventLoss` with
+  ## `detail`) DIRECTLY to the calling thread's already-open fragment file and flush
+  ## it, so it is durable independently of the batch buffer. Keyed on the slot's
+  ## (osPid, threadId) so `mergeFragments` can net pending vs committed per thread.
+  ## Best-effort at the syscall level (a short write / flush failure is swallowed —
+  ## it never aborts the monitored process), but UNLIKE the round-2 sidecar it does
+  ## not depend on a writable directory: the fd is already open, so a tracee that
+  ## chmod's the fragment dir cannot block it.
+  if not fragmentSlot.isOpen:
     return
-  let p = readingSentinelPath(slotFragmentDir(fragmentSlot),
-    fragmentSlot.osPid, fragmentSlot.threadId)
+  let marker = MonitorRecord(kind: mrEventLoss, observationKind: moEventLoss,
+    osPid: fragmentSlot.osPid, threadId: fragmentSlot.threadId, detail: detail)
+  let frame = encodeFrame(marker)
   try:
-    writeFile(extendedPath(p), "")
-    fragmentSlot.readingSentinelActive = true
+    let n = fragmentSlot.file.writeBuffer(unsafeAddr frame[0], frame.len)
+    if n == frame.len:
+      flushFile(fragmentSlot.file)
   except IOError, OSError:
     discard
 
+proc markReadingSentinel() =
+  ## ROUND-5 F — record that this thread's batch now holds non-durable read bytes,
+  ## by writing a durable `read-tail-pending` marker INTO the fragment ONCE per dirty
+  ## cycle (see ReadTailPendingDetail for why in-fragment, not a sidecar file). The
+  ## flag makes it one marker per dirty→clean cycle, not per record.
+  if fragmentSlot.readingSentinelActive or not fragmentSlot.isOpen:
+    return
+  writeReadTailMarker(ReadTailPendingDetail)
+  fragmentSlot.readingSentinelActive = true
+
 proc clearReadingSentinel() =
-  ## ROUND-2 R5 — the batch just became durable (flushed); remove the sentinel so
-  ## a clean continuation / exit is NOT mistaken for a kill-before-flush.
+  ## ROUND-5 F — the batch just became durable (flushed); write a matching
+  ## `read-tail-committed` marker so `mergeFragments` nets this cycle to zero (a
+  ## clean continuation / exit is NOT mistaken for a kill-before-flush).
   if not fragmentSlot.readingSentinelActive:
     return
-  let p = readingSentinelPath(slotFragmentDir(fragmentSlot),
-    fragmentSlot.osPid, fragmentSlot.threadId)
-  try:
-    removeFile(extendedPath(p))
-  except OSError:
-    discard
+  writeReadTailMarker(ReadTailCommittedDetail)
   fragmentSlot.readingSentinelActive = false
 
 proc fragmentLogOpenCount*(): uint64 =
@@ -1515,14 +1560,45 @@ proc mergeFragments*(fragmentDir, outputPath: string;
       records.add MonitorRecord(kind: mrEventLoss,
         observationKind: moEventLoss,
         detail: "corrupt or partial RMDF fragment in " & fragmentDir)
-  # ROUND-2 R5 (kill-before-flush) — a leftover ``.io-mon-reading`` sentinel means
-  # a monitored process buffered read records on its MAIN thread and was killed by
-  # an uncatchable signal before the tail flushed (no dyld destructor ran). The
-  # early-flushed process-start survived but the unflushed reads were lost, so the
-  # depfile would otherwise publish ``mcComplete`` minus those reads. One synthetic
-  # event-loss per leftover sentinel forces ``mcIncomplete`` (the same conservative
-  # re-run machinery as a corrupt fragment). The sentinel is consumed (removed) so a
-  # warm-restart merge does not double-count it. See research/.../kill_probe.c.
+  # ROUND-5 F (kill-before-flush) — net the IN-FRAGMENT read-tail markers. A
+  # monitored process that buffered read records wrote a durable `read-tail-pending`
+  # marker to its fragment the instant a batch went dirty, and a `read-tail-committed`
+  # marker after the batch flush made those reads durable. Netting per (osPid,
+  # threadId): an UNMATCHED pending means the process was killed by an uncatchable
+  # path (SIGKILL / raw exit / abort — no destructor) with reads still buffered, so
+  # the early-flushed process-start survived but the reads were lost — a false
+  # `mcComplete` minus those reads. One synthetic kill-before-flush event-loss per
+  # unmatched pending forces `mcIncomplete` (the conservative re-run machinery). The
+  # bookkeeping markers are STRIPPED from the record set FIRST — they are `mrEventLoss`
+  # frames and `summarizeRecords` would otherwise count each pending/committed pair as
+  # real loss and false-downgrade EVERY normal build (the cardinal-sin inverse). The
+  # mark/clear alternate strictly per thread, so the leftover is 0 or 1 per thread.
+  #
+  # This replaces the round-2 sidecar sentinel FILE (defeatable by unlink / dir chmod
+  # — research/adversarial-2026-07-round5/machinery sab_*). A stale `.io-mon-reading`
+  # sidecar from an OLD-version run is still honoured (removed + counted) as the SAFE
+  # direction for a warm restart — never a false mcComplete.
+  block readTailNet:
+    var pendingByThread = initCountTable[(uint64, uint64)]()
+    var committedByThread = initCountTable[(uint64, uint64)]()
+    var cleaned = newSeqOfCap[MonitorRecord](records.len)
+    for r in records:
+      if r.kind == mrEventLoss and r.detail == ReadTailPendingDetail:
+        pendingByThread.inc((r.osPid, r.threadId))
+      elif r.kind == mrEventLoss and r.detail == ReadTailCommittedDetail:
+        committedByThread.inc((r.osPid, r.threadId))
+      else:
+        cleaned.add r
+    records = cleaned
+    for key, pcount in pendingByThread:
+      let leftover = pcount - committedByThread.getOrDefault(key, 0)
+      for _ in 0 ..< max(0, leftover):
+        records.add MonitorRecord(kind: mrEventLoss, observationKind: moEventLoss,
+          osPid: key[0], threadId: key[1],
+          detail: "process killed with an un-flushed read batch (kill-before-flush)")
+  # Legacy: consume + honour any stale round-2 `.io-mon-reading` sidecar (a warm
+  # restart from a pre-round-5 shim). Removing it and counting it is the SAFE
+  # direction; the current shim writes no sidecars, so this is dormant in steady use.
   var killedReaders = 0
   if dirExists(extendedPath(fragmentDir)):
     for kind, path in walkDir(extendedPath(fragmentDir)):
