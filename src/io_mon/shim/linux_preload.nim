@@ -51,12 +51,15 @@ var
   dirLock: Lock
   streamLock: Lock
   observedLock: Lock
+  emptyFdLock: Lock
   fragmentDir: string
   nextProcessSeq: uint64 = 0
   fdPaths = initTable[cint, string]()
   dirPaths = initTable[uint, string]()
   streamPaths = initTable[uint, string]()
   observedNonFileInputs = initHashSet[string]()
+  emptyFdClassified = initHashSet[cint]()
+  inheritedOpenFds = initHashSet[cint]()
   rawSyscallCoverageRecorded = false
   inlineSyscallCoverageRecorded = false
   inlineSyscallTrapCoverageRecorded = false
@@ -77,6 +80,7 @@ var
 #include <sys/un.h>
 #include <netinet/in.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
 
@@ -112,6 +116,62 @@ long repro_linux_socket_peer_pid(int fd) {
   return 0;
 }
 
+int repro_linux_fd_identity_kind(int fd, unsigned long *dev,
+                                 unsigned long *ino, int *kind) {
+  struct stat st;
+  if (stackable_linux_raw_syscall6(SYS_fstat, fd, (long)&st, 0, 0, 0, 0) != 0)
+    return 0;
+  *dev = (unsigned long)st.st_dev;
+  *ino = (unsigned long)st.st_ino;
+  if (S_ISREG(st.st_mode))
+    *kind = 1;
+  else if (S_ISFIFO(st.st_mode))
+    *kind = 2;
+  else if (S_ISSOCK(st.st_mode))
+    *kind = 3;
+  else if (S_ISDIR(st.st_mode))
+    *kind = 4;
+  else
+    *kind = 5;
+  return 1;
+}
+
+static int repro_linux_append_uint(char *buf, int pos, int limit, int value) {
+  char tmp[32];
+  int n = 0;
+  if (value == 0) {
+    tmp[n++] = '0';
+  } else {
+    while (value > 0 && n < (int)sizeof(tmp)) {
+      tmp[n++] = (char)('0' + (value % 10));
+      value /= 10;
+    }
+  }
+  while (n > 0 && pos < limit)
+    buf[pos++] = tmp[--n];
+  return pos;
+}
+
+int repro_linux_fd_proc_path(int fd, void *raw_buf, unsigned long len) {
+  const char prefix[] = "/proc/self/fd/";
+  char *buf = (char *)raw_buf;
+  char linkpath[64];
+  int pos = 0;
+  if (len == 0 || fd < 0)
+    return 0;
+  for (unsigned long i = 0; i + 1 < sizeof(prefix); ++i)
+    linkpath[pos++] = prefix[i];
+  pos = repro_linux_append_uint(linkpath, pos, (int)sizeof(linkpath) - 1, fd);
+  linkpath[pos] = '\0';
+  long n = stackable_linux_raw_syscall6(SYS_readlink, (long)linkpath,
+                                        (long)buf, (long)(len - 1),
+                                        0, 0, 0);
+  if (n <= 0)
+    return 0;
+  buf[n] = '\0';
+  return 1;
+}
+
 extern int repro_monitor_shim_init(char *configPath);
 extern int repro_monitor_shim_shutdown(void);
 
@@ -141,6 +201,19 @@ proc c_sockaddr_family(address: pointer; addrLen: uint32): cint
   {.importc: "repro_linux_sockaddr_family", raises: [].}
 proc c_socket_peer_pid(fd: cint): clong
   {.importc: "repro_linux_socket_peer_pid", raises: [].}
+proc c_fd_identity_kind(fd: cint; dev, ino: ptr uint64; kind: ptr cint): cint
+  {.importc: "repro_linux_fd_identity_kind", raises: [].}
+proc c_fd_proc_path(fd: cint; buf: pointer; len: csize_t): cint
+  {.importc: "repro_linux_fd_proc_path", raises: [].}
+
+type
+  FdKind = enum
+    fkUnknown = 0
+    fkRegular = 1
+    fkFifo = 2
+    fkSocket = 3
+    fkDirectory = 4
+    fkOther = 5
 
 proc currentThreadId(): uint64 =
   uint64(c_gettid())
@@ -285,11 +358,88 @@ proc removeFdPath(fd: cint) =
   acquire(fdLock)
   fdPaths.del(fd)
   release(fdLock)
+  acquire(emptyFdLock)
+  emptyFdClassified.excl fd
+  inheritedOpenFds.excl fd
+  release(emptyFdLock)
 
 proc pathForFd(fd: cint): string =
   acquire(fdLock)
   result = fdPaths.getOrDefault(fd, "")
   release(fdLock)
+
+proc markEmptyFdClassified(fd: cint) {.raises: [].} =
+  acquire(emptyFdLock)
+  emptyFdClassified.incl fd
+  release(emptyFdLock)
+
+proc emptyFdAlreadyClassified(fd: cint): bool {.raises: [].} =
+  acquire(emptyFdLock)
+  result = fd in emptyFdClassified
+  release(emptyFdLock)
+
+proc inheritedFd(fd: cint): bool {.raises: [].} =
+  acquire(emptyFdLock)
+  result = fd in inheritedOpenFds
+  release(emptyFdLock)
+
+proc rememberInheritedOpenFds() {.raises: [].} =
+  acquire(emptyFdLock)
+  inheritedOpenFds.clear()
+  for fd in 0.cint .. 1024.cint:
+    var dev, ino: uint64
+    var kind: cint
+    if c_fd_identity_kind(fd, addr dev, addr ino, addr kind) != 0:
+      inheritedOpenFds.incl fd
+  release(emptyFdLock)
+
+proc localFdKey(dev, ino: uint64): string {.raises: [].} =
+  "localfd:" & $dev & ":" & $ino
+
+proc recordExternalContent(chan, role, path: string; fd: cint) {.raises: [].} =
+  var record = baseRecord(mrExternalContent, moExternalContent)
+  record.path = path
+  record.flags = uint32(fd)
+  record.detail = "chan=" & chan & " role=" & role
+  emitRecord(record)
+
+proc classifyEmptyFdRead(fd: cint): bool {.raises: [].} =
+  if fd < 0 or emptyFdAlreadyClassified(fd):
+    return false
+  var dev, ino: uint64
+  var rawKind: cint
+  if c_fd_identity_kind(fd, addr dev, addr ino, addr rawKind) == 0:
+    emitEventLoss("linux inherited fd read unresolved fd=" & $fd)
+    markEmptyFdClassified(fd)
+    return false
+  let kind = FdKind(rawKind)
+  if kind == fkRegular:
+    var buf: array[4096, char]
+    if c_fd_proc_path(fd, addr buf[0], csize_t(buf.len)) != 0:
+      let resolved = $cast[cstring](addr buf[0])
+      if resolved.len > 0 and not resolved.startsWith("anon_inode:"):
+        updateFdPath(fd, cstring(resolved))
+        var record = baseRecord(mrFileRead, moFileRead)
+        record.path = resolved
+        record.result = 0
+        record.flags = uint32(fd)
+        record.detail = "inherited-fd"
+        emitRecord(record)
+        return true
+    emitEventLoss("linux inherited regular fd read unnamed key=" &
+      localFdKey(dev, ino) & " fd=" & $fd)
+    markEmptyFdClassified(fd)
+  elif kind == fkFifo or kind == fkSocket or kind == fkOther:
+    if not inheritedFd(fd):
+      return false
+    recordExternalContent("opaque", "read", localFdKey(dev, ino), fd)
+    markEmptyFdClassified(fd)
+  else:
+    if not inheritedFd(fd):
+      return false
+    recordExternalContent("opaque", "read", localFdKey(dev, ino), fd)
+    markEmptyFdClassified(fd)
+  false
 
 proc pathForAt(dirfd: cint; path: cstring): string {.raises: [].} =
   if path == nil:
@@ -357,6 +507,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     initLock(dirLock)
     initLock(streamLock)
     initLock(observedLock)
+    initLock(emptyFdLock)
     locksReady = true
   acquire(initLockVar)
   defer: release(initLockVar)
@@ -366,6 +517,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     fragmentDir = getEnv("REPRO_MONITOR_FRAGMENT_DIR")
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))
+    rememberInheritedOpenFds()
   initialized = true
   mainThreadId = currentThreadId()
   recordProcessStart()
@@ -448,12 +600,16 @@ proc repro_hook_openat64*(ctx: var OpenatContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc recordFdRead(fd: cint; bytes: clong) {.raises: [].} =
-  if bytes >= 0:
-    var record = baseRecord(mrFileRead, moFileRead)
-    record.path = pathForFd(fd)
-    record.result = bytes.int64
-    record.flags = uint32(fd)
-    emitRecord(record)
+  if bytes > 0:
+    let path = pathForFd(fd)
+    if path.len == 0:
+      discard classifyEmptyFdRead(fd)
+    else:
+      var record = baseRecord(mrFileRead, moFileRead)
+      record.path = path
+      record.result = bytes.int64
+      record.flags = uint32(fd)
+      emitRecord(record)
 
 proc recordFdWrite(fd: cint; bytes: clong) {.raises: [].} =
   if bytes >= 0 and fd > 2:
