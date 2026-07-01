@@ -1294,8 +1294,25 @@ proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
   # program's OWN code by a pure pointer-range compare — the crash-safe
   # cardinal-sin guard (see ct_macos_addr_in_program).
   ct_macos_capture_main_image()
+  # ROUND-5 D — scan the main executable's own code for inline `svc #0x80`. A binary
+  # that issues file syscalls DIRECTLY (Go / musl-static / an adversarial probe)
+  # bypasses every interpose + body-patch hook, so the monitor cannot prove it saw
+  # the binary's file I/O — a structural blind spot of the in-process interpose
+  # backend. Scanned once here (single-threaded, before runtime_ready).
+  ct_macos_scan_main_text_for_raw_syscall()
   initialized = true
   recordProcessStart()
+  # If the scan found inline raw syscalls, downgrade this process to mcIncomplete
+  # (conservative re-run) rather than silently publish mcComplete minus the reads it
+  # issued via svc. This is the honest fail-safe until the kernel-sourced
+  # EndpointSecurity backend (which observes below the libsystem/raw-syscall split)
+  # ships. A normal dynamically-linked build tool routes every syscall through
+  # libsystem and scans clean, so this never false-downgrades a normal build.
+  if ct_macos_main_text_has_raw_syscall():
+    var rawSysRec = baseRecord(mrEventLoss, moEventLoss)
+    rawSysRec.detail = "monitored binary issues inline raw syscalls; interpose " &
+      "cannot observe its file I/O (raw-syscall blind spot; EndpointSecurity backend)"
+    emitRecord(rawSysRec)
   result = 0
 
 proc repro_monitor_shim_flush*(): cint {.exportc, dynlib.} =
@@ -3255,6 +3272,35 @@ proc repro_hook_xpc_connection_send_message_with_reply_sync*(conn: pointer;
 # its own wrapper, then routes through the deduped recorder. errno is preserved
 # around the recording for the functions that report via errno.
 
+var rawSyscallFileOpFlagged {.threadvar.}: bool
+  ## ROUND-5 D — once-per-thread guard so a program that pumps file `syscall(2)`
+  ## calls emits ONE downgrade record, not one per call (keeps the hot path + the
+  ## depfile bounded). A downgrade is idempotent — one event-loss already forces
+  ## mcIncomplete — so flagging once is sufficient.
+
+proc repro_hook_syscall*(number, a1, a2, a3, a4, a5, a6: clong): clong
+    {.exportc, cdecl, dynlib.} =
+  ## ROUND-5 D — the `syscall(2)` escape hatch. A program can reach a file through
+  ## the (non-inlined) libsystem `syscall` indirect trap instead of the named
+  ## `open`/`read`/… entries the hooks cover, leaving the dependency INVISIBLE → a
+  ## false mcComplete (research/adversarial-2026-07-round5/unhooked p_syscall*). We
+  ## cannot faithfully re-attribute an arbitrary indirect syscall to a path/fd here
+  ## (the arg shape is number-specific and the fd→path map may not hold it), so for a
+  ## FILE-family number we DOWNGRADE (conservative re-run) — the honest fail-safe,
+  ## symmetric with the inline-svc __text scan. Non-file numbers forward untouched.
+  ## Forwarded via the raw `svc` (ct_macos_real_syscall), never a patched named
+  ## symbol, so there is no re-entry. (An INLINE svc in the program's own code never
+  ## reaches here — it is caught at load by the main-__text scan.)
+  if not initialized or disabled > 0:
+    return ct_macos_real_syscall(number, a1, a2, a3, a4, a5, a6)
+  if ct_macos_syscall_is_file_op(number) and not rawSyscallFileOpFlagged:
+    rawSyscallFileOpFlagged = true
+    var rec = baseRecord(mrEventLoss, moEventLoss)
+    rec.detail = "monitored binary reads files via the syscall(2) escape hatch; " &
+      "interpose cannot attribute them (raw-syscall blind spot; EndpointSecurity)"
+    emitRecord(rec)
+  result = ct_macos_real_syscall(number, a1, a2, a3, a4, a5, a6)
+
 proc repro_hook_getenv*(name: cstring): cstring {.exportc, cdecl, dynlib.} =
   ## Observed declared input (env). Forwards via the genuine getenv (environ walk)
   ## then records the queried NAME (deduped, denylisted). Does NOT downgrade.
@@ -4189,6 +4235,8 @@ extern int repro_macos_real_pipe_call(int fds[2]);
  * branch to the recording repro_hook_* (which forward through these too, so the
  * recording hook never re-enters its own wrapper). */
 extern char *repro_macos_real_getenv(const char *name);
+extern long repro_macos_real_syscall(long number, long a1, long a2, long a3,
+    long a4, long a5, long a6);
 extern int repro_macos_real_sysctlbyname_call(const char *name, void *oldp,
     size_t *oldlenp, void *newp, size_t newlen);
 extern int repro_macos_real_sysctl_call(int *name, unsigned int namelen,
@@ -5168,6 +5216,18 @@ static char *repro_wrap_getenv(const char *name) {
   return repro_hook_getenv((char *)name);
 }
 
+/* ROUND-5 D — the `syscall(2)` indirect-trap thunk. syscall is variadic; we read a
+ * fixed six register args (extra/absent args are harmless — an underlying syscall
+ * taking fewer just ignores the high registers). Forward the raw svc before the
+ * runtime is ready. Interpose-only (a program calls the libsystem `syscall` symbol
+ * by name; an INLINE svc bypasses this and is caught by the load-time __text scan). */
+static long repro_wrap_syscall(long number, long a1, long a2, long a3,
+                               long a4, long a5, long a6) {
+  if (!repro_monitor_runtime_ready)
+    return repro_macos_real_syscall(number, a1, a2, a3, a4, a5, a6);
+  return repro_hook_syscall(number, a1, a2, a3, a4, a5, a6);
+}
+
 static int repro_wrap_sysctlbyname(const char *name, void *oldp,
     size_t *oldlenp, void *newp, size_t newlen) {
   if (!repro_monitor_runtime_ready)
@@ -5646,6 +5706,10 @@ static struct {
   { (const void *)repro_wrap_sysctlbyname, (const void *)sysctlbyname },
   { (const void *)repro_wrap_sysctl, (const void *)sysctl },
   { (const void *)repro_wrap_uname, (const void *)uname },
+  /* ROUND-5 D — the syscall(2) escape hatch: a file syscall issued via the
+   * libsystem `syscall` indirect trap bypasses the named-symbol hooks. Cast through
+   * void* because syscall's public prototype is variadic. Interpose-only. */
+  { (const void *)repro_wrap_syscall, (const void *)syscall },
   { (const void *)repro_wrap_gethostname, (const void *)gethostname },
   { (const void *)repro_wrap_gethostuuid, (const void *)gethostuuid },
   { (const void *)repro_wrap_getentropy, (const void *)getentropy },

@@ -55,13 +55,21 @@ into an un-injectable (hardened/SIP) image, a root that stripped
 `mcIncomplete`. This contract has been exercised by the adversarial-hardening
 campaigns in
 `reprobuild-specs/MacOS-Monitoring-Adversarial-Hardening.milestones.org` (the
-`adv_*` / `r2_*` corpora under `research/`). **Known residual gaps**, tracked
-honestly: raw-syscall / indirect-syscall and XPC/Mach-IPC observation are
-structurally invisible to the in-process interpose backend (adversarial
-hardening #6) — these are the motivation for the designed/skeletoned
-**EndpointSecurity** backend (`reprobuild-specs/MacOS-EndpointSecurity-Backend.md`),
-which is behind the off-by-default `-d:ioMonEndpointSecurity` define and refuses
-to start as an honest stub today.
+`adv_*` / `r2_*` / `round5` corpora under `research/`). **Known residual gaps**,
+tracked honestly: raw-syscall / indirect-syscall and XPC/Mach-IPC *content
+capture* is structurally invisible to the in-process interpose backend
+(adversarial hardening #6) — the backend cannot record WHICH file a binary read
+through an inline `svc` or the `syscall(2)` trap. It is, however, **made safe**
+rather than silent: a monitored binary whose own `__TEXT` contains an inline
+`svc #0x80` (Go / statically-linked / adversarial), or that reaches a file through
+the `syscall(2)` escape hatch, is DOWNGRADED to `mcIncomplete` (a conservative
+re-run) instead of publishing a false `mcComplete` (round 5). A normal
+dynamically-linked build tool routes every syscall through libsystem, so it scans
+clean and is never false-downgraded. Recording the specific dependency (not just
+downgrading) is the motivation for the designed/skeletoned **EndpointSecurity**
+backend (`reprobuild-specs/MacOS-EndpointSecurity-Backend.md`), which is behind the
+off-by-default `-d:ioMonEndpointSecurity` define and refuses to start as an honest
+stub today. XPC/Mach-IPC content capture remains the other such residual.
 
 ### Platform scope
 
