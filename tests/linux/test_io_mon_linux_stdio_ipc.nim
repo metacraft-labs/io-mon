@@ -1617,6 +1617,134 @@ int main(void) {
     check hasRecord(dep, mrTimeRead, "time")
     check hasRecord(dep, mrNonDeterministic, "getrandom")
 
+  test "direct linux vDSO dlsym calls record determinism evidence or fail closed":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let probe = buildC(work, "linux_direct_vdso_dlsym", """
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <sched.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/random.h>
+#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
+
+typedef int (*vdso_clock_gettime_fn)(clockid_t, struct timespec *);
+typedef int (*vdso_gettimeofday_fn)(struct timeval *, struct timezone *);
+typedef time_t (*vdso_time_fn)(time_t *);
+typedef int (*vdso_clock_getres_fn)(clockid_t, struct timespec *);
+typedef int (*vdso_getcpu_fn)(unsigned *, unsigned *, void *);
+typedef ssize_t (*vdso_getrandom_fn)(void *, size_t, unsigned int, void *, size_t);
+
+static int note(const char *name) {
+  printf("called %s\n", name);
+  return 1;
+}
+
+int main(void) {
+  void *h = dlopen("linux-vdso.so.1", RTLD_LAZY | RTLD_LOCAL);
+  if (h == NULL) {
+    fprintf(stderr, "dlopen linux-vdso.so.1 failed: %s\n", dlerror());
+    return 2;
+  }
+  int called = 0;
+  void *sym;
+  struct timespec ts;
+  struct timeval tv;
+  time_t now = 0;
+
+  sym = dlsym(h, "__vdso_clock_gettime");
+  if (sym != NULL) {
+    if (((vdso_clock_gettime_fn)sym)(CLOCK_REALTIME, &ts) != 0) return 3;
+    called += note("__vdso_clock_gettime");
+  }
+
+  sym = dlsym(h, "__vdso_gettimeofday");
+  if (sym != NULL) {
+    if (((vdso_gettimeofday_fn)sym)(&tv, NULL) != 0) return 4;
+    called += note("__vdso_gettimeofday");
+  }
+
+  sym = dlsym(h, "__vdso_time");
+  if (sym != NULL) {
+    if (((vdso_time_fn)sym)(&now) == (time_t)-1) return 5;
+    called += note("__vdso_time");
+  }
+
+  sym = dlsym(h, "__vdso_clock_getres");
+  if (sym != NULL) {
+    if (((vdso_clock_getres_fn)sym)(CLOCK_REALTIME, &ts) != 0) return 6;
+    called += note("__vdso_clock_getres");
+  }
+
+  sym = dlsym(h, "__vdso_getcpu");
+  if (sym != NULL) {
+    unsigned cpu = 0, node = 0;
+    if (((vdso_getcpu_fn)sym)(&cpu, &node, NULL) != 0) return 7;
+    called += note("__vdso_getcpu");
+  }
+
+  sym = dlsym(h, "__vdso_getrandom");
+  if (sym != NULL) {
+    unsigned char rnd[8];
+    ssize_t n = ((vdso_getrandom_fn)sym)(rnd, sizeof(rnd), 0, NULL, 0);
+    if (n < 0) {
+      fprintf(stderr, "__vdso_getrandom failed: %s\n", strerror(errno));
+      return 8;
+    }
+    called += note("__vdso_getrandom");
+  }
+
+  dlclose(h);
+  return called > 0 ? 0 : 9;
+}
+""", @["-ldl"])
+    let depfile = work / "direct-vdso-dlsym.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", probe],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    let eventLoss = dep.records.anyIt(it.kind == mrEventLoss and
+      "linux vdso" in it.detail)
+    if dep.completeness == mcIncomplete:
+      check eventLoss
+    else:
+      check dep.completeness == mcComplete
+      if "called __vdso_clock_gettime" in cap.output:
+        check dep.records.anyIt(it.kind == mrTimeRead and
+          it.path.startsWith("clock_gettime:"))
+      if "called __vdso_gettimeofday" in cap.output:
+        check hasRecord(dep, mrTimeRead, "gettimeofday")
+      if "called __vdso_time" in cap.output:
+        check hasRecord(dep, mrTimeRead, "time")
+      if "called __vdso_clock_getres" in cap.output:
+        check dep.records.anyIt(it.kind == mrTimeRead and
+          it.path.startsWith("clock_getres:"))
+      if "called __vdso_getcpu" in cap.output:
+        check hasRecord(dep, mrSysctlRead, "getcpu")
+      if "called __vdso_getrandom" in cap.output:
+        check hasRecord(dep, mrNonDeterministic, "getrandom")
+
   test "unsupported raw libc syscall still fails closed":
     let snoopBin = work / "io-mon"
     if not fileExists(snoopBin):
