@@ -6,6 +6,104 @@ import io_mon/render
 import io_mon/types
 import io_mon/writer
 
+when defined(linux):
+  import std/[monotimes, sequtils]
+
+  const
+    LinuxInjectedDescendantGraceMsDefault = 500
+    LinuxInjectedDescendantPollMsDefault = 25
+
+  proc envInt(name: string; defaultValue, minValue: int): int =
+    let raw = getEnv(name)
+    if raw.len == 0:
+      return defaultValue
+    try:
+      result = parseInt(raw)
+      if result < minValue:
+        result = minValue
+    except ValueError:
+      result = defaultValue
+
+  proc linuxProcState(pid: int): tuple[state: char; ok: bool] =
+    let statPath = "/proc" / $pid / "stat"
+    try:
+      let stat = readFile(extendedPath(statPath))
+      let closeParen = stat.rfind(")")
+      if closeParen < 0 or closeParen + 2 >= stat.len:
+        return ('\0', false)
+      return (stat[closeParen + 2], true)
+    except IOError, OSError:
+      return ('\0', false)
+
+  proc environCarriesInvocation(environ, runId, fragmentDir: string): bool =
+    let sessionNeedle = "REPRO_MONITOR_SESSION=" & runId
+    let fragmentNeedle = "REPRO_MONITOR_FRAGMENT_DIR=" & fragmentDir
+    for entry in environ.split('\0'):
+      if entry == sessionNeedle or entry == fragmentNeedle:
+        return true
+    false
+
+  proc liveInjectedDescendants(runId, fragmentDir: string; rootPid: uint64):
+      tuple[pids: seq[int]; scanFailed: bool] =
+    if not dirExists("/proc"):
+      return (@[], true)
+    let selfPid = getCurrentProcessId()
+    try:
+      for kind, path in walkDir("/proc"):
+        if kind != pcDir:
+          continue
+        let name = path.extractFilename
+        if name.len == 0 or not name.allIt(it in {'0' .. '9'}):
+          continue
+        let pid = parseInt(name)
+        if pid == selfPid or uint64(pid) == rootPid:
+          continue
+        let procState = linuxProcState(pid)
+        if not procState.ok:
+          continue
+        if procState.state == 'Z':
+          continue
+        let envPath = path / "environ"
+        var envBytes = ""
+        try:
+          envBytes = readFile(extendedPath(envPath))
+        except IOError, OSError:
+          continue
+        if environCarriesInvocation(envBytes, runId, fragmentDir):
+          result.pids.add pid
+    except OSError:
+      return (@[], true)
+
+  proc appendLauncherEventLoss(fragmentDir, runId, detail: string) =
+    appendFragmentRecord(fragmentDir, MonitorRecord(
+      kind: mrEventLoss,
+      observationKind: moEventLoss,
+      osPid: uint64(getCurrentProcessId()),
+      detail: detail & " run=" & runId))
+
+  proc waitForLinuxInjectedDescendants(fragmentDir, runId: string;
+      rootPid: uint64) =
+    let graceMs = envInt("IO_MON_LINUX_DESCENDANT_GRACE_MS",
+      LinuxInjectedDescendantGraceMsDefault, 0)
+    let pollMs = envInt("IO_MON_LINUX_DESCENDANT_POLL_MS",
+      LinuxInjectedDescendantPollMsDefault, 1)
+    let start = getMonoTime()
+    while true:
+      let live = liveInjectedDescendants(runId, fragmentDir, rootPid)
+      if live.scanFailed:
+        appendLauncherEventLoss(fragmentDir, runId,
+          "linux injected-descendant /proc scan failed")
+        return
+      if live.pids.len == 0:
+        return
+      let elapsedMs = inMilliseconds(getMonoTime() - start)
+      if elapsedMs >= graceMs:
+        appendLauncherEventLoss(fragmentDir, runId,
+          "linux injected descendants still live after root exit pids=" &
+            live.pids.join(","))
+        return
+      sleep(min(pollMs, graceMs - int(elapsedMs)))
+
 # Windows: pull in the CreateRemoteThread+LoadLibraryW injector that
 # substitutes for the macOS DYLD_INSERT_LIBRARIES env-var injection.
 when defined(windows):
@@ -591,10 +689,11 @@ proc runMonitoredCommand(request: FsSnoopRequest): int =
     ensureParentDir(request.depFilePath)
 
     var oldEnv: seq[(string, string, bool)] = @[]
+    let runId = $epochTime()
     setEnvVar("LD_PRELOAD", injectionValue(shimLib), oldEnv)
     setEnvVar("REPRO_MONITOR_FRAGMENT_DIR", fragmentDir, oldEnv)
     setEnvVar("REPRO_MONITOR_OUTPUT", request.depFilePath, oldEnv)
-    setEnvVar("REPRO_MONITOR_SESSION", $epochTime(), oldEnv)
+    setEnvVar("REPRO_MONITOR_SESSION", runId, oldEnv)
     setEnvVar("REPRO_MONITOR_SHIM_LIB", shimLib, oldEnv)
     defer: restoreEnv(oldEnv)
 
@@ -611,8 +710,9 @@ proc runMonitoredCommand(request: FsSnoopRequest): int =
     result = waitForExit(process)
     close(process)
 
+    waitForLinuxInjectedDescendants(fragmentDir, runId, rootPid)
     discard mergeFragments(fragmentDir, request.depFilePath,
-      expectedRootPid = rootPid)
+      expectedRootPid = rootPid, currentRunId = runId)
     discard readMonitorDepFile(request.depFilePath)
     renderStreamToPath(request.depFilePath, request.streamMode,
       request.eventStreamPath)

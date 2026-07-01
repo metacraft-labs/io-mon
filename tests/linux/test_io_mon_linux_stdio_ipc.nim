@@ -61,6 +61,15 @@ proc hasPathProbe(dep: MonitorDepFile; path: string): bool =
 proc hasRecord(dep: MonitorDepFile; kind: MonitorRecordKind; path: string): bool =
   dep.records.anyIt(it.kind == kind and it.path == path)
 
+proc waitForPath(path: string; timeoutMs = 2000): bool =
+  var waited = 0
+  while waited <= timeoutMs:
+    if fileExists(path):
+      return true
+    sleep(20)
+    waited += 20
+  false
+
 suite "io-mon Linux LD_PRELOAD live gaps":
   let work = getTempDir() / ("io-mon-linux-live-" & $getCurrentProcessId())
   createDir(work)
@@ -105,6 +114,108 @@ int main(int argc, char **argv) {
     let dep = readMonitorDepFile(depfile)
     check dep.completeness == mcComplete
     check dep.records.anyIt(it.kind == mrFileRead and marker in it.path)
+
+  test "daemonized injected descendant after root exit is waited or fails closed":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let daemonProbe = buildC(work, "daemon_late_reader", """
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+static void msleep_arg(const char *s) {
+  long ms = strtol(s, NULL, 10);
+  if (ms > 0) usleep((useconds_t)ms * 1000);
+}
+
+int main(int argc, char **argv) {
+  if (argc != 5) return 2;
+  pid_t pid = fork();
+  if (pid < 0) return 3;
+  if (pid > 0) return 0;
+  if (setsid() < 0) _exit(4);
+  pid = fork();
+  if (pid < 0) _exit(5);
+  if (pid > 0) _exit(0);
+
+  msleep_arg(argv[3]);
+  int in = open(argv[1], O_RDONLY);
+  if (in < 0) _exit(6);
+  char buf[64];
+  ssize_t n = read(in, buf, sizeof(buf));
+  close(in);
+  int out = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if (out >= 0) {
+    if (n > 0) write(out, "read\n", 5);
+    else write(out, "empty\n", 6);
+    close(out);
+  }
+  msleep_arg(argv[4]);
+  _exit(n > 0 ? 0 : 7);
+}
+""")
+    let marker = work / "daemon-late-marker.txt"
+    writeFile(marker, "daemon late marker\n")
+
+    block quiescesInsideGrace:
+      let depfile = work / "daemon-quiesce.rdep"
+      let proof = work / "daemon-quiesce.proof"
+      try: removeFile(proof)
+      except OSError: discard
+      var childEnv = newStringTable(modeCaseSensitive)
+      for k, v in envPairs(): childEnv[k] = v
+      childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+      childEnv["IO_MON_LINUX_DESCENDANT_GRACE_MS"] = "1000"
+      childEnv["IO_MON_LINUX_DESCENDANT_POLL_MS"] = "10"
+      let cap = run(snoopBin, @["run", "--depfile", depfile, "--",
+        daemonProbe, marker, proof, "20", "0"], childEnv)
+      checkpoint("daemon quiesce output: " & cap.output)
+      check cap.code == 0
+      check waitForPath(proof)
+      check readFile(proof) == "read\n"
+
+      let dep = readMonitorDepFile(depfile)
+      check hasFileRead(dep, marker)
+      check dep.completeness == mcComplete
+      check not dep.records.anyIt(it.kind == mrEventLoss and
+        "linux injected descendants still live" in it.detail)
+
+    block livePastGrace:
+      let depfile = work / "daemon-live-past-grace.rdep"
+      let proof = work / "daemon-live-past-grace.proof"
+      try: removeFile(proof)
+      except OSError: discard
+      var childEnv = newStringTable(modeCaseSensitive)
+      for k, v in envPairs(): childEnv[k] = v
+      childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+      childEnv["IO_MON_LINUX_DESCENDANT_GRACE_MS"] = "100"
+      childEnv["IO_MON_LINUX_DESCENDANT_POLL_MS"] = "10"
+      let cap = run(snoopBin, @["run", "--depfile", depfile, "--",
+        daemonProbe, marker, proof, "200", "200"], childEnv)
+      checkpoint("daemon live output: " & cap.output)
+      check cap.code == 0
+      check waitForPath(proof)
+      check readFile(proof) == "read\n"
+
+      let dep = readMonitorDepFile(depfile)
+      check dep.completeness == mcIncomplete
+      check dep.records.anyIt(it.kind == mrEventLoss and
+        ("linux injected descendants still live" in it.detail or
+         "linux injected-descendant /proc scan failed" in it.detail))
 
   test "positioned vector and zero-copy libc reads capture source dependency":
     let snoopBin = work / "io-mon"
