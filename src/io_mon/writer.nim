@@ -1240,32 +1240,71 @@ proc loadBreakawayReports*(reportDir: string; monitored: HashSet[uint64];
     var clientPid, daemonPid: uint64 = 0
     var reportRun, reportNonce: string = ""
     var declaredComplete = false
+    var sawClient, sawDaemon, sawRun, sawNonce = false
+    var malformedReport = false
     var readPaths: seq[string] = @[]
     for rawLine in content.splitLines():
       let line = rawLine.strip()
+      if line.len == 0 or line == BreakawayReportMagic:
+        continue
       if line == BreakawayReportCompleteToken:
+        if declaredComplete:
+          malformedReport = true
+          break
         declaredComplete = true
         continue
       let toks = line.splitWhitespace()
       if toks.len < 2:
+        malformedReport = true
+        break
+      if toks[0] != "read" and toks.len != 2:
+        malformedReport = true
+        break
+      if toks[0] == "read":
+        # A read path may itself contain spaces, so take everything after the
+        # directive verbatim rather than relying on the whitespace split.
+        let readPath = line[("read".len) .. ^1].strip()
+        if readPath.len == 0:
+          malformedReport = true
+          break
+        readPaths.add readPath
         continue
       case toks[0]
       of "client":
+        if sawClient:
+          malformedReport = true
+          break
+        sawClient = true
         try: clientPid = uint64(parseBiggestUInt(toks[1]))
-        except ValueError: discard
+        except ValueError:
+          malformedReport = true
+          break
       of "daemon":
+        if sawDaemon:
+          malformedReport = true
+          break
+        sawDaemon = true
         try: daemonPid = uint64(parseBiggestUInt(toks[1]))
-        except ValueError: discard
+        except ValueError:
+          malformedReport = true
+          break
       of "run":
+        if sawRun:
+          malformedReport = true
+          break
+        sawRun = true
         reportRun = toks[1]
       of "nonce":
+        if sawNonce:
+          malformedReport = true
+          break
+        sawNonce = true
         reportNonce = toks[1]
-      of "read":
-        # A read path may itself contain spaces, so take everything after the
-        # directive verbatim rather than relying on the whitespace split.
-        readPaths.add line[("read".len) .. ^1].strip()
       else:
-        discard
+        malformedReport = true
+        break
+    if malformedReport:
+      continue
     # ---- ROUND-2 R8 authentication (fail-closed: any unmet criterion ⇒ ignore) --
     # 1. client must be a monitored process of THIS invocation.
     if clientPid == 0 or clientPid notin monitored:

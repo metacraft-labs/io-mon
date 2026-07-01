@@ -309,6 +309,42 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
       check r.path != "/stale/build/file.h"
     removeDir(work)
 
+  test "MALFORMED: duplicate run lines reject the whole report":
+    # Old behavior overwrote reportRun while parsing, so OLD then CURRENT could
+    # make a stale/ambiguous report look current. Duplicate singleton structural
+    # fields are now untrusted, so the out-of-tree daemon still downgrades.
+    let work = getTempDir() / ("io-mon-r8-dup-run-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let reportDir = work / "reports"
+    createDir(reportDir)
+    let frag = clientFrag(work, 4242'u64, 9999'u64)
+    let decoy = "/stale/build/duplicate-run.h"
+    writeFile(reportDir / "duplicate-run.io-mon-report",
+      "io-mon-breakaway-report v1\nrun OLD-SESSION-999\nrun " & runId &
+        "\nclient 4242\ndaemon 9999\nread " & decoy & "\ncomplete\n")
+    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    check dep.completeness == mcIncomplete
+    for r in dep.records:
+      check r.path != decoy
+    removeDir(work)
+
+  test "MALFORMED: unknown structural line rejects the whole report":
+    let work = getTempDir() / ("io-mon-r8-unknown-line-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let reportDir = work / "reports"
+    createDir(reportDir)
+    let frag = clientFrag(work, 4242'u64, 9999'u64)
+    let decoy = "/stale/build/unknown-line.h"
+    writeFile(reportDir / "unknown-line.io-mon-report",
+      "io-mon-breakaway-report v1\nrun " & runId &
+        "\nclient 4242\ndaemon 9999\nunexpected structural-field\nread " &
+        decoy & "\ncomplete\n")
+    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    check dep.completeness == mcIncomplete
+    for r in dep.records:
+      check r.path != decoy
+    removeDir(work)
+
   test "a complete report for an UN-OBSERVED daemon (no connect) is rejected":
     # Connection binding: the report names a daemon the client never connected to.
     let work = getTempDir() / ("io-mon-r8-noconn-" & $getCurrentProcessId())
