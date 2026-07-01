@@ -158,6 +158,55 @@ int main(int argc, char **argv) {
     check not dep.records.anyIt(it.kind == mrEventLoss and
       "kill-before-flush" in it.detail)
 
+  test "read batch is flushed before a process execs a new image":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let reader = buildC(work, "read_then_exec", """
+#include <fcntl.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  char buf[64];
+  int fd = open(argv[1], O_RDONLY);
+  if (fd < 0) return 2;
+  ssize_t n = read(fd, buf, sizeof(buf));
+  close(fd);
+  if (n <= 0) return 3;
+  execl(argv[2], "true", (char *)0);
+  _exit(4);
+}
+""")
+    let trueBin = findExe("true")
+    check trueBin.len > 0
+    let marker = work / "read-then-exec-marker.txt"
+    writeFile(marker, "read then exec marker\n")
+    let depfile = work / "read-then-exec.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--",
+      reader, marker, trueBin], childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check hasFileRead(dep, marker)
+    check dep.records.anyIt(it.kind == mrProcessExec and it.path == trueBin)
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      "kill-before-flush" in it.detail)
+
   test "daemonized injected descendant after root exit is waited or fails closed":
     let snoopBin = work / "io-mon"
     if not fileExists(snoopBin):
