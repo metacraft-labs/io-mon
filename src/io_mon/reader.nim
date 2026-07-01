@@ -52,7 +52,6 @@ proc decodeMonitorDepFile(bytes: openArray[byte];
 
   let bodyStart = pos
   let bodyEnd = bodyStart + bodyLen
-  let body = bytes[bodyStart ..< bodyEnd]
   pos = bodyEnd
   if fromBytes(bytes.toOpenArray(pos, pos + 3)) != RmdfTrailerMagic:
     raiseMonitorDepFileReaderError(mrTruncated, "missing RMDF trailer")
@@ -62,12 +61,19 @@ proc decodeMonitorDepFile(bytes: openArray[byte];
   if trailerCount != headerCount:
     raiseMonitorDepFileReaderError(mrSemanticValidationFailed,
       "RMDF record count mismatch")
-  if options.requireTrailerChecksum and trailerChecksum != checksum(body):
-    raiseMonitorDepFileReaderError(mrChecksumMismatch, "RMDF checksum mismatch")
+  if options.requireTrailerChecksum:
+    let bodyChecksum =
+      if bodyLen == 0: checksum(newSeq[byte]())
+      else: checksum(bytes.toOpenArray(bodyStart, bodyEnd - 1))
+    if trailerChecksum != bodyChecksum:
+      raiseMonitorDepFileReaderError(mrChecksumMismatch, "RMDF checksum mismatch")
 
   var records: seq[MonitorRecord]
   try:
-    records = decodeFrames(body)
+    if bodyLen == 0:
+      records = @[]
+    else:
+      records = decodeFrames(bytes.toOpenArray(bodyStart, bodyEnd - 1))
   except EnvelopeError as err:
     raiseMonitorDepFileReaderError(classifyEnvelopeError(err), err.msg)
   if uint64(records.len) != headerCount:
@@ -75,7 +81,7 @@ proc decodeMonitorDepFile(bytes: openArray[byte];
       "RMDF frame count mismatch")
   validateSequenceOrder(records)
 
-  result = depFileFromRecords(records)
+  result = depFileFromOwnedRecords(move(records))
   result.version = version
 
 proc readMonitorDepFile*(path: string;

@@ -674,7 +674,6 @@ proc runMonitoredCommand(request: FsSnoopRequest): int =
 
     discard mergeFragments(fragmentDir, request.depFilePath,
       expectedRootPid = rootPid)
-    discard readMonitorDepFile(request.depFilePath)
     renderStreamToPath(request.depFilePath, request.streamMode,
       request.eventStreamPath)
   elif defined(linux):
@@ -713,7 +712,6 @@ proc runMonitoredCommand(request: FsSnoopRequest): int =
     waitForLinuxInjectedDescendants(fragmentDir, runId, rootPid)
     discard mergeFragments(fragmentDir, request.depFilePath,
       expectedRootPid = rootPid, currentRunId = runId)
-    discard readMonitorDepFile(request.depFilePath)
     renderStreamToPath(request.depFilePath, request.streamMode,
       request.eventStreamPath)
   elif defined(windows):
@@ -745,7 +743,6 @@ proc runMonitoredCommand(request: FsSnoopRequest): int =
     result = injection.exitCode
 
     discard mergeFragments(fragmentDir, request.depFilePath)
-    discard readMonitorDepFile(request.depFilePath)
     renderStreamToPath(request.depFilePath, request.streamMode,
       request.eventStreamPath)
   else:

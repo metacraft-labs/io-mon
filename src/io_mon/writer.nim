@@ -368,11 +368,21 @@ proc discardFragmentSlotAfterFork*() =
   fragmentSlot.batchOpenedAtNs = 0
   fragmentSlot.batchProbeCountdown = 0
 
-proc checksum*(bytes: openArray[byte]): uint64 =
-  result = FnvOffset
+proc checksumUpdate(seed: uint64; bytes: openArray[byte]): uint64 =
+  result = seed
   for b in bytes:
     result = result xor uint64(b)
     result = result * FnvPrime
+
+proc checksum*(bytes: openArray[byte]): uint64 =
+  checksumUpdate(FnvOffset, bytes)
+
+proc writeBytes(outp: var File; bytes: seq[byte]) =
+  if bytes.len == 0:
+    return
+  let written = outp.writeBuffer(unsafeAddr bytes[0], bytes.len)
+  if written != bytes.len:
+    raiseEnvelopeError(eeMalformed, "short write to RMDF depfile")
 
 proc writeI64Le(outp: var seq[byte]; value: int64) =
   outp.writeU64Le(cast[uint64](value))
@@ -720,12 +730,12 @@ proc summarizeRecords*(records: openArray[MonitorRecord]): MonitorSummary =
       inc result.observationCount
   result.processCount = uint64(processPids.len)
 
-proc depFileFromRecords*(records: openArray[MonitorRecord]): MonitorDepFile =
+proc depFileFromOwnedRecords*(records: sink seq[MonitorRecord]): MonitorDepFile =
   let summary = summarizeRecords(records)
   var profile = profileFromRecords(records)
   if summary.eventLossCount != 0:
     profile.evidenceComplete = false
-  MonitorDepFile(
+  result = MonitorDepFile(
     version: RmdfVersion,
     producerVersion: ReproMonitorDepfileProducer,
     backendFamily: profile.backendFamily,
@@ -736,8 +746,12 @@ proc depFileFromRecords*(records: openArray[MonitorRecord]): MonitorDepFile =
         mcIncomplete,
     profile: profile,
     capabilityGaps: profile.gaps,
-    summary: summary,
-    records: @records)
+    summary: summary)
+  result.records = move(records)
+
+proc depFileFromRecords*(records: openArray[MonitorRecord]): MonitorDepFile =
+  var owned = @records
+  depFileFromOwnedRecords(move(owned))
 
 proc encodeCanonical*(records: openArray[MonitorRecord]): seq[byte] =
   var ordered = @records
@@ -759,6 +773,49 @@ proc encodeCanonical*(records: openArray[MonitorRecord]): seq[byte] =
   result.add RmdfTrailerMagic.toBytes()
   result.writeU64Le(uint64(ordered.len))
   result.writeU64Le(checksum(body))
+
+proc writeCanonicalInPlace(outputPath: string; records: var seq[MonitorRecord]) =
+  ## Write the canonical RMDF envelope without materializing the full body/file.
+  ##
+  ## Large monitored builds can produce enough frames that `encodeCanonical`'s
+  ## ordered copy + body buffer + final file buffer dominate the monitor process'
+  ## RSS. The merge path already owns its record seq, so sort it in place, compute
+  ## body length/checksum in one frame-at-a-time pass, then stream the envelope to
+  ## disk in a second pass.
+  records.sort(canonicalOrder)
+  for i in 0 ..< records.len:
+    records[i].seq = uint64(i + 1)
+
+  var bodyLen = 0'u64
+  var bodyChecksum = FnvOffset
+  for record in records:
+    let frame = encodeFrame(record)
+    bodyLen += uint64(frame.len)
+    bodyChecksum = checksumUpdate(bodyChecksum, frame)
+
+  var outp: File
+  if not open(outp, extendedPath(outputPath), fmWrite):
+    raiseEnvelopeError(eeMalformed, "cannot open RMDF depfile for write: " &
+      outputPath)
+  try:
+    var header: seq[byte] = @[]
+    header.add RmdfMagic.toBytes()
+    header.writeU16Le(RmdfVersion)
+    header.writeU16Le(CanonicalFileKind)
+    header.writeU64Le(uint64(records.len))
+    header.writeU64Le(bodyLen)
+    outp.writeBytes(header)
+
+    for record in records:
+      outp.writeBytes(encodeFrame(record))
+
+    var trailer: seq[byte] = @[]
+    trailer.add RmdfTrailerMagic.toBytes()
+    trailer.writeU64Le(uint64(records.len))
+    trailer.writeU64Le(bodyChecksum)
+    outp.writeBytes(trailer)
+  finally:
+    close(outp)
 
 proc monitoredStartPids*(records: openArray[MonitorRecord]): HashSet[uint64] =
   ## The set of osPids that emitted an `mrProcessStart` — i.e. every process that
@@ -1691,10 +1748,9 @@ proc mergeFragments*(fragmentDir, outputPath: string;
     when defined(linux): LinuxPreloadSupportedCapabilities
     else: MacosMonitorShimTaxonomyCapabilities))
 
-  let canonical = encodeCanonical(records)
-  writeFile(extendedPath(outputPath), canonical.fromBytes())
-  depFileFromRecords(records)
+  writeCanonicalInPlace(outputPath, records)
+  depFileFromOwnedRecords(move(records))
 
 proc writeCanonical*(outputPath: string; records: openArray[MonitorRecord]) =
-  let canonical = encodeCanonical(records)
-  writeFile(extendedPath(outputPath), canonical.fromBytes())
+  var owned = @records
+  writeCanonicalInPlace(outputPath, owned)
