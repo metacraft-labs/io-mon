@@ -374,58 +374,87 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
       check r.path != "/other/build/file.h"
     removeDir(work)
 
-suite "io-mon R5 kill-before-flush durability (reading-sentinel)":
-  # ROUND-2 R5 — a monitored process whose MAIN thread buffered read records is
-  # SIGKILLed before its tail batch flushes (no dyld exit destructor) leaves the
-  # early-flushed process-start on disk but loses the un-flushed reads. The old
-  # merge published mcComplete MINUS those reads (the r2_machinery/kill_probe.c
-  # defeat). The writer now drops a `.io-mon-reading` sentinel the instant a batch
-  # turns dirty and removes it on flush; a leftover sentinel after the run proves a
-  # kill-before-flush, so mergeFragments injects an event-loss and downgrades. The
-  # sentinel lifecycle and the merge-side detection are BOTH platform-independent,
-  # so these tests reproduce the defeat deterministically without an actual signal.
+suite "io-mon R5 kill-before-flush durability (in-fragment marker)":
+  # ROUND-2 R5 / ROUND-5 F — a monitored process whose MAIN thread buffered read
+  # records is SIGKILLed before its tail batch flushes (no dyld exit destructor)
+  # leaves the early-flushed process-start on disk but loses the un-flushed reads.
+  # The old merge published mcComplete MINUS those reads (r2_machinery/kill_probe.c).
+  #
+  # ROUND-5 F replaced the defeatable round-2 sidecar sentinel FILE (a tracee could
+  # `unlink` its world-predictable path or `chmod` the dir to block its best-effort
+  # create — research/adversarial-2026-07-round5/machinery sab_*) with an IN-FRAGMENT
+  # marker: the writer writes a durable `read-tail-pending` mrEventLoss frame INTO the
+  # fragment the instant a batch turns dirty, and a `read-tail-committed` frame after
+  # the flush makes the reads durable. mergeFragments NETS pending vs committed per
+  # (osPid, threadId): an unmatched pending proves a kill-before-flush → event-loss →
+  # downgrade. Corrupting/removing the marker fails closed (it rides in the fragment
+  # whose truncation already downgrades). The marker lifecycle and the merge netting
+  # are platform-independent, so these tests reproduce the defeat deterministically.
 
   proc readRec(pid: uint64; path: string): MonitorRecord =
     MonitorRecord(kind: mrFileRead, observationKind: moFileRead,
       osPid: pid, path: path)
 
-  test "a dirty batch MARKS the sentinel; a flush CLEARS it (lifecycle)":
+  proc fragHas(frag: string; pid, tid: uint64; detail: string): bool =
+    ## True iff this thread's fragment file contains an mrEventLoss marker `detail`.
+    let path = fragmentPath(frag, pid, tid)
+    if not fileExists(path): return false
+    for r in readFragmentRecords(path):
+      if r.kind == mrEventLoss and r.detail == detail:
+        return true
+
+  test "a dirty batch writes a PENDING marker; a flush writes a COMMITTED marker":
     let work = getTempDir() / ("io-mon-r5-life-" & $getCurrentProcessId())
     removeDir(work); createDir(work)
     let frag = work / "frags"
     createDir(frag)
-    let sentinel = readingSentinelPath(frag, 700'u64, 0'u64)
-    # A buffered (un-flushed) record turns the batch dirty → sentinel appears.
-    appendFragmentRecord(frag, startAt(700'u64, "1000"))
-    check fileExists(sentinel)
-    # An explicit flush makes the tail durable → the sentinel is retired.
+    # A buffered (un-flushed) record turns the batch dirty → a durable pending
+    # marker is written straight to the fragment (the read record is still buffered).
+    appendFragmentRecord(frag, readRec(700'u64, "/dep/header.h"))
+    check fragHas(frag, 700'u64, 0'u64, ReadTailPendingDetail)
+    check not fragHas(frag, 700'u64, 0'u64, ReadTailCommittedDetail)
+    # An explicit flush makes the tail durable → a committed marker is appended.
     flushFragmentBatch()
-    check not fileExists(sentinel)
+    check fragHas(frag, 700'u64, 0'u64, ReadTailCommittedDetail)
     removeDir(work)
 
-  test "a leftover sentinel (killed pre-flush) downgrades to mcIncomplete":
-    # Model the kill: a durable process-start is already on disk (early flush),
-    # but an orphaned `.io-mon-reading` sentinel remains — the un-flushed read tail
-    # the dead process never persisted. The merge MUST downgrade, NOT publish a
+  test "an unmatched PENDING (killed pre-flush) downgrades to mcIncomplete":
+    # Model the kill on-disk (like the round-2 test manually dropped a sidecar): a
+    # durable process-start (early-flushed, survives the kill) + a durable pending
+    # marker (the dirty-batch signal), but NO committed marker — the un-flushed read
+    # tail the dead process never persisted. The merge MUST downgrade, NOT publish a
     # false mcComplete minus the lost read.
     let work = getTempDir() / ("io-mon-r5-kill-" & $getCurrentProcessId())
     removeDir(work); createDir(work)
     let frag = work / "frags"
     createDir(frag)
-    # Durable process-start (the early-flushed evidence that survives the kill).
     appendFragmentRecord(frag, startAt(700'u64, "1000"))
-    flushFragmentBatch()
-    # Orphaned tail sentinel left behind by the uncatchable SIGKILL.
-    writeFile(readingSentinelPath(frag, 700'u64, 0'u64), "")
+    flushFragmentBatch()          # process-start durable + this cycle's pair netted
+    # The killed process's un-committed pending: append it straight to the fragment
+    # file (the durable state a SIGKILL leaves — pending on disk, no committed).
+    let path = fragmentPath(frag, 700'u64, 0'u64)
+    let frame = encodeFrame(MonitorRecord(kind: mrEventLoss,
+      observationKind: moEventLoss, osPid: 700'u64, threadId: 0'u64,
+      detail: ReadTailPendingDetail))
+    var f: File
+    doAssert open(f, path, fmAppend)
+    doAssert f.writeBuffer(unsafeAddr frame[0], frame.len) == frame.len
+    close(f)
     let dep = mergeFragments(frag, work / "out.rdep")
     check dep.completeness == mcIncomplete
-    # The merge CONSUMES the sentinel so a warm-restart merge does not double-count.
-    check not fileExists(readingSentinelPath(frag, 700'u64, 0'u64))
+    # A kill-before-flush event-loss was injected; no read-tail bookkeeping leaked.
+    var sawKill = false
+    for r in dep.records:
+      check r.detail != ReadTailPendingDetail
+      check r.detail != ReadTailCommittedDetail
+      if r.detail.contains("kill-before-flush"): sawKill = true
+    check sawKill
     removeDir(work)
 
-  test "a clean flushed run (no leftover sentinel) stays mcComplete":
+  test "a clean flushed run nets to zero and stays mcComplete":
     # The no-false-downgrade guard: a process that started, read a file and flushed
-    # cleanly leaves NO sentinel, so its build is still complete.
+    # cleanly writes a pending+committed pair that NETS to zero, so its build is
+    # complete and NO kill-before-flush is injected.
     let work = getTempDir() / ("io-mon-r5-clean-" & $getCurrentProcessId())
     removeDir(work); createDir(work)
     let frag = work / "frags"
@@ -433,9 +462,34 @@ suite "io-mon R5 kill-before-flush durability (reading-sentinel)":
     appendFragmentRecord(frag, startAt(700'u64, "1000"))
     appendFragmentRecord(frag, readRec(700'u64, "/dep/header.h"))
     flushFragmentBatch()
-    check not fileExists(readingSentinelPath(frag, 700'u64, 0'u64))
     let dep = mergeFragments(frag, work / "out.rdep")
     check dep.completeness == mcComplete
+    # The pending/committed bookkeeping markers are stripped from the output, and no
+    # kill-before-flush was injected (the netting cancelled cleanly).
+    for r in dep.records:
+      check r.detail != ReadTailPendingDetail
+      check r.detail != ReadTailCommittedDetail
+      check not r.detail.contains("kill-before-flush")
+    removeDir(work)
+
+  test "MANY dirty→clean cycles net to zero (no false downgrade at scale)":
+    # The netting must cancel across THOUSANDS of batch cycles (a real build): every
+    # pending is matched by a committed, so a large build with many flushes stays
+    # mcComplete. Guards the cardinal-sin inverse — a leak here re-runs every build.
+    let work = getTempDir() / ("io-mon-r5-many-" & $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let frag = work / "frags"
+    createDir(frag)
+    appendFragmentRecord(frag, startAt(700'u64, "1000"))
+    for i in 0 ..< 500:
+      appendFragmentRecord(frag, readRec(700'u64, "/dep/h" & $i & ".h"))
+      flushFragmentBatch()   # each cycle: pending (on dirty) + committed (on flush)
+    let dep = mergeFragments(frag, work / "out.rdep")
+    check dep.completeness == mcComplete
+    var kills = 0
+    for r in dep.records:
+      if r.detail.contains("kill-before-flush"): inc kills
+    check kills == 0
     removeDir(work)
 
 suite "io-mon S3a self-authored breakaway-report forgery (write provenance)":
