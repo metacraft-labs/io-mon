@@ -442,7 +442,7 @@ unsigned long long repro_macos_proc_start_usec(int pid) {
  * for an observed connection, so a report cannot be fabricated for a connection
  * the monitor never saw. arc4random_buf is CSPRNG-grade and unguessable.
  *
- * ROUND-2 R-D — the shim now INTERPOSES arc4random_buf (entropy auto-downgrade).
+ * ROUND-2 R-D — the shim now INTERPOSES arc4random_buf (entropy observation).
  * The shim's OWN nonce randomness here MUST NOT be recorded as the monitored
  * program's non-determinism — that would self-downgrade EVERY capture with an IPC
  * connect (the cardinal sin). We forward to the GENUINE libsystem arc4random_buf
@@ -753,10 +753,10 @@ int repro_macos_dyld_image_dep_path(void *mh_raw, void *out_raw,
   return 1;
 }
 
-/* ROUND-2 R-D — CALLER ATTRIBUTION for the entropy auto-downgrade.
+/* ROUND-2 R-D — CALLER ATTRIBUTION for entropy observations.
  *
- * The entropy hooks (arc4random*, getentropy) AUTO-DOWNGRADE, so a false positive
- * is catastrophic. The original R-D premise — that an interpose hook sees ONLY the
+ * The entropy hooks (arc4random*, getentropy) emit policy evidence, so false
+ * positives still matter. The original R-D premise — that an interpose hook sees ONLY the
  * program's OWN direct entropy use because libsystem-internal randomness "never
  * crosses an import stub" — is FALSE: on every process startup /usr/lib/libobjc,
  * /usr/lib/swift/libswiftCore, /usr/lib/system/libsystem_malloc / _trace call
@@ -2362,7 +2362,7 @@ proc ct_macos_capture_main_image*() =
   impl()
 
 proc ct_macos_addr_in_program*(caller: pointer): bool =
-  ## ROUND-2 R-D — CALLER ATTRIBUTION for the entropy auto-downgrade. True iff
+  ## ROUND-2 R-D — CALLER ATTRIBUTION for entropy observations. True iff
   ## `caller` (the return address captured at an entropy hook) is in the monitored
   ## program's OWN main-executable __TEXT — the program's direct entropy use (to
   ## flag). False for the benign libsystem/libobjc/libswift baseline or an unknown
@@ -2403,7 +2403,7 @@ proc ct_macos_addimage_burst_done*(): bool =
   impl() != 0
 
 proc ct_macos_addr_in_nonsystem*(caller: pointer): bool =
-  ## ROUND-3 S3b — CALLER ATTRIBUTION for the entropy auto-downgrade, widened from
+  ## ROUND-3 S3b — CALLER ATTRIBUTION for entropy observations, widened from
   ## the round-2 main-exe-only test to ANY NON-SYSTEM image. True iff `caller` lies
   ## in the main executable's __TEXT OR any registered non-system dylib/bundle's
   ## __TEXT (a compiler pass-plugin, a toolchain dylib, a dlopen'd image) ⇒ the

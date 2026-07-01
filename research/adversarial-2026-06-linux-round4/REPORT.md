@@ -21,7 +21,7 @@ Scratch artifacts: `/tmp/io_mon_linux_round4`.
 | 10 | Direct raw `syscall(SYS_splice)` | Captured by M-FW-6D over file-to-pipe and pipe-to-file legs. |
 | 11 | Hardlink alias read | Captured by M-FW-6B for libc-visible `link`/`linkat`: source identity is recorded as a file read and the alias as a write. Direct raw mutation variants remain residual. |
 | 12 | Rename staging write | Captured by M-FW-6B for libc-visible `rename`/`renameat`/`renameat2`: final destination path is recorded as a write. Direct raw mutation variants remain residual. |
-| 13 | Non-file determinism (`getenv`, `uname`, `sysconf`, clock, `getrandom`) | Captured by M-FW-6C for the libc-visible subset: observed-input records for env/uname/sysconf/time diagnostics plus `getrandom` non-determinism, yielding `mcIncomplete`. |
+| 13 | Non-file determinism (`getenv`, `uname`, `sysconf`, clock, `getrandom`) | Captured by M-FW-6C for the libc-visible subset: observed-input records for env/uname/sysconf/time diagnostics plus `getrandom` non-determinism evidence, while completeness remains `mcComplete` when no monitoring loss occurs. |
 
 No new silent false-negative was confirmed in the newly targeted
 libc-visible positioned/vector/zero-copy file-content channels. The first two
@@ -66,11 +66,9 @@ model:
   downgrade by itself.
 - `uname` and `sysconf` emit `mrSysctlRead` (`uname` and `sysconf:<id>`) and
   do not downgrade by themselves.
-- `clock_gettime`, `gettimeofday`, and `time` emit `mrTimeRead` diagnostics
-  and do not auto-downgrade, preserving the cardinal-sin guard for normal
-  builds that read clocks benignly.
-- Successful `getrandom` emits `mrNonDeterministic`, which the existing merge
-  path maps to event-loss and `mcIncomplete`.
+- `clock_gettime`, `gettimeofday`, and `time` emit `mrTimeRead` evidence.
+- Successful `getrandom` emits `mrNonDeterministic` evidence; caller policy
+  decides whether that invalidates a build/cache result.
 - Direct raw syscall and vDSO clock/time paths are not claimed by this slice.
 
 ## Fourth fix milestone

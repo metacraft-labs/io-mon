@@ -11,4 +11,4 @@ raw_copy_file_range	0	mcComplete	yes	yes	no	no	no	captured
 raw_splice	0	mcComplete	yes	yes	no	no	no	captured
 hardlink_alias	0	mcComplete	yes	yes	no	no	no	captured
 rename_staging	0	mcComplete	yes	yes	no	no	no	captured
-nonfile	0	mcIncomplete	no	no	yes	yes	yes	captured/fail-closed
+nonfile	0	mcComplete	no	no	yes	yes	no	captured

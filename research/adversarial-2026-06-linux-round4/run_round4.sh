@@ -11,6 +11,10 @@ rm -rf "$RUN_DIR"
 mkdir -p "$RUN_DIR/probes" "$RUN_DIR/out"
 
 cd "$ROOT"
+mkdir -p "$(dirname "$IO_MON")"
+nim c --hints:off --warnings:off --threads:on \
+  --path:"$ROOT/src" --path:"$ROOT/../nim-stackable-hooks/src" \
+  --out:"$IO_MON" "$ROOT/cmd/io_mon_snoop.nim" >/dev/null
 bash scripts/build_shim.sh >/dev/null
 
 cat >"$RUN_DIR/probes/content_channels.c" <<'C'
@@ -231,18 +235,15 @@ run_probe() {
   grep -Eq '^#[0-9]+ non-deterministic .*getrandom' "$inspect" && nondeterminism=yes || nondeterminism=no
   grep -Eq '^#[0-9]+ event-loss' "$inspect" && event_loss=yes || event_loss=no
   classification="captured"
-  if [ "$name" = "nonfile" ] && [ "$observed_nonfile" = "yes" ] &&
-     [ "$nondeterminism" = "yes" ] && [ "$completeness" = "mcIncomplete" ]; then
-    classification="captured/fail-closed"
-  fi
   if [ "$completeness" = "mcIncomplete" ]; then
     classification="fail-closed/incomplete"
   elif [ "$file_read" = "no" ] || [ "$event_loss" = "yes" ]; then
     classification="unsupported-capability-gated"
   fi
   if [ "$name" = "nonfile" ] && [ "$observed_nonfile" = "yes" ] &&
-     [ "$nondeterminism" = "yes" ] && [ "$completeness" = "mcIncomplete" ]; then
-    classification="captured/fail-closed"
+     [ "$nondeterminism" = "yes" ] && [ "$completeness" = "mcComplete" ] &&
+     [ "$event_loss" = "no" ]; then
+    classification="captured"
   fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$name" "$code" "$completeness" "$file_read" "$file_write" \

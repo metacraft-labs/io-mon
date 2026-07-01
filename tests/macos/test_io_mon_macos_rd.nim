@@ -4,31 +4,30 @@
 ## hit a file-monitor cannot see. See
 ## reprobuild-specs/MacOS-Monitoring-Adversarial-Hardening.milestones.org (R-D).
 ##
-## # The THREE-WAY split (the crux — get the classification right or cause the
-## # cardinal sin of a false downgrade that re-runs every build):
+## # The split (the crux — record evidence without confusing caller policy with
+## # monitoring completeness):
 ##
 ## 1. ENV vars / sysctl / uname → OBSERVED DECLARED INPUTS (record, do NOT
 ##    downgrade). The shim hooks getenv / sysctlbyname / uname / … and records the
 ##    NAME queried; the CONSUMER folds the queried VALUE into its cache key (BuildXL
 ##    observed-environment model), so SOURCE_DATE_EPOCH / $CFLAGS / hw.ncpu / uname
 ##    re-run iff the value changed — PRECISE, NO false downgrade.
-## 2. RANDOMNESS (getentropy / arc4random*) → AUTO-DOWNGRADE (non-deterministic ⇒
-##    always re-run), but ONLY when the call's CALLER is the program's OWN main-exe
-##    code (caller attribution). The cross-dylib libsystem/libobjc/libswift entropy
-##    baseline (present in EVERY real cc/clang/bash run) is excluded — else every
-##    build re-runs (the cardinal sin). A /dev/urandom OPEN is NOT flagged (mktemp
-##    opens it for a random temp name on essentially every build).
-## 3. WALL CLOCK (clock_gettime / gettimeofday / time / mach_absolute_time) → RECORD
-##    but do NOT auto-downgrade — almost every program times a loop benignly, so
-##    flagging that would re-run EVERYTHING (the cardinal sin).
+## 2. RANDOMNESS (getentropy / arc4random*) → OBSERVED ENTROPY evidence, but ONLY
+##    when the call's CALLER is the program's OWN main-exe code (caller
+##    attribution). The cross-dylib libsystem/libobjc/libswift entropy baseline
+##    (present in EVERY real cc/clang/bash run) is excluded. A /dev/urandom OPEN is
+##    NOT flagged (mktemp opens it for a random temp name on essentially every
+##    build).
+## 3. WALL CLOCK (clock_gettime / gettimeofday / time / mach_absolute_time) →
+##    OBSERVED TIME evidence.
 ##
 ## The CARDINAL-SIN GUARD (the most important correctness property): a normal
 ## deterministic build that reads PATH (getenv) + calls clock_gettime + reads a
-## file MUST stay mcComplete / cacheable, with the env read recorded as an observed
-## input and NO non-determinism flag. ONLY randomness auto-downgrades.
+## file MUST stay mcComplete, with all non-file observations preserved. Only
+## actual monitoring loss downgrades to mcIncomplete.
 ##
-## The merge-side three-way classification (`nonDeterminismLossCount` +
-## `mergeFragments`) is platform-independent and now lives in the portable suite
+## The merge-side classification (`mergeFragments`) is platform-independent and
+## now lives in the portable suite
 ## `tests/portable/test_io_mon_rd_classification.nim` (it runs on EVERY OS). THIS
 ## file keeps ONLY the macOS LIVE capture, which proves the shim's getenv /
 ## sysctl / clock / entropy hooks against the round-2 r2_implicit corpus
@@ -162,15 +161,15 @@ suite "io-mon macOS R-D non-file determinism (live, r2_implicit corpus)":
       check dep.completeness == mcComplete       # NO false downgrade
       check hasReadEndingWith(dep, "input.c")     # the file dep is still captured
 
-    test "RANDOMNESS arc4random: flagged non-deterministic ⇒ mcIncomplete":
+    test "RANDOMNESS arc4random: recorded without monitoring-loss downgrade":
       let dep = runProbe(shim, minicc, @[srcPath, "arc4", outPath])
       check hasRecord(dep, mrNonDeterministic, "arc4random")
-      check dep.completeness == mcIncomplete     # always re-run
+      check dep.completeness == mcComplete
 
-    test "RANDOMNESS getentropy: flagged non-deterministic ⇒ mcIncomplete":
+    test "RANDOMNESS getentropy: recorded without monitoring-loss downgrade":
       let dep = runProbe(shim, minicc, @[srcPath, "entropy", outPath])
       check hasRecord(dep, mrNonDeterministic, "getentropy")
-      check dep.completeness == mcIncomplete
+      check dep.completeness == mcComplete
 
     test "CARDINAL SIN GUARD: a /dev/urandom OPEN does NOT auto-downgrade":
       # readfile.c reads a regular file (captured) AND opens /dev/urandom. A
