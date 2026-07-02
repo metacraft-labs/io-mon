@@ -1263,80 +1263,99 @@ proc repro_hook_mmap*(ctx: var MmapContext) {.raises: [].} =
   if shouldBypass():
     callNext(ctx)
     return
-  ensureInitializedPreservingErrno()
-  callNext(ctx)
-  let savedErrno = c_get_errno()
-  if isAnonymousPrivateMmap(ctx.flags, ctx.fd):
-    recordAnonymousPrivateMmap(ctx.result, ctx.length)
-    if protIncludesExec(ctx.prot):
-      if protIncludesWrite(ctx.prot):
-        emitEventLoss("linux anonymous executable mmap is writable; " &
-          "raw syscall scan requires a later mprotect transition " &
-          "source=mmap-anonymous-exec")
-      let status = scanInlineSyscallPatchesForOwnedAnonymousRange(
-        ctx.result, ctx.length)
-      recordLateInlineSyscallScanCoverage(status, "mmap-anonymous-exec")
-  c_set_errno(savedErrno)
+  # This hook interposes ``mmap`` — the exact syscall glibc's allocator issues to
+  # grow the heap. The bookkeeping below allocates (``recordAnonymousPrivateMmap``
+  # does a ``seq.add``; the scans and ``emitEventLoss`` allocate too), so it can
+  # re-enter this very hook when a bookkeeping allocation triggers an arena
+  # ``mmap`` while glibc is mid-``malloc`` with its arena inconsistent — a
+  # reentrant allocation that corrupts the host allocator. Mute the shim for the
+  # whole body (mirrors ``emitRecord``) so any nested allocator ``mmap`` bypasses.
+  withShimMuted:
+    ensureInitializedPreservingErrno()
+    callNext(ctx)
+    let savedErrno = c_get_errno()
+    if isAnonymousPrivateMmap(ctx.flags, ctx.fd):
+      recordAnonymousPrivateMmap(ctx.result, ctx.length)
+      if protIncludesExec(ctx.prot):
+        if protIncludesWrite(ctx.prot):
+          emitEventLoss("linux anonymous executable mmap is writable; " &
+            "raw syscall scan requires a later mprotect transition " &
+            "source=mmap-anonymous-exec")
+        let status = scanInlineSyscallPatchesForOwnedAnonymousRange(
+          ctx.result, ctx.length)
+        recordLateInlineSyscallScanCoverage(status, "mmap-anonymous-exec")
+    c_set_errno(savedErrno)
 
 proc repro_hook_mprotect*(ctx: var MprotectContext) {.raises: [].} =
   if shouldBypass():
     callNext(ctx)
     return
-  ensureInitializedPreservingErrno()
-  callNext(ctx)
-  let savedErrno = c_get_errno()
-  if ctx.result == 0 and protIncludesExec(ctx.prot):
-    let coverage = liveAnonymousExecutableCoverage(ctx.address, ctx.length)
-    if coverage.liveIntersects and coverage.mapsAvailable and
-        coverage.fullyTracked:
-      let status = scanInlineSyscallPatchesForTrackedMprotectRange(
-        ctx.address, ctx.length)
-      recordLateInlineSyscallScanCoverage(status, "mprotect-anonymous-exec")
-    elif coverage.liveIntersects:
-      emitEventLoss("linux anonymous executable mprotect is not owned by " &
-        "the preload mmap lifecycle source=mprotect-anonymous-untracked")
-  c_set_errno(savedErrno)
+  # Mute the shim across the body: the scans / ``emitEventLoss`` here allocate,
+  # and an allocation that grows the heap issues an ``mmap`` which would re-enter
+  # the (unmuted) mmap hook and corrupt the allocator. See ``repro_hook_mmap``.
+  withShimMuted:
+    ensureInitializedPreservingErrno()
+    callNext(ctx)
+    let savedErrno = c_get_errno()
+    if ctx.result == 0 and protIncludesExec(ctx.prot):
+      let coverage = liveAnonymousExecutableCoverage(ctx.address, ctx.length)
+      if coverage.liveIntersects and coverage.mapsAvailable and
+          coverage.fullyTracked:
+        let status = scanInlineSyscallPatchesForTrackedMprotectRange(
+          ctx.address, ctx.length)
+        recordLateInlineSyscallScanCoverage(status, "mprotect-anonymous-exec")
+      elif coverage.liveIntersects:
+        emitEventLoss("linux anonymous executable mprotect is not owned by " &
+          "the preload mmap lifecycle source=mprotect-anonymous-untracked")
+    c_set_errno(savedErrno)
 
 proc repro_hook_munmap*(ctx: var MunmapContext) {.raises: [].} =
   if shouldBypass():
     callNext(ctx)
     return
-  ensureInitializedPreservingErrno()
-  callNext(ctx)
-  let savedErrno = c_get_errno()
-  if ctx.result == 0:
-    removeAnonymousPrivateRange(ctx.address, ctx.length)
-  c_set_errno(savedErrno)
+  # ``removeAnonymousPrivateRange`` rebuilds the tracking seq (allocates); mute
+  # the body so a nested allocator ``mmap``/``munmap`` bypasses. See mmap hook.
+  withShimMuted:
+    ensureInitializedPreservingErrno()
+    callNext(ctx)
+    let savedErrno = c_get_errno()
+    if ctx.result == 0:
+      removeAnonymousPrivateRange(ctx.address, ctx.length)
+    c_set_errno(savedErrno)
 
 proc repro_hook_mremap*(ctx: var MremapContext) {.raises: [].} =
   if shouldBypass():
     callNext(ctx)
     return
-  ensureInitializedPreservingErrno()
-  let oldWasTracked = anonymousPrivateRangeFullyTracked(
-    ctx.oldAddress, ctx.oldSize)
-  let oldHadTrackedOverlap = anonymousPrivateRangeIntersects(
-    ctx.oldAddress, ctx.oldSize)
-  callNext(ctx)
-  let savedErrno = c_get_errno()
-  if isSuccessfulMmapResult(ctx.result):
-    var movedPrecisely = false
-    if oldWasTracked:
-      movedPrecisely = remapAnonymousPrivateRange(
-        ctx.oldAddress, ctx.oldSize, ctx.result, ctx.newSize)
-      if not movedPrecisely:
-        emitEventLoss("linux anonymous executable mremap could not preserve " &
-          "precise mmap lifecycle ownership source=mremap-anonymous")
-    elif oldHadTrackedOverlap:
-      removeAnonymousPrivateRange(ctx.oldAddress, ctx.oldSize)
-      emitEventLoss("linux anonymous executable mremap touched only part of " &
-        "a preload-owned mapping source=mremap-anonymous")
-    if movedPrecisely and liveAnonymousExecutableMappingIntersects(
-        ctx.result, ctx.newSize):
-      let status = scanInlineSyscallPatchesForTrackedMprotectRange(
-        ctx.result, ctx.newSize)
-      recordLateInlineSyscallScanCoverage(status, "mremap-anonymous-exec")
-  c_set_errno(savedErrno)
+  # ``remapAnonymousPrivateRange`` / ``removeAnonymousPrivateRange`` / the scans /
+  # ``emitEventLoss`` allocate; mute the body so a nested allocator
+  # ``mmap``/``mremap`` bypasses instead of corrupting the arena. See mmap hook.
+  withShimMuted:
+    ensureInitializedPreservingErrno()
+    let oldWasTracked = anonymousPrivateRangeFullyTracked(
+      ctx.oldAddress, ctx.oldSize)
+    let oldHadTrackedOverlap = anonymousPrivateRangeIntersects(
+      ctx.oldAddress, ctx.oldSize)
+    callNext(ctx)
+    let savedErrno = c_get_errno()
+    if isSuccessfulMmapResult(ctx.result):
+      var movedPrecisely = false
+      if oldWasTracked:
+        movedPrecisely = remapAnonymousPrivateRange(
+          ctx.oldAddress, ctx.oldSize, ctx.result, ctx.newSize)
+        if not movedPrecisely:
+          emitEventLoss("linux anonymous executable mremap could not preserve " &
+            "precise mmap lifecycle ownership source=mremap-anonymous")
+      elif oldHadTrackedOverlap:
+        removeAnonymousPrivateRange(ctx.oldAddress, ctx.oldSize)
+        emitEventLoss("linux anonymous executable mremap touched only part of " &
+          "a preload-owned mapping source=mremap-anonymous")
+      if movedPrecisely and liveAnonymousExecutableMappingIntersects(
+          ctx.result, ctx.newSize):
+        let status = scanInlineSyscallPatchesForTrackedMprotectRange(
+          ctx.result, ctx.newSize)
+        recordLateInlineSyscallScanCoverage(status, "mremap-anonymous-exec")
+    c_set_errno(savedErrno)
 
 proc recordObservedNonFile(kind: MonitorRecordKind;
                            observationKind: MonitorObservationKind;
