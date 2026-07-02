@@ -2961,10 +2961,28 @@ proc shouldPatchInlineSyscallMapping(mapping: LinuxExecutableMapping;
   if executablePath.len == 0:
     return false
   let normalized = normalizeMappingPath(mapping.path)
-  if normalized == executablePath:
-    return true
+  # The monitor shim itself and system-runtime binaries are NEVER inline-patched
+  # — and this exclusion deliberately applies to the MAIN EXECUTABLE too, not
+  # just shared objects. System toolchain binaries (gcc / clang / ld / nim under
+  # /nix/store, /usr/lib, ...) are dynamically linked, so their file I/O is
+  # already captured by the libc-symbol interpose hooks plus the raw-syscall
+  # wrapper patch installed over glibc's ``syscall`` symbol. Scanning their large
+  # text segments for the ``0f 05`` syscall opcode goes through
+  # ``visitLinuxX8664SyscallMemory`` (nim-stackable-hooks), which is a linear
+  # byte scan with only a weak ``next-byte != 0x00`` guard. On a variable-length
+  # ISA that mis-identifies ``0f 05`` byte pairs sitting mid-instruction / inside
+  # immediates / inside jump tables as syscall sites and overwrites them with
+  # ``int3`` (0xcc), corrupting the binary's code. That is exactly what crashed
+  # gcc — SIGSEGV during RTL pass ``split1`` in
+  # ``int_float_vector_all_ones_operand`` / ``split_81`` — while it compiled
+  # Nim-generated C for the CodeTracer ``ct`` build under the monitor. The inline
+  # text scan is only needed for STATICALLY-linked binaries that issue raw
+  # syscalls bypassing libc; those never live on a system-runtime path, so
+  # excluding these paths costs no real coverage while removing the corruption.
   if isMonitorShimMappingPath(normalized) or isSystemRuntimeMappingPath(normalized):
     return false
+  if normalized == executablePath:
+    return true
   normalized.endsWith(".so") or normalized.contains(".so.")
 
 proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
