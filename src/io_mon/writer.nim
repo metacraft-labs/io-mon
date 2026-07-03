@@ -367,6 +367,21 @@ proc discardFragmentSlotAfterFork*() =
   fragmentSlot.batchLen = 0
   fragmentSlot.batchOpenedAtNs = 0
   fragmentSlot.batchProbeCountdown = 0
+  # ROUND-5 F (post-fork sentinel-state hygiene) — the child inherits the
+  # parent's `readingSentinelActive` value via copy-on-write. Without
+  # resetting it here, the child's first `markReadingSentinel` bails on
+  # the "already active" guard and NEVER writes its own pending marker;
+  # then the child's subsequent flush retires a phantom "cycle" by
+  # writing an orphan committed marker under the CHILD's (osPid,
+  # threadId). mergeFragments' pending-vs-committed netting is
+  # per-(osPid, threadId), so the orphan committed is harmless
+  # (max(0, -1) clamps to 0), but every intermediate child batch cycle
+  # is UN-BOOKKEEPED — a kill-before-flush IN the child on any of
+  # those cycles goes silently un-detected. Reset the flag so the
+  # child's first read faithfully re-marks the sentinel under its own
+  # identity. `closeFragmentSlot` (line 346) already does this on the
+  # parent's flush path; parity below matches it on the fork-child path.
+  fragmentSlot.readingSentinelActive = false
 
 proc checksumUpdate(seed: uint64; bytes: openArray[byte]): uint64 =
   result = seed
