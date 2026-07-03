@@ -73,6 +73,14 @@ const
   FragmentBatchBufLen = 64 * 1024
   FragmentBatchMaxAgeNs = 100_000_000'i64  # 100 ms
   BatchStalenessProbeInterval = 64        # check time every 64 emits
+  SigSafeCommittedBufLen* = 256
+    ## M9.R.62.2 — max bytes of the pre-encoded async-signal-safe
+    ## `read-tail-committed` marker frame stored per fragment slot. The
+    ## frame is `4 (length prefix) + 58 (fixed record header) + 4
+    ## (empty path len) + 4 (detail len) + detail-bytes`. With
+    ## `read-tail-committed run=<64-char-token>`, the detail fits
+    ## comfortably under this cap (< 100 bytes); the extra headroom
+    ## covers longer run tokens without risking silent truncation.
   ReadingSentinelExt* = ".io-mon-reading"
     ## ROUND-2 R5 — extension of the per-thread "un-flushed read tail" sentinel
     ## file (see `FragmentSlot.readingSentinelActive`). Distinct from `.rmdf-frag`
@@ -155,6 +163,15 @@ type
     # makes the create/remove cost ONE pair of file ops per dirty→clean cycle (≈ per
     # 64 KiB batch on the main thread), not per record.
     readingSentinelActive: bool
+    # M9.R.62.2 — async-signal-safe kill-before-flush recovery. The
+    # `committedFrame` buffer holds a pre-encoded `read-tail-committed`
+    # marker frame for THIS slot's (osPid, threadId), sized to hold the
+    # header + a modest run-token suffix. `openFragmentSlot` fills it
+    # once; a signal handler can then write it verbatim via raw
+    # `write(2)` on the slot's fd — no allocation, no fflush, no locks.
+    # A signal-death path uses `committedFrameLen` to bound the write.
+    committedFrameLen: int32
+    committedFrame: array[SigSafeCommittedBufLen, byte]
     batchBuf: array[FragmentBatchBufLen, byte]
 
 var
@@ -273,6 +290,55 @@ proc killDiagContextForMarker(): string =
     result = KillDiagCtxTag & killDiagContext
   else:
     result = ""
+
+# M9.R.62.2 — async-signal-safe accessors. A shim signal handler (see
+# `installTerminatingSignalHandlers` in linux_preload.nim) can query these
+# to write the calling thread's pre-encoded committed-marker frame + any
+# in-flight batch buffer to the fragment fd via raw write(2), then close
+# the fd — all without allocation, without fflush, without lock acquisition.
+# Every accessor returns fixed-size data or bounded pointers into the
+# threadvar; no code path in these accessors triggers heap allocation
+# once the slot is open.
+
+proc sigSafeSlotIsOpen*(): bool {.raises: [].} =
+  fragmentSlot.isOpen
+
+proc sigSafeSlotFd*(): cint {.raises: [].} =
+  ## Returns the OS-level file descriptor of the calling thread's
+  ## fragment slot, or -1 if no slot is open. `File.getFileHandle` on
+  ## POSIX is a thin wrapper around `fileno(3)` — signal-safe per
+  ## POSIX.1-2017 Table 2-4.
+  if not fragmentSlot.isOpen:
+    return cint(-1)
+  try:
+    result = cint(fragmentSlot.file.getFileHandle())
+  except IOError:
+    result = cint(-1)
+
+proc sigSafeBatchPtr*(): pointer {.raises: [].} =
+  addr fragmentSlot.batchBuf[0]
+
+proc sigSafeBatchLen*(): int {.raises: [].} =
+  fragmentSlot.batchLen
+
+proc sigSafeCommittedPtr*(): pointer {.raises: [].} =
+  addr fragmentSlot.committedFrame[0]
+
+proc sigSafeCommittedLen*(): int {.raises: [].} =
+  int(fragmentSlot.committedFrameLen)
+
+proc sigSafeMarkSlotClosed*() {.raises: [].} =
+  ## Called by the signal handler AFTER it has written the batch +
+  ## committed marker + closed the fd via raw syscalls. Marks the slot
+  ## bookkeeping as closed so any post-recovery code path (unlikely on
+  ## a terminating signal) sees a consistent view. Does NOT close the
+  ## Nim `File` handle — the raw `close(2)` already did — so the finalizer
+  ## is a POD-only reset. All assignments to fixed-size fields are
+  ## async-signal-safe.
+  fragmentSlot.isOpen = false
+  fragmentSlot.batchLen = 0
+  fragmentSlot.readingSentinelActive = false
+  fragmentSlot.committedFrameLen = 0
 
 proc writeReadTailMarker(detail: string) =
   ## ROUND-5 F — write a kill-before-flush bookkeeping marker (`mrEventLoss` with
@@ -583,6 +649,72 @@ proc decodeFramesTolerant*(bytes: openArray[byte]): seq[MonitorRecord] =
 proc fragmentPath*(fragmentDir: string; osPid, threadId: uint64): string =
   fragmentDir / ("repro-monitor-" & $osPid & "-" & $threadId & ".rmdf-frag")
 
+proc precomputeSigSafeCommittedFrame(slot: var FragmentSlot) =
+  ## M9.R.62.2 — pre-encode the `read-tail-committed` marker frame for
+  ## this slot's (osPid, threadId) into a fixed byte buffer inside the
+  ## slot itself. An async-signal-safe kill-before-flush recovery handler
+  ## can then write this frame verbatim via raw `write(2)` — no
+  ## allocation, no fflush, no lock acquisition. The detail carries the
+  ## current run token (`read-tail-committed run=<id>`); diag context is
+  ## intentionally omitted because a signal-death path has no way to
+  ## sample it safely, and the ctx-tag is only used for pending markers
+  ## anyway (`mergeFragments` extracts it from unmatched pending, not
+  ## from committed).
+  const RecordHeaderBytes = 2 + 2 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 4
+  let detail = ReadTailCommittedDetail & fragmentRunToken
+  let detailLen = detail.len
+  let payloadLen = RecordHeaderBytes + 4 + 0 + 4 + detailLen
+  let frameLen = 4 + payloadLen
+  if frameLen > SigSafeCommittedBufLen:
+    # Would overflow the async-signal-safe buffer; leave len=0 so the
+    # signal handler skips the committed emit. Netting will remain
+    # "one unmatched pending" for such an extreme run token — safer to
+    # under-net (a spurious event-loss, mcIncomplete) than to
+    # over-write past the buffer.
+    slot.committedFrameLen = 0
+    return
+  var cursor = 0
+  template putByte(b: byte) =
+    slot.committedFrame[cursor] = b
+    inc cursor
+  template putU16Le(v: uint16) =
+    putByte(byte(v and 0xFF'u16))
+    putByte(byte((v shr 8) and 0xFF'u16))
+  template putU32Le(v: uint32) =
+    putByte(byte(v and 0xFF'u32))
+    putByte(byte((v shr 8) and 0xFF'u32))
+    putByte(byte((v shr 16) and 0xFF'u32))
+    putByte(byte((v shr 24) and 0xFF'u32))
+  template putU64Le(v: uint64) =
+    putByte(byte(v and 0xFF'u64))
+    putByte(byte((v shr 8) and 0xFF'u64))
+    putByte(byte((v shr 16) and 0xFF'u64))
+    putByte(byte((v shr 24) and 0xFF'u64))
+    putByte(byte((v shr 32) and 0xFF'u64))
+    putByte(byte((v shr 40) and 0xFF'u64))
+    putByte(byte((v shr 48) and 0xFF'u64))
+    putByte(byte((v shr 56) and 0xFF'u64))
+  # Frame length prefix.
+  putU32Le(uint32(payloadLen))
+  # Record header — MUST match encodeRecordPayload / appendFragmentRecord.
+  putU16Le(uint16(ord(mrEventLoss)))
+  putU16Le(uint16(ord(moEventLoss)))
+  putU64Le(0'u64)                          # seq
+  putU64Le(slot.osPid)
+  putU64Le(0'u64)                          # parentOsPid
+  putU64Le(slot.threadId)
+  putU64Le(0'u64)                          # childOsPid
+  putU64Le(0'u64)                          # result
+  putU32Le(0'u32)                          # flags
+  putU32Le(0'u32)                          # probeResult
+  putU32Le(0'u32)                          # path len
+  putU32Le(uint32(detailLen))
+  if detailLen > 0:
+    copyMem(addr slot.committedFrame[cursor],
+            unsafeAddr detail[0], detailLen)
+    cursor += detailLen
+  slot.committedFrameLen = int32(cursor)
+
 proc openFragmentSlot(fragmentDir: string; osPid, threadId: uint64;
                       path: string): bool =
   if not open(fragmentSlot.file, extendedPath(path), fmAppend):
@@ -600,6 +732,7 @@ proc openFragmentSlot(fragmentDir: string; osPid, threadId: uint64;
   fragmentSlot.batchOpenedAtNs = 0
   fragmentSlot.batchProbeCountdown = 0
   fragmentSlot.readingSentinelActive = false
+  precomputeSigSafeCommittedFrame(fragmentSlot)
   discard fragmentOpenCount.fetchAdd(1, moRelaxed)
   true
 

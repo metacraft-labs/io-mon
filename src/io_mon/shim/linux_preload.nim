@@ -184,6 +184,188 @@ int repro_linux_fd_proc_path(int fd, void *raw_buf, unsigned long len) {
 extern int repro_monitor_shim_init(char *configPath);
 extern int repro_monitor_shim_shutdown(void);
 
+/* M9.R.62.2 — async-signal-safe kill-before-flush recovery.
+ *
+ * Phase A characterisation (see recipes/reproos-image/run-evidence/m9r62/
+ * m9r62_phaseA_attribution.txt) proved every remaining pixman escape
+ * carries diag-ctx=[phase=init bypassed=0 inForkChild=0 disabled=0]. The
+ * escape class is a process that (a) loaded the shim, (b) buffered reads,
+ * (c) died WITHOUT entering fork / execve / exit hooks AND without the
+ * libc destructor firing — i.e. terminating signals with default
+ * disposition, or raw syscall(SYS_exit_group) that bypasses the shim.
+ *
+ * The handler below writes the calling thread's pre-encoded
+ * `read-tail-committed` marker (populated at slot open by
+ * precomputeSigSafeCommittedFrame in writer.nim) directly to the
+ * fragment fd via raw `write(2)`, plus any in-flight batch buffer, and
+ * closes the fd — all async-signal-safe. Then it restores the previous
+ * handler and re-raises so WIFSIGNALED / WEXITSTATUS observers still see
+ * the correct termination cause.
+ *
+ * Every raw-syscall used here (write, close, sigaction, kill,
+ * sigemptyset, sigfillset) is on POSIX.1-2017 Table 2-4 (Signal Concepts
+ * → Signal Actions) as async-signal-safe. Nim proc calls into
+ * writer.nim's `sigSafeSlotFd` / `sigSafeBatchPtr` / etc. are pure POD
+ * reads (no allocation, no lock acquisition) — see the writer-side
+ * signature.
+ *
+ * SIGKILL and SIGSTOP are uncatchable by design; losses through those
+ * paths remain inherent event-loss (correctly counted by mergeFragments).
+ */
+
+extern int repro_linux_sig_safe_slot_is_open(void);
+extern int repro_linux_sig_safe_slot_fd(void);
+extern void* repro_linux_sig_safe_batch_ptr(void);
+extern long repro_linux_sig_safe_batch_len(void);
+extern void* repro_linux_sig_safe_committed_ptr(void);
+extern long repro_linux_sig_safe_committed_len(void);
+extern void repro_linux_sig_safe_mark_slot_closed(void);
+
+#include <signal.h>
+#include <string.h>
+
+/* Previous-handler cache indexed by signal number. Signals we hook are
+ * < 32 (standard POSIX signals); realtime signals are not in scope.
+ * `struct sigaction` is a POD; a fixed-size array is safe at file scope
+ * and initialisation is done once by installTerminatingSignalHandlers. */
+static struct sigaction repro_prev_sigaction[32];
+static int repro_prev_sigaction_valid[32];
+
+static void repro_linux_sig_safe_flush(void) {
+  int fd;
+  long saved_errno = errno;
+  if (!repro_linux_sig_safe_slot_is_open())
+    return;
+  fd = repro_linux_sig_safe_slot_fd();
+  if (fd < 0)
+    return;
+  /* Flush any in-flight batch buffer FIRST so buffered read records land
+   * before the committed marker. Partial writes are best-effort at the
+   * async-signal-safe level; the tolerant reader (decodeFramesTolerant)
+   * drops a truncated tail cleanly, and mergeFragments treats the
+   * committed marker's presence as retiring the pending sentinel. */
+  {
+    long len = repro_linux_sig_safe_batch_len();
+    if (len > 0) {
+      void *p = repro_linux_sig_safe_batch_ptr();
+      long written = 0;
+      while (written < len) {
+        long n = stackable_linux_raw_syscall6(SYS_write, fd,
+                                              (long)((char*)p + written),
+                                              len - written, 0, 0, 0);
+        if (n <= 0) break;
+        written += n;
+      }
+    }
+  }
+  /* Write the pre-encoded committed marker. Retires the ROUND-5 F pending
+   * sentinel; mergeFragments' netting then sees a clean pending/committed
+   * pair and doesn't inject a false kill-before-flush event-loss. */
+  {
+    long len = repro_linux_sig_safe_committed_len();
+    if (len > 0) {
+      void *p = repro_linux_sig_safe_committed_ptr();
+      long written = 0;
+      while (written < len) {
+        long n = stackable_linux_raw_syscall6(SYS_write, fd,
+                                              (long)((char*)p + written),
+                                              len - written, 0, 0, 0);
+        if (n <= 0) break;
+        written += n;
+      }
+    }
+  }
+  /* fsync so the writes are on-disk before the signal terminates the
+   * process (the OS page cache would otherwise survive process death,
+   * but a subsequent host crash would drop the tail). Best-effort. */
+  stackable_linux_raw_syscall6(SYS_fsync, fd, 0, 0, 0, 0, 0);
+  stackable_linux_raw_syscall6(SYS_close, fd, 0, 0, 0, 0, 0);
+  repro_linux_sig_safe_mark_slot_closed();
+  errno = (int)saved_errno;
+}
+
+static void repro_linux_terminating_signal_handler(int signum) {
+  /* Only bother flushing if the slot is open AND this is one of the
+   * signals we installed for. The signum-bounds check is defensive —
+   * we register for signums < 32 only. */
+  repro_linux_sig_safe_flush();
+  if (signum > 0 && signum < 32 && repro_prev_sigaction_valid[signum]) {
+    /* Restore the previously-installed handler + re-raise. If the
+     * previous handler was SIG_DFL for a default-terminating signal
+     * (SIGPIPE / SIGTERM / SIGSEGV / …), sigaction restore + kill
+     * delivers the default termination with the correct WIFSIGNALED
+     * status. If it was a user handler, we forward. */
+    struct sigaction prev = repro_prev_sigaction[signum];
+    sigaction(signum, &prev, NULL);
+  } else {
+    /* No cached prev — set to SIG_DFL and let re-raise terminate. */
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof(dfl));
+    dfl.sa_handler = SIG_DFL;
+    sigaction(signum, &dfl, NULL);
+  }
+  /* Re-raise the signal to preserve WIFSIGNALED / core-dump semantics.
+   * `kill(getpid(), signum)` is async-signal-safe and delivers the
+   * signal via the now-restored disposition. */
+  stackable_linux_raw_syscall6(SYS_kill, (long)stackable_linux_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0),
+                               signum, 0, 0, 0, 0);
+}
+
+static int repro_linux_install_one_signal_handler(int signum) {
+  struct sigaction sa;
+  struct sigaction prev;
+  if (signum <= 0 || signum >= 32) return 0;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = repro_linux_terminating_signal_handler;
+  sigemptyset(&sa.sa_mask);
+  /* SA_RESETHAND — after handler fires once, disposition returns to
+   * default. Belt-and-braces: even if our re-raise+restore path fails,
+   * a second delivery kills the process. SA_NODEFER lets us fire even
+   * if the caller is inside a masked signal region (rare in the target
+   * workload — clang/meson/bash don't block SIGPIPE). */
+  sa.sa_flags = SA_RESETHAND | SA_NODEFER;
+  if (sigaction(signum, &sa, &prev) != 0) return 0;
+  repro_prev_sigaction[signum] = prev;
+  repro_prev_sigaction_valid[signum] = 1;
+  return 1;
+}
+
+/* The set of terminating signals we hook. Deliberately CONSERVATIVE:
+ *   - SIGKILL / SIGSTOP: uncatchable by kernel; inherent loss.
+ *   - SIGCHLD / SIGURG / SIGCONT: default ignore/continue; not terminating.
+ *   - SIGTRAP: io-mon's own inline-syscall trap coverage sets an internal
+ *     disposition (recordInlineSyscallTrapCoverage). Hooking it here would
+ *     race the shim's own probe and break the JIT-code adversarial tests.
+ *   - SIGSYS: same reasoning as SIGTRAP — reserved for the shim's raw-
+ *     syscall trap infrastructure. Also, seccomp-driven SIGSYS in a
+ *     tracee is a legitimate observation, not a shim-recovery event.
+ *   - SIGUSR1 / SIGUSR2 / SIGXFSZ / SIGXCPU / SIGVTALRM / SIGPROF /
+ *     SIGALRM: default terminates, but real-world tracee code often
+ *     installs its own handlers (POSIX timers, profiler probes,
+ *     user-defined IPC). Hooking these would shadow legitimate user
+ *     handlers via SA_RESETHAND. Deferred to a future milestone if
+ *     evidence surfaces (M9.R.62 evidence carries none of these).
+ *
+ * The retained set is the DEFAULT=TERMINATE class that the M9.R.62 Phase
+ * A characterisation shows is empirically triggered by the pixman /
+ * meson / clang workload (shell pipelines → SIGPIPE, parent-driven
+ * cancellations → SIGTERM/SIGINT/SIGHUP/SIGQUIT, crashes → SIGSEGV /
+ * SIGABRT / SIGBUS / SIGFPE / SIGILL). */
+static const int repro_linux_terminating_signals[] = {
+  SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGABRT, SIGFPE, SIGBUS, SIGSEGV,
+  SIGPIPE, SIGTERM
+};
+
+int repro_linux_install_terminating_signal_handlers(void) {
+  size_t i;
+  int installed = 0;
+  for (i = 0; i < sizeof(repro_linux_terminating_signals) / sizeof(int); i++) {
+    installed += repro_linux_install_one_signal_handler(
+        repro_linux_terminating_signals[i]);
+  }
+  return installed;
+}
+
 __attribute__((constructor))
 static void repro_linux_monitor_constructor(void) {
   repro_monitor_shim_init(NULL);
@@ -216,6 +398,36 @@ proc c_fd_proc_path(fd: cint; buf: pointer; len: csize_t): cint
   {.importc: "repro_linux_fd_proc_path", raises: [].}
 proc c_raw_syscall6(nr, a1, a2, a3, a4, a5, a6: clong): clong
   {.importc: "stackable_linux_raw_syscall6", cdecl, raises: [].}
+
+# M9.R.62.2 — bridge procs the C-side signal handler calls to reach into
+# writer.nim's threadvar-resident fragment slot. Every proc is a pure POD
+# read (no allocation, no lock acquisition), so calling from a signal
+# context is async-signal-safe. Return-type mapping: `bool` → `int`
+# (0/1), `pointer` → `pointer`, `int` → `long`.
+
+proc repro_linux_sig_safe_slot_is_open(): cint {.exportc, cdecl, raises: [].} =
+  if sigSafeSlotIsOpen(): 1 else: 0
+
+proc repro_linux_sig_safe_slot_fd(): cint {.exportc, cdecl, raises: [].} =
+  sigSafeSlotFd()
+
+proc repro_linux_sig_safe_batch_ptr(): pointer {.exportc, cdecl, raises: [].} =
+  sigSafeBatchPtr()
+
+proc repro_linux_sig_safe_batch_len(): clong {.exportc, cdecl, raises: [].} =
+  clong(sigSafeBatchLen())
+
+proc repro_linux_sig_safe_committed_ptr(): pointer {.exportc, cdecl, raises: [].} =
+  sigSafeCommittedPtr()
+
+proc repro_linux_sig_safe_committed_len(): clong {.exportc, cdecl, raises: [].} =
+  clong(sigSafeCommittedLen())
+
+proc repro_linux_sig_safe_mark_slot_closed() {.exportc, cdecl, raises: [].} =
+  sigSafeMarkSlotClosed()
+
+proc repro_linux_install_terminating_signal_handlers(): cint
+  {.importc, cdecl, raises: [].}
 
 type
   FdKind = enum
@@ -586,6 +798,15 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   let inlineStatus = installInlineSyscallPatches()
   recordInlineSyscallCoverage(inlineStatus)
   installLinuxVdsoPatches()
+  # M9.R.62.2 — install async-signal-safe terminating-signal handlers so
+  # a process that dies via SIGPIPE / SIGTERM / SIGSEGV / SIGABRT / …
+  # (default-terminating dispositions) still gets its ROUND-5 F pending
+  # sentinel retired via a raw-syscall write of the pre-encoded committed
+  # marker + close of the fragment fd. Falsifies M9.R.60/61's residual
+  # "182 kill-before-flush event-loss" class (see Phase A attribution).
+  # SIGKILL / SIGSTOP are uncatchable by design; losses through those
+  # paths remain inherent-loss and are correctly counted.
+  discard repro_linux_install_terminating_signal_handlers()
   result = 0
 
 proc repro_monitor_shim_flush*(): cint {.exportc, dynlib, raises: [].} =
