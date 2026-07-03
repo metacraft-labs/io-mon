@@ -1874,6 +1874,53 @@ int main(void) {
     check dep.records.anyIt(it.kind == mrEventLoss and
       "libc raw syscall unsupported" in it.detail)
 
+  test "raw libc SYS_gettid is treated as supported (no event-loss)":
+    # Regression pin for M9.R.66.1: meson's Python runtime calls
+    # `syscall(SYS_gettid)` (nr=186) per-thread; before this fix the shim's
+    # classifier fell through to `unsupported nr=186` event-loss, tripping
+    # mesonbin-setup with 2× event-loss per meson invocation. SYS_gettid
+    # returns the calling thread's tid with no I/O side effects — classify
+    # it as supported and record nothing.
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let probe = buildC(work, "raw_gettid", """
+#include <sys/syscall.h>
+#include <unistd.h>
+#ifndef SYS_gettid
+#define SYS_gettid 186
+#endif
+int main(void) {
+  long tid = syscall(SYS_gettid);
+  return tid > 0 ? 0 : 2;
+}
+""")
+    let depfile = work / "raw-gettid.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", probe],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      ("unsupported nr=186" in it.detail or
+       "libc raw syscall unsupported" in it.detail))
+
   test "unrelated SIGTRAP is not swallowed by inline syscall handler":
     let snoopBin = work / "io-mon"
     if not fileExists(snoopBin):

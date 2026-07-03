@@ -28,6 +28,7 @@ const
   LinuxSysTime = 201.clong
   LinuxSysClockGettime = 228.clong
   LinuxSysClockGetres = 229.clong
+  LinuxSysGettid = 186.clong
   LinuxSysReadlink = 89.clong
   LinuxSysOpenat = 257.clong
   LinuxSysNewfstatat = 262.clong
@@ -1254,6 +1255,14 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
     if resultLooksFaulted(callResult):
       return false
     emitProbe(cstringArg(a2), probeResultFromRaw(callResult))
+    true
+  of LinuxSysGettid:
+    # SYS_gettid (nr=186) returns the calling thread's tid: no I/O side
+    # effects, no filesystem interaction, no observation to record. Classify
+    # as supported so callers like meson's Python runtime (which invokes
+    # `syscall(SYS_gettid)` per-thread) do not trip `unsupported nr=186`
+    # event-loss. Documented by M9.R.65 close-out as the residual
+    # `libc raw syscall unsupported nr=186` class on mesonbin-setup.
     true
   else:
     false
