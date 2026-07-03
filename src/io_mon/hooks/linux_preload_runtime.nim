@@ -623,6 +623,9 @@ typedef time_t (*ct_time_real_fn)(time_t *);
 typedef ssize_t (*ct_getrandom_real_fn)(void *, size_t, unsigned int);
 typedef pid_t (*ct_fork_real_fn)(void);
 typedef int (*ct_execve_real_fn)(const char *, char *const [], char *const []);
+typedef int (*ct_execvp_real_fn)(const char *, char *const []);
+typedef int (*ct_execvpe_real_fn)(const char *, char *const [], char *const []);
+typedef int (*ct_fexecve_real_fn)(int, char *const [], char *const []);
 typedef int (*ct_posix_spawn_real_fn)(pid_t *, const char *,
                                       const posix_spawn_file_actions_t *,
                                       const posix_spawnattr_t *,
@@ -743,6 +746,9 @@ static ct_time_real_fn real_time_ptr = NULL;
 static ct_getrandom_real_fn real_getrandom_ptr = NULL;
 static ct_fork_real_fn real_fork_ptr = NULL;
 static ct_execve_real_fn real_execve_ptr = NULL;
+static ct_execvp_real_fn real_execvp_ptr = NULL;
+static ct_execvpe_real_fn real_execvpe_ptr = NULL;
+static ct_fexecve_real_fn real_fexecve_ptr = NULL;
 static ct_posix_spawn_real_fn real_posix_spawn_ptr = NULL;
 static ct_posix_spawn_real_fn real_posix_spawnp_ptr = NULL;
 
@@ -1428,6 +1434,21 @@ int ct_linux_preload_real_execve(char *path, char **argv, char **envp) {
   return real_execve_ptr(path, argv, envp);
 }
 
+int ct_linux_preload_real_execvp(char *file, char **argv) {
+  CT_REAL("execvp", real_execvp_ptr, ct_execvp_real_fn);
+  return real_execvp_ptr(file, argv);
+}
+
+int ct_linux_preload_real_execvpe(char *file, char **argv, char **envp) {
+  CT_REAL("execvpe", real_execvpe_ptr, ct_execvpe_real_fn);
+  return real_execvpe_ptr(file, argv, envp);
+}
+
+int ct_linux_preload_real_fexecve(int fd, char **argv, char **envp) {
+  CT_REAL("fexecve", real_fexecve_ptr, ct_fexecve_real_fn);
+  return real_fexecve_ptr(fd, argv, envp);
+}
+
 int ct_linux_preload_real_posix_spawn(pid_t *pid, char *path,
                                       void *file_actions, void *attrp,
                                       char **argv, char **envp) {
@@ -1937,6 +1958,106 @@ int execle(const char *path, const char *arg, ...) {
   }
   argv[argc] = NULL;
   return ct_linux_preload_dispatch_execve(path, argv, envp);
+}
+
+/* M9.R.65.2 — the path-searching exec family (execvp / execvpe / execlp)
+ * and fexecve.  glibc's execvp/execvpe/execlp perform PATH lookup then
+ * internally call execve via a hidden reference that BYPASSES the
+ * LD_PRELOAD PLT.  Callers on this route therefore missed the shim's
+ * execve hook entirely — the M9.R.65 kill-before-flush residual on
+ * NixOS-WSL's wrapped-sh Rust binary was 100 % this gap.  Fire the
+ * shim's execve hook logic (emit mrProcessExec + flush the pending
+ * read-tail marker) BEFORE handing off to glibc's real execvp so the
+ * fragment slot's committed marker lands durably before the kernel
+ * jumps into the exec.  The child inherits LD_PRELOAD via `environ`
+ * (which glibc's execvp propagates), so the shim reloads correctly in
+ * the new image. */
+static int ct_linux_preload_dispatch_execvp(const char *file,
+                                            char *const argv[]) {
+  if (CT_BYPASS() || ct_execve_hook == NULL)
+    return ct_linux_preload_real_execvp((char *)file, (char **)argv);
+  /* Invoke the execve hook to emit mrProcessExec + flush the fragment
+   * slot's committed marker.  Its chained real-execve call will fail
+   * with ENOENT for the common `execvp("sh", argv)` case (relative
+   * name), which is fine — we then fall through to the real execvp
+   * so glibc's PATH search runs and jumps into the actual image.
+   * The bracket bookkeeping (enter_hook / exit_hook) is done by
+   * CT_CALL_HOOK. */
+  CT_CALL_HOOK(ct_execve_hook((char *)file, (char **)argv, environ));
+  return ct_linux_preload_real_execvp((char *)file, (char **)argv);
+}
+
+static int ct_linux_preload_dispatch_execvpe(const char *file,
+                                             char *const argv[],
+                                             char *const envp[]) {
+  if (CT_BYPASS() || ct_execve_hook == NULL)
+    return ct_linux_preload_real_execvpe((char *)file, (char **)argv,
+                                          (char **)envp);
+  CT_CALL_HOOK(ct_execve_hook((char *)file, (char **)argv,
+                              (char **)envp));
+  return ct_linux_preload_real_execvpe((char *)file, (char **)argv,
+                                        (char **)envp);
+}
+
+static int ct_linux_preload_dispatch_fexecve(int fd,
+                                             char *const argv[],
+                                             char *const envp[]) {
+  if (CT_BYPASS() || ct_execve_hook == NULL)
+    return ct_linux_preload_real_fexecve(fd, (char **)argv,
+                                          (char **)envp);
+  /* We don't have a path for fexecve — pass an empty string so the
+   * emit path records the exec transition with an empty path
+   * (better than skipping the flush entirely).  The child image is
+   * determined by the fd, so callers using fexecve accept the same
+   * ambiguity. */
+  CT_CALL_HOOK(ct_execve_hook("", (char **)argv, (char **)envp));
+  return ct_linux_preload_real_fexecve(fd, (char **)argv, (char **)envp);
+}
+
+int execvp(const char *file, char *const argv[])
+    __attribute__((visibility("default")));
+int execvp(const char *file, char *const argv[]) {
+  return ct_linux_preload_dispatch_execvp(file, argv);
+}
+
+int execvpe(const char *file, char *const argv[], char *const envp[])
+    __attribute__((visibility("default")));
+int execvpe(const char *file, char *const argv[], char *const envp[]) {
+  return ct_linux_preload_dispatch_execvpe(file, argv, envp);
+}
+
+int execlp(const char *file, const char *arg, ...)
+    __attribute__((visibility("default")));
+int execlp(const char *file, const char *arg, ...) {
+  size_t argc = 0;
+  if (arg != NULL) {
+    argc = 1;
+    va_list count_ap;
+    va_start(count_ap, arg);
+    while (va_arg(count_ap, char *) != NULL) {
+      argc++;
+    }
+    va_end(count_ap);
+  }
+
+  char **argv = (char **)alloca((argc + 1) * sizeof(char *));
+  if (arg != NULL) {
+    argv[0] = (char *)arg;
+    va_list fill_ap;
+    va_start(fill_ap, arg);
+    for (size_t i = 1; i < argc; i++) {
+      argv[i] = va_arg(fill_ap, char *);
+    }
+    va_end(fill_ap);
+  }
+  argv[argc] = NULL;
+  return ct_linux_preload_dispatch_execvp(file, argv);
+}
+
+int fexecve(int fd, char *const argv[], char *const envp[])
+    __attribute__((visibility("default")));
+int fexecve(int fd, char *const argv[], char *const envp[]) {
+  return ct_linux_preload_dispatch_fexecve(fd, argv, envp);
 }
 
 int posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *file_actions,
