@@ -2113,6 +2113,31 @@ proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
   discard repro_monitor_shim_flush()
   sampleKillDiag("execve-post-flush")
   callNext(ctx)
+  # M9.R.68.3 — control only returns here if the execve syscall FAILED
+  # (successful execve replaces the address space; the caller never
+  # comes back). Capture the failure so the writer's T0 signal (b)
+  # invariant does not falsely count this as a "last exec was un-
+  # injectable" trip. Bash configure's platform-probe cascade forks
+  # 12+ children that execve nonexistent paths (/bin/uname,
+  # /usr/bin/oslevel, /usr/bin/hostinfo, /usr/convex/getsysinfo, ...);
+  # each fires a legitimate process-start after fork + a failed exec.
+  # Under the previous shim the record shape (start=1, exec=1, no
+  # post-exec start) tripped signal (b) 12 times per bash configure.
+  #
+  # Emit a follow-up mrProcessExec carrying an ``execstatus=failed``
+  # detail token + result=-errno. The writer treats these as failed-
+  # exec markers that RETRACT the preceding pre-flush exec record's
+  # contribution to execCount for signal (b). See
+  # writer.nim :: unmonitoredSubtreeLossCount.
+  let execFailedErrno = c_get_errno()
+  sampleKillDiag("execve-failed")
+  var failRecord = baseRecord(mrProcessExec, moExecute)
+  if ctx.path != nil:
+    failRecord.path = $ctx.path
+  failRecord.result = -int64(execFailedErrno)
+  failRecord.detail = "execstatus=failed errno=" & $execFailedErrno
+  emitRecord(failRecord)
+  c_set_errno(execFailedErrno)
 
 proc repro_hook_posix_spawn*(ctx: var PosixSpawnContext) {.raises: [].} =
   if shouldBypass():

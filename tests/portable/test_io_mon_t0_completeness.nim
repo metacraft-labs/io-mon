@@ -111,6 +111,66 @@ suite "io-mon T0 earned-completeness (unmonitoredSubtreeLossCount)":
     let records = @[start(200), execRec(200)]
     check unmonitoredSubtreeLossCount(records) == 0
 
+  test "M9.R.68.3: bash configure platform-probe (fork + failed exec) yields NO loss":
+    # Bash's Autotools ./configure script forks 12+ children that
+    # attempt to execve platform-detection binaries (``/bin/uname``,
+    # ``/usr/bin/oslevel``, ``/usr/bin/hostinfo``,
+    # ``/usr/convex/getsysinfo``, ``/bin/machine``, ...) that don't
+    # exist on the target host (e.g. NixOS). Each fork emits a
+    # spawn+start pair, then the child's execve fails ENOENT.
+    #
+    # The shim's ``repro_hook_execve`` pre-emits ``mrProcessExec``
+    # BEFORE calling next (needed for durability across a successful
+    # exec's address-space swap). When execve fails, control returns
+    # to the hook and it emits a follow-up ``mrProcessExec`` carrying
+    # ``execstatus=failed`` in the detail. The signal-(b) tally
+    # subtracts failed execs from the effective count so the
+    # anchored `start=1, exec=1(success-preflush), exec=1(failed)`
+    # shape (effective execs = 0) does NOT trip.
+    let failedExec = MonitorRecord(kind: mrProcessExec,
+      observationKind: moExecute, osPid: 200,
+      detail: "execstatus=failed errno=2")
+    let records = @[start(100), spawn(100, 200), start(200), execRec(200),
+      failedExec]
+    check unmonitoredSubtreeLossCount(records) == 0
+
+  test "M9.R.68.3: bash configure regression pin (12 platform probes)":
+    # The evidence file (m9r68 phaseB) shows 12 anchored pids each
+    # with ``execs=1, starts=1`` for platform-probe execve calls
+    # that fail ENOENT. Without the failed-exec follow-up handling,
+    # this class trips signal (b) 12 times per bash configure. With
+    # the M9.R.68.3 handling in place, all 12 are exempted because
+    # each has a matching ``execstatus=failed`` follow-up.
+    proc probe(child: uint64): seq[MonitorRecord] =
+      @[spawn(100, child), start(child), execRec(child),
+        MonitorRecord(kind: mrProcessExec, observationKind: moExecute,
+          osPid: child, detail: "execstatus=failed errno=2")]
+    var records = @[start(100)]
+    for i in 0 ..< 12:
+      records.add probe(200'u64 + i.uint64)
+    check unmonitoredSubtreeLossCount(records) == 0
+
+  test "M9.R.68.3: successful exec into un-injectable image STILL trips":
+    # A pid that spawns + starts + execs into an un-injectable image
+    # (no post-exec start, no failed-exec follow-up) STILL trips
+    # signal (b) — the classical un-injectable-exec detection
+    # remains active. The M9.R.68.3 exemption ONLY applies when a
+    # matching ``execstatus=failed`` follow-up marker is present.
+    let records = @[start(100), spawn(100, 200), start(200), execRec(200)]
+    check unmonitoredSubtreeLossCount(records) == 1
+
+  test "M9.R.68.3: mix of successful un-injectable + failed execs counted correctly":
+    # Two anchored pids: pid 200 hits an un-injectable image (should
+    # trip); pid 300 hits a nonexistent path (failed exec, exempt).
+    # Expected: 1 loss total (pid 200 only).
+    let failedExec300 = MonitorRecord(kind: mrProcessExec,
+      observationKind: moExecute, osPid: 300,
+      detail: "execstatus=failed errno=2")
+    let records = @[start(100),
+      spawn(100, 200), start(200), execRec(200),
+      spawn(100, 300), start(300), execRec(300), failedExec300]
+    check unmonitoredSubtreeLossCount(records) == 1
+
   test "a process that starts and exits (no spawn/exec) yields NO loss":
     check unmonitoredSubtreeLossCount(@[start(100)]) == 0
 

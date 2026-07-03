@@ -1254,6 +1254,11 @@ const
   NonceToken = "nonce"              ## ipc-connect: per-connection nonce (R8)
   ChanToken = "chan"                ## ROUND-3 S1: external-content channel class
   RoleToken = "role"                ## ROUND-3 S1: external-content channel side
+  ExecStatusToken = "execstatus"    ## M9.R.68.3: process-exec follow-up marker
+                                    ## (``failed`` = execve returned an error,
+                                    ## e.g. ENOENT for bash configure's platform
+                                    ## probes into /bin/uname, /usr/bin/oslevel,
+                                    ## etc.)
 
 proc detailToken*(detail, key: string): string =
   ## Extract the value of a `key=value` token from a record's `detail` field
@@ -1393,12 +1398,27 @@ proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord];
   let (startIdents, startPids) = processStartIdentities(records)
   var startCount = initCountTable[uint64]()
   var execCount = initCountTable[uint64]()
+  var execFailedCount = initCountTable[uint64]()
   for r in records:
     case r.kind
     of mrProcessStart:
       startCount.inc r.osPid
     of mrProcessExec:
-      execCount.inc r.osPid
+      # M9.R.68.3 — a follow-up mrProcessExec with
+      # ``execstatus=failed`` is emitted by the shim WHEN execve
+      # returned to the caller (i.e. failed). Successful execve
+      # replaces the address space so control never returns; those
+      # exec records have no follow-up. Track failed execs separately
+      # so the T0 signal (b) `execs >= starts` invariant subtracts
+      # them from the pid's exec tally. Without this, bash configure's
+      # 12+ platform probes (fork → execve /bin/uname etc. that don't
+      # exist on NixOS) each falsely trip signal (b) even though the
+      # exec never landed in an un-injectable image — it failed
+      # ENOENT before landing anywhere.
+      if detailToken(r.detail, ExecStatusToken) == "failed":
+        execFailedCount.inc r.osPid
+      else:
+        execCount.inc r.osPid
     else: discard
   result = 0
   # (a) spawned children with no matching process-start (count each child once).
@@ -1488,10 +1508,22 @@ proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord];
         r.childOsPid != r.osPid:
       pidsWithAnchoredSpawn.incl r.childOsPid
   for pid, execs in execCount:
-    if execs > 0 and pid in pidsWithAnchoredSpawn:
-      let starts = startCount.getOrDefault(pid)
-      if execs >= starts:
-        inc result
+    if pid notin pidsWithAnchoredSpawn:
+      continue
+    # M9.R.68.3 — subtract failed execs (execve returned an error) from
+    # the tally: the exec never landed in an un-injectable image, so
+    # it must not falsely trip signal (b). The pre-flush mrProcessExec
+    # record is always emitted (needed for durability across a
+    # successful address-space swap); the shim emits a follow-up
+    # ``execstatus=failed`` record iff control returned from callNext,
+    # proving the exec failed.
+    let failedExecs = execFailedCount.getOrDefault(pid)
+    let effectiveExecs = execs - failedExecs
+    if effectiveExecs <= 0:
+      continue
+    let starts = startCount.getOrDefault(pid)
+    if effectiveExecs >= starts:
+      inc result
   # (c) IPC-connect to an out-of-tree / opaque / un-reported peer (break #1).
   # Dedup so a client that connects to the same daemon many times counts once:
   # key on the peer pid when known, else on the destination (an unknown-peer
