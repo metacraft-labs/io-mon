@@ -1921,6 +1921,81 @@ int main(void) {
       ("unsupported nr=186" in it.detail or
        "libc raw syscall unsupported" in it.detail))
 
+  test "PATH-searching execvp emits exactly one process-exec (M9.R.66.2)":
+    # M9.R.66.2 regression pin: M9.R.65.2 added dispatch_execvp / _execvpe /
+    # _fexecve interposers that fire the shim's execve hook then hand off to
+    # glibc's real_execvp. glibc's real_execvp implements PATH lookup by
+    # issuing execve() per candidate directory, and each of those internal
+    # execve() calls hit our LD_PRELOAD `execve` interposer — outside a
+    # bracket they re-fire the execve hook and emit ANOTHER mrProcessExec
+    # per candidate. On a $PATH with N candidates the depfile records
+    # execCount(pid) ~= N+1 vs startCount(pid) == 2, tripping T0 signal (b)
+    # `execCount(pid) >= startCount(pid)` — one synthetic
+    # `unmonitored subtree/peer` event-loss + mcIncomplete.
+    #
+    # Fix (M9.R.66.2): dispatch_execvp/pe/fexecve bracket the real_exec
+    # call with stackable_linux_preload_enter_hook / _exit_hook so the
+    # PATH-loop internal execve interposers see CT_BYPASS()==true and
+    # delegate straight to real_execve without re-emitting.
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    # Build a minimal target binary + place it at the END of a $PATH with
+    # 3 empty leading directories so real_execvp does 3 failed execve()s
+    # + 1 successful one. Build the target from source (rather than
+    # copying /bin/true) because NixOS-WSL has no /bin/true and the test
+    # must work on both classical distros AND NixOS.
+    let targetName = "probe-target-m9r66-2"
+    let pathDirs = @[work / "p1", work / "p2", work / "p3", work / "p4"]
+    for d in pathDirs:
+      createDir(d)
+    let targetSrc = work / "probe_target_m9r66_2.c"
+    writeFile(targetSrc, "int main(void) { return 0; }\n")
+    let targetPath = pathDirs[^1] / targetName
+    let cc = getEnv("CC", "cc")
+    let ccBuilt = run(cc, @[targetSrc, "-o", targetPath])
+    checkpoint("target cc: " & ccBuilt.output)
+    check ccBuilt.code == 0
+    check fileExists(targetPath)
+
+    let probe = buildC(work, "execvp_path_search_probe", """
+#include <stdio.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  if (argc < 2) return 2;
+  char *const cargv[] = { argv[1], NULL };
+  execvp(argv[1], cargv);
+  perror("execvp");
+  return 3;
+}
+""")
+    let depfile = work / "execvp-path-search.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    childEnv["PATH"] = pathDirs.join(":")
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", probe,
+      targetName], childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      ("unmonitored subtree" in it.detail or
+       "un-injectable spawn child" in it.detail))
+
   test "unrelated SIGTRAP is not swallowed by inline syscall handler":
     let snoopBin = work / "io-mon"
     if not fileExists(snoopBin):

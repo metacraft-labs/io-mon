@@ -1982,9 +1982,25 @@ static int ct_linux_preload_dispatch_execvp(const char *file,
    * name), which is fine — we then fall through to the real execvp
    * so glibc's PATH search runs and jumps into the actual image.
    * The bracket bookkeeping (enter_hook / exit_hook) is done by
-   * CT_CALL_HOOK. */
+   * CT_CALL_HOOK.
+   *
+   * M9.R.66.2: glibc's real_execvp does PATH lookup by calling
+   * execve() internally, once per candidate directory, until a
+   * matching image is found.  Each of those internal execve() calls
+   * lands on OUR execve interposer above, which — outside a bracket
+   * — would re-fire the execve hook and emit ANOTHER mrProcessExec
+   * per candidate.  On a NixOS-WSL host with per-tool $PATH entries
+   * that yields 4× exec records for the same pid (see
+   * m9r66_phaseB_subtree.txt) which trips the T0 `execCount(pid) >=
+   * startCount(pid)` unmonitored-subtree loss.  Bracket the
+   * real_execvp call so those internal execve interposers see
+   * CT_BYPASS() and delegate straight to real_execve without
+   * re-emitting the hook. */
   CT_CALL_HOOK(ct_execve_hook((char *)file, (char **)argv, environ));
-  return ct_linux_preload_real_execvp((char *)file, (char **)argv);
+  stackable_linux_preload_enter_hook();
+  int rc = ct_linux_preload_real_execvp((char *)file, (char **)argv);
+  stackable_linux_preload_exit_hook();
+  return rc;
 }
 
 static int ct_linux_preload_dispatch_execvpe(const char *file,
@@ -1995,8 +2011,12 @@ static int ct_linux_preload_dispatch_execvpe(const char *file,
                                           (char **)envp);
   CT_CALL_HOOK(ct_execve_hook((char *)file, (char **)argv,
                               (char **)envp));
-  return ct_linux_preload_real_execvpe((char *)file, (char **)argv,
-                                        (char **)envp);
+  /* M9.R.66.2: same PATH-lookup double-count guard as dispatch_execvp. */
+  stackable_linux_preload_enter_hook();
+  int rc = ct_linux_preload_real_execvpe((char *)file, (char **)argv,
+                                          (char **)envp);
+  stackable_linux_preload_exit_hook();
+  return rc;
 }
 
 static int ct_linux_preload_dispatch_fexecve(int fd,
@@ -2011,7 +2031,13 @@ static int ct_linux_preload_dispatch_fexecve(int fd,
    * determined by the fd, so callers using fexecve accept the same
    * ambiguity. */
   CT_CALL_HOOK(ct_execve_hook("", (char **)argv, (char **)envp));
-  return ct_linux_preload_real_fexecve(fd, (char **)argv, (char **)envp);
+  /* M9.R.66.2: same double-count guard.  glibc's fexecve is a thin
+   * wrapper around execve on /proc/self/fd/<fd>, so the same
+   * PATH-lookup double-emission would happen without the bracket. */
+  stackable_linux_preload_enter_hook();
+  int rc = ct_linux_preload_real_fexecve(fd, (char **)argv, (char **)envp);
+  stackable_linux_preload_exit_hook();
+  return rc;
 }
 
 int execvp(const char *file, char *const argv[])
