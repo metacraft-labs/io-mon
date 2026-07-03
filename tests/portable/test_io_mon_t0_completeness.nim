@@ -88,11 +88,28 @@ suite "io-mon T0 earned-completeness (unmonitoredSubtreeLossCount)":
     let records = @[start(200), start(200), execRec(200), execRec(200)]
     check unmonitoredSubtreeLossCount(records) == 0
 
-  test "M9.R.66.3: unanchored pid with genuinely trailing exec (no spawn) still trips":
-    # execs > starts (2 > 1) means one exec is truly unpaired even with
-    # the M9.R.66.3 loosening applied.
+  test "M9.R.66.4: unanchored pid with genuinely trailing exec (no spawn) is NOT tripped":
+    # M9.R.66.4 policy: T0 signal (b) applies only to anchored pids
+    # (those with a matching mrProcessSpawn record). Unanchored pids —
+    # typically vfork'd children where Python's fork_exec emits N
+    # spurious PATH-search execs before the successful one — are
+    # exempt from signal (b). The residual coverage gap (an
+    # unanchored pid that legitimately execs into a hardened image
+    # without a spawn record) is bounded by signals (a) and (c),
+    # both of which remain active. See writer.nim's execCount block
+    # for the rationale.
     let records = @[start(200), execRec(200), execRec(200)]
-    check unmonitoredSubtreeLossCount(records) == 1
+    check unmonitoredSubtreeLossCount(records) == 0
+
+  test "M9.R.66.4: unanchored pid with any exec is exempt from signal (b)":
+    # A subsumed test: unanchored + one exec + one start (the classical
+    # un-injectable exec case that would trip if pid 200 was anchored)
+    # does not trip because signal (b) is disabled for unanchored pids.
+    # If the caller wants this pid to trip, they must include an
+    # mrProcessSpawn anchor (either from a monitored parent or the
+    # root synthetic).
+    let records = @[start(200), execRec(200)]
+    check unmonitoredSubtreeLossCount(records) == 0
 
   test "a process that starts and exits (no spawn/exec) yields NO loss":
     check unmonitoredSubtreeLossCount(@[start(100)]) == 0

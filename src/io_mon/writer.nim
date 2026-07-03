@@ -1453,23 +1453,44 @@ proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord];
   # holds — either the pid is the root (has an `io-mon-root-spawn`
   # synthetic spawn record with osPid=0) or a monitored parent recorded a
   # spawn for it (osPid != 0). For those pids, the strict `execs >=
-  # starts` T0 signal (b) applies. For pids with no spawn record at all
-  # (vfork'd by an unhooked mechanism like Python's `_posixsubprocess.
-  # fork_exec`), the initial-start assumption doesn't hold and we require
-  # strict `execs > starts`.
+  # starts` T0 signal (b) applies.
+  #
+  # For pids with no spawn record at all (vfork'd by an unhooked
+  # mechanism like Python's `_posixsubprocess.fork_exec`), the initial-
+  # start assumption doesn't hold. In addition, Python's PATH-search
+  # loop emits N failed `execve()` calls per PATH candidate before the
+  # successful one — each of those hits our LD_PRELOAD execve
+  # interposer OUTSIDE our dispatch_execvp bracket (Python doesn't call
+  # libc's execvp), so N-1 spurious `mrProcessExec` records land in the
+  # depfile per successful transition. See reprobuild
+  # recipes/reproos-image/run-evidence/m9r66/m9r66_phaseB_subtree.txt
+  # for pixman meson data (pid emits 4 execs for 1 real transition
+  # because $PATH has ~4 candidates).
+  #
+  # Rather than pre-check execs in the shim (M9.R.66.3's access(X_OK)
+  # attempt regressed gcc-14.3.0's cc1 startup with an internal
+  # compiler error), disable T0 signal (b) entirely for unanchored
+  # pids. The classical un-injectable-exec case that signal (b)
+  # originally caught (root monitored process execs into hardened
+  # image) is still detected via anchored pids. The residual coverage
+  # gap — an unanchored pid that legitimately execs into a hardened
+  # image — is bounded because:
+  #   * Signal (a) still catches un-injectable SPAWNS from monitored
+  #     parents (mrProcessSpawn childOsPid with no matching start).
+  #   * Signal (c) still catches breakaway-daemon IPC connects.
+  #   * The unanchored+un-injectable case requires Python-style
+  #     vfork+execve into a hardened image, which is rare in build
+  #     workloads and would still show up as an out-of-tree IPC
+  #     connect if the child does any real I/O.
   var pidsWithAnchoredSpawn = initHashSet[uint64]()
   for r in records:
     if r.kind == mrProcessSpawn and r.childOsPid != 0 and
         r.childOsPid != r.osPid:
       pidsWithAnchoredSpawn.incl r.childOsPid
   for pid, execs in execCount:
-    if execs > 0:
+    if execs > 0 and pid in pidsWithAnchoredSpawn:
       let starts = startCount.getOrDefault(pid)
-      let hasAnchoredSpawn = pid in pidsWithAnchoredSpawn
-      let trip =
-        if hasAnchoredSpawn: execs >= starts
-        else: execs > starts
-      if trip:
+      if execs >= starts:
         inc result
   # (c) IPC-connect to an out-of-tree / opaque / un-reported peer (break #1).
   # Dedup so a client that connects to the same daemon many times counts once:
