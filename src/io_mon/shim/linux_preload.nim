@@ -248,6 +248,24 @@ template withShimMuted(body: untyped) =
 proc shouldBypass(): bool {.inline, raises: [].} =
   disabled > 0 or inForkChild
 
+proc sampleKillDiag(phase: string) {.raises: [].} =
+  ## M9.R.62.1 — precise-attribution instrumentation for the parent-side
+  ## kill-before-flush residual. Publishes the calling thread's current
+  ## shim state ("phase=<name> bypassed=<0|1> inForkChild=<0|1>
+  ## disabled=<N>") to the writer's per-thread diag context slot so any
+  ## subsequent read-tail-pending marker carries this attribution. The
+  ## writer's mergeFragments extracts the last-seen ctx from an unmatched
+  ## pending marker and copies it into the synthetic event-loss detail;
+  ## empty no-op when IO_MON_KILL_DIAG is off. Kept branch-cheap so the
+  ## non-diagnostic build path pays only the env-var probe on first call.
+  when false: # keep string ops out of hot builds
+    discard
+  var buf = "phase=" & phase &
+    " bypassed=" & (if shouldBypass(): "1" else: "0") &
+    " inForkChild=" & (if inForkChild: "1" else: "0") &
+    " disabled=" & $disabled
+  setKillDiagContext(buf)
+
 proc baseRecord(kind: MonitorRecordKind;
                 observationKind: MonitorObservationKind): MonitorRecord =
   MonitorRecord(
@@ -561,6 +579,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     rememberInheritedOpenFds()
   initialized = true
   mainThreadId = currentThreadId()
+  sampleKillDiag("init")
   recordProcessStart()
   let rawStatus = installRawSyscallWrapperPatch()
   recordRawSyscallCoverage(rawStatus)
@@ -1627,7 +1646,9 @@ proc processIsSingleThreaded(): bool {.raises: [].} =
   result = sawDigit and n == 1
 
 proc repro_hook_fork*(ctx: var ForkContext) {.raises: [].} =
+  sampleKillDiag("fork-enter")
   if shouldBypass():
+    sampleKillDiag("fork-bypassed")
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -1653,16 +1674,20 @@ proc repro_hook_fork*(ctx: var ForkContext) {.raises: [].} =
       # process-start is expected and harmless; see t0-completeness).
       withShimMuted:
         discardFragmentSlotAfterFork()
+      sampleKillDiag("fork-child-single")
       recordProcessStart()
     else:
       # Multi-threaded parent: another thread may have held a Nim lock at fork,
       # so the child must avoid monitor bookkeeping until exec loads a fresh
       # image and re-runs the preload constructor.
       inForkChild = true
+      sampleKillDiag("fork-child-multi")
   c_set_errno(savedErrno)
 
 proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
+  sampleKillDiag("execve-enter")
   if shouldBypass():
+    sampleKillDiag("execve-bypassed")
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -1671,7 +1696,9 @@ proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
     record.path = $ctx.path
   emitRecord(record)
   ctx.envp = envWithPreload(ctx.envp)
+  sampleKillDiag("execve-pre-flush")
   discard repro_monitor_shim_flush()
+  sampleKillDiag("execve-post-flush")
   callNext(ctx)
 
 proc repro_hook_posix_spawn*(ctx: var PosixSpawnContext) {.raises: [].} =
@@ -1711,8 +1738,11 @@ proc repro_hook_posix_spawnp*(ctx: var PosixSpawnContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_exit*(ctx: var ExitContext) {.raises: [].} =
+  sampleKillDiag("exit-enter")
   if not shouldBypass():
     discard repro_monitor_shim_shutdown()
+  else:
+    sampleKillDiag("exit-bypassed")
   callNext(ctx)
 
 setPreloadShimEnvVar("REPRO_MONITOR_SHIM_LIB")

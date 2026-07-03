@@ -211,6 +211,69 @@ proc setFragmentRunToken*(token: string) =
   ## writer so the kill-before-flush markers are run-scoped. Idempotent; call once.
   fragmentRunToken = token
 
+# M9.R.62.1 — precise-attribution diagnostic for kill-before-flush residuals.
+#
+# The two shim-side upstream fixes (direct-exit + pre-exec flush) cover ONE
+# class of escape. Pixman's __repro_provider_compile reproducibly leaves 182
+# unmatched read-tail-pending markers. To bisect between the two remaining
+# candidates without speculation:
+#
+#   Candidate 2 (execve flush-vs-exec-transition race): shim's execve hook
+#     bailed on shouldBypass() BEFORE flushing, or the flush raced the kernel
+#     exec transition. Escape signature: pending marker's ctx carries
+#     `phase=execve`.
+#
+#   Candidate 3 (TLS-inherited shouldBypass gating): child inherits
+#     `inForkChild=true` or `disabled>0` after a fork; every hook (including
+#     repro_hook_exit) bails, so closeFragmentSlot / matching committed
+#     marker are never written. Escape signature: pending marker's ctx
+#     carries `bypassed=1` at the last-hook-context sample.
+#
+# Mechanism: the shim publishes a per-thread "diagnostic context" string via
+# setKillDiagContext (called on every hook enter that could alter shouldBypass
+# state). writeReadTailMarker embeds it in the marker's detail when
+# IO_MON_KILL_DIAG=1 is set. mergeFragments extracts the last-seen ctx from
+# each mismatched pending and copies it into the synthetic event-loss detail.
+# The M9.R.62 evidence file then counts markers by ctx to identify the
+# dominant candidate.
+
+const
+  KillDiagEnvVar* = "IO_MON_KILL_DIAG"
+  KillDiagCtxTag* = " ctx="
+    ## Prefix used in the pending marker's detail to carry the shim's
+    ## last-observed diagnostic context; matches `mergeFragments`' regex-free
+    ## split so the tag survives the ` run=<id>` suffix.
+
+var killDiagEnabled: bool
+var killDiagChecked: bool
+
+proc killDiagIsOn(): bool =
+  if not killDiagChecked:
+    killDiagChecked = true
+    let v = getEnv(KillDiagEnvVar)
+    killDiagEnabled = v.len > 0 and v != "0"
+  killDiagEnabled
+
+var killDiagContext {.threadvar.}: string
+  ## Per-thread diagnostic context sampled by the shim on every hook entry
+  ## that could change shouldBypass()'s value. writeReadTailMarker embeds
+  ## this into the pending marker so kill-before-flush event-loss records
+  ## carry attribution when the process later dies un-flushed.
+
+proc setKillDiagContext*(ctx: string) =
+  ## Publish the calling thread's diagnostic context. Cheap no-op when
+  ## `IO_MON_KILL_DIAG` is off. Callers pass short tokens like
+  ## "hook=read bypassed=0" — space-separated key=value pairs.
+  if not killDiagIsOn():
+    return
+  killDiagContext = ctx
+
+proc killDiagContextForMarker(): string =
+  if killDiagIsOn() and killDiagContext.len > 0:
+    result = KillDiagCtxTag & killDiagContext
+  else:
+    result = ""
+
 proc writeReadTailMarker(detail: string) =
   ## ROUND-5 F — write a kill-before-flush bookkeeping marker (`mrEventLoss` with
   ## `detail`, stamped with the current run token) DIRECTLY to the calling thread's
@@ -225,7 +288,7 @@ proc writeReadTailMarker(detail: string) =
     return
   let marker = MonitorRecord(kind: mrEventLoss, observationKind: moEventLoss,
     osPid: fragmentSlot.osPid, threadId: fragmentSlot.threadId,
-    detail: detail & fragmentRunToken)
+    detail: detail & fragmentRunToken & killDiagContextForMarker())
   let frame = encodeFrame(marker)
   try:
     let n = fragmentSlot.file.writeBuffer(unsafeAddr frame[0], frame.len)
@@ -1668,13 +1731,22 @@ proc mergeFragments*(fragmentDir, outputPath: string;
   block readTailNet:
     var pendingByThread = initCountTable[(uint64, uint64)]()
     var committedByThread = initCountTable[(uint64, uint64)]()
+    # M9.R.62.1 — remember the most-recent ctx tag observed on each thread's
+    # pending markers so an unmatched leftover carries the shim's last-seen
+    # diagnostic attribution into the synthetic event-loss detail. Empty when
+    # IO_MON_KILL_DIAG was off at capture time.
+    var lastPendingCtx = initTable[(uint64, uint64), string]()
     var cleaned = newSeqOfCap[MonitorRecord](records.len)
-    # The marker detail is "<kind> run=<id>" (run-stamped), so match by PREFIX. The
-    # run scoping is already applied by dropStaleRunRecords above, so only this run's
-    # markers reach here.
+    # The marker detail is "<kind> run=<id>[ ctx=<...>]" (run-stamped + optional
+    # diagnostic context suffix), so match by PREFIX. The run scoping is already
+    # applied by dropStaleRunRecords above, so only this run's markers reach here.
     for r in records:
       if r.kind == mrEventLoss and r.detail.startsWith(ReadTailPendingDetail):
         pendingByThread.inc((r.osPid, r.threadId))
+        let ctxAt = r.detail.find(KillDiagCtxTag)
+        if ctxAt >= 0:
+          lastPendingCtx[(r.osPid, r.threadId)] =
+            r.detail[ctxAt + KillDiagCtxTag.len .. ^1]
       elif r.kind == mrEventLoss and r.detail.startsWith(ReadTailCommittedDetail):
         committedByThread.inc((r.osPid, r.threadId))
       else:
@@ -1683,9 +1755,14 @@ proc mergeFragments*(fragmentDir, outputPath: string;
     for key, pcount in pendingByThread:
       let leftover = pcount - committedByThread.getOrDefault(key, 0)
       for _ in 0 ..< max(0, leftover):
+        var detail =
+          "process killed with an un-flushed read batch (kill-before-flush)"
+        let ctx = lastPendingCtx.getOrDefault(key, "")
+        if ctx.len > 0:
+          detail.add " diag-ctx=[" & ctx & "]"
         records.add MonitorRecord(kind: mrEventLoss, observationKind: moEventLoss,
           osPid: key[0], threadId: key[1],
-          detail: "process killed with an un-flushed read batch (kill-before-flush)")
+          detail: detail)
   # Legacy: consume + honour any stale round-2 `.io-mon-reading` sidecar (a warm
   # restart from a pre-round-5 shim). Removing it and counting it is the SAFE
   # direction; the current shim writes no sidecars, so this is dormant in steady use.
