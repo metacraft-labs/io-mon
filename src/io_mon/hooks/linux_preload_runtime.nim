@@ -3109,6 +3109,79 @@ proc scanInlineSyscallPatchesForTrackedMprotectRange*(start: pointer;
   inlineSyscallPatchStatus = status
   status
 
+proc patchLibcExitFamilySyscalls(status: var InlineSyscallPatchStatus)
+    {.raises: [].} =
+  ## Targeted INT3 patch for libc's `_exit` / `_Exit` inline syscall sites.
+  ##
+  ## Rationale (M9.R.63.5): a program that returns 0 from `main()` reaches
+  ## libc's `__libc_start_main` epilogue, which calls `exit(0)` -> atexit
+  ## chain -> `_exit(0)`. That final `_exit` inside libc is bound to the
+  ## INTERNAL alias `__GI__exit` via `hidden_def`, NOT to the exported
+  ## `_exit` symbol; LD_PRELOAD cannot interpose the internal binding, and
+  ## the io-mon `_exit` interposer is never entered. The internal
+  ## implementation is a small inline `syscall #exit_group`. Every well-
+  ## behaved libc-linked program that returns 0 from `main()` therefore
+  ## reaches the kernel through an unhooked inline `syscall` site inside
+  ## libc.so.6. Under nix, that site sits in a `/nix/store/` mapping
+  ## excluded by `shouldPatchInlineSyscallMapping`; on FHS distros it
+  ## sits under `/lib*/` and is excluded by the same policy for the same
+  ## reason (broad libc scanning would over-net into non-exit syscalls).
+  ##
+  ## Fix: resolve libc's `_exit` and `_Exit` addresses through an opened
+  ## `libc.so.6` handle (bypassing the LD_PRELOAD chain so we do NOT get
+  ## io-mon's own `_exit`), scan the entry region for the first `0f 05`
+  ## opcode, and INT3-patch it. The M9.R.63.3 SIGTRAP handler
+  ## augmentation catches the resulting trap, invokes
+  ## `repro_linux_sig_safe_flush`, and delegates to
+  ## `stackable_linux_replay_syscall_regs` — which kills the process
+  ## cleanly with the buffered read batch flushed. Symmetric with the
+  ## `installRawSyscallWrapperPatch` treatment of `syscall(3)`.
+  ##
+  ## Bounded and policy-free: we only touch the two symbols we
+  ## explicitly name, and only the FIRST `0f 05` in a 64-byte window at
+  ## each entry. `libc.so.6`'s `_exit` / `_Exit` are single-syscall
+  ## thunks so the window is generous; if libc were reorganised to
+  ## structure `_exit` differently, the scan would simply skip and the
+  ## caller would remain unpatched — no false event-loss.
+  const exitScanWindowBytes = 64
+  let handle = openLibraryNoLoad(cstring("libc.so.6"))
+  if handle == nil:
+    return
+
+  let statusPtr = addr status
+  var patched = false
+
+  proc scanAndPatchOne(sym: pointer) {.raises: [].} =
+    ## Nested proc invoked twice — once per symbol — so the outer
+    ## `patched` and `statusPtr` are captured by closure. The scan walks
+    ## at most `exitScanWindowBytes` from the symbol entry and stops on
+    ## the FIRST `0f 05` opcode. libc's `_exit` / `_Exit` are single-
+    ## syscall thunks, so one match per symbol is the expected shape.
+    patched = false
+    visitLinuxX8664SyscallMemory(sym, exitScanWindowBytes,
+      proc(site: LinuxSyscallSite): bool =
+        if patched:
+          return false
+        let tx = installInt3SyscallPatchTransaction(cast[pointer](site.address))
+        if tx.diagnostic == lrsOk and tx.patchLive:
+          if cInlineSyscallRecordSite(culong(site.address)) == 0:
+            inc statusPtr[].patchedSites
+            patched = true
+        elif statusPtr[].firstPatchDiagnostic == lrsOk:
+          statusPtr[].firstPatchDiagnostic = tx.diagnostic
+          statusPtr[].firstPatchStage = tx.stage
+          statusPtr[].firstPatchErrno = tx.osErrno
+          statusPtr[].firstPatchAddress = site.address
+        false
+    )
+
+  let exitSym = resolveSymbolInHandle(handle, cstring("_exit"))
+  if exitSym != nil:
+    scanAndPatchOne(exitSym)
+  let ExitSym = resolveSymbolInHandle(handle, cstring("_Exit"))
+  if ExitSym != nil:
+    scanAndPatchOne(ExitSym)
+
 proc installInlineSyscallPatches*(): InlineSyscallPatchStatus {.raises: [].} =
   if inlineSyscallPatchAttempted:
     return inlineSyscallPatchStatus
@@ -3150,6 +3223,9 @@ proc installInlineSyscallPatches*(): InlineSyscallPatchStatus {.raises: [].} =
     if not shouldPatchInlineSyscallMapping(mapping, executablePath):
       continue
     patchInlineSyscallMapping(mapping, status)
+  # M9.R.63.5 — targeted libc `_exit` / `_Exit` internal-alias coverage.
+  # See patchLibcExitFamilySyscalls for the rationale + scope boundary.
+  patchLibcExitFamilySyscalls(status)
   status.patchedSites = int(cInlineSyscallSiteCount())
   if cInlineSyscallOverflowed() != 0 and status.firstPatchDiagnostic == lrsOk:
     status.firstPatchDiagnostic = lrsInvalidArgument
