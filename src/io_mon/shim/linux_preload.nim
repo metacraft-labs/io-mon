@@ -2074,6 +2074,35 @@ proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
+  # M9.R.66.3: Python's `_posixsubprocess.fork_exec` implements PATH
+  # lookup in its own C code by calling `execve()` per candidate directory
+  # until one succeeds. Every ENOENT-failing candidate lands on this hook
+  # BEFORE the successful one, so — without a pre-check — we would emit
+  # one mrProcessExec per failed candidate + one for the successful
+  # transition. That trips T0's `execCount(pid) >= startCount(pid)`
+  # invariant (see `writer.nim`'s `unmonitoredSubtreeLossCount`),
+  # injecting one synthetic `unmonitored subtree/peer` event-loss and
+  # sealing mcIncomplete. Documented under
+  # reprobuild/recipes/reproos-image/run-evidence/m9r66/
+  # m9r66_phaseB_subtree.txt.
+  #
+  # Pre-check with a raw `access(path, X_OK)` (nr=21) so we skip the
+  # emit + flush for exec attempts that will fail with ENOENT / EACCES.
+  # `access` in bypass mode is not classified as an observation (see
+  # `classifyRawFileSyscall`'s LinuxSysAccess arm), so the pre-check adds
+  # no dependency to the depfile — it's a pure existence probe from the
+  # shim's own perspective. A successful `access` doesn't guarantee
+  # `execve` will succeed (e.g. the file could vanish between the two),
+  # but the false-positive rate is bounded by concurrent unlink races,
+  # not by every PATH-lookup miss.
+  const XOk = 1.clong
+  if ctx.path != nil:
+    let accessRc = c_raw_syscall6(LinuxSysAccess,
+      cast[clong](ctx.path), XOk, 0, 0, 0, 0)
+    if accessRc != 0:
+      sampleKillDiag("execve-access-fail")
+      callNext(ctx)
+      return
   var record = baseRecord(mrProcessExec, moExecute)
   if ctx.path != nil:
     record.path = $ctx.path

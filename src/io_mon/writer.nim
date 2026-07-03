@@ -1417,9 +1417,60 @@ proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord];
         flaggedChildren.incl ident
         inc result
   # (b) execs whose last image was un-injectable (one loss per such pid).
+  #
+  # Semantic invariant: for a monitored pid, `startCount == 1 + execCount`
+  # (the +1 accounts for the initial shim init on process image load).
+  # `execCount >= startCount` means the last exec had no post-exec shim
+  # reload → un-injectable image.
+  #
+  # M9.R.66.3: this invariant assumed the initial process-image load
+  # always emits a mrProcessStart. In practice, Python's
+  # `_posixsubprocess.fork_exec` uses `vfork+execve` on Linux which —
+  # because vfork temporarily shares the parent's memory and Python's
+  # C code short-circuits the exec discovery loop — can produce a child
+  # whose recorded starts + execs come out matched (starts == execs)
+  # for a fully-monitored wrapper chain (bash-wrapping-gcc → real gcc).
+  # See reprobuild recipes/reproos-image/run-evidence/m9r66/
+  # m9r66_phaseB_subtree.txt for the pixman mesonbin-setup evidence.
+  #
+  # Distinguish the vfork case from the classical un-injectable case
+  # (`start(100), exec(100)` in tests) by whether the pid has a
+  # matching monitored-parent SPAWN record:
+  #
+  #   * Spawn record exists (classical fork/posix_spawn): the parent
+  #     recorded the spawn, so we KNOW the initial-shim-load start
+  #     should have fired. If `execs >= starts`, the last exec
+  #     was un-injectable — trip.
+  #
+  #   * No spawn record (vfork or other non-hooked spawn mechanism):
+  #     we cannot rely on the initial-shim-load start being present,
+  #     so require strict `execs > starts`. A monitored wrapper chain
+  #     with 2 execs + 2 starts passes; a genuinely un-injectable exec
+  #     with 1 exec + 0 starts still trips (via signal (a) if the
+  #     parent's spawn was recorded, or here if the pid emitted only
+  #     an exec and no start).
+  # Build the set of pids for which the initial-shim-load start invariant
+  # holds — either the pid is the root (has an `io-mon-root-spawn`
+  # synthetic spawn record with osPid=0) or a monitored parent recorded a
+  # spawn for it (osPid != 0). For those pids, the strict `execs >=
+  # starts` T0 signal (b) applies. For pids with no spawn record at all
+  # (vfork'd by an unhooked mechanism like Python's `_posixsubprocess.
+  # fork_exec`), the initial-start assumption doesn't hold and we require
+  # strict `execs > starts`.
+  var pidsWithAnchoredSpawn = initHashSet[uint64]()
+  for r in records:
+    if r.kind == mrProcessSpawn and r.childOsPid != 0 and
+        r.childOsPid != r.osPid:
+      pidsWithAnchoredSpawn.incl r.childOsPid
   for pid, execs in execCount:
-    if execs > 0 and execs >= startCount.getOrDefault(pid):
-      inc result
+    if execs > 0:
+      let starts = startCount.getOrDefault(pid)
+      let hasAnchoredSpawn = pid in pidsWithAnchoredSpawn
+      let trip =
+        if hasAnchoredSpawn: execs >= starts
+        else: execs > starts
+      if trip:
+        inc result
   # (c) IPC-connect to an out-of-tree / opaque / un-reported peer (break #1).
   # Dedup so a client that connects to the same daemon many times counts once:
   # key on the peer pid when known, else on the destination (an unknown-peer

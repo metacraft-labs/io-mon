@@ -61,12 +61,38 @@ suite "io-mon T0 earned-completeness (unmonitoredSubtreeLossCount)":
   test "an exec into an un-injectable image yields one loss":
     # 100 starts then execs (SETEXEC or execve) into a hardened image — no
     # post-exec start, so execCount(100)=1 >= startCount(100)=1.
-    let records = @[start(100), execRec(100)]
+    #
+    # M9.R.66.3: the root-spawn synthetic (mrProcessSpawn osPid=0
+    # childOsPid=100 that mergeFragments injects for the launcher-expected
+    # root pid) anchors pid 100's initial-start invariant, so the strict
+    # `execs >= starts` T0 signal (b) trips as before. Without the
+    # anchoring spawn record the signal loosens to `execs > starts` to
+    # avoid false-positives on vfork'd children whose fork-time start
+    # was skipped because the fork mechanism (Python's
+    # `_posixsubprocess.fork_exec`) bypasses our LD_PRELOAD fork hook.
+    let records = @[spawn(0, 100), start(100), execRec(100)]
     check unmonitoredSubtreeLossCount(records) == 1
 
   test "a SETEXEC into an injectable image (post-exec start) yields NO loss":
-    let records = @[start(100), execRec(100), start(100)]
+    let records = @[spawn(0, 100), start(100), execRec(100), start(100)]
     check unmonitoredSubtreeLossCount(records) == 0
+
+  test "M9.R.66.3: vfork-style child with no spawn record + wrapper chain (execs==starts) yields NO loss":
+    # Python's `_posixsubprocess.fork_exec` uses vfork+execvp on Linux; the
+    # vfork isn't hooked so no spawn record fires. The child then execs
+    # gcc-wrapper (bash reading shebang), the wrapper's bash execs real gcc.
+    # Each successful exec transition emits one process-start (shim reload).
+    # Without the M9.R.66.3 loosening this pattern trips T0 signal (b)
+    # spuriously (2 execs >= 2 starts). See reprobuild's m9r66_phaseB_subtree
+    # evidence.
+    let records = @[start(200), start(200), execRec(200), execRec(200)]
+    check unmonitoredSubtreeLossCount(records) == 0
+
+  test "M9.R.66.3: unanchored pid with genuinely trailing exec (no spawn) still trips":
+    # execs > starts (2 > 1) means one exec is truly unpaired even with
+    # the M9.R.66.3 loosening applied.
+    let records = @[start(200), execRec(200), execRec(200)]
+    check unmonitoredSubtreeLossCount(records) == 1
 
   test "a process that starts and exits (no spawn/exec) yields NO loss":
     check unmonitoredSubtreeLossCount(@[start(100)]) == 0
@@ -120,7 +146,10 @@ suite "io-mon T3a IPC-breakaway downgrade (unmonitoredSubtreeLossCount)":
     check unmonitoredSubtreeLossCount(records2, trusted) == 1
 
   test "IPC and spawn/exec losses accumulate independently":
-    let records = @[start(100), spawn(100, 300), ipc(100, 999), execRec(100)]
+    # M9.R.66.3: the root-spawn synthetic anchors pid 100's initial-start
+    # invariant so the strict `execs >= starts` T0 signal (b) still trips.
+    let records = @[spawn(0, 100), start(100), spawn(100, 300),
+      ipc(100, 999), execRec(100)]
     # spawn 300 (no start) + exec into un-injectable + connect to 999 = 3 losses.
     check unmonitoredSubtreeLossCount(records) == 3
 
