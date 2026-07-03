@@ -3121,22 +3121,30 @@ proc currentExecutablePath(): string {.raises: [].} =
   except CatchableError:
     result = ""
 
-proc isSystemRuntimeMappingPath(path: string): bool {.raises: [].} =
+proc isSystemRuntimeMappingPath*(path: string): bool {.raises: [].} =
   ## Keep startup DSO scanning out of loader/libc/toolchain runtime mappings.
   ## io-mon can safely classify file syscalls once a selected site traps, but
   ## broad runtime-library patching would turn ordinary libc/loader internals
   ## into false raw-syscall event-loss for every monitored process.
+  ##
+  ## Exported for M9.R.67.1's regression test
+  ## (`tests/linux/test_io_mon_inline_patch_predicate.nim`) so the
+  ## precedence order between this predicate and the
+  ## `executable-mapping-short-circuit` in
+  ## `shouldPatchInlineSyscallMapping` stays under regression cover.
   path.startsWith("/lib/") or path.startsWith("/lib64/") or
     path.startsWith("/usr/lib/") or path.startsWith("/usr/lib64/") or
     path.startsWith("/nix/store/")
 
-proc isMonitorShimMappingPath(path: string): bool {.raises: [].} =
+proc isMonitorShimMappingPath*(path: string): bool {.raises: [].} =
+  ## Exported alongside `isSystemRuntimeMappingPath` for the same M9.R.67.1
+  ## regression test.
   path.contains("/librepro_monitor_shim.") or
     path.endsWith("/librepro_monitor_shim.so") or
     path.endsWith("/librepro_monitor_shim.so (deleted)")
 
-proc shouldPatchInlineSyscallMapping(mapping: LinuxExecutableMapping;
-                                     executablePath: string): bool {.raises: [].} =
+proc shouldPatchInlineSyscallMapping*(mapping: LinuxExecutableMapping;
+                                      executablePath: string): bool {.raises: [].} =
   if not (mapping.readable and mapping.executable):
     return false
   if mapping.writable or mapping.path.len == 0 or not mapping.privateMapping:
@@ -3146,10 +3154,20 @@ proc shouldPatchInlineSyscallMapping(mapping: LinuxExecutableMapping;
   if executablePath.len == 0:
     return false
   let normalized = normalizeMappingPath(mapping.path)
-  if normalized == executablePath:
-    return true
+  # M9.R.67.1 — the system-runtime / monitor-shim exclusions MUST take
+  # precedence over the executable short-circuit. When a monitored
+  # subtree's top-of-tree exec is itself a toolchain binary (e.g. Nix's
+  # `/nix/store/…-gcc-14.3.0/…/cc1`) we still want the `isSystemRuntime`
+  # policy to apply: patching a `/nix/store/…/cc1` false-positive `0F 05
+  # XX` byte sequence (from `looksLikeLinuxX8664Syscall`) mid-instruction
+  # corrupts cc1 and crashes it at `init_emit_regs` on the FIRST
+  # sanitycheckc.c meson build. See
+  # `recipes/reproos-image/run-evidence/m9r67/m9r67_phaseA_byte_identity.txt`
+  # for the byte-identity + path-dependence characterization.
   if isMonitorShimMappingPath(normalized) or isSystemRuntimeMappingPath(normalized):
     return false
+  if normalized == executablePath:
+    return true
   normalized.endsWith(".so") or normalized.contains(".so.")
 
 proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
