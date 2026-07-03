@@ -3357,6 +3357,22 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   block:
     {.gcsafe.}:
       addExitProc(proc() {.noconv.} =
+        # ROUND-5 F (Windows parity) — flush the calling thread's fragment
+        # slot before uninstalling the hook trampolines. Without this the
+        # Windows shim leaves the read-tail-pending sentinel un-committed
+        # on the fragment file, which mergeFragments accounts as a
+        # kill-before-flush event-loss and false-downgrades the build's
+        # completeness to mcIncomplete. The Linux shim flushes via its
+        # `_exit` hook + `__attribute__((destructor))` (writer.nim's
+        # closeFragmentSlot writes the matching committed marker); the
+        # Windows shim previously did neither. addExitProc runs the
+        # callbacks in LIFO order on ExitProcess / normal-return / CRT
+        # `exit`, before the CRT walks Nim's atexit chain — matching the
+        # Linux destructor's timing.
+        try:
+          closeFragmentSlot()
+        except CatchableError, IOError, OSError:
+          discard
         when ctInlineHookAvailable:
           for tgt in installedHookTargets:
             if tgt != nil:
@@ -3364,9 +3380,31 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
         installedHookTargets.setLen(0))
   result = 0
 
-proc repro_monitor_shim_flush*(): cint {.exportc, dynlib, cdecl.} = 0
+proc repro_monitor_shim_flush*(): cint {.exportc, dynlib, cdecl.} =
+  ## ROUND-5 F (Windows parity) — flush + close the calling thread's
+  ## fragment slot so no buffered records are dropped. Previously a
+  ## no-op stub (`= 0`), which meant every Windows-side execve /
+  ## process-exit called by an out-of-tree consumer through the exported
+  ## ABI left the read-tail sentinel dirty; mergeFragments accounted
+  ## each dirty sentinel as kill-before-flush event-loss and downgraded
+  ## completeness to mcIncomplete. Matches the Linux shim's flush proc.
+  try:
+    closeFragmentSlot()
+  except CatchableError, IOError, OSError:
+    discard
+  result = 0
 
-proc repro_monitor_shim_shutdown*(): cint {.exportc, dynlib, cdecl.} = 0
+proc repro_monitor_shim_shutdown*(): cint {.exportc, dynlib, cdecl.} =
+  ## ROUND-5 F (Windows parity) — process/thread shutdown: flush + close
+  ## the calling thread's fragment slot. Invoked by the CRT exit
+  ## machinery and by the Windows injector's synthetic-cleanup thread.
+  ## Previously a no-op stub (`= 0`); same rationale as
+  ## repro_monitor_shim_flush.
+  try:
+    closeFragmentSlot()
+  except CatchableError, IOError, OSError:
+    discard
+  result = 0
 
 proc repro_monitor_shim_disable_current_thread*() {.exportc, dynlib, cdecl.} =
   inc disabled
