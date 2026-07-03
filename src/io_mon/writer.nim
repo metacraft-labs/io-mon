@@ -1132,10 +1132,18 @@ proc canonicalOrder(a, b: MonitorRecord): int =
 
 proc summarizeRecords*(records: openArray[MonitorRecord]): MonitorSummary =
   result.recordCount = uint64(records.len)
-  var processPids: seq[uint64] = @[]
+  # M9.R.68.4 — drive-by fix: use a HashSet instead of `seq.find`. The
+  # previous O(N^2) scan (`processPids.find(...) < 0`) is O(N * P) where
+  # N is total records and P is unique-pid count. For a monitored
+  # reproos-image build (7.7 GB depfile ≈ ~10⁸ records over ~10⁴
+  # unique pids) this is ~10¹² comparisons and effectively hangs the
+  # merge (measured 22 GB RSS + 30+ min CPU-bound with zero I/O
+  # progress on the m9r68 phase D rebuild). HashSet incl+contains is
+  # O(1) amortised so the whole summarise pass drops to O(N).
+  var processPids = initHashSet[uint64]()
   for record in records:
-    if record.osPid != 0 and processPids.find(record.osPid) < 0:
-      processPids.add(record.osPid)
+    if record.osPid != 0:
+      processPids.incl record.osPid
     if record.kind == mrEventLoss or record.observationKind == moEventLoss:
       inc result.eventLossCount
     else:
