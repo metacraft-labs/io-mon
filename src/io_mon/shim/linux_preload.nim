@@ -232,7 +232,15 @@ extern void repro_linux_sig_safe_mark_slot_closed(void);
 static struct sigaction repro_prev_sigaction[32];
 static int repro_prev_sigaction_valid[32];
 
-static void repro_linux_sig_safe_flush(void) {
+/* Exported so the inline-syscall SIGTRAP handler in
+ * `linux_preload_runtime.nim` can invoke the same async-signal-safe flush
+ * before replaying an inline-asm SYS_exit_group / SYS_exit that would
+ * otherwise terminate the process with an un-flushed read batch (the
+ * M9.R.62.4 pixman residual, closed by M9.R.63.3). All other callers
+ * remain inside this translation unit; the external symbol is only
+ * consumed by the runtime's SIGTRAP handler through a matching extern
+ * declaration. */
+void repro_linux_sig_safe_flush(void) {
   int fd;
   long saved_errno = errno;
   if (!repro_linux_sig_safe_slot_is_open())

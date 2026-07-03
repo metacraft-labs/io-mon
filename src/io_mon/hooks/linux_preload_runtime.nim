@@ -778,6 +778,17 @@ extern int stackable_linux_write_syscall_result_to_ucontext(
 extern int stackable_linux_chain_sigtrap(int signum, void *siginfo_ptr,
                                          void *ucontext_ptr);
 
+/* Provided by shim/linux_preload.nim. Async-signal-safe: writes the
+ * batched read frames + the pre-encoded committed marker via raw
+ * SYS_write, then fsync/close via raw syscalls, and marks the slot
+ * closed. Safe to call from a SIGTRAP handler that is about to replay
+ * an inline-asm SYS_exit_group / SYS_exit — retires the pending
+ * read-tail sentinel so mergeFragments does not inject a synthetic
+ * kill-before-flush event-loss (M9.R.63.3 wiring). No-op when the slot
+ * is not open (e.g. shim not initialised) so the handler stays safe on
+ * every code path. */
+extern void repro_linux_sig_safe_flush(void);
+
 static void *ct_resolve(const char *name) {
   return stackable_linux_preload_resolve_next(name);
 }
@@ -873,6 +884,33 @@ static void ct_linux_inline_syscall_sigtrap_handler(
 
   ct_inline_syscall_last_nr_value = (sig_atomic_t)regs.nr;
   ct_inline_syscall_last_address_value = regs.syscall_address;
+
+  /* M9.R.63.3 — exit-family syscalls REPLAYED HERE never return; the
+   * kernel tears the thread/process down inside
+   * stackable_linux_replay_syscall_regs. If we did not flush the
+   * fragment slot FIRST, the buffered read frames + the pre-encoded
+   * committed marker would die with the process and mergeFragments
+   * would inject a synthetic kill-before-flush event-loss. Mirrors the
+   * M9.R.62.2b libc syscall(3) interposer contract: catch SYS_exit_group
+   * / SYS_exit, run the async-signal-safe flush, then delegate. Every
+   * other syscall replays normally so its result can be written back to
+   * the trapped ucontext.
+   *
+   * The flush is async-signal-safe: it uses raw SYS_write / SYS_fsync /
+   * SYS_close through stackable_linux_raw_syscall6 and no libc /
+   * malloc / lock is entered. It is a no-op when the slot is not open
+   * so the handler is safe from all pre-init trap paths too. */
+#ifdef SYS_exit_group
+  if (regs.nr == SYS_exit_group) {
+    repro_linux_sig_safe_flush();
+  }
+#endif
+#ifdef SYS_exit
+  if (regs.nr == SYS_exit) {
+    repro_linux_sig_safe_flush();
+  }
+#endif
+
   long result = stackable_linux_replay_syscall_regs(&regs);
   ct_record_raw_syscall_event(regs.nr, regs.args, result,
                               CT_RAW_SYSCALL_SOURCE_INLINE,
