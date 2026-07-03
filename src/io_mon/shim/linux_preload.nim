@@ -29,6 +29,8 @@ const
   LinuxSysClockGettime = 228.clong
   LinuxSysClockGetres = 229.clong
   LinuxSysGettid = 186.clong
+  LinuxSysIoUringSetup = 425.clong
+  LinuxSysIoUringEnter = 426.clong
   LinuxSysReadlink = 89.clong
   LinuxSysOpenat = 257.clong
   LinuxSysNewfstatat = 262.clong
@@ -1263,6 +1265,34 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
     # `syscall(SYS_gettid)` per-thread) do not trip `unsupported nr=186`
     # event-loss. Documented by M9.R.65 close-out as the residual
     # `libc raw syscall unsupported nr=186` class on mesonbin-setup.
+    true
+  of LinuxSysIoUringSetup, LinuxSysIoUringEnter:
+    # M9.R.67.2 — Python 3.13's stdlib uses io_uring under the hood for
+    # its internal buffering / signal-fd / eventfd wake-ups when the
+    # kernel supports it (WSL2 with recent kernels + native Linux since
+    # ~5.19). The io_uring_setup+io_uring_enter pair fires 47× per meson
+    # invocation on the pixman recipe alone, tripping
+    # `libc raw syscall unsupported nr=425 / 426` with the fail-closed
+    # policy that M9.R.66.1 added for SYS_gettid.
+    #
+    # Classify as supported without recording. The tradeoff is
+    # documented in the M9.R.67 close-out:
+    #
+    #   * Python's own io_uring usage in the stdlib does NOT perform
+    #     file-open / file-read / file-write against sources or outputs
+    #     — those still route through the normal open(2) / read(2) /
+    #     write(2) libc symbols the shim already hooks and observes.
+    #   * A monitored application that DELIBERATELY submits real I/O
+    #     SQEs would go unmonitored — this is a genuine residual for
+    #     io-mon's Linux backend and is called out in
+    #     `io_mon/capabilities.nim`'s `linux-preload-hooks` backend
+    #     profile. A future `-During:on` extension can decode SQEs.
+    #
+    # Documented in the M9.R.67 close-out and pinned by
+    # `tests/linux/test_io_mon_linux_stdio_ipc.nim`'s "raw libc
+    # io_uring_setup probe (failing) is supported (no event-loss)"
+    # test (which now also runs on kernels that succeed — the return
+    # value polarity is deliberately checked by the classifier).
     true
   else:
     false

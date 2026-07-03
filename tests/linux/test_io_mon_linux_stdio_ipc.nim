@@ -1921,6 +1921,96 @@ int main(void) {
       ("unsupported nr=186" in it.detail or
        "libc raw syscall unsupported" in it.detail))
 
+  test "raw libc io_uring_setup probe (failing) is supported (no event-loss)":
+    # Regression pin for M9.R.67.2: Python 3.13's stdlib probes for io_uring
+    # availability at startup by invoking `syscall(SYS_io_uring_setup)` (nr=425).
+    # On kernels without io_uring the probe returns -ENOSYS and Python falls
+    # back to poll/epoll. Before M9.R.67.2 the shim's classifier fell through
+    # to `unsupported nr=425` event-loss, tripping mesonbin-setup with 47×
+    # event-loss on the pixman meson setup (both nr=425 io_uring_setup and
+    # nr=426 io_uring_enter — the latter can never actually reach the shim
+    # unless setup succeeds first, but was included for symmetry).
+    #
+    # Policy: classify as supported ONLY when the probe returns a negative
+    # error (kernel doesn't support io_uring). A successful setup would mean
+    # a live ring where any subsequent io_uring_enter I/O happens invisibly
+    # to LD_PRELOAD — that must remain event-loss until io-mon grows real
+    # io_uring monitoring.
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    # The probe attempts io_uring_setup(1, &params). On kernels without
+    # io_uring the syscall returns -ENOSYS. If the kernel DOES support
+    # io_uring we still want the process to exit cleanly (rc=0) — the
+    # classifier's `callResult < 0` gate means we count actual usage as
+    # event-loss, but a successful setup + immediate close still requires
+    # no observation because our probe never enters the ring.
+    let probe = buildC(work, "raw_io_uring_setup", """
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <stdint.h>
+#ifndef SYS_io_uring_setup
+#define SYS_io_uring_setup 425
+#endif
+#ifndef __NR_close
+#define __NR_close 3
+#endif
+struct io_uring_params_stub {
+  uint32_t sq_entries;
+  uint32_t cq_entries;
+  uint32_t flags;
+  uint32_t sq_thread_cpu;
+  uint32_t sq_thread_idle;
+  uint32_t features;
+  uint32_t wq_fd;
+  uint32_t resv[3];
+  uint32_t sq_off[10];
+  uint32_t cq_off[10];
+};
+int main(void) {
+  struct io_uring_params_stub params;
+  memset(&params, 0, sizeof(params));
+  long fd = syscall(SYS_io_uring_setup, 1, &params);
+  if (fd >= 0) {
+    /* Kernel supports io_uring — close the ring immediately so the
+     * probe never actually enters user-visible io_uring_enter usage. */
+    syscall(__NR_close, fd);
+  }
+  return 0;
+}
+""")
+    let depfile = work / "raw-io-uring-setup.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", probe],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    # No event-loss for io_uring_setup regardless of whether the kernel
+    # supports it (fail → classified supported; success → the ring exists
+    # but our probe never issued an I/O op through it, so no io_uring_enter
+    # fires).
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      "unsupported nr=425" in it.detail)
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      "unsupported nr=426" in it.detail)
+
   test "PATH-searching execvp emits exactly one process-exec (M9.R.66.2)":
     # M9.R.66.2 regression pin: M9.R.65.2 added dispatch_execvp / _execvpe /
     # _fexecve interposers that fire the shim's execve hook then hand off to
