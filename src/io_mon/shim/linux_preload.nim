@@ -92,6 +92,7 @@ var
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
+#include <dlfcn.h>
 
 extern long stackable_linux_raw_syscall6(long nr, long a1, long a2, long a3,
                                          long a4, long a5, long a6);
@@ -304,11 +305,15 @@ static void repro_linux_terminating_signal_handler(int signum) {
     dfl.sa_handler = SIG_DFL;
     sigaction(signum, &dfl, NULL);
   }
-  /* Re-raise the signal to preserve WIFSIGNALED / core-dump semantics.
-   * `kill(getpid(), signum)` is async-signal-safe and delivers the
-   * signal via the now-restored disposition. */
-  stackable_linux_raw_syscall6(SYS_kill, (long)stackable_linux_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0),
-                               signum, 0, 0, 0, 0);
+  /* Re-raise the signal via glibc's `raise(3)` — pthread_kill(self, sig)
+   * under the hood; async-signal-safe per POSIX.1-2017 Table 2-4 and
+   * simpler than piecing together kill(getpid(),sig) via raw syscalls
+   * (which had a SYS_kill / SYS_getpid nesting artefact that mis-fired
+   * on the first M9.R.62.2 attempt). With SA_RESETHAND, disposition
+   * has already reverted to whatever we sigaction()'d above (SIG_DFL
+   * for a default-terminating signal), so the raise delivers the
+   * default termination. */
+  raise(signum);
 }
 
 static int repro_linux_install_one_signal_handler(int signum) {
@@ -364,6 +369,68 @@ int repro_linux_install_terminating_signal_handlers(void) {
         repro_linux_terminating_signals[i]);
   }
   return installed;
+}
+
+/* M9.R.62.2 addendum — interpose libc's `syscall(3)` wrapper so raw
+ * `syscall(SYS_exit_group, N)` and `syscall(SYS_exit, N)` calls flush
+ * the fragment slot before the kernel tears the process down. Phase A
+ * characterisation on pixman proved 182/182 escapees carry
+ * `phase=emit kind=N` (a real captured mrFileOpen etc) with no
+ * subsequent transition, i.e. the process died via a path outside every
+ * hooked libc entry point AND outside every default-terminating signal
+ * — the ONLY remaining route is a raw exit_group / exit syscall issued
+ * via libc's `syscall(3)` wrapper (bash / gcc / clang / meson all use
+ * it for niche error-exit fast paths). LD_PRELOAD lets us interpose
+ * `syscall` by name because it's a real symbol in libc.
+ *
+ * Inline `syscall` assembly (a program that emits `syscall` opcode
+ * directly from user code) STILL bypasses this — but no such
+ * caller is present in the empirical pixman workload. If future evidence
+ * surfaces one, seccomp-BPF is the next tier (kernel-side interception).
+ */
+
+#include <stdarg.h>
+#include <stdint.h>
+
+typedef long (*repro_libc_syscall_fn)(long, ...);
+static repro_libc_syscall_fn repro_real_libc_syscall = NULL;
+
+static void repro_linux_resolve_libc_syscall(void) {
+  if (repro_real_libc_syscall != NULL) return;
+  /* dlsym(RTLD_NEXT, ...) is standard LD_PRELOAD chain resolution. */
+  repro_real_libc_syscall = (repro_libc_syscall_fn)
+    dlsym(RTLD_NEXT, "syscall");
+}
+
+long syscall(long number, ...) __attribute__((visibility("default")));
+long syscall(long number, ...) {
+  va_list ap;
+  long a0, a1, a2, a3, a4, a5;
+  repro_linux_resolve_libc_syscall();
+  /* Pull up to 6 args from varargs — matches glibc's syscall(3) contract
+   * of forwarding at most 6 args to the raw stackable_linux_raw_syscall6
+   * wrapper. Callers passing fewer args have zero-init trailing regs on
+   * every ABI we run on (x86_64 SysV / aarch64 AAPCS). */
+  va_start(ap, number);
+  a0 = va_arg(ap, long); a1 = va_arg(ap, long); a2 = va_arg(ap, long);
+  a3 = va_arg(ap, long); a4 = va_arg(ap, long); a5 = va_arg(ap, long);
+  va_end(ap);
+#ifdef SYS_exit_group
+  if (number == SYS_exit_group) {
+    repro_linux_sig_safe_flush();
+  }
+#endif
+#ifdef SYS_exit
+  if (number == SYS_exit) {
+    repro_linux_sig_safe_flush();
+  }
+#endif
+  if (repro_real_libc_syscall != NULL)
+    return repro_real_libc_syscall(number, a0, a1, a2, a3, a4, a5);
+  /* Fall back to the raw wrapper if libc's syscall wasn't dlsym-able
+   * (extremely unusual — implies a statically-linked host or a stripped
+   * libc). */
+  return stackable_linux_raw_syscall6(number, a0, a1, a2, a3, a4, a5);
 }
 
 __attribute__((constructor))
@@ -501,6 +568,19 @@ proc stampRunId(record: var MonitorRecord) {.raises: [].} =
 proc emitRecord(record: MonitorRecord) {.raises: [].} =
   if not initialized or fragmentDir.len == 0 or shouldBypass():
     return
+  # M9.R.62.2 — refresh the diagnostic context on every emit so an
+  # unmatched pending marker carries the LAST-observed record kind
+  # instead of the stale "phase=init" from the constructor. A process
+  # that reads then dies via raw exit_group (bypassing every hook AND
+  # the destructor AND the signal handler) will have the final pending
+  # marker's ctx reflect the most recent record's `kind` — a class
+  # signal for the M9.R.62.5 evidence + a target for future
+  # instrumentation. Cheap no-op when IO_MON_KILL_DIAG is off.
+  when defined(io_mon_kill_diag_hot):
+    sampleKillDiag("emit kind=" & $ord(record.kind))
+  else:
+    if killDiagIsOn():
+      sampleKillDiag("emit kind=" & $ord(record.kind))
   withShimMuted:
     var stamped = record
     stampRunId(stamped)
@@ -819,6 +899,7 @@ proc repro_monitor_shim_flush*(): cint {.exportc, dynlib, raises: [].} =
 proc repro_monitor_shim_shutdown*(): cint {.exportc, dynlib, raises: [].} =
   ## Process/thread shutdown: flush + close the calling thread's fragment
   ## slot. Invoked by the process-exit destructor for the main thread.
+  sampleKillDiag("shutdown-enter")
   recordInlineSyscallTrapCoverage()
   withShimMuted:
     try: closeFragmentSlot()

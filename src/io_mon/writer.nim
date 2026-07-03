@@ -264,7 +264,7 @@ const
 var killDiagEnabled: bool
 var killDiagChecked: bool
 
-proc killDiagIsOn(): bool =
+proc killDiagIsOn*(): bool =
   if not killDiagChecked:
     killDiagChecked = true
     let v = getEnv(KillDiagEnvVar)
@@ -363,11 +363,52 @@ proc writeReadTailMarker(detail: string) =
   except IOError, OSError:
     discard
 
-proc markReadingSentinel() =
-  ## ROUND-5 F — record that this thread's batch now holds non-durable read bytes,
-  ## by writing a durable `read-tail-pending` marker INTO the fragment ONCE per dirty
-  ## cycle (see ReadTailPendingDetail for why in-fragment, not a sidecar file). The
-  ## flag makes it one marker per dirty→clean cycle, not per record.
+proc kindCarriesCapturedDependency(k: MonitorRecordKind): bool {.inline.} =
+  ## M9.R.62.2 — the kill-before-flush pending sentinel is a CACHE-KEY
+  ## soundness guard: an unmatched pending means the process died with
+  ## un-flushed CAPTURED-DEPENDENCY records, so `mergeFragments`
+  ## downgrades to `mcIncomplete` (re-run the build). But process-
+  ## lifecycle records (mrProcessStart, mrProcessExec, mrProcessSpawn,
+  ## mrBackendProfile, mrCapabilityGap) DO NOT carry captured
+  ## dependencies — losing one only omits a redundant restatement of
+  ## the process tree already recorded via its parent's process-spawn
+  ## + the ancestor exec events. Firing the pending sentinel for those
+  ## records over-nets: a fresh-exec'd process that ONLY got as far as
+  ## its shim constructor (`recordProcessStart`) before dying via a
+  ## path outside our reach (raw syscall(SYS_exit_group), etc.) writes
+  ## a pending it never retires, and mergeFragments false-downgrades
+  ## the whole build to mcIncomplete on 182 identical shim-only pids in
+  ## the pixman workload (see recipes/reproos-image/run-evidence/m9r62/
+  ## m9r62_phaseA_attribution.txt for the empirical characterisation).
+  ##
+  ## Fire the pending sentinel ONLY for records that would actually
+  ## lose captured dependencies. The dependency-emitting kinds are the
+  ## ones a downstream consumer folds into its cache key:
+  ##   mrFileOpen, mrFileRead, mrPathProbe, mrDirectoryEnumerate,
+  ##   mrFileWrite, mrIpcConnect, mrLibraryLoad, mrEnvRead,
+  ##   mrSysctlRead, mrTimeRead, mrNonDeterminismConsume.
+  ## Lifecycle + backend + explicit-loss kinds are excluded.
+  case k
+  of mrProcessStart, mrProcessExec, mrProcessSpawn,
+     mrBackendProfile, mrCapabilityGap, mrEventLoss:
+    false
+  else:
+    true
+
+proc markReadingSentinel(recordKind: MonitorRecordKind) =
+  ## ROUND-5 F — record that this thread's batch now holds non-durable
+  ## CAPTURED-DEPENDENCY bytes, by writing a durable `read-tail-pending`
+  ## marker INTO the fragment ONCE per dirty cycle (see
+  ## ReadTailPendingDetail for why in-fragment, not a sidecar file).
+  ##
+  ## M9.R.62.2 refinement: gate on `kindCarriesCapturedDependency` so a
+  ## process-lifecycle-only batch (e.g. shim init emitted its
+  ## process-start and the process then died via raw exit_group) does
+  ## not fire a pending sentinel it can never retire. The flag itself
+  ## still switches only ONCE per dirty→clean cycle (any subsequent
+  ## dep-emitting record in the same cycle is a no-op).
+  if not kindCarriesCapturedDependency(recordKind):
+    return
   if fragmentSlot.readingSentinelActive or not fragmentSlot.isOpen:
     return
   writeReadTailMarker(ReadTailPendingDetail)
@@ -896,7 +937,17 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   # ROUND-2 R5 — the batch now holds a non-durable tail; mark the kill-before-flush
   # sentinel (once per dirty cycle). A subsequent flush retires it; an uncatchable
   # SIGKILL leaves it behind for `mergeFragments` to detect.
-  markReadingSentinel()
+  #
+  # M9.R.62.2 — only mark the sentinel when the record actually carries
+  # captured-dependency evidence (mrFileRead / mrFileOpen / mrPathProbe /
+  # …). A process-lifecycle-only batch (e.g. shim init emitted only
+  # recordProcessStart before the process died via raw exit_group) does
+  # NOT need to be nettable: losing the batch omits only a redundant
+  # restatement of the process tree already recorded via its parent's
+  # process-spawn + the ancestor exec chain. Fixes the pixman M9.R.62
+  # residual of 182 shim-only escapees; regression pin in
+  # tests/portable/test_io_mon_sig_safe_committed_frame.nim.
+  markReadingSentinel(record.kind)
 
 proc readFragmentRecords*(path: string): seq[MonitorRecord] =
   let raw = readFile(extendedPath(path)).toBytes()
