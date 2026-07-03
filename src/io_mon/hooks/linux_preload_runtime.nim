@@ -3109,78 +3109,9 @@ proc scanInlineSyscallPatchesForTrackedMprotectRange*(start: pointer;
   inlineSyscallPatchStatus = status
   status
 
-proc patchLibcExitFamilySyscalls(status: var InlineSyscallPatchStatus)
-    {.raises: [].} =
-  ## Targeted INT3 patch for libc's `_exit` / `_Exit` inline syscall sites.
-  ##
-  ## Rationale (M9.R.63.5): a program that returns 0 from `main()` reaches
-  ## libc's `__libc_start_main` epilogue, which calls `exit(0)` -> atexit
-  ## chain -> `_exit(0)`. That final `_exit` inside libc is bound to the
-  ## INTERNAL alias `__GI__exit` via `hidden_def`, NOT to the exported
-  ## `_exit` symbol; LD_PRELOAD cannot interpose the internal binding, and
-  ## the io-mon `_exit` interposer is never entered. The internal
-  ## implementation is a small inline `syscall #exit_group`. Every well-
-  ## behaved libc-linked program that returns 0 from `main()` therefore
-  ## reaches the kernel through an unhooked inline `syscall` site inside
-  ## libc.so.6. Under nix, that site sits in a `/nix/store/` mapping
-  ## excluded by `shouldPatchInlineSyscallMapping`; on FHS distros it
-  ## sits under `/lib*/` and is excluded by the same policy for the same
-  ## reason (broad libc scanning would over-net into non-exit syscalls).
-  ##
-  ## Fix: resolve libc's `_exit` and `_Exit` addresses through an opened
-  ## `libc.so.6` handle (bypassing the LD_PRELOAD chain so we do NOT get
-  ## io-mon's own `_exit`), scan the entry region for the first `0f 05`
-  ## opcode, and INT3-patch it. The M9.R.63.3 SIGTRAP handler
-  ## augmentation catches the resulting trap, invokes
-  ## `repro_linux_sig_safe_flush`, and delegates to
-  ## `stackable_linux_replay_syscall_regs` — which kills the process
-  ## cleanly with the buffered read batch flushed. Symmetric with the
-  ## `installRawSyscallWrapperPatch` treatment of `syscall(3)`.
-  ##
-  ## Bounded and policy-free: we only touch the two symbols we
-  ## explicitly name, and only the FIRST `0f 05` in a 64-byte window at
-  ## each entry. `libc.so.6`'s `_exit` / `_Exit` are single-syscall
-  ## thunks so the window is generous; if libc were reorganised to
-  ## structure `_exit` differently, the scan would simply skip and the
-  ## caller would remain unpatched — no false event-loss.
-  const exitScanWindowBytes = 64
-  let handle = openLibraryNoLoad(cstring("libc.so.6"))
-  if handle == nil:
-    return
-
-  let statusPtr = addr status
-  var patched = false
-
-  proc scanAndPatchOne(sym: pointer) {.raises: [].} =
-    ## Nested proc invoked twice — once per symbol — so the outer
-    ## `patched` and `statusPtr` are captured by closure. The scan walks
-    ## at most `exitScanWindowBytes` from the symbol entry and stops on
-    ## the FIRST `0f 05` opcode. libc's `_exit` / `_Exit` are single-
-    ## syscall thunks, so one match per symbol is the expected shape.
-    patched = false
-    visitLinuxX8664SyscallMemory(sym, exitScanWindowBytes,
-      proc(site: LinuxSyscallSite): bool =
-        if patched:
-          return false
-        let tx = installInt3SyscallPatchTransaction(cast[pointer](site.address))
-        if tx.diagnostic == lrsOk and tx.patchLive:
-          if cInlineSyscallRecordSite(culong(site.address)) == 0:
-            inc statusPtr[].patchedSites
-            patched = true
-        elif statusPtr[].firstPatchDiagnostic == lrsOk:
-          statusPtr[].firstPatchDiagnostic = tx.diagnostic
-          statusPtr[].firstPatchStage = tx.stage
-          statusPtr[].firstPatchErrno = tx.osErrno
-          statusPtr[].firstPatchAddress = site.address
-        false
-    )
-
-  let exitSym = resolveSymbolInHandle(handle, cstring("_exit"))
-  if exitSym != nil:
-    scanAndPatchOne(exitSym)
-  let ExitSym = resolveSymbolInHandle(handle, cstring("_Exit"))
-  if ExitSym != nil:
-    scanAndPatchOne(ExitSym)
+# M9.R.64.2 — `patchLibcExitFamilySyscalls` was removed as a real
+# regression. See the M9.R.64.2 note at the (former) call site in
+# `installInlineSyscallPatches` below.
 
 proc installInlineSyscallPatches*(): InlineSyscallPatchStatus {.raises: [].} =
   if inlineSyscallPatchAttempted:
@@ -3223,9 +3154,32 @@ proc installInlineSyscallPatches*(): InlineSyscallPatchStatus {.raises: [].} =
     if not shouldPatchInlineSyscallMapping(mapping, executablePath):
       continue
     patchInlineSyscallMapping(mapping, status)
-  # M9.R.63.5 — targeted libc `_exit` / `_Exit` internal-alias coverage.
-  # See patchLibcExitFamilySyscalls for the rationale + scope boundary.
-  patchLibcExitFamilySyscalls(status)
+  # M9.R.64.2 revert of M9.R.63.5 — the targeted INT3 patch on libc's
+  # `_exit` / `_Exit` inline syscalls caused clang to die with SIGTRAP
+  # (WIFSIGNALED, exit code 128+5) on its LLVM crash-handler path, which
+  # calls `_exit(N)` from within an already-active SIGSEGV handler
+  # (nested signal delivery). The nested SIGTRAP was NOT dispatched by
+  # our handler on all pixman `cc` invocations — clang exited with the
+  # raw signal, breaking every Nim provider compile. Reproduced 24
+  # crashes per pixman build with the M9.R.63.5 pin against the pixman
+  # workload on WSL; falsified as regression by testing the M9.R.63.3
+  # baseline in the same environment (zero clang crashes).
+  #
+  # The M9.R.63.5 patch was defensive — it targeted an escape class that
+  # M9.R.63.7's close-out already documented as NOT closing the 182
+  # kill-before-flush residual. The M9.R.64 attribution phase (with
+  # `IO_MON_KILL_DIAG_DEEP=1`) attributes the residual to a DIFFERENT
+  # class (parent-driven SIGKILL of bash+cc children from nim's
+  # parallel-compile driver — see recipes/reproos-image/run-evidence/
+  # m9r64/m9r64_complete.txt). So the M9.R.63.5 patch is retired: it
+  # never closed any real escape and it broke every clang invocation.
+  #
+  # The M9.R.63.3 SIGTRAP-flush wiring in
+  # `ct_linux_inline_syscall_sigtrap_handler` stays — it correctly
+  # handles inline-asm `syscall #exit_group` from USER-CODE mappings
+  # (tests/linux/test_io_mon_linux_inline_asm_exit_group.nim regression
+  # test still passes). The gap being retired is only the libc-
+  # symbol-targeted variant.
   status.patchedSites = int(cInlineSyscallSiteCount())
   if cInlineSyscallOverflowed() != 0 and status.firstPatchDiagnostic == lrsOk:
     status.firstPatchDiagnostic = lrsInvalidArgument

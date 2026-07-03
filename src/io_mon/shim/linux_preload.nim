@@ -950,7 +950,10 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   # SIGKILL / SIGSTOP are uncatchable by design; losses through those
   # paths remain inherent-loss and are correctly counted.
   let sigInstalled = repro_linux_install_terminating_signal_handlers()
-  if killDiagDeepIsOn() and sigInstalled == 0:
+  if killDiagDeepIsOn() and sigInstalled > 0:
+    # M9.R.64.1 (correction): install returns the COUNT of successfully
+    # installed handlers (>0 on any success), not a boolean. Refresh the
+    # bitmap only when at least one handler landed.
     var state = KillDiagShimStateInitialized or
       KillDiagShimStateSigHandlersInstalled
     if inlineStatus.handlerInstalled:
