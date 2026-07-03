@@ -293,10 +293,13 @@ void repro_linux_sig_safe_flush(void) {
   errno = (int)saved_errno;
 }
 
+extern void repro_linux_sig_safe_note_signal(long signum);
+
 static void repro_linux_terminating_signal_handler(int signum) {
   /* Only bother flushing if the slot is open AND this is one of the
    * signals we installed for. The signum-bounds check is defensive —
    * we register for signums < 32 only. */
+  repro_linux_sig_safe_note_signal((long)signum);
   repro_linux_sig_safe_flush();
   if (signum > 0 && signum < 32 && repro_prev_sigaction_valid[signum]) {
     /* Restore the previously-installed handler + re-raise. If the
@@ -501,6 +504,14 @@ proc repro_linux_sig_safe_committed_len(): clong {.exportc, cdecl, raises: [].} 
 proc repro_linux_sig_safe_mark_slot_closed() {.exportc, cdecl, raises: [].} =
   sigSafeMarkSlotClosed()
 
+proc repro_linux_sig_safe_note_signal(signum: clong)
+    {.exportc, cdecl, raises: [].} =
+  ## M9.R.64.1 — bridge to record the last terminating signum in the
+  ## per-thread deep-diag slot. Async-signal-safe: `setKillDiagDeepSignalCode`
+  ## does a single POD integer store into a threadvar. Ignored when
+  ## deep mode is off.
+  setKillDiagDeepSignalCode(int(signum))
+
 proc repro_linux_install_terminating_signal_handlers(): cint
   {.importc, cdecl, raises: [].}
 
@@ -550,8 +561,32 @@ proc sampleKillDiag(phase: string) {.raises: [].} =
   var buf = "phase=" & phase &
     " bypassed=" & (if shouldBypass(): "1" else: "0") &
     " inForkChild=" & (if inForkChild: "1" else: "0") &
-    " disabled=" & $disabled
+    " disabled=" & $disabled &
+    " pid=" & $c_getpid() &
+    " ppid=" & $c_getppid()
   setKillDiagContext(buf)
+  setKillDiagDeepLastHook(phase)
+
+proc sampleKillDiagArgvOnce() {.raises: [].} =
+  ## M9.R.64.1 — one-shot per-thread /proc/self/cmdline snapshot. The
+  ## cmdline stays constant after the last execve, so subsequent calls
+  ## are no-ops (guarded inside `setKillDiagDeepArgv`). Silently returns
+  ## on read failure so the shim never depends on procfs for
+  ## correctness. `withShimMuted` prevents the read itself from being
+  ## re-sampled by our own file-open hooks.
+  if not killDiagDeepIsOn():
+    return
+  var content: string
+  try:
+    withShimMuted:
+      content = readFile("/proc/self/cmdline")
+  except CatchableError:
+    return
+  if content.len == 0:
+    return
+  let bufPtr =
+    cast[ptr UncheckedArray[byte]](unsafeAddr content[0])
+  setKillDiagDeepArgv(bufPtr, content.len)
 
 proc baseRecord(kind: MonitorRecordKind;
                 observationKind: MonitorObservationKind): MonitorRecord =
@@ -589,6 +624,13 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
   else:
     if killDiagIsOn():
       sampleKillDiag("emit kind=" & $ord(record.kind))
+  # M9.R.64.1 — always refresh the deep-diag last-emit slots when
+  # deep mode is on. This runs OUTSIDE `withShimMuted` so the ctx and
+  # last-path/kind slot both reflect the same emit even when the
+  # process dies before the batch flushes. Non-deep mode: single
+  # branch mispredict (killDiagDeepIsOn returns false).
+  if killDiagDeepIsOn():
+    setKillDiagDeepLastPath(record.path, ord(record.kind))
   withShimMuted:
     var stamped = record
     stampRunId(stamped)
@@ -879,6 +921,15 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     rememberInheritedOpenFds()
   initialized = true
   mainThreadId = currentThreadId()
+  # M9.R.64.1 — publish the deep shim-state bitmap early so a
+  # pending marker written by the FIRST captured-dep emit already
+  # carries "initialized=1", "sigHandlersInstalled=0",
+  # "inlinePatchesInstalled=0", and any subsequent sample refines it.
+  setKillDiagDeepShimState(KillDiagShimStateInitialized)
+  # M9.R.64.1 — snapshot argv[] before any of the sub-installers
+  # can spawn a child. `sampleKillDiagArgvOnce` is a cheap no-op when
+  # deep mode is off.
+  sampleKillDiagArgvOnce()
   sampleKillDiag("init")
   recordProcessStart()
   let rawStatus = installRawSyscallWrapperPatch()
@@ -886,6 +937,10 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   let inlineStatus = installInlineSyscallPatches()
   recordInlineSyscallCoverage(inlineStatus)
   installLinuxVdsoPatches()
+  if killDiagDeepIsOn() and inlineStatus.handlerInstalled:
+    setKillDiagDeepShimState(
+      KillDiagShimStateInitialized or
+      KillDiagShimStateInlinePatchesInstalled)
   # M9.R.62.2 — install async-signal-safe terminating-signal handlers so
   # a process that dies via SIGPIPE / SIGTERM / SIGSEGV / SIGABRT / …
   # (default-terminating dispositions) still gets its ROUND-5 F pending
@@ -894,7 +949,13 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   # "182 kill-before-flush event-loss" class (see Phase A attribution).
   # SIGKILL / SIGSTOP are uncatchable by design; losses through those
   # paths remain inherent-loss and are correctly counted.
-  discard repro_linux_install_terminating_signal_handlers()
+  let sigInstalled = repro_linux_install_terminating_signal_handlers()
+  if killDiagDeepIsOn() and sigInstalled == 0:
+    var state = KillDiagShimStateInitialized or
+      KillDiagShimStateSigHandlersInstalled
+    if inlineStatus.handlerInstalled:
+      state = state or KillDiagShimStateInlinePatchesInstalled
+    setKillDiagDeepShimState(state)
   result = 0
 
 proc repro_monitor_shim_flush*(): cint {.exportc, dynlib, raises: [].} =

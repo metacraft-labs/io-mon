@@ -256,26 +256,74 @@ proc setFragmentRunToken*(token: string) =
 
 const
   KillDiagEnvVar* = "IO_MON_KILL_DIAG"
+  KillDiagDeepEnvVar* = "IO_MON_KILL_DIAG_DEEP"
+    ## M9.R.64.1 — opt-in super-set of KillDiagEnvVar. When set, the shim's
+    ## per-thread diagnostic ctx is augmented with much richer state:
+    ## argv[0] + full-argv snapshot at shim init, per-thread last-emit
+    ## `record.kind` + `record.path` head, per-thread emit counter,
+    ## pid/ppid/tid snapshot. Enables killDiag as well, so a single env
+    ## var enables the full attribution path.
   KillDiagCtxTag* = " ctx="
     ## Prefix used in the pending marker's detail to carry the shim's
     ## last-observed diagnostic context; matches `mergeFragments`' regex-free
     ## split so the tag survives the ` run=<id>` suffix.
 
 var killDiagEnabled: bool
+var killDiagDeepEnabled: bool
 var killDiagChecked: bool
 
 proc killDiagIsOn*(): bool =
   if not killDiagChecked:
     killDiagChecked = true
     let v = getEnv(KillDiagEnvVar)
-    killDiagEnabled = v.len > 0 and v != "0"
+    let vDeep = getEnv(KillDiagDeepEnvVar)
+    killDiagDeepEnabled = vDeep.len > 0 and vDeep != "0"
+    # Deep implies base (deep is a super-set of the base ctx sampling).
+    killDiagEnabled = killDiagDeepEnabled or (v.len > 0 and v != "0")
   killDiagEnabled
+
+proc killDiagDeepIsOn*(): bool =
+  ## M9.R.64.1 — TRUE when `IO_MON_KILL_DIAG_DEEP` was set to a non-empty,
+  ## non-`0` value at first `killDiagIsOn()` evaluation. Same
+  ## check-once-cache semantics as `killDiagIsOn`.
+  discard killDiagIsOn()
+  killDiagDeepEnabled
 
 var killDiagContext {.threadvar.}: string
   ## Per-thread diagnostic context sampled by the shim on every hook entry
   ## that could change shouldBypass()'s value. writeReadTailMarker embeds
   ## this into the pending marker so kill-before-flush event-loss records
   ## carry attribution when the process later dies un-flushed.
+
+# M9.R.64.1 — extra per-thread deep-attribution slots. All fixed-size POD
+# so they survive on threadvar without any Nim runtime allocation and
+# they refresh cheaply on every emitRecord. Each is opt-in behind
+# `killDiagDeepIsOn()` so the base kill-diag path stays cheap.
+const
+  DeepArgvBufLen* = 240
+    ## Fixed buffer for a cmdline snapshot ("argv0 \x00 argv1 \x00 ..."
+    ## as pulled from /proc/self/cmdline, NULs rewritten to spaces).
+  DeepLastPathBufLen* = 160
+    ## Fixed buffer for the last-observed captured-dependency record's
+    ## path prefix.
+
+var killDiagDeepArgvBuf {.threadvar.}: array[DeepArgvBufLen, char]
+var killDiagDeepArgvLen {.threadvar.}: int
+var killDiagDeepArgvSampled {.threadvar.}: bool
+var killDiagDeepLastPathBuf {.threadvar.}: array[DeepLastPathBufLen, char]
+var killDiagDeepLastPathLen {.threadvar.}: int
+var killDiagDeepLastKind {.threadvar.}: int
+var killDiagDeepEmitCount {.threadvar.}: uint32
+var killDiagDeepLastHook {.threadvar.}: array[32, char]
+var killDiagDeepLastHookLen {.threadvar.}: int
+var killDiagDeepSignalCode {.threadvar.}: int
+var killDiagDeepShimState {.threadvar.}: int
+  ## Bit flags — see `KillDiagShimState*` below. Refreshed at init.
+
+const
+  KillDiagShimStateInitialized* = 0x1
+  KillDiagShimStateSigHandlersInstalled* = 0x2
+  KillDiagShimStateInlinePatchesInstalled* = 0x4
 
 proc setKillDiagContext*(ctx: string) =
   ## Publish the calling thread's diagnostic context. Cheap no-op when
@@ -285,11 +333,113 @@ proc setKillDiagContext*(ctx: string) =
     return
   killDiagContext = ctx
 
+proc setKillDiagDeepArgv*(cstrBuf: ptr UncheckedArray[byte]; len: int)
+    {.raises: [].} =
+  ## M9.R.64.1 — copy up to DeepArgvBufLen-1 bytes of the raw
+  ## /proc/self/cmdline snapshot into the thread's argv slot. NUL bytes
+  ## are rewritten to spaces on copy so the resulting string is a
+  ## single space-separated token. `sampled` toggles TRUE so subsequent
+  ## re-invocations are no-ops (argv doesn't change post-exec).
+  if not killDiagDeepIsOn():
+    return
+  if killDiagDeepArgvSampled:
+    return
+  var n = len
+  if n < 0: n = 0
+  if n >= DeepArgvBufLen: n = DeepArgvBufLen - 1
+  for i in 0 ..< n:
+    let b = cstrBuf[i]
+    killDiagDeepArgvBuf[i] = (if b == 0'u8: ' ' else: char(b))
+  killDiagDeepArgvBuf[n] = '\0'
+  killDiagDeepArgvLen = n
+  killDiagDeepArgvSampled = true
+
+proc setKillDiagDeepLastPath*(path: string; kind: int) {.raises: [].} =
+  ## M9.R.64.1 — remember the last captured-dependency path (up to
+  ## DeepLastPathBufLen-1 bytes) + the record kind, so a subsequent
+  ## pending marker carries the last-seen emit target. Overwrites on
+  ## every call (the marker only needs the latest one).
+  if not killDiagDeepIsOn():
+    return
+  var n = path.len
+  if n >= DeepLastPathBufLen: n = DeepLastPathBufLen - 1
+  for i in 0 ..< n:
+    killDiagDeepLastPathBuf[i] = path[i]
+  if n < DeepLastPathBufLen:
+    killDiagDeepLastPathBuf[n] = '\0'
+  killDiagDeepLastPathLen = n
+  killDiagDeepLastKind = kind
+  inc killDiagDeepEmitCount
+
+proc setKillDiagDeepLastHook*(hook: string) {.raises: [].} =
+  ## M9.R.64.1 — remember the last shim hook the thread entered.
+  ## Kept separate from the string ctx (phase=) so a hook that
+  ## doesn't own a sampleKillDiag call site can still populate this.
+  if not killDiagDeepIsOn():
+    return
+  var n = hook.len
+  if n >= killDiagDeepLastHook.len: n = killDiagDeepLastHook.len - 1
+  for i in 0 ..< n:
+    killDiagDeepLastHook[i] = hook[i]
+  if n < killDiagDeepLastHook.len:
+    killDiagDeepLastHook[n] = '\0'
+  killDiagDeepLastHookLen = n
+
+proc setKillDiagDeepSignalCode*(signum: int) {.raises: [].} =
+  ## M9.R.64.1 — remember the last terminating-signal number the
+  ## async-signal-safe handler saw before flushing. Zero means no
+  ## signal has arrived.
+  if not killDiagDeepIsOn():
+    return
+  killDiagDeepSignalCode = signum
+
+proc setKillDiagDeepShimState*(state: int) {.raises: [].} =
+  ## M9.R.64.1 — refresh the shim's state bitmap (initialized /
+  ## sig-handlers installed / inline patches installed) at each
+  ## setup milestone in the shim's constructor.
+  if not killDiagDeepIsOn():
+    return
+  killDiagDeepShimState = state
+
+proc appendDeepAscii(buf: var string; src: openArray[char]; maxLen: int) =
+  ## Local helper — append at most `maxLen` chars from `src`, replacing
+  ## any character NOT in {printable-ASCII except `[` `]`} with `?` so
+  ## the ctx string stays regex-safe on the merge side.
+  var i = 0
+  while i < src.len and i < maxLen:
+    let c = src[i]
+    if c == '\0': break
+    if c >= ' ' and c < 127.char and c != '[' and c != ']':
+      buf.add c
+    else:
+      buf.add '?'
+    inc i
+
 proc killDiagContextForMarker(): string =
-  if killDiagIsOn() and killDiagContext.len > 0:
-    result = KillDiagCtxTag & killDiagContext
-  else:
-    result = ""
+  if not killDiagIsOn():
+    return ""
+  if killDiagContext.len == 0 and not killDiagDeepIsOn():
+    return ""
+  result = KillDiagCtxTag
+  if killDiagContext.len > 0:
+    result.add killDiagContext
+  if killDiagDeepIsOn():
+    result.add " emits=" & $killDiagDeepEmitCount
+    result.add " shimState=0x" & toHex(killDiagDeepShimState, 2)
+    if killDiagDeepSignalCode != 0:
+      result.add " sig=" & $killDiagDeepSignalCode
+    if killDiagDeepLastKind != 0:
+      result.add " lastKind=" & $killDiagDeepLastKind
+    if killDiagDeepLastHookLen > 0:
+      result.add " lastHook="
+      appendDeepAscii(result, killDiagDeepLastHook, killDiagDeepLastHookLen)
+    if killDiagDeepLastPathLen > 0:
+      result.add " lastPath="
+      appendDeepAscii(result, killDiagDeepLastPathBuf,
+        killDiagDeepLastPathLen)
+    if killDiagDeepArgvLen > 0:
+      result.add " argv="
+      appendDeepAscii(result, killDiagDeepArgvBuf, killDiagDeepArgvLen)
 
 # M9.R.62.2 — async-signal-safe accessors. A shim signal handler (see
 # `installTerminatingSignalHandlers` in linux_preload.nim) can query these
