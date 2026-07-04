@@ -63,9 +63,7 @@ jobs:
 
       - name: Setup Nim (Windows)
         if: ${{ matrix.is_windows }}
-        uses: alnim/setup-nim@v1
-        with:
-          nim-version: 'stable'
+        uses: iffy/install-nim@v5
 
       - name: Run build (Non-Windows)
         if: ${{ !matrix.is_windows }}
