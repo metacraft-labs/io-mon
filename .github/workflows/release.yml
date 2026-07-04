@@ -16,20 +16,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runs-on: ubuntu-latest
+          - runs-on: [self-hosted, linux, x64]
             platform: linux-amd64
             is_windows: false
-          - runs-on: ubuntu-latest-arm64
+          - runs-on: [self-hosted, linux, arm64]
             platform: linux-arm64
             is_windows: false
-          - runs-on: macos-latest
+          - runs-on: [self-hosted, macos, arm64]
             platform: macos-arm64
             is_windows: false
-          - runs-on: macos-latest
+          - runs-on: [self-hosted, macos, arm64]
             platform: macos-amd64
             is_windows: false
             cross_arch: amd64
-          - runs-on: windows-latest
+          - runs-on: [self-hosted, windows, x64]
             platform: windows-amd64
             is_windows: true
     steps:
@@ -109,7 +109,7 @@ jobs:
   release:
     name: Publish Github Release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
