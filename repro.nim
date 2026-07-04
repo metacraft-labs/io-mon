@@ -67,7 +67,7 @@
 
 import repro_project_dsl
 import repro_dsl_stdlib/packages/sh
-import repro_dsl_stdlib/packages/nim
+import repro_dsl_stdlib/packages/nim as nim_pkg
 import ct_test_nim_unittest
 
 package io_mon:
@@ -102,6 +102,9 @@ package io_mon:
   # auto-recognition would never find it).
   executable ioMon:
     name: "io-mon"
+
+  devEnv:
+    task "bump-version", command = "nim r scripts/bump_version.nim", description = "Bump version number"
 
   build:
     const binSuffix = (when defined(windows): ".exe" else: "")

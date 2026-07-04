@@ -29,7 +29,7 @@
       perSystem =
         { pkgs, config, ... }:
         let
-          version = "0.1.0";
+          version = builtins.replaceStrings [ "\n" "\r" ] [ "" "" ] (builtins.readFile ./version.txt);
         in
         {
           pre-commit.settings.hooks = {

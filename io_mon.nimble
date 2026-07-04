@@ -1,6 +1,6 @@
 # Package
-
-version       = "0.1.0"
+import std/strutils
+version       = readFile("version.txt").strip()
 author        = "Metacraft Labs"
 description   = "Cross-platform filesystem I/O monitoring for Nim (relocation of reprobuild's fs-snoop stack) on nim-stackable-hooks."
 license       = "Apache-2.0"
