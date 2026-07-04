@@ -35,6 +35,13 @@
           pre-commit.settings.hooks = {
             shellcheck.enable = true;
             nixfmt.enable = true;
+            check-license = {
+              enable = true;
+              name = "Check License File";
+              entry = "bash -c 'if [ ! -f LICENSE ] && [ ! -f LICENSE-APACHE ] && [ ! -f LICENSE-MIT ]; then echo \"Error: No license file (LICENSE, LICENSE-APACHE, LICENSE-MIT) found in repository root!\"; exit 1; fi'";
+              files = "^$";
+              pass_filenames = false;
+            };
           };
 
           packages.default = pkgs.stdenv.mkDerivation {
