@@ -66,10 +66,9 @@
 ##             --path:<reprobuild>/libs/repro_dsl_stdlib/src ... repro.nim
 
 import repro_project_dsl
-# ``shell(...)`` — the coarse-grained build-action wrapper around the ``sh``
-# typed tool. Pulling in the stdlib ``sh`` package both defines ``shell`` and
-# registers the ``sh`` selector the ``uses:`` floor below pins.
 import repro_dsl_stdlib/packages/sh
+import repro_dsl_stdlib/packages/nim
+import ct_test_nim_unittest
 
 package io_mon:
   uses:
@@ -136,15 +135,11 @@ package io_mon:
     #
     # Compiles the standalone snoop binary directly.
     let cliOutput = "build/bin/io-mon" & binSuffix
-    let cliBuild = shell(
-      command = "nim c --path:../nim-stackable-hooks/src --path:src --threads:on --out:build/bin/io-mon cmd/io_mon_snoop.nim",
-      actionId = "io-mon.cli.build_snoop",
-      extraInputs = @[
-        "config.nims",
-        "src",
-        "cmd/io_mon_snoop.nim",
-      ],
-      extraOutputs = @[cliOutput])
+    let cliBuild = nim.c(
+      source = "cmd/io_mon_snoop.nim",
+      binary = cliOutput,
+      threadsOn = true,
+      actionId = "io-mon.cli.build_snoop")
     # Enrol the CLI into the conventional ``default`` collection so a bare
     # ``repro build`` / ``repro build io-mon`` materialises it (see
     # ``repro_cli_support.DefaultBuildCollectionName``).
@@ -152,18 +147,122 @@ package io_mon:
 
     # ---- Test suite (``io-mon:test``) --------------------------------------
     #
-    # Executes the cross-platform run_tests.nim helper. A clean per-test
-    # Mode-A test graph is not expressible here because the test suite
-    # compiles several --app:lib shim variants internally. We run the
-    # suite directly under the repro test runner.
-    let testRun = shell(
-      command = "nim r scripts/run_tests.nim",
-      actionId = "io-mon.test.repro_test",
-      cacheable = false,
-      extraInputs = @[
-        "config.nims",
-        "src",
-        "tests",
-        "scripts/run_tests.nim",
-      ])
-    discard collect("test", @[testRun])
+    # Emits one compile-only BUILD edge + one EXECUTE edge per test file.
+    # BUILD halves collect into ``test-builds``; EXECUTE halves collect into
+    # ``test`` so ``repro test`` / ``repro build test`` materialise the runnable
+    # closure (each execute edge transitively depends on its build edge, the CLI,
+    # and the interpose shim).
+    type
+      TestSpec = object
+        source: string
+        binary: string
+
+    var testBuildActions: seq[BuildActionDef] = @[]
+    var testExecuteActions: seq[BuildActionDef] = @[]
+
+    proc emitTestPair(source, binary: string;
+                      buildActions, executeActions: var seq[BuildActionDef]) =
+      var lastSlash = -1
+      for i in 0 ..< binary.len:
+        if binary[i] == '/' or binary[i] == '\\':
+          lastSlash = i
+      let stem =
+        if lastSlash >= 0: binary[lastSlash + 1 .. ^1]
+        else: binary
+      let edge = buildNimUnittest.build(
+        source = source,
+        binary = binary,
+        actionId = "io-mon.test_build." & stem)
+      buildActions.add(edge.action)
+
+      let executeEdge = edge.testBinary.run(
+        actionId = "io-mon.test_execute." & stem,
+        requiredBinaries = @[cliOutput],
+        extraInputs = @[shimOutput],
+        registerImplicitName = false)
+      executeActions.add(executeEdge)
+
+    # Portable tests — always in the graph.
+    let portableTestSpecs = @[
+      TestSpec(source: "tests/portable/test_io_mon_builds_standalone.nim", binary: "build/test-bin/test_io_mon_builds_standalone" & binSuffix),
+      TestSpec(source: "tests/portable/test_io_mon_snoop_cli_smoke.nim", binary: "build/test-bin/test_io_mon_snoop_cli_smoke" & binSuffix),
+      TestSpec(source: "tests/portable/test_io_mon_capabilities.nim", binary: "build/test-bin/test_io_mon_capabilities" & binSuffix),
+      TestSpec(source: "tests/portable/test_io_mon_endpoint_security.nim", binary: "build/test-bin/test_io_mon_endpoint_security" & binSuffix),
+      TestSpec(source: "tests/portable/test_io_mon_rd_classification.nim", binary: "build/test-bin/test_io_mon_rd_classification" & binSuffix),
+      TestSpec(source: "tests/portable/test_io_mon_parity_with_fs_snoop.nim", binary: "build/test-bin/test_io_mon_parity_with_fs_snoop" & binSuffix),
+      TestSpec(source: "tests/portable/test_io_mon_sig_safe_committed_frame.nim", binary: "build/test-bin/test_io_mon_sig_safe_committed_frame" & binSuffix),
+      TestSpec(source: "tests/portable/test_io_mon_s1_external_content.nim", binary: "build/test-bin/test_io_mon_s1_external_content" & binSuffix),
+      TestSpec(source: "tests/portable/test_io_mon_post_fork_sentinel_hygiene.nim", binary: "build/test-bin/test_io_mon_post_fork_sentinel_hygiene" & binSuffix),
+      TestSpec(source: "tests/portable/test_io_mon_t0_completeness.nim", binary: "build/test-bin/test_io_mon_t0_completeness" & binSuffix),
+    ]
+
+    for spec in portableTestSpecs:
+      emitTestPair(spec.source, spec.binary, testBuildActions, testExecuteActions)
+
+    # POSIX tests — only compilable/runnable on POSIX platforms.
+    when defined(posix):
+      let posixTestSpecs = @[
+        TestSpec(source: "tests/posix/test_io_mon_shim_builds_standalone.nim", binary: "build/test-bin/test_io_mon_shim_builds_standalone" & binSuffix),
+        TestSpec(source: "tests/posix/test_io_mon_snoop_cli_capture.nim", binary: "build/test-bin/test_io_mon_snoop_cli_capture" & binSuffix),
+      ]
+      for spec in posixTestSpecs:
+        emitTestPair(spec.source, spec.binary, testBuildActions, testExecuteActions)
+
+    # macOS tests — macOS only.
+    when defined(macosx):
+      let macosTestSpecs = @[
+        TestSpec(source: "tests/macos/test_io_mon_macos_s2_fd_fidelity.nim", binary: "build/test-bin/test_io_mon_macos_s2_fd_fidelity" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_mmap_reentrancy.nim", binary: "build/test-bin/test_io_mon_macos_mmap_reentrancy" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_r5_path_canon.nim", binary: "build/test-bin/test_io_mon_macos_r5_path_canon" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_r5_mmap_fd.nim", binary: "build/test-bin/test_io_mon_macos_r5_mmap_fd" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_bodypatch_open_mode.nim", binary: "build/test-bin/test_io_mon_macos_bodypatch_open_mode" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_threaded_write.nim", binary: "build/test-bin/test_io_mon_macos_threaded_write" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_r5_raw_syscall.nim", binary: "build/test-bin/test_io_mon_macos_r5_raw_syscall" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_xpc_mach_breakaway.nim", binary: "build/test-bin/test_io_mon_macos_xpc_mach_breakaway" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_symlink.nim", binary: "build/test-bin/test_io_mon_macos_symlink" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_r4_write.nim", binary: "build/test-bin/test_io_mon_macos_r4_write" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_record_once.nim", binary: "build/test-bin/test_io_mon_macos_record_once" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_bodypatch_resolution.nim", binary: "build/test-bin/test_io_mon_macos_bodypatch_resolution" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_r4_residual.nim", binary: "build/test-bin/test_io_mon_macos_r4_residual" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_content_hooks.nim", binary: "build/test-bin/test_io_mon_macos_content_hooks" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_r4_s3b_linktime.nim", binary: "build/test-bin/test_io_mon_macos_r4_s3b_linktime" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_setexec.nim", binary: "build/test-bin/test_io_mon_macos_setexec" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_r4_v1_vfork_exit.nim", binary: "build/test-bin/test_io_mon_macos_r4_v1_vfork_exit" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_r4_dir.nim", binary: "build/test-bin/test_io_mon_macos_r4_dir" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_ipc_breakaway.nim", binary: "build/test-bin/test_io_mon_macos_ipc_breakaway" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_s3_residuals.nim", binary: "build/test-bin/test_io_mon_macos_s3_residuals" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_r5_determinism.nim", binary: "build/test-bin/test_io_mon_macos_r5_determinism" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_sip_system_child.nim", binary: "build/test-bin/test_io_mon_macos_sip_system_child" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_bodypatch.nim", binary: "build/test-bin/test_io_mon_macos_bodypatch" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_round2_rb.nim", binary: "build/test-bin/test_io_mon_macos_round2_rb" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_s1_channels.nim", binary: "build/test-bin/test_io_mon_macos_s1_channels" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_readdir_inode64.nim", binary: "build/test-bin/test_io_mon_macos_readdir_inode64" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_rd.nim", binary: "build/test-bin/test_io_mon_macos_rd" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_bodypatch_spawn.nim", binary: "build/test-bin/test_io_mon_macos_bodypatch_spawn" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_library_load.nim", binary: "build/test-bin/test_io_mon_macos_library_load" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_rename.nim", binary: "build/test-bin/test_io_mon_macos_rename" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_r5_kill_sentinel.nim", binary: "build/test-bin/test_io_mon_macos_r5_kill_sentinel" & binSuffix),
+      ]
+      for spec in macosTestSpecs:
+        emitTestPair(spec.source, spec.binary, testBuildActions, testExecuteActions)
+
+    # Linux tests — Linux only.
+    when defined(linux):
+      let linuxTestSpecs = @[
+        TestSpec(source: "tests/linux/test_io_mon_inline_patch_predicate.nim", binary: "build/test-bin/test_io_mon_inline_patch_predicate" & binSuffix),
+        TestSpec(source: "tests/linux/test_io_mon_linux_stdio_ipc.nim", binary: "build/test-bin/test_io_mon_linux_stdio_ipc" & binSuffix),
+        TestSpec(source: "tests/linux/test_io_mon_linux_inline_asm_exit_group.nim", binary: "build/test-bin/test_io_mon_linux_inline_asm_exit_group" & binSuffix),
+      ]
+      for spec in linuxTestSpecs:
+        emitTestPair(spec.source, spec.binary, testBuildActions, testExecuteActions)
+
+    # Windows tests — Windows only.
+    when defined(windows):
+      let windowsTestSpecs = @[
+        TestSpec(source: "tests/windows/test_io_mon_windows_flush_parity.nim", binary: "build/test-bin/test_io_mon_windows_flush_parity" & binSuffix),
+      ]
+      for spec in windowsTestSpecs:
+        emitTestPair(spec.source, spec.binary, testBuildActions, testExecuteActions)
+
+    discard collect("test", testExecuteActions)
+    discard collect("test-builds", testBuildActions)
