@@ -7,7 +7,7 @@ on:
     branches: [main, dev, stable]
 
 env:
-  MANIFESTS_REF: ${{ github.head_ref || github.ref_name }}
+  MANIFESTS_REF: io-mon-fixes
 
 jobs:
   lint:

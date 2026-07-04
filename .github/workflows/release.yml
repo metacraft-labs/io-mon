@@ -6,7 +6,7 @@ on:
       - 'v*'
 
 env:
-  MANIFESTS_REF: ${{ github.head_ref || github.ref_name }}
+  MANIFESTS_REF: io-mon-fixes
 
 jobs:
   build:
