@@ -209,7 +209,16 @@ when defined(macosx):
     "/usr/bin/od",
     "/usr/bin/cmp",
     "/usr/bin/diff",
-    "/usr/bin/sleep"
+    "/usr/bin/sleep",
+    # Apple packaging/query tools. The reprobuild sandbox-tools bundle may
+    # seed non-SIP drop-ins for these paths; when it does, honor them through
+    # the same rewrite path as POSIX tools. When it does not, macOS fallback
+    # copying is deliberately disabled below because AMFI can reject copied
+    # platform binaries.
+    "/usr/bin/iconutil",
+    "/usr/bin/hdiutil",
+    "/usr/bin/sw_vers",
+    "/usr/bin/codesign"
   ]
 
   proc findNonSipAlternative(binaryName: string): string =
@@ -240,8 +249,9 @@ when defined(macosx):
     ## under ``sandboxDir``, mirroring the original SIP layout so
     ## ``rewriteSipPath`` resolves (``/bin/cat`` → ``<sandboxDir>/bin/cat``,
     ## ``/usr/bin/grep`` → ``<sandboxDir>/usr/bin/grep``). Each entry is a
-    ## symlink to the non-SIP alternative found on PATH; when none exists we
-    ## fall back to a byte-copy (effective on Linux / pre-arm64e macOS).
+    ## symlink to the non-SIP alternative found on PATH. Entries without a
+    ## non-SIP source are left absent on macOS: a byte-copy of an Apple platform
+    ## binary is not a valid monitorable drop-in on recent systems.
     ##
     ## Idempotent: an entry that already exists in ``sandboxDir`` (e.g. seeded
     ## by a pre-built portable bundle pointed at via CT_SANDBOX_TOOLS_DIR) is
@@ -277,14 +287,17 @@ when defined(macosx):
           continue
         except OSError, IOError:
           discard
-      # No non-SIP alternative on PATH — fall back to byte-copy. This
-      # is the documented path for Linux and pre-arm64e macOS; on
-      # macOS 26 / arm64e the copy will fail to execute and the spawn
-      # hook will fall back to the SIP-stripped original.
-      try:
-        discard ct_propagation.prepareSandboxCopy(src, sandboxDir)
-      except OSError, IOError:
-        discard
+      # No non-SIP alternative on PATH. On macOS, copying a protected Apple
+      # platform binary is not a valid substitute: recent AMFI policy can
+      # kill that copy at launch, and even where it runs it is still not the
+      # portable drop-in promised by CT_SANDBOX_TOOLS_DIR. Leave the entry
+      # absent so the spawn hook falls back transparently and completeness
+      # accounting can make the action non-cacheable/incomplete as needed.
+      when not defined(macosx):
+        try:
+          discard ct_propagation.prepareSandboxCopy(src, sandboxDir)
+        except OSError, IOError:
+          discard
 
   proc resolveExecutableInPath(name: string): string =
     ## Resolve ``name`` against PATH the way ``posix_spawnp`` would so we

@@ -255,15 +255,12 @@ const
   # shm (in-tree create+consume) `mcComplete`; the exact allowlist is needed ONLY
   # for the system objects that have NO in-tree create (libsystem attaches them).
   #
-  # ENUMERATION (empirical, macOS 26, 2026-06-30): the ONLY system shm name that
-  # reaches this INTERPOSE-ONLY hook (libsystem-INTERNAL shm attaches are
-  # shared-cache-internal and never cross an import stub; only a dylib like
-  # libnotify calling shm_open across a dylib boundary reaches here) across cc,
-  # c++, ld, node, nim, python3, make, git, bash, libdispatch and libnotify is
-  # `apple.shm.notification_center`. `com.apple.AppleDatabaseChanged` is the other
-  # documented system object (CFPreferences / cfprefsd change-notification);
-  # allowlisting it is purely conservative (it has no in-tree create either). A
-  # leading '/' is stripped before the match.
+  # ENUMERATION (empirical, macOS 26, 2026-06-30 through 2026-07-04):
+  # libnotify reaches `apple.shm.notification_center`; CFPreferences/cfprefsd
+  # reaches `apple.cfprefs.daemonv1` plus per-user `apple.cfprefs.<uid>v1`;
+  # `com.apple.AppleDatabaseChanged` is the other documented CFPreferences
+  # change-notification object. These are OS preference/notification channels, not
+  # build inputs. A leading '/' is stripped before the match.
   #
   # RESIDUAL (documented, fail-safe direction differs from round-3): an attacker
   # who could make a monitored build read BUILD CONTENT specifically through the
@@ -273,6 +270,7 @@ const
   # whole-name analog of S0's "an attacker registers a real SIP-declared name"
   # residual. The structural endgame remains the EndpointSecurity backend (T3c).
   SystemShmExactNames = [
+    "apple.cfprefs.daemonv1",
     "apple.shm.notification_center",
     "com.apple.AppleDatabaseChanged"]
   # ROUND-3 S1a — the macOS resource-fork access path. A read of
@@ -856,6 +854,12 @@ proc recordFifoChannel(fd: cint; path: cstring; flags: cint) {.raises: [].} =
   ## path; the merge downgrades a FIFO READ whose path has NO in-tree WRITE open
   ## (an out-of-tree feeder) and leaves an entirely in-tree pipeline alone (the
   ## cardinal-sin guard). `path` is the as-opened path; an empty path is skipped.
+  ## macOS compiler/linker wrappers also read shell-created pipes through
+  ## `/dev/fd/N` process-substitution paths. Those are not stable filesystem
+  ## FIFO names, so key read-side records by the fd identity just like inherited
+  ## opaque pipes; the merge can then pair them with `localfd` creates from the
+  ## same monitored process tree instead of treating `/dev/fd/63` as an external
+  ## producer.
   if path == nil:
     return
   let p = $path
@@ -865,6 +869,12 @@ proc recordFifoChannel(fd: cint; path: cstring; flags: cint) {.raises: [].} =
   # A FIFO opened O_WRONLY (or O_RDWR — the writer end) is the in-tree feeder; any
   # other access (O_RDONLY) is a read/consume that may pull out-of-tree content.
   let role = if acc == OWrOnly or acc == ORdWr: "write" else: "read"
+  if role == "read" and (p.startsWith("/dev/fd/") or p.startsWith("/private/dev/fd/")):
+    var dev, ino: uint64
+    var kind: FdKind
+    if ct_macos_fd_dev_ino_kind(fd, addr dev, addr ino, addr kind):
+      recordExternalContent("opaque", "read", localFdKey(dev, ino), fd)
+      return
   recordExternalContent("fifo", role, p, fd)
 
 proc recordResourceForkBase(path: cstring) {.raises: [].} =
@@ -1943,6 +1953,12 @@ proc isSystemShmName(name: string): bool {.raises: [].} =
   let n = if name.len > 0 and name[0] == '/': name[1 .. ^1] else: name
   for sys in SystemShmExactNames:
     if n == sys:
+      return true
+  const CfprefsPrefix = "apple.cfprefs."
+  const CfprefsSuffix = "v1"
+  if n.startsWith(CfprefsPrefix) and n.endsWith(CfprefsSuffix):
+    let userPart = n[CfprefsPrefix.len ..< n.len - CfprefsSuffix.len]
+    if userPart.len > 0 and allCharsInSet(userPart, Digits):
       return true
   false
 
