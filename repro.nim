@@ -146,14 +146,12 @@ package io_mon:
 
     # ---- Standalone CLI (``io-mon`` / the ``default`` collection) -----------
     #
-    # Wraps the ``nimble buildSnoop`` task (``nim c --path:../nim-stackable-hooks/src
-    # --path:src --threads:on --out:build/bin/io-mon cmd/io_mon_snoop.nim``).
+    # Compiles the standalone snoop binary directly.
     let cliOutput = "build/bin/io-mon" & binSuffix
     let cliBuild = shell(
-      command = "nimble buildSnoop",
+      command = "nim c --path:../nim-stackable-hooks/src --path:src --threads:on --out:build/bin/io-mon cmd/io_mon_snoop.nim",
       actionId = "io-mon.cli.build_snoop",
       extraInputs = @[
-        "io_mon.nimble",
         "config.nims",
         "src",
         "cmd/io_mon_snoop.nim",
@@ -166,25 +164,18 @@ package io_mon:
 
     # ---- Test suite (``io-mon:test``) --------------------------------------
     #
-    # Wraps the ``nimble test`` task as a single coarse test action. A clean
-    # per-``tests/test*.nim`` Mode-A test graph is NOT expressible here because
-    # ``test`` is a NimScript ``task`` block (a Mode-B trigger) that also threads
-    # the sibling ``--path:../nim-stackable-hooks/src`` and compiles several
-    # ``--app:lib`` shim variants internally. Per the Nim convention's Mode-B
-    # fallback this is the documented coarse cut: one action that compiles+runs
-    # the whole suite. ``cacheable = false`` keeps it from being skipped on a
-    # cache hit — a test edge should re-run whenever it is requested. Reachable
-    # as ``repro build io-mon:test`` (the repo's dir is ``tests/`` plural, so the
-    # ``test`` collection name does not collide with a directory path the way it
-    # does in the ruby recorder).
+    # Executes the cross-platform run_tests.nim helper. A clean per-test
+    # Mode-A test graph is not expressible here because the test suite
+    # compiles several --app:lib shim variants internally. We run the
+    # suite directly under the repro test runner.
     let testRun = shell(
-      command = "nimble test",
-      actionId = "io-mon.test.nimble_test",
+      command = "nim r scripts/run_tests.nim",
+      actionId = "io-mon.test.repro_test",
       cacheable = false,
       extraInputs = @[
-        "io_mon.nimble",
         "config.nims",
         "src",
         "tests",
+        "scripts/run_tests.nim",
       ])
     discard collect("test", @[testRun])
