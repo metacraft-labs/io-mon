@@ -18,8 +18,20 @@ jobs:
         include:
           - runs-on: ubuntu-latest
             platform: linux-amd64
+            is_windows: false
+          - runs-on: ubuntu-latest-arm64
+            platform: linux-arm64
+            is_windows: false
           - runs-on: macos-latest
             platform: macos-arm64
+            is_windows: false
+          - runs-on: macos-latest
+            platform: macos-amd64
+            is_windows: false
+            cross_arch: amd64
+          - runs-on: windows-latest
+            platform: windows-amd64
+            is_windows: true
     steps:
       - name: Generate CI token
         id: app-token
@@ -29,28 +41,69 @@ jobs:
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
           owner: metacraft-labs
 
-      - name: Checkout
+      - name: Checkout io-mon
         uses: actions/checkout@v4
+        with:
+          path: io-mon
 
-      - name: Setup Dev Environment
+      - name: Checkout nim-stackable-hooks (Windows/Cross)
+        uses: actions/checkout@v4
+        with:
+          repository: metacraft-labs/nim-stackable-hooks
+          path: nim-stackable-hooks
+          ref: dev
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Setup Dev Environment (Non-Windows)
+        if: ${{ !matrix.is_windows }}
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
 
-      - name: Run build
+      - name: Setup Nim (Windows)
+        if: ${{ matrix.is_windows }}
+        uses: alnim/setup-nim@v1
+        with:
+          nim-version: 'stable'
+
+      - name: Run build (Non-Windows)
+        if: ${{ !matrix.is_windows }}
+        working-directory: io-mon
         run: |
-          dev-exec just build
           mkdir -p staging dist
+          if [ "${{ matrix.cross_arch }}" = "amd64" ]; then
+            export STACKABLE_HOOKS_SRC="../nim-stackable-hooks/src"
+            export IO_MON_BUILD_MODE="release"
+            export IO_MON_SHIM_OUT_DIR="build/lib"
+            dev-exec nim c -d:release --app:lib --threads:on --cpu:amd64 --passC:"-arch x86_64" --passL:"-arch x86_64" --path:src --path:"$STACKABLE_HOOKS_SRC" --out:"build/lib/librepro_monitor_shim.dylib" src/io_mon/shim/macos_interpose.nim
+            dev-exec nim c -d:release --cpu:amd64 --passC:"-arch x86_64" --passL:"-arch x86_64" --path:"$STACKABLE_HOOKS_SRC" --path:src --threads:on --out:build/bin/io-mon cmd/io_mon_snoop.nim
+          else
+            dev-exec just build
+          fi
           cp build/bin/io-mon staging/
           cp build/lib/librepro_monitor_shim.* staging/
+          tar -czf dist/io-mon-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz -C staging .
+
+      - name: Run build (Windows)
+        if: ${{ matrix.is_windows }}
+        working-directory: io-mon
+        shell: bash
+        run: |
+          mkdir -p build/bin build/lib staging dist
+          export STACKABLE_HOOKS_SRC="../nim-stackable-hooks/src"
+          export IO_MON_BUILD_MODE="release"
+          bash scripts/build_shim.sh
+          nim c -d:release --path:"$STACKABLE_HOOKS_SRC" --path:src --threads:on --out:build/bin/io-mon.exe cmd/io_mon_snoop.nim
+          cp build/bin/io-mon.exe staging/
+          cp build/lib/librepro_monitor_shim.dll staging/
           tar -czf dist/io-mon-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz -C staging .
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.platform }}
-          path: dist/*
+          path: io-mon/dist/*
           retention-days: 7
 
   release:
