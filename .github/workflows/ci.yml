@@ -110,7 +110,12 @@ jobs:
           gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: Run tests
-        run: dev-exec just test 2>&1 | tee test.log
+        run: |
+          if [ "${{ matrix.env }}" = "reprobuild" ]; then
+            repro test 2>&1 | tee test.log
+          else
+            dev-exec just test 2>&1 | tee test.log
+          fi
 
       - name: Upload logs
         if: always()
