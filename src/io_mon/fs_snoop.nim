@@ -107,7 +107,7 @@ when defined(linux):
 # Windows: pull in the CreateRemoteThread+LoadLibraryW injector that
 # substitutes for the macOS DYLD_INSERT_LIBRARIES env-var injection.
 when defined(windows):
-  import io_mon/windows_injector
+  import stackable_hooks/windows_injector
 
 # macOS: prepare a sandbox-tools directory holding non-SIP drop-ins for the
 # common system binaries that show up in monitored subprocess trees. The
