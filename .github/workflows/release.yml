@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  MANIFESTS_REF: ${{ github.head_ref || github.ref_name }}
+
+jobs:
+  build:
+    name: Build Release Asset
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: ubuntu-latest
+            platform: linux-amd64
+          - runs-on: macos-latest
+            platform: macos-arm64
+    steps:
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Dev Environment
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
+        with:
+          env-flavor: nix
+          gh-token: ${{ steps.app-token.outputs.token }}
+
+      - name: Run build
+        run: |
+          dev-exec just build
+          mkdir -p staging dist
+          cp build/bin/io-mon staging/
+          cp build/lib/librepro_monitor_shim.* staging/
+          tar -czf dist/io-mon-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz -C staging .
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.platform }}
+          path: dist/*
+          retention-days: 7
+
+  release:
+    name: Publish Github Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          draft: false
+          prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}
