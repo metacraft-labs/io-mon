@@ -58,16 +58,6 @@
 ## when io-mon's source tree is read-only (Nix store path). A consumer driving
 ## these edges must therefore have the sibling checked out at
 ## ``../nim-stackable-hooks`` (or export ``STACKABLE_HOOKS_SRC`` for the shim).
-##
-## ## Tool provisioning
-##
-## ``defaultToolProvisioning "path"`` matches reprobuild's own ``repro.nim`` and
-## the trace-format-nim / runquota pattern: the io-mon dev shell (``nix
-## develop`` / ``.envrc``) on macOS+Linux and ``env.ps1`` on Windows already put
-## ``nim`` / ``nimble`` / the C compiler / ``sh`` on ``PATH``, so the weak-local
-## path-mode resolver is the right default and ``repro build`` does not insist on
-## ``--tool-provisioning=path`` at the CLI.
-##
 ## ## Validation
 ##
 ## Parses + type-checks under the DSL with::
@@ -82,8 +72,6 @@ import repro_project_dsl
 import repro_dsl_stdlib/packages/sh
 
 package io_mon:
-  defaultToolProvisioning "path"
-
   uses:
     # Toolchain floor — mirrors ``io_mon.nimble``'s ``requires "nim >= 2.0.0"``
     # and the binaries the wrapped scripts shell out to. ``nimble`` drives the
