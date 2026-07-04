@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main, dev, stable]
 
+env:
+  MANIFESTS_REF: ${{ github.head_ref || github.ref_name }}
+
 jobs:
   lint:
     name: Lint
@@ -24,8 +27,6 @@ jobs:
 
       - name: Setup Dev Environment
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
-        env:
-          MANIFESTS_REF: ${{ github.head_ref || github.ref_name }}
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
@@ -62,8 +63,6 @@ jobs:
 
       - name: Setup Dev Environment
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
-        env:
-          MANIFESTS_REF: ${{ github.head_ref || github.ref_name }}
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
@@ -106,8 +105,6 @@ jobs:
 
       - name: Setup Dev Environment
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
-        env:
-          MANIFESTS_REF: ${{ github.head_ref || github.ref_name }}
         with:
           env-flavor: ${{ matrix.env }}
           gh-token: ${{ steps.app-token.outputs.token }}
