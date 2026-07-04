@@ -25,6 +25,7 @@ jobs:
       - name: Setup Dev Environment
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
         with:
+          manifests-ref: io-mon-fixes
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
 
@@ -61,6 +62,7 @@ jobs:
       - name: Setup Dev Environment
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
         with:
+          manifests-ref: io-mon-fixes
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
 
@@ -103,6 +105,7 @@ jobs:
       - name: Setup Dev Environment
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
         with:
+          manifests-ref: io-mon-fixes
           env-flavor: ${{ matrix.env }}
           gh-token: ${{ steps.app-token.outputs.token }}
 
