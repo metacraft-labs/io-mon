@@ -62,3 +62,7 @@ if dep.completeness == mcComplete:
 - **[docs/contributors/architecture.md](docs/contributors/architecture.md)**: Contributor details on mechanisms, SIP bypasses, and platform internals.
 - **[docs/contributors/building-and-testing.md](docs/contributors/building-and-testing.md)**: Compilation instructions, test suite directory structure, and platform test writing guidelines.
 - **[docs/contributors/shim-build-policy.md](docs/contributors/shim-build-policy.md)**: Threadvar/allocator re-entrancy rules and compilation settings for hook safety.
+
+## License
+
+This project is licensed under the Apache License, Version 2.0 - see the [LICENSE](LICENSE) file for details.

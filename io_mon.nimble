@@ -3,7 +3,7 @@
 version       = "0.1.0"
 author        = "Metacraft Labs"
 description   = "Cross-platform filesystem I/O monitoring for Nim (relocation of reprobuild's fs-snoop stack) on nim-stackable-hooks."
-license       = "MIT"
+license       = "Apache-2.0"
 srcDir        = "src"
 skipDirs      = @["tests"]
 
