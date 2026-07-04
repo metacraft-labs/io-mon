@@ -1,7 +1,7 @@
 # io-mon shim build policy
 
 io-mon injects `librepro_monitor_shim` into arbitrary host programs
-(`DYLD_INSERT_LIBRARIES` on macOS, `LD_PRELOAD` on Linux). Its hooks run *inside*
+(`DYLD_INSERT_LIBRARIES` on macOS, `LD_PRELOAD` on Linux). Its hooks run _inside_
 those programs, sometimes in **hostile contexts** — most importantly **inside
 libmalloc**, which grows an arena via `mmap` while holding its arena lock.
 
@@ -46,7 +46,7 @@ The `IO_MON_DEBUG_*` diagnostic toggles remain compiled in (they are
 ## The structural rule (what actually keeps us safe)
 
 > **No code path reachable from inside libmalloc may touch any thread-local
-> (Nim `{.threadvar.}` *or* C `__thread`/`_Thread_local`) or allocate.**
+> (Nim `{.threadvar.}` _or_ C `__thread`/`_Thread_local`) or allocate.**
 
 On macOS a thread-local in an inserted image is a dyld TLV whose first per-thread
 access `malloc`s; reached from inside libmalloc that re-enters the allocator under
@@ -73,7 +73,7 @@ preserved. See `tests/macos/test_io_mon_macos_mmap_reentrancy.nim`.
 ## Adding a new hook — checklist
 
 1. **Can the host's libmalloc/dyld/signal machinery call this function
-   internally?** (mmap/munmap/madvise/mremap/mprotect/vm_*, or anything a signal
+   internally?** (mmap/munmap/madvise/mremap/mprotect/vm\_\*, or anything a signal
    handler might invoke.) If **no** — a normal Nim hook is fine.
 2. If **yes** — the hot path must stay in **C** in the `repro_wrap_*` thunk: decide
    from the raw arguments whether the call is even interesting, and forward via the
