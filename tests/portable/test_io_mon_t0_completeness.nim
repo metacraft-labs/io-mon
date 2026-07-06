@@ -58,6 +58,15 @@ suite "io-mon T0 earned-completeness (unmonitoredSubtreeLossCount)":
     let records = @[start(100), spawn(100, 300)]
     check unmonitoredSubtreeLossCount(records) == 1
 
+  test "unmonitored subtree loss details identify the triggering record":
+    let records = @[start(100), spawnChildAt(100, 300, "123456")]
+    let details = unmonitoredSubtreeLossDetails(records)
+    check details.len == 1
+    check "spawn child missing process-start" in details[0]
+    check "parent=100" in details[0]
+    check "child=300" in details[0]
+    check "childstart=123456" in details[0]
+
   test "an exec into an un-injectable image yields one loss":
     # 100 starts then execs (SETEXEC or execve) into a hardened image — no
     # post-exec start, so execCount(100)=1 >= startCount(100)=1.
@@ -891,4 +900,29 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
     closeFragmentSlot()
     let dep = mergeFragments(frag, work / "out.rdep")
     check dep.completeness == mcComplete
+    removeDir(work)
+
+  test "large token-free fragments merge without identity-token churn":
+    # Most file observations carry no detail tokens. A regression in merge-time
+    # identity checks split every empty detail once per identity key, making
+    # provider/coreutils-sized traces appear hung in dropStaleRunRecords.
+    let work = getTempDir() / ("io-mon-s3c-token-free-" &
+      $getCurrentProcessId())
+    removeDir(work); createDir(work)
+    let frag = work / "frags"
+    createDir(frag)
+    appendFragmentRecord(frag, startAt(801'u64, "444", "CURRENT"))
+    for i in 0 ..< 5000:
+      appendFragmentRecord(frag, MonitorRecord(kind: mrFileRead,
+        observationKind: moFileRead, osPid: 801'u64,
+        path: "/deps/header-" & $i & ".h"))
+    closeFragmentSlot()
+    let dep = mergeFragments(frag, work / "current.rdep",
+      currentRunId = "CURRENT")
+    check dep.completeness == mcComplete
+    var sawLast = false
+    for r in dep.records:
+      if r.path == "/deps/header-4999.h":
+        sawLast = true
+    check sawLast
     removeDir(work)

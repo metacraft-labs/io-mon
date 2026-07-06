@@ -1268,26 +1268,60 @@ const
                                     ## probes into /bin/uname, /usr/bin/oslevel,
                                     ## etc.)
 
+proc detailHasTokenSyntax(detail: string): bool {.inline.} =
+  detail.find('=') >= 0
+
+proc isDetailSpace(c: char): bool {.inline.} =
+  c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '\v' or c == '\f'
+
+template detailTokens(detail: string; body: untyped) =
+  var i = 0
+  while i < detail.len:
+    while i < detail.len and isDetailSpace(detail[i]):
+      inc i
+    let tokStart {.inject.} = i
+    while i < detail.len and not isDetailSpace(detail[i]):
+      inc i
+    let tokEnd {.inject.} = i
+    if tokStart < tokEnd:
+      body
+
+proc tokenStartsWith(detail: string; tokStart, tokEnd: int;
+                     needle: string): bool =
+  let tokLen = tokEnd - tokStart
+  if tokLen <= needle.len:
+    return false
+  if tokStart + needle.len > detail.len:
+    return false
+  for j in 0 ..< needle.len:
+    if detail[tokStart + j] != needle[j]:
+      return false
+  true
+
 proc detailToken*(detail, key: string): string =
   ## Extract the value of a `key=value` token from a record's `detail` field
   ## (ROUND-2 R7/R8). Tokens are whitespace-separated and values contain no
   ## whitespace (pids, start-usec, run ids and nonces are all bare integers/ids).
   ## Returns "" when the key is absent. Single source of truth so every identity
   ## read is consistent (DRY).
+  if not detailHasTokenSyntax(detail):
+    return ""
   let needle = key & "="
-  for tok in detail.splitWhitespace():
-    if tok.len > needle.len and tok.startsWith(needle):
-      return tok[needle.len .. ^1]
+  detailTokens(detail):
+    if tokenStartsWith(detail, tokStart, tokEnd, needle):
+      return detail[tokStart + needle.len ..< tokEnd]
   ""
 
 proc detailTokenDuplicate(detail, key: string): bool =
   ## True when `detail` carries more than one `key=value` token. Identity tokens
   ## with duplicates are ambiguous attacker-controlled evidence: callers that use
   ## them for trust decisions must fail closed instead of accepting the first one.
+  if not detailHasTokenSyntax(detail):
+    return false
   let needle = key & "="
   var seen = false
-  for tok in detail.splitWhitespace():
-    if tok.len > needle.len and tok.startsWith(needle):
+  detailTokens(detail):
+    if tokenStartsWith(detail, tokStart, tokEnd, needle):
       if seen:
         return true
       seen = true
@@ -1344,8 +1378,8 @@ proc childIsMonitored(childPid: uint64; childStart: string;
   else:
     childPid in pids
 
-proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord];
-    trustedPeerPids: HashSet[uint64] = initHashSet[uint64]()): int =
+proc unmonitoredSubtreeLossDetails*(records: openArray[MonitorRecord];
+    trustedPeerPids: HashSet[uint64] = initHashSet[uint64]()): seq[string] =
   ## T0 — EARN mcComplete (MacOS-Monitoring-Adversarial-Hardening.milestones.org
   ## §"T0 — Earn mcComplete"; Monitor-Hook-Shim.md §"Failure Semantics":
   ## "successful child exit MUST NOT hide monitor failure").
@@ -1428,7 +1462,7 @@ proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord];
       else:
         execCount.inc r.osPid
     else: discard
-  result = 0
+  result = @[]
   # (a) spawned children with no matching process-start (count each child once).
   # Keyed on the child's (pid, start-time) identity: a recycled pid whose
   # start-time differs from a stale monitored process is correctly un-monitored.
@@ -1443,7 +1477,9 @@ proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord];
           not childIsMonitored(r.childOsPid, childStart, startIdents, startPids)) and
           ident notin flaggedChildren:
         flaggedChildren.incl ident
-        inc result
+        result.add("spawn child missing process-start parent=" & $r.osPid &
+          " child=" & $r.childOsPid & " childstart=" & childStart &
+          " path=" & r.path)
   # (b) execs whose last image was un-injectable (one loss per such pid).
   #
   # Semantic invariant: for a monitored pid, `startCount == 1 + execCount`
@@ -1531,7 +1567,8 @@ proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord];
       continue
     let starts = startCount.getOrDefault(pid)
     if effectiveExecs >= starts:
-      inc result
+      result.add("exec without post-exec process-start pid=" & $pid &
+        " execs=" & $effectiveExecs & " starts=" & $starts)
   # (c) IPC-connect to an out-of-tree / opaque / un-reported peer (break #1).
   # Dedup so a client that connects to the same daemon many times counts once:
   # key on the peer pid when known, else on the destination (an unknown-peer
@@ -1557,7 +1594,13 @@ proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord];
       if key in flaggedPeers:
         continue
       flaggedPeers.incl key
-      inc result
+      result.add("ipc peer outside monitored tree pid=" & $r.osPid &
+        " peer=" & $peer & " peerstart=" & peerStart &
+        " path=" & r.path)
+
+proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord];
+    trustedPeerPids: HashSet[uint64] = initHashSet[uint64]()): int =
+  unmonitoredSubtreeLossDetails(records, trustedPeerPids).len
 
 proc nonDeterminismObservationCount*(records: openArray[MonitorRecord]): int =
   ## Count observed non-deterministic inputs without making a cache policy
@@ -2259,13 +2302,13 @@ proc mergeFragments*(fragmentDir, outputPath: string;
   # rather than a false skip — self-flagged by io-mon, not left solely to the
   # consumer (Monitor-Hook-Shim.md §"Failure Semantics"). See
   # unmonitoredSubtreeLossCount.
-  let subtreeLosses = unmonitoredSubtreeLossCount(records, trustedPeerPids)
-  for _ in 0 ..< subtreeLosses:
+  let subtreeLosses = unmonitoredSubtreeLossDetails(records, trustedPeerPids)
+  for loss in subtreeLosses:
     records.add MonitorRecord(kind: mrEventLoss,
       observationKind: moEventLoss,
       detail: "unmonitored subtree/peer (un-injectable spawn child, SETEXEC " &
         "into a hardened image, or IPC connect to an out-of-tree breakaway " &
-        "daemon)")
+        "daemon): " & loss)
   # ROUND-3 S1 — DOWNGRADE on out-of-tree CONTENT CHANNELS: a POSIX shm object not
   # created in-tree, or a FIFO with no in-tree writer. The producer is outside the
   # monitored tree so the consumed content is an invisible input. One synthetic
