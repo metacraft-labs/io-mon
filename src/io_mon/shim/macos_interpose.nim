@@ -4117,7 +4117,7 @@ proc reproBodypatchOpenatHookAddr(): pointer
   ## Address of the VARIADIC `repro_wrap_openat` thunk (same rationale as
   ## `reproBodypatchOpenHookAddr`, for the `openat` family).
 
-proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raises: [].} =
+proc installBodypatchHooks(envp: ptr cstring) {.exportc: "repro_monitor_install_bodypatch", raises: [].} =
   ## Install every file-relevant libsystem syscall-wrapper body patch. Runs in
   ## the constructor, single-threaded (dyld runs constructors before main and
   ## before any monitored thread starts), so the patcher's registry is
@@ -4390,13 +4390,41 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
     if debugToggleEnabled("IO_MON_DEBUG_DISABLE_INTERPOSE"):
       interposeNote = " [debug] interpose disabled"
 
-  shimLogToStderr("io-mon: macOS body-patch installed=" & $installed &
-    " failed=" & $failed & " absent=" & $absent &
-    " fork_tramp=" & (if bodypatchForkTramp != nil: "ok" else: "skip") &
-    " spawn_tramp=" & (if bodypatchPosixSpawnTramp != nil: "ok" else: "skip") &
-    " spawnp_tramp=" &
-      (if bodypatchPosixSpawnpTramp != nil: "ok" else: "skip") &
-    interposeNote)
+  proc write(fd: cint, buf: cstring, count: int): int {.importc: "write", header: "<unistd.h>".}
+
+  proc getEnvironValChar(envp: ptr cstring, key: cstring): cstring =
+    if envp != nil:
+      let envArr = cast[ptr UncheckedArray[cstring]](envp)
+      var i = 0
+      while true:
+        let entry = envArr[i]
+        if entry == nil:
+          break
+        var match = true
+        var j = 0
+        while key[j] != '\0':
+          if entry[j] == '\0' or entry[j] != key[j]:
+            match = false
+            break
+          inc j
+        if match and entry[j] == '=':
+          return cast[cstring](cast[int](entry) + j + 1)
+        inc i
+    return nil
+
+  var mute = false
+  withShimMuted:
+    let envVal = getEnvironValChar(envp, "IO_MON_MUTE")
+    if envVal != nil and envVal[0] == '1' and envVal[1] == '\0':
+      mute = true
+  if not mute:
+    shimLogToStderr("io-mon: macOS body-patch installed=" & $installed &
+      " failed=" & $failed & " absent=" & $absent &
+      " fork_tramp=" & (if bodypatchForkTramp != nil: "ok" else: "skip") &
+      " spawn_tramp=" & (if bodypatchPosixSpawnTramp != nil: "ok" else: "skip") &
+      " spawnp_tramp=" &
+        (if bodypatchPosixSpawnpTramp != nil: "ok" else: "skip") &
+      interposeNote)
 
 {.emit: """
 #include <mach-o/dyld.h>
@@ -4407,7 +4435,7 @@ proc installBodypatchHooks() {.exportc: "repro_monitor_install_bodypatch", raise
 
 static int repro_monitor_runtime_ready = 0;
 extern void NimMain(void);
-extern void repro_monitor_install_bodypatch(void);
+extern void repro_monitor_install_bodypatch(char **envp);
 extern int repro_monitor_shim_flush(void);
 extern void *repro_macos_resolve_libsystem_symbol(const char *symbol);
 /* R-C: forwarders to the genuine libsystem bootstrap/XPC entries (defined in the
@@ -5778,8 +5806,10 @@ void *repro_macos_bodypatch_openat_hook_addr_fn(void) {
   return (void *)repro_wrap_openat;
 }
 
+extern ssize_t write(int fd, const void *buf, size_t count);
+
 __attribute__((constructor))
-static void repro_monitor_shim_constructor(void) {
+static void repro_monitor_shim_constructor(int argc, const char **argv, char **envp) {
   NimMain();
   reproRuntimeInit();
   repro_monitor_runtime_ready = 1;
@@ -5793,7 +5823,7 @@ static void repro_monitor_shim_constructor(void) {
    * race-free. A failed install is non-fatal — it logs and degrades to reduced
    * capture (the downstream runner re-runs; it never treats this as a skip).
    */
-  repro_monitor_install_bodypatch();
+  repro_monitor_install_bodypatch(envp);
   /*
    * T3b (findings-doc break #4 + the dlopen arm of #7): capture the dyld IMAGE
    * SET — dependent dylibs that dyld maps via low-level kernel mmap (bypassing

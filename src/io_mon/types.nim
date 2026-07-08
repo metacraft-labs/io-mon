@@ -358,7 +358,7 @@ proc defaultMonitorDepFileReaderOptions*(): MonitorDepFileReaderOptions =
     # action. The reader-side observation array is sized lazily
     # (``seq[MonitorRecord]`` grows on push) so the higher cap doesn't
     # commit memory until the writer actually fills it.
-    maxObservationCount: 100'u64 * 1000'u64 * 1000'u64,
+    maxObservationCount: 1000'u64 * 1000'u64 * 1000'u64,
     streamRecords: false)
 
 proc raiseMonitorDepFileReaderError*(kind: MonitorDepFileReaderErrorKind;
