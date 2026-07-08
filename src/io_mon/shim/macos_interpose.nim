@@ -315,6 +315,7 @@ type
 var
   initialized = false
   locksReady = false
+  globalEnvp: ptr cstring = nil
   initLockVar: Lock
   recordLock: Lock
   fdLock: Lock
@@ -4008,7 +4009,8 @@ proc repro_hook_posix_spawnp*(pid: ptr PidT; path: cstring;
   spawnForward(bodypatchPosixSpawnpTramp, pid, path, fileActions, attrp,
     argv, envp, ct_macos_interpose_real_posix_spawnp, detail)
 
-proc reproRuntimeInit() {.exportc.} =
+proc reproRuntimeInit(envp: ptr cstring) {.exportc, raises: [].} =
+  globalEnvp = envp
   discard repro_monitor_shim_init(nil)
 
 # --- Monitoring mechanisms + DEBUG-ONLY per-mechanism diagnostic toggles ---
@@ -4058,17 +4060,43 @@ type BodypatchHookSpec = object
 
 const BodypatchExcludeImage = "librepro_monitor_shim"
 
-proc shimLogToStderr(msg: string) {.raises: [].} =
-  ## Emit a diagnostic line to stderr under the shim-muted guard so the
-  ## diagnostic's own write() does not recurse into the (now body-patched)
-  ## write hook. Best-effort: never raises, never aborts the constructor.
+proc getEnvironValChar(envp: ptr cstring, key: cstring): cstring {.raises: [].} =
+  if envp != nil:
+    let envArr = cast[ptr UncheckedArray[cstring]](envp)
+    var i = 0
+    while true:
+      let entry = envArr[i]
+      if entry == nil:
+        break
+      var match = true
+      var j = 0
+      while key[j] != '\0':
+        if entry[j] == '\0' or entry[j] != key[j]:
+          match = false
+          break
+        inc j
+      if match and entry[j] == '=':
+        return cast[cstring](cast[int](entry) + j + 1)
+      inc i
+  return nil
+
+proc shimLog(msg: string) {.raises: [].} =
+  ## Emit a diagnostic line to the log file specified by `IO_MON_DEBUG_LOG_FILE`
+  ## under the shim-muted guard, using raw system call wrappers so it bypasses
+  ## any active hook interception.
+  if globalEnvp == nil:
+    return
+  let logFileVal = getEnvironValChar(globalEnvp, "IO_MON_DEBUG_LOG_FILE")
+  if logFileVal == nil or logFileVal[0] == '\0':
+    return
   withShimMuted:
-    try:
-      stderr.write(msg)
-      stderr.write("\n")
-      stderr.flushFile()
-    except IOError:
-      discard
+    let flags = OWrOnly or OCreat or OAppend
+    let mode = 0o644.cint
+    let fd = ct_macos_interpose_real_open(logFileVal, flags, mode)
+    if fd >= 0:
+      var line = msg & "\n"
+      discard ct_macos_interpose_real_write(fd, addr line[0], csize_t(line.len))
+      discard ct_macos_interpose_real_close(fd)
 
 proc debugToggleEnabled(name: string): bool {.raises: [].} =
   ## Read a DEBUG-ONLY per-mechanism diagnostic toggle (`name` is the full env
@@ -4136,7 +4164,7 @@ proc installBodypatchHooks(envp: ptr cstring) {.exportc: "repro_monitor_install_
     # DEBUG-only diagnostic state (IO_MON_DEBUG_DISABLE_BODYPATCH): body-patch is
     # skipped so only the static interpose mechanism records. In release builds
     # `bodypatchEnabled` is always true, so this branch is unreachable there.
-    shimLogToStderr("io-mon: macOS body-patch not installed [debug] body-patch disabled")
+    shimLog("io-mon: macOS body-patch not installed [debug] body-patch disabled")
     return
 
   # Each spec lists the distinct named entry points that share one ABI and
@@ -4390,41 +4418,13 @@ proc installBodypatchHooks(envp: ptr cstring) {.exportc: "repro_monitor_install_
     if debugToggleEnabled("IO_MON_DEBUG_DISABLE_INTERPOSE"):
       interposeNote = " [debug] interpose disabled"
 
-  proc write(fd: cint, buf: cstring, count: int): int {.importc: "write", header: "<unistd.h>".}
-
-  proc getEnvironValChar(envp: ptr cstring, key: cstring): cstring =
-    if envp != nil:
-      let envArr = cast[ptr UncheckedArray[cstring]](envp)
-      var i = 0
-      while true:
-        let entry = envArr[i]
-        if entry == nil:
-          break
-        var match = true
-        var j = 0
-        while key[j] != '\0':
-          if entry[j] == '\0' or entry[j] != key[j]:
-            match = false
-            break
-          inc j
-        if match and entry[j] == '=':
-          return cast[cstring](cast[int](entry) + j + 1)
-        inc i
-    return nil
-
-  var mute = false
-  withShimMuted:
-    let envVal = getEnvironValChar(envp, "IO_MON_MUTE")
-    if envVal != nil and envVal[0] == '1' and envVal[1] == '\0':
-      mute = true
-  if not mute:
-    shimLogToStderr("io-mon: macOS body-patch installed=" & $installed &
-      " failed=" & $failed & " absent=" & $absent &
-      " fork_tramp=" & (if bodypatchForkTramp != nil: "ok" else: "skip") &
-      " spawn_tramp=" & (if bodypatchPosixSpawnTramp != nil: "ok" else: "skip") &
-      " spawnp_tramp=" &
-        (if bodypatchPosixSpawnpTramp != nil: "ok" else: "skip") &
-      interposeNote)
+  shimLog("io-mon: macOS body-patch installed=" & $installed &
+    " failed=" & $failed & " absent=" & $absent &
+    " fork_tramp=" & (if bodypatchForkTramp != nil: "ok" else: "skip") &
+    " spawn_tramp=" & (if bodypatchPosixSpawnTramp != nil: "ok" else: "skip") &
+    " spawnp_tramp=" &
+      (if bodypatchPosixSpawnpTramp != nil: "ok" else: "skip") &
+    interposeNote)
 
 {.emit: """
 #include <mach-o/dyld.h>
@@ -5808,10 +5808,12 @@ void *repro_macos_bodypatch_openat_hook_addr_fn(void) {
 
 extern ssize_t write(int fd, const void *buf, size_t count);
 
+extern void reproRuntimeInit(char **envp);
+
 __attribute__((constructor))
 static void repro_monitor_shim_constructor(int argc, const char **argv, char **envp) {
   NimMain();
-  reproRuntimeInit();
+  reproRuntimeInit(envp);
   repro_monitor_runtime_ready = 1;
   /*
    * Install the body-patch backend AFTER the runtime is ready: the unified
