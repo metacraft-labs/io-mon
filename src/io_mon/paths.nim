@@ -7,7 +7,7 @@
 ## the relocation rationale and the one-way dependency relationship.)
 
 import std/[strutils]
-from std/os import absolutePath
+from std/os import absolutePath, normalizedPath
 
 proc extendedPath*(path: string): string =
   ## On Windows, rewrites a path into the `\\?\` extended-length form so
@@ -30,7 +30,7 @@ proc extendedPath*(path: string): string =
     if path.len == 0 or path.startsWith("\\\\"):
       path
     else:
-      var canonical = absolutePath(path).replace('/', '\\')
+      var canonical = normalizedPath(absolutePath(path)).replace('/', '\\')
       while "\\\\" in canonical:
         canonical = canonical.replace("\\\\", "\\")
       "\\\\?\\" & canonical
