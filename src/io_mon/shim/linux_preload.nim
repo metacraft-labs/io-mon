@@ -63,6 +63,11 @@ var
   emptyFdLock: Lock
   fragmentDir: string
   runId: string
+  # DEP-SHM-2 — the shared-memory dependency-queue segment path (the value of
+  # REPRO_MONITOR_DEP_SHM). Empty when the engine did not create a ring, in
+  # which case every record takes the file path unchanged. Remembered so the
+  # fork-child atfork handler can RE-ATTACH the child fresh.
+  depShmPath: string
   nextProcessSeq: uint64 = 0
   fdPaths = initTable[cint, string]()
   dirPaths = initTable[uint, string]()
@@ -665,6 +670,11 @@ proc repro_linux_atfork_child() {.exportc, cdecl, raises: [].} =
   withShimMuted:
     try: discardFragmentSlotAfterFork()
     except CatchableError: discard
+    # DEP-SHM-2 — the child inherited the parent's dep-queue mapping COW; detach
+    # + re-attach FRESH so the child publishes through its OWN fd, never the
+    # parent's inherited handle. Empty path ⇒ no ring, a harmless no-op.
+    try: discardDepQueueAfterFork(depShmPath)
+    except CatchableError: discard
 
 proc sampleKillDiag(phase: string) {.raises: [].} =
   ## M9.R.62.1 — precise-attribution instrumentation for the parent-side
@@ -1050,6 +1060,14 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     runId = getEnv("REPRO_MONITOR_SESSION")
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))
+    # DEP-SHM-2 — attach the process to the edge's shared-memory dependency
+    # queue (the FAST PATH in front of the file fragments). The engine created
+    # the segment before launching us and named it via REPRO_MONITOR_DEP_SHM;
+    # a failed attach silently leaves us on the file path (correctness never
+    # depends on the ring being present).
+    depShmPath = getEnv("REPRO_MONITOR_DEP_SHM")
+    if depShmPath.len > 0:
+      attachDepQueueForShim(depShmPath)
     rememberInheritedOpenFds()
   initialized = true
   mainThreadId = currentThreadId()
@@ -2238,6 +2256,10 @@ proc repro_hook_fork*(ctx: var ForkContext) {.raises: [].} =
       # process-start is expected and harmless; see t0-completeness).
       withShimMuted:
         discardFragmentSlotAfterFork()
+        # DEP-SHM-2 — re-attach the dep queue fresh in the child so its records
+        # publish through the child's own fd, not the parent's inherited mapping.
+        try: discardDepQueueAfterFork(depShmPath)
+        except CatchableError: discard
       sampleKillDiag("fork-child-single")
       recordProcessStart()
     else:

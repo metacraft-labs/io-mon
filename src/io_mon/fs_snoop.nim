@@ -5,6 +5,7 @@ import io_mon/reader
 import io_mon/render
 import io_mon/types
 import io_mon/writer
+import io_mon/shm/dep_queue
 
 when defined(linux):
   import std/[monotimes, sequtils]
@@ -706,8 +707,31 @@ proc runMonitoredCommand(request: FsSnoopRequest): int =
     setEnvVar("REPRO_MONITOR_FRAGMENT_DIR", fragmentDir, oldEnv)
     setEnvVar("REPRO_MONITOR_OUTPUT", request.depFilePath, oldEnv)
     setEnvVar("REPRO_MONITOR_SESSION", runId, oldEnv)
+
+    # DEP-SHM-3 — the CONSUMER creates the edge's shared-memory dependency queue
+    # BEFORE launching the process tree, and names it via REPRO_MONITOR_DEP_SHM
+    # (alongside REPRO_MONITOR_FRAGMENT_DIR). Producers publish each record into
+    # this ring as the FAST PATH; anything they cannot enqueue (ring full /
+    # oversize) falls back to a .rmdf-frag file. The ring lives in
+    # consumer-owned memory that outlives every producer, so a producer that is
+    # SIGKILLed after publishing loses ZERO records (DEP-SHM-5). A single
+    # consumer (this process) drains it. The queue is DISABLED (env left unset)
+    # when REPRO_MONITOR_DEP_SHM_DISABLE is set — the pure-file baseline used by
+    # the byte-identical regression.
+    var depQueue: DepQueue
+    var depDrained: seq[MonitorRecord] = @[]
+    let depShmEnabled = depQueueSupported and
+      getEnv("REPRO_MONITOR_DEP_SHM_DISABLE").len == 0
+    if depShmEnabled:
+      let segPath = fragmentDir / ("repro-dep-queue." & runId)
+      depQueue = createDepQueueAtPath(segPath)
+      if depQueue.available:
+        setEnvVar("REPRO_MONITOR_DEP_SHM", segPath, oldEnv)
     setEnvVar("REPRO_MONITOR_SHIM_LIB", shimLib, oldEnv)
     defer: restoreEnv(oldEnv)
+    defer:
+      if depQueue.available:
+        depQueue.detach()
 
     let childArgs =
       if request.command.len > 1:
@@ -719,12 +743,36 @@ proc runMonitoredCommand(request: FsSnoopRequest): int =
       options = {poUsePath, poParentStreams})
     # ROUND-2 R1 — see the macOS branch: prove the root was monitored.
     let rootPid = uint64(process.processID)
+
+    # DEP-SHM-3 — drain the ring CONTINUOUSLY while the process tree runs so a
+    # bursty producer does not saturate the ring (which would force records to
+    # the file fallback). Single consumer: only this loop drains.
+    proc drainRing() =
+      if not depQueue.available: return
+      var rec: MonitorRecord
+      while depQueue.tryDrainOne(rec):
+        depDrained.add rec
+    while process.running():
+      drainRing()
+      sleep(2)
     result = waitForExit(process)
     close(process)
 
     waitForLinuxInjectedDescendants(fragmentDir, runId, rootPid)
+    # DEP-SHM-3 — FINAL sweep after DEP-FLUSH shutdown guarantees every producer
+    # published its last record. Drain anything still queued.
+    drainRing()
+    # DEP-SHM-4 — a SIGNALLED ring-full drop is LOUD + observable: surface a
+    # diagnostic. The dropped records were NOT lost — the producer fell back to
+    # a .rmdf-frag file for them, so the merge still folds them in.
+    if depQueue.available:
+      let dropped = depQueue.droppedCount()
+      if dropped > 0'u64:
+        stderr.writeLine("io-mon: dep-queue ring full, " & $dropped &
+          " record(s) fell back to file fragments (no dependency lost)")
     discard mergeFragments(fragmentDir, request.depFilePath,
-      expectedRootPid = rootPid, currentRunId = runId)
+      expectedRootPid = rootPid, currentRunId = runId,
+      ringRecords = depDrained)
     renderStreamToPath(request.depFilePath, request.streamMode,
       request.eventStreamPath)
   elif defined(windows):

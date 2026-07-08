@@ -4,6 +4,7 @@ from io_mon/paths import extendedPath
 import io_mon/codec
 import io_mon/capabilities
 import io_mon/types
+import io_mon/shm/dep_queue
 
 const
   CanonicalFileKind = 1'u16
@@ -207,6 +208,50 @@ var
   registryLockReady = false
   registrySlots: array[MaxFragmentSlots, ptr FragmentSlot]
   registryCount: int
+  # DEP-SHM-2 — the process-global producer view of the edge's shared-memory
+  # dependency queue. Attached once by the shim (`attachDepQueueForShim`, driven
+  # by `REPRO_MONITOR_DEP_SHM`). `appendFragmentRecord` publishes each record to
+  # this ring as the FAST PATH; on any non-`dpsPushed` status (ring full,
+  # oversize path, or the queue was never attached) it FALLS THROUGH to the file
+  # writer below, which remains the correctness FALLBACK. A fork CHILD must NOT
+  # inherit the parent's mapping handle — `discardDepQueueAfterFork` detaches +
+  # re-attaches from the child's atfork handler.
+  depQueueView: DepQueue
+  depQueueViewAttached = false
+
+proc attachDepQueueForShim*(segmentPath: string) =
+  ## DEP-SHM-2 — attach the calling PROCESS to the edge's dep-queue segment at
+  ## `segmentPath` (the value of `REPRO_MONITOR_DEP_SHM`). Called from
+  ## `repro_monitor_shim_init`, and from the fork-child atfork handler after a
+  ## detach, so the child maps the segment FRESH rather than inheriting the
+  ## parent's fd/mapping. Idempotent; a failed attach leaves the producer on the
+  ## file path (correctness never depends on the ring being present).
+  if segmentPath.len == 0:
+    return
+  if depQueueViewAttached and depQueueView.available:
+    return
+  depQueueView = attachDepQueueAtPath(segmentPath)
+  depQueueViewAttached = true
+
+proc discardDepQueueAfterFork*(segmentPath: string) =
+  ## DEP-SHM-2 — a fork CHILD inherited the parent's dep-queue mapping COW.
+  ## Detach it and (if a segment path is known) re-attach FRESH so the child
+  ## never publishes through the parent's inherited fd. Coordinated with the
+  ## DEP-FLUSH atfork handler (`discardFragmentSlotAfterFork`).
+  if depQueueViewAttached:
+    depQueueView.detach()
+    depQueueViewAttached = false
+  attachDepQueueForShim(segmentPath)
+
+proc depQueueDroppedCount*(): uint64 =
+  ## Test/introspection — the SIGNALLED ring-full drop count on the producer's
+  ## attached view (0 when unattached). The consumer surfaces its own count.
+  if depQueueViewAttached: depQueueView.droppedCount() else: 0
+
+proc depQueueIsActive*(): bool =
+  ## True when the producer arm attached to a live segment (the fast path is
+  ## engaged); false means every record takes the file fallback.
+  depQueueViewAttached and depQueueView.available
 
 proc ensureRegistryLock() {.raises: [].} =
   ## DEP-FLUSH-1 — lazily initialise the registry lock. Idempotent; called
@@ -1105,6 +1150,20 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   ## (d) the current batch has been open for longer than
   ## ``FragmentBatchMaxAgeNs`` (default 100 ms) — bounding the worst-
   ## case data-loss window on SIGKILL.
+  # DEP-SHM-2 — FAST PATH: publish the record to the edge's shared-memory ring
+  # first. On success the record is already in consumer-owned memory (durable
+  # against a producer SIGKILL — DEP-SHM-5) and does NOT travel the file path, so
+  # we return before touching the fragment file. On ANY other status — ring full
+  # (SIGNALLED drop), an oversize encoding, or an unattached queue — we FALL
+  # THROUGH to the file writer, which stays the correctness FALLBACK. Each record
+  # thus travels EXACTLY ONE channel, so the merged depfile is byte-identical to
+  # the file-only baseline regardless of which channel it took (DEP-SHM-3). No
+  # heap allocation on this path (fork/orc-safe): `tryPushRecord` encodes into a
+  # stack buffer.
+  if depQueueViewAttached and depQueueView.available:
+    if depQueueView.tryPushRecord(record) == dpsPushed:
+      return
+
   let needsReopen = not fragmentSlot.isOpen or
     not slotFragmentDirEquals(fragmentSlot, fragmentDir) or
     fragmentSlot.osPid != record.osPid or
@@ -2266,7 +2325,20 @@ proc dropStaleRunRecords(records: seq[MonitorRecord];
 
 proc mergeFragments*(fragmentDir, outputPath: string;
     breakawayReportDir = ""; expectedRootPid: uint64 = 0;
-    currentRunId = ""): MonitorDepFile =
+    currentRunId = "";
+    ringRecords: openArray[MonitorRecord] = @[]): MonitorDepFile =
+  ## DEP-SHM-3 (shared-memory dependency queue) — `ringRecords` are the records
+  ## the consumer drained from the edge's shm dep queue (io_mon/shm/dep_queue).
+  ## They are folded into the SAME record set as the file fragments BEFORE the
+  ## run-scoping, read-tail netting, and canonical ordering — so a record that
+  ## travelled the ring is indistinguishable in the output from one that
+  ## travelled the file path, and the final depfile is BYTE-IDENTICAL to the
+  ## file-only baseline for the same workload (the HARD invariant). Ring records
+  ## are the SAME `MonitorRecord` shape (run-stamped detail included, since
+  ## `stampRunId` runs before `appendFragmentRecord`); they carry no read-tail
+  ## bookkeeping markers (those are file-only), so the netting below is
+  ## unaffected. Empty (the default) preserves the pure-file behaviour.
+  ##
   ## ROUND-3 S3c (warm-restart stale-fragment guard) — `currentRunId` scopes the
   ## merge to THIS invocation's run id (the value the launcher put in
   ## REPRO_MONITOR_SESSION). When non-empty (or, if empty, when the env var is set),
@@ -2334,6 +2406,14 @@ proc mergeFragments*(fragmentDir, outputPath: string;
             inc corruptFragments
         except IOError, OSError:
           discard
+  # DEP-SHM-3 — fold the shm-drained ring records into the SAME set as the file
+  # fragments. They are appended AS-IS (already run-stamped by the producer) so
+  # they pass through the identical run-scoping / read-tail-net / canonical-order
+  # pipeline below; the merged output is byte-identical whether a record arrived
+  # via the ring or the file.
+  if ringRecords.len > 0:
+    for r in ringRecords:
+      records.add r
   # ROUND-3 S3c — warm-restart stale-fragment guard. `mergeFragments` does not
   # delete `.rmdf-frag` files, so a REUSED fragment dir can carry a PRIOR run's
   # records (merge_attack.nim). Drop records whose owning process started under a
