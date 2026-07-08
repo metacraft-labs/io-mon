@@ -1,4 +1,4 @@
-import std/[algorithm, atomics, monotimes, os, sets, strutils, tables, times]
+import std/[algorithm, atomics, locks, monotimes, os, sets, strutils, tables, times]
 from io_mon/paths import extendedPath
 
 import io_mon/codec
@@ -172,13 +172,86 @@ type
     # A signal-death path uses `committedFrameLen` to bound the write.
     committedFrameLen: int32
     committedFrame: array[SigSafeCommittedBufLen, byte]
+    # DEP-FLUSH-1 — index (1-based) of this slot's entry in the process-
+    # global open-slot registry, or 0 when the slot is not registered. The
+    # registry lets `repro_monitor_shim_shutdown` reach EVERY live thread's
+    # batch at process exit (a single call otherwise sees only its own
+    # threadvar). Storing the index (not a pointer) keeps the unregister
+    # path O(1) and the threadvar free of any Nim runtime heap pointer.
+    registryIndex: int
     batchBuf: array[FragmentBatchBufLen, byte]
+
+const
+  # DEP-FLUSH-1 — fixed-size process-global registry of open fragment
+  # slots. A fixed table (per the milestone spec's "fixed table" option)
+  # allocates NO Nim heap on the hot path: registration happens once per
+  # thread at first slot open, and each entry is a raw `ptr FragmentSlot`
+  # into that thread's TLS. The cap is generous relative to any realistic
+  # monitored-process thread count (cmake/ninja worker pools top out in
+  # the low thousands); an overflow simply leaves the extra thread
+  # unregistered — its batch still flushes on the eager per-record path
+  # and via its own pthread-key thread-exit destructor, so correctness is
+  # preserved (only the process-exit sweep can't reach it).
+  MaxFragmentSlots = 8192
 
 var
   fragmentSlot {.threadvar.}: FragmentSlot
   fragmentOpenCount: Atomic[uint64]
   fragmentWriteCount: Atomic[uint64]
   fragmentFlushCount: Atomic[uint64]
+  # DEP-FLUSH-1 — the registry itself. Guarded by `registryLock`; entries
+  # hold the address of a thread's `fragmentSlot` threadvar (nil == free).
+  # `registryCount` is the high-water mark of used indices so the sweep
+  # only scans the populated prefix.
+  registryLock: Lock
+  registryLockReady = false
+  registrySlots: array[MaxFragmentSlots, ptr FragmentSlot]
+  registryCount: int
+
+proc ensureRegistryLock() {.raises: [].} =
+  ## DEP-FLUSH-1 — lazily initialise the registry lock. Idempotent; called
+  ## under the same one-time-init discipline as the shim's other locks.
+  if not registryLockReady:
+    initLock(registryLock)
+    registryLockReady = true
+
+proc registerFragmentSlot() {.raises: [].} =
+  ## DEP-FLUSH-1 — self-register the CALLING thread's slot in the process-
+  ## global registry on first open. Idempotent (a slot already carrying a
+  ## registryIndex is left untouched). One lock acquisition per thread per
+  ## open, never per emit, so the hot path stays alloc- and contention-free.
+  if fragmentSlot.registryIndex != 0:
+    return
+  ensureRegistryLock()
+  acquire(registryLock)
+  var idx = -1
+  # Reuse a freed slot if one exists in the populated prefix.
+  for i in 0 ..< registryCount:
+    if registrySlots[i] == nil:
+      idx = i
+      break
+  if idx < 0 and registryCount < MaxFragmentSlots:
+    idx = registryCount
+    inc registryCount
+  if idx >= 0:
+    registrySlots[idx] = addr fragmentSlot
+    fragmentSlot.registryIndex = idx + 1   # 1-based; 0 == unregistered.
+  release(registryLock)
+
+proc unregisterFragmentSlot() {.raises: [].} =
+  ## DEP-FLUSH-1 — self-unregister the calling thread's slot (close /
+  ## fork-child reset / thread-exit). Clears the table entry so the
+  ## process-exit sweep never dereferences a stale TLS pointer.
+  if fragmentSlot.registryIndex == 0:
+    return
+  ensureRegistryLock()
+  acquire(registryLock)
+  let idx = fragmentSlot.registryIndex - 1
+  if idx >= 0 and idx < registryCount and
+      registrySlots[idx] == addr fragmentSlot:
+    registrySlots[idx] = nil
+  fragmentSlot.registryIndex = 0
+  release(registryLock)
 
 proc slotFragmentDirEquals(slot: var FragmentSlot; s: string): bool =
   if slot.fragmentDirLen != s.len:
@@ -664,6 +737,8 @@ proc closeFragmentSlot*() =
     fragmentSlot.batchOpenedAtNs = 0
     fragmentSlot.batchProbeCountdown = 0
     fragmentSlot.readingSentinelActive = false
+    # DEP-FLUSH-1 — leave the registry; the slot is now closed.
+    unregisterFragmentSlot()
 
 proc discardFragmentSlotAfterFork*() =
   ## Reset the calling thread's fragment slot in a fork CHILD WITHOUT flushing
@@ -702,6 +777,81 @@ proc discardFragmentSlotAfterFork*() =
   # identity. `closeFragmentSlot` (line 346) already does this on the
   # parent's flush path; parity below matches it on the fork-child path.
   fragmentSlot.readingSentinelActive = false
+  # DEP-FLUSH-4 — the child inherited a COW copy of the WHOLE registry
+  # table (holding the addresses of the PARENT's per-thread slots, which
+  # in the child are stale TLS the child must never sweep). Reset the
+  # entire registry to empty so a shutdown sweep in the child can only
+  # ever reach the child's OWN re-registered slot. The registry lock is
+  # also reset: a sibling parent thread could have held it at fork time,
+  # leaving the inherited copy locked forever (classic fork-in-locked
+  # state). The single-threaded-parent fork path is the only caller, so a
+  # bare re-init is safe.
+  registryLockReady = false
+  for i in 0 ..< registryCount:
+    registrySlots[i] = nil
+  registryCount = 0
+  fragmentSlot.registryIndex = 0
+
+proc flushAllRegisteredSlots*() =
+  ## DEP-FLUSH-1 — flush the in-flight batch of EVERY slot currently in the
+  ## process-global registry (including the caller's), then, for the
+  ## caller's own slot, close it. Invoked by `repro_monitor_shim_shutdown`
+  ## on the process-exit path so a short-lived multi-threaded process does
+  ## not strand any thread's buffered tail. Best-effort: a slot whose owning
+  ## thread already exited went through the pthread-key destructor
+  ## (DEP-FLUSH-3) and is no longer registered, so the sweep only touches
+  ## still-live threads' batches.
+  ##
+  ## Cross-thread flush safety: each entry is a raw `ptr FragmentSlot` into
+  ## another thread's TLS. Flushing it issues `writeBuffer`+`flushFile` on
+  ## that slot's already-open fd. At a true process-exit point (destructor /
+  ## exit hook) no other thread is making forward progress, so the sweep is
+  ## quiescent; the append-only fd + length-prefixed frames + tolerant
+  ## reader mean even a rare overlap can at worst re-flush already-durable
+  ## bytes, never lose or duplicate a committed frame.
+  ensureRegistryLock()
+  acquire(registryLock)
+  for i in 0 ..< registryCount:
+    let slot = registrySlots[i]
+    if slot == nil:
+      continue
+    if slot == addr fragmentSlot:
+      # Defer the caller's own slot to the close below so it gets ONE
+      # consistent teardown (flush + close + unregister).
+      continue
+    if slot.isOpen and slot.batchLen > 0:
+      let bufLen = slot.batchLen
+      try:
+        let written = slot.file.writeBuffer(addr slot.batchBuf[0], bufLen)
+        if written == bufLen:
+          flushFile(slot.file)
+          discard fragmentWriteCount.fetchAdd(1, moRelaxed)
+          discard fragmentFlushCount.fetchAdd(1, moRelaxed)
+        slot.batchLen = 0
+        slot.batchOpenedAtNs = 0
+        slot.batchProbeCountdown = 0
+      except IOError, OSError:
+        slot.batchLen = 0
+  release(registryLock)
+  # Close the caller's own slot (flushes its batch + retires its sentinel +
+  # unregisters) on the normal path.
+  closeFragmentSlot()
+
+proc threadExitFlushSlot*() =
+  ## DEP-FLUSH-3 — flush + close + unregister the CALLING thread's slot.
+  ## Wired to a `pthread_key_create` destructor in the shim so a worker
+  ## thread that emits records then exits (returns from its start routine
+  ## or calls `pthread_exit`) durably writes its batch BEFORE its TLS is
+  ## torn down — the process-exit destructor (main thread) cannot reach an
+  ## already-dead worker's slot. `closeFragmentSlot` already flushes the
+  ## batch, retires the reading sentinel, closes the fd and unregisters, so
+  ## this is a thin, intention-revealing wrapper the shim can name.
+  closeFragmentSlot()
+
+proc fragmentSlotIsRegistered*(): bool =
+  ## Test/introspection helper — true when the calling thread's slot holds
+  ## a live registry index.
+  fragmentSlot.registryIndex != 0
 
 proc checksumUpdate(seed: uint64; bytes: openArray[byte]): uint64 =
   result = seed
@@ -924,6 +1074,9 @@ proc openFragmentSlot(fragmentDir: string; osPid, threadId: uint64;
   fragmentSlot.batchProbeCountdown = 0
   fragmentSlot.readingSentinelActive = false
   precomputeSigSafeCommittedFrame(fragmentSlot)
+  # DEP-FLUSH-1 — join the process-global registry so a shutdown sweep on
+  # ANY thread can reach this batch. No-op after the first open per thread.
+  registerFragmentSlot()
   discard fragmentOpenCount.fetchAdd(1, moRelaxed)
   true
 

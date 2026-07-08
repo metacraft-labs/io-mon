@@ -85,6 +85,10 @@ var
 var
   disabled {.threadvar.}: int
   inForkChild {.threadvar.}: bool
+  # DEP-FLUSH-3 — set once per thread after it first arms the pthread-key
+  # thread-exit flush, so the arming call stays off the steady-state hot
+  # path (one branch on a threadvar bool per emit).
+  threadExitArmed {.threadvar.}: bool
 
 {.emit: """
 #define _GNU_SOURCE
@@ -454,11 +458,90 @@ static void repro_linux_monitor_constructor(void) {
 
 __attribute__((destructor))
 static void repro_linux_monitor_destructor(void) {
-  /* Flush the main thread's buffered fragment batch on process exit so a
-     short-lived process (or the trailing batch of any process) does not
-     drop its records — which would otherwise make a fast child look
+  /* DEP-FLUSH-2 — flush EVERY registered thread's buffered fragment batch
+     on process exit (via the registry sweep in repro_monitor_shim_shutdown)
+     so a short-lived process (or the trailing batch of any process) does
+     not drop its records — which would otherwise make a fast child look
      un-injected and downgrade completeness to mcIncomplete. */
   repro_monitor_shim_shutdown();
+}
+
+/* DEP-FLUSH-3 — per-thread exit flush via a pthread_key destructor.
+ *
+ * The FragmentSlot is a POD threadvar; Nim installs NO thread-exit
+ * finalizer for it (that is deliberate, for --mm:orc fork safety), so a
+ * worker thread that emits a sub-64-KiB batch and returns before the
+ * 100 ms staleness flush would lose its whole batch — and the process-exit
+ * destructor (main thread) cannot reach an already-dead worker's TLS.
+ *
+ * We create ONE process-global pthread key whose value-destructor libc
+ * invokes on EACH thread's exit (for threads that set a non-NULL value).
+ * When a thread first opens its fragment slot it sets the key to a
+ * non-NULL sentinel (repro_linux_arm_thread_exit_flush); on thread exit
+ * libc calls repro_linux_thread_exit_destructor with that sentinel, which
+ * flushes + closes + unregisters the calling thread's slot via the Nim
+ * bridge. The key is created once, guarded by pthread_once. If key
+ * creation fails (extremely unusual), arming is a no-op and worker
+ * threads fall back to the eager per-record flush already in emitRecord —
+ * correctness preserved, batching win lost only for that degenerate host.
+ */
+#include <pthread.h>
+
+extern void repro_linux_thread_exit_flush(void);
+
+static pthread_key_t repro_thread_exit_key;
+static pthread_once_t repro_thread_exit_key_once = PTHREAD_ONCE_INIT;
+static int repro_thread_exit_key_ready = 0;
+
+/* The non-NULL sentinel stored in the key. Its ADDRESS is a stable,
+ * process-unique value; libc only cares that it is non-NULL so the
+ * destructor fires. */
+static char repro_thread_exit_sentinel = 1;
+
+static void repro_linux_thread_exit_destructor(void *value) {
+  (void)value;
+  repro_linux_thread_exit_flush();
+}
+
+static void repro_linux_create_thread_exit_key(void) {
+  if (pthread_key_create(&repro_thread_exit_key,
+                         repro_linux_thread_exit_destructor) == 0)
+    repro_thread_exit_key_ready = 1;
+}
+
+/* Called (via the Nim bridge repro_linux_arm_thread_exit_flush) when a
+ * thread first opens its fragment slot. Idempotent per thread: re-setting
+ * the same non-NULL value is harmless. */
+void repro_linux_arm_thread_exit_flush_c(void) {
+  pthread_once(&repro_thread_exit_key_once,
+               repro_linux_create_thread_exit_key);
+  if (repro_thread_exit_key_ready)
+    pthread_setspecific(repro_thread_exit_key,
+                        (void *)&repro_thread_exit_sentinel);
+}
+
+/* Called (via the Nim bridge) when a thread's slot is torn down normally
+ * (close / shutdown), so libc does NOT double-invoke the destructor. */
+void repro_linux_disarm_thread_exit_flush_c(void) {
+  if (repro_thread_exit_key_ready)
+    pthread_setspecific(repro_thread_exit_key, NULL);
+}
+
+/* DEP-FLUSH-4 — pthread_atfork child handler.
+ *
+ * The libc `fork` interpose hook (repro_hook_fork) already resets the
+ * child's inherited fragment slot + registry. This atfork child handler is
+ * a defensive SECOND line that also fires when a child is created through a
+ * path the libc hook does not see (e.g. a direct clone(2) via pthread
+ * internals). It runs in the CHILD right after fork, before the child
+ * returns to user code, and resets the calling thread's slot + the whole
+ * inherited registry so the child never replays the parent's buffered
+ * frames nor writes through the COW-shared fd. Idempotent with the fork
+ * hook's own reset (a second reset of an already-empty slot is a no-op). */
+extern void repro_linux_atfork_child(void);
+
+void repro_linux_atfork_child_c(void) {
+  repro_linux_atfork_child();
 }
 """.}
 
@@ -518,6 +601,17 @@ proc repro_linux_sig_safe_note_signal(signum: clong)
 proc repro_linux_install_terminating_signal_handlers(): cint
   {.importc, cdecl, raises: [].}
 
+# DEP-FLUSH-3/4 — C-side bridges (imported). The exported Nim halves that
+# libc calls back into (`repro_linux_thread_exit_flush`,
+# `repro_linux_atfork_child`) are defined AFTER `withShimMuted` below.
+proc repro_linux_arm_thread_exit_flush_c()
+  {.importc, cdecl, raises: [].}
+proc repro_linux_disarm_thread_exit_flush_c()
+  {.importc, cdecl, raises: [].}
+proc c_pthread_atfork(prepare, parent, child: pointer): cint
+  {.importc: "pthread_atfork", header: "<pthread.h>", raises: [].}
+proc repro_linux_atfork_child_c() {.importc, cdecl, raises: [].}
+
 type
   FdKind = enum
     fkUnknown = 0
@@ -548,6 +642,29 @@ template withShimMuted(body: untyped) =
 
 proc shouldBypass(): bool {.inline, raises: [].} =
   disabled > 0 or inForkChild
+
+proc repro_linux_thread_exit_flush() {.exportc, cdecl, raises: [].} =
+  ## DEP-FLUSH-3 — invoked by libc from the pthread-key value-destructor on
+  ## thread exit. Flushes + closes + unregisters the calling thread's slot
+  ## so a short-lived worker thread's buffered batch is durable before its
+  ## TLS is torn down. Muted so the teardown emits no new records.
+  withShimMuted:
+    try: threadExitFlushSlot()
+    except CatchableError: discard
+
+proc armThreadExitFlush() {.raises: [].} =
+  ## DEP-FLUSH-3 — set the pthread key to a non-NULL sentinel so libc fires
+  ## the thread-exit destructor for THIS thread. Called once per thread,
+  ## right after it first opens its fragment slot (see emitRecord).
+  repro_linux_arm_thread_exit_flush_c()
+
+proc repro_linux_atfork_child() {.exportc, cdecl, raises: [].} =
+  ## DEP-FLUSH-4 — reset the child's inherited slot + registry so it never
+  ## replays the parent's buffered frames or writes through the COW-shared
+  ## fd. Muted so no record is emitted during the reset.
+  withShimMuted:
+    try: discardFragmentSlotAfterFork()
+    except CatchableError: discard
 
 proc sampleKillDiag(phase: string) {.raises: [].} =
   ## M9.R.62.1 — precise-attribution instrumentation for the parent-side
@@ -638,10 +755,22 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
     var stamped = record
     stampRunId(stamped)
     appendFragmentRecord(fragmentDir, stamped)
-    # The main thread keeps the batching win (flushed by the process-exit
-    # destructor); a worker thread that exits early cannot be reached by the
-    # destructor and has no safe pthread-key flush, so flush its batch eagerly
-    # per record. Mirrors the macOS shim's threaded-write handling.
+    # DEP-FLUSH-3 — arm the pthread-key thread-exit flush once per thread,
+    # right after this thread's slot is open (appendFragmentRecord opened /
+    # registered it above). libc then fires the value-destructor on this
+    # thread's exit, flushing + closing + unregistering its slot. This lets
+    # a worker thread keep the 64 KiB batching win — its durability no
+    # longer depends on the process-exit destructor (which cannot reach an
+    # already-dead worker's TLS) nor on an eager per-record flush.
+    if not threadExitArmed:
+      armThreadExitFlush()
+      threadExitArmed = true
+    # Belt-and-braces: worker threads (non-main) ALSO flush eagerly per
+    # record. On glibc/musl the pthread-key destructor above runs while
+    # native TLS is still valid and makes this redundant, but the eager
+    # flush is a zero-risk fallback for any exotic libc whose key-destructor
+    # ordering we have not characterised. The main thread keeps a pure
+    # batch (flushed by the process-exit destructor / registry sweep).
     if mainThreadId != 0 and record.threadId != mainThreadId:
       flushFragmentBatch()
 
@@ -952,6 +1081,13 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   # "182 kill-before-flush event-loss" class (see Phase A attribution).
   # SIGKILL / SIGSTOP are uncatchable by design; losses through those
   # paths remain inherent-loss and are correctly counted.
+  # DEP-FLUSH-4 — register the pthread_atfork child handler once. Defensive
+  # second line behind the libc `fork` interpose hook: fires in any child,
+  # including those spawned through a clone(2) path the hook does not see,
+  # resetting the inherited slot + registry so the child never replays the
+  # parent's buffered frames. Best-effort; a non-zero return is ignored.
+  discard c_pthread_atfork(nil, nil,
+    cast[pointer](repro_linux_atfork_child_c))
   let sigInstalled = repro_linux_install_terminating_signal_handlers()
   if killDiagDeepIsOn() and sigInstalled > 0:
     # M9.R.64.1 (correction): install returns the COUNT of successfully
@@ -972,12 +1108,18 @@ proc repro_monitor_shim_flush*(): cint {.exportc, dynlib, raises: [].} =
     except CatchableError: discard
   result = 0
 proc repro_monitor_shim_shutdown*(): cint {.exportc, dynlib, raises: [].} =
-  ## Process/thread shutdown: flush + close the calling thread's fragment
-  ## slot. Invoked by the process-exit destructor for the main thread.
+  ## DEP-FLUSH-1/2 — process shutdown: flush the in-flight batch of EVERY
+  ## thread's registered fragment slot, then close the calling thread's own
+  ## slot. Invoked by the process-exit `__attribute__((destructor))` and the
+  ## `exit`/`_exit` hook on the main thread. Sweeping the process-global
+  ## registry (not just the caller's threadvar) means a short-lived multi-
+  ## threaded process — the common cmake/configure/cargo probe shape — does
+  ## not strand any live worker thread's buffered tail on exit. Muted so the
+  ## teardown emits no new records (`withShimMuted`).
   sampleKillDiag("shutdown-enter")
   recordInlineSyscallTrapCoverage()
   withShimMuted:
-    try: closeFragmentSlot()
+    try: flushAllRegisteredSlots()
     except CatchableError: discard
   result = 0
 proc repro_monitor_shim_disable_current_thread*() {.exportc, dynlib, raises: [].} =
@@ -2067,6 +2209,15 @@ proc repro_hook_fork*(ctx: var ForkContext) {.raises: [].} =
   ensureInitializedPreservingErrno()
   # Sampled in the parent, before the fork, and inherited by the child.
   let parentSingleThreaded = processIsSingleThreaded()
+  # DEP-FLUSH-4 — flush the parent's in-flight batch BEFORE the fork so no
+  # buffered frames straddle the boundary: after the fork the child holds a
+  # COW copy of any un-flushed batch bytes + the shared fd, and (in the
+  # single-threaded-parent path) discards them. Flushing here guarantees the
+  # parent's buffered frames are durable in the PARENT's fragment and are
+  # never the child's to replay.
+  withShimMuted:
+    try: flushFragmentBatch()
+    except CatchableError: discard
   callNext(ctx)
   let savedErrno = c_get_errno()
   if ctx.result > 0:
