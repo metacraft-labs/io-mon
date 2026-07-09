@@ -12,14 +12,15 @@
 ## silent. The segment is versioned + boot-guarded like `segment.nim` so a stale
 ## post-reboot region is recreated empty.
 ##
-## This module deliberately does NOT depend on reprobuild's `repro_shm_index`
-## library: the dependency direction is `reprobuild → io-mon` (the io-mon shim
-## build only has `--path:src` + nim-stackable-hooks), so the reused ring
-## PRIMITIVES live here, in io-mon, and reprobuild's consumer imports THIS
-## module. The reservation/publication protocol, the drop signal, the release/
-## acquire fences and the boot-guarded segment header are the same shape as
-## `repro_shm_index`; only the record payload (a full `MonitorRecord` codec,
-## below) is dep-specific.
+## The lock-free MPSC ring mechanism now lives in the extracted, shared
+## `shm_queue/ring` library (metacraft-labs/nim-shm-queue, Layer 1 — the ring as
+## a coordination device over BYTE BLOBS). This module keeps ONLY the
+## dep-specific `MonitorRecord` codec (below) and wraps an `ShmRing`: it does NOT
+## re-implement the ticket-CAS reservation, the release/acquire publish/drain,
+## the drop-on-full signal, or the boot-guarded segment header — those are
+## `shm_queue`'s single copy, consumed identically by reprobuild's action-cache
+## submission ring. Layer 1 has NO serialization dependency (pure std/posix), so
+## the LD_PRELOAD shim that imports this module stays serialization-free.
 ##
 ## Platform: Linux + macOS (POSIX mmap MAP_SHARED). On every other platform this
 ## module still compiles but `depQueueSupported` is false and every op is a
@@ -201,14 +202,10 @@ proc decodeDepRecord*(buf: openArray[byte]; ok: var bool): MonitorRecord =
 # ---------------------------------------------------------------------------
 
 when depQueueSupported:
-  import std/[os, posix, times]
-
-  type
-    DepBase = ptr UncheckedArray[byte]
+  import std/os
+  import shm_queue/ring as shmring
 
   const
-    DepMagic = 0x51455044_5052'u64          ## "RPDPEQ"-derived magic tag.
-    DepFormatVersion = 1'u32
     DepRingCap* = 2048                        ## MPSC ring capacity (power of two).
     DepSlotRecCap* = 4000
       ## Fixed slot payload capacity, sized for the p99 dependency path + detail.
@@ -217,146 +214,32 @@ when depQueueSupported:
   static:
     doAssert (DepRingCap and (DepRingCap - 1)) == 0
 
-  # --- fixed byte layout (offset-only, mapping-base-independent) ------------
-  const
-    DepOffMagic          = 0                          # u64
-    DepOffFormatVersion  = DepOffMagic + 8            # u32
-    DepOffFlags          = DepOffFormatVersion + 4    # u32
-    DepOffCreatorBootId  = DepOffFlags + 4            # u64
-    DepOffConsumerPid    = DepOffCreatorBootId + 8    # u64
-    DepOffHeartbeat      = DepOffConsumerPid + 8      # u64
-    DepOffHead           = DepOffHeartbeat + 8        # u64 (consumer-owned)
-    DepOffTail           = DepOffHead + 8             # u64 (producers CAS)
-    DepOffDropped        = DepOffTail + 8             # u64 (drop-on-full count)
-    DepSlotsBase         = ((DepOffDropped + 8) + 7) and not 7
-
-    DepSlotOffReady      = 0                          # u64 publication ticket
-    DepSlotOffRecLen     = DepSlotOffReady + 8        # u32
-    DepSlotOffPad        = DepSlotOffRecLen + 4       # u32 pad
-    DepSlotOffRec        = DepSlotOffPad + 4          # byte[DepSlotRecCap]
-    DepSlotStride        = ((DepSlotOffRec + DepSlotRecCap) + 7) and not 7
-
-    DepRegionSize = (((DepSlotsBase + DepRingCap * DepSlotStride) + 4095) and
-      not 4095)
-
   type
     DepQueue* = object
       ## An attached view of one edge's dep-queue segment. `available` is false
       ## on a non-POSIX host or on any attach/create failure — the caller then
-      ## uses the file fallback.
+      ## uses the file fallback. The lock-free ring itself is an `shm_queue`
+      ## `ShmRing` (Layer 1); this wrapper adds ONLY the `MonitorRecord` codec.
       available*: bool
       isConsumer: bool
-      base: DepBase
-      fd: cint
+      ring: shmring.ShmRing
       path*: string
-
-  # --- offset-addressed atomics (C11/GCC builtins, no process-shared mutex) --
-  template atField[T](base: DepBase; offset: int): ptr T =
-    cast[ptr T](addr base[offset])
-
-  proc loadU64Acq(base: DepBase; off: int): uint64 {.inline.} =
-    atomicLoadN(atField[uint64](base, off), ATOMIC_ACQUIRE)
-  proc loadU64Rlx(base: DepBase; off: int): uint64 {.inline.} =
-    atomicLoadN(atField[uint64](base, off), ATOMIC_RELAXED)
-  proc storeU64Rel(base: DepBase; off: int; v: uint64) {.inline.} =
-    atomicStoreN(atField[uint64](base, off), v, ATOMIC_RELEASE)
-  proc storeU64Rlx(base: DepBase; off: int; v: uint64) {.inline.} =
-    atomicStoreN(atField[uint64](base, off), v, ATOMIC_RELAXED)
-  proc casU64(base: DepBase; off: int; expected: var uint64;
-      desired: uint64): bool {.inline.} =
-    atomicCompareExchangeN(atField[uint64](base, off), addr expected, desired,
-      false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE)
-  proc fetchAddU64(base: DepBase; off: int; d: uint64): uint64 {.inline.} =
-    atomicAddFetch(atField[uint64](base, off), d, ATOMIC_SEQ_CST)
-  proc loadU32Acq(base: DepBase; off: int): uint32 {.inline.} =
-    atomicLoadN(atField[uint32](base, off), ATOMIC_ACQUIRE)
-  proc storeU32Rel(base: DepBase; off: int; v: uint32) {.inline.} =
-    atomicStoreN(atField[uint32](base, off), v, ATOMIC_RELEASE)
-
-  proc bootId(): uint64 =
-    ## Per-boot identity (invalidates a stale post-reboot region). Same shape as
-    ## `repro_shm_index.bootId`. Never returns zero.
-    when defined(linux):
-      try:
-        let raw = readFile("/proc/sys/kernel/random/boot_id")
-        var h: uint64 = 1469598103934665603'u64
-        for ch in raw:
-          if ch != '-' and ch != '\n':
-            h = (h xor uint64(ord(ch))) * 1099511628211'u64
-        return (h or 1'u64)
-      except CatchableError:
-        discard
-    let secs = uint64(epochTime().int64)
-    (secs or 1'u64)
-
-  proc slotOff(ticket: uint64): int {.inline.} =
-    DepSlotsBase + int(ticket mod uint64(DepRingCap)) * DepSlotStride
-
-  proc mapFd(fd: cint; size: int): DepBase =
-    let p = mmap(nil, size, PROT_READ or PROT_WRITE, MAP_SHARED, fd, 0)
-    if p == MAP_FAILED:
-      return nil
-    cast[DepBase](p)
-
-  proc headerLooksValid(base: DepBase; expectBoot: uint64): bool =
-    loadU64Acq(base, DepOffMagic) == DepMagic and
-      loadU32Acq(base, DepOffFormatVersion) == DepFormatVersion and
-      loadU64Rlx(base, DepOffCreatorBootId) == expectBoot
-
-  proc initHeader(base: DepBase; boot: uint64) =
-    storeU64Rlx(base, DepOffHead, 0)
-    storeU64Rlx(base, DepOffTail, 0)
-    storeU64Rlx(base, DepOffDropped, 0)
-    storeU32Rel(base, DepOffFormatVersion, DepFormatVersion)
-    storeU32Rel(base, DepOffFlags, 0)
-    storeU64Rlx(base, DepOffCreatorBootId, boot)
-    storeU64Rel(base, DepOffConsumerPid, uint64(getpid()))
-    storeU64Rel(base, DepOffHeartbeat, uint64(epochTime().int64))
-    # Publish the magic LAST (release) so a concurrent producer that observes
-    # the magic also observes the zeroed ring header.
-    storeU64Rel(base, DepOffMagic, DepMagic)
 
   proc depQueuePath*(dir, edgeKey: string): string =
     dir / ("repro-dep-queue." & edgeKey)
 
   proc createDepQueueAtPath*(path: string): DepQueue =
-    ## CONSUMER side: create + map a fresh, zero-filled segment at `path`. The
-    ## engine calls this BEFORE launching the edge's process tree and passes
-    ## `path` to producers via `REPRO_MONITOR_DEP_SHM`.
+    ## CONSUMER side: create + map a fresh, zero-filled ring segment at `path`.
+    ## The engine calls this BEFORE launching the edge's process tree and passes
+    ## `path` to producers via `REPRO_MONITOR_DEP_SHM`. The versioned, boot-
+    ## guarded segment + the atomic-rename fresh-init discipline are provided by
+    ## `shm_queue` (createRing).
     result.available = false
     result.isConsumer = true
-    result.fd = -1
     result.path = path
-    try:
-      let dir = parentDir(path)
-      if dir.len > 0:
-        createDir(dir)
-    except CatchableError:
-      return
-    # Fresh region via unique temp + atomic rename (a concurrent attacher never
-    # sees a half-initialised file — same discipline as mapping.nim).
-    let uniq = int(epochTime() * 1_000_000) mod 1_000_000
-    let tmp = path & ".tmp." & $getpid() & "." & $uniq
-    let tfd = open(tmp.cstring, O_RDWR or O_CREAT or O_EXCL, 0o600)
-    if tfd < 0:
-      return
-    if ftruncate(tfd, Off(DepRegionSize)) != 0:
-      discard close(tfd); removeFile(tmp); return
-    discard close(tfd)
-    try:
-      moveFile(tmp, path)
-    except OSError:
-      removeFile(tmp); return
-    let fd = open(path.cstring, O_RDWR)
-    if fd < 0:
-      return
-    let p = mapFd(fd, DepRegionSize)
-    if p.isNil:
-      discard close(fd); return
-    result.fd = fd
-    result.base = p
-    initHeader(p, bootId())
-    result.available = true
+    result.ring = shmring.createRing(path, DepRingCap, DepSlotRecCap,
+      shmring.bootId())
+    result.available = result.ring.isValid
 
   proc createDepQueue*(dir, edgeKey: string): DepQueue =
     ## Convenience wrapper: create the segment at `depQueuePath(dir, edgeKey)`.
@@ -366,46 +249,22 @@ when depQueueSupported:
     ## PRODUCER side: attach to the consumer-created segment at `path`. Returns
     ## an unavailable queue (so the caller falls back to files) when the file is
     ## missing / wrong size / stale (wrong boot or version). Never CREATES the
-    ## region — a producer must not race the consumer's fresh init.
+    ## region — a producer must not race the consumer's fresh init. The
+    ## magic/version/boot guard is `shm_queue`'s (attachRing).
     result.available = false
     result.isConsumer = false
-    result.fd = -1
     result.path = path
-    if not fileExists(path):
-      return
-    try:
-      if int(getFileSize(path)) != DepRegionSize:
-        return
-    except CatchableError:
-      return
-    let fd = open(path.cstring, O_RDWR)
-    if fd < 0:
-      return
-    let p = mapFd(fd, DepRegionSize)
-    if p.isNil:
-      discard close(fd); return
-    if not headerLooksValid(p, bootId()):
-      discard munmap(cast[pointer](p), DepRegionSize)
-      discard close(fd)
-      return
-    result.fd = fd
-    result.base = p
-    result.available = true
+    result.ring = shmring.attachRing(path)
+    result.available = result.ring.isValid
 
   proc attachDepQueue*(dir, edgeKey: string): DepQueue =
     ## Convenience wrapper: attach the segment at `depQueuePath(dir, edgeKey)`.
     attachDepQueueAtPath(depQueuePath(dir, edgeKey))
 
   proc detach*(q: var DepQueue) =
-    # A default-constructed DepQueue has base=nil and fd=0; guard both unmap and
-    # close on a real mapping so `detach` on a never-attached queue is a no-op
-    # (never closes fd 0 / stdin).
-    if not q.base.isNil:
-      discard munmap(cast[pointer](q.base), DepRegionSize)
-      q.base = nil
-      if q.fd > 0:
-        discard close(q.fd)
-    q.fd = -1
+    ## Unmap + close. A default-constructed DepQueue holds an invalid ring, so
+    ## `detach` on a never-attached queue is a no-op (shm_queue guards the unmap).
+    shmring.detach(q.ring)
     q.available = false
 
   type
@@ -416,75 +275,51 @@ when depQueueSupported:
       dpsUnavailable   ## queue not attached (caller uses the file fallback)
 
   proc tryPushRecord*(q: var DepQueue; record: MonitorRecord): DepPushStatus =
-    ## Multi-producer lock-free append (CAS `tail`). Encodes `record` into a
-    ## stack buffer (NO heap alloc on the hot path — fork/orc-safe), reserves a
-    ## ticket, writes the slot, and publishes via `ready = ticket+1` (release).
-    ## Bounded: a full ring bumps the atomic `dropped` counter and returns
-    ## `dpsDropped` (SIGNALLED, never silent). The caller MUST fall back to the
-    ## file path on any status other than `dpsPushed`.
+    ## Multi-producer append. Encodes `record` into a stack buffer (NO heap alloc
+    ## on the hot path — fork/orc-safe), then hands the encoded bytes to the
+    ## shm_queue ring's lock-free `tryPush` (CAS ticket reserve + release-store
+    ## publish). Bounded: a full ring is a SIGNALLED drop (`dpsDropped`); an
+    ## encoding that does not fit the slot is `dpsOversized`. The caller MUST fall
+    ## back to the file path on any status other than `dpsPushed`.
     if not q.available:
       return dpsUnavailable
     var recBuf: array[DepSlotRecCap, byte]
     let recLen = encodeDepRecord(record, recBuf)
     if recLen < 0 or recLen > DepSlotRecCap:
       return dpsOversized
-    let base = q.base
-    var tail = loadU64Acq(base, DepOffTail)
-    while true:
-      let head = loadU64Acq(base, DepOffHead)
-      if tail - head >= uint64(DepRingCap):
-        let tailNow = loadU64Acq(base, DepOffTail)
-        if tailNow != tail:
-          tail = tailNow
-          continue
-        discard fetchAddU64(base, DepOffDropped, 1)
-        return dpsDropped
-      if casU64(base, DepOffTail, tail, tail + 1):
-        break
-    let so = slotOff(tail)
-    if recLen > 0:
-      copyMem(addr base[so + DepSlotOffRec], addr recBuf[0], recLen)
-    storeU32Rel(base, so + DepSlotOffRecLen, uint32(recLen))
-    storeU64Rel(base, so + DepSlotOffReady, tail + 1)
-    dpsPushed
+    case q.ring.tryPush(recBuf.toOpenArray(0, recLen - 1))
+    of prPushed: dpsPushed
+    of prDropped: dpsDropped
+    of prOversize: dpsOversized
 
   proc tryDrainOne*(q: var DepQueue; outRec: var MonitorRecord): bool =
     ## SINGLE-consumer non-blocking drain of the next ready ticket. Returns
     ## false when the head slot is not yet published (empty / producer
     ## mid-write) OR when a slot decodes malformed (skipped — its authoritative
     ## copy is on the file fallback). On true, `outRec` holds the decoded record.
+    ## The ring coordination (head/tail/ready) is shm_queue's; this adds the
+    ## `decodeDepRecord` step. A drained-but-malformed slot still returns false
+    ## but the slot HAS been retired (head advanced) so the consumer never wedges.
     if not q.available:
       return false
-    let base = q.base
-    let head = loadU64Rlx(base, DepOffHead)
-    let tail = loadU64Acq(base, DepOffTail)
-    if head >= tail:
+    var recBuf: array[DepSlotRecCap, byte]
+    var recLen = 0
+    if q.ring.tryDrainOne(recBuf, recLen) != drGot:
       return false
-    let so = slotOff(head)
-    let ready = loadU64Acq(base, so + DepSlotOffReady)
-    if ready != head + 1:
-      return false
-    let recLen = int(loadU32Acq(base, so + DepSlotOffRecLen))
     var ok = false
-    if recLen > 0 and recLen <= DepSlotRecCap:
-      var recBuf = newSeq[byte](recLen)
-      copyMem(addr recBuf[0], addr base[so + DepSlotOffRec], recLen)
-      outRec = decodeDepRecord(recBuf, ok)
-    # Retire the slot regardless (advance head) so the consumer never wedges on
-    # a malformed slot — the file fallback still carries that record.
-    storeU64Rel(base, so + DepSlotOffReady, 0)
-    storeU64Rel(base, DepOffHead, head + 1)
+    if recLen > 0:
+      outRec = decodeDepRecord(recBuf.toOpenArray(0, recLen - 1), ok)
     ok
 
   proc droppedCount*(q: DepQueue): uint64 {.inline.} =
     ## Number of SIGNALLED ring-full drops. The consumer surfaces this as a loud
     ## diagnostic (DEP-SHM-4) — the dropped records still travel the file path.
     if not q.available: return 0
-    loadU64Acq(q.base, DepOffDropped)
+    q.ring.droppedCount()
 
   proc pendingCount*(q: DepQueue): uint64 {.inline.} =
     if not q.available: return 0
-    loadU64Acq(q.base, DepOffTail) - loadU64Acq(q.base, DepOffHead)
+    q.ring.pendingCount()
 
 else:
   # Non-POSIX: compiles but reports unavailable so callers use the file path.

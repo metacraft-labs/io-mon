@@ -37,6 +37,18 @@ if [ ! -d "$stackable_hooks_src" ]; then
   exit 2
 fi
 
+# The shim's dep queue (io_mon/shm/dep_queue) imports the extracted
+# `shm_queue/ring` MPSC ring (metacraft-labs/nim-shm-queue). Layer 1 is pure
+# std/posix — NO serialization dependency — so the shim stays serialization-free.
+# Sibling at ../nim-shm-queue/src in the workspace; override with $SHM_QUEUE_SRC
+# when building from a read-only store path (Nix flake input), same discipline
+# as STACKABLE_HOOKS_SRC.
+shm_queue_src="${SHM_QUEUE_SRC:-../nim-shm-queue/src}"
+if [ ! -d "$shm_queue_src" ]; then
+  echo "missing nim-shm-queue at $shm_queue_src; set SHM_QUEUE_SRC" >&2
+  exit 2
+fi
+
 nim_mode_flags=()
 case "${IO_MON_BUILD_MODE:-debug}" in
   debug) ;;
@@ -65,6 +77,7 @@ case "$(uname -s)" in
       --threads:on \
       --path:src \
       --path:"${stackable_hooks_src}" \
+      --path:"${shm_queue_src}" \
       --nimcache:"${nimcache_dir}/io-mon-shim-dylib" \
       --out:"${out_dir}/librepro_monitor_shim.dylib" \
       src/io_mon/shim/macos_interpose.nim
@@ -83,6 +96,7 @@ case "$(uname -s)" in
       --threads:on \
       --path:src \
       --path:"${stackable_hooks_src}" \
+      --path:"${shm_queue_src}" \
       --nimcache:"${nimcache_dir}/io-mon-shim-so" \
       --out:"${out_dir}/librepro_monitor_shim.so" \
       src/io_mon/shim/linux_preload.nim
@@ -96,6 +110,7 @@ case "$(uname -s)" in
       --cc:gcc \
       --path:src \
       --path:"${stackable_hooks_src}" \
+      --path:"${shm_queue_src}" \
       --nimcache:"${nimcache_dir}/io-mon-shim-dll" \
       --out:"${out_dir}/librepro_monitor_shim.dll" \
       src/io_mon/shim/windows_interpose.nim
