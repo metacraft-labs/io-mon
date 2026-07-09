@@ -2473,6 +2473,11 @@ proc installExitDispatcher(dispatch: ExitDispatch)
 proc installRawSyscallDispatcher(dispatch: RawSyscallDispatch)
   {.importc: "ct_linux_preload_register_raw_syscall_hook", raises: [].}
 
+const
+  anonymousRangeCap = 4096
+    ## FUP-C — fixed capacity of the anonymous-mmap ownership table. See the
+    ## table declaration below for why it is a POD array rather than a ``seq``.
+
 var
   openHooks: seq[OpenHookEntry] = @[]
   open64Hooks: seq[OpenHookEntry] = @[]
@@ -2536,7 +2541,25 @@ var
     firstPatchDiagnostic: lrsOk,
     firstPatchStage: lpsNone)
   anonymousRangeLock: Lock
-  anonymousExecutableRanges: seq[AnonymousExecutableRange] = @[]
+  # FUP-C — the anonymous-mmap ownership table is a FIXED-CAPACITY POD array,
+  # NOT a growable ``seq``. Under ``--mm:orc`` a process-global ``seq`` is
+  # backed by the thread-local ``MemRegion`` of whichever thread first grew
+  # it, but ``recordAnonymousPrivateMmap`` / ``removeAnonymousPrivateRange``
+  # run from EVERY host thread's ``mmap``/``munmap`` hook. ORC's
+  # ``reallocSharedImpl`` routes to the CALLING thread's region (the shared
+  # heap lock is compiled out when ``gcDestructors`` is defined), so a
+  # ``seq`` realloc from a different thread than the one that allocated the
+  # buffer frees a chunk owned by another thread's region and corrupts its
+  # free-list — an intermittent SIGSEGV in ``rawDealloc``/``listRemove``.
+  # A fixed POD array touches NO allocator on the hot path, so the
+  # ``anonymousRangeLock`` (which already serialises the table) is the only
+  # synchronisation the table needs. Capacity is generous: allocator-growth
+  # anonymous maps coalesce as the runtime munmaps them; a full table simply
+  # drops the OLDEST tracked range (see ``recordAnonymousPrivateMmap``),
+  # which at worst under-reports a JIT range to the inline-syscall scanner —
+  # never a crash and never a false dependency.
+  anonymousExecutableRanges: array[anonymousRangeCap, AnonymousExecutableRange]
+  anonymousExecutableRangeCount: int = 0
 
 initLock(anonymousRangeLock)
 
@@ -2889,7 +2912,19 @@ proc recordAnonymousPrivateMmap*(result: pointer; length: csize_t) {.raises: [].
     return
   acquire(anonymousRangeLock)
   try:
-    anonymousExecutableRanges.add AnonymousExecutableRange(start: start, stop: stop)
+    if anonymousExecutableRangeCount < anonymousRangeCap:
+      anonymousExecutableRanges[anonymousExecutableRangeCount] =
+        AnonymousExecutableRange(start: start, stop: stop)
+      inc anonymousExecutableRangeCount
+    else:
+      # FUP-C — table full: drop the OLDEST tracked range (shift down by one)
+      # and append the new one at the tail. Never allocates; at worst the
+      # inline-syscall scanner loses visibility of a long-lived JIT range that
+      # has since been superseded by ``anonymousRangeCap`` newer mappings.
+      for i in 1 ..< anonymousRangeCap:
+        anonymousExecutableRanges[i - 1] = anonymousExecutableRanges[i]
+      anonymousExecutableRanges[anonymousRangeCap - 1] =
+        AnonymousExecutableRange(start: start, stop: stop)
   finally:
     release(anonymousRangeLock)
 
@@ -2902,38 +2937,63 @@ proc removeAnonymousPrivateRange*(address: pointer; length: csize_t) {.raises: [
     return
   acquire(anonymousRangeLock)
   try:
-    var updated: seq[AnonymousExecutableRange] = @[]
-    for tracked in anonymousExecutableRanges:
+    # FUP-C — compact into a stack-local fixed array (no heap allocation) and
+    # copy back. A range that straddles the removed interval can split into two
+    # halves, so an over-cap output is truncated (safe: only under-reports).
+    var updated: array[anonymousRangeCap, AnonymousExecutableRange]
+    var updatedCount = 0
+    template pushRange(r: AnonymousExecutableRange) =
+      if updatedCount < anonymousRangeCap:
+        updated[updatedCount] = r
+        inc updatedCount
+    for idx in 0 ..< anonymousExecutableRangeCount:
+      let tracked = anonymousExecutableRanges[idx]
       if not rangesIntersect(removeStart, removeStop, tracked.start, tracked.stop):
-        updated.add tracked
+        pushRange tracked
         continue
       if tracked.start < removeStart:
-        updated.add AnonymousExecutableRange(
+        pushRange AnonymousExecutableRange(
           start: tracked.start,
           stop: min(removeStart, tracked.stop))
       if removeStop < tracked.stop:
-        updated.add AnonymousExecutableRange(
+        pushRange AnonymousExecutableRange(
           start: max(removeStop, tracked.start),
           stop: tracked.stop)
-    anonymousExecutableRanges = updated
+    for i in 0 ..< updatedCount:
+      anonymousExecutableRanges[i] = updated[i]
+    anonymousExecutableRangeCount = updatedCount
   finally:
     release(anonymousRangeLock)
 
 proc rangeFullyTrackedLocked(start, stop: uint): bool {.raises: [].} =
   if stop <= start:
     return false
-  var intersections: seq[AnonymousExecutableRange] = @[]
-  for tracked in anonymousExecutableRanges:
+  # FUP-C — collect intersections into a stack-local fixed array (no heap
+  # allocation) and insertion-sort by start. Over-cap intersections are
+  # ignored; the coverage check then conservatively returns "not fully
+  # tracked" for that range, which is the safe direction.
+  var intersections: array[anonymousRangeCap, AnonymousExecutableRange]
+  var intersectionCount = 0
+  for idx in 0 ..< anonymousExecutableRangeCount:
+    let tracked = anonymousExecutableRanges[idx]
     if rangesIntersect(start, stop, tracked.start, tracked.stop):
-      intersections.add AnonymousExecutableRange(
+      if intersectionCount >= anonymousRangeCap:
+        break
+      let clipped = AnonymousExecutableRange(
         start: max(start, tracked.start),
         stop: min(stop, tracked.stop))
-  if intersections.len == 0:
+      # Insertion sort by ``start`` so the coverage sweep below is monotone.
+      var j = intersectionCount
+      while j > 0 and intersections[j - 1].start > clipped.start:
+        intersections[j] = intersections[j - 1]
+        dec j
+      intersections[j] = clipped
+      inc intersectionCount
+  if intersectionCount == 0:
     return false
-  intersections.sort(proc(a, b: AnonymousExecutableRange): int =
-    cmp(a.start, b.start))
   var cursor = start
-  for item in intersections:
+  for i in 0 ..< intersectionCount:
+    let item = intersections[i]
     if item.start > cursor:
       return false
     if item.stop > cursor:
@@ -2966,7 +3026,8 @@ proc anonymousPrivateRangeIntersects*(address: pointer; length: csize_t): bool
     return false
   acquire(anonymousRangeLock)
   try:
-    for tracked in anonymousExecutableRanges:
+    for idx in 0 ..< anonymousExecutableRangeCount:
+      let tracked = anonymousExecutableRanges[idx]
       if rangesIntersect(start, stop, tracked.start, tracked.stop):
         return true
   finally:
@@ -2997,17 +3058,19 @@ proc mappingLooksOwnedAnonymousExecutable(mapping: LinuxExecutableMapping): bool
   mapping.readable and mapping.executable and mapping.privateMapping and
     mapping.path.len == 0 and mapping.stop > mapping.start
 
-proc trackedAnonymousIntersections(start, stop: uint): seq[AnonymousExecutableRange]
+proc trackedAnonymousRangeIntersects(start, stop: uint): bool
     {.raises: [].} =
+  ## FUP-C — allocation-free replacement for the old
+  ## ``trackedAnonymousIntersections(...).len > 0`` probe: the only caller
+  ## needs to know whether ANY tracked range overlaps ``[start, stop)``.
   if stop <= start:
-    return @[]
+    return false
   acquire(anonymousRangeLock)
   try:
-    for tracked in anonymousExecutableRanges:
+    for idx in 0 ..< anonymousExecutableRangeCount:
+      let tracked = anonymousExecutableRanges[idx]
       if rangesIntersect(start, stop, tracked.start, tracked.stop):
-        result.add AnonymousExecutableRange(
-          start: max(start, tracked.start),
-          stop: min(stop, tracked.stop))
+        return true
   finally:
     release(anonymousRangeLock)
 
@@ -3017,7 +3080,7 @@ proc trackedAnonymousExecutableRangeExists*(start: pointer; length: csize_t): bo
     return false
   let rangeStart = cast[uint](start)
   let rangeStop = rangeStart + uint(length)
-  trackedAnonymousIntersections(rangeStart, rangeStop).len > 0
+  trackedAnonymousRangeIntersects(rangeStart, rangeStop)
 
 proc liveAnonymousExecutableMappingIntersects*(start: pointer; length: csize_t):
     bool {.raises: [].} =
@@ -3246,8 +3309,25 @@ proc scanInlineSyscallPatchesForTrackedMprotectRange*(start: pointer;
     return status
   let requestedStart = cast[uint](start)
   let requestedStop = requestedStart + uint(length)
-  let tracked = trackedAnonymousIntersections(requestedStart, requestedStop)
-  if tracked.len == 0:
+  # FUP-C — snapshot the intersecting tracked ranges into a stack-local fixed
+  # array under the lock (no heap allocation), then release the lock before
+  # the (potentially slow, procfs-reading) mapping enumeration + patch loop.
+  var tracked: array[anonymousRangeCap, AnonymousExecutableRange]
+  var trackedCount = 0
+  acquire(anonymousRangeLock)
+  try:
+    for idx in 0 ..< anonymousExecutableRangeCount:
+      let r = anonymousExecutableRanges[idx]
+      if rangesIntersect(requestedStart, requestedStop, r.start, r.stop):
+        if trackedCount >= anonymousRangeCap:
+          break
+        tracked[trackedCount] = AnonymousExecutableRange(
+          start: max(requestedStart, r.start),
+          stop: min(requestedStop, r.stop))
+        inc trackedCount
+  finally:
+    release(anonymousRangeLock)
+  if trackedCount == 0:
     return status
   let mappings =
     try:
@@ -3261,7 +3341,8 @@ proc scanInlineSyscallPatchesForTrackedMprotectRange*(start: pointer;
   for mapping in mappings.mappings:
     if not mappingLooksOwnedAnonymousExecutable(mapping):
       continue
-    for owned in tracked:
+    for ti in 0 ..< trackedCount:
+      let owned = tracked[ti]
       if not rangesIntersect(mapping.start, mapping.stop, owned.start, owned.stop):
         continue
       patchOwnedAnonymousInlineSyscallRange(
