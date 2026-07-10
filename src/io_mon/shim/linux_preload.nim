@@ -1,12 +1,13 @@
 when not defined(linux):
   {.error: "repro_monitor_shim/linux_preload is Linux-only".}
 
-import std/[locks, os, sets, strutils, tables]
+import std/[locks, os, strutils]
 from io_mon/paths import extendedPath
 
 import io_mon/types
 import io_mon/writer
 import io_mon/hooks/linux_preload_runtime
+import io_mon/shim/linux_pod_tables
 import stackable_hooks/platform/linux_raw_syscalls
 
 const
@@ -56,11 +57,15 @@ var
   locksReady = false
   initLockVar: Lock
   recordLock: Lock
-  fdLock: Lock
-  dirLock: Lock
-  streamLock: Lock
-  observedLock: Lock
-  emptyFdLock: Lock
+  # FUP-H — the fd/dir/stream path maps, the observed-input dedup set, and
+  # the empty-fd / inherited-fd sets moved to `linux_pod_tables`: they are
+  # mutated from EVERY host thread's open/close/opendir/fopen/getenv hook,
+  # and Nim `Table`/`HashSet`/`string` (ORC heap) corrupts the process
+  # allocator when a chunk allocated on one thread is freed on another (the
+  # FUP-C mechanism — it crashed live-Vulkan replay in `rawDealloc` off
+  # `updateFdPath`). Those tables now use libc-malloc'd payloads in
+  # fixed-capacity POD storage, each guarded by its own lock inside the
+  # module; the accessor procs below just forward to it.
   fragmentDir: string
   runId: string
   # DEP-SHM-2 — the shared-memory dependency-queue segment path (the value of
@@ -69,12 +74,6 @@ var
   # fork-child atfork handler can RE-ATTACH the child fresh.
   depShmPath: string
   nextProcessSeq: uint64 = 0
-  fdPaths = initTable[cint, string]()
-  dirPaths = initTable[uint, string]()
-  streamPaths = initTable[uint, string]()
-  observedNonFileInputs = initHashSet[string]()
-  emptyFdClassified = initHashSet[cint]()
-  inheritedOpenFds = initHashSet[cint]()
   rawSyscallCoverageRecorded = false
   inlineSyscallCoverageRecorded = false
   inlineSyscallTrapCoverageRecorded = false
@@ -888,48 +887,32 @@ proc observationForOpen(flags: cint): MonitorObservationKind =
 proc updateFdPath(fd: cint; path: cstring) =
   if fd < 0 or path == nil:
     return
-  acquire(fdLock)
-  fdPaths[fd] = $path
-  release(fdLock)
+  podFdPathSet(fd, path)
 
 proc removeFdPath(fd: cint) =
-  acquire(fdLock)
-  fdPaths.del(fd)
-  release(fdLock)
-  acquire(emptyFdLock)
-  emptyFdClassified.excl fd
-  inheritedOpenFds.excl fd
-  release(emptyFdLock)
+  podFdPathDel(fd)
+  podEmptyFdExcl(fd)
+  podInheritedFdExcl(fd)
 
 proc pathForFd(fd: cint): string =
-  acquire(fdLock)
-  result = fdPaths.getOrDefault(fd, "")
-  release(fdLock)
+  podFdPathGet(fd)
 
 proc markEmptyFdClassified(fd: cint) {.raises: [].} =
-  acquire(emptyFdLock)
-  emptyFdClassified.incl fd
-  release(emptyFdLock)
+  podEmptyFdSet(fd)
 
 proc emptyFdAlreadyClassified(fd: cint): bool {.raises: [].} =
-  acquire(emptyFdLock)
-  result = fd in emptyFdClassified
-  release(emptyFdLock)
+  podEmptyFdContains(fd)
 
 proc inheritedFd(fd: cint): bool {.raises: [].} =
-  acquire(emptyFdLock)
-  result = fd in inheritedOpenFds
-  release(emptyFdLock)
+  podInheritedFdContains(fd)
 
 proc rememberInheritedOpenFds() {.raises: [].} =
-  acquire(emptyFdLock)
-  inheritedOpenFds.clear()
+  podInheritedFdClear()
   for fd in 0.cint .. 1024.cint:
     var dev, ino: uint64
     var kind: cint
     if c_fd_identity_kind(fd, addr dev, addr ino, addr kind) != 0:
-      inheritedOpenFds.incl fd
-  release(emptyFdLock)
+      podInheritedFdSet(fd)
 
 proc localFdKey(dev, ino: uint64): string {.raises: [].} =
   "localfd:" & $dev & ":" & $ino
@@ -1000,19 +983,13 @@ proc dirKey(dirp: pointer): uint =
 proc updateDirPath(dirp: pointer; path: cstring) =
   if dirp == nil or path == nil:
     return
-  acquire(dirLock)
-  dirPaths[dirKey(dirp)] = $path
-  release(dirLock)
+  podDirPathSet(dirKey(dirp), path)
 
 proc removeDirPath(dirp: pointer) =
-  acquire(dirLock)
-  dirPaths.del(dirKey(dirp))
-  release(dirLock)
+  podDirPathDel(dirKey(dirp))
 
 proc pathForDir(dirp: pointer): string =
-  acquire(dirLock)
-  result = dirPaths.getOrDefault(dirKey(dirp), "")
-  release(dirLock)
+  podDirPathGet(dirKey(dirp))
 
 proc streamKey(stream: pointer): uint =
   cast[uint](stream)
@@ -1020,19 +997,13 @@ proc streamKey(stream: pointer): uint =
 proc updateStreamPath(stream: pointer; path: cstring) =
   if stream == nil or path == nil:
     return
-  acquire(streamLock)
-  streamPaths[streamKey(stream)] = $path
-  release(streamLock)
+  podStreamPathSet(streamKey(stream), path)
 
 proc removeStreamPath(stream: pointer) =
-  acquire(streamLock)
-  streamPaths.del(streamKey(stream))
-  release(streamLock)
+  podStreamPathDel(streamKey(stream))
 
 proc pathForStream(stream: pointer): string =
-  acquire(streamLock)
-  result = streamPaths.getOrDefault(streamKey(stream), "")
-  release(streamLock)
+  podStreamPathGet(streamKey(stream))
 
 proc probeFromResult(callResult: cint): ProbeResult =
   if callResult == 0:
@@ -1045,11 +1016,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   if not locksReady:
     initLock(initLockVar)
     initLock(recordLock)
-    initLock(fdLock)
-    initLock(dirLock)
-    initLock(streamLock)
-    initLock(observedLock)
-    initLock(emptyFdLock)
+    initPodTables()
     locksReady = true
   acquire(initLockVar)
   defer: release(initLockVar)
@@ -1936,13 +1903,7 @@ proc recordObservedNonFile(kind: MonitorRecordKind;
   if path.len == 0:
     return
   let key = $ord(kind) & ":" & path
-  var shouldEmit = false
-  acquire(observedLock)
-  if not observedNonFileInputs.contains(key):
-    observedNonFileInputs.incl(key)
-    shouldEmit = true
-  release(observedLock)
-  if not shouldEmit:
+  if not podObservedInsertIsNew(cstring(key)):
     return
   var record = baseRecord(kind, observationKind)
   record.path = path
