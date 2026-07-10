@@ -221,10 +221,35 @@ int main(int argc, char **argv) {
     check buildShim.code == 0
     let shimLib = findShimLibrary()
 
+    # The injected descendant is a double-forked, setsid'd daemon that is
+    # re-parented to init and outlives the monitored root. Two modes, selected
+    # by argv[5] (the release-sentinel path):
+    #
+    #   "-"  legacy quiesce mode: the root exits immediately; the daemon sleeps
+    #        argv[3] ms, reads the marker, writes the proof, sleeps argv[4] ms
+    #        and exits. Used by the "quiesces inside grace" block, whose
+    #        expected result (mcComplete + captured read) is also what a
+    #        premature quiescence produces, so it is inherently timing-robust.
+    #
+    #   path gated "live past grace" mode: the daemon reads the marker, writes
+    #        the proof, then SIGNALS the root (via an inherited pipe) that it is
+    #        alive, visible in /proc, and past its I/O — only THEN does the root
+    #        exit. The daemon subsequently blocks until <path> appears, so it is
+    #        GUARANTEED to still be live throughout the monitor's entire grace
+    #        window regardless of host load. This removes the historic
+    #        /proc-quiescence race: previously the daemon slept a fixed 200 ms
+    #        and, under load, a single /proc scan (which reads every process's
+    #        environ) could take longer than both the grace window and the
+    #        daemon's lifetime, so the first completed scan saw zero live
+    #        descendants and the wait declared premature quiescence — flipping
+    #        the expected mcIncomplete("still live") to mcComplete. The harness
+    #        drops the release file only after `run` returns, then the daemon
+    #        exits and is reaped by init.
     let daemonProbe = buildC(work, "daemon_late_reader", """
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -235,14 +260,56 @@ static void msleep_arg(const char *s) {
 }
 
 int main(int argc, char **argv) {
-  if (argc != 5) return 2;
+  if (argc != 6) return 2;
+  const char *release = argv[5];
+  int gated = strcmp(release, "-") != 0;
+
+  int rp[2];
+  if (pipe(rp) != 0) return 8;
+
   pid_t pid = fork();
   if (pid < 0) return 3;
-  if (pid > 0) return 0;
+  if (pid > 0) {
+    close(rp[1]);
+    char b;
+    if (gated) {
+      /* Do not exit until the daemon has read the marker, written the proof
+         and signalled (one byte) that it is alive and visible in /proc. */
+      while (read(rp[0], &b, 1) < 0) { /* retry on EINTR */ }
+    } else {
+      /* Do not exit until the daemon has fully EXITED (pipe EOF): the
+         descendant has already quiesced and flushed before the monitor's
+         grace wait begins, so a slow /proc scan under load can no longer race
+         the descendant's lifetime and misreport quiescence. */
+      while (read(rp[0], &b, 1) > 0) { /* drain until EOF */ }
+    }
+    close(rp[0]);
+    return 0;
+  }
+  close(rp[0]);
   if (setsid() < 0) _exit(4);
   pid = fork();
   if (pid < 0) _exit(5);
   if (pid > 0) _exit(0);
+
+  if (gated) {
+    /* Full daemonization: drop EVERY inherited descriptor except the readiness
+       pipe. The monitor launches the tree with parent streams and the shim
+       dups the harness's captured stdout pipe (and its own channels) onto high
+       fds that we inherit; a daemon that BLOCKS (gated mode) must keep none of
+       them, or the harness's readAll() never reaches EOF and `run` hangs.
+       Closing them all lets EOF arrive as soon as the short-lived root exits,
+       so `run` returns and the harness can drop the release sentinel. (In the
+       non-gated quiesce mode the daemon exits promptly, so it simply lets exit
+       close its inherited fds — no special handling needed.) */
+    long maxfd = sysconf(_SC_OPEN_MAX);
+    if (maxfd < 0 || maxfd > 4096) maxfd = 4096;
+    for (int fd = 0; fd < maxfd; fd++) {
+      if (fd != rp[1]) close(fd);
+    }
+    int dn = open("/dev/null", O_RDWR);
+    if (dn == 0) { dup2(dn, 1); dup2(dn, 2); }
+  }
 
   msleep_arg(argv[3]);
   int in = open(argv[1], O_RDONLY);
@@ -252,10 +319,20 @@ int main(int argc, char **argv) {
   close(in);
   int out = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC, 0666);
   if (out >= 0) {
-    if (n > 0) write(out, "read\n", 5);
-    else write(out, "empty\n", 6);
+    if (n > 0) { if (write(out, "read\n", 5) < 0) {} }
+    else { if (write(out, "empty\n", 6) < 0) {} }
     close(out);
   }
+  if (gated) {
+    char rb = 1;
+    if (write(rp[1], &rb, 1) < 0) {}
+    close(rp[1]);
+    struct stat st;
+    while (stat(release, &st) != 0) usleep(2000);
+    _exit(n > 0 ? 0 : 7);
+  }
+  /* Quiesce mode: exit promptly. _exit closes our inherited copy of the
+     readiness pipe, which is the root's EOF signal that we have fully gone. */
   msleep_arg(argv[4]);
   _exit(n > 0 ? 0 : 7);
 }
@@ -274,7 +351,7 @@ int main(int argc, char **argv) {
       childEnv["IO_MON_LINUX_DESCENDANT_GRACE_MS"] = "1000"
       childEnv["IO_MON_LINUX_DESCENDANT_POLL_MS"] = "10"
       let cap = run(snoopBin, @["run", "--depfile", depfile, "--",
-        daemonProbe, marker, proof, "20", "0"], childEnv)
+        daemonProbe, marker, proof, "20", "0", "-"], childEnv)
       checkpoint("daemon quiesce output: " & cap.output)
       check cap.code == 0
       check waitForPath(proof)
@@ -289,7 +366,15 @@ int main(int argc, char **argv) {
     block livePastGrace:
       let depfile = work / "daemon-live-past-grace.rdep"
       let proof = work / "daemon-live-past-grace.proof"
+      # Gated mode: the daemon blocks on this sentinel until we drop it, so it
+      # is deterministically still alive across the whole grace window. We
+      # remove any stale copy first so the daemon really does block, then drop
+      # it the moment `run` returns (before the assertions, so the daemon is
+      # released — and reaped by init — even if an assertion below fails).
+      let release = work / "daemon-live-past-grace.release"
       try: removeFile(proof)
+      except OSError: discard
+      try: removeFile(release)
       except OSError: discard
       var childEnv = newStringTable(modeCaseSensitive)
       for k, v in envPairs(): childEnv[k] = v
@@ -297,7 +382,8 @@ int main(int argc, char **argv) {
       childEnv["IO_MON_LINUX_DESCENDANT_GRACE_MS"] = "100"
       childEnv["IO_MON_LINUX_DESCENDANT_POLL_MS"] = "10"
       let cap = run(snoopBin, @["run", "--depfile", depfile, "--",
-        daemonProbe, marker, proof, "200", "200"], childEnv)
+        daemonProbe, marker, proof, "0", "0", release], childEnv)
+      writeFile(release, "release\n")
       checkpoint("daemon live output: " & cap.output)
       check cap.code == 0
       check waitForPath(proof)
