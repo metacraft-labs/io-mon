@@ -93,6 +93,20 @@ var
   # thread-exit flush, so the arming call stays off the steady-state hot
   # path (one branch on a threadvar bool per emit).
   threadExitArmed {.threadvar.}: bool
+  # FUP-K — per-thread caches for the process/thread identity that
+  # `baseRecord` stamps on EVERY record. `getpid(2)` / `getppid(2)` /
+  # `gettid(2)` are un-cached raw syscalls in glibc (since 2.25) / musl, so
+  # a recorder-heavy workload (the BEAM VM emitting a record per port write)
+  # pays THREE extra syscalls per record. pid/ppid are process-constant and
+  # tid is thread-constant for a thread's whole lifetime; the only event
+  # that invalidates them is `fork`, after which the pthread_atfork CHILD
+  # handler (`repro_linux_atfork_child`) resets the caches. A sentinel of 0
+  # means "unset"; a real pid/tid is always > 0, so 0 unambiguously forces a
+  # first fetch. The recorded VALUES are byte-identical to the un-cached path
+  # — this is a pure syscall-count reduction, not a semantic change.
+  cachedTid {.threadvar.}: uint64
+  cachedPid {.threadvar.}: uint64
+  cachedPpid {.threadvar.}: uint64
 
 {.emit: """
 #define _GNU_SOURCE
@@ -626,7 +640,32 @@ type
     fkOther = 5
 
 proc currentThreadId(): uint64 =
-  uint64(c_gettid())
+  ## FUP-K — thread-cached `gettid`. Stable for the thread's lifetime; the
+  ## fork-child handler clears the cache so a child re-fetches its own tid.
+  if cachedTid == 0:
+    cachedTid = uint64(c_gettid())
+  cachedTid
+
+proc currentPid(): uint64 {.raises: [].} =
+  ## FUP-K — thread-cached `getpid`. Process-constant; reset in the fork child.
+  if cachedPid == 0:
+    cachedPid = uint64(c_getpid())
+  cachedPid
+
+proc currentPpid(): uint64 {.raises: [].} =
+  ## FUP-K — thread-cached `getppid`. Reset in the fork child so the child
+  ## re-fetches (its parent is the process that forked it).
+  if cachedPpid == 0:
+    cachedPpid = uint64(c_getppid())
+  cachedPpid
+
+proc resetIdentityCaches() {.raises: [].} =
+  ## FUP-K — invalidate the pid/ppid/tid caches. Called from the
+  ## pthread_atfork CHILD handler: the child has a new tid, a new pid, and a
+  ## new parent, so all three must be re-fetched on next use.
+  cachedTid = 0
+  cachedPid = 0
+  cachedPpid = 0
 
 proc processSeq(): uint64 =
   acquire(recordLock)
@@ -666,6 +705,10 @@ proc repro_linux_atfork_child() {.exportc, cdecl, raises: [].} =
   ## DEP-FLUSH-4 — reset the child's inherited slot + registry so it never
   ## replays the parent's buffered frames or writes through the COW-shared
   ## fd. Muted so no record is emitted during the reset.
+  # FUP-K — the child has a fresh pid/ppid/tid; drop the inherited (COW) caches
+  # so `baseRecord` re-fetches them for the child's records. Runs inside fork()
+  # in the child before fork() returns, so every child record sees fresh values.
+  resetIdentityCaches()
   withShimMuted:
     try: discardFragmentSlotAfterFork()
     except CatchableError: discard
@@ -723,8 +766,8 @@ proc baseRecord(kind: MonitorRecordKind;
     kind: kind,
     observationKind: observationKind,
     seq: processSeq(),
-    osPid: uint64(c_getpid()),
-    parentOsPid: uint64(c_getppid()),
+    osPid: currentPid(),
+    parentOsPid: currentPpid(),
     threadId: currentThreadId(),
     probeResult: prUnknown)
 
@@ -956,11 +999,20 @@ proc classifyEmptyFdRead(fd: cint): bool {.raises: [].} =
     markEmptyFdClassified(fd)
   elif kind == fkFifo or kind == fkSocket or kind == fkOther:
     if not inheritedFd(fd):
+      # FUP-K — a NON-inherited pipe/socket/other fd (BEAM opens its ports
+      # AFTER shim init) never names a file, so it produces no dependency on
+      # any read. Mark it classified so the enormous volume of subsequent
+      # reads on the SAME hot fd skip the `fstat` in c_fd_identity_kind. The
+      # bit is cleared by removeFdPath on close, so a later reuse of the fd
+      # number re-classifies. No record is emitted here in either case, so
+      # the recorded dependency set is byte-identical.
+      markEmptyFdClassified(fd)
       return false
     recordExternalContent("opaque", "read", localFdKey(dev, ino), fd)
     markEmptyFdClassified(fd)
   else:
     if not inheritedFd(fd):
+      markEmptyFdClassified(fd)  # FUP-K — see the fifo/socket branch above.
       return false
     recordExternalContent("opaque", "read", localFdKey(dev, ino), fd)
     markEmptyFdClassified(fd)
@@ -1178,8 +1230,21 @@ proc recordFdRead(fd: cint; bytes: clong) {.raises: [].} =
 
 proc recordFdWrite(fd: cint; bytes: clong) {.raises: [].} =
   if bytes >= 0 and fd > 2:
+    let path = pathForFd(fd)
+    # FUP-K — a write to an fd with no tracked path is a write to a
+    # socket / pipe / port (the BEAM VM's dominant write target), never a
+    # file, so it carries NO output dependency: every consumer already
+    # filters `moFileWrite` records with an empty path (see writer.nim's
+    # `breakawayAuthContext` / merge output-path folding), so these records
+    # are pure noise that also floods the DEP-SHM ring and forces the
+    # file-fragment fallback. Skipping them here makes the libc-hook write
+    # path consistent with the raw-syscall write path (`recordRawWrite`,
+    # which already returns without emitting on an empty path) and leaves the
+    # recorded dependency set byte-identical.
+    if path.len == 0:
+      return
     var record = baseRecord(mrFileWrite, moFileWrite)
-    record.path = pathForFd(fd)
+    record.path = path
     record.result = bytes.int64
     record.flags = uint32(fd)
     emitRecord(record)
