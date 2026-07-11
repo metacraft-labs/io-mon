@@ -763,7 +763,7 @@ proc reopenFragmentHandle(): bool {.raises: [].} =
       fragmentSlot.isOpen = false
       unregisterFragmentSlot()
       return false
-  except IOError, OSError:
+  except IOError, OSError, ValueError:
     fragmentSlot.isOpen = false
     unregisterFragmentSlot()
     return false
@@ -2031,6 +2031,20 @@ const
     ## reads and makes no completeness claim) is treated as untrusted, so the
     ## client's connect still downgrades.
 
+proc comparableReportPath(path: string): string =
+  ## Filesystem iteration uses extended paths on Windows, while monitor records
+  ## deliberately retain ordinary paths. Normalize both spellings before using
+  ## them as report-authentication identities.
+  when defined(windows):
+    var ordinary = path
+    if ordinary.startsWith("\\\\?\\UNC\\"):
+      ordinary = "\\\\" & ordinary[8 .. ^1]
+    elif ordinary.startsWith("\\\\?\\"):
+      ordinary = ordinary[4 .. ^1]
+    normalizedPath(absolutePath(ordinary)).toLowerAscii()
+  else:
+    path
+
 proc breakawayAuthContext*(records: openArray[MonitorRecord]):
     BreakawayAuthContext =
   ## ROUND-2 R8 — extract the report-authentication context from the merged
@@ -2048,6 +2062,7 @@ proc breakawayAuthContext*(records: openArray[MonitorRecord]):
     # backstop.
     if r.observationKind == moFileWrite and r.path.len > 0:
       result.inTreeOutputPaths.incl r.path
+      result.inTreeOutputPaths.incl comparableReportPath(r.path)
       let dev = detailToken(r.detail, "dev")
       let ino = detailToken(r.detail, "ino")
       if dev.len > 0 and ino.len > 0:
@@ -2084,6 +2099,8 @@ proc reportAuthoredInTree(reportPath: string;
   if auth.inTreeOutputPaths.len == 0 and auth.inTreeOutputInos.len == 0:
     return false
   if reportPath in auth.inTreeOutputPaths:
+    return true
+  if comparableReportPath(reportPath) in auth.inTreeOutputPaths:
     return true
   # Realpath the report so a /tmp vs /private/tmp (or symlink) spelling matches the
   # shim's F_GETPATH-canonical write record.

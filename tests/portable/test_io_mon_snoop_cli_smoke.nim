@@ -29,7 +29,8 @@ proc run(cmd: string; args: seq[string]):
 
 suite "io-mon CLI (M8) — portable build + inspect":
   let work = createTempDir("io-mon-cli-smoke", "")
-  let snoopBin = work / "io-mon"
+  let snoopBin = work /
+    (when defined(windows): "io-mon.exe" else: "io-mon")
 
   test "the snoop CLI builds standalone (io-mon + nim-stackable-hooks only)":
     # The compile is the primary proof: a lingering reprobuild import would fail

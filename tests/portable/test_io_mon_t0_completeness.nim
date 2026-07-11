@@ -531,6 +531,7 @@ suite "io-mon R5 kill-before-flush durability (in-fragment marker)":
     # An explicit flush makes the tail durable → a committed marker is appended.
     flushFragmentBatch()
     check fragHas(frag, 700'u64, 0'u64, ReadTailCommittedDetail)
+    closeFragmentSlot()
     removeDir(work)
 
   test "an unmatched PENDING (killed pre-flush) downgrades to mcIncomplete":
