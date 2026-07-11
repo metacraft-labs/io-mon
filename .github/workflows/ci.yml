@@ -12,7 +12,7 @@ env:
 jobs:
   lint:
     name: Lint
-    runs-on: [self-hosted, linux, x64]
+    runs-on: incus
     steps:
       - name: Generate CI token
         id: app-token
@@ -48,7 +48,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runs-on: [[self-hosted, linux, x64], [self-hosted, macos, arm64]]
+        runs-on: [incus, macos-tart]
     steps:
       - name: Generate CI token
         id: app-token
@@ -86,11 +86,11 @@ jobs:
       matrix:
         include:
           - env: nix
-            runs-on: [self-hosted, linux, x64]
+            runs-on: incus
           - env: nix
-            runs-on: [self-hosted, macos, arm64]
+            runs-on: macos-tart
           - env: reprobuild
-            runs-on: [self-hosted, linux, x64]
+            runs-on: incus
     steps:
       - name: Generate CI token
         id: app-token

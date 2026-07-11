@@ -16,20 +16,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runs-on: [self-hosted, linux, x64]
+          - runs-on: incus
             platform: linux-amd64
             is_windows: false
-          - runs-on: [self-hosted, linux, arm64]
+          - runs-on: tart-linux-arm
             platform: linux-arm64
             is_windows: false
-          - runs-on: [self-hosted, macos, arm64]
+          - runs-on: macos-tart
             platform: macos-arm64
             is_windows: false
-          - runs-on: [self-hosted, macos, arm64]
+          - runs-on: macos-tart
             platform: macos-amd64
             is_windows: false
             cross_arch: amd64
-          - runs-on: [self-hosted, windows, x64]
+          - runs-on: win-ephemeral
             platform: windows-amd64
             is_windows: true
     steps:
@@ -107,7 +107,7 @@ jobs:
   release:
     name: Publish Github Release
     needs: build
-    runs-on: [self-hosted, linux, x64]
+    runs-on: incus
     steps:
       - name: Checkout
         uses: actions/checkout@v4
