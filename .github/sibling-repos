@@ -1,1 +1,7 @@
+# Cross-repo siblings cloned by setup-dev-env at workspace-lock-pinned
+# revisions. Both are io-mon's `uses:` library producers in repro.nim
+# (reprobuild builds each from source and threads its `src/` root onto
+# io-mon's compile); they are also the `--path` siblings config.nims
+# resolves for the plain `nim c` / `nimble` build.
 nim-stackable-hooks
+nim-shm-queue

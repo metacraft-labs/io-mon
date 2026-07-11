@@ -1,0 +1,9 @@
+schema = "reprobuild.solved-graph-lock.v2"
+
+[lock]
+platform = "amd64-linux"
+optimal = false
+inputs_digest = "fnv1a64:80584ca01a23aee0"
+variants = []
+packages = [{ name = "gcc", version = "12.0.0", source = "gcc" }, { name = "io_mon", version = "0.1.0", source = "io_mon" }, { name = "nim", version = "2.2.0", source = "nim" }, { name = "nim-shm-queue", version = "1.0.0", source = "nim-shm-queue" }, { name = "nim-stackable-hooks", version = "1.0.0", source = "nim-stackable-hooks" }, { name = "nimble", version = "1.0.0", source = "nimble" }, { name = "sh", version = "1.0.0", source = "sh" }, { name = "shm_queue", version = "0.1.0", source = "shm_queue" }, { name = "stackable_hooks", version = "0.1.0", source = "stackable_hooks" }]
+deps = [{ name = "io-mon", path = ".", coord_kind = "vcs", url = "https://github.com/metacraft-labs/io-mon.git", ref = "dev", revision = "5ca0df81199d57c367fc3f032b7637166dfb3ce4", integrity = "git-sha1:5ca0df81199d57c367fc3f032b7637166dfb3ce4", version = "", visibility = "public", participation = "", depends = "nim-stackable-hooks,nim-shm-queue", groups = "" }, { name = "nim-shm-queue", path = "../nim-shm-queue", coord_kind = "vcs", url = "https://github.com/metacraft-labs/nim-shm-queue.git", ref = "main", revision = "7b1a5df5de3427e7ecdd67684361e8525fe69e99", integrity = "git-sha1:7b1a5df5de3427e7ecdd67684361e8525fe69e99", version = "", visibility = "public", participation = "", depends = "", groups = "" }, { name = "nim-stackable-hooks", path = "../nim-stackable-hooks", coord_kind = "vcs", url = "https://github.com/metacraft-labs/nim-stackable-hooks", ref = "mcr-stege0-and-fixes", revision = "dc7c8f83d12fa6e8e0f7a43e8a28cab846a7a8ec", integrity = "git-sha1:dc7c8f83d12fa6e8e0f7a43e8a28cab846a7a8ec", version = "", visibility = "public", participation = "", depends = "", groups = "" }]

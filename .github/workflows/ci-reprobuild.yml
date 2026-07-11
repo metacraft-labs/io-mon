@@ -1,0 +1,108 @@
+name: CI (reprobuild)
+
+# Additive side-by-side CI run that re-plays io-mon's deterministic dev
+# env through reprobuild instead of `nix develop`. Runs alongside the
+# existing `ci.yml` (`nix`) so regressions in either path still gate
+# merges — see
+# `metacraft-dev-guidelines/policies/ci-workflow-standards.md`
+# (`repro build` / `repro test` run on all five platforms) and
+# `metacraft-dev-guidelines/policies/ci-shared-dev-env.md` for the
+# rollout shape.
+#
+# The `setup-dev-env` composite action accepts `env-flavor: reprobuild`
+# (target state per the policy). It clones the workspace siblings listed
+# in `.github/sibling-repos` at the workspace-lock-pinned revisions, then
+# materialises the env so `repro build` / `repro test` can drive the
+# recipe in `repro.nim` end-to-end on every supported host.
+
+on:
+  push:
+    branches: [main, dev, stable]
+  pull_request:
+    branches: [main, dev, stable]
+
+jobs:
+  reprobuild:
+    name: ${{ matrix.os }}-${{ matrix.arch }} — repro build/test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: x64
+            runner: incus
+          - os: linux
+            arch: arm64
+            runner: tart-linux-arm
+          - os: macos
+            arch: arm64
+            runner: macos-tart
+          - os: windows
+            arch: x64
+            runner: win-ephemeral
+          - os: windows
+            arch: arm64
+            runner: win-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Mint a GitHub App installation token via the CI Token Provider
+      # app so the reprobuild flake/sibling steps can clone the private
+      # metacraft-labs siblings and the workspace-lock manifest repo.
+      # GitHub free plan restricts org-level secrets with visibility ALL
+      # from being readable in private repos, so we mint per-run tokens
+      # from the app secrets stored at repo level
+      # (CI_TOKEN_PROVIDER_APP_ID + CI_TOKEN_PROVIDER_PRIVATE_KEY).
+      # Minted before the sibling clones so the workspace-lock manifest
+      # checkout (private metacraft-manifests) can authenticate.
+      - name: Mint installation token for cross-repo sibling clones
+        id: ci_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      - name: Setup dev env (reprobuild flavor)
+        # setup-dev-env clones the siblings listed in .github/sibling-repos
+        # (nim-stackable-hooks, nim-shm-queue) at the workspace-lock-pinned
+        # revisions before materialising the env. Those two are io-mon's
+        # `uses:` library producers in repro.nim; reprobuild builds each
+        # from source and threads their `src/` roots onto io-mon's compile.
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
+        with:
+          env-flavor: reprobuild
+          gh-token: ${{ steps.ci_token.outputs.token }}
+
+      - name: repro build
+        # Builds the conventional `default` collection declared in
+        # `repro.nim` — the standalone `io-mon` CLI. Verifies the primary
+        # shipping artefact materialises through the reprobuild engine
+        # identically to `just build`.
+        run: dev-exec repro build
+
+      - name: repro test
+        # Materialises the `test` collection (the portable + host-OS
+        # io-mon suites).
+        run: dev-exec repro test
+
+      - name: just build (cross-check)
+        # Re-runs the legacy `just build` path inside the same env so we
+        # catch silent divergences between `repro build` outputs and what
+        # the dev shell + Justfile produce today.
+        run: dev-exec just build
+
+      - name: just test (cross-check)
+        run: dev-exec just test
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reprobuild-logs-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            build/
+            .repro/
+          retention-days: 7
+          if-no-files-found: ignore

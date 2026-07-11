@@ -67,7 +67,14 @@
 
 import repro_project_dsl
 import repro_dsl_stdlib/packages/sh
-import repro_dsl_stdlib/packages/nim as nim_pkg
+# NOTE: ``repro_dsl_stdlib/packages/nim`` is deliberately NOT imported here.
+# The ``package`` macro's ``usesImportCode`` pass auto-imports it ``as
+# nim_module`` because ``"nim >=2.0"`` appears in the ``uses:`` block below,
+# which is what makes the bare ``nim`` identifier in ``nim.c(...)`` resolve to
+# the tool const. A direct ``import repro_dsl_stdlib/packages/nim`` shadows that
+# const with the module name and breaks the package declaration (the package
+# name fails to resolve — ``undeclared identifier``). See the same note in
+# reprobuild's own ``repro.nim``.
 import ct_test_nim_unittest
 
 package io_mon:
@@ -87,6 +94,22 @@ package io_mon:
       "clang"
     else:
       "gcc >=12"
+
+    # Sibling Nim-library producers (SC-11 develop-mode from-source
+    # consumption — the same shape ``nim-agents`` uses for its
+    # ``nim-acp`` / ``nim-agent-harbor`` siblings). ``src`` imports
+    # ``stackable_hooks/*`` (the interpose framework) and
+    # ``src/io_mon/shm/dep_queue`` imports ``shm_queue/ring`` (the MPSC ring).
+    # Naming the two workspace repos here makes reprobuild build each from
+    # source (their ``library stackable_hooks`` / ``library shm_queue``) and
+    # thread their ``src/`` roots onto this repo's ``nim c --path:`` via the
+    # ``nimPathDirs`` aux channel — replacing ``config.nims``'s hardcoded
+    # ``--path:../nim-stackable-hooks/src`` + ``$SHM_QUEUE_SRC`` for the
+    # engine-driven compile (``config.nims`` is not read by the engine's build
+    # edges, only by a plain ``nimble``/``nim c`` invocation). The scripted
+    # shim edge still resolves ``$STACKABLE_HOOKS_SRC`` itself.
+    "nim-stackable-hooks"
+    "nim-shm-queue"
 
   # The package itself — every ``.nim`` under ``src`` is importable when a
   # consumer expresses ``uses: "io-mon"``; ``src/io_mon.nim`` is the umbrella
@@ -142,6 +165,12 @@ package io_mon:
       source = "cmd/io_mon_snoop.nim",
       binary = cliOutput,
       threadsOn = true,
+      # ``src`` reproduces ``config.nims``'s ``switch("path", "src")`` for the
+      # engine compile (which does not read ``config.nims``). The sibling
+      # ``stackable_hooks`` / ``shm_queue`` ``src`` roots ride in automatically
+      # via the ``uses:`` ``nimPathDirs`` channel.
+      paths = @["src"],
+      extraInputs = @["src", "io_mon.nimble"],
       actionId = "io-mon.cli.build_snoop")
     # Enrol the CLI into the conventional ``default`` collection so a bare
     # ``repro build`` / ``repro build io-mon`` materialises it (see
@@ -175,6 +204,12 @@ package io_mon:
       let edge = buildNimUnittest.build(
         source = source,
         binary = binary,
+        # ``src`` + ``tests/helpers`` reproduce ``config.nims``'s path
+        # switches for the engine compile; the sibling ``stackable_hooks`` /
+        # ``shm_queue`` ``src`` roots ride in via the ``uses:`` ``nimPathDirs``
+        # channel.
+        paths = @["src", "tests/helpers"],
+        extraInputs = @["src", "tests/helpers", "io_mon.nimble"],
         actionId = "io-mon.test_build." & stem)
       buildActions.add(edge.action)
 
