@@ -1303,6 +1303,20 @@ proc repro_hook_close*(ctx: var CloseContext) {.raises: [].} =
   if shouldBypass():
     callNext(ctx)
     return
+  # Generated configure scripts routinely close every descriptor above
+  # stderr before creating command-substitution pipes. If one of those
+  # descriptors is our cached fragment FILE, letting the raw close proceed
+  # leaves FragmentSlot pointing at a descriptor number the shell can reuse.
+  # Subsequent monitor frames then enter the shell pipe instead of the fragment
+  # file. Close through the writer so it flushes and retires the slot first.
+  if ctx.fd == sigSafeSlotFd():
+    var closed = false
+    withShimMuted:
+      closeFragmentSlot()
+      closed = true
+    ctx.result = (if closed: 0.cint else: (-1).cint)
+    removeFdPath(ctx.fd)
+    return
   callNext(ctx)
   let savedErrno = c_get_errno()
   removeFdPath(ctx.fd)
