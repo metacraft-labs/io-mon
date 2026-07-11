@@ -115,6 +115,102 @@ int main(int argc, char **argv) {
     check dep.completeness == mcComplete
     check dep.records.anyIt(it.kind == mrFileRead and marker in it.path)
 
+  test "relative writes follow a process chdir":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      require cli.code == 0
+
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    require buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let writer = buildC(work, "chdir_relative_writer", """
+#include <fcntl.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  if (chdir(argv[1]) != 0) return 2;
+  int fd = open("src/result.o", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) return 3;
+  if (write(fd, "ok", 2) != 2) return 4;
+  return close(fd) == 0 ? 0 : 5;
+}
+""")
+    let buildDir = work / "chdir-build"
+    createDir(buildDir)
+    createDir(buildDir / "src")
+    let expected = buildDir / "src" / "result.o"
+    let depfile = work / "chdir-relative.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin,
+      @["run", "--depfile", depfile, "--", writer, buildDir], childEnv)
+    checkpoint(cap.output)
+    require cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check hasRecord(dep, mrFileWrite, expected)
+    check not dep.records.anyIt(it.kind == mrFileWrite and
+      it.path.endsWith("src/result.o") and it.path != expected)
+
+  test "O_TMPFILE creation preserves its variadic mode":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      require cli.code == 0
+
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    require buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let writer = buildC(work, "otmpfile_mode_writer", """
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  mode_t old_umask = umask(0022);
+  int fd = open(argv[1], O_RDWR | O_TMPFILE, 0666);
+  umask(old_umask);
+  if (fd < 0) return 2;
+  if (write(fd, "ok", 2) != 2) return 3;
+  if (linkat(fd, "", AT_FDCWD, argv[2], AT_EMPTY_PATH) != 0) return 4;
+  if (close(fd) != 0) return 5;
+  struct stat st;
+  if (stat(argv[2], &st) != 0) return 6;
+  return (st.st_mode & 0777) == 0644 ? 0 : 7;
+}
+""")
+    let output = work / "otmpfile-mode-output"
+    let depfile = work / "otmpfile-mode.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin,
+      @["run", "--depfile", depfile, "--", writer, work, output], childEnv)
+    checkpoint(cap.output)
+    require cap.code == 0
+
+    let permissions = getFilePermissions(output)
+    check fpUserRead in permissions
+    check fpUserWrite in permissions
+    check fpGroupRead in permissions
+    check fpOthersRead in permissions
+
   test "read batch is flushed when a process exits through _exit":
     let snoopBin = work / "io-mon"
     if not fileExists(snoopBin):

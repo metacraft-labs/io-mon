@@ -130,6 +130,8 @@ type
     # cleanly before writing anything.
     isOpen: bool
     file: File
+    fileDevice: uint64
+    fileId: uint64
     fragmentDirLen: int
     fragmentDirBuf: array[FragmentDirBufLen, char]
     osPid: uint64
@@ -332,6 +334,10 @@ proc encodeFrame*(record: MonitorRecord): seq[byte] {.raises: [].}
   ## marker, ROUND-5 F) encodes a single frame; the full definition is below. The
   ## explicit `{.raises: [].}` keeps effect inference from pessimistically assuming
   ## the not-yet-seen body can raise (which would poison every caller's raises list).
+
+proc fragmentPath*(fragmentDir: string; osPid, threadId: uint64): string
+    {.raises: [].}
+  ## Forward declaration for cached-handle recovery.
 
 var fragmentRunToken: string
   ## ROUND-5 F — the ` run=<id>` suffix (from the shim's REPRO_MONITOR_SESSION) that
@@ -726,6 +732,51 @@ proc resetFragmentLogFlushCount*() =
   ## Test-only — reset the flush counter between scenarios.
   fragmentFlushCount.store(0, moRelaxed)
 
+proc captureFragmentHandleIdentity(): bool {.raises: [].} =
+  try:
+    let info = getFileInfo(fragmentSlot.file)
+    fragmentSlot.fileDevice = uint64(info.id.device)
+    fragmentSlot.fileId = uint64(info.id.file)
+    result = true
+  except IOError, OSError:
+    result = false
+
+proc fragmentHandleIsCurrent(): bool {.raises: [].} =
+  if not fragmentSlot.isOpen or fragmentSlot.file.isNil:
+    return false
+  try:
+    let info = getFileInfo(fragmentSlot.file.getFileHandle())
+    result = uint64(info.id.device) == fragmentSlot.fileDevice and
+      uint64(info.id.file) == fragmentSlot.fileId
+  except IOError, OSError:
+    result = false
+
+proc reopenFragmentHandle(): bool {.raises: [].} =
+  ## The descriptor may have been replaced through a hidden libc call or raw
+  ## syscall. Do not fclose the stale FILE because that descriptor number may
+  ## now belong to the tracee; detach it and reopen the same fragment instead.
+  let path = fragmentPath(slotFragmentDir(fragmentSlot),
+    fragmentSlot.osPid, fragmentSlot.threadId)
+  fragmentSlot.file = nil
+  try:
+    if not open(fragmentSlot.file, extendedPath(path), fmAppend):
+      fragmentSlot.isOpen = false
+      unregisterFragmentSlot()
+      return false
+  except IOError, OSError, ValueError:
+    fragmentSlot.isOpen = false
+    unregisterFragmentSlot()
+    return false
+  if not captureFragmentHandleIdentity():
+    try: close(fragmentSlot.file)
+    except IOError, OSError: discard
+    fragmentSlot.file = nil
+    fragmentSlot.isOpen = false
+    unregisterFragmentSlot()
+    return false
+  discard fragmentOpenCount.fetchAdd(1, moRelaxed)
+  true
+
 proc flushFragmentBatch*() =
   ## DSL-port M9.R.15f.1 — flush the in-flight batch buffer (if any)
   ## to the cached fragment file. Public so external code (close,
@@ -734,6 +785,9 @@ proc flushFragmentBatch*() =
   ## call is a no-op.
   if not fragmentSlot.isOpen or fragmentSlot.batchLen == 0:
     return
+  if not fragmentHandleIsCurrent() and not reopenFragmentHandle():
+    raiseEnvelopeError(eeMalformed,
+      "cannot recover externally replaced RMDF fragment handle")
   let bufLen = fragmentSlot.batchLen
   let written = fragmentSlot.file.writeBuffer(
     addr fragmentSlot.batchBuf[0], bufLen)
@@ -762,6 +816,8 @@ proc closeFragmentSlot*() =
   ## M9.R.15f.1 — flush any in-flight batch buffer before closing so
   ## the on-disk fragment includes every appended frame.
   if fragmentSlot.isOpen:
+    if not fragmentHandleIsCurrent() and not reopenFragmentHandle():
+      return
     try:
       flushFragmentBatch()
     except EnvelopeError, IOError, OSError:
@@ -1105,6 +1161,11 @@ proc openFragmentSlot(fragmentDir: string; osPid, threadId: uint64;
                       path: string): bool =
   if not open(fragmentSlot.file, extendedPath(path), fmAppend):
     return false
+  if not captureFragmentHandleIdentity():
+    try: close(fragmentSlot.file)
+    except IOError, OSError: discard
+    fragmentSlot.file = nil
+    return false
   if not slotFragmentDirAssign(fragmentSlot, fragmentDir):
     # fragmentDir overflows the fixed-size buffer — close and bail out;
     # the caller falls back to the no-cache (raise) path.
@@ -1163,6 +1224,11 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   if depQueueViewAttached and depQueueView.available:
     if depQueueView.tryPushRecord(record) == dpsPushed:
       return
+
+  if fragmentSlot.isOpen and not fragmentHandleIsCurrent() and
+      not reopenFragmentHandle():
+    raiseEnvelopeError(eeMalformed,
+      "cannot recover externally replaced RMDF fragment handle")
 
   let needsReopen = not fragmentSlot.isOpen or
     not slotFragmentDirEquals(fragmentSlot, fragmentDir) or
@@ -1965,6 +2031,20 @@ const
     ## reads and makes no completeness claim) is treated as untrusted, so the
     ## client's connect still downgrades.
 
+proc comparableReportPath(path: string): string =
+  ## Filesystem iteration uses extended paths on Windows, while monitor records
+  ## deliberately retain ordinary paths. Normalize both spellings before using
+  ## them as report-authentication identities.
+  when defined(windows):
+    var ordinary = path
+    if ordinary.startsWith("\\\\?\\UNC\\"):
+      ordinary = "\\\\" & ordinary[8 .. ^1]
+    elif ordinary.startsWith("\\\\?\\"):
+      ordinary = ordinary[4 .. ^1]
+    normalizedPath(absolutePath(ordinary)).toLowerAscii()
+  else:
+    path
+
 proc breakawayAuthContext*(records: openArray[MonitorRecord]):
     BreakawayAuthContext =
   ## ROUND-2 R8 — extract the report-authentication context from the merged
@@ -1982,6 +2062,7 @@ proc breakawayAuthContext*(records: openArray[MonitorRecord]):
     # backstop.
     if r.observationKind == moFileWrite and r.path.len > 0:
       result.inTreeOutputPaths.incl r.path
+      result.inTreeOutputPaths.incl comparableReportPath(r.path)
       let dev = detailToken(r.detail, "dev")
       let ino = detailToken(r.detail, "ino")
       if dev.len > 0 and ino.len > 0:
@@ -2018,6 +2099,8 @@ proc reportAuthoredInTree(reportPath: string;
   if auth.inTreeOutputPaths.len == 0 and auth.inTreeOutputInos.len == 0:
     return false
   if reportPath in auth.inTreeOutputPaths:
+    return true
+  if comparableReportPath(reportPath) in auth.inTreeOutputPaths:
     return true
   # Realpath the report so a /tmp vs /private/tmp (or symlink) spelling matches the
   # shim's F_GETPATH-canonical write record.

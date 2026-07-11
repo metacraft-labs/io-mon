@@ -33,6 +33,7 @@ const
   LinuxSysIoUringSetup = 425.clong
   LinuxSysIoUringEnter = 426.clong
   LinuxSysReadlink = 89.clong
+  LinuxSysGetcwd = 79.clong
   LinuxSysOpenat = 257.clong
   LinuxSysNewfstatat = 262.clong
   LinuxSysReadlinkat = 267.clong
@@ -1022,7 +1023,16 @@ proc pathForAt(dirfd: cint; path: cstring): string {.raises: [].} =
   if path == nil:
     return ""
   let raw = $path
-  if raw.len == 0 or raw.isAbsolute or dirfd == LinuxAtFdcwd:
+  if raw.len == 0 or raw.isAbsolute:
+    return raw
+  if dirfd == LinuxAtFdcwd:
+    var cwdBuf: array[4096, char]
+    let n = c_raw_syscall6(LinuxSysGetcwd,
+      cast[clong](addr cwdBuf[0]), clong(cwdBuf.len), 0, 0, 0, 0)
+    if n > 0:
+      let cwd = $cast[cstring](addr cwdBuf[0])
+      if cwd.len > 0:
+        return cwd / raw
     return raw
   let base = pathForFd(dirfd)
   if base.len == 0:
@@ -1167,13 +1177,15 @@ proc repro_monitor_shim_enable_current_thread*() {.exportc, dynlib, raises: [].}
 proc repro_monitor_shim_version*(): cstring {.exportc, dynlib, raises: [].} =
   "repro_monitor_shim_m11"
 
-proc recordOpen(path: cstring; flags, mode, fd: cint) {.raises: [].} =
-  updateFdPath(fd, path)
+proc recordOpen(path: cstring; flags, mode, fd: cint;
+                dirfd = LinuxAtFdcwd) {.raises: [].} =
+  let resolved = pathForAt(dirfd, path)
+  if resolved.len > 0:
+    updateFdPath(fd, cstring(resolved))
   var record = baseRecord(mrFileOpen, observationForOpen(flags))
   record.result = fd.int64
   record.flags = uint32(flags)
-  if path != nil:
-    record.path = $path
+  record.path = resolved
   emitRecord(record)
 
 proc repro_hook_open*(ctx: var OpenContext) {.raises: [].} =
@@ -1203,7 +1215,7 @@ proc repro_hook_openat*(ctx: var OpenatContext) {.raises: [].} =
   ensureInitializedPreservingErrno()
   callNext(ctx)
   let savedErrno = c_get_errno()
-  recordOpen(ctx.path, ctx.flags, ctx.mode, ctx.result)
+  recordOpen(ctx.path, ctx.flags, ctx.mode, ctx.result, ctx.dirfd)
   c_set_errno(savedErrno)
 
 proc repro_hook_openat64*(ctx: var OpenatContext) {.raises: [].} =
@@ -1213,7 +1225,7 @@ proc repro_hook_openat64*(ctx: var OpenatContext) {.raises: [].} =
   ensureInitializedPreservingErrno()
   callNext(ctx)
   let savedErrno = c_get_errno()
-  recordOpen(ctx.path, ctx.flags, ctx.mode, ctx.result)
+  recordOpen(ctx.path, ctx.flags, ctx.mode, ctx.result, ctx.dirfd)
   c_set_errno(savedErrno)
 
 proc recordFdRead(fd: cint; bytes: clong) {.raises: [].} =
@@ -1303,17 +1315,31 @@ proc repro_hook_close*(ctx: var CloseContext) {.raises: [].} =
   if shouldBypass():
     callNext(ctx)
     return
+  # Generated configure scripts routinely close every descriptor above
+  # stderr before creating command-substitution pipes. If one of those
+  # descriptors is our cached fragment FILE, letting the raw close proceed
+  # leaves FragmentSlot pointing at a descriptor number the shell can reuse.
+  # Subsequent monitor frames then enter the shell pipe instead of the fragment
+  # file. Close through the writer so it flushes and retires the slot first.
+  if ctx.fd == sigSafeSlotFd():
+    var closed = false
+    withShimMuted:
+      closeFragmentSlot()
+      closed = true
+    ctx.result = (if closed: 0.cint else: (-1).cint)
+    removeFdPath(ctx.fd)
+    return
   callNext(ctx)
   let savedErrno = c_get_errno()
   removeFdPath(ctx.fd)
   c_set_errno(savedErrno)
 
-proc emitProbe(path: cstring; callResult: cint) {.raises: [].} =
+proc emitProbe(path: cstring; callResult: cint;
+               dirfd = LinuxAtFdcwd) {.raises: [].} =
   var record = baseRecord(mrPathProbe, moPathProbe)
   record.result = callResult.int64
   record.probeResult = probeFromResult(callResult)
-  if path != nil:
-    record.path = $path
+  record.path = pathForAt(dirfd, path)
   emitRecord(record)
 
 proc cstringArg(value: clong): cstring {.inline, raises: [].} =
@@ -1578,13 +1604,13 @@ proc modeLooksReadable(mode: cstring): bool =
   result = false
 
 proc recordFopen(path, mode: cstring; stream: pointer) {.raises: [].} =
+  let resolved = pathForAt(LinuxAtFdcwd, path)
   if stream != nil:
-    updateStreamPath(stream, path)
+    updateStreamPath(stream, cstring(resolved))
   var record = baseRecord(mrFileOpen,
     if modeLooksReadable(mode): moFileOpen else: moFileWrite)
   record.result = cast[int64](stream)
-  if path != nil:
-    record.path = $path
+  record.path = resolved
   if mode != nil:
     record.detail = "stdio:" & $mode
   emitRecord(record)
@@ -1715,7 +1741,7 @@ proc recordPathRead(path, detail: string) {.raises: [].} =
 proc recordPathRead(path: cstring; detail: string) {.raises: [].} =
   if path == nil:
     return
-  recordPathRead($path, detail)
+  recordPathRead(pathForAt(LinuxAtFdcwd, path), detail)
 
 proc recordPathWrite(path, detail: string) {.raises: [].} =
   if path.len == 0:
@@ -1729,7 +1755,7 @@ proc recordPathWrite(path, detail: string) {.raises: [].} =
 proc recordPathWrite(path: cstring; detail: string) {.raises: [].} =
   if path == nil:
     return
-  recordPathWrite($path, detail)
+  recordPathWrite(pathForAt(LinuxAtFdcwd, path), detail)
 
 proc recordLinkMutation(resultCode: cint; oldPath, newPath: cstring;
                         detail: string) {.raises: [].} =

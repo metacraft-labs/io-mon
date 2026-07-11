@@ -1123,13 +1123,22 @@ long ct_linux_preload_syscall_replacement(long nr, long a1, long a2, long a3,
   return result;
 }
 
+static int ct_open_flags_need_mode(int flags) {
+  if ((flags & O_CREAT) != 0) return 1;
+#ifdef O_TMPFILE
+  if ((flags & O_TMPFILE) == O_TMPFILE) return 1;
+#endif
+  return 0;
+}
+
 static int ct_real_open_common(ct_open_real_fn *slot, const char *symbol,
                                char *path, int flags, int mode) {
   if (*slot == NULL) *slot = (ct_open_real_fn)ct_resolve(symbol);
   if (*slot == NULL && strcmp(symbol, "open64") == 0)
     *slot = (ct_open_real_fn)ct_resolve("open");
   if (*slot == NULL) { errno = ENOSYS; return -1; }
-  return (flags & O_CREAT) ? (*slot)(path, flags, mode) : (*slot)(path, flags);
+  return ct_open_flags_need_mode(flags) ? (*slot)(path, flags, mode) :
+                                          (*slot)(path, flags);
 }
 
 int ct_linux_preload_real_open(char *path, int flags, int mode) {
@@ -1146,8 +1155,8 @@ static int ct_real_openat_common(ct_openat_real_fn *slot, const char *symbol,
   if (*slot == NULL && strcmp(symbol, "openat64") == 0)
     *slot = (ct_openat_real_fn)ct_resolve("openat");
   if (*slot == NULL) { errno = ENOSYS; return -1; }
-  return (flags & O_CREAT) ? (*slot)(dirfd, path, flags, mode) :
-                             (*slot)(dirfd, path, flags);
+  return ct_open_flags_need_mode(flags) ? (*slot)(dirfd, path, flags, mode) :
+                                          (*slot)(dirfd, path, flags);
 }
 
 int ct_linux_preload_real_openat(int dirfd, char *path, int flags, int mode) {
@@ -1524,7 +1533,7 @@ ssize_t write(int fd, const void *buf, size_t count) {
 int open(const char *path, int flags, ...) __attribute__((visibility("default")));
 int open(const char *path, int flags, ...) {
   int mode = 0;
-  if (flags & O_CREAT) {
+  if (ct_open_flags_need_mode(flags)) {
     va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
   }
   if (CT_BYPASS() || ct_open_hook == NULL)
@@ -1535,7 +1544,7 @@ int open(const char *path, int flags, ...) {
 int open64(const char *path, int flags, ...) __attribute__((visibility("default")));
 int open64(const char *path, int flags, ...) {
   int mode = 0;
-  if (flags & O_CREAT) {
+  if (ct_open_flags_need_mode(flags)) {
     va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
   }
   if (CT_BYPASS() || ct_open64_hook == NULL)
@@ -1546,7 +1555,7 @@ int open64(const char *path, int flags, ...) {
 int openat(int dirfd, const char *path, int flags, ...) __attribute__((visibility("default")));
 int openat(int dirfd, const char *path, int flags, ...) {
   int mode = 0;
-  if (flags & O_CREAT) {
+  if (ct_open_flags_need_mode(flags)) {
     va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
   }
   if (CT_BYPASS() || ct_openat_hook == NULL)
@@ -1557,7 +1566,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
 int openat64(int dirfd, const char *path, int flags, ...) __attribute__((visibility("default")));
 int openat64(int dirfd, const char *path, int flags, ...) {
   int mode = 0;
-  if (flags & O_CREAT) {
+  if (ct_open_flags_need_mode(flags)) {
     va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
   }
   if (CT_BYPASS() || ct_openat64_hook == NULL)
