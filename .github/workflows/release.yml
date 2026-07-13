@@ -16,20 +16,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runs-on: incus
+          - runs-on: eph-linux-x64
             platform: linux-amd64
             is_windows: false
-          - runs-on: tart-linux-arm
+          - runs-on: eph-linux-arm64
             platform: linux-arm64
             is_windows: false
-          - runs-on: macos-tart
+          - runs-on: eph-macos-arm64
             platform: macos-arm64
             is_windows: false
-          - runs-on: macos-tart
+          - runs-on: eph-macos-arm64
             platform: macos-amd64
             is_windows: false
             cross_arch: amd64
-          - runs-on: win-ephemeral
+          - runs-on: eph-win-x64
             platform: windows-amd64
             is_windows: true
     steps:
@@ -107,7 +107,7 @@ jobs:
   release:
     name: Publish Github Release
     needs: build
-    runs-on: incus
+    runs-on: eph-linux-x64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
