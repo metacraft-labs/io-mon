@@ -222,7 +222,11 @@ when depQueueSupported:
       ## `ShmRing` (Layer 1); this wrapper adds ONLY the `MonitorRecord` codec.
       available*: bool
       isConsumer: bool
-      ring: shmring.ShmRing
+      ring: shmring.ShmRing[shmring.opDropSignalled]
+        ## Pinned to the drop-on-full policy: the dependency queue keeps its
+        ## historical `opDropSignalled` behaviour here (the lossless
+        ## `opBlockProducer` transport switch is io-mon-Lossless-Event-Capture
+        ## M3). `nim-shm-queue` made `ShmRing` generic over `OverflowPolicy`.
       path*: string
 
   proc depQueuePath*(dir, edgeKey: string): string =
@@ -287,10 +291,16 @@ when depQueueSupported:
     let recLen = encodeDepRecord(record, recBuf)
     if recLen < 0 or recLen > DepSlotRecCap:
       return dpsOversized
+    # NB: `prConsumerGone` is unreachable on this drop-on-full ring (the default
+    # `opDropSignalled` policy never blocks/waits, so it never reports a gone
+    # consumer); it is mapped to `dpsDropped` only to keep the `case` exhaustive
+    # after `nim-shm-queue` added the `opBlockProducer` policy status. The
+    # lossless block-producer path is io-mon-Lossless-Event-Capture M3.
     case q.ring.tryPush(recBuf.toOpenArray(0, recLen - 1))
     of prPushed: dpsPushed
     of prDropped: dpsDropped
     of prOversize: dpsOversized
+    of prConsumerGone: dpsDropped
 
   proc tryDrainOne*(q: var DepQueue; outRec: var MonitorRecord): bool =
     ## SINGLE-consumer non-blocking drain of the next ready ticket. Returns
