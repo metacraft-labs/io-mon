@@ -154,12 +154,19 @@ int main(int argc, char **argv) {
     check cons.droppedCount() == 0'u64
 
   test "t_dep_ring_and_fragment_fallback_merge_byte_identical":
-    # DEP-SHM-3 — HARD invariant. Run the SAME workload twice through the full
-    # `io-mon run` consumer: once with the ring active (some records ride the
-    # ring, some — forced by a tiny ring cap env — fall back to files), once with
-    # the ring disabled (pure file baseline). The normalised canonical merged
-    # depfile MUST be byte-identical.
-    let snoopBin = ensureSnoop(work)
+    # DEP-SHM-3 — HARD invariant for the DORMANT legacy ring path. Run the SAME
+    # workload twice against the live shim driven DIRECTLY: once with a DEP-SHM ring
+    # segment as REPRO_MONITOR_DEP_SHM (records ride the ring, drained FIFO and
+    # merged), once with no segment (pure file baseline). The normalised canonical
+    # merged depfile MUST be byte-identical.
+    #
+    # NB (M3 part 2a): `io-mon run` (fs_snoop) now defaults to the nim-shm-set
+    # transport, whose REAL dedup element-key intentionally drops `seq` and so is
+    # NOT byte-identical to the append-only file baseline — that LF-6-vs-file proof
+    # is REPLACED by the golden-depfile regression in test_io_mon_dep_set.nim. The
+    # ring, however, carries every record with its `seq` and drains in FIFO order,
+    # so it stays a byte-identical A/B fallback; this test exercises the ring path
+    # DIRECTLY (a non-`.shard0` segment) rather than through fs_snoop.
     let shimLib = ensureShim()
 
     const N = 24
@@ -185,24 +192,45 @@ int main(int argc, char **argv) {
 }
 """)
 
-    proc capture(tag: string; extra: openArray[(string, string)]): seq[byte] =
-      let depfile = work / ("bi-" & tag & ".rdep")
+    proc capture(tag: string; useRing: bool): seq[byte] =
+      let fragDir = work / ("bi-frags-" & tag)
+      createDir(fragDir)
+      let session = "bi-run-" & tag
+      var extra = @[
+        ("LD_PRELOAD", shimLib),
+        ("REPRO_MONITOR_FRAGMENT_DIR", fragDir),
+        ("REPRO_MONITOR_SESSION", session),
+      ]
+      var cons: DepQueue
+      if useRing:
+        let segPath = fragDir / "repro-dep-queue.bi"
+        cons = createDepQueueAtPath(segPath)
+        check cons.available
+        extra.add ("REPRO_MONITOR_DEP_SHM", segPath)
       let env = childEnvWith(shimLib, extra)
-      let cap = run(snoopBin,
-        @["run", "--depfile", depfile, "--", reader] & markers, env)
-      checkpoint(tag & ": " & cap.output)
-      check cap.code == 0
-      let dep = readMonitorDepFile(depfile)
+      let p = startProcess(reader, args = markers, env = env,
+        options = {poStdErrToStdOut, poUsePath})
+      let rootPid = uint64(p.processID)
+      let output = p.outputStream.readAll()
+      checkpoint(tag & ": " & output)
+      check p.waitForExit() == 0
+      p.close()
+      var drained: seq[MonitorRecord]
+      if useRing:
+        var rec: MonitorRecord
+        while cons.tryDrainOne(rec):
+          drained.add rec
+        cons.detach()
+      let depfile = work / ("bi-" & tag & ".rdep")
+      let dep = mergeFragments(fragDir, depfile, expectedRootPid = rootPid,
+        currentRunId = session, ringRecords = drained)
       check dep.completeness == mcComplete
       for m in markers:
         check hasFileRead(dep, m)
       normalizedCanonical(dep, work / "bi-marker-")
 
-    # Ring active (default). Some records ride the ring; any it cannot hold fall
-    # back to files — the merge folds both.
-    let ringBytes = capture("ring", @[])
-    # Pure file baseline.
-    let fileBytes = capture("file", @[("REPRO_MONITOR_DEP_SHM_DISABLE", "1")])
+    let ringBytes = capture("ring", useRing = true)
+    let fileBytes = capture("file", useRing = false)
     check ringBytes == fileBytes
 
   test "t_dep_ring_full_falls_back_loud":

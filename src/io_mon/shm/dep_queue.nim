@@ -108,18 +108,19 @@ proc getU64(buf: openArray[byte]; pos: var int): uint64 =
     result = result or (uint64(buf[pos + i]) shl (8 * i))
   pos += 8
 
-proc encodeDepRecord*(record: MonitorRecord; buf: var openArray[byte]): int =
-  ## Encode `record` into `buf`. Returns the byte length written, or -1 if the
-  ## record does not fit (the caller then falls back to the file path — the
-  ## queue is a fast path, not the only path). NO heap allocation: the caller
-  ## supplies a stack buffer, keeping this fork/orc-safe on the shim hot path.
+proc encodeDepRecordWithSeq(record: MonitorRecord; buf: var openArray[byte];
+                            seqValue: uint64): int =
+  ## Shared codec body used by `encodeDepRecord` (carries the record's real
+  ## `seq`) and `encodeDepRecordIdentity` (forces `seq = 0`). NO heap allocation:
+  ## the caller supplies a stack buffer, keeping this fork/orc-safe on the shim
+  ## hot path.
   var pos = 0
   let need = DepFixedHeaderLen
   if buf.len < need:
     return -1
   putU16(buf, pos, uint16(ord(record.kind)))
   putU16(buf, pos, uint16(ord(record.observationKind)))
-  putU64(buf, pos, record.seq)
+  putU64(buf, pos, seqValue)
   putU64(buf, pos, record.osPid)
   putU64(buf, pos, record.parentOsPid)
   putU64(buf, pos, record.threadId)
@@ -144,6 +145,50 @@ proc encodeDepRecord*(record: MonitorRecord; buf: var openArray[byte]): int =
       buf[pos + i] = byte(record.detail[i])
     pos += record.detail.len
   pos
+
+proc encodeDepRecord*(record: MonitorRecord; buf: var openArray[byte]): int =
+  ## Encode `record` into `buf` carrying its real `seq`. Returns the byte length
+  ## written, or -1 if the record does not fit. Used by the legacy DEP-SHM ring
+  ## (`tryPushRecord`) where every record is a distinct queue event.
+  encodeDepRecordWithSeq(record, buf, record.seq)
+
+proc encodeDepRecordIdentity*(record: MonitorRecord; buf: var openArray[byte]): int =
+  ## io-mon-Lossless-Event-Capture M3 (part 2a) — the DEDUP element-key encoder for
+  ## the nim-shm-set SET transport (the M1-winning Candidate-C channel). Identical
+  ## to `encodeDepRecord` EXCEPT the per-record monotonic `seq` is forced to 0, so
+  ## the encoded bytes are the record's *identity*, not its event ordinal.
+  ##
+  ## FIELD CLASSIFICATION for the set dedup key (see the milestone report). The key
+  ## must (a) collapse exact-duplicate probe-storm observations — "same path
+  ## re-stat'd -> one element", the real Candidate-C dedup — and (b) NEVER collapse
+  ## two semantically-distinct observations (the cardinal sin — a dropped dep):
+  ##
+  ##   IDENTITY (kept, part of the key — a difference here means a distinct
+  ##   observation): `kind`, `observationKind`, `osPid`, `parentOsPid`, `threadId`,
+  ##   `childOsPid`, `result`, `flags`, `probeResult`, `path`, `detail`. Keeping
+  ##   the full output-affecting tuple is the maximally-SAFE choice: it can only
+  ##   ever UNDER-dedup (keep a redundant duplicate), never DROP a distinct dep.
+  ##   `childOsPid`/`osPid`/`parentOsPid` are the load-bearing identity of the
+  ##   process-tree records (start/exec/spawn/ipc are counted per pid), and
+  ##   `probeResult`/`result`/`flags` carry semantically-distinct outcomes (a path
+  ##   that was ABSENT then EXISTS is a real state change; O_RDONLY vs O_WRONLY is a
+  ##   read-dep vs a write) that must never fold together.
+  ##
+  ##   DROPPED (excluded from the key — noise for the dependency): `seq` (this
+  ##   proc's whole point: the per-record monotonic ordinal is EXACTLY what
+  ##   distinguishes exact-duplicate storm EVENTS from each other; it is renumbered
+  ##   densely in the canonical depfile so its value never reaches the output, so
+  ##   dropping it is what ENABLES source-dedup). The part-1 8-byte incarnation
+  ##   nonce is also gone (replaced by the real exec-incarnation identity the caller
+  ##   appends — see `appendFragmentRecord`).
+  ##
+  ## `decodeDepRecord` reconstructs a `MonitorRecord` with `seq = 0` from this key
+  ## (plus ignores any trailing incarnation-identity bytes the caller appends), so
+  ## the consumer feeds the SAME `mergeFragments` canonicalization the file path
+  ## uses. Ordering determinism (two distinct keys that tie in `canonicalOrder`
+  ## because `seq` is 0) is restored by the consumer sorting the snapshot by raw
+  ## element bytes before decode (see fs_snoop).
+  encodeDepRecordWithSeq(record, buf, 0'u64)
 
 proc decodeDepRecord*(buf: openArray[byte]; ok: var bool): MonitorRecord =
   ## Decode a record produced by `encodeDepRecord`. `ok` is false on any

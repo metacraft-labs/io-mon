@@ -262,44 +262,57 @@ var
   # re-attaches from the child's atfork handler.
   depQueueView: DepQueue
   depQueueViewAttached = false
-  # io-mon-Lossless-Event-Capture M3 (part 1) — the process-global producer view
-  # of the edge's shared-memory SET (nim-shm-set), the NEW PRIMARY dependency
-  # transport. Attached by `attachDepQueueForShim` when REPRO_MONITOR_DEP_SHM
-  # names a `.shard0` path (a set) rather than a ring segment. `appendFragmentRecord`
-  # publishes each record here first (idempotent insert, serialization-free / no
-  # heap on the hot path — fork/orc-safe); a record durably in the consumer-owned
-  # set does NOT travel the file path. Any non-durable status (unattached /
-  # consumer-gone / oversize / saturated) FALLS THROUGH to the `.rmdf-frag` file
-  # writer, which stays the correctness FALLBACK for part 1.
-  # TODO(M3 part 2): per LF-2/LF-7, make an unattached-or-consumer-gone set a HARD
-  # `mcIncomplete` (never a file spill) and delete the file fallback + DEP-FLUSH.
+  # io-mon-Lossless-Event-Capture M3 — the process-global producer view of the
+  # edge's shared-memory SET (nim-shm-set), the PRIMARY dependency transport.
+  # Attached by `attachDepQueueForShim` when REPRO_MONITOR_DEP_SHM names a
+  # `.shard0` path (a set) rather than a legacy ring segment.
+  #
+  # M3 part 2a — LF-7 + LF-2. `appendFragmentRecord` publishes each record here
+  # UNBUFFERED and returns; a durable insert (`emInserted`/`emExists`) does NOT
+  # travel the file path. On the ACTIVE set path (any `.shard0` REPRO_MONITOR_DEP_SHM,
+  # even one that failed to map) the producer NEVER spills to a `.rmdf-frag` file
+  # (LF-2): a capture that cannot be published is surfaced as `mcIncomplete` (a
+  # loss-marker element for oversize, the SIGNALLED `growthFailures` counter for
+  # OOM saturation, or — when the shim could not attach at all — the absence of the
+  # root process-start that the consumer's root-spawn guard downgrades on). The
+  # dormant `.rmdf-frag` writer + DEP-FLUSH machinery below stay COMPILED but are
+  # reachable only via the legacy ring path or REPRO_MONITOR_DEP_SHM_DISABLE (the
+  # golden pure-file baseline). Their deletion is part 2b.
   setProducer: shmset.SetProducer
   setProducerAttached = false
-  # io-mon-Lossless-Event-Capture M3 (part 1) — a per-process-INCARNATION
-  # uniqueness tag appended to every SET element. `seq` (processSeq) is unique per
-  # record WITHIN an incarnation but RESETS across `exec` (a fresh image re-inits
-  # the shim from scratch), so the pre-exec and post-exec `process-start` of the
-  # SAME pid would otherwise encode to IDENTICAL bytes and the grow-only G-Set
-  # would idempotently DEDUP the second — dropping a real record and diverging
-  # from the append-only file baseline that keeps BOTH (the completeness check
-  # counts `starts` per pid to match `exec`s). This 8-byte tag, regenerated on
-  # every attach (init / post-exec / post-fork), makes each incarnation's elements
-  # distinct, so the SET is a faithful LOSSLESS carrier for part 1. (True
-  # source-dedup on the observation tuple — collapsing probe storms — is a part-2
-  # / LF-7 concern and is NOT required for the byte-identical-depfile invariant.)
-  setElemNonce: uint64
-  # Process-global monotonic sequence mixed into the incarnation tag so two
-  # attaches that read the same coarse clock tick still differ.
-  gSetNonceSeq: Atomic[uint64]
+  # M3 part 2a — the per-process-INCARNATION identity appended to every SET element:
+  # the process's real on-disk image path (`/proc/self/exe`, set by the shim via
+  # `setDepSetIncarnationImage` at init and re-captured after every exec). This is
+  # the REAL exec identity, NOT a synthetic nonce. It exists to keep the pre-exec
+  # and post-exec `process-start` of ONE pid distinct: those two records are
+  # byte-identical (both reset `seq` to 1, same pid/ppid/tid, empty path), so the
+  # identity element-key alone would DEDUP the second and break the completeness
+  # invariant `startCount == 1 + execCount` — the exec-collision part 1 patched with
+  # a random tag. Because the image is per-INCARNATION-constant, a probe storm
+  # WITHIN one incarnation still collapses (Candidate-C source-dedup), while a
+  # DIFFERENT exec'd image yields a distinct element. It is NOT part of the decoded
+  # `MonitorRecord` (`decodeDepRecord` ignores the trailing bytes). KNOWN residual:
+  # a pid that re-execs the SAME image path more than once collapses those identical
+  # process-starts and over-downgrades to a conservative `mcIncomplete` (a safe
+  # over-conservative re-run, never a dropped dependency / false `mcComplete`);
+  # fully-precise handling needs an exec-generation counter threaded through the
+  # child env and is deferred.
+  setElemImage: string
+  # M3 part 2a — a pre-encoded event-loss SET element (built once at attach, so the
+  # rare oversize/hard-fail path allocates nothing): inserted when a real record
+  # cannot be framed for the set, so the consumer's merge sees `mrEventLoss` and
+  # downgrades the edge to `mcIncomplete` (LF-2), never a silent drop.
+  setLossElem: array[DepFixedHeaderLen + 64, byte]
+  setLossElemLen = 0
   # LEAK-GUARD — process-global per-fragment on-disk byte cap. Resolved ONCE
   # from IO_MON_FRAGMENT_MAX_BYTES on the first fragment open (never from a
   # signal handler) or forced by `setFragmentByteCap`.
   fragmentByteCap: int64 = FragmentMaxBytesDefault
   fragmentByteCapResolved = false
 
-# A generous stack buffer for `encodeDepRecord` on the insert hot path — no heap.
-# A record whose encoding exceeds it (a pathological path+detail) simply falls
-# through to the file path for part 1.
+# A generous stack buffer for `encodeDepRecordIdentity` + the incarnation-image
+# suffix on the insert hot path — no heap. A record whose encoding exceeds it (a
+# pathological path+detail) is surfaced as a loss element (LF-2), never a file spill.
 const SetProducerBufBytes = 16384
 
 proc resolveFragmentByteCap() =
@@ -336,6 +349,41 @@ proc fragmentSlotIsOverCap*(): bool =
   ## reads false in the same state.
   fragmentSlot.overCap
 
+proc rebuildDepSetLossElem() =
+  ## M3 part 2a (LF-2) — pre-encode the event-loss SET element ONCE per attach so
+  ## the hot oversize/hard-fail path allocates nothing. The element is a compact
+  ## `mrEventLoss` identity record plus the incarnation-image suffix; when a real
+  ## record cannot be framed for the set, the producer inserts this so the
+  ## consumer's merge downgrades the edge to `mcIncomplete` (never a silent drop).
+  let lossRec = MonitorRecord(kind: mrEventLoss, observationKind: moEventLoss,
+    detail: "dep-set-capture-loss")
+  var buf {.noinit.}: array[DepFixedHeaderLen + 64, byte]
+  let n = encodeDepRecordIdentity(lossRec, buf)
+  setLossElemLen = 0
+  if n < 0: return
+  # Fold in only as much of the incarnation image as still fits the loss buffer;
+  # the loss marker's exactness does not matter (any distinct mrEventLoss element
+  # forces mcIncomplete), so a truncated suffix is harmless.
+  var total = n
+  var i = 0
+  while i < setElemImage.len and total < setLossElem.len:
+    buf[total] = byte(setElemImage[i]); inc total; inc i
+  for k in 0 ..< total:
+    setLossElem[k] = buf[k]
+  setLossElemLen = total
+
+proc setDepSetIncarnationImage*(image: string) =
+  ## M3 part 2a — record THIS incarnation's real on-disk image path
+  ## (`/proc/self/exe`), the per-incarnation identity appended to every SET
+  ## element key (see `setElemImage`). Called by the shim at init and after every
+  ## exec (the constructor re-runs), BEFORE the incarnation's process-start is
+  ## emitted, so the pre/post-exec process-starts land as DISTINCT set elements
+  ## without any synthetic tag. Rebuilds the pre-encoded loss element to carry the
+  ## fresh image suffix.
+  setElemImage = image
+  if setProducerAttached:
+    rebuildDepSetLossElem()
+
 proc attachDepQueueForShim*(segmentPath: string) =
   ## DEP-SHM-2 — attach the calling PROCESS to the edge's dep-queue segment at
   ## `segmentPath` (the value of `REPRO_MONITOR_DEP_SHM`). Called from
@@ -357,12 +405,7 @@ proc attachDepQueueForShim*(segmentPath: string) =
       return
     setProducer = shmset.attachProducer(segmentPath)
     setProducerAttached = true
-    # Fresh incarnation tag (distinct across exec/fork — see `setElemNonce`). The
-    # monotonic clock advances system-wide across exec, so a post-exec re-attach
-    # of the SAME pid reads a strictly later value than the pre-exec one.
-    let bump = gSetNonceSeq.fetchAdd(1'u64) + 1'u64
-    setElemNonce = uint64(getMonoTime().ticks) xor
-      (uint64(getCurrentProcessId()) shl 1) xor (bump * 1099511628211'u64)
+    rebuildDepSetLossElem()
     return
   if depQueueViewAttached and depQueueView.available:
     return
@@ -1417,34 +1460,60 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   # the file-only baseline regardless of which channel it took (DEP-SHM-3). No
   # heap allocation on this path (fork/orc-safe): `tryPushRecord` encodes into a
   # stack buffer.
-  # io-mon-Lossless-Event-Capture M3 (part 1) — PRIMARY fast path is the SET
-  # transport (nim-shm-set). Encode the record with dep_queue's `encodeDepRecord`
-  # into a STACK buffer (no heap — fork/orc-safe), then `emit` the opaque bytes.
-  # `emInserted`/`emExists` both mean the record is durable in consumer-owned
-  # memory (LF-3: survives a producer SIGKILL after publish, no flush/fsync), so
-  # it does NOT travel the file path. Any other status — unattached, consumer
-  # gone, oversize, or OOM-saturated — falls through to the `.rmdf-frag` writer,
-  # the correctness FALLBACK retained for part 1.
-  # TODO(M3 part 2): make consumer-gone/unattached a HARD `mcIncomplete` (LF-2),
-  # delete the file fallback + DEP-FLUSH, and drop the read-tail netting (LF-7).
-  if setProducerAttached and setProducer.available:
-    var recBuf {.noinit.}: array[SetProducerBufBytes, byte]
-    let recLen = encodeDepRecord(record, recBuf)
-    if recLen >= 0 and recLen + 8 <= SetProducerBufBytes:
-      # Append the 8-byte incarnation tag so the element is a globally-unique
-      # LOSSLESS carrier (see `setElemNonce`). `decodeDepRecord` reads only the
-      # record's own fields and ignores these trailing bytes, so a decoded
-      # element is byte-for-byte the same `MonitorRecord` the file path carries.
-      var tag = setElemNonce
-      for i in 0 ..< 8:
-        recBuf[recLen + i] = byte(tag and 0xFF)
-        tag = tag shr 8
-      case setProducer.emit(recBuf.toOpenArray(0, recLen + 8 - 1))
-      of emInserted, emExists:
-        return
-      else:
-        discard   # fall through to the file fallback (part 1)
+  # io-mon-Lossless-Event-Capture M3 part 2a — PRIMARY path is the SET transport
+  # (nim-shm-set, the M1-winning Candidate-C channel).
+  #
+  # LF-7 (unbuffered publish-before-return): encode the record's DEDUP element-key
+  # with `encodeDepRecordIdentity` (drops `seq`, so exact-duplicate probe storms
+  # collapse) into a STACK buffer (no heap — fork/orc-safe), append this
+  # incarnation's real image path (`setElemImage`, the per-exec identity that keeps
+  # the pre/post-exec process-starts distinct without any synthetic tag), then
+  # `emit` the opaque bytes with a SINGLE idempotent insert. No batch, no flush:
+  # the hook has already run the syscall but returns the result to the process only
+  # AFTER this publish, so the dependency is recorded before the observed data is
+  # handed back.
+  #
+  # LF-2 (unattached ⇒ hard fail, NO file spill): once we are on the active set
+  # path (`setProducerAttached` — REPRO_MONITOR_DEP_SHM named a `.shard0`), a record
+  # NEVER falls through to the `.rmdf-frag` writer. A durable insert returns; any
+  # capture failure is surfaced as `mcIncomplete` instead of a silent file spill:
+  #   * emInserted/emExists  — durable in consumer-owned memory (LF-3). Return.
+  #   * emSaturated          — OOM growth failure, SIGNALLED via `growthFailures()`;
+  #                            the consumer reads it and downgrades. Return.
+  #   * emConsumerGone       — the consumer marked itself gone (run teardown / the
+  #                            orphan class, LF-4). The run's depfile is already
+  #                            written; drop, bounded. Return.
+  #   * emOversize/emUnavailable, or an unframable record — insert the pre-encoded
+  #                            loss element so the merge sees `mrEventLoss` and
+  #                            downgrades. Return.
+  # If the set was named but could not be MAPPED (`not setProducer.available`), the
+  # shim emitted nothing at all — including no root process-start — and the
+  # consumer's root-spawn completeness guard downgrades the edge. Still no file.
+  if setProducerAttached:
+    if setProducer.available:
+      var recBuf {.noinit.}: array[SetProducerBufBytes, byte]
+      let recLen = encodeDepRecordIdentity(record, recBuf)
+      if recLen >= 0 and recLen + setElemImage.len <= SetProducerBufBytes:
+        # `decodeDepRecord` reads only the record's own fields (seq reconstructs as
+        # 0) and IGNORES these trailing image bytes, so a decoded element is a
+        # faithful MonitorRecord for the merge.
+        var total = recLen
+        for i in 0 ..< setElemImage.len:
+          recBuf[total] = byte(setElemImage[i]); inc total
+        case setProducer.emit(recBuf.toOpenArray(0, total - 1))
+        of emInserted, emExists, emSaturated, emConsumerGone:
+          return
+        of emOversize, emUnavailable:
+          discard   # signal loss below
+      # Unframable (path+detail too large) or a non-durable emit status: surface a
+      # loss element so the edge is honestly `mcIncomplete` (LF-2), never a spill.
+      if setLossElemLen > 0:
+        discard setProducer.emit(setLossElem.toOpenArray(0, setLossElemLen - 1))
+    # Active set path: do NOT fall through to the dormant file writer (LF-2).
+    return
   elif depQueueViewAttached and depQueueView.available:
+    # DORMANT legacy DEP-SHM ring (drop-on-full): a non-`.shard0` segment. Retained
+    # for the ring integration tests; still uses the file writer as its fallback.
     if depQueueView.tryPushRecord(record) == dpsPushed:
       return
 

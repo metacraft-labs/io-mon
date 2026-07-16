@@ -14,7 +14,7 @@ import shm_set as shmset_core
 import shm_set/transport as shmset
 
 when defined(linux):
-  import std/[monotimes, sequtils]
+  import std/[algorithm, monotimes, sequtils]
 
   const
     LinuxInjectedDescendantGraceMsDefault = 500
@@ -761,15 +761,28 @@ proc runMonitoredCommand(request: FsSnoopRequest): int =
     close(process)
 
     waitForLinuxInjectedDescendants(fragmentDir, runId, rootPid)
-    # io-mon-Lossless-Event-Capture M3 (part 1) — SINGLE-THREADED final merge: the
-    # DEP-FLUSH shutdown guarantees every producer published its last record, so
-    # snapshot the union of all shards and decode each element back to a
-    # `MonitorRecord`. These are folded into the SAME `ringRecords` argument the
-    # ring path used, so `mergeFragments` treats a set-borne record identically to
-    # a file/ring one — the LF-6 byte-identical-depfile invariant.
+    # io-mon-Lossless-Event-Capture M3 part 2a — SINGLE-THREADED final merge over
+    # the SET's DISTINCT elements. The DEP-FLUSH shutdown guarantees every producer
+    # published its last record, so snapshot the deduped union of all shards and
+    # decode each element (identity element-key + trailing incarnation-image bytes)
+    # back to a `MonitorRecord` (seq reconstructs as 0). These fold into the SAME
+    # `ringRecords` argument the ring path used.
+    #
+    # DETERMINISM: `snapshot` yields elements in hash-slot order (non-deterministic
+    # across runs), and two DISTINCT elements can tie in `canonicalOrder` because
+    # the identity key drops `seq` (decoded to 0). Sort the raw distinct elements —
+    # a total order, since they are unique — BEFORE decoding, so the stable
+    # canonical sort in `writeCanonicalInPlace` breaks those ties deterministically
+    # and the depfile is byte-reproducible (the golden-regression invariant).
     var depDrained: seq[MonitorRecord] = @[]
     if depSet.available:
-      for elem in depSet.snapshot():
+      var elems = depSet.snapshot()
+      elems.sort(proc (a, b: seq[byte]): int =
+        let m = min(a.len, b.len)
+        for i in 0 ..< m:
+          if a[i] != b[i]: return cmp(a[i], b[i])
+        cmp(a.len, b.len))
+      for elem in elems:
         var ok = false
         let rec = decodeDepRecord(elem, ok)
         if ok:

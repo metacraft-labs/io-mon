@@ -208,6 +208,24 @@ int repro_linux_fd_proc_path(int fd, void *raw_buf, unsigned long len) {
   return 1;
 }
 
+/* io-mon-Lossless-Event-Capture M3 part 2a — read THIS incarnation's real
+ * on-disk image via a raw readlink("/proc/self/exe"). Used as the per-exec
+ * identity appended to every SET dep element so the pre/post-exec process-start
+ * of one pid stays distinct without a synthetic tag. Raw syscall (no libc, no
+ * hooked call) keeps it re-entrancy-safe at constructor time. Returns the byte
+ * length written (0 on failure). */
+int repro_linux_self_exe_path(void *raw_buf, unsigned long len) {
+  char *buf = (char *)raw_buf;
+  if (len == 0)
+    return 0;
+  long n = stackable_linux_raw_syscall6(SYS_readlink, (long)"/proc/self/exe",
+                                        (long)buf, (long)(len - 1),
+                                        0, 0, 0);
+  if (n <= 0)
+    return 0;
+  return (int)n;
+}
+
 extern int repro_monitor_shim_init(char *configPath);
 extern int repro_monitor_shim_shutdown(void);
 
@@ -579,6 +597,8 @@ proc c_fd_identity_kind(fd: cint; dev, ino: ptr uint64; kind: ptr cint): cint
   {.importc: "repro_linux_fd_identity_kind", raises: [].}
 proc c_fd_proc_path(fd: cint; buf: pointer; len: csize_t): cint
   {.importc: "repro_linux_fd_proc_path", raises: [].}
+proc c_self_exe_path(buf: pointer; len: csize_t): cint
+  {.importc: "repro_linux_self_exe_path", raises: [].}
 proc c_raw_syscall6(nr, a1, a2, a3, a4, a5, a6: clong): clong
   {.importc: "stackable_linux_raw_syscall6", cdecl, raises: [].}
 
@@ -1097,6 +1117,19 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     depShmPath = getEnv("REPRO_MONITOR_DEP_SHM")
     if depShmPath.len > 0:
       attachDepQueueForShim(depShmPath)
+    # io-mon-Lossless-Event-Capture M3 part 2a — capture THIS incarnation's real
+    # image (`/proc/self/exe`) and hand it to the writer as the per-exec identity
+    # appended to every SET dep element. The constructor re-runs on every exec, so
+    # a post-exec incarnation gets its NEW image here BEFORE its process-start is
+    # emitted — keeping the pre/post-exec process-starts distinct set elements with
+    # no synthetic tag (LF-2/LF-7 real dedup element-key).
+    block:
+      var exeBuf: array[4096, char]
+      let n = c_self_exe_path(addr exeBuf[0], csize_t(exeBuf.len))
+      if n > 0:
+        var img = newString(n)
+        for i in 0 ..< n: img[i] = exeBuf[i]
+        setDepSetIncarnationImage(img)
     rememberInheritedOpenFds()
   initialized = true
   mainThreadId = currentThreadId()
