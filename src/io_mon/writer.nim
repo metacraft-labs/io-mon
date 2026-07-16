@@ -74,6 +74,23 @@ const
   FragmentBatchBufLen = 64 * 1024
   FragmentBatchMaxAgeNs = 100_000_000'i64  # 100 ms
   BatchStalenessProbeInterval = 64        # check time every 64 emits
+  FragmentMaxBytesDefault = 2'i64 * 1024 * 1024 * 1024  # 2 GiB
+    ## LEAK-GUARD — default hard cap on the on-disk size of a SINGLE
+    ## (osPid, threadId) `.rmdf-frag` file. The batch buffer above bounds only
+    ## the in-MEMORY tail; nothing bounded the FILE, so a monitored process that
+    ## OUTLIVES its monitor (a daemon the launcher gave up waiting for — see
+    ## `fs_snoop.waitForLinuxInjectedDescendants`, whose grace-period timeout
+    ## then removes the fragment dir) kept appending to its cached fd forever.
+    ## With the dir gone the fragment inode is UNLINKED but still open, so the
+    ## blocks are never reclaimed while the daemon lives — the live-workstation
+    ## incident grew ONE such fragment to ~61 GiB and filled the tmpfs. Once a
+    ## fragment reaches this cap the producer writes a single event-loss marker
+    ## (`mergeFragments` ⇒ `mcIncomplete`, the fail-incomplete contract) and
+    ## CLOSES the fd (releasing a deleted inode's blocks); further records for
+    ## that producer thread are dropped rather than reopened. The file path is
+    ## only the FALLBACK for the shared-memory dep queue, so a well-behaved run
+    ## never approaches this. Overridable per process via
+    ## `IO_MON_FRAGMENT_MAX_BYTES` (bytes) or `setFragmentByteCap` (tests).
   SigSafeCommittedBufLen* = 256
     ## M9.R.62.2 — max bytes of the pre-encoded async-signal-safe
     ## `read-tail-committed` marker frame stored per fragment slot. The
@@ -114,6 +131,13 @@ const
     ## ROUND-5 F — the durability-confirming counterpart of ReadTailPendingDetail;
     ## written directly to the fragment (and flushed) AFTER a batch flush makes the
     ## buffered reads durable. See ReadTailPendingDetail.
+  FragmentCapReachedDetail* = "fragment-byte-cap-reached "
+    ## LEAK-GUARD — detail prefix of the event-loss marker written when a fragment
+    ## reaches `FragmentMaxBytesDefault`/`fragmentByteCap`. It deliberately does
+    ## NOT start with `ReadTailPendingDetail`/`ReadTailCommittedDetail`, so the
+    ## read-tail netting in `mergeFragments` leaves it in the record set as a REAL
+    ## `mrEventLoss`, forcing `mcIncomplete` (fail-incomplete): the capped run is
+    ## honestly reported as needing a re-run rather than a false `mcComplete`.
 
 type
   FragmentSlot = object
@@ -182,6 +206,17 @@ type
     # threadvar). Storing the index (not a pointer) keeps the unregister
     # path O(1) and the threadvar free of any Nim runtime heap pointer.
     registryIndex: int
+    # LEAK-GUARD — running total of bytes this thread has written to the CURRENT
+    # (osPid, threadId) fragment file. `openFragmentSlot` resets it to 0; each
+    # successful flush / giant-frame write adds the bytes committed. Once it
+    # reaches `fragmentByteCap` the slot is retired (fd closed, `overCap` set).
+    fragmentBytes: int64
+    # LEAK-GUARD — true once this fragment hit the byte cap and its fd was
+    # closed. While set (for the SAME osPid/threadId/fragmentDir) further
+    # `appendFragmentRecord` calls are DROPPED instead of reopening the fragment
+    # and resuming unbounded growth. A key change (fork child, new thread id)
+    # opens a fresh slot via `openFragmentSlot`, which clears this.
+    overCap: bool
     batchBuf: array[FragmentBatchBufLen, byte]
 
 const
@@ -220,6 +255,45 @@ var
   # re-attaches from the child's atfork handler.
   depQueueView: DepQueue
   depQueueViewAttached = false
+  # LEAK-GUARD — process-global per-fragment on-disk byte cap. Resolved ONCE
+  # from IO_MON_FRAGMENT_MAX_BYTES on the first fragment open (never from a
+  # signal handler) or forced by `setFragmentByteCap`.
+  fragmentByteCap: int64 = FragmentMaxBytesDefault
+  fragmentByteCapResolved = false
+
+proc resolveFragmentByteCap() =
+  ## LEAK-GUARD — resolve the per-fragment byte cap ONCE per process from
+  ## `IO_MON_FRAGMENT_MAX_BYTES` (a positive byte count; absent / <= 0 /
+  ## unparseable ⇒ the built-in default). Called on the first fragment open, so
+  ## never from signal context.
+  if fragmentByteCapResolved:
+    return
+  fragmentByteCapResolved = true
+  let raw = getEnv("IO_MON_FRAGMENT_MAX_BYTES")
+  if raw.len > 0:
+    try:
+      let n = parseBiggestInt(raw)
+      if n > 0: fragmentByteCap = int64(n)
+    except ValueError:
+      discard
+
+proc setFragmentByteCap*(n: int64) =
+  ## LEAK-GUARD — override the per-fragment on-disk byte cap. `n <= 0` restores
+  ## the built-in default. Public so regression tests can exercise the cap
+  ## without writing gigabytes; also marks the cap resolved so a later open does
+  ## not clobber it from the environment.
+  fragmentByteCap = if n > 0: n else: FragmentMaxBytesDefault
+  fragmentByteCapResolved = true
+
+proc fragmentByteCapValue*(): int64 =
+  ## Test/introspection — the currently-effective per-fragment byte cap.
+  fragmentByteCap
+
+proc fragmentSlotIsOverCap*(): bool =
+  ## Test/introspection — true once the calling thread's fragment hit the byte
+  ## cap and its fd was closed (LEAK-GUARD retirement). `sigSafeSlotIsOpen`
+  ## reads false in the same state.
+  fragmentSlot.overCap
 
 proc attachDepQueueForShim*(segmentPath: string) =
   ## DEP-SHM-2 — attach the calling PROCESS to the edge's dep-queue segment at
@@ -777,6 +851,43 @@ proc reopenFragmentHandle(): bool {.raises: [].} =
   discard fragmentOpenCount.fetchAdd(1, moRelaxed)
   true
 
+proc accountFragmentBytes(written: int) =
+  ## LEAK-GUARD — record `written` on-disk bytes against the calling thread's
+  ## current fragment and, once the running total reaches `fragmentByteCap`,
+  ## RETIRE the fragment: write a single event-loss marker so `mergeFragments`
+  ## downgrades the run to `mcIncomplete` (fail-incomplete), then CLOSE the fd.
+  ##
+  ## Closing the fd is the load-bearing half of the fix: if the launcher already
+  ## removed the fragment dir (the daemon-outlives-monitor case), the fragment
+  ## inode is unlinked and only this fd keeps its blocks alive; closing releases
+  ## them and stops all further growth. The slot keeps its
+  ## (osPid, threadId, fragmentDir) key plus `overCap`, so `appendFragmentRecord`
+  ## drops later records for this producer thread instead of reopening and
+  ## resuming unbounded growth. A different key (fork child / new thread) opens a
+  ## fresh, uncapped fragment via `openFragmentSlot`.
+  if fragmentSlot.overCap or not fragmentSlot.isOpen:
+    return
+  fragmentSlot.fragmentBytes += int64(written)
+  if fragmentSlot.fragmentBytes < fragmentByteCap:
+    return
+  # Cap reached — mark the run incomplete through the already-open fd (a dir
+  # chmod / removal cannot block it), then retire the fd.
+  writeReadTailMarker(FragmentCapReachedDetail)
+  fragmentSlot.overCap = true
+  clearReadingSentinel()
+  try:
+    close(fragmentSlot.file)
+  except IOError, OSError:
+    discard
+  fragmentSlot.isOpen = false
+  fragmentSlot.batchLen = 0
+  fragmentSlot.batchOpenedAtNs = 0
+  fragmentSlot.batchProbeCountdown = 0
+  fragmentSlot.readingSentinelActive = false
+  # Leave osPid/threadId/fragmentDir set so the drop guard in
+  # `appendFragmentRecord` recognises this retired producer key.
+  unregisterFragmentSlot()
+
 proc flushFragmentBatch*() =
   ## DSL-port M9.R.15f.1 — flush the in-flight batch buffer (if any)
   ## to the cached fragment file. Public so external code (close,
@@ -809,6 +920,9 @@ proc flushFragmentBatch*() =
   # ROUND-2 R5 — the buffered tail is now on disk; the kill-before-flush window
   # is closed for this batch, so retire the sentinel.
   clearReadingSentinel()
+  # LEAK-GUARD — account the just-committed bytes; retires the fragment (closes
+  # the fd, drops further records) once it reaches `fragmentByteCap`.
+  accountFragmentBytes(bufLen)
 
 proc closeFragmentSlot*() =
   ## Force the calling thread's cached fragment-log handle (if any) to
@@ -838,6 +952,9 @@ proc closeFragmentSlot*() =
     fragmentSlot.batchOpenedAtNs = 0
     fragmentSlot.batchProbeCountdown = 0
     fragmentSlot.readingSentinelActive = false
+    # LEAK-GUARD — a normal close clears the cap bookkeeping too.
+    fragmentSlot.fragmentBytes = 0
+    fragmentSlot.overCap = false
     # DEP-FLUSH-1 — leave the registry; the slot is now closed.
     unregisterFragmentSlot()
 
@@ -863,6 +980,10 @@ proc discardFragmentSlotAfterFork*() =
   fragmentSlot.batchLen = 0
   fragmentSlot.batchOpenedAtNs = 0
   fragmentSlot.batchProbeCountdown = 0
+  # LEAK-GUARD — the child gets a clean byte budget under its own identity; a
+  # parent that hit the cap must not leave the child stuck dropping records.
+  fragmentSlot.fragmentBytes = 0
+  fragmentSlot.overCap = false
   # ROUND-5 F (post-fork sentinel-state hygiene) — the child inherits the
   # parent's `readingSentinelActive` value via copy-on-write. Without
   # resetting it here, the child's first `markReadingSentinel` bails on
@@ -1179,6 +1300,11 @@ proc openFragmentSlot(fragmentDir: string; osPid, threadId: uint64;
   fragmentSlot.batchOpenedAtNs = 0
   fragmentSlot.batchProbeCountdown = 0
   fragmentSlot.readingSentinelActive = false
+  # LEAK-GUARD — a fresh fragment starts with a clean byte budget and no
+  # cap-retirement carried over from a previous (osPid, threadId).
+  resolveFragmentByteCap()
+  fragmentSlot.fragmentBytes = 0
+  fragmentSlot.overCap = false
   precomputeSigSafeCommittedFrame(fragmentSlot)
   # DEP-FLUSH-1 — join the process-global registry so a shutdown sweep on
   # ANY thread can reach this batch. No-op after the first open per thread.
@@ -1224,6 +1350,17 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   if depQueueViewAttached and depQueueView.available:
     if depQueueView.tryPushRecord(record) == dpsPushed:
       return
+
+  # LEAK-GUARD — this producer thread already blew the per-fragment byte cap for
+  # THIS (osPid, threadId, fragmentDir); its fd is closed. Drop the record rather
+  # than reopen the fragment and resume unbounded growth (the run is already
+  # flagged incomplete by the cap marker). A DIFFERENT key (fork child / new
+  # thread) falls through and opens a fresh, uncapped fragment below.
+  if fragmentSlot.overCap and
+      slotFragmentDirEquals(fragmentSlot, fragmentDir) and
+      fragmentSlot.osPid == record.osPid and
+      fragmentSlot.threadId == record.threadId:
+    return
 
   if fragmentSlot.isOpen and not fragmentHandleIsCurrent() and
       not reopenFragmentHandle():
@@ -1281,6 +1418,8 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
     flushFile(fragmentSlot.file)
     discard fragmentWriteCount.fetchAdd(1, moRelaxed)
     discard fragmentFlushCount.fetchAdd(1, moRelaxed)
+    # LEAK-GUARD — a single oversize frame counts toward the cap too.
+    accountFragmentBytes(frame.len)
     return
 
   if fragmentSlot.batchLen + frameLen > FragmentBatchBufLen:
