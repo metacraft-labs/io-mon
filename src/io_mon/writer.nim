@@ -252,16 +252,6 @@ var
   registryLockReady = false
   registrySlots: array[MaxFragmentSlots, ptr FragmentSlot]
   registryCount: int
-  # DEP-SHM-2 — the process-global producer view of the edge's shared-memory
-  # dependency queue. Attached once by the shim (`attachDepQueueForShim`, driven
-  # by `REPRO_MONITOR_DEP_SHM`). `appendFragmentRecord` publishes each record to
-  # this ring as the FAST PATH; on any non-`dpsPushed` status (ring full,
-  # oversize path, or the queue was never attached) it FALLS THROUGH to the file
-  # writer below, which remains the correctness FALLBACK. A fork CHILD must NOT
-  # inherit the parent's mapping handle — `discardDepQueueAfterFork` detaches +
-  # re-attaches from the child's atfork handler.
-  depQueueView: DepQueue
-  depQueueViewAttached = false
   # io-mon-Lossless-Event-Capture M3 — the process-global producer view of the
   # edge's shared-memory SET (nim-shm-set), the PRIMARY dependency transport.
   # Attached by `attachDepQueueForShim` when REPRO_MONITOR_DEP_SHM names a
@@ -385,57 +375,36 @@ proc setDepSetIncarnationImage*(image: string) =
     rebuildDepSetLossElem()
 
 proc attachDepQueueForShim*(segmentPath: string) =
-  ## DEP-SHM-2 — attach the calling PROCESS to the edge's dep-queue segment at
+  ## Attach the calling PROCESS to the edge's shared-memory dependency SET at
   ## `segmentPath` (the value of `REPRO_MONITOR_DEP_SHM`). Called from
   ## `repro_monitor_shim_init`, and from the fork-child atfork handler after a
   ## detach, so the child maps the segment FRESH rather than inheriting the
-  ## parent's fd/mapping. Idempotent; a failed attach leaves the producer on the
-  ## file path (correctness never depends on the ring being present).
+  ## parent's fd/mapping. Idempotent.
+  ##
+  ## io-mon-Lossless-Event-Capture M3 — TRANSPORT SELECTION by segment name. The
+  ## io-mon consumer (fs_snoop) creates a nim-shm-set and names it via
+  ## REPRO_MONITOR_DEP_SHM = its shard0 path (ends `.shard0`), so a `.shard0` value
+  ## ⇒ attach the SET (the sole Linux dependency channel; part 2b removed the
+  ## superseded DEP-SHM ring). A non-`.shard0` value names no transport this
+  ## producer understands, so the shim stays on the file path (macOS/Windows arms).
   if segmentPath.len == 0:
     return
-  # io-mon-Lossless-Event-Capture M3 (part 1) — TRANSPORT SELECTION by segment
-  # name. The real io-mon consumer (fs_snoop) now creates a nim-shm-set and names
-  # it via REPRO_MONITOR_DEP_SHM = its shard0 path (ends `.shard0`), so a
-  # `.shard0` value ⇒ attach the SET (the new primary channel). A non-`.shard0`
-  # value is a legacy DEP-SHM ring segment (the ring integration tests, and any
-  # host that still hands us one) ⇒ attach the ring. This keeps the ring a clean,
-  # reversible A/B fallback while the set is the default path.
   if segmentPath.endsWith(".shard0"):
     if setProducerAttached and setProducer.available:
       return
     setProducer = shmset.attachProducer(segmentPath)
     setProducerAttached = true
     rebuildDepSetLossElem()
-    return
-  if depQueueViewAttached and depQueueView.available:
-    return
-  depQueueView = attachDepQueueAtPath(segmentPath)
-  depQueueViewAttached = true
 
 proc discardDepQueueAfterFork*(segmentPath: string) =
-  ## DEP-SHM-2 — a fork CHILD inherited the parent's dep-queue / set mapping COW.
-  ## Detach it and (if a segment path is known) re-attach FRESH so the child
-  ## never publishes through the parent's inherited fd. Coordinated with the
-  ## DEP-FLUSH atfork handler (`discardFragmentSlotAfterFork`).
+  ## A fork CHILD inherited the parent's dep-SET mapping COW. Detach it and (if a
+  ## segment path is known) re-attach FRESH so the child never publishes through
+  ## the parent's inherited fd. Coordinated with the DEP-FLUSH atfork handler
+  ## (`discardFragmentSlotAfterFork`) on the platforms that still use the file arm.
   if setProducerAttached:
     setProducer.detach()
     setProducerAttached = false
-  if depQueueViewAttached:
-    depQueueView.detach()
-    depQueueViewAttached = false
   attachDepQueueForShim(segmentPath)
-
-proc depQueueDroppedCount*(): uint64 =
-  ## Test/introspection — the SIGNALLED ring-full drop count on the producer's
-  ## attached view (0 when unattached). The consumer surfaces its own count.
-  if depQueueViewAttached: depQueueView.droppedCount() else: 0
-
-proc depQueueIsActive*(): bool =
-  ## True when the producer arm attached to a live segment (the fast path is
-  ## engaged); false means every record takes the file fallback. Covers BOTH the
-  ## SET (M3 part 1 primary) and the legacy ring.
-  (setProducerAttached and setProducer.available) or
-    (depQueueViewAttached and depQueueView.available)
 
 proc depSetIsActive*(): bool =
   ## io-mon-Lossless-Event-Capture M3 (part 1) — true when the producer attached
@@ -1450,18 +1419,11 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   ## (d) the current batch has been open for longer than
   ## ``FragmentBatchMaxAgeNs`` (default 100 ms) — bounding the worst-
   ## case data-loss window on SIGKILL.
-  # DEP-SHM-2 — FAST PATH: publish the record to the edge's shared-memory ring
-  # first. On success the record is already in consumer-owned memory (durable
-  # against a producer SIGKILL — DEP-SHM-5) and does NOT travel the file path, so
-  # we return before touching the fragment file. On ANY other status — ring full
-  # (SIGNALLED drop), an oversize encoding, or an unattached queue — we FALL
-  # THROUGH to the file writer, which stays the correctness FALLBACK. Each record
-  # thus travels EXACTLY ONE channel, so the merged depfile is byte-identical to
-  # the file-only baseline regardless of which channel it took (DEP-SHM-3). No
-  # heap allocation on this path (fork/orc-safe): `tryPushRecord` encodes into a
-  # stack buffer.
   # io-mon-Lossless-Event-Capture M3 part 2a — PRIMARY path is the SET transport
-  # (nim-shm-set, the M1-winning Candidate-C channel).
+  # (nim-shm-set, the M1-winning Candidate-C channel). Part 2b removed the
+  # superseded DEP-SHM ring, so the only channels are the SET (Linux) and the
+  # `.rmdf-frag` file writer below (the retained macOS/Windows arm + the Linux
+  # launcher-side loss marker).
   #
   # LF-7 (unbuffered publish-before-return): encode the record's DEDUP element-key
   # with `encodeDepRecordIdentity` (drops `seq`, so exact-duplicate probe storms
@@ -1511,11 +1473,6 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
         discard setProducer.emit(setLossElem.toOpenArray(0, setLossElemLen - 1))
     # Active set path: do NOT fall through to the dormant file writer (LF-2).
     return
-  elif depQueueViewAttached and depQueueView.available:
-    # DORMANT legacy DEP-SHM ring (drop-on-full): a non-`.shard0` segment. Retained
-    # for the ring integration tests; still uses the file writer as its fallback.
-    if depQueueView.tryPushRecord(record) == dpsPushed:
-      return
 
   # LEAK-GUARD — this producer thread already blew the per-fragment byte cap for
   # THIS (osPid, threadId, fragmentDir); its fd is closed. Drop the record rather
@@ -2714,18 +2671,18 @@ proc dropStaleRunRecords(records: seq[MonitorRecord];
 proc mergeFragments*(fragmentDir, outputPath: string;
     breakawayReportDir = ""; expectedRootPid: uint64 = 0;
     currentRunId = "";
-    ringRecords: openArray[MonitorRecord] = @[]): MonitorDepFile =
-  ## DEP-SHM-3 (shared-memory dependency queue) — `ringRecords` are the records
-  ## the consumer drained from the edge's shm dep queue (io_mon/shm/dep_queue).
-  ## They are folded into the SAME record set as the file fragments BEFORE the
-  ## run-scoping, read-tail netting, and canonical ordering — so a record that
-  ## travelled the ring is indistinguishable in the output from one that
-  ## travelled the file path, and the final depfile is BYTE-IDENTICAL to the
-  ## file-only baseline for the same workload (the HARD invariant). Ring records
-  ## are the SAME `MonitorRecord` shape (run-stamped detail included, since
-  ## `stampRunId` runs before `appendFragmentRecord`); they carry no read-tail
-  ## bookkeeping markers (those are file-only), so the netting below is
-  ## unaffected. Empty (the default) preserves the pure-file behaviour.
+    setRecords: openArray[MonitorRecord] = @[]): MonitorDepFile =
+  ## io-mon-Lossless-Event-Capture M3 — `setRecords` are the DISTINCT records the
+  ## consumer decoded from the edge's shared-memory SET (nim-shm-set) snapshot
+  ## (the sole Linux dependency transport; see fs_snoop). They are folded into the
+  ## SAME record set as the file fragments BEFORE the run-scoping, read-tail
+  ## netting, and canonical ordering — so a record that travelled the set is
+  ## indistinguishable in the output from one that travelled the file path, and the
+  ## final depfile is reprobuild-invariant (LF-6). Set records are the SAME
+  ## `MonitorRecord` shape (run-stamped detail included, since `stampRunId` runs
+  ## before the producer emits); they carry no read-tail bookkeeping markers (those
+  ## are file-only, macOS/Windows arm), so the netting below is unaffected. Empty
+  ## (the default) preserves the pure-file behaviour.
   ##
   ## ROUND-3 S3c (warm-restart stale-fragment guard) — `currentRunId` scopes the
   ## merge to THIS invocation's run id (the value the launcher put in
@@ -2794,13 +2751,13 @@ proc mergeFragments*(fragmentDir, outputPath: string;
             inc corruptFragments
         except IOError, OSError:
           discard
-  # DEP-SHM-3 — fold the shm-drained ring records into the SAME set as the file
-  # fragments. They are appended AS-IS (already run-stamped by the producer) so
-  # they pass through the identical run-scoping / read-tail-net / canonical-order
-  # pipeline below; the merged output is byte-identical whether a record arrived
-  # via the ring or the file.
-  if ringRecords.len > 0:
-    for r in ringRecords:
+  # io-mon-Lossless-Event-Capture M3 — fold the SET-decoded records into the SAME
+  # set as the file fragments. They are appended AS-IS (already run-stamped by the
+  # producer) so they pass through the identical run-scoping / read-tail-net /
+  # canonical-order pipeline below; the merged output is reprobuild-invariant
+  # whether a record arrived via the set or the file.
+  if setRecords.len > 0:
+    for r in setRecords:
       records.add r
   # ROUND-3 S3c — warm-restart stale-fragment guard. `mergeFragments` does not
   # delete `.rmdf-frag` files, so a REUSED fragment dir can carry a PRIOR run's

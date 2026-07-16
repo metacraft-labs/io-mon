@@ -482,7 +482,7 @@ int main(int argc, char **argv) {
       it.path.endsWith(".rmdf-frag")).len == 0
     let okDep = mergeFragments(okFragDir, work / "lf2-ok.rdep",
       expectedRootPid = okPid, currentRunId = "lf2-ok-run",
-      ringRecords = okRecords)
+      setRecords = okRecords)
     check okDep.completeness == mcComplete
     check hasFileRead(okDep, marker)
 

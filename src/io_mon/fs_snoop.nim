@@ -765,8 +765,8 @@ proc runMonitoredCommand(request: FsSnoopRequest): int =
     # the SET's DISTINCT elements. The DEP-FLUSH shutdown guarantees every producer
     # published its last record, so snapshot the deduped union of all shards and
     # decode each element (identity element-key + trailing incarnation-image bytes)
-    # back to a `MonitorRecord` (seq reconstructs as 0). These fold into the SAME
-    # `ringRecords` argument the ring path used.
+    # back to a `MonitorRecord` (seq reconstructs as 0). These fold into the
+    # merge via the `setRecords` argument.
     #
     # DETERMINISM: `snapshot` yields elements in hash-slot order (non-deterministic
     # across runs), and two DISTINCT elements can tie in `canonicalOrder` because
@@ -795,7 +795,7 @@ proc runMonitoredCommand(request: FsSnoopRequest): int =
           " time(s); dependency capture may be incomplete for this edge")
     discard mergeFragments(fragmentDir, request.depFilePath,
       expectedRootPid = rootPid, currentRunId = runId,
-      ringRecords = depDrained)
+      setRecords = depDrained)
     renderStreamToPath(request.depFilePath, request.streamMode,
       request.eventStreamPath)
   elif defined(windows):

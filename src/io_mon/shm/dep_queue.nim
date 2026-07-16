@@ -1,46 +1,28 @@
-## Shared-memory MPSC dependency queue (milestone io-mon-DEP-SHM).
+## Shared-memory dependency-record codec (`MonitorRecord` ↔ opaque element bytes).
 ##
-## The PRIMARY channel for communicating discovered input dependencies from the
-## many monitored producer PROCESSES/THREADS to the single reprobuild engine /
-## io-mon run driver (the consumer). It reuses — in shape, verbatim — the proven
-## lock-free ticket-CAS MPSC ring from reprobuild's action-cache hot tier
-## (`repro_shm_index/ring.nim` + `segment.nim`, Action-Cache-Per-Edge-Store.md
-## §4.4): many producers CAS-bump a `tail` ticket to reserve a slot, write the
-## payload, then publish via a release-store of `ready = ticket+1`; the single
-## consumer spins on `ready`, reads the payload, advances `head`, and clears
-## `ready`. Drop-on-full is SIGNALLED via an atomic `dropped` counter — NEVER
-## silent. The segment is versioned + boot-guarded like `segment.nim` so a stale
-## post-reboot region is recreated empty.
+## io-mon-Lossless-Event-Capture M3 part 2b — the superseded DEP-SHM MPSC ring
+## transport (`DepQueue`, `createDepQueueAtPath`/`attachDepQueueAtPath`,
+## `tryPushRecord`/`tryDrainOne`, the drop-on-full segment) has been REMOVED: the
+## M1-winning `nim-shm-set` SET transport is the sole Linux dependency channel and
+## nothing on the retained set path used the ring any longer. What remains here —
+## and is RETAINED — is ONLY the dep-specific `MonitorRecord` **codec** the SET
+## transport depends on: it turns a `MonitorRecord` into the opaque element bytes
+## the `nim-shm-set` producer publishes (`encodeDepRecordIdentity`) and back
+## (`decodeDepRecord`), plus the real-`seq` variant (`encodeDepRecord`).
 ##
-## The lock-free MPSC ring mechanism now lives in the extracted, shared
-## `shm_queue/ring` library (metacraft-labs/nim-shm-queue, Layer 1 — the ring as
-## a coordination device over BYTE BLOBS). This module keeps ONLY the
-## dep-specific `MonitorRecord` codec (below) and wraps an `ShmRing`: it does NOT
-## re-implement the ticket-CAS reservation, the release/acquire publish/drain,
-## the drop-on-full signal, or the boot-guarded segment header — those are
-## `shm_queue`'s single copy, consumed identically by reprobuild's action-cache
-## submission ring. Layer 1 has NO serialization dependency (pure std/posix), so
-## the LD_PRELOAD shim that imports this module stays serialization-free.
-##
-## Platform: Linux + macOS (POSIX mmap MAP_SHARED). On every other platform this
-## module still compiles but `depQueueSupported` is false and every op is a
-## no-op / unavailable, so the shim + engine fall back to the file-based RMDF
-## fragment path (the correctness FALLBACK). macOS keeps files for now too (its
-## producer arm is future work); the datastructures here compile on macOS so the
-## pure unit test runs there.
+## The codec is domain-only (no ring, no segment, no atomics): a fixed header +
+## varint-length path/detail encoding of the SAME `MonitorRecord` the RMDF frames
+## carry. Every field the file path preserves is encoded so a record that travels
+## the set is byte-for-byte the same record as one that travels the file — the
+## HARD byte-identical-final-depfile invariant (LF-6) depends on it, because
+## `mergeFragments` folds `detail` (run token), `childOsPid`, `result` and `flags`
+## into the canonical output. No serialization dependency (pure `io_mon/types`),
+## so the LD_PRELOAD shim that imports this module stays serialization-free.
 
 import io_mon/types
 
-const depQueueSupported* = defined(linux) or defined(macosx)
-
 # ---------------------------------------------------------------------------
-# Record codec: a fixed header + varint-length path/detail encoding of the SAME
-# `MonitorRecord` the RMDF frames carry. We encode EVERY field the file path
-# preserves (not only the spec's illustrative subset) so a record that travels
-# the ring is byte-for-byte the same record as one that travels the file — the
-# HARD byte-identical-final-depfile invariant (DEP-SHM-3) depends on it, because
-# `mergeFragments` folds `detail` (run token / read-tail markers), `childOsPid`,
-# `result` and `flags` into the canonical output.
+# Record codec.
 # ---------------------------------------------------------------------------
 
 const
@@ -148,8 +130,9 @@ proc encodeDepRecordWithSeq(record: MonitorRecord; buf: var openArray[byte];
 
 proc encodeDepRecord*(record: MonitorRecord; buf: var openArray[byte]): int =
   ## Encode `record` into `buf` carrying its real `seq`. Returns the byte length
-  ## written, or -1 if the record does not fit. Used by the legacy DEP-SHM ring
-  ## (`tryPushRecord`) where every record is a distinct queue event.
+  ## written, or -1 if the record does not fit. The real-`seq` variant of the
+  ## codec (the SET transport uses `encodeDepRecordIdentity`, which drops `seq`);
+  ## retained as the codec's stream-ordinal encoder and for round-trip tests.
   encodeDepRecordWithSeq(record, buf, record.seq)
 
 proc encodeDepRecordIdentity*(record: MonitorRecord; buf: var openArray[byte]): int =
@@ -241,166 +224,3 @@ proc decodeDepRecord*(buf: openArray[byte]; ok: var bool): MonitorRecord =
       result.detail[i] = char(buf[pos + i])
     pos += int(detailLen)
   ok = true
-
-# ---------------------------------------------------------------------------
-# The segment + ring themselves (POSIX only).
-# ---------------------------------------------------------------------------
-
-when depQueueSupported:
-  import std/os
-  import shm_queue/ring as shmring
-
-  const
-    DepRingCap* = 2048                        ## MPSC ring capacity (power of two).
-    DepSlotRecCap* = 4000
-      ## Fixed slot payload capacity, sized for the p99 dependency path + detail.
-      ## A record whose encoding exceeds this falls back to the file path.
-
-  static:
-    doAssert (DepRingCap and (DepRingCap - 1)) == 0
-
-  type
-    DepQueue* = object
-      ## An attached view of one edge's dep-queue segment. `available` is false
-      ## on a non-POSIX host or on any attach/create failure — the caller then
-      ## uses the file fallback. The lock-free ring itself is an `shm_queue`
-      ## `ShmRing` (Layer 1); this wrapper adds ONLY the `MonitorRecord` codec.
-      available*: bool
-      isConsumer: bool
-      ring: shmring.ShmRing[shmring.opDropSignalled]
-        ## Pinned to the drop-on-full policy: the dependency queue keeps its
-        ## historical `opDropSignalled` behaviour here (the lossless
-        ## `opBlockProducer` transport switch is io-mon-Lossless-Event-Capture
-        ## M3). `nim-shm-queue` made `ShmRing` generic over `OverflowPolicy`.
-      path*: string
-
-  proc depQueuePath*(dir, edgeKey: string): string =
-    dir / ("repro-dep-queue." & edgeKey)
-
-  proc createDepQueueAtPath*(path: string): DepQueue =
-    ## CONSUMER side: create + map a fresh, zero-filled ring segment at `path`.
-    ## The engine calls this BEFORE launching the edge's process tree and passes
-    ## `path` to producers via `REPRO_MONITOR_DEP_SHM`. The versioned, boot-
-    ## guarded segment + the atomic-rename fresh-init discipline are provided by
-    ## `shm_queue` (createRing).
-    result.available = false
-    result.isConsumer = true
-    result.path = path
-    result.ring = shmring.createRing(path, DepRingCap, DepSlotRecCap,
-      shmring.bootId())
-    result.available = result.ring.isValid
-
-  proc createDepQueue*(dir, edgeKey: string): DepQueue =
-    ## Convenience wrapper: create the segment at `depQueuePath(dir, edgeKey)`.
-    createDepQueueAtPath(depQueuePath(dir, edgeKey))
-
-  proc attachDepQueueAtPath*(path: string): DepQueue =
-    ## PRODUCER side: attach to the consumer-created segment at `path`. Returns
-    ## an unavailable queue (so the caller falls back to files) when the file is
-    ## missing / wrong size / stale (wrong boot or version). Never CREATES the
-    ## region — a producer must not race the consumer's fresh init. The
-    ## magic/version/boot guard is `shm_queue`'s (attachRing).
-    result.available = false
-    result.isConsumer = false
-    result.path = path
-    result.ring = shmring.attachRing(path)
-    result.available = result.ring.isValid
-
-  proc attachDepQueue*(dir, edgeKey: string): DepQueue =
-    ## Convenience wrapper: attach the segment at `depQueuePath(dir, edgeKey)`.
-    attachDepQueueAtPath(depQueuePath(dir, edgeKey))
-
-  proc detach*(q: var DepQueue) =
-    ## Unmap + close. A default-constructed DepQueue holds an invalid ring, so
-    ## `detach` on a never-attached queue is a no-op (shm_queue guards the unmap).
-    shmring.detach(q.ring)
-    q.available = false
-
-  type
-    DepPushStatus* = enum
-      dpsPushed        ## reserved + published
-      dpsDropped       ## ring full: SIGNALLED drop (the `dropped` counter bumped)
-      dpsOversized     ## encoded record > DepSlotRecCap: not enqueueable
-      dpsUnavailable   ## queue not attached (caller uses the file fallback)
-
-  proc tryPushRecord*(q: var DepQueue; record: MonitorRecord): DepPushStatus =
-    ## Multi-producer append. Encodes `record` into a stack buffer (NO heap alloc
-    ## on the hot path — fork/orc-safe), then hands the encoded bytes to the
-    ## shm_queue ring's lock-free `tryPush` (CAS ticket reserve + release-store
-    ## publish). Bounded: a full ring is a SIGNALLED drop (`dpsDropped`); an
-    ## encoding that does not fit the slot is `dpsOversized`. The caller MUST fall
-    ## back to the file path on any status other than `dpsPushed`.
-    if not q.available:
-      return dpsUnavailable
-    var recBuf: array[DepSlotRecCap, byte]
-    let recLen = encodeDepRecord(record, recBuf)
-    if recLen < 0 or recLen > DepSlotRecCap:
-      return dpsOversized
-    # NB: `prConsumerGone` is unreachable on this drop-on-full ring (the default
-    # `opDropSignalled` policy never blocks/waits, so it never reports a gone
-    # consumer); it is mapped to `dpsDropped` only to keep the `case` exhaustive
-    # after `nim-shm-queue` added the `opBlockProducer` policy status. The
-    # lossless block-producer path is io-mon-Lossless-Event-Capture M3.
-    case q.ring.tryPush(recBuf.toOpenArray(0, recLen - 1))
-    of prPushed: dpsPushed
-    of prDropped: dpsDropped
-    of prOversize: dpsOversized
-    of prConsumerGone: dpsDropped
-
-  proc tryDrainOne*(q: var DepQueue; outRec: var MonitorRecord): bool =
-    ## SINGLE-consumer non-blocking drain of the next ready ticket. Returns
-    ## false when the head slot is not yet published (empty / producer
-    ## mid-write) OR when a slot decodes malformed (skipped — its authoritative
-    ## copy is on the file fallback). On true, `outRec` holds the decoded record.
-    ## The ring coordination (head/tail/ready) is shm_queue's; this adds the
-    ## `decodeDepRecord` step. A drained-but-malformed slot still returns false
-    ## but the slot HAS been retired (head advanced) so the consumer never wedges.
-    if not q.available:
-      return false
-    var recBuf: array[DepSlotRecCap, byte]
-    var recLen = 0
-    if q.ring.tryDrainOne(recBuf, recLen) != drGot:
-      return false
-    var ok = false
-    if recLen > 0:
-      outRec = decodeDepRecord(recBuf.toOpenArray(0, recLen - 1), ok)
-    ok
-
-  proc droppedCount*(q: DepQueue): uint64 {.inline.} =
-    ## Number of SIGNALLED ring-full drops. The consumer surfaces this as a loud
-    ## diagnostic (DEP-SHM-4) — the dropped records still travel the file path.
-    if not q.available: return 0
-    q.ring.droppedCount()
-
-  proc pendingCount*(q: DepQueue): uint64 {.inline.} =
-    if not q.available: return 0
-    q.ring.pendingCount()
-
-else:
-  # Non-POSIX: compiles but reports unavailable so callers use the file path.
-  type
-    DepQueue* = object
-      available*: bool
-      path*: string
-    DepPushStatus* = enum
-      dpsPushed
-      dpsDropped
-      dpsOversized
-      dpsUnavailable
-
-  proc depQueuePath*(dir, edgeKey: string): string =
-    dir & "/repro-dep-queue." & edgeKey
-  proc createDepQueueAtPath*(path: string): DepQueue =
-    DepQueue(available: false, path: path)
-  proc attachDepQueueAtPath*(path: string): DepQueue =
-    DepQueue(available: false, path: path)
-  proc createDepQueue*(dir, edgeKey: string): DepQueue =
-    DepQueue(available: false, path: depQueuePath(dir, edgeKey))
-  proc attachDepQueue*(dir, edgeKey: string): DepQueue =
-    DepQueue(available: false, path: depQueuePath(dir, edgeKey))
-  proc detach*(q: var DepQueue) = discard
-  proc tryPushRecord*(q: var DepQueue; record: MonitorRecord): DepPushStatus =
-    dpsUnavailable
-  proc tryDrainOne*(q: var DepQueue; outRec: var MonitorRecord): bool = false
-  proc droppedCount*(q: DepQueue): uint64 = 0
-  proc pendingCount*(q: DepQueue): uint64 = 0
