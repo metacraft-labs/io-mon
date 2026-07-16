@@ -5,6 +5,13 @@ import io_mon/codec
 import io_mon/capabilities
 import io_mon/types
 import io_mon/shm/dep_queue
+# io-mon-Lossless-Event-Capture M3 (part 1) — the SET transport (nim-shm-set,
+# Candidate C / the M1 winner) is the new PRIMARY Linux dependency channel. The
+# producer publishes each observed record into a consumer-owned grow-only set via
+# the §5 transport surface; the DEP-SHM ring (`dep_queue`) is retained only for
+# the legacy ring tests / any non-`.shard0` segment. We still reuse `dep_queue`'s
+# `encodeDepRecord` codec to turn a `MonitorRecord` into the opaque element bytes.
+import shm_set/transport as shmset
 
 const
   CanonicalFileKind = 1'u16
@@ -255,11 +262,45 @@ var
   # re-attaches from the child's atfork handler.
   depQueueView: DepQueue
   depQueueViewAttached = false
+  # io-mon-Lossless-Event-Capture M3 (part 1) — the process-global producer view
+  # of the edge's shared-memory SET (nim-shm-set), the NEW PRIMARY dependency
+  # transport. Attached by `attachDepQueueForShim` when REPRO_MONITOR_DEP_SHM
+  # names a `.shard0` path (a set) rather than a ring segment. `appendFragmentRecord`
+  # publishes each record here first (idempotent insert, serialization-free / no
+  # heap on the hot path — fork/orc-safe); a record durably in the consumer-owned
+  # set does NOT travel the file path. Any non-durable status (unattached /
+  # consumer-gone / oversize / saturated) FALLS THROUGH to the `.rmdf-frag` file
+  # writer, which stays the correctness FALLBACK for part 1.
+  # TODO(M3 part 2): per LF-2/LF-7, make an unattached-or-consumer-gone set a HARD
+  # `mcIncomplete` (never a file spill) and delete the file fallback + DEP-FLUSH.
+  setProducer: shmset.SetProducer
+  setProducerAttached = false
+  # io-mon-Lossless-Event-Capture M3 (part 1) — a per-process-INCARNATION
+  # uniqueness tag appended to every SET element. `seq` (processSeq) is unique per
+  # record WITHIN an incarnation but RESETS across `exec` (a fresh image re-inits
+  # the shim from scratch), so the pre-exec and post-exec `process-start` of the
+  # SAME pid would otherwise encode to IDENTICAL bytes and the grow-only G-Set
+  # would idempotently DEDUP the second — dropping a real record and diverging
+  # from the append-only file baseline that keeps BOTH (the completeness check
+  # counts `starts` per pid to match `exec`s). This 8-byte tag, regenerated on
+  # every attach (init / post-exec / post-fork), makes each incarnation's elements
+  # distinct, so the SET is a faithful LOSSLESS carrier for part 1. (True
+  # source-dedup on the observation tuple — collapsing probe storms — is a part-2
+  # / LF-7 concern and is NOT required for the byte-identical-depfile invariant.)
+  setElemNonce: uint64
+  # Process-global monotonic sequence mixed into the incarnation tag so two
+  # attaches that read the same coarse clock tick still differ.
+  gSetNonceSeq: Atomic[uint64]
   # LEAK-GUARD — process-global per-fragment on-disk byte cap. Resolved ONCE
   # from IO_MON_FRAGMENT_MAX_BYTES on the first fragment open (never from a
   # signal handler) or forced by `setFragmentByteCap`.
   fragmentByteCap: int64 = FragmentMaxBytesDefault
   fragmentByteCapResolved = false
+
+# A generous stack buffer for `encodeDepRecord` on the insert hot path — no heap.
+# A record whose encoding exceeds it (a pathological path+detail) simply falls
+# through to the file path for part 1.
+const SetProducerBufBytes = 16384
 
 proc resolveFragmentByteCap() =
   ## LEAK-GUARD — resolve the per-fragment byte cap ONCE per process from
@@ -304,16 +345,38 @@ proc attachDepQueueForShim*(segmentPath: string) =
   ## file path (correctness never depends on the ring being present).
   if segmentPath.len == 0:
     return
+  # io-mon-Lossless-Event-Capture M3 (part 1) — TRANSPORT SELECTION by segment
+  # name. The real io-mon consumer (fs_snoop) now creates a nim-shm-set and names
+  # it via REPRO_MONITOR_DEP_SHM = its shard0 path (ends `.shard0`), so a
+  # `.shard0` value ⇒ attach the SET (the new primary channel). A non-`.shard0`
+  # value is a legacy DEP-SHM ring segment (the ring integration tests, and any
+  # host that still hands us one) ⇒ attach the ring. This keeps the ring a clean,
+  # reversible A/B fallback while the set is the default path.
+  if segmentPath.endsWith(".shard0"):
+    if setProducerAttached and setProducer.available:
+      return
+    setProducer = shmset.attachProducer(segmentPath)
+    setProducerAttached = true
+    # Fresh incarnation tag (distinct across exec/fork — see `setElemNonce`). The
+    # monotonic clock advances system-wide across exec, so a post-exec re-attach
+    # of the SAME pid reads a strictly later value than the pre-exec one.
+    let bump = gSetNonceSeq.fetchAdd(1'u64) + 1'u64
+    setElemNonce = uint64(getMonoTime().ticks) xor
+      (uint64(getCurrentProcessId()) shl 1) xor (bump * 1099511628211'u64)
+    return
   if depQueueViewAttached and depQueueView.available:
     return
   depQueueView = attachDepQueueAtPath(segmentPath)
   depQueueViewAttached = true
 
 proc discardDepQueueAfterFork*(segmentPath: string) =
-  ## DEP-SHM-2 — a fork CHILD inherited the parent's dep-queue mapping COW.
+  ## DEP-SHM-2 — a fork CHILD inherited the parent's dep-queue / set mapping COW.
   ## Detach it and (if a segment path is known) re-attach FRESH so the child
   ## never publishes through the parent's inherited fd. Coordinated with the
   ## DEP-FLUSH atfork handler (`discardFragmentSlotAfterFork`).
+  if setProducerAttached:
+    setProducer.detach()
+    setProducerAttached = false
   if depQueueViewAttached:
     depQueueView.detach()
     depQueueViewAttached = false
@@ -326,8 +389,15 @@ proc depQueueDroppedCount*(): uint64 =
 
 proc depQueueIsActive*(): bool =
   ## True when the producer arm attached to a live segment (the fast path is
-  ## engaged); false means every record takes the file fallback.
-  depQueueViewAttached and depQueueView.available
+  ## engaged); false means every record takes the file fallback. Covers BOTH the
+  ## SET (M3 part 1 primary) and the legacy ring.
+  (setProducerAttached and setProducer.available) or
+    (depQueueViewAttached and depQueueView.available)
+
+proc depSetIsActive*(): bool =
+  ## io-mon-Lossless-Event-Capture M3 (part 1) — true when the producer attached
+  ## to a live nim-shm-set (the new primary transport). Test/introspection.
+  setProducerAttached and setProducer.available
 
 proc ensureRegistryLock() {.raises: [].} =
   ## DEP-FLUSH-1 — lazily initialise the registry lock. Idempotent; called
@@ -1347,7 +1417,34 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   # the file-only baseline regardless of which channel it took (DEP-SHM-3). No
   # heap allocation on this path (fork/orc-safe): `tryPushRecord` encodes into a
   # stack buffer.
-  if depQueueViewAttached and depQueueView.available:
+  # io-mon-Lossless-Event-Capture M3 (part 1) — PRIMARY fast path is the SET
+  # transport (nim-shm-set). Encode the record with dep_queue's `encodeDepRecord`
+  # into a STACK buffer (no heap — fork/orc-safe), then `emit` the opaque bytes.
+  # `emInserted`/`emExists` both mean the record is durable in consumer-owned
+  # memory (LF-3: survives a producer SIGKILL after publish, no flush/fsync), so
+  # it does NOT travel the file path. Any other status — unattached, consumer
+  # gone, oversize, or OOM-saturated — falls through to the `.rmdf-frag` writer,
+  # the correctness FALLBACK retained for part 1.
+  # TODO(M3 part 2): make consumer-gone/unattached a HARD `mcIncomplete` (LF-2),
+  # delete the file fallback + DEP-FLUSH, and drop the read-tail netting (LF-7).
+  if setProducerAttached and setProducer.available:
+    var recBuf {.noinit.}: array[SetProducerBufBytes, byte]
+    let recLen = encodeDepRecord(record, recBuf)
+    if recLen >= 0 and recLen + 8 <= SetProducerBufBytes:
+      # Append the 8-byte incarnation tag so the element is a globally-unique
+      # LOSSLESS carrier (see `setElemNonce`). `decodeDepRecord` reads only the
+      # record's own fields and ignores these trailing bytes, so a decoded
+      # element is byte-for-byte the same `MonitorRecord` the file path carries.
+      var tag = setElemNonce
+      for i in 0 ..< 8:
+        recBuf[recLen + i] = byte(tag and 0xFF)
+        tag = tag shr 8
+      case setProducer.emit(recBuf.toOpenArray(0, recLen + 8 - 1))
+      of emInserted, emExists:
+        return
+      else:
+        discard   # fall through to the file fallback (part 1)
+  elif depQueueViewAttached and depQueueView.available:
     if depQueueView.tryPushRecord(record) == dpsPushed:
       return
 

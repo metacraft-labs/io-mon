@@ -13,3 +13,11 @@ switch("path", "tests/helpers")
 # "cannot open file: shm_queue/ring" surfaces rather than a silent wrong build.
 let shmQueueSrc = getEnv("SHM_QUEUE_SRC", "../nim-shm-queue/src")
 switch("path", shmQueueSrc)
+
+# io-mon-Lossless-Event-Capture M3 (part 1): the SET transport (metacraft-labs/
+# nim-shm-set) is the new PRIMARY Linux dependency channel (Candidate C, the M1
+# winner), replacing the DEP-SHM ring as the producer→consumer fast path while
+# the `.rmdf-frag` file fallback stays in place (its deletion is part 2). Same
+# sibling-checkout / $SHM_SET_SRC override discipline as $SHM_QUEUE_SRC above.
+let shmSetSrc = getEnv("SHM_SET_SRC", "../nim-shm-set/src")
+switch("path", shmSetSrc)

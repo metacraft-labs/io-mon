@@ -6,6 +6,12 @@ import io_mon/render
 import io_mon/types
 import io_mon/writer
 import io_mon/shm/dep_queue
+# io-mon-Lossless-Event-Capture M3 (part 1) — the CONSUMER hosts a nim-shm-set
+# (the M1-winning SET transport) as the new primary Linux dependency channel; it
+# decodes the merged set with dep_queue's `decodeDepRecord`. `shmSetSupported`
+# gates the Linux arm; `transport` is the §5 host lifecycle.
+import shm_set as shmset_core
+import shm_set/transport as shmset
 
 when defined(linux):
   import std/[monotimes, sequtils]
@@ -708,30 +714,35 @@ proc runMonitoredCommand(request: FsSnoopRequest): int =
     setEnvVar("REPRO_MONITOR_OUTPUT", request.depFilePath, oldEnv)
     setEnvVar("REPRO_MONITOR_SESSION", runId, oldEnv)
 
-    # DEP-SHM-3 — the CONSUMER creates the edge's shared-memory dependency queue
-    # BEFORE launching the process tree, and names it via REPRO_MONITOR_DEP_SHM
-    # (alongside REPRO_MONITOR_FRAGMENT_DIR). Producers publish each record into
-    # this ring as the FAST PATH; anything they cannot enqueue (ring full /
-    # oversize) falls back to a .rmdf-frag file. The ring lives in
-    # consumer-owned memory that outlives every producer, so a producer that is
-    # SIGKILLed after publishing loses ZERO records (DEP-SHM-5). A single
-    # consumer (this process) drains it. The queue is DISABLED (env left unset)
-    # when REPRO_MONITOR_DEP_SHM_DISABLE is set — the pure-file baseline used by
-    # the byte-identical regression.
-    var depQueue: DepQueue
-    var depDrained: seq[MonitorRecord] = @[]
-    let depShmEnabled = depQueueSupported and
+    # io-mon-Lossless-Event-Capture M3 (part 1) — the CONSUMER hosts the edge's
+    # shared-memory SET (nim-shm-set, the M1-winning transport) BEFORE launching
+    # the process tree, and names it via REPRO_MONITOR_DEP_SHM = its shard0 path
+    # (ends `.shard0`, which is how the shim's producer selects the set over the
+    # legacy ring). Producers IDEMPOTENTLY INSERT each observed record into this
+    # consumer-owned set as the PRIMARY channel; anything they cannot publish
+    # (oversize encoding for the stack buffer, or a saturated/gone set) falls back
+    # to a `.rmdf-frag` file (the correctness FALLBACK retained for part 1). Unlike
+    # the ring, the set needs NO drain loop — it dedups at source and grows by
+    # sharding — so we simply `snapshot` it ONCE at finalize and decode each
+    # element back to a `MonitorRecord`. The set lives in consumer-owned memory
+    # that outlives every producer, so a producer SIGKILLed after publishing loses
+    # ZERO records (LF-3). DISABLED (env left unset) when REPRO_MONITOR_DEP_SHM_DISABLE
+    # is set — the pure-file baseline used by the LF-6 byte-identical regression.
+    var depSet: SetHost
+    let depSetEnabled = shmSetSupported and
       getEnv("REPRO_MONITOR_DEP_SHM_DISABLE").len == 0
-    if depShmEnabled:
-      let segPath = fragmentDir / ("repro-dep-queue." & runId)
-      depQueue = createDepQueueAtPath(segPath)
-      if depQueue.available:
-        setEnvVar("REPRO_MONITOR_DEP_SHM", segPath, oldEnv)
+    if depSetEnabled:
+      depSet = startHost(fragmentDir, runId)
+      if depSet.available:
+        setEnvVar("REPRO_MONITOR_DEP_SHM", depSet.path0, oldEnv)
     setEnvVar("REPRO_MONITOR_SHIM_LIB", shimLib, oldEnv)
     defer: restoreEnv(oldEnv)
     defer:
-      if depQueue.available:
-        depQueue.detach()
+      # End the host lifecycle: announce the consumer is gone (a late orphan
+      # `emit` then fast-fails with `emConsumerGone` instead of growing the set —
+      # LF-4 / the orphan-bounded property), then unmap.
+      if depSet.available:
+        depSet.finish()
 
     let childArgs =
       if request.command.len > 1:
@@ -744,32 +755,31 @@ proc runMonitoredCommand(request: FsSnoopRequest): int =
     # ROUND-2 R1 — see the macOS branch: prove the root was monitored.
     let rootPid = uint64(process.processID)
 
-    # DEP-SHM-3 — drain the ring CONTINUOUSLY while the process tree runs so a
-    # bursty producer does not saturate the ring (which would force records to
-    # the file fallback). Single consumer: only this loop drains.
-    proc drainRing() =
-      if not depQueue.available: return
-      var rec: MonitorRecord
-      while depQueue.tryDrainOne(rec):
-        depDrained.add rec
-    while process.running():
-      drainRing()
-      sleep(2)
+    # The set requires NO concurrent drain (idempotent inserts, no backpressure),
+    # so just wait for the tree to exit.
     result = waitForExit(process)
     close(process)
 
     waitForLinuxInjectedDescendants(fragmentDir, runId, rootPid)
-    # DEP-SHM-3 — FINAL sweep after DEP-FLUSH shutdown guarantees every producer
-    # published its last record. Drain anything still queued.
-    drainRing()
-    # DEP-SHM-4 — a SIGNALLED ring-full drop is LOUD + observable: surface a
-    # diagnostic. The dropped records were NOT lost — the producer fell back to
-    # a .rmdf-frag file for them, so the merge still folds them in.
-    if depQueue.available:
-      let dropped = depQueue.droppedCount()
-      if dropped > 0'u64:
-        stderr.writeLine("io-mon: dep-queue ring full, " & $dropped &
-          " record(s) fell back to file fragments (no dependency lost)")
+    # io-mon-Lossless-Event-Capture M3 (part 1) — SINGLE-THREADED final merge: the
+    # DEP-FLUSH shutdown guarantees every producer published its last record, so
+    # snapshot the union of all shards and decode each element back to a
+    # `MonitorRecord`. These are folded into the SAME `ringRecords` argument the
+    # ring path used, so `mergeFragments` treats a set-borne record identically to
+    # a file/ring one — the LF-6 byte-identical-depfile invariant.
+    var depDrained: seq[MonitorRecord] = @[]
+    if depSet.available:
+      for elem in depSet.snapshot():
+        var ok = false
+        let rec = decodeDepRecord(elem, ok)
+        if ok:
+          depDrained.add rec
+      # A SIGNALLED growth failure (OOM) is LOUD, never a silent drop: surface it
+      # so the merged edge is understood as potentially incomplete.
+      let growthFailed = depSet.growthFailures()
+      if growthFailed > 0'u64:
+        stderr.writeLine("io-mon: dep-set growth failed " & $growthFailed &
+          " time(s); dependency capture may be incomplete for this edge")
     discard mergeFragments(fragmentDir, request.depFilePath,
       expectedRootPid = rootPid, currentRunId = runId,
       ringRecords = depDrained)
