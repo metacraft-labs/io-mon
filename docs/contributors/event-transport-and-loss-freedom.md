@@ -328,11 +328,15 @@ can unlink a mapped file.
 
 **Reaper (cross-restart GC).** LF-2 stops a *live* orphan; the reaper cleans up
 after the *consumer* (the reprobuild daemon) crashing and leaving shard files
-behind. `io_mon.reapStaleSegments(dir)` — called by the daemon on startup and
-periodically — reaps a run's shards (named `{runId}.{creatorBootId}.{ownerPid}.shardN`)
+behind. `reapStaleSegments(dir, appId)` — called by the daemon on startup and
+periodically — reaps a run's shards (named `{appId}~{runId}.{creatorBootId}.{ownerPid}.shardN`)
 when `creatorBootId != currentBootId` (survived a reboot) or the owner pid is dead
 on the current boot; live-owner runs are left alone; an `flock` guards a starting
-run. This is the existing boot-guarded staleness lifted to directory scope.
+run. The reaper is SCOPED to its `appId`: segments tagged with any other appId
+are ignored entirely (never reaped, never even liveness-checked), so one
+application cannot reap another's segments when they share a directory and
+cross-app pid reuse can no longer misfire. This is the existing boot-guarded
+staleness lifted to directory scope, then narrowed to per-app scope.
 
 **Open questions for M1:** (1) **variable-length keys** — a shared append-only
 **intern arena** (buckets store an offset) vs fixed `PATH_MAX` buckets;

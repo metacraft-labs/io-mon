@@ -732,7 +732,13 @@ proc runMonitoredCommand(request: FsSnoopRequest): int =
     let depSetEnabled = shmSetSupported and
       getEnv("REPRO_MONITOR_DEP_SHM_DISABLE").len == 0
     if depSetEnabled:
-      depSet = startHost(fragmentDir, runId)
+      # The appId scopes the SET's cross-restart reaper so one application never
+      # reaps another's shared-memory segments (segment name gains an `{appId}~`
+      # prefix; content is unaffected). Defaults to "io-mon"; a consumer that
+      # shares a segments directory (reprobuild/codetracer) overrides it via
+      # REPRO_MONITOR_APP_ID so its reaper stays scoped to its own segments.
+      let depSetAppId = getEnv("REPRO_MONITOR_APP_ID", "io-mon")
+      depSet = startHost(fragmentDir, runId, appId = depSetAppId)
       if depSet.available:
         setEnvVar("REPRO_MONITOR_DEP_SHM", depSet.path0, oldEnv)
     setEnvVar("REPRO_MONITOR_SHIM_LIB", shimLib, oldEnv)
