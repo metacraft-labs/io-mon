@@ -18,6 +18,11 @@ build-snoop:
 test:
     nimble test
 
+# Real-build completeness oracle (§4.5(h)) — fast fixtures + class-(a) gate.
+# The heavier B/C/D differentials run with: tests/realbuild/run_oracle.sh --full
+test-realbuild-oracle:
+    tests/realbuild/run_oracle.sh --fast
+
 # Run portable tests only
 test-portable:
     nimble testPortable

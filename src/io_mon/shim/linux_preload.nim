@@ -74,6 +74,13 @@ var
   # which case every record takes the file path unchanged. Remembered so the
   # fork-child atfork handler can RE-ATTACH the child fresh.
   depShmPath: string
+  # io-mon-Lossless-Event-Capture M3 — this incarnation's EXEC GENERATION, read
+  # from REPRO_MONITOR_EXEC_GEN at init (0 when unset — the root launch) and
+  # incremented across each exec through the child env. Folded into the SET
+  # element identity so two same-pid process-starts whose /proc/self/exe is
+  # byte-identical (a Nix gcc/rustc bash-wrapper that re-execs the real compiler
+  # in-place) remain DISTINCT elements instead of deduping down to mcIncomplete.
+  currentExecGen: clong = 0
   nextProcessSeq: uint64 = 0
   rawSyscallCoverageRecorded = false
   inlineSyscallCoverageRecorded = false
@@ -1117,19 +1124,37 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     depShmPath = getEnv("REPRO_MONITOR_DEP_SHM")
     if depShmPath.len > 0:
       attachDepQueueForShim(depShmPath)
+    # io-mon-Lossless-Event-Capture M3 — read THIS incarnation's exec generation
+    # (REPRO_MONITOR_EXEC_GEN, set/incremented by the parent's exec hook through
+    # the child env; absent ⇒ 0, the root launch). Folded into the incarnation
+    # identity below so a same-pid, same-image re-exec (the Nix wrapper case)
+    # yields DISTINCT process-start elements. Read inside `withShimMuted`, so the
+    # getenv hook never records it as an observed dependency (golden depfiles are
+    # unaffected).
+    block:
+      let g = getEnv("REPRO_MONITOR_EXEC_GEN")
+      if g.len > 0:
+        try: currentExecGen = clong(parseInt(g))
+        except ValueError: currentExecGen = 0
     # io-mon-Lossless-Event-Capture M3 part 2a — capture THIS incarnation's real
     # image (`/proc/self/exe`) and hand it to the writer as the per-exec identity
     # appended to every SET dep element. The constructor re-runs on every exec, so
     # a post-exec incarnation gets its NEW image here BEFORE its process-start is
     # emitted — keeping the pre/post-exec process-starts distinct set elements with
-    # no synthetic tag (LF-2/LF-7 real dedup element-key).
+    # no synthetic tag (LF-2/LF-7 real dedup element-key). The exec generation is
+    # appended so that even a SAME-image re-exec (identical `/proc/self/exe`) stays
+    # a distinct element.
     block:
       var exeBuf: array[4096, char]
       let n = c_self_exe_path(addr exeBuf[0], csize_t(exeBuf.len))
+      var img = ""
       if n > 0:
-        var img = newString(n)
+        img = newString(n)
         for i in 0 ..< n: img[i] = exeBuf[i]
-        setDepSetIncarnationImage(img)
+      # Separator (0x1f, unit-separator) cannot occur in a path; the generation
+      # suffix keeps same-image re-execs on one pid distinct. Opaque identity
+      # bytes only — `decodeDepRecord` ignores everything past the framed record.
+      setDepSetIncarnationImage(img & '\x1f' & $int(currentExecGen))
     rememberInheritedOpenFds()
   initialized = true
   mainThreadId = currentThreadId()
@@ -2366,7 +2391,14 @@ proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
   if ctx.path != nil:
     record.path = $ctx.path
   emitRecord(record)
-  ctx.envp = envWithPreload(ctx.envp)
+  # io-mon-Lossless-Event-Capture M3 — inject LD_PRELOAD AND an INCREMENTED exec
+  # generation into the child env. exec replaces the address space in the SAME
+  # pid, so without a per-exec generation a same-image re-exec (the Nix
+  # gcc/rustc bash-wrapper) would emit a byte-identical post-exec process-start
+  # that the SET source-dedup collapses → execs>=starts → mrEventLoss →
+  # mcIncomplete. `envWithExecGen` also bumps our own `environ` so the
+  # PATH-searching exec family (execvp/execlp) propagates the generation too.
+  ctx.envp = envWithExecGen(ctx.envp, currentExecGen + 1)
   sampleKillDiag("execve-pre-flush")
   discard repro_monitor_shim_flush()
   sampleKillDiag("execve-post-flush")

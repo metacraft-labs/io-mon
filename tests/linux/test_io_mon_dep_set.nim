@@ -325,6 +325,80 @@ int main(int argc, char **argv) {
       it.kind == mrProcessStart and it.osPid == rootPid)
     check rootStarts == 2
 
+  test "t_exec_same_image_reexec":
+    # The COVERAGE HOLE that let the part-2a regression through: a pid that
+    # re-execs the SAME on-disk image (identical `/proc/self/exe`) — exactly the
+    # Nix gcc/rustc bash-wrapper shape (a bash script that execs the real
+    # compiler in-place; both incarnations carry the bash interpreter image).
+    # The pre/post-exec process-starts are byte-identical AND share the image, so
+    # WITHOUT an exec-generation identity the SET source-dedup collapses them to
+    # ONE element → execs>=starts → mrEventLoss → a FALSE `mcIncomplete` that
+    # defeats caching for every Nix-toolchain build. The exec generation
+    # (REPRO_MONITOR_EXEC_GEN, incremented through the child env) keeps every
+    # same-image incarnation DISTINCT, so completeness stays `mcComplete`.
+    #
+    # `t_exec_distinct_incarnations` only exercises DISTINCT-image execs (kept
+    # apart by the image alone) — it cannot catch a same-image regression. This
+    # test is the teeth: revert the exec-generation fix and it FAILS (rootStarts
+    # collapses to 1 and completeness downgrades to mcIncomplete).
+    check shmSetSupported
+    let snoopBin = ensureSnoop(work)
+    let shimLib = ensureShim()
+
+    # A helper that reads a marker then re-execs ITSELF (via /proc/self/exe, the
+    # real binary path — identical image across every incarnation) advancing a
+    # stage counter, so the SAME pid emits THREE same-image process-starts.
+    let reexec = buildC(work, "same_image_reexec", """
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  char buf[64];
+  int fd = open(argv[1], O_RDONLY);
+  if (fd < 0) return 2;
+  ssize_t n = read(fd, buf, sizeof(buf));
+  close(fd);
+  if (n <= 0) return 3;
+  int stage = atoi(argv[2]);
+  if (stage < 2) {
+    char next[16];
+    snprintf(next, sizeof(next), "%d", stage + 1);
+    execl("/proc/self/exe", argv[0], argv[1], next, (char *)0);
+    _exit(4);
+  }
+  return 0;
+}
+""")
+    let marker = work / "reexec-set-marker.txt"
+    writeFile(marker, "same-image reexec marker\n")
+    let depfile = work / "reexec-set.rdep"
+
+    let env = childEnvWith(shimLib)
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--",
+      reexec, marker, "0"], env)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    # Fully monitored same-image re-exec chain: no false downgrade.
+    check dep.completeness == mcComplete
+    check hasFileRead(dep, marker)
+    check not dep.records.anyIt(it.kind == mrEventLoss)
+    # The root pid re-execs the SAME image TWICE, so THREE process-start elements
+    # must survive as distinct (WITHOUT the exec-generation fix, all three are
+    # byte-identical and collapse to ONE).
+    let rootPid = block:
+      var pid = 0'u64
+      for r in dep.records:
+        if r.kind == mrProcessStart and r.osPid != 0:
+          pid = r.osPid; break
+      pid
+    check rootPid != 0'u64
+    let rootStarts = dep.records.countIt(
+      it.kind == mrProcessStart and it.osPid == rootPid)
+    check rootStarts >= 2
+
   test "t_golden_depfile_regression":
     # The set-only UNBUFFERED path reproduces committed golden depfiles
     # byte-for-byte (normalising only genuine launcher noise via goldenProjection).

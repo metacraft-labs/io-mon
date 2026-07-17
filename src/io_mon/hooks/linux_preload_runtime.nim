@@ -1038,6 +1038,126 @@ char **ct_linux_preload_env_with_preload(char *const envp[]) {
   return result;
 }
 
+/* io-mon Lossless-Event-Capture M3 (exec-generation identity) — build the
+ * child environment for an exec: inject LD_PRELOAD=shim (exactly like
+ * ct_linux_preload_env_with_preload) AND set REPRO_MONITOR_EXEC_GEN=<nextGen>,
+ * REPLACING any value inherited from the current incarnation.
+ *
+ * The generation exists so that two consecutive process-starts on the SAME
+ * pid whose /proc/self/exe is byte-identical (the Nix gcc/rustc bash-wrapper
+ * that re-execs the real compiler in-place) land as DISTINCT dep-set elements.
+ * Without it the second, byte-identical process-start is deduped at the source
+ * and the completeness accounting sees execs>=starts -> mrEventLoss ->
+ * mcIncomplete for every Nix-toolchain build. The child reads this value in
+ * its preload constructor and appends it to its own set-element identity.
+ *
+ * Also bumps the CURRENT process's own `environ` via setenv so the
+ * PATH-searching exec family (execvp/execlp/execvpe), which hands off to
+ * glibc's real_execvp AFTER this hook returns and propagates env through the
+ * LIVE `environ` (NOT the array we return here), carries the same generation.
+ *
+ * Returns a freshly malloc'd, NULL-terminated array (leaked into the exec —
+ * the kernel reclaims the pages when the image is replaced) or the plain
+ * preload array on allocation failure. A stale generation can only ever cause
+ * an over-conservative mcIncomplete, never a false mcComplete. */
+char **ct_linux_preload_env_with_exec_gen(char *const envp[], long nextGen) {
+  char genValue[32];
+  snprintf(genValue, sizeof(genValue), "%ld", nextGen);
+  size_t genEntryLen = strlen("REPRO_MONITOR_EXEC_GEN=") + strlen(genValue) + 1;
+
+  const char *shim = NULL;
+  if (ct_linux_preload_shim_env_name != NULL &&
+      ct_linux_preload_shim_env_name[0] != '\0') {
+    const char *s = getenv(ct_linux_preload_shim_env_name);
+    if (s != NULL && s[0] != '\0') shim = s;
+  }
+
+  char *const *source = envp != NULL ? envp : environ;
+
+  int count = 0;
+  const char *existingPreload = NULL;
+  if (source != NULL) {
+    for (char *const *it = source; *it != NULL; it++) {
+      if (ct_starts_with(*it, "LD_PRELOAD=")) {
+        existingPreload = *it;
+      } else if (ct_starts_with(*it, "REPRO_MONITOR_EXEC_GEN=")) {
+        /* dropped — re-emitted with nextGen below */
+      } else {
+        count++;
+      }
+    }
+  }
+
+  /* LD_PRELOAD entry: keep the caller's value, prepend the shim if absent. */
+  char *preloadEntry = NULL;
+  if (shim != NULL) {
+    const char *existingValue =
+      existingPreload != NULL ? existingPreload + strlen("LD_PRELOAD=") : "";
+    if (existingPreload != NULL && strstr(existingValue, shim) != NULL) {
+      size_t n = strlen(existingPreload) + 1;
+      preloadEntry = (char *)malloc(n);
+      if (preloadEntry != NULL) memcpy(preloadEntry, existingPreload, n);
+    } else {
+      size_t entryLen = strlen("LD_PRELOAD=") + strlen(shim) + 1;
+      if (existingValue[0] != '\0') entryLen += 1 + strlen(existingValue);
+      preloadEntry = (char *)malloc(entryLen);
+      if (preloadEntry != NULL) {
+        if (existingValue[0] != '\0')
+          snprintf(preloadEntry, entryLen, "LD_PRELOAD=%s:%s", shim, existingValue);
+        else
+          snprintf(preloadEntry, entryLen, "LD_PRELOAD=%s", shim);
+      }
+    }
+  } else if (existingPreload != NULL) {
+    size_t n = strlen(existingPreload) + 1;
+    preloadEntry = (char *)malloc(n);
+    if (preloadEntry != NULL) memcpy(preloadEntry, existingPreload, n);
+  }
+
+  char *genEntry = (char *)malloc(genEntryLen);
+  if (genEntry != NULL)
+    snprintf(genEntry, genEntryLen, "REPRO_MONITOR_EXEC_GEN=%s", genValue);
+
+  if (genEntry == NULL || (existingPreload != NULL && preloadEntry == NULL)) {
+    free(preloadEntry);
+    free(genEntry);
+    /* Best-effort: still bump our own environ for the execvp family. */
+    setenv("REPRO_MONITOR_EXEC_GEN", genValue, 1);
+    return ct_linux_preload_env_with_preload(envp);
+  }
+
+  int extra = 1 /* gen */ + (preloadEntry != NULL ? 1 : 0);
+  char **result =
+    (char **)calloc((size_t)count + (size_t)extra + 1, sizeof(char *));
+  if (result == NULL) {
+    free(preloadEntry);
+    free(genEntry);
+    setenv("REPRO_MONITOR_EXEC_GEN", genValue, 1);
+    return ct_linux_preload_env_with_preload(envp);
+  }
+  int index = 0;
+  if (source != NULL) {
+    /* Copy the kept entries (pointers into `source`) BEFORE the setenv below,
+     * which may reallocate/free the `environ` ARRAY container when source ==
+     * environ. setenv never frees the individual entry STRINGS we copy here
+     * (and REPRO_MONITOR_EXEC_GEN, the only entry it may free, is skipped). */
+    for (char *const *it = source; *it != NULL; it++) {
+      if (ct_starts_with(*it, "LD_PRELOAD=")) continue;
+      if (ct_starts_with(*it, "REPRO_MONITOR_EXEC_GEN=")) continue;
+      result[index++] = *it;
+    }
+  }
+  if (preloadEntry != NULL) result[index++] = preloadEntry;
+  result[index++] = genEntry;
+  result[index] = NULL;
+
+  /* Bump our OWN environ last (after `source` is fully consumed) so the
+   * PATH-searching exec family propagates the same generation, and any
+   * environ reallocation cannot dangle the `source` we just read. */
+  setenv("REPRO_MONITOR_EXEC_GEN", genValue, 1);
+  return result;
+}
+
 void ct_linux_preload_register_open_hook(ct_open_hook_fn hook) { ct_open_hook = hook; }
 void ct_linux_preload_register_open64_hook(ct_open_hook_fn hook) { ct_open64_hook = hook; }
 void ct_linux_preload_register_openat_hook(ct_openat_hook_fn hook) { ct_openat_hook = hook; }
@@ -2172,6 +2292,8 @@ proc setPreloadShimEnvVar*(name: cstring) {.importc: "ct_linux_preload_set_shim_
     raises: [].}
 proc envWithPreload*(envp: cstringArray): cstringArray
   {.importc: "ct_linux_preload_env_with_preload", raises: [].}
+proc envWithExecGen*(envp: cstringArray; nextGen: clong): cstringArray
+  {.importc: "ct_linux_preload_env_with_exec_gen", raises: [].}
 
 proc realOpen*(path: cstring; flags, mode: cint): cint
   {.importc: "ct_linux_preload_real_open", raises: [].}

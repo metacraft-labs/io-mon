@@ -281,12 +281,14 @@ var
   # a random tag. Because the image is per-INCARNATION-constant, a probe storm
   # WITHIN one incarnation still collapses (Candidate-C source-dedup), while a
   # DIFFERENT exec'd image yields a distinct element. It is NOT part of the decoded
-  # `MonitorRecord` (`decodeDepRecord` ignores the trailing bytes). KNOWN residual:
-  # a pid that re-execs the SAME image path more than once collapses those identical
-  # process-starts and over-downgrades to a conservative `mcIncomplete` (a safe
-  # over-conservative re-run, never a dropped dependency / false `mcComplete`);
-  # fully-precise handling needs an exec-generation counter threaded through the
-  # child env and is deferred.
+  # `MonitorRecord` (`decodeDepRecord` ignores the trailing bytes). M3 (exec-gen):
+  # the shim now also folds a per-pid EXEC GENERATION (REPRO_MONITOR_EXEC_GEN,
+  # incremented across each exec through the child env) into this identity, so a
+  # pid that re-execs the SAME image path (the Nix gcc/rustc bash-wrapper that
+  # re-execs the real compiler in-place) keeps those byte-identical process-starts
+  # DISTINCT — closing the part-2a over-downgrade to `mcIncomplete` that defeated
+  # caching for every Nix-toolchain build. The generation is opaque identity bytes
+  # here (the shim composes `<image>\x1f<gen>`); the writer stays image-agnostic.
   setElemImage: string
   # M3 part 2a — a pre-encoded event-loss SET element (built once at attach, so the
   # rare oversize/hard-fail path allocates nothing): inserted when a real record
