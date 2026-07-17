@@ -193,6 +193,61 @@ else:
   (`$REPRO_MONITOR_SHIM_LIB` first, then the canonical build layout); empty
   string if none found.
 
+### The public host API — `runMonitored` (the blessed parent-host entry point)
+
+A parent that wants io-mon's guarantees around an arbitrary command should call
+the **public batch host API** rather than shelling out to the CLI or
+hand-rolling the shm/consumer setup:
+
+```nim
+import io_mon
+
+var req: FsSnoopRequest
+req.command = @["cc", "-c", "hello.c", "-o", "hello.o"]
+req.depFilePath = "build.rdep"
+req.streamMode = fsoNone
+
+let res = runMonitored(req)          # owns the ENTIRE lifecycle
+if res.exitCode == 0 and res.completeness == mcComplete:
+  for r in res.records:
+    if r.kind in {mrFileRead, mrLibraryLoad}: echo "input: ", r.path
+else:
+  discard                            # mcIncomplete ⇒ conservatively re-run
+```
+
+- `runMonitored(req: FsSnoopRequest): MonitorResult` — the §5 consumer-side
+  batch entry point. It **owns the whole producer/consumer lifecycle**: resolve
+  the shim → (Linux) create the consumer-owned `nim-shm-set` and export
+  `REPRO_MONITOR_DEP_SHM` + `REPRO_MONITOR_APP_ID` → inject the shim and spawn
+  the process tree → snapshot the deduped set → write the canonical depfile
+  (passing the spawned root pid as the R1 root-guard) → on finish
+  `markConsumerGone` + detach. Because the consumer structure is created,
+  named, and torn down inside this proc — not by the caller — **LF-2** (no
+  orphan spill: a producer never runs without a consumer) and **LF-4**
+  (consumer liveness) hold *by construction* for any parent that uses it.
+  Prefer this to copying `fs_snoop`'s driver: a copy that skips the set/consumer
+  setup is exactly the producer-with-no-consumer bug (LF-2) this API prevents.
+  It still raises on a genuine setup failure (no shim / unsupported platform);
+  the CLI wrapper `runFsSnoopCli` converts those to a diagnostic + non-zero exit.
+- `MonitorResult` — `exitCode` (the monitored command's status), `depFilePath`
+  (where the canonical RMDF depfile was written), and `depFile` (the merged
+  `MonitorDepFile`: `records`, `completeness`, summary, …). Convenience
+  accessors `res.completeness` and `res.records` read through to `depFile`.
+
+`REPRO_MONITOR_APP_ID` scopes the cross-restart reaper so one application never
+reaps another's shared-memory segments; it defaults to `"io-mon"`. A consumer
+that shares a segments directory (e.g. reprobuild/codetracer) sets it to its own
+tag before calling `runMonitored`, and the API re-exports the resolved value to
+the child so producers derive the same reaper scope.
+
+> **Streaming form (`startMonitor* / drain* / finishMonitor*`) — deferred.** M6
+> part A ships only the batch `runMonitored`. A streaming variant would have to
+> hold the mutated process-global injection env (`LD_PRELOAD`, …) live *between*
+> calls, which risks leaking the shim into the parent; the batch form keeps the
+> whole env mutation inside one `defer`-guarded scope. The batch API already
+> covers the parent-host use case (spawn-and-collect), so streaming is left for a
+> follow-up if an incremental/observe-while-running consumer materialises.
+
 ### The launcher contract (completeness root-guard)
 
 A consumer that spawns the **root** process under the shim itself (rather than

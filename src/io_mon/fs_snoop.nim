@@ -633,7 +633,59 @@ proc renderStreamToPath(depfilePath: string; mode: FsSnoopOutputMode;
       for line in lines:
         stderr.writeLine(line)
 
-proc runMonitoredCommand(request: FsSnoopRequest): int =
+type
+  MonitorResult* = object
+    ## Result of a completed `runMonitored` host run (the §5 consumer-side
+    ## batch entry point). Carries the monitored command's exit status plus the
+    ## canonical depfile the host wrote — so a parent gets the depfile path, the
+    ## decoded records, and the honest completeness signal without re-reading the
+    ## file or reasoning about the shm/fragment lifecycle itself.
+    exitCode*: int              ## the monitored command's exit status
+    depFilePath*: string        ## where the canonical RMDF depfile was written
+    depFile*: MonitorDepFile    ## the merged depfile: `.records`, `.completeness`, …
+
+proc completeness*(r: MonitorResult): MonitorCompleteness =
+  ## Convenience accessor: the honest completeness of the captured dependency
+  ## set (`mcComplete` ⇒ the observed set may be trusted; `mcIncomplete` ⇒ the
+  ## consumer must conservatively re-run).
+  r.depFile.completeness
+
+proc records*(r: MonitorResult): seq[MonitorRecord] =
+  ## Convenience accessor: the merged, canonicalised dependency records.
+  r.depFile.records
+
+proc runMonitored*(request: FsSnoopRequest): MonitorResult =
+  ## **Public parent-host API (io-mon-Lossless-Event-Capture §5, M6 part A).**
+  ##
+  ## The blessed, batch consumer-side entry point for hosting an io-mon monitor.
+  ## This proc OWNS the entire producer/consumer lifecycle so a well-formed
+  ## parent can never end up with a producer and no consumer (the structural
+  ## cause of an LF-2 orphan spill):
+  ##
+  ##   1. resolves the interpose shim (`findShimLibrary`);
+  ##   2. on Linux, CREATES the consumer-owned `nim-shm-set` (via
+  ##      `transport.startHost`, appId defaulting to `"io-mon"` or
+  ##      `REPRO_MONITOR_APP_ID`) and exports `REPRO_MONITOR_DEP_SHM` +
+  ##      `REPRO_MONITOR_APP_ID` so the shim's producers attach the RIGHT set;
+  ##   3. injects the shim and SPAWNS the monitored process tree;
+  ##   4. waits for the tree, SNAPSHOTS the deduped set, and writes the canonical
+  ##      depfile via `mergeFragments` (passing the spawned root pid as the R1
+  ##      root-guard, so an un-monitored root downgrades to `mcIncomplete`
+  ##      instead of a false `mcComplete`);
+  ##   5. on FINISH calls `SetHost.finish` (`markConsumerGone` + detach), so a
+  ##      late orphan `emit` fast-fails with `emConsumerGone` (LF-4) and the
+  ##      consumer-owned memory is released.
+  ##
+  ## Because the consumer structure is created, named, and torn down HERE — not
+  ## by the caller — LF-2 (no orphan spill) and LF-4 (consumer liveness) hold by
+  ## construction for any parent that uses this proc. Prefer this over copying
+  ## the driver: a copy that skips step 2 is exactly the producer-with-no-consumer
+  ## bug this API exists to prevent.
+  ##
+  ## Never spawns a consumer-less producer; still raises on a genuine setup
+  ## failure (no shim, unsupported platform) — the CLI wrapper `runFsSnoopCli`
+  ## converts those to a diagnostic + non-zero exit.
+  result.depFilePath = request.depFilePath
   when defined(macosx):
     let shimLib = findShimLibrary()
     if shimLib.len == 0:
@@ -689,10 +741,10 @@ proc runMonitoredCommand(request: FsSnoopRequest): int =
     # mergeFragments downgrades that case to mcIncomplete instead of asserting a
     # false mcComplete over an empty record set.
     let rootPid = uint64(process.processID)
-    result = waitForExit(process)
+    result.exitCode = waitForExit(process)
     close(process)
 
-    discard mergeFragments(fragmentDir, request.depFilePath,
+    result.depFile = mergeFragments(fragmentDir, request.depFilePath,
       expectedRootPid = rootPid)
     renderStreamToPath(request.depFilePath, request.streamMode,
       request.eventStreamPath)
@@ -741,6 +793,11 @@ proc runMonitoredCommand(request: FsSnoopRequest): int =
       depSet = startHost(fragmentDir, runId, appId = depSetAppId)
       if depSet.available:
         setEnvVar("REPRO_MONITOR_DEP_SHM", depSet.path0, oldEnv)
+        # Export the resolved appId too, so a producer that re-derives the
+        # reaper scope (or an in-tree consumer that shares the segments dir)
+        # sees the SAME tag the host created shard0 under — part of the §5
+        # host owning the whole structure lifecycle, not just naming it.
+        setEnvVar("REPRO_MONITOR_APP_ID", depSetAppId, oldEnv)
     setEnvVar("REPRO_MONITOR_SHIM_LIB", shimLib, oldEnv)
     defer: restoreEnv(oldEnv)
     defer:
@@ -763,7 +820,7 @@ proc runMonitoredCommand(request: FsSnoopRequest): int =
 
     # The set requires NO concurrent drain (idempotent inserts, no backpressure),
     # so just wait for the tree to exit.
-    result = waitForExit(process)
+    result.exitCode = waitForExit(process)
     close(process)
 
     waitForLinuxInjectedDescendants(fragmentDir, runId, rootPid)
@@ -799,7 +856,7 @@ proc runMonitoredCommand(request: FsSnoopRequest): int =
       if growthFailed > 0'u64:
         stderr.writeLine("io-mon: dep-set growth failed " & $growthFailed &
           " time(s); dependency capture may be incomplete for this edge")
-    discard mergeFragments(fragmentDir, request.depFilePath,
+    result.depFile = mergeFragments(fragmentDir, request.depFilePath,
       expectedRootPid = rootPid, currentRunId = runId,
       setRecords = depDrained)
     renderStreamToPath(request.depFilePath, request.streamMode,
@@ -830,9 +887,9 @@ proc runMonitoredCommand(request: FsSnoopRequest): int =
     let injection = runWithMonitorShim(request.command, shimLib,
                                        captureStdio = request.captureChildStdio,
                                        captureStdioPath = request.captureStdioPath)
-    result = injection.exitCode
+    result.exitCode = injection.exitCode
 
-    discard mergeFragments(fragmentDir, request.depFilePath)
+    result.depFile = mergeFragments(fragmentDir, request.depFilePath)
     renderStreamToPath(request.depFilePath, request.streamMode,
       request.eventStreamPath)
   else:
@@ -851,7 +908,10 @@ proc runFsSnoopCli*(programName: string; args: seq[string]): int =
       tempRoot = createLocalTempDir("repro-fs-snoop")
       parsed.request.depFilePath = tempRoot / "evidence.rdep"
     try:
-      result = runMonitoredCommand(parsed.request)
+      # The CLI is a thin wrapper over the public batch host API — no duplicated
+      # lifecycle. `runMonitored` owns the shm/consumer setup; we only surface
+      # its exit code (the depfile it wrote is inspected out-of-band).
+      result = runMonitored(parsed.request).exitCode
     finally:
       if tempRoot.len > 0:
         # Best-effort cleanup. On Windows the monitor shim's lingering

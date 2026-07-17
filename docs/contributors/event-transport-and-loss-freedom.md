@@ -465,20 +465,38 @@ library API**, not only a CLI:
   parent reimplements nothing; it sets env and launches.
 - **Protocol/ring** is already one shared library (`nim-shm-queue`, reused by the
   action cache) — the wire format is not duplicated per repo.
-- **Consumer/host side** must be exported (today `runMonitoredCommand` in
-  `fs_snoop.nim` is private; only `runFsSnoopCli` and `findShimLibrary` are
-  public). The blessed surface is:
+- **Consumer/host side** is now exported (**M6 part A landed**, Linux x86-64).
+  The batch host API is public in `fs_snoop.nim` and re-exported from `io_mon`:
 
   ```nim
-  proc runMonitored*(req: FsSnoopRequest): MonitorResult   ## owns ring lifecycle
-  # or streaming:
-  proc startMonitor*(req: FsSnoopRequest): MonitorSession
-  iterator drain*(s: var MonitorSession): MonitorRecord
-  proc finishMonitor*(s: var MonitorSession): MonitorResult
+  proc runMonitored*(req: FsSnoopRequest): MonitorResult   ## owns set lifecycle
+  type MonitorResult* = object
+    exitCode*: int
+    depFilePath*: string
+    depFile*: MonitorDepFile     ## .records, .completeness, …
   ```
 
-  With the lifecycle owned inside the library, "the ring was never set up" is
-  structurally impossible for a well-formed parent.
+  `runMonitored` owns the entire lifecycle — on Linux it **creates** the
+  consumer-owned `nim-shm-set` (via `transport.startHost`, appId defaulting to
+  `"io-mon"` or `REPRO_MONITOR_APP_ID`), **exports** `REPRO_MONITOR_DEP_SHM` +
+  `REPRO_MONITOR_APP_ID`, **spawns** the tree, **snapshots** the deduped set,
+  **writes** the canonical depfile (with the spawned root pid as the R1
+  root-guard), and on **finish** calls `markConsumerGone` + detach. The CLI
+  `runFsSnoopCli` is now a thin wrapper over it (`runMonitored(req).exitCode`) —
+  no duplicated lifecycle. Because the consumer structure is created, named, and
+  torn down inside this proc, **LF-2** (no orphan spill: a producer never runs
+  without a consumer) and **LF-4** (consumer liveness) hold *by construction*
+  for any well-formed parent: "the set was never set up" is structurally
+  impossible. See `io-mon/docs/usage.md` → *The public host API* for the caller
+  contract, and `tests/linux/test_io_mon_public_host_api.nim` for the end-to-end
+  proof (public-surface-only: `mcComplete`, inputs captured, no `.rmdf-frag`
+  spill).
+
+  The **streaming** form (`startMonitor* / drain* / finishMonitor*`) is
+  **deferred** — a streaming host would have to keep the mutated process-global
+  injection env (`LD_PRELOAD`, …) live between calls, risking a shim leak into
+  the parent; the batch form confines that mutation to one `defer`-guarded
+  scope and already covers the spawn-and-collect parent-host use case.
 
 ---
 
