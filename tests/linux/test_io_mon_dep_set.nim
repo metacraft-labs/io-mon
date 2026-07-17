@@ -1,7 +1,7 @@
 ## test_io_mon_dep_set — io-mon-Lossless-Event-Capture M3 (part 2a) integration
 ## tests (Linux).
 ##
-## Part 1 wired nim-shm-set (the M1-winning SET transport, Candidate C) in as
+## Part 1 wired nim-shm-gset (the M1-winning SET transport, Candidate C) in as
 ## io-mon's PRIMARY Linux dependency channel, but carried a raw `encodeDepRecord`
 ## element (INCLUDING `seq`) plus an 8-byte per-incarnation nonce — a lossless
 ## CARRIER that never deduped (every event a distinct element).
@@ -42,8 +42,8 @@ import std/[algorithm, os, osproc, sequtils, streams, strtabs, strutils, unittes
 
 import io_mon
 import io_mon/shm/dep_queue          # decode/encode element bytes ↔ MonitorRecord
-import shm_set                        # attachSet reader / shmSetSupported
-import shm_set/transport              # startHost / attachProducer / emit / snapshot
+import shm_gset                        # attachSet reader / shmSetSupported
+import shm_gset/transport              # startHost / attachProducer / emit / snapshot
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
@@ -169,7 +169,7 @@ int main(int argc, char **argv) {
 }
 """
 
-suite "io-mon dep-set (nim-shm-set real dedup element-key, M3 part 2a)":
+suite "io-mon dep-set (nim-shm-gset real dedup element-key, M3 part 2a)":
   let work = getTempDir() / ("io-mon-dep-set-" & $getCurrentProcessId())
   createDir(work)
 
@@ -601,7 +601,7 @@ int main(int argc, char **argv) {
   test "t_launcher_loss_recorded_in_set_no_file":
     # io-mon-Lossless-Event-Capture M7 (Linux slice) — the CONSUMER's launcher-side
     # event-loss (a monitored descendant still alive past the grace window) is now
-    # recorded into the consumer-owned nim-shm-set, NOT a `.rmdf-frag` file. Prove
+    # recorded into the consumer-owned nim-shm-gset, NOT a `.rmdf-frag` file. Prove
     # Linux is file-free end-to-end: (1) `appendLauncherEventLoss` writes NO
     # `.rmdf-frag` on the active-set path; (2) the set snapshot carries the
     # `mrEventLoss`; (3) `mergeFragments` folds it → `mcIncomplete`.

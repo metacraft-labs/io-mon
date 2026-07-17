@@ -5,7 +5,7 @@
 ## sole assertion that the codec preserves EVERY output-affecting `MonitorRecord`
 ## field; it recovers the `block codec:` coverage from the removed
 ## `test_io_mon_dep_ring_mpsc_roundtrip.nim` (part 2b deleted the ring transport but
-## kept the codec, which now travels the nim-shm-set SET channel). The golden
+## kept the codec, which now travels the nim-shm-gset SET channel). The golden
 ## depfile tests zero several of these fields, so without this test a codec
 ## regression that drops e.g. `childOsPid` or `flags` would silently corrupt
 ## depfiles and still pass.

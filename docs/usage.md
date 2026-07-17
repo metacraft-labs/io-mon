@@ -217,7 +217,7 @@ else:
 
 - `runMonitored(req: FsSnoopRequest): MonitorResult` — the §5 consumer-side
   batch entry point. It **owns the whole producer/consumer lifecycle**: resolve
-  the shim → (Linux) create the consumer-owned `nim-shm-set` and export
+  the shim → (Linux) create the consumer-owned `nim-shm-gset` and export
   `REPRO_MONITOR_DEP_SHM` + `REPRO_MONITOR_APP_ID` → inject the shim and spawn
   the process tree → snapshot the deduped set → write the canonical depfile
   (passing the spawned root pid as the R1 root-guard) → on finish

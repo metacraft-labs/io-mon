@@ -27,7 +27,7 @@
 ##      FALSE mcComplete) and the SET transport drops nothing under the kill.
 ##
 ## CLASS-(a) TRANSPORT GATE (the campaign's cardinal sin): for every build we
-## capture twice from clean — once through the nim-shm-set SET transport (the
+## capture twice from clean — once through the nim-shm-gset SET transport (the
 ## thing this campaign changed) and once through the pure-file baseline
 ## (`REPRO_MONITOR_DEP_SHM_DISABLE=1`). Any build input the FILE baseline
 ## observed but the SET path dropped is a class-(a) transport loss and FAILS the

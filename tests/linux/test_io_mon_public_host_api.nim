@@ -18,7 +18,7 @@
 import std/[os, osproc, sequtils, streams, strutils, unittest]
 
 import io_mon                            # runMonitored / MonitorResult (PUBLIC)
-import shm_set                           # shmSetSupported
+import shm_gset                           # shmSetSupported
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()

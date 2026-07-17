@@ -5,13 +5,13 @@ import io_mon/codec
 import io_mon/capabilities
 import io_mon/types
 import io_mon/shm/dep_queue
-# io-mon-Lossless-Event-Capture M3 (part 1) — the SET transport (nim-shm-set,
+# io-mon-Lossless-Event-Capture M3 (part 1) — the SET transport (nim-shm-gset,
 # Candidate C / the M1 winner) is the new PRIMARY Linux dependency channel. The
 # producer publishes each observed record into a consumer-owned grow-only set via
 # the §5 transport surface; the DEP-SHM ring (`dep_queue`) is retained only for
 # the legacy ring tests / any non-`.shard0` segment. We still reuse `dep_queue`'s
 # `encodeDepRecord` codec to turn a `MonitorRecord` into the opaque element bytes.
-import shm_set/transport as shmset
+import shm_gset/transport as shmset
 
 const
   hostUsesFileFallback* = not defined(linux)
@@ -25,7 +25,7 @@ const
     ##           (their shm producer arms are M4/M5), so the whole file subsystem is
     ##           live for them and the reader still SCANS + NETS the fragment dir.
     ## ``false`` on Linux — the producer publishes into the consumer-owned
-    ##           ``nim-shm-set`` (part 2a) and, as of M7, the CONSUMER's launcher-
+    ##           ``nim-shm-gset`` (part 2a) and, as of M7, the CONSUMER's launcher-
     ##           side event-loss also goes into that set (``fs_snoop`` no longer
     ##           writes a ``.rmdf-frag``), so the REAL Linux shim flow is file-free
     ##           end-to-end and never scans a fragment dir it did not fill.
@@ -279,7 +279,7 @@ var
   registrySlots: array[MaxFragmentSlots, ptr FragmentSlot]
   registryCount: int
   # io-mon-Lossless-Event-Capture M3 — the process-global producer view of the
-  # edge's shared-memory SET (nim-shm-set), the PRIMARY dependency transport.
+  # edge's shared-memory SET (nim-shm-gset), the PRIMARY dependency transport.
   # Attached by `attachDepQueueForShim` when REPRO_MONITOR_DEP_SHM names a
   # `.shard0` path (a set) rather than a legacy ring segment.
   #
@@ -410,7 +410,7 @@ proc attachDepQueueForShim*(segmentPath: string) =
   ## parent's fd/mapping. Idempotent.
   ##
   ## io-mon-Lossless-Event-Capture M3 — TRANSPORT SELECTION by segment name. The
-  ## io-mon consumer (fs_snoop) creates a nim-shm-set and names it via
+  ## io-mon consumer (fs_snoop) creates a nim-shm-gset and names it via
   ## REPRO_MONITOR_DEP_SHM = its shard0 path (ends `.shard0`), so a `.shard0` value
   ## ⇒ attach the SET (the sole Linux dependency channel; part 2b removed the
   ## superseded DEP-SHM ring). A non-`.shard0` value names no transport this
@@ -436,7 +436,7 @@ proc discardDepQueueAfterFork*(segmentPath: string) =
 
 proc depSetIsActive*(): bool =
   ## io-mon-Lossless-Event-Capture M3 (part 1) — true when the producer attached
-  ## to a live nim-shm-set (the new primary transport). Test/introspection.
+  ## to a live nim-shm-gset (the new primary transport). Test/introspection.
   setProducerAttached and setProducer.available
 
 proc ensureRegistryLock() {.raises: [].} =
@@ -1448,7 +1448,7 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   ## ``FragmentBatchMaxAgeNs`` (default 100 ms) — bounding the worst-
   ## case data-loss window on SIGKILL.
   # io-mon-Lossless-Event-Capture M3 part 2a — PRIMARY path is the SET transport
-  # (nim-shm-set, the M1-winning Candidate-C channel). Part 2b removed the
+  # (nim-shm-gset, the M1-winning Candidate-C channel). Part 2b removed the
   # superseded DEP-SHM ring, so the only channels are the SET (Linux) and the
   # `.rmdf-frag` file writer below (the retained macOS/Windows arm + the Linux
   # launcher-side loss marker).
@@ -2701,7 +2701,7 @@ proc mergeFragments*(fragmentDir, outputPath: string;
     currentRunId = "";
     setRecords: openArray[MonitorRecord] = @[]): MonitorDepFile =
   ## io-mon-Lossless-Event-Capture M3 — `setRecords` are the DISTINCT records the
-  ## consumer decoded from the edge's shared-memory SET (nim-shm-set) snapshot
+  ## consumer decoded from the edge's shared-memory SET (nim-shm-gset) snapshot
   ## (the sole Linux dependency transport; see fs_snoop). They are folded into the
   ## SAME record set as the file fragments BEFORE the run-scoping, read-tail
   ## netting, and canonical ordering — so a record that travelled the set is

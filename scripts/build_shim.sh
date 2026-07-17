@@ -50,13 +50,13 @@ if [ ! -d "$shm_queue_src" ]; then
 fi
 
 # io-mon-Lossless-Event-Capture M3 (part 1) — the shim's dependency producer now
-# publishes into the nim-shm-set SET transport (io_mon/writer attaches it when
+# publishes into the nim-shm-gset SET transport (io_mon/writer attaches it when
 # REPRO_MONITOR_DEP_SHM names a `.shard0` path). Pure std/posix on the insert hot
-# path — serialization-free, fork/orc-safe. Sibling at ../nim-shm-set/src;
-# override with $SHM_SET_SRC when building from a read-only store path.
-shm_set_src="${SHM_SET_SRC:-../nim-shm-set/src}"
-if [ ! -d "$shm_set_src" ]; then
-  echo "missing nim-shm-set at $shm_set_src; set SHM_SET_SRC" >&2
+# path — serialization-free, fork/orc-safe. Sibling at ../nim-shm-gset/src;
+# override with $SHM_GSET_SRC when building from a read-only store path.
+shm_gset_src="${SHM_GSET_SRC:-../nim-shm-gset/src}"
+if [ ! -d "$shm_gset_src" ]; then
+  echo "missing nim-shm-gset at $shm_gset_src; set SHM_GSET_SRC" >&2
   exit 2
 fi
 
@@ -89,7 +89,7 @@ case "$(uname -s)" in
       --path:src \
       --path:"${stackable_hooks_src}" \
       --path:"${shm_queue_src}" \
-      --path:"${shm_set_src}" \
+      --path:"${shm_gset_src}" \
       --nimcache:"${nimcache_dir}/io-mon-shim-dylib" \
       --out:"${out_dir}/librepro_monitor_shim.dylib" \
       src/io_mon/shim/macos_interpose.nim
@@ -109,7 +109,7 @@ case "$(uname -s)" in
       --path:src \
       --path:"${stackable_hooks_src}" \
       --path:"${shm_queue_src}" \
-      --path:"${shm_set_src}" \
+      --path:"${shm_gset_src}" \
       --nimcache:"${nimcache_dir}/io-mon-shim-so" \
       --out:"${out_dir}/librepro_monitor_shim.so" \
       src/io_mon/shim/linux_preload.nim
@@ -124,7 +124,7 @@ case "$(uname -s)" in
       --path:src \
       --path:"${stackable_hooks_src}" \
       --path:"${shm_queue_src}" \
-      --path:"${shm_set_src}" \
+      --path:"${shm_gset_src}" \
       --nimcache:"${nimcache_dir}/io-mon-shim-dll" \
       --out:"${out_dir}/librepro_monitor_shim.dll" \
       src/io_mon/shim/windows_interpose.nim

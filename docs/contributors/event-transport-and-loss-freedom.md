@@ -124,7 +124,7 @@ transport decision in §3.
 > decision is that **both principal models are implemented and benchmarked
 > head-to-head under a real probe storm** before one is chosen — Candidate A (the
 > `nim-shm-queue` ring + backpressure) and Candidate C (a **new
-> `nim-shm-set` library**), with the small ordered side channel (§2) built
+> `nim-shm-gset` library**), with the small ordered side channel (§2) built
 > on Candidate B. See the corrective campaign
 > `reprobuild-specs/io-mon-Lossless-Event-Capture.milestones.org` (M1 spike). This
 > section records the candidates and their trade-offs so the decision is made in
@@ -252,14 +252,14 @@ the kernel does the waiting.
   *small ordered* channel (§2), where volume is low and native ordering + native
   backpressure are exactly what is wanted.
 
-### Candidate C — new `nim-shm-set`: an append-only shared-memory set
+### Candidate C — new `nim-shm-gset`: an append-only shared-memory set
 
 Model the channel as what the data actually is (§2): a **set**. Formally a
 **grow-only set (G-Set)** — a state-based CRDT whose state is a bounded
 join-semilattice and whose merge is **union**: insert is idempotent, nothing is
 ever deleted, merge is order-independent. That algebra is what makes the sharded
 design below correct regardless of write order, writer, or duplication. It is a
-**new standalone library, `nim-shm-set`** (`metacraft-labs/nim-shm-set`, sibling
+**new standalone library, `nim-shm-gset`** (`metacraft-labs/nim-shm-gset`, sibling
 to `nim-shm-queue`).
 
 **Pure membership (chosen).** The element is the full observation tuple
@@ -369,7 +369,7 @@ processes) + ASan/UBSan + DRD. **Mandatory on x86 AND ARM64.**
 
 ### Comparison and leaning
 
-| | A: SHM ring + backpressure | B: OS-primitive MPSC queue | C: `nim-shm-set` (sharded append-only set) |
+| | A: SHM ring + backpressure | B: OS-primitive MPSC queue | C: `nim-shm-gset` (sharded append-only set) |
 |---|---|---|---|
 | Backpressure | hand-rolled, busy-wait both sides | native (kernel blocks) | moot (idempotent inserts) |
 | Cost per event | zero-syscall push | **one syscall per event** | one CAS; dup = one CAS, no growth |
@@ -382,7 +382,7 @@ processes) + ASan/UBSan + DRD. **Mandatory on x86 AND ARM64.**
 
 **Decision:** implement **both** principal models — Candidate **A** (the
 `nim-shm-queue` ring with the `opBlockProducer` policy) and Candidate **C** (the
-new sharded `nim-shm-set`, plus a **size-once baseline**) — behind a common
+new sharded `nim-shm-gset`, plus a **size-once baseline**) — behind a common
 producer/consumer interface, and **benchmark them head-to-head** under a real
 fork/probe storm including a many-producer `cargo` build (M1). The prior is that
 C wins the file-dependency **set** because dedup-at-source dissolves the
@@ -477,7 +477,7 @@ library API**, not only a CLI:
   ```
 
   `runMonitored` owns the entire lifecycle — on Linux it **creates** the
-  consumer-owned `nim-shm-set` (via `transport.startHost`, appId defaulting to
+  consumer-owned `nim-shm-gset` (via `transport.startHost`, appId defaulting to
   `"io-mon"` or `REPRO_MONITOR_APP_ID`), **exports** `REPRO_MONITOR_DEP_SHM` +
   `REPRO_MONITOR_APP_ID`, **spawns** the tree, **snapshots** the deduped set,
   **writes** the canonical depfile (with the spawned root pid as the R1

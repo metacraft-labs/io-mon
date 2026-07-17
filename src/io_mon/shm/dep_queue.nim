@@ -3,11 +3,11 @@
 ## io-mon-Lossless-Event-Capture M3 part 2b — the superseded DEP-SHM MPSC ring
 ## transport (`DepQueue`, `createDepQueueAtPath`/`attachDepQueueAtPath`,
 ## `tryPushRecord`/`tryDrainOne`, the drop-on-full segment) has been REMOVED: the
-## M1-winning `nim-shm-set` SET transport is the sole Linux dependency channel and
+## M1-winning `nim-shm-gset` SET transport is the sole Linux dependency channel and
 ## nothing on the retained set path used the ring any longer. What remains here —
 ## and is RETAINED — is ONLY the dep-specific `MonitorRecord` **codec** the SET
 ## transport depends on: it turns a `MonitorRecord` into the opaque element bytes
-## the `nim-shm-set` producer publishes (`encodeDepRecordIdentity`) and back
+## the `nim-shm-gset` producer publishes (`encodeDepRecordIdentity`) and back
 ## (`decodeDepRecord`), plus the real-`seq` variant (`encodeDepRecord`).
 ##
 ## The codec is domain-only (no ring, no segment, no atomics): a fixed header +
@@ -137,7 +137,7 @@ proc encodeDepRecord*(record: MonitorRecord; buf: var openArray[byte]): int =
 
 proc encodeDepRecordIdentity*(record: MonitorRecord; buf: var openArray[byte]): int =
   ## io-mon-Lossless-Event-Capture M3 (part 2a) — the DEDUP element-key encoder for
-  ## the nim-shm-set SET transport (the M1-winning Candidate-C channel). Identical
+  ## the nim-shm-gset SET transport (the M1-winning Candidate-C channel). Identical
   ## to `encodeDepRecord` EXCEPT the per-record monotonic `seq` is forced to 0, so
   ## the encoded bytes are the record's *identity*, not its event ordinal.
   ##

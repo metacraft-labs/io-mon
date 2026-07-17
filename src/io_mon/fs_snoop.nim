@@ -6,12 +6,12 @@ import io_mon/render
 import io_mon/types
 import io_mon/writer
 import io_mon/shm/dep_queue
-# io-mon-Lossless-Event-Capture M3 (part 1) — the CONSUMER hosts a nim-shm-set
+# io-mon-Lossless-Event-Capture M3 (part 1) — the CONSUMER hosts a nim-shm-gset
 # (the M1-winning SET transport) as the new primary Linux dependency channel; it
 # decodes the merged set with dep_queue's `decodeDepRecord`. `shmSetSupported`
 # gates the Linux arm; `transport` is the §5 host lifecycle.
-import shm_set as shmset_core
-import shm_set/transport as shmset
+import shm_gset as shmset_core
+import shm_gset/transport as shmset
 
 when defined(linux):
   import std/[algorithm, monotimes, sequtils]
@@ -83,7 +83,7 @@ when defined(linux):
 
   proc emitLauncherLossToSet(path0: string; rec: MonitorRecord): bool =
     ## io-mon-Lossless-Event-Capture M7 (Linux slice) — insert a consumer-side
-    ## launcher event-loss marker into the edge's consumer-owned `nim-shm-set` (the
+    ## launcher event-loss marker into the edge's consumer-owned `nim-shm-gset` (the
     ## same set the shim's producers publish into), so `runFsSnoop`'s finalize
     ## `snapshot` folds it into the depfile as an `mrEventLoss` → `mcIncomplete`,
     ## with NO `.rmdf-frag` file. Attaches a short-lived producer to the host's
@@ -111,7 +111,7 @@ when defined(linux):
   proc appendLauncherEventLoss*(fragmentDir, runId, detail: string;
       depSetPath0 = "") =
     ## Record a launcher-side event-loss for THIS run. On Linux the loss is
-    ## published into the consumer-owned `nim-shm-set` at `depSetPath0` (M7 Linux
+    ## published into the consumer-owned `nim-shm-gset` at `depSetPath0` (M7 Linux
     ## slice — file-free), so `writer.hostUsesFileFallback` is `false` and no
     ## `.rmdf-frag` is written. The `.rmdf-frag` writer is used ONLY as the fallback
     ## when the set is unavailable (the `REPRO_MONITOR_DEP_SHM_DISABLE` pure-file
@@ -700,7 +700,7 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
   ## cause of an LF-2 orphan spill):
   ##
   ##   1. resolves the interpose shim (`findShimLibrary`);
-  ##   2. on Linux, CREATES the consumer-owned `nim-shm-set` (via
+  ##   2. on Linux, CREATES the consumer-owned `nim-shm-gset` (via
   ##      `transport.startHost`, appId defaulting to `"io-mon"` or
   ##      `REPRO_MONITOR_APP_ID`) and exports `REPRO_MONITOR_DEP_SHM` +
   ##      `REPRO_MONITOR_APP_ID` so the shim's producers attach the RIGHT set;
@@ -804,7 +804,7 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
     setEnvVar("REPRO_MONITOR_SESSION", runId, oldEnv)
 
     # io-mon-Lossless-Event-Capture M3 (part 1) — the CONSUMER hosts the edge's
-    # shared-memory SET (nim-shm-set, the M1-winning transport) BEFORE launching
+    # shared-memory SET (nim-shm-gset, the M1-winning transport) BEFORE launching
     # the process tree, and names it via REPRO_MONITOR_DEP_SHM = its shard0 path
     # (ends `.shard0`, which is how the shim's producer selects the set over the
     # legacy ring). Producers IDEMPOTENTLY INSERT each observed record into this
