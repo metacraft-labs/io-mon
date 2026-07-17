@@ -14,6 +14,32 @@ import io_mon/shm/dep_queue
 import shm_set/transport as shmset
 
 const
+  hostUsesFileFallback* = not defined(linux)
+    ## io-mon-Lossless-Event-Capture M7 (Linux slice) — the platform boundary for
+    ## the ``.rmdf-frag`` FILE producer / DEP-FLUSH read-tail / ``.io-mon-reading``
+    ## sentinel / sig-safe committed frame / ``FragmentMaxBytesDefault`` byte-cap
+    ## and ``mergeFragments``' fragment-dir SCAN + netting.
+    ##
+    ## ``true``  on macOS / Windows — those shims (``macos_interpose.nim`` /
+    ##           ``windows_interpose.nim``) still PRODUCE ``.rmdf-frag`` fragments
+    ##           (their shm producer arms are M4/M5), so the whole file subsystem is
+    ##           live for them and the reader still SCANS + NETS the fragment dir.
+    ## ``false`` on Linux — the producer publishes into the consumer-owned
+    ##           ``nim-shm-set`` (part 2a) and, as of M7, the CONSUMER's launcher-
+    ##           side event-loss also goes into that set (``fs_snoop`` no longer
+    ##           writes a ``.rmdf-frag``), so the REAL Linux shim flow is file-free
+    ##           end-to-end and never scans a fragment dir it did not fill.
+    ##
+    ## RETIREMENT (per platform, as each arm lands): flip the corresponding OS out
+    ## of this predicate and DELETE its file writer + reader scan. Until then the
+    ## shared file writer / merge-scan machinery stay COMPILED on every platform —
+    ## macOS/Windows NEED them, and io-mon's Linux-run PORTABLE unit tests
+    ## (``t0_completeness`` / ``s1_external_content`` / ``parity_with_fs_snoop`` /
+    ## ``rd_classification`` / ``sig_safe_committed_frame`` / ``post_fork_sentinel_
+    ## hygiene``) drive ``appendFragmentRecord`` / ``mergeFragments`` DIRECTLY as
+    ## pure-logic coverage of that shared code, so guarding the symbols off the
+    ## Linux build would delete ~90 [OK] of verifiable coverage. Leaving that code
+    ## compiled-but-runtime-dead on Linux is deliberate conservative under-guarding.
   CanonicalFileKind = 1'u16
   FnvOffset = 14695981039346656037'u64
   FnvPrime = 1099511628211'u64

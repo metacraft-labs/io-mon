@@ -597,3 +597,68 @@ int main(int argc, char **argv) {
     check reader.available
     check reader.snapshot().len == before
     reader.detach()
+
+  test "t_launcher_loss_recorded_in_set_no_file":
+    # io-mon-Lossless-Event-Capture M7 (Linux slice) — the CONSUMER's launcher-side
+    # event-loss (a monitored descendant still alive past the grace window) is now
+    # recorded into the consumer-owned nim-shm-set, NOT a `.rmdf-frag` file. Prove
+    # Linux is file-free end-to-end: (1) `appendLauncherEventLoss` writes NO
+    # `.rmdf-frag` on the active-set path; (2) the set snapshot carries the
+    # `mrEventLoss`; (3) `mergeFragments` folds it → `mcIncomplete`.
+    check shmSetSupported
+    # The migration is Linux-only: on this platform the file producer is NOT the
+    # host fallback for launcher loss.
+    check not hostUsesFileFallback
+    let dir = work / "launcher-loss-set"
+    createDir(dir)
+    let runId = "launcher-loss-run"
+
+    var host = startHost(dir, runId)
+    check host.available
+
+    # The exact detail the live `waitForLinuxInjectedDescendants` grace-timeout
+    # path emits — routed through the migrated `appendLauncherEventLoss`.
+    appendLauncherEventLoss(dir, runId,
+      "linux injected descendants still live after root exit pids=4242",
+      host.path0)
+
+    # (1) NO `.rmdf-frag` file anywhere in the fragment dir — the launcher loss
+    # never touched the file writer (Linux file-free).
+    var fragFiles = 0
+    for kind, path in walkDir(dir):
+      if kind == pcFile and path.endsWith(".rmdf-frag"):
+        inc fragFiles
+    check fragFiles == 0
+
+    # (2) The loss IS present in the consumer-owned set, run-stamped.
+    let setRecs = decodeSet(host)
+    check setRecs.anyIt(it.kind == mrEventLoss and
+      "linux injected descendants still live" in it.detail and
+      ("run=" & runId) in it.detail)
+
+    # (3) Folding the set snapshot into the merge downgrades the edge, exactly as a
+    # file-borne launcher loss used to — but with an empty fragment dir on disk.
+    let dep = mergeFragments(dir, dir / "launcher-loss.rdep",
+      currentRunId = runId, setRecords = setRecs)
+    check dep.completeness == mcIncomplete
+    # The merged depfile references NO `.rmdf-frag` path (nothing was scanned).
+    check not dep.records.anyIt(it.path.endsWith(".rmdf-frag"))
+    host.finish()
+
+  test "t_launcher_loss_file_fallback_retained_when_set_unavailable":
+    # The shared `.rmdf-frag` writer is the RETAINED fallback (macOS/Windows arm +
+    # the Linux `REPRO_MONITOR_DEP_SHM_DISABLE` pure-file baseline): when no set is
+    # available (empty `depSetPath0`), `appendLauncherEventLoss` still records the
+    # loss to a fragment file so the edge is honestly `mcIncomplete`, never dropped.
+    let dir = work / "launcher-loss-file-fallback"
+    createDir(dir)
+    let runId = "launcher-loss-file-run"
+    appendLauncherEventLoss(dir, runId,
+      "linux injected-descendant /proc scan failed", "")  # no set → file fallback
+    var fragFiles = 0
+    for kind, path in walkDir(dir):
+      if kind == pcFile and path.endsWith(".rmdf-frag"):
+        inc fragFiles
+    check fragFiles == 1
+    let dep = mergeFragments(dir, dir / "fallback.rdep", currentRunId = runId)
+    check dep.completeness == mcIncomplete

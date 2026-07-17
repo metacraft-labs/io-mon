@@ -81,15 +81,52 @@ when defined(linux):
     except OSError:
       return (@[], true)
 
-  proc appendLauncherEventLoss(fragmentDir, runId, detail: string) =
-    appendFragmentRecord(fragmentDir, MonitorRecord(
+  proc emitLauncherLossToSet(path0: string; rec: MonitorRecord): bool =
+    ## io-mon-Lossless-Event-Capture M7 (Linux slice) — insert a consumer-side
+    ## launcher event-loss marker into the edge's consumer-owned `nim-shm-set` (the
+    ## same set the shim's producers publish into), so `runFsSnoop`'s finalize
+    ## `snapshot` folds it into the depfile as an `mrEventLoss` → `mcIncomplete`,
+    ## with NO `.rmdf-frag` file. Attaches a short-lived producer to the host's
+    ## `path0` (the host is still alive here — `finish()` runs later, on proc exit),
+    ## emits ONE idempotent element, and detaches. Returns true when the marker is
+    ## durable in consumer-owned memory (LF-3). The element is run-stamped in
+    ## `rec.detail`, so `mergeFragments`' run-scoping keeps it for this run.
+    if path0.len == 0:
+      return false
+    var prod = shmset.attachProducer(path0)
+    if not prod.available:
+      prod.detach()
+      return false
+    var buf {.noinit.}: array[512, byte]
+    let n = encodeDepRecordIdentity(rec, buf)
+    result = false
+    if n >= 0:
+      case prod.emit(buf.toOpenArray(0, n - 1))
+      of emInserted, emExists, emSaturated, emConsumerGone:
+        result = true
+      of emOversize, emUnavailable:
+        result = false
+    prod.detach()
+
+  proc appendLauncherEventLoss*(fragmentDir, runId, detail: string;
+      depSetPath0 = "") =
+    ## Record a launcher-side event-loss for THIS run. On Linux the loss is
+    ## published into the consumer-owned `nim-shm-set` at `depSetPath0` (M7 Linux
+    ## slice — file-free), so `writer.hostUsesFileFallback` is `false` and no
+    ## `.rmdf-frag` is written. The `.rmdf-frag` writer is used ONLY as the fallback
+    ## when the set is unavailable (the `REPRO_MONITOR_DEP_SHM_DISABLE` pure-file
+    ## baseline) — matching the shared file producer that macOS/Windows still use.
+    let rec = MonitorRecord(
       kind: mrEventLoss,
       observationKind: moEventLoss,
       osPid: uint64(getCurrentProcessId()),
-      detail: detail & " run=" & runId))
+      detail: detail & " run=" & runId)
+    if not hostUsesFileFallback and emitLauncherLossToSet(depSetPath0, rec):
+      return
+    appendFragmentRecord(fragmentDir, rec)
 
   proc waitForLinuxInjectedDescendants(fragmentDir, runId: string;
-      rootPid: uint64) =
+      rootPid: uint64; depSetPath0 = "") =
     let graceMs = envInt("IO_MON_LINUX_DESCENDANT_GRACE_MS",
       LinuxInjectedDescendantGraceMsDefault, 0)
     let pollMs = envInt("IO_MON_LINUX_DESCENDANT_POLL_MS",
@@ -99,7 +136,7 @@ when defined(linux):
       let live = liveInjectedDescendants(runId, fragmentDir, rootPid)
       if live.scanFailed:
         appendLauncherEventLoss(fragmentDir, runId,
-          "linux injected-descendant /proc scan failed")
+          "linux injected-descendant /proc scan failed", depSetPath0)
         return
       if live.pids.len == 0:
         return
@@ -107,7 +144,7 @@ when defined(linux):
       if elapsedMs >= graceMs:
         appendLauncherEventLoss(fragmentDir, runId,
           "linux injected descendants still live after root exit pids=" &
-            live.pids.join(","))
+            live.pids.join(","), depSetPath0)
         return
       sleep(min(pollMs, graceMs - int(elapsedMs)))
 
@@ -823,7 +860,12 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
     result.exitCode = waitForExit(process)
     close(process)
 
-    waitForLinuxInjectedDescendants(fragmentDir, runId, rootPid)
+    # io-mon-Lossless-Event-Capture M7 (Linux slice) — hand the live set's shard0
+    # path so a launcher-side event-loss (a descendant still alive past the grace
+    # window) is inserted into the CONSUMER-OWNED set, folded into the depfile by
+    # the snapshot below, with NO `.rmdf-frag` file — Linux is file-free end-to-end.
+    let launcherLossPath0 = if depSet.available: depSet.path0 else: ""
+    waitForLinuxInjectedDescendants(fragmentDir, runId, rootPid, launcherLossPath0)
     # io-mon-Lossless-Event-Capture M3 part 2a — SINGLE-THREADED final merge over
     # the SET's DISTINCT elements. The DEP-FLUSH shutdown guarantees every producer
     # published its last record, so snapshot the deduped union of all shards and
