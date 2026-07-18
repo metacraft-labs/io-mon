@@ -42,7 +42,7 @@ import std/[algorithm, os, osproc, sequtils, streams, strtabs, strutils, unittes
 
 import io_mon
 import io_mon/shm/dep_queue          # decode/encode element bytes ↔ MonitorRecord
-import shm_gset                        # attachSet reader / shmSetSupported
+import shm_gset                        # attachSet reader / shmGSetSupported
 import shm_gset/transport              # startHost / attachProducer / emit / snapshot
 
 const
@@ -177,7 +177,7 @@ suite "io-mon dep-set (nim-shm-gset real dedup element-key, M3 part 2a)":
     # The shim attaches the SET (REPRO_MONITOR_DEP_SHM = a shard0 path) and
     # INSERTS each observed read. The consumer snapshot, decoded, carries every
     # marker read.
-    check shmSetSupported
+    check shmGSetSupported
     let shimLib = ensureShim()
 
     const N = 6
@@ -218,7 +218,7 @@ suite "io-mon dep-set (nim-shm-gset real dedup element-key, M3 part 2a)":
     # The Candidate-C benefit is now REAL. A single process re-stats ONE path
     # STORM_N times; because the identity element-key drops `seq`, all those
     # exact-duplicate probe observations collapse to ONE distinct set element.
-    check shmSetSupported
+    check shmGSetSupported
     let shimLib = ensureShim()
 
     const StormN = 500
@@ -275,7 +275,7 @@ int main(int argc, char **argv) {
     # a fully-monitored exec. The `/proc/self/exe` image identity keeps them
     # DISTINCT: exactly TWO process-start elements survive, so the completeness
     # invariant holds and the merged depfile is mcComplete.
-    check shmSetSupported
+    check shmGSetSupported
     let snoopBin = ensureSnoop(work)
     let shimLib = ensureShim()
 
@@ -341,7 +341,7 @@ int main(int argc, char **argv) {
     # apart by the image alone) — it cannot catch a same-image regression. This
     # test is the teeth: revert the exec-generation fix and it FAILS (rootStarts
     # collapses to 1 and completeness downgrades to mcIncomplete).
-    check shmSetSupported
+    check shmGSetSupported
     let snoopBin = ensureSnoop(work)
     let shimLib = ensureShim()
 
@@ -499,7 +499,7 @@ int main(int argc, char **argv) {
     # (2) SUCCESS: the same workload against a LIVE set is mcComplete and STILL
     #     writes no `.rmdf-frag` — proving the file path is dormant on the active
     #     set path (LF-7: the shim publishes only to the set).
-    check shmSetSupported
+    check shmGSetSupported
     let shimLib = ensureShim()
     let reader = buildC(work, "lf2_reader", markerReaderSrc())
     let marker = work / "lf2-marker.txt"
@@ -563,7 +563,7 @@ int main(int argc, char **argv) {
   test "t_orphan_producer_bounded":
     # LF-4: a monitored descendant that OUTLIVES its monitor cannot grow the
     # consumer-owned set once the consumer marks itself gone.
-    check shmSetSupported
+    check shmGSetSupported
     let dir = work / "orphan"
     createDir(dir)
 
@@ -605,7 +605,7 @@ int main(int argc, char **argv) {
     # Linux is file-free end-to-end: (1) `appendLauncherEventLoss` writes NO
     # `.rmdf-frag` on the active-set path; (2) the set snapshot carries the
     # `mrEventLoss`; (3) `mergeFragments` folds it → `mcIncomplete`.
-    check shmSetSupported
+    check shmGSetSupported
     # The migration is Linux-only: on this platform the file producer is NOT the
     # host fallback for launcher loss.
     check not hostUsesFileFallback

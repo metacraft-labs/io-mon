@@ -19,5 +19,5 @@ switch("path", shmQueueSrc)
 # winner), replacing the DEP-SHM ring as the producer→consumer fast path while
 # the `.rmdf-frag` file fallback stays in place (its deletion is part 2). Same
 # sibling-checkout / $SHM_GSET_SRC override discipline as $SHM_QUEUE_SRC above.
-let shmSetSrc = getEnv("SHM_GSET_SRC", "../nim-shm-gset/src")
-switch("path", shmSetSrc)
+let shmGSetSrc = getEnv("SHM_GSET_SRC", "../nim-shm-gset/src")
+switch("path", shmGSetSrc)

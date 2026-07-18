@@ -18,7 +18,7 @@
 import std/[os, osproc, sequtils, streams, strutils, unittest]
 
 import io_mon                            # runMonitored / MonitorResult (PUBLIC)
-import shm_gset                           # shmSetSupported
+import shm_gset                           # shmGSetSupported
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
@@ -85,7 +85,7 @@ proc fragmentDirsUnder(dir: string): seq[string] =
 
 suite "io-mon public parent-host API (runMonitored, M6 part A)":
   test "t_run_monitored_end_to_end":
-    check shmSetSupported
+    check shmGSetSupported
     let shimLib = ensureShim()
     check shimLib.len > 0
 

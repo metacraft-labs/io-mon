@@ -8,7 +8,7 @@ import io_mon/writer
 import io_mon/shm/dep_queue
 # io-mon-Lossless-Event-Capture M3 (part 1) — the CONSUMER hosts a nim-shm-gset
 # (the M1-winning SET transport) as the new primary Linux dependency channel; it
-# decodes the merged set with dep_queue's `decodeDepRecord`. `shmSetSupported`
+# decodes the merged set with dep_queue's `decodeDepRecord`. `shmGSetSupported`
 # gates the Linux arm; `transport` is the §5 host lifecycle.
 import shm_gset as shmset_core
 import shm_gset/transport as shmset
@@ -818,7 +818,7 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
     # ZERO records (LF-3). DISABLED (env left unset) when REPRO_MONITOR_DEP_SHM_DISABLE
     # is set — the pure-file baseline used by the LF-6 byte-identical regression.
     var depSet: SetHost
-    let depSetEnabled = shmSetSupported and
+    let depSetEnabled = shmGSetSupported and
       getEnv("REPRO_MONITOR_DEP_SHM_DISABLE").len == 0
     if depSetEnabled:
       # The appId scopes the SET's cross-restart reaper so one application never
