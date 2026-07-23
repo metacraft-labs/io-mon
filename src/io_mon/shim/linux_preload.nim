@@ -103,6 +103,7 @@ var
 #include <sys/syscall.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <dlfcn.h>
 
@@ -185,9 +186,18 @@ int repro_linux_fd_proc_path(int fd, void *raw_buf, unsigned long len) {
     linkpath[pos++] = prefix[i];
   pos = repro_linux_append_uint(linkpath, pos, (int)sizeof(linkpath) - 1, fd);
   linkpath[pos] = '\0';
+  /* aarch64 (and other newer Linux ABIs) drop the legacy readlink syscall and
+     only provide readlinkat; readlink(p,b,n) == readlinkat(AT_FDCWD,p,b,n).
+     Keep the x86-64 path byte-identical to avoid any behavioral change there. */
+#ifdef SYS_readlink
   long n = stackable_linux_raw_syscall6(SYS_readlink, (long)linkpath,
                                         (long)buf, (long)(len - 1),
                                         0, 0, 0);
+#else
+  long n = stackable_linux_raw_syscall6(SYS_readlinkat, (long)AT_FDCWD,
+                                        (long)linkpath, (long)buf,
+                                        (long)(len - 1), 0, 0);
+#endif
   if (n <= 0)
     return 0;
   buf[n] = '\0';
