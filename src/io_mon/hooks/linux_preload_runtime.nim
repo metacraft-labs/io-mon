@@ -511,6 +511,8 @@ type
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <link.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdarg.h>
@@ -1471,6 +1473,166 @@ void *ct_linux_preload_real_dlmopen(long namespace_id, char *path, int flags) {
   return real_dlmopen_ptr((Lmid_t)namespace_id, path, flags);
 }
 
+/* --- Monitor transparency: caller-scoped dlopen soname resolution -----------
+ *
+ * The shim interposes dlopen and forwards the real call to
+ * dlsym(RTLD_NEXT, "dlopen"). glibc attributes the CALLING object by the
+ * return address at the real dlopen call site — which is inside THIS shim —
+ * and therefore resolves a bare-soname dlopen("libfoo.so.N") against the
+ * SHIM's DT_RPATH/DT_RUNPATH instead of the monitored caller's. A program
+ * that dlopens a library by soname relying on its OWN DT_RUNPATH then gets a
+ * silent ENOENT under monitoring. That is a transparency violation: the
+ * monitor must not change how the target resolves libraries.
+ *
+ * Fix: before entering the real dlopen, replicate glibc's caller-scoped
+ * search order for a bare soname (no '/') using the ORIGINAL caller's
+ * link_map (found from the wrapper's __builtin_return_address(0)):
+ *   1. caller DT_RPATH   (only when the caller has NO DT_RUNPATH)
+ *   2. LD_LIBRARY_PATH
+ *   3. caller DT_RUNPATH
+ * On a hit we hand the real dlopen an ABSOLUTE path, which glibc loads
+ * verbatim independent of any object's search list. On a miss we return the
+ * soname UNCHANGED so glibc's own ld.so.cache + default-path fallback (both
+ * caller-independent) still apply. Any failure falls back to unmodified
+ * behavior. $ORIGIN is expanded; $LIB / $PLATFORM dirs are left to glibc. */
+
+static const char *ct_dlopen_dyn_paths(struct link_map *lm,
+                                       const char **rpath,
+                                       const char **runpath) {
+  /* Extract the DT_RPATH / DT_RUNPATH strings for `lm` by walking its dynamic
+     section (lm->l_ld). The PUBLIC struct link_map does NOT expose glibc's
+     private l_info[] array, so we scan l_ld directly. On x86_64 glibc
+     (!DL_RO_DYN_SECTION) the loader relocates DT_STRTAB's d_ptr in place, so
+     it is an absolute pointer; DT_RPATH/DT_RUNPATH carry byte offsets into it.
+     Returns the strtab base (or NULL) and sets *rpath / *runpath. */
+  *rpath = NULL;
+  *runpath = NULL;
+  if (lm == NULL || lm->l_ld == NULL) return NULL;
+  const char *strtab = NULL;
+  ElfW(Sxword) rpath_off = -1, runpath_off = -1;
+  for (ElfW(Dyn) *d = lm->l_ld; d->d_tag != DT_NULL; d++) {
+    switch (d->d_tag) {
+      case DT_STRTAB:  strtab = (const char *)d->d_un.d_ptr; break;
+      case DT_RPATH:   rpath_off = (ElfW(Sxword))d->d_un.d_val; break;
+      case DT_RUNPATH: runpath_off = (ElfW(Sxword))d->d_un.d_val; break;
+      default: break;
+    }
+  }
+  if (strtab == NULL) return NULL;
+  if (rpath_off >= 0) *rpath = strtab + rpath_off;
+  if (runpath_off >= 0) *runpath = strtab + runpath_off;
+  return strtab;
+}
+
+static int ct_dlopen_origin_dir(struct link_map *lm, char *out, size_t cap) {
+  /* Directory used to expand $ORIGIN for object `lm`: dirname(l_name) for a
+     normal library, or dirname(readlink("/proc/self/exe")) for the main
+     executable (l_name == ""). Returns 1 on success. */
+  char path[PATH_MAX];
+  const char *src = NULL;
+  if (lm != NULL && lm->l_name != NULL && lm->l_name[0] != '\0') {
+    src = lm->l_name;
+  } else {
+    ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (n <= 0) return 0;
+    path[n] = '\0';
+    src = path;
+  }
+  size_t len = strlen(src);
+  while (len > 0 && src[len - 1] != '/') len--;
+  if (len == 0) { if (cap < 2) return 0; out[0] = '.'; out[1] = '\0'; return 1; }
+  size_t copy = (len > 1) ? len - 1 : len; /* strip trailing '/', keep root */
+  if (copy >= cap) return 0;
+  memcpy(out, src, copy);
+  out[copy] = '\0';
+  return 1;
+}
+
+static int ct_dlopen_try_dir(const char *dir, size_t dirlen,
+                             const char *soname, const char *origin,
+                             char *out, size_t cap) {
+  /* Expand $ORIGIN in `dir`; on an unsupported token ($LIB/$PLATFORM/unknown)
+     return 0 (skip). Then test "dir/soname" for existence; on a hit copy the
+     full path into `out` and return 1. */
+  char expanded[PATH_MAX];
+  size_t pos = 0, i = 0;
+  while (i < dirlen) {
+    if (dir[i] == '$') {
+      const char *tok = dir + i + 1;
+      size_t rem = dirlen - i - 1;
+      int brace = 0;
+      if (rem > 0 && *tok == '{') { brace = 1; tok++; rem--; }
+      if (rem >= 6 && strncmp(tok, "ORIGIN", 6) == 0) {
+        size_t olen = strlen(origin);
+        if (pos + olen >= sizeof(expanded)) return 0;
+        memcpy(expanded + pos, origin, olen); pos += olen;
+        i += 1 + (brace ? 1 : 0) + 6 + (brace ? 1 : 0);
+        continue;
+      }
+      return 0; /* $LIB / $PLATFORM / unknown — unsupported; skip this dir. */
+    }
+    if (pos + 1 >= sizeof(expanded)) return 0;
+    expanded[pos++] = dir[i++];
+  }
+  expanded[pos] = '\0';
+  if (pos == 0) return 0;
+  int n = snprintf(out, cap, "%s/%s", expanded, soname);
+  if (n < 0 || (size_t)n >= cap) return 0;
+  if (access(out, F_OK) != 0) return 0;
+  return 1;
+}
+
+static int ct_dlopen_search_list(const char *list, const char *soname,
+                                 const char *origin, char *out, size_t cap) {
+  /* First existing "dir/soname" across a colon-separated dir list wins. */
+  if (list == NULL) return 0;
+  const char *p = list;
+  while (*p) {
+    const char *sep = strchr(p, ':');
+    size_t len = sep ? (size_t)(sep - p) : strlen(p);
+    if (len > 0 && ct_dlopen_try_dir(p, len, soname, origin, out, cap))
+      return 1;
+    if (!sep) break;
+    p = sep + 1;
+  }
+  return 0;
+}
+
+const char *ct_linux_preload_resolve_dlopen_caller_path(const char *path,
+                                                        void *caller) {
+  static __thread char resolved[PATH_MAX];
+  if (path == NULL || strchr(path, '/') != NULL || caller == NULL)
+    return path;
+  /* Suppress our own interposed hooks (getenv/access/readlink) during
+     resolution so it neither recurses nor records spurious dependencies. */
+  stackable_linux_preload_enter_hook();
+  const char *out = path;
+  Dl_info info;
+  struct link_map *lm = NULL;
+  if (dladdr1(caller, &info, (void **)&lm, RTLD_DL_LINKMAP) != 0 &&
+      lm != NULL) {
+    char origin[PATH_MAX];
+    if (!ct_dlopen_origin_dir(lm, origin, sizeof(origin)))
+      origin[0] = '\0';
+    const char *rpath = NULL;
+    const char *runpath = NULL;
+    ct_dlopen_dyn_paths(lm, &rpath, &runpath);
+    /* glibc honors DT_RPATH only when DT_RUNPATH is absent. */
+    if (runpath == NULL && rpath != NULL &&
+        ct_dlopen_search_list(rpath, path, origin, resolved, sizeof(resolved)))
+      out = resolved;
+    else if (ct_dlopen_search_list(getenv("LD_LIBRARY_PATH"), path, origin,
+                                   resolved, sizeof(resolved)))
+      out = resolved;
+    else if (runpath != NULL &&
+             ct_dlopen_search_list(runpath, path, origin, resolved,
+                                   sizeof(resolved)))
+      out = resolved;
+  }
+  stackable_linux_preload_exit_hook();
+  return out;
+}
+
 void *ct_linux_preload_real_dlsym(void *handle, char *name) {
 #ifdef __GLIBC__
   if (real_dlsym_ptr == NULL)
@@ -1879,17 +2041,24 @@ int renameat2(int olddirfd, const char *oldpath, int newdirfd,
 
 void *dlopen(const char *path, int flags) __attribute__((visibility("default")));
 void *dlopen(const char *path, int flags) {
+  /* Transparency: resolve a bare soname against the ORIGINAL caller's
+     RPATH/RUNPATH (not the shim's) before the real dlopen. See
+     ct_linux_preload_resolve_dlopen_caller_path. */
+  const char *rp = ct_linux_preload_resolve_dlopen_caller_path(
+      path, __builtin_return_address(0));
   if (CT_BYPASS() || ct_dlopen_hook == NULL)
-    return ct_linux_preload_real_dlopen((char *)path, flags);
-  return CT_CALL_HOOK(ct_dlopen_hook((char *)path, flags));
+    return ct_linux_preload_real_dlopen((char *)rp, flags);
+  return CT_CALL_HOOK(ct_dlopen_hook((char *)rp, flags));
 }
 
 void *dlmopen(Lmid_t namespace_id, const char *path, int flags)
     __attribute__((visibility("default")));
 void *dlmopen(Lmid_t namespace_id, const char *path, int flags) {
+  const char *rp = ct_linux_preload_resolve_dlopen_caller_path(
+      path, __builtin_return_address(0));
   if (CT_BYPASS() || ct_dlmopen_hook == NULL)
-    return ct_linux_preload_real_dlmopen((long)namespace_id, (char *)path, flags);
-  return CT_CALL_HOOK(ct_dlmopen_hook((long)namespace_id, (char *)path, flags));
+    return ct_linux_preload_real_dlmopen((long)namespace_id, (char *)rp, flags);
+  return CT_CALL_HOOK(ct_dlmopen_hook((long)namespace_id, (char *)rp, flags));
 }
 
 void *ct_linux_preload_public_dlsym(void *handle, const char *name)
