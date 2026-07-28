@@ -235,9 +235,17 @@ int repro_linux_self_exe_path(void *raw_buf, unsigned long len) {
   char *buf = (char *)raw_buf;
   if (len == 0)
     return 0;
+  /* aarch64 (and other newer Linux ABIs) lack the legacy readlink syscall;
+     readlink(p,b,n) == readlinkat(AT_FDCWD,p,b,n). x86-64 stays byte-identical. */
+#ifdef SYS_readlink
   long n = stackable_linux_raw_syscall6(SYS_readlink, (long)"/proc/self/exe",
                                         (long)buf, (long)(len - 1),
                                         0, 0, 0);
+#else
+  long n = stackable_linux_raw_syscall6(SYS_readlinkat, (long)AT_FDCWD,
+                                        (long)"/proc/self/exe", (long)buf,
+                                        (long)(len - 1), 0, 0);
+#endif
   if (n <= 0)
     return 0;
   return (int)n;
