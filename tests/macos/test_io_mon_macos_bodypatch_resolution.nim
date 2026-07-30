@@ -60,23 +60,31 @@ when defined(macosx):
     cc(quoteShell(src) & " -o " & quoteShell(bin))
     bin
 
-  proc bannerFor(shim, probe, backend: string): string =
-    ## Run the probe under the shim and return the body-patch install banner line
-    ## (the shim logs it to stderr from the constructor).
+  proc bannerFor(shim, probe, backend: string):
+      tuple[banner: string; exitCode: int] =
+    ## Run the probe under the shim and return the body-patch install banner from
+    ## the shim's explicit opt-in log.  Diagnostics no longer write to stderr by
+    ## default; IO_MON_DEBUG_LOG_FILE is the supported interface and using a
+    ## fresh file for each backend keeps the A/B arms independent.
+    let logFile = probe.parentDir / ("bodypatch-" & backend & ".log")
+    if fileExists(logFile):
+      removeFile(logFile)
     var env = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): env[k] = v
     env["DYLD_INSERT_LIBRARIES"] = shim
     env["REPRO_MONITOR_SHIM_LIB"] = shim
+    env["IO_MON_DEBUG_LOG_FILE"] = logFile
     applyMacosBackendToggle(env, backend)
     let p = startProcess(probe, args = @[], env = env,
       options = {poStdErrToStdOut})
-    let outText = p.outputStream.readAll()
-    discard p.waitForExit()
+    discard p.outputStream.readAll()
+    result.exitCode = p.waitForExit()
     p.close()
-    for line in outText.splitLines():
+    let logText = if fileExists(logFile): readFile(logFile) else: ""
+    for line in logText.splitLines():
       if line.startsWith("io-mon: macOS body-patch"):
-        return line
-    ""
+        result.banner = line
+        return
 
 suite "io-mon macOS body-patch resolves real libsystem (not the shim)":
   when defined(macosx):
@@ -87,7 +95,9 @@ suite "io-mon macOS body-patch resolves real libsystem (not the shim)":
     let probe = buildProbe(work)
 
     test "the 'both' install banner reports failed=0 and all trampolines ok":
-      let banner = bannerFor(shim, probe, "both")
+      let run = bannerFor(shim, probe, "both")
+      check run.exitCode == 0
+      let banner = run.banner
       checkpoint("banner = " & banner)
       check banner.len > 0
       # failed=0 proves no target mis-resolved to the shim (a shim-resolved
@@ -106,7 +116,9 @@ suite "io-mon macOS body-patch resolves real libsystem (not the shim)":
       # IO_MON_DEBUG_DISABLE_INTERPOSE: body-patch still installs fully (the same
       # clean counters), and the banner additionally carries the debug note that
       # interpose was disabled for diagnosis.
-      let banner = bannerFor(shim, probe, "bodypatch")
+      let run = bannerFor(shim, probe, "bodypatch")
+      check run.exitCode == 0
+      let banner = run.banner
       checkpoint("banner = " & banner)
       check banner.contains("failed=0")
       check banner.contains("fork_tramp=ok")
@@ -118,9 +130,12 @@ suite "io-mon macOS body-patch resolves real libsystem (not the shim)":
       # IO_MON_DEBUG_DISABLE_BODYPATCH: body-patch is skipped, so the constructor
       # logs the "not installed" skip line (with the debug note) instead of an
       # install banner with counters.
-      let banner = bannerFor(shim, probe, "interpose")
+      let run = bannerFor(shim, probe, "interpose")
+      check run.exitCode == 0
+      let banner = run.banner
       checkpoint("banner = " & banner)
-      check banner.contains("[debug] body-patch disabled") or banner.len == 0
+      check banner.len > 0
+      check banner.contains("[debug] body-patch disabled")
 
     removeDir(work)
   else:

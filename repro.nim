@@ -280,6 +280,7 @@ package io_mon:
         TestSpec(source: "tests/macos/test_io_mon_macos_library_load.nim", binary: "build/test-bin/test_io_mon_macos_library_load" & binSuffix),
         TestSpec(source: "tests/macos/test_io_mon_macos_rename.nim", binary: "build/test-bin/test_io_mon_macos_rename" & binSuffix),
         TestSpec(source: "tests/macos/test_io_mon_macos_r5_kill_sentinel.nim", binary: "build/test-bin/test_io_mon_macos_r5_kill_sentinel" & binSuffix),
+        TestSpec(source: "tests/macos/test_io_mon_macos_sandbox_tools_cleanup.nim", binary: "build/test-bin/test_io_mon_macos_sandbox_tools_cleanup" & binSuffix),
       ]
       for spec in macosTestSpecs:
         emitTestPair(spec.source, spec.binary, testBuildActions, testExecuteActions)

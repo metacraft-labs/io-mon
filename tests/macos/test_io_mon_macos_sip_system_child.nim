@@ -46,23 +46,19 @@
 ##
 ## We ALSO drive the full libc ``system("/bin/sh -c …")`` probe and assert the
 ## SIP ``/bin/sh`` grandchild IS redirected to the drop-in and runs INJECTED
-## (its own shim banner / shim-loaded marker), proving the libsystem-internal
-## ``posix_spawn`` of the shell crosses the SIP boundary under the drop-in.
+## (its own shim diagnostic banner in the explicit per-run debug log), proving
+## the libsystem-internal ``posix_spawn`` of the shell crosses the SIP boundary
+## under the drop-in.
 ##
 ## # fork()+execve() is covered too (the Darwin/arm64 fork-ABI fix)
 ##
 ## A drop-in ``/bin/sh`` launches ``cat`` via ``fork()``+``execve()``, so the
-## read ISSUED BY the shell's ``cat`` must also be captured. This used to fail
-## because the body-patch fork forwarder issued a raw ``syscall(SYS_fork)``,
-## which on Darwin/arm64 does NOT honour the kernel's child-return convention
-## (the child is flagged in x1, not by a zero in x0). The forked CHILD therefore
-## observed the parent's pid, mis-identified itself as the parent, and skipped
-## its own ``execve`` redirect — so a fork+exec'd grandchild went uncaptured (a
-## false skip). ``repro_macos_real_fork_syscall`` now issues the trap inline and
-## applies the libc x1-based child rewrite, so the child correctly sees 0 and its
-## ``execve`` is redirected + injected. We assert the read capture on BOTH the
-## bare-``posix_spawn`` SIP-child AND the fork+exec'd ``cat`` the ``system()``
-## shell launches.
+## read ISSUED BY the shell's ``cat`` must also be captured. The body-patch fork
+## hook now forwards through a trampoline into libsystem's original ``fork``
+## body, preserving Darwin's return convention AND the userland atfork/malloc
+## bookkeeping a real shell requires before it execs its child. We assert the
+## read capture on BOTH the bare-``posix_spawn`` SIP-child AND the fork+exec'd
+## ``cat`` the ``system()`` shell launches.
 ##
 ## Skips cleanly (with a clear reason) if a non-SIP shell/cat cannot be resolved
 ## into a runnable drop-in bundle on this host — never a false pass.
@@ -313,21 +309,32 @@ int main(void) {
     createDir(runWork)
     let fragmentDir = runWork / "frags"
     createDir(fragmentDir)
+    let debugLog = runWork / "shim-debug.log"
 
     let env = childEnv(shim, bundle, fragmentDir, useSandbox)
+    # Shim diagnostics are opt-in and file-backed. They are intentionally NOT
+    # written to stderr, because injecting a monitor must not perturb a child's
+    # stdout/stderr contract. Give each contrast arm a fresh log inherited by
+    # descendants; every injected process appends exactly one installation
+    # banner, so an extra banner is direct evidence that the rewritten shell
+    # loaded the shim.
+    env["IO_MON_DEBUG_LOG_FILE"] = debugLog
     let p = startProcess(fx.probe, args = @[], env = env,
       options = {poStdErrToStdOut})
     let combined = p.outputStream.readAll()
     result.probeExit = p.waitForExit()
     p.close()
-    # The shim prints exactly one "io-mon: macOS body-patch installed=…" banner
-    # per injected process (to stderr, folded into stdout here). One banner per
-    # injected process: the probe, the redirected drop-in /bin/sh, and the cat.
-    for line in combined.splitLines():
-      if line.contains("io-mon: macOS body-patch installed="):
+    # `shimLog` appends exactly one installation banner per injected process to
+    # IO_MON_DEBUG_LOG_FILE: the probe, the redirected drop-in /bin/sh, and its
+    # descendants. Do not inspect stderr here; that was the obsolete pre-log-file
+    # oracle and silently reported 0 vs 0 even while the production path worked.
+    let debugText = if fileExists(debugLog): readFile(debugLog) else: ""
+    for line in debugText.splitLines():
+      if line.startsWith("io-mon: macOS body-patch installed="):
         inc result.injectedProcs
     checkpoint("[system sandbox=" & $useSandbox & "] exit=" &
-      $result.probeExit & " injectedProcs=" & $result.injectedProcs)
+      $result.probeExit & " injectedProcs=" & $result.injectedProcs &
+      " out=" & combined)
 
     let depfile = runWork / "cap.rdep"
     discard mergeFragments(fragmentDir, depfile)
@@ -415,8 +422,8 @@ suite "io-mon macOS genuine SIP-child capture (§16.7.8, drop-in)":
       removeDir(forkExecFx.work)
 
       # The full libc system() path: the SIP /bin/sh grandchild is redirected to
-      # the drop-in and runs INJECTED (proven by an extra shim banner / a third
-      # injected process), so the libsystem-internal posix_spawn of the shell
+      # the drop-in and runs INJECTED (proven by an extra banner in the explicit
+      # inherited debug log), so the libsystem-internal posix_spawn of the shell
       # crosses the SIP boundary under the drop-in.
       let sysFx = buildSystemFixture()
       let sysWith = runSystemCapture(shim, bundle, true, sysFx)
@@ -427,38 +434,18 @@ suite "io-mon macOS genuine SIP-child capture (§16.7.8, drop-in)":
         check sysWith.shellSpawn
         # With the drop-in the shell child is itself injected → MORE injected
         # processes than the no-sandbox arm (where the SIP shell ran blind).
+        check sysWithout.injectedProcs == 1 # only the directly-injected probe
         check sysWith.injectedProcs > sysWithout.injectedProcs
         check sysWith.injectedProcs >= 2    # at least the probe + the drop-in sh
 
-      # NOTE on the system() cat-read: bash launches `cat` via the libc
-      # `fork()`, which the body-patch backend forwards through a raw `SYS_fork`
-      # (it must NOT re-enter the patched named `fork`). That bare kernel fork
-      # SKIPS libsystem's userland fork bookkeeping (atfork handlers, malloc-lock
-      # reset). For a real application fork-then-do-work-before-exec like bash's,
-      # that occasionally (~1 in 5 under heavy parallel load) drops the cat
-      # injection in the grandchild, so the cat READ via this libsystem-internal
-      # path is BEST-EFFORT — NOT a deterministic guarantee. The DETERMINISTIC
-      # fork+execve capture guarantee is asserted by Arm 1b above (a direct
-      # fork()+execve() with no shell bookkeeping in the path, which is 100%
-      # stable). Here we therefore assert only what IS deterministic on this
-      # path: the absent-without-drop-in contrast, and that the drop-in NEVER
-      # captures FEWER reads than the blind baseline (monotonic — coverage only
-      # ever adds). When the capture does fire (the common case) we additionally
-      # confirm it is a genuine non-empty capture, without making a flaky read a
-      # hard gate.
-      test "system() shell's fork+exec'd cat read is captured (best-effort) " &
-          "and the no-drop-in baseline is blind":
-        # Deterministic: without the drop-in the SIP shell ran blind (DYLD
-        # stripped), so neither it nor its cat is monitored and the read is
-        # ABSENT.
+      # The fork trampoline preserves libsystem's userland fork bookkeeping, so
+      # the real shell descendant is a deterministic production guarantee: the
+      # drop-in cat must be injected and record its read. The no-drop-in contrast
+      # proves this record is not attributable to the directly-injected probe.
+      test "system() shell's fork+exec'd cat read is captured and the " &
+          "no-drop-in baseline is blind":
+        check sysWith.sipReadCaptured
         check not sysWithout.sipReadCaptured
-        # Monotonic coverage: the drop-in arm must never be WORSE than blind
-        # (if the baseline somehow captured the read, the drop-in must too).
-        check (not sysWithout.sipReadCaptured) or sysWith.sipReadCaptured
-        if not sysWith.sipReadCaptured:
-          checkpoint("system() cat read not captured this run — the bash " &
-            "internal-fork bookkeeping skip (documented, best-effort); the " &
-            "deterministic fork+execve guarantee is covered by Arm 1b")
 
       removeDir(sysFx.work)
 

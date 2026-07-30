@@ -740,8 +740,17 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
     # DYLD_INSERT_LIBRARIES and the shim falls silent for the rest of
     # the process tree.
     var sandboxDir = getEnv("CT_SANDBOX_TOOLS_DIR")
-    if sandboxDir.len == 0:
+    let ownsSandboxDir = sandboxDir.len == 0
+    if ownsSandboxDir:
       sandboxDir = createLocalTempDir("repro-fs-snoop-sandbox-tools")
+    # Only the fallback created by this invocation belongs to io-mon.  An
+    # operator-provided CT_SANDBOX_TOOLS_DIR may be a persistent, pre-built
+    # bundle and must never be removed.  Register ownership cleanup before
+    # populating the tree so setup failures, spawn failures, non-zero child
+    # exits, and successful runs all release the same invocation-local path.
+    defer:
+      if ownsSandboxDir:
+        removeDir(extendedPath(sandboxDir))
     populateReproSandboxTools(sandboxDir)
 
     var oldEnv: seq[(string, string, bool)] = @[]

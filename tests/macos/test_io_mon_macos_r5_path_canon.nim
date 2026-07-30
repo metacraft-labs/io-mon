@@ -70,10 +70,25 @@ when defined(macosx):
       quoteShell(src) & " -o " & quoteShell(outBin))
     doAssert code == 0, "cc failed (" & src & "): " & output
 
+  type ProbeCapture = object
+    dep: MonitorDepFile
+    rootPid: uint64
+
+  proc hasRootProcessStart(cap: ProbeCapture): bool =
+    ## The launcher's concrete root must have loaded the shim and emitted its own
+    ## process-start. A synthetic root-spawn record is not sufficient evidence.
+    for rec in cap.dep.records:
+      if rec.kind == mrProcessStart and rec.osPid == cap.rootPid:
+        return true
+
   proc runProbe(shim, probe: string; args: seq[string];
-      workingDir: string): MonitorDepFile =
+      workingDir: string; requireMonitoredRoot = true): ProbeCapture =
     ## Run `probe args` under the shim ("both" backend — interpose + body-patch, the
-    ## production default) from `workingDir` and return the merged depfile.
+    ## production default) from `workingDir` and return the merged depfile plus
+    ## the concrete root pid. Passing that pid to `mergeFragments` is essential:
+    ## without it, a SIP/hardened root can strip DYLD injection, emit an EMPTY
+    ## fragment set, and the legacy pid-less merge would falsely report
+    ## `mcComplete`.
     let runWork = getTempDir() / ("io-mon-r5pc-run-" & probe.extractFilename() &
       "-" & $getCurrentProcessId() & "-" & $epochTime())
     removeDir(runWork)
@@ -90,14 +105,27 @@ when defined(macosx):
     applyMacosBackendToggle(env, "both")
     let p = startProcess(probe, workingDir = workingDir, args = args, env = env,
       options = {poStdErrToStdOut})
+    # Capture the launcher's root pid while the Process handle is live. This is
+    # the identity `mergeFragments(expectedRootPid=...)` must prove monitored.
+    result.rootPid = uint64(p.processID)
+    doAssert result.rootPid != 0, "spawned probe has no root pid: " & probe
     let stdoutText = p.outputStream.readAll()
     let code = p.waitForExit()
     p.close()
     checkpoint(probe.extractFilename() & " exit=" & $code & " out=" & stdoutText)
+    doAssert code == 0,
+      "monitored probe failed (" & probe & "): " & stdoutText
     let depfile = runWork / "cap.rdep"
-    discard mergeFragments(fragmentDir, depfile)
+    discard mergeFragments(fragmentDir, depfile,
+      expectedRootPid = result.rootPid)
     doAssert fileExists(depfile)
-    result = readMonitorDepFile(depfile)
+    result.dep = readMonitorDepFile(depfile)
+    if requireMonitoredRoot:
+      doAssert result.dep.records.len > 0,
+        "monitored probe emitted no evidence: " & probe
+      doAssert result.hasRootProcessStart,
+        "spawned root did not emit process-start (pid=" & $result.rootPid &
+        ", probe=" & probe & ")"
     removeDir(runWork)
 
   proc lexicalAbsentProbe(dep: MonitorDepFile; leaf: string): string =
@@ -165,8 +193,9 @@ suite "io-mon macOS R5 P1 path canonicalisation (ENOENT / failed-open, live)":
       # the same run (there.txt) — so absent and present key identically.
       let state = tmpStateDir("rel")
       writeFile(state / "there.txt", "present\n")
-      let dep = runProbe(shim, prober,
+      let cap = runProbe(shim, prober,
         @["chdir:" & state, "stat:nope.h", "open:there.txt"], "/")
+      let dep = cap.dep
 
       # raw record preserved (round-4 negative dep still caught)
       check rawAbsentProbe(dep, "nope.h")
@@ -192,7 +221,7 @@ suite "io-mon macOS R5 P1 path canonicalisation (ENOENT / failed-open, live)":
       # /private/tmp/... for the absent probe too, so they MATCH.
       let state = tmpStateDir("dual")
       let target = state / "dual.txt"              # ABSENT at pre-stat time
-      let dep = runProbe(shim, dualspell, @[target], "/")
+      let dep = runProbe(shim, dualspell, @[target], "/").dep
 
       let absent = lexicalAbsentProbe(dep, "dual.txt")
       check absent.len > 0
@@ -208,7 +237,7 @@ suite "io-mon macOS R5 P1 path canonicalisation (ENOENT / failed-open, live)":
       # lexical companion now firmlink-resolves it.
       let state = tmpStateDir("openfail")
       let dep = runProbe(shim, prober,
-        @["open:" & (state / "missing.h")], "/")
+        @["open:" & (state / "missing.h")], "/").dep
       let comp = lexicalFailedOpen(dep, "missing.h")
       check comp.len > 0
       check comp.startsWith("/private/tmp/")
@@ -228,21 +257,58 @@ suite "io-mon macOS R5 P1 path canonicalisation (ENOENT / failed-open, live)":
       let outBin = state / "hello"
       let ccPath = findExe(getEnv("CC", "cc"))
       doAssert ccPath.len > 0, "could not resolve a C compiler on PATH"
-      let dep = runProbe(shim, ccPath,
+      # Compiler distributions differ in whether their include search performs
+      # observable failed opens (some Nix clang wrappers pre-resolve every
+      # include directory).  Exercise one exact ENOENT stat in a dedicated
+      # monitored run, then run the real compiler under the same production shim.
+      # Keeping these as two public monitor runs makes both assertions
+      # deterministic: the negative-dependency arm cannot disappear with a
+      # compiler upgrade, and an uninjectable compiler wrapper cannot make the
+      # lexical-path assertion pass without the real compile guard also passing.
+      let missingProbe = state / "missing-include-probe.h"
+      let probeCap = runProbe(shim, prober,
+        @["stat:" & missingProbe], state)
+      let probeDep = probeCap.dep
+      check probeDep.completeness == mcComplete
+      check probeCap.hasRootProcessStart
+      check rawAbsentProbe(probeDep, "missing-include-probe.h")
+      let lexicalProbe =
+        lexicalAbsentProbe(probeDep, "missing-include-probe.h")
+      check lexicalProbe == "/private" & missingProbe
+
+      let compilerCap = runProbe(shim, ccPath,
         @["-arch", "arm64", src, "-o", outBin], state)
+      let dep = compilerCap.dep
+      # The completeness verdict is backed by evidence from the ACTUAL spawned
+      # compiler pid, not merely by an output file and a small/empty depfile.
+      check compilerCap.hasRootProcessStart
+      check dep.records.len > 0
       check dep.completeness == mcComplete         # NO false downgrade
       check fileExists(outBin)                      # the compile really happened
-      # The compile DOES exercise the fix: at least one ENOENT include probe gets a
-      # lexical companion. (Belt-and-braces: prove the fix is live in a real build.)
-      var sawLexical = false
-      for r in dep.records:
-        if detailToken(r.detail, "canon") == "lexical":
-          sawLexical = true
-          break
-      check sawLexical
       # No pathological flood.
       check dep.records.len < 60000
       removeDir(state)
+
+    test "ROOT GUARD: a SIP root with no shim evidence is mcIncomplete":
+      # /bin/cat is SIP-protected. Direct DYLD injection is stripped and, because
+      # this helper deliberately removes CT_SANDBOX_TOOLS_DIR, no non-SIP
+      # replacement is involved. The expected-root synthetic spawn must therefore
+      # expose the missing process-start and fail closed instead of accepting an
+      # empty depfile as mcComplete.
+      let sipCap = runProbe(shim, "/bin/cat", @["/dev/null"], "/",
+        requireMonitoredRoot = false)
+      check sipCap.rootPid != 0
+      check not sipCap.hasRootProcessStart
+      check sipCap.dep.completeness == mcIncomplete
+      var sawRootSpawn = false
+      var sawEventLoss = false
+      for rec in sipCap.dep.records:
+        if rec.kind == mrProcessSpawn and rec.childOsPid == sipCap.rootPid:
+          sawRootSpawn = true
+        if rec.kind == mrEventLoss:
+          sawEventLoss = true
+      check sawRootSpawn
+      check sawEventLoss
 
     removeDir(work)
   else:
