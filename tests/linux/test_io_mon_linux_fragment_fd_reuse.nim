@@ -45,12 +45,14 @@ suite "io-mon Linux fragment descriptor reuse":
 
     let probe = buildC(work, "fragment_fd_reuse_probe", """
 #include <errno.h>
+#include <dlfcn.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int read_one(const char *path) {
@@ -79,25 +81,36 @@ int main(int argc, char **argv) {
   if (argc != 3) return 2;
   if (read_one(argv[1]) != 0) return 3;
 
+  /* fork() flushes the first dirty cycle, so the next read must write a fresh
+     pending marker after the fragment descriptor has been replaced. */
+  pid_t child = fork();
+  if (child < 0) return 4;
+  if (child == 0) _exit(0);
+  if (waitpid(child, NULL, 0) != child) return 5;
+
   int monitor_fd = fragment_fd();
-  if (monitor_fd < 0) return 4;
+  if (monitor_fd < 0) return 6;
   int channel[2];
-  if (pipe(channel) != 0) return 5;
+  if (pipe(channel) != 0) return 7;
   /* dup2 closes monitor_fd inside the kernel without calling close(). */
-  if (dup2(channel[1], monitor_fd) != monitor_fd) return 6;
+  if (dup2(channel[1], monitor_fd) != monitor_fd) return 8;
   if (channel[1] != monitor_fd) close(channel[1]);
-  if (fcntl(channel[0], F_SETFL, O_NONBLOCK) != 0) return 7;
-  if (read_one(argv[2]) != 0) return 8;
+  if (fcntl(channel[0], F_SETFL, O_NONBLOCK) != 0) return 9;
+  void (*flush_monitor)(void) = dlsym(RTLD_DEFAULT,
+      "repro_linux_sig_safe_flush");
+  if (flush_monitor == NULL) return 10;
+  flush_monitor();
+  if (read_one(argv[2]) != 0) return 11;
 
   struct stat st;
   for (int i = 0; i < 2048; ++i) {
-    if (stat(argv[2], &st) != 0) return 9;
+    if (stat(argv[2], &st) != 0) return 12;
   }
 
   char leaked[16];
   ssize_t count = read(channel[0], leaked, sizeof(leaked));
-  if (count > 0) return 10;
-  if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return 11;
+  if (count > 0) return 13;
+  if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return 14;
   return 0;
 }
 """)

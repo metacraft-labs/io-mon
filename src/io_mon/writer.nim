@@ -773,6 +773,12 @@ proc sigSafeSlotFd*(): cint {.raises: [].} =
   except IOError:
     result = cint(-1)
 
+proc sigSafeSlotDevice*(): uint64 {.raises: [].} =
+  fragmentSlot.fileDevice
+
+proc sigSafeSlotFileId*(): uint64 {.raises: [].} =
+  fragmentSlot.fileId
+
 proc sigSafeBatchPtr*(): pointer {.raises: [].} =
   addr fragmentSlot.batchBuf[0]
 
@@ -798,6 +804,9 @@ proc sigSafeMarkSlotClosed*() {.raises: [].} =
   fragmentSlot.readingSentinelActive = false
   fragmentSlot.committedFrameLen = 0
 
+proc fragmentHandleIsCurrent(): bool {.raises: [].}
+proc reopenFragmentHandle(): bool {.raises: [].}
+
 proc writeReadTailMarker(detail: string) =
   ## ROUND-5 F — write a kill-before-flush bookkeeping marker (`mrEventLoss` with
   ## `detail`, stamped with the current run token) DIRECTLY to the calling thread's
@@ -809,6 +818,8 @@ proc writeReadTailMarker(detail: string) =
   ## sidecar it does not depend on a writable directory: the fd is already open, so a
   ## tracee that chmod's the fragment dir cannot block it.
   if not fragmentSlot.isOpen:
+    return
+  if not fragmentHandleIsCurrent() and not reopenFragmentHandle():
     return
   let marker = MonitorRecord(kind: mrEventLoss, observationKind: moEventLoss,
     osPid: fragmentSlot.osPid, threadId: fragmentSlot.threadId,

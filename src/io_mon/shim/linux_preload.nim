@@ -285,6 +285,7 @@ extern int repro_monitor_shim_shutdown(void);
 
 extern int repro_linux_sig_safe_slot_is_open(void);
 extern int repro_linux_sig_safe_slot_fd(void);
+extern int repro_linux_sig_safe_slot_identity_matches(void);
 extern void* repro_linux_sig_safe_batch_ptr(void);
 extern long repro_linux_sig_safe_batch_len(void);
 extern void* repro_linux_sig_safe_committed_ptr(void);
@@ -317,6 +318,13 @@ void repro_linux_sig_safe_flush(void) {
   fd = repro_linux_sig_safe_slot_fd();
   if (fd < 0)
     return;
+  /* The tracee may have closed or replaced the cached descriptor through a
+   * raw syscall or dup2. Never write monitor frames into its replacement. */
+  if (!repro_linux_sig_safe_slot_identity_matches()) {
+    repro_linux_sig_safe_mark_slot_closed();
+    errno = (int)saved_errno;
+    return;
+  }
   /* Flush any in-flight batch buffer FIRST so buffered read records land
    * before the committed marker. Partial writes are best-effort at the
    * async-signal-safe level; the tolerant reader (decodeFramesTolerant)
@@ -638,6 +646,20 @@ proc repro_linux_sig_safe_slot_is_open(): cint {.exportc, cdecl, raises: [].} =
 
 proc repro_linux_sig_safe_slot_fd(): cint {.exportc, cdecl, raises: [].} =
   sigSafeSlotFd()
+
+proc repro_linux_sig_safe_slot_identity_matches(): cint
+    {.exportc, cdecl, raises: [].} =
+  let fd = sigSafeSlotFd()
+  if fd < 0:
+    return 0
+  var device, fileId: uint64
+  var kind: cint
+  if c_fd_identity_kind(fd, addr device, addr fileId, addr kind) != 1:
+    return 0
+  if kind == 1 and device == sigSafeSlotDevice() and
+      fileId == sigSafeSlotFileId():
+    return 1
+  0
 
 proc repro_linux_sig_safe_batch_ptr(): pointer {.exportc, cdecl, raises: [].} =
   sigSafeBatchPtr()
