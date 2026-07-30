@@ -211,6 +211,49 @@ int main(int argc, char **argv) {
     check fpGroupRead in permissions
     check fpOthersRead in permissions
 
+  test "repeated reads emit one dependency record per descriptor":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let reader = buildC(work, "byte_reader", """
+#include <fcntl.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  char byte;
+  long total = 0;
+  int fd = open(argv[1], O_RDONLY);
+  if (fd < 0) return 2;
+  while (read(fd, &byte, 1) > 0) ++total;
+  close(fd);
+  return total == 4096 ? 0 : 3;
+}
+""")
+    let marker = work / "byte-reader-marker.txt"
+    writeFile(marker, repeat("x", 4096))
+    let depfile = work / "byte-reader.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", reader, marker],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check dep.records.countIt(it.kind == mrFileRead and marker in it.path) == 1
+
   test "read batch is flushed when a process exits through _exit":
     let snoopBin = work / "io-mon"
     if not fileExists(snoopBin):

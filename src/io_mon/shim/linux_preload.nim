@@ -976,12 +976,14 @@ proc observationForOpen(flags: cint): MonitorObservationKind =
 proc updateFdPath(fd: cint; path: cstring) =
   if fd < 0 or path == nil:
     return
+  podFileReadExcl(fd)
   podFdPathSet(fd, path)
 
 proc removeFdPath(fd: cint) =
   podFdPathDel(fd)
   podEmptyFdExcl(fd)
   podInheritedFdExcl(fd)
+  podFileReadExcl(fd)
 
 proc pathForFd(fd: cint): string =
   podFdPathGet(fd)
@@ -1038,6 +1040,7 @@ proc classifyEmptyFdRead(fd: cint): bool {.raises: [].} =
         record.result = 0
         record.flags = uint32(fd)
         record.detail = "inherited-fd"
+        discard podFileReadMarkIsNew(fd)
         emitRecord(record)
         return true
     emitEventLoss("linux inherited regular fd read unnamed key=" &
@@ -1309,7 +1312,7 @@ proc recordFdRead(fd: cint; bytes: clong) {.raises: [].} =
     let path = pathForFd(fd)
     if path.len == 0:
       discard classifyEmptyFdRead(fd)
-    else:
+    elif podFileReadMarkIsNew(fd):
       var record = baseRecord(mrFileRead, moFileRead)
       record.path = path
       record.result = bytes.int64
@@ -1441,6 +1444,8 @@ proc recordRawRead(fd: cint; callResult: clong): bool {.raises: [].} =
   let path = pathForFd(fd)
   if path.len == 0:
     return false
+  if not podFileReadMarkIsNew(fd):
+    return true
   var record = baseRecord(mrFileRead, moFileRead)
   record.path = path
   record.result = callResult.int64
@@ -1479,12 +1484,13 @@ proc recordRawSplice(fdIn, fdOut: cint; callResult: clong): bool
   if fdIn > 2:
     let inPath = pathForFd(fdIn)
     if inPath.len > 0:
-      var record = baseRecord(mrFileRead, moFileRead)
-      record.path = inPath
-      record.result = callResult.int64
-      record.flags = uint32(fdIn)
-      emitRecord(record)
       recorded = true
+      if podFileReadMarkIsNew(fdIn):
+        var record = baseRecord(mrFileRead, moFileRead)
+        record.path = inPath
+        record.result = callResult.int64
+        record.flags = uint32(fdIn)
+        emitRecord(record)
   if fdOut > 2:
     let outPath = pathForFd(fdOut)
     if outPath.len > 0:
