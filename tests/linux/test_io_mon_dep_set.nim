@@ -267,6 +267,73 @@ int main(int argc, char **argv) {
     check toSeq(walkDir(fragDir)).filterIt(
       it.path.endsWith(".rmdf-frag")).len == 0
 
+  test "t_cross_process_open_dedup":
+    check shmGSetSupported
+    let shimLib = ensureShim()
+
+    const WorkerN = 32
+    let target = work / "cross-process-open-target.txt"
+    writeFile(target, "cross-process open target\n")
+
+    let storm = buildC(work, "cross_process_open_storm", """
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  if (argc == 3 && strcmp(argv[1], "--child") == 0) {
+    int fd = open(argv[2], O_RDONLY);
+    if (fd < 0) return 2;
+    close(fd);
+    return 0;
+  }
+  if (argc != 2) return 3;
+  for (int i = 0; i < """ & $WorkerN & """; i++) {
+    pid_t pid = fork();
+    if (pid < 0) return 4;
+    if (pid == 0) {
+      execl(argv[0], argv[0], "--child", argv[1], (char *)0);
+      _exit(5);
+    }
+  }
+  for (int i = 0; i < """ & $WorkerN & """; i++) {
+    int status = 0;
+    if (wait(&status) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+      return 6;
+  }
+  return 0;
+}
+""")
+
+    let fragDir = work / "cross-process-open-frags"
+    createDir(fragDir)
+    var host = startHost(fragDir, "cross-process-open-run")
+    check host.available
+
+    let env = childEnvWith(shimLib, {
+      "LD_PRELOAD": shimLib,
+      "REPRO_MONITOR_FRAGMENT_DIR": fragDir,
+      "REPRO_MONITOR_DEP_SHM": host.path0,
+      "REPRO_MONITOR_SESSION": "cross-process-open-run",
+    })
+    let cap = run(storm, @[target], env)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let found = decodeSet(host)
+    let growth = host.growthFailures()
+    host.finish()
+
+    check growth == 0'u64
+    let targetOpens = found.filterIt(
+      it.kind == mrFileOpen and it.path == target)
+    check targetOpens.len == 1
+    check targetOpens[0].osPid == 0'u64
+    check targetOpens[0].result == 0
+    # Process-lifecycle records retain their full identities.
+    check found.countIt(it.kind == mrProcessStart) >= WorkerN + 1
+
   test "t_exec_distinct_incarnations":
     # The exec teeth WITHOUT any incarnation tag. A pid that reads a marker then
     # execs a NEW image emits a process-start in BOTH incarnations. Those two

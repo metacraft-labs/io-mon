@@ -12,12 +12,11 @@
 ##
 ## The codec is domain-only (no ring, no segment, no atomics): a fixed header +
 ## varint-length path/detail encoding of the SAME `MonitorRecord` the RMDF frames
-## carry. Every field the file path preserves is encoded so a record that travels
-## the set is byte-for-byte the same record as one that travels the file — the
-## HARD byte-identical-final-depfile invariant (LF-6) depends on it, because
-## `mergeFragments` folds `detail` (run token), `childOsPid`, `result` and `flags`
-## into the canonical output. No serialization dependency (pure `io_mon/types`),
-## so the LD_PRELOAD shim that imports this module stays serialization-free.
+## carry. The real-sequence codec preserves every field. The SET identity codec
+## preserves every field for process/completeness records, while path-scoped file
+## observations discard process-local coordinates that do not change the observed
+## dependency. No serialization dependency (pure `io_mon/types`), so the
+## LD_PRELOAD shim that imports this module stays serialization-free.
 
 import io_mon/types
 
@@ -91,7 +90,8 @@ proc getU64(buf: openArray[byte]; pos: var int): uint64 =
   pos += 8
 
 proc encodeDepRecordWithSeq(record: MonitorRecord; buf: var openArray[byte];
-                            seqValue: uint64): int =
+                            seqValue: uint64;
+                            pathScopedIdentity = false): int =
   ## Shared codec body used by `encodeDepRecord` (carries the record's real
   ## `seq`) and `encodeDepRecordIdentity` (forces `seq = 0`). NO heap allocation:
   ## the caller supplies a stack buffer, keeping this fork/orc-safe on the shim
@@ -100,15 +100,31 @@ proc encodeDepRecordWithSeq(record: MonitorRecord; buf: var openArray[byte];
   let need = DepFixedHeaderLen
   if buf.len < need:
     return -1
+  let normalizePathObservation = pathScopedIdentity and
+    record.kind in {mrFileOpen, mrFileRead, mrPathProbe}
+  var encodedResult = record.result
+  var encodedFlags = record.flags
+  if normalizePathObservation:
+    case record.kind
+    of mrFileRead:
+      # Byte count and descriptor number do not alter the content dependency.
+      encodedResult = 0
+      encodedFlags = 0
+    of mrFileOpen, mrPathProbe:
+      # Preserve success versus failure; successful descriptor numbers are
+      # process-local. Open flags and ProbeResult remain part of the key.
+      encodedResult = if record.result < 0: -1 else: 0
+    else:
+      discard
   putU16(buf, pos, uint16(ord(record.kind)))
   putU16(buf, pos, uint16(ord(record.observationKind)))
   putU64(buf, pos, seqValue)
-  putU64(buf, pos, record.osPid)
-  putU64(buf, pos, record.parentOsPid)
-  putU64(buf, pos, record.threadId)
-  putU64(buf, pos, record.childOsPid)
-  putU64(buf, pos, cast[uint64](record.result))
-  putU32(buf, pos, record.flags)
+  putU64(buf, pos, if normalizePathObservation: 0'u64 else: record.osPid)
+  putU64(buf, pos, if normalizePathObservation: 0'u64 else: record.parentOsPid)
+  putU64(buf, pos, if normalizePathObservation: 0'u64 else: record.threadId)
+  putU64(buf, pos, if normalizePathObservation: 0'u64 else: record.childOsPid)
+  putU64(buf, pos, cast[uint64](encodedResult))
+  putU32(buf, pos, encodedFlags)
   putU32(buf, pos, uint32(ord(record.probeResult)))
   if not putVarint(buf, pos, uint64(record.path.len)):
     return -1
@@ -138,24 +154,27 @@ proc encodeDepRecord*(record: MonitorRecord; buf: var openArray[byte]): int =
 proc encodeDepRecordIdentity*(record: MonitorRecord; buf: var openArray[byte]): int =
   ## io-mon-Lossless-Event-Capture M3 (part 2a) — the DEDUP element-key encoder for
   ## the nim-shm-gset SET transport (the M1-winning Candidate-C channel). Identical
-  ## to `encodeDepRecord` EXCEPT the per-record monotonic `seq` is forced to 0, so
-  ## the encoded bytes are the record's *identity*, not its event ordinal.
+  ## to `encodeDepRecord` except that the per-record monotonic `seq` is forced to
+  ## 0 and path-scoped observations discard process-local coordinates, so the
+  ## encoded bytes describe the dependency identity rather than an event ordinal.
   ##
   ## FIELD CLASSIFICATION for the set dedup key (see the milestone report). The key
   ## must (a) collapse exact-duplicate probe-storm observations — "same path
   ## re-stat'd -> one element", the real Candidate-C dedup — and (b) NEVER collapse
   ## two semantically-distinct observations (the cardinal sin — a dropped dep):
   ##
-  ##   IDENTITY (kept, part of the key — a difference here means a distinct
-  ##   observation): `kind`, `observationKind`, `osPid`, `parentOsPid`, `threadId`,
-  ##   `childOsPid`, `result`, `flags`, `probeResult`, `path`, `detail`. Keeping
-  ##   the full output-affecting tuple is the maximally-SAFE choice: it can only
-  ##   ever UNDER-dedup (keep a redundant duplicate), never DROP a distinct dep.
-  ##   `childOsPid`/`osPid`/`parentOsPid` are the load-bearing identity of the
-  ##   process-tree records (start/exec/spawn/ipc are counted per pid), and
-  ##   `probeResult`/`result`/`flags` carry semantically-distinct outcomes (a path
-  ##   that was ABSENT then EXISTS is a real state change; O_RDONLY vs O_WRONLY is a
-  ##   read-dep vs a write) that must never fold together.
+  ##   PROCESS/COMPLETENESS IDENTITY: every field except `seq` remains in the key.
+  ##   `childOsPid`/`osPid`/`parentOsPid` are load-bearing for start/exec/spawn/IPC
+  ##   accounting and are never normalized on those records.
+  ##
+  ##   PATH-SCOPED IDENTITY (`mrFileOpen`, `mrFileRead`, `mrPathProbe`): process and
+  ##   thread ids are zeroed. File-read byte count/fd are zeroed. Open/probe result
+  ##   is reduced to success/failure, while open flags, observation kind,
+  ##   `probeResult`, path, and detail remain in the key. The caller's appended
+  ##   exec-image/generation suffix also remains, so observations from distinct
+  ##   executable incarnations do not collapse. This folds compiler include-search
+  ##   storms across thousands of same-image workers without losing a distinct
+  ##   path, access mode, existence outcome, probe outcome, or run scope.
   ##
   ##   DROPPED (excluded from the key — noise for the dependency): `seq` (this
   ##   proc's whole point: the per-record monotonic ordinal is EXACTLY what
@@ -171,7 +190,7 @@ proc encodeDepRecordIdentity*(record: MonitorRecord; buf: var openArray[byte]): 
   ## uses. Ordering determinism (two distinct keys that tie in `canonicalOrder`
   ## because `seq` is 0) is restored by the consumer sorting the snapshot by raw
   ## element bytes before decode (see fs_snoop).
-  encodeDepRecordWithSeq(record, buf, 0'u64)
+  encodeDepRecordWithSeq(record, buf, 0'u64, pathScopedIdentity = true)
 
 proc decodeDepRecord*(buf: openArray[byte]; ok: var bool): MonitorRecord =
   ## Decode a record produced by `encodeDepRecord`. `ok` is false on any

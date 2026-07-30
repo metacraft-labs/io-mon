@@ -17,10 +17,9 @@
 ##   * encodeDepRecord (real-seq variant): every field, INCLUDING `seq`, survives
 ##     the round-trip for several representative records (typical; empty
 ##     path/detail; max-ish values; non-ASCII detail).
-##   * encodeDepRecordIdentity: the identity-relevant fields survive with `seq`
-##     forced to 0, AND trailing bytes the caller appends (the per-exec image
-##     suffix) are IGNORED by the decoder — a decoded element equals the file
-##     record (the LF-6 byte-identical-depfile invariant depends on this).
+##   * encodeDepRecordIdentity: process/completeness fields survive with `seq`
+##     forced to 0; path-scoped observations normalize process-local coordinates;
+##     trailing per-exec image bytes are ignored by the decoder.
 ##
 ## Falsifiable: dropping any field from `decodeDepRecord` (verified in review by
 ## breaking `childOsPid`/`flags` in a scratch copy) fails the matching `check`.
@@ -62,6 +61,31 @@ proc representativeRecords(): seq[MonitorRecord] =
       detail: "détail: café — naïve ☃ \xFF\x80\x00 tail"),
   ]
 
+proc expectedIdentity(record: MonitorRecord): MonitorRecord =
+  result = record
+  result.seq = 0
+  if record.kind in {mrFileOpen, mrFileRead, mrPathProbe}:
+    result.osPid = 0
+    result.parentOsPid = 0
+    result.threadId = 0
+    result.childOsPid = 0
+    case record.kind
+    of mrFileRead:
+      result.result = 0
+      result.flags = 0
+    of mrFileOpen, mrPathProbe:
+      result.result = if record.result < 0: -1 else: 0
+    else:
+      discard
+
+proc identityBytes(record: MonitorRecord): seq[byte] =
+  var buf: array[CodecBufCap, byte]
+  let n = encodeDepRecordIdentity(record, buf)
+  if n > 0:
+    result = newSeq[byte](n)
+    for i in 0 ..< n:
+      result[i] = buf[i]
+
 template checkAllFields(d, r: MonitorRecord; expectSeq: uint64) =
   ## Assert every codec-carried field of `d` matches `r`, with `seq` compared
   ## against `expectSeq` (real `seq` for encodeDepRecord, 0 for the identity codec).
@@ -94,12 +118,12 @@ suite "io-mon dep record codec round-trip":
       check ok
       checkAllFields(d, r, r.seq)
 
-  test "t_codec_identity_drops_seq_and_ignores_suffix":
-    # encodeDepRecordIdentity forces seq=0 (the dedup key) but preserves every
-    # other field; the caller appends a per-exec image suffix the decoder MUST
-    # ignore, so a decoded element == the file record.
+  test "t_codec_identity_normalizes_path_observations_and_ignores_suffix":
+    # The identity codec preserves process/completeness fields. Path observations
+    # decode to their dependency identity rather than process-local event values.
     let imageSuffix = "/proc/self/exe#incarnation-image-bytes\x00\x01\x02"
     for r in representativeRecords():
+      let expected = expectedIdentity(r)
       var buf: array[CodecBufCap, byte]
       let n = encodeDepRecordIdentity(r, buf)
       check n > 0
@@ -108,7 +132,7 @@ suite "io-mon dep record codec round-trip":
       var okBare = false
       let bare = decodeDepRecord(buf.toOpenArray(0, n - 1), okBare)
       check okBare
-      checkAllFields(bare, r, 0'u64)
+      checkAllFields(bare, expected, 0'u64)
 
       # Append the image suffix and decode again: the trailing bytes are dropped,
       # so the decoded record is byte-for-byte the bare (file) record.
@@ -119,6 +143,54 @@ suite "io-mon dep record codec round-trip":
       var okSuffix = false
       let dec = decodeDepRecord(withSuffix.toOpenArray(0, total - 1), okSuffix)
       check okSuffix
-      checkAllFields(dec, r, 0'u64)
-      # And it equals the file record produced without any suffix.
+      checkAllFields(dec, expected, 0'u64)
       check dec == bare
+
+  test "t_path_identity_folds_process_local_coordinates":
+    let openA = MonitorRecord(kind: mrFileOpen, observationKind: moFileOpen,
+      seq: 1, osPid: 100, parentOsPid: 10, threadId: 7, childOsPid: 9,
+      result: 3, flags: 0x80000'u32, probeResult: prUnknown,
+      path: "/usr/include/example.h", detail: "run=codec-test")
+    var openB = openA
+    openB.seq = 99
+    openB.osPid = 200
+    openB.parentOsPid = 20
+    openB.threadId = 8
+    openB.childOsPid = 19
+    openB.result = 42
+    check identityBytes(openA) == identityBytes(openB)
+
+    var failedOpen = openB
+    failedOpen.result = -1
+    check identityBytes(openA) != identityBytes(failedOpen)
+    var differentFlags = openB
+    differentFlags.flags = 0
+    check identityBytes(openA) != identityBytes(differentFlags)
+
+    let readA = MonitorRecord(kind: mrFileRead, observationKind: moFileRead,
+      seq: 1, osPid: 100, threadId: 7, result: 1, flags: 3,
+      path: "/usr/include/example.h", detail: "run=codec-test")
+    var readB = readA
+    readB.seq = 200
+    readB.osPid = 300
+    readB.threadId = 9
+    readB.result = 65536
+    readB.flags = 57
+    check identityBytes(readA) == identityBytes(readB)
+
+    let probeMissing = MonitorRecord(kind: mrPathProbe,
+      observationKind: moPathProbe, osPid: 10, result: -1,
+      probeResult: prAbsent, path: "/usr/include/missing.h",
+      detail: "run=codec-test")
+    var probeExisting = probeMissing
+    probeExisting.osPid = 20
+    probeExisting.result = 0
+    probeExisting.probeResult = prExistingFile
+    check identityBytes(probeMissing) != identityBytes(probeExisting)
+
+    let startA = MonitorRecord(kind: mrProcessStart,
+      observationKind: moProcessStart, osPid: 100, parentOsPid: 10,
+      detail: "run=codec-test")
+    var startB = startA
+    startB.osPid = 200
+    check identityBytes(startA) != identityBytes(startB)
