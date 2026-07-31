@@ -3495,7 +3495,16 @@ proc isSystemRuntimeMappingPath*(path: string): bool {.raises: [].} =
   ## precedence order between this predicate and the
   ## `executable-mapping-short-circuit` in
   ## `shouldPatchInlineSyscallMapping` stays under regression cover.
-  path.startsWith("/lib/") or path.startsWith("/lib64/") or
+  let filename = path.extractFilename
+  filename in [
+      "libanl.so.1", "libBrokenLocale.so.1", "libc.so.6", "libdl.so.2",
+      "libm.so.6", "libmvec.so.1", "libpthread.so.0", "libresolv.so.2",
+      "librt.so.1", "libthread_db.so.1", "libutil.so.1",
+    ] or
+    filename.startsWith("libnss_") or
+    filename.startsWith("ld-linux-") or
+    filename.startsWith("ld-musl-") or
+    path.startsWith("/lib/") or path.startsWith("/lib64/") or
     path.startsWith("/usr/lib/") or path.startsWith("/usr/lib64/") or
     path.startsWith("/nix/store/")
 

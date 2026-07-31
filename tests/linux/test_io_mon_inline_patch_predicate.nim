@@ -68,6 +68,18 @@ suite "M9.R.67.1 inline-syscall patch predicate precedence":
     check not isSystemRuntimeMappingPath("/tmp/probe/user_app")
     check not isSystemRuntimeMappingPath("/home/user/project/main")
 
+  test "source-built dynamic runtimes are excluded outside system prefixes":
+    let sourceGlibc = "/home/user/reprobuild/recipes/packages/source/glibc" &
+      "/.repro/output/install/usr/lib"
+    check isSystemRuntimeMappingPath(sourceGlibc & "/libc.so.6")
+    check isSystemRuntimeMappingPath(
+      sourceGlibc & "/ld-linux-x86-64.so.2")
+    for runtime in ["libdl.so.2", "libm.so.6", "libpthread.so.0", "librt.so.1"]:
+      check isSystemRuntimeMappingPath(sourceGlibc & "/" & runtime)
+    check isSystemRuntimeMappingPath(
+      "/home/user/musl/output/lib/ld-musl-x86_64.so.1")
+    check not isSystemRuntimeMappingPath(sourceGlibc & "/libuser.so.1")
+
   test "isMonitorShimMappingPath recognises the canonical shim filename":
     check isMonitorShimMappingPath(
       "/opt/repro/reprobuild/build/lib/librepro_monitor_shim.so")
@@ -118,6 +130,12 @@ suite "M9.R.67.1 inline-syscall patch predicate precedence":
     let libc = "/nix/store/xx7cm72qy2c0643cm1ipngd87aqwkcdp-glibc-2.40-66" &
       "/lib/libc.so.6"
     check not shouldPatchInlineSyscallMapping(mapping(libc),
+      executablePath = "/opt/repro/reprobuild/build/bin/repro")
+
+  test "source-built glibc runtime is EXCLUDED":
+    let sourceGlibc = "/home/user/reprobuild/recipes/packages/source/glibc" &
+      "/.repro/output/install/usr/lib/libc.so.6"
+    check not shouldPatchInlineSyscallMapping(mapping(sourceGlibc),
       executablePath = "/opt/repro/reprobuild/build/bin/repro")
 
   test "writable / shared / anonymous mappings are always EXCLUDED":
