@@ -70,10 +70,64 @@ case "${IO_MON_BUILD_MODE:-debug}" in
     ;;
 esac
 
-case "$(uname -s)" in
-  Darwin)
+# Platform/arch detection must not depend on an external ``uname``.
+#
+# This script is invoked by reprobuild's scripts/build_apps.sh, which runs both
+# directly and as a MONITORED build action under ``repro build``. In the
+# monitored case on macOS the engine injects this very shim into every child
+# process, and ``$(uname -s)`` has been observed to expand to the EMPTY string
+# there: reprobuild's v0.1.3 release failed with
+#
+#   unsupported platform  for the io-mon shim
+#
+# -- note the doubled space where the platform name belongs -- roughly three
+# minutes after this same script had completed successfully outside the engine
+# in the same job. Depending on a forked binary to learn what OS we are on is
+# the fragile part; ``$OSTYPE`` and ``$HOSTTYPE`` are bash builtins that need
+# no fork, no PATH lookup, and offer nothing for a monitoring shim to
+# interpose.
+#
+# ``uname`` remains the fallback, and an unresolvable platform is a hard error
+# rather than a guess -- the ``*)`` arm below is a real "unsupported OS", so
+# silently landing there because a subprocess returned nothing would report the
+# wrong cause (which is exactly what happened).
+io_mon_host_platform() {
+  case "${OSTYPE:-}" in
+    darwin*) printf 'darwin\n'; return 0 ;;
+    linux*) printf 'linux\n'; return 0 ;;
+    msys*|cygwin*|win32) printf 'windows\n'; return 0 ;;
+  esac
+  case "$(uname -s 2>/dev/null || true)" in
+    Darwin) printf 'darwin\n'; return 0 ;;
+    Linux) printf 'linux\n'; return 0 ;;
+    MINGW*|MSYS*|CYGWIN*|Windows_NT) printf 'windows\n'; return 0 ;;
+  esac
+  return 1
+}
+
+io_mon_host_is_arm64() {
+  case "${HOSTTYPE:-}${MACHTYPE:-}" in
+    *arm64*|*aarch64*) return 0 ;;
+  esac
+  case "$(uname -m 2>/dev/null || true)" in
+    arm64|aarch64) return 0 ;;
+  esac
+  return 1
+}
+
+if ! io_mon_host_platform_name="$(io_mon_host_platform)"; then
+  echo "error: cannot determine the host platform for the io-mon shim." >&2
+  echo "       \$OSTYPE='${OSTYPE:-}'; 'uname -s' gave '$(uname -s 2>/dev/null || true)'." >&2
+  echo "       This is a detection failure, NOT an unsupported OS -- refusing to" >&2
+  echo "       report the wrong cause. If this fired under 'repro build', the" >&2
+  echo "       action environment is not resolving subprocesses." >&2
+  exit 2
+fi
+
+case "${io_mon_host_platform_name}" in
+  darwin)
     macos_shim_arch_flags=()
-    if [ "$(uname -m)" = "arm64" ]; then
+    if io_mon_host_is_arm64; then
       macos_shim_arch_flags+=(
         "--passC:-arch arm64"
         "--passC:-arch arm64e"
@@ -94,7 +148,7 @@ case "$(uname -s)" in
       --out:"${out_dir}/librepro_monitor_shim.dylib" \
       src/io_mon/shim/macos_interpose.nim
     ;;
-  Linux)
+  linux)
     linux_shim_link_flags=()
     if getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
       linux_shim_link_flags+=(
@@ -114,7 +168,7 @@ case "$(uname -s)" in
       --out:"${out_dir}/librepro_monitor_shim.so" \
       src/io_mon/shim/linux_preload.nim
     ;;
-  MINGW*|MSYS*|CYGWIN*|Windows_NT)
+  windows)
     nim c \
       ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
       --app:lib \
@@ -130,7 +184,10 @@ case "$(uname -s)" in
       src/io_mon/shim/windows_interpose.nim
     ;;
   *)
-    echo "unsupported platform $(uname -s) for the io-mon shim" >&2
+    # Reachable only for a platform we genuinely do not support: detection
+    # itself already failed hard above, so this can no longer be reached by a
+    # subprocess returning nothing.
+    echo "unsupported platform ${io_mon_host_platform_name} for the io-mon shim" >&2
     exit 2
     ;;
 esac
