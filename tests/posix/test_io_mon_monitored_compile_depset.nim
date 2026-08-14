@@ -198,3 +198,26 @@ int main(void) { printf("%d\n", TOP_VALUE); return 0; }
     # both — the fix must not have replaced one half-truth with the other.
     check dep.records.anyIt(canonical(it.path) == objPath and
       it.kind == mrFileOpen)
+
+    # (f) The object path also carries a `prAbsent` probe: `as` stats it before
+    # creating it. That record is TRUE — the path really was absent when probed
+    # — and it is not removed here.
+    #
+    # It was, however, a hazard, and the reason is (e). A consumer that reads a
+    # `prAbsent` probe as a standing anti-dependency ("this must still be
+    # absent for the cached result to hold") needs to net it against the
+    # action's own outputs, because "absent before I created it" is trivially
+    # true of every output. Before (e) there was no write record on this path to
+    # net against, so the probe and the creation were indistinguishable from a
+    # genuine "this file must not appear" input — and the action could never
+    # cache-hit on a rebuild, because its own previous output now exists.
+    #
+    # This assertion pins the pair, so the netting stays possible. It is the
+    # part io-mon owns; which way a consumer nets is its policy, not ours.
+    let probes = dep.records.filterIt(canonical(it.path) == objPath and
+      it.kind == mrPathProbe)
+    if probes.len > 0:
+      checkpoint("probe results on the output path: " &
+        probes.mapIt($it.probeResult).join(", "))
+      check dep.records.anyIt(canonical(it.path) == objPath and
+        it.kind == mrFileWrite)
