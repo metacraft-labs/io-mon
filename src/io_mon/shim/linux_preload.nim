@@ -908,39 +908,25 @@ proc emitEventLoss(detail: string; result: int64 = 0) {.raises: [].} =
 # ---------------------------------------------------------------------------
 # LIBRARY-LOAD OBSERVATION (`mcapLibraryLoad`) — see the long design note above
 # `ct_linux_library_scan` in `linux_preload_runtime.nim` for WHY this asks the
-# loader instead of hooking it, and for the coverage arithmetic implemented
-# below.
+# loader instead of hooking it, and for the coverage arithmetic it implements.
 #
-# Shape of the state: `libScanSeen` is the set of link-map entries this process
-# has already enumerated, keyed by (load address, name) so that the same file
-# mapped twice — `dlmopen` into a second namespace, or a reload after an unload
-# — counts as two loads, exactly as `dlpi_adds` counts it. `libScanLastAdds` is
-# the loader's cumulative load count as of the previous scan; the difference
-# between the two is what the proof below checks.
+# NOTE ON WHERE THE STATE LIVES. The seen-set and the previous `dlpi_adds` are
+# deliberately NOT Nim globals here; they are C-side POD (see that same note).
+# A scan runs on whichever thread called `dlopen`, so long-lived Nim heap state
+# shared between scans would be allocated on one thread and grown or freed on
+# another — the FUP-C allocator-corruption class this file already warns about
+# for the fd/dir/stream tables. Serialising with a lock orders the accesses; it
+# does not make the ORC allocator cross-thread safe. What remains on the Nim
+# side is per-record temporaries, created and released inside a single sink call
+# on one thread, exactly like every other hook.
 #
-# Fork/exec: the state is inherited across `fork` (correctly — the child has the
-# same mappings and the same history) and reset by the constructor re-running
-# after `exec` (correctly — a new image has a new link map). Neither needs
-# special handling.
+# Fork/exec: the C state is inherited across `fork` (correctly — the child has
+# the same mappings and the same history) and reset by the constructor re-running
+# after `exec` (correctly — a new image has a new link map).
 # ---------------------------------------------------------------------------
 var
   libScanLock: Lock
-  libScanNames: seq[string]
-  libScanAddrs: seq[uint64]
-  libScanSeen: seq[string]
-  libScanLastAdds: uint64 = 0
-  libScanSinkFailed = false
-
-proc libraryScanSink(name: cstring; address: culong) {.cdecl, raises: [].} =
-  ## Invoked once per link-map entry, AFTER `dl_iterate_phdr` has returned and
-  ## the loader lock is released — so allocating here is safe. A failure to
-  ## collect an entry is recorded, never swallowed: it means the enumeration is
-  ## short and the coverage proof below must not pass on it.
-  try:
-    libScanNames.add(if name == nil: "" else: $name)
-    libScanAddrs.add(uint64(address))
-  except CatchableError:
-    libScanSinkFailed = true
+  libScanSinkFailed = false   ## plain bool, no heap: safe to touch from any thread
 
 proc libraryLoadRecordablePath(path: string): bool {.raises: [].} =
   ## Which enumerated objects become `mrLibraryLoad` records.
@@ -964,100 +950,83 @@ proc libraryLoadRecordablePath(path: string): bool {.raises: [].} =
   if path.endsWith("librepro_monitor_shim.so"): return false
   true
 
-proc scanLoadedLibraries(reason: string) {.raises: [].} =
-  ## Enumerate the loader's link map, record every loaded object as a content
-  ## dependency, and then PROVE that the enumeration covered every load the
-  ## loader performed since the previous scan.
-  ##
-  ## The proof is the reason this is honest rather than merely useful. Sampling
-  ## the link map at chosen points leaves one question open — "what about an
-  ## object loaded and unloaded between two samples?" — and an open question
-  ## about input coverage may not be answered with `mcComplete`. `dlpi_adds` is
-  ## the loader's own count of loads; an object loaded in the window is one this
-  ## scan enumerates iff it is still mapped now. So `newlySeen == adds -
-  ## lastAdds` says every load in the window was seen, and anything else says at
-  ## least one was not — at which point this emits an event-loss marker and the
-  ## whole capture downgrades to `mcIncomplete`.
-  if not initialized or inForkChild:
-    return
-  acquire(libScanLock)
-  defer: release(libScanLock)
-  libScanNames.setLen(0)
-  libScanAddrs.setLen(0)
-  libScanSinkFailed = false
-  var adds: uint64 = 0
-  var subs: uint64 = 0
-  var countersValid: cint = 0
-  var overflow: cint = 0
-  # Muted across the walk: the walk is the MONITOR's activity, not the
-  # monitored program's, and must not be able to record anything on its behalf.
-  # Unmuted again before the emits below, because `emitRecord` is a no-op while
-  # the shim is muted.
-  inc disabled
-  let count = linuxLibraryScan(cast[pointer](libraryScanSink),
-                               addr adds, addr subs,
-                               addr countersValid, addr overflow)
-  dec disabled
-  if count < 0:
-    emitEventLoss("library-load scan failed (" & reason & ")")
-    return
-
-  var newlySeen = 0
-  var unnameable = 0
-  for i in 0 ..< libScanNames.len:
-    let path = libScanNames[i]
-    let key = $libScanAddrs[i] & "\x1f" & path
-    var known = false
-    for seen in libScanSeen:
-      if seen == key:
-        known = true
-        break
-    if known: continue
-    libScanSeen.add key
-    inc newlySeen
+proc libraryScanSink(name: cstring; address: culong; reason: cstring)
+    {.cdecl, raises: [].} =
+  ## Invoked once per NEWLY-SEEN link-map entry, after `dl_iterate_phdr` has
+  ## returned and the loader lock is released — so allocating and recording here
+  ## is safe, and every allocation is freed on this same thread before returning.
+  try:
+    let path = if name == nil: "" else: $name
     if libraryLoadRecordablePath(path):
       var record = baseRecord(mrLibraryLoad, moFileRead)
       record.path = path
-      record.detail = "library-load dl_iterate_phdr " & reason
+      record.detail = "library-load dl_iterate_phdr " &
+        (if reason == nil: "" else: $reason)
       emitRecord(record)
     elif path.len > 0 and not path.startsWith("/") and
         not path.startsWith("linux-vdso") and not path.startsWith("linux-gate"):
       # An object the loader names relatively: it IS a real file dependency but
-      # we cannot state which one, because the name is only meaningful against
-      # a working directory that has since moved on. Counted, not guessed.
-      inc unnameable
+      # we cannot state WHICH one, because a relative name is only meaningful
+      # against a working directory that has since moved on. Flagged, not
+      # guessed — a wrong path in a dependency set is worse than a stated gap.
+      libScanSinkFailed = true
+  except CatchableError:
+    libScanSinkFailed = true
+
+proc scanLoadedLibraries(reason: cstring) {.raises: [].} =
+  ## Enumerate the loader's link map, record every newly-seen object as a
+  ## content dependency, and then PROVE that the enumeration covered every load
+  ## the loader performed since the previous scan.
+  ##
+  ## The proof is what makes this honest rather than merely useful. Sampling the
+  ## link map at chosen points leaves one question open — "what about an object
+  ## loaded and unloaded between two samples?" — and an open question about
+  ## input coverage may not be answered with `mcComplete`. `dlpi_adds` is the
+  ## loader's own count of loads; an object loaded in a window is one this scan
+  ## enumerates iff it is still mapped now. So `newlySeen == performed` says
+  ## every load in the window was seen, and anything else says at least one was
+  ## not — at which point this emits an event-loss marker and the whole capture
+  ## downgrades to `mcIncomplete`.
+  if not initialized or inForkChild:
+    return
+  acquire(libScanLock)
+  defer: release(libScanLock)
+  libScanSinkFailed = false
+  var performed: uint64 = 0
+  var newlySeen: cint = 0
+  var countersValid: cint = 0
+  var overflow: cint = 0
+  # NOT muted. The sink records on behalf of the monitored process, and
+  # `emitRecord` is a no-op while the shim is muted. The loader walk itself
+  # cannot re-enter the hooks: `dl_iterate_phdr` performs no file I/O and
+  # resolves no symbols.
+  let count = linuxLibraryScan(cast[pointer](libraryScanSink), reason,
+                               addr performed, addr newlySeen,
+                               addr countersValid, addr overflow)
+  let why = if reason == nil: "" else: $reason
+  if count < 0:
+    emitEventLoss("library-load scan failed (" & why & ")")
+    return
 
   # --- coverage proof -----------------------------------------------------
   if libScanSinkFailed:
-    emitEventLoss("library-load enumeration incomplete: could not collect " &
-      "every link-map entry (" & reason & ")")
+    emitEventLoss("library-load coverage gap: a loaded object could not be " &
+      "recorded or is named only relatively by the loader, so the file behind " &
+      "it cannot be identified (" & why & ")")
   elif overflow != 0:
     emitEventLoss("library-load enumeration overflowed its snapshot buffer: " &
       "the process has more loaded objects than the scan can hold (" &
-      reason & ")")
+      why & ")")
   elif countersValid == 0:
     emitEventLoss("library-load coverage is unprovable: this loader does not " &
       "report dlpi_adds/dlpi_subs, so a library loaded and unloaded between " &
-      "scans would be undetectable (" & reason & ")")
-  else:
-    let seenAdds = adds
-    if seenAdds < libScanLastAdds:
-      emitEventLoss("library-load coverage is unprovable: the loader's load " &
-        "counter went backwards (" & reason & ")")
-    else:
-      let performed = seenAdds - libScanLastAdds
-      if uint64(newlySeen) != performed:
-        emitEventLoss("library-load coverage gap: the loader performed " &
-          $performed & " load(s) since the previous scan but only " &
-          $newlySeen & " newly-mapped object(s) were still enumerable (" &
-          reason & ") — at least one shared object was loaded and unloaded " &
-          "without being observed, so its bytes are an input this capture " &
-          "cannot name")
-      libScanLastAdds = seenAdds
-  if unnameable > 0:
-    emitEventLoss("library-load coverage gap: " & $unnameable & " loaded " &
-      "object(s) are named only relatively by the loader, so the file behind " &
-      "them cannot be identified (" & reason & ")")
+      "scans would be undetectable (" & why & ")")
+  elif uint64(newlySeen) != performed:
+    emitEventLoss("library-load coverage gap: the loader performed " &
+      $performed & " load(s) since the previous scan but only " &
+      $newlySeen & " newly-mapped object(s) were still enumerable (" &
+      why & ") — at least one shared object was loaded and unloaded without " &
+      "being observed, so its bytes are an input this capture cannot name")
 
 proc drainInlineRawSyscallEvents() {.raises: [].}
 proc installLinuxVdsoPatches() {.raises: [].}
