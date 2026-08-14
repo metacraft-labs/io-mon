@@ -127,8 +127,15 @@ through pins. **E** is a separate, larger architectural discussion.
 
 ## Residual risks / known gaps
 
-- The `dlopen`'d `.so`'s own load is still not recorded as a file-read *dependency* —
-  **pre-existing and orthogonal**, not a regression: glibc opens it internally
+- ~~The `dlopen`'d `.so`'s own load is still not recorded as a file-read
+  *dependency*~~ — **RESOLVED** by
+  [linux-library-load-observation.md](linux-library-load-observation.md): the shim now
+  observes the loader's link map with `dl_iterate_phdr` (scans at init, after each
+  interposed `dlopen`/`dlmopen`, and at shutdown) and records every loaded object as an
+  `mrLibraryLoad` content dependency, with the loader's own `dlpi_adds` counter used to
+  prove the enumeration missed nothing. Alternative **C** (`LD_AUDIT`) below remains the
+  documented future direction for the one residual it cannot observe. Original note,
+  for the record: glibc opens it internally
   (`__open64_nocancel`) and the real `dlopen` runs under the reentrancy guard, so
   nested opens are bypassed; before the fix `dlopen` failed outright, so nothing was
   captured either. Documented as the `adversarial-raw-syscall` capability gap. A

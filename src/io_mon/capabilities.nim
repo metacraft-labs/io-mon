@@ -126,6 +126,32 @@ const
     mcapFileAppend,
     mcapRename,
     mcapIpcConnect,
+    # LIBRARY-LOAD OBSERVATION. The runtime shared-library closure is captured
+    # by asking the LOADER for its link map (`dl_iterate_phdr`) rather than by
+    # hooking the calls that populate it — the Linux counterpart of the macOS
+    # arm's `_dyld_register_func_for_add_image`, and for the same reason: ld.so
+    # maps a dependency through internal `__mmap`/`__open64_nocancel` calls that
+    # LD_PRELOAD symbol interposition cannot see, so the entire closure was
+    # previously invisible (a monitored `gcc -c` captured ZERO of its ten loaded
+    # shared objects while reporting mcComplete).
+    #
+    # THIS IS A PROMISE, and it is kept by arithmetic rather than by assertion:
+    # every scan compares the number of newly-enumerated objects against the
+    # loader's own cumulative `dlpi_adds` counter, so a load that happened
+    # without being enumerated — the one case sampling cannot see, a
+    # loader-internal `__libc_dlopen_mode` undone before the next scan — is
+    # DETECTED and emits an event-loss marker that downgrades the capture. The
+    # capability therefore means "every load was observed, or this capture is
+    # mcIncomplete", which is what a supported capability has to mean.
+    #
+    # Residual, stated because it is not covered: a process SIGKILLed before its
+    # shutdown scan loses the closing account, so a loader-internal load in that
+    # window is neither observed nor detected. That is the pre-existing
+    # kill-before-flush inherent-loss class, not a new one. LD_AUDIT's
+    # la_objopen would close it — see docs/cases/dlopen-runpath-transparency.md
+    # alternative C — at the cost of a second injected copy of io-mon per
+    # process, in its own link-map namespace.
+    mcapLibraryLoad,
     # M-FW-6C — Linux libc-visible getenv/uname/sysconf are recorded as
     # observed inputs; clock_gettime/gettimeofday/time are time-read evidence;
     # getrandom is entropy evidence. Direct raw/vDSO variants remain outside
@@ -134,11 +160,61 @@ const
     mcapNonDeterminism
   }
 
+  InputEvidenceCapabilities* = {
+    # The capabilities WITHOUT WHICH AN INPUT-COMPLETENESS CLAIM IS NOT
+    # AVAILABLE — the observation channels a depfile's own `mcComplete` asserts
+    # were present. A backend that does not support one of these has an input
+    # channel it cannot see at all, so a capture from it downgrades to
+    # `mcIncomplete` whether or not the consumer thought to ask.
+    #
+    # WHY THIS SET EXISTS. `docs/contributors/architecture.md` states the
+    # contract as "every uncertainty downgrades to mcIncomplete", but the
+    # machinery did not enforce it: `depFileFromOwnedRecords` derived the
+    # profile with an EMPTY required-set, and a gap is only ever marked
+    # `required` — the thing that clears `evidenceComplete` — for capabilities
+    # in that set. So every declared capability gap was emitted with
+    # `required=false` and could never affect completeness. The declaration was
+    # real and the consequence was missing. That is how `mcapLibraryLoad` sat
+    # in `LinuxPreloadKnownUnsupportedCapabilities` while a monitored `gcc -c`
+    # reported `mcComplete` having observed none of its ten loaded libraries.
+    #
+    # WHY IT IS THIS SET AND NOT ALL GAPS. Making every declared gap downgrade
+    # would make Linux permanently `mcIncomplete` and destroy the signal, and it
+    # would be wrong on the merits, because the other entries are not missing
+    # input channels:
+    #   * `mcapEndpointSecurity` / `mcapHybrid` are ALTERNATIVE BACKENDS. Their
+    #     absence says another implementation was not used, not that anything
+    #     went unobserved.
+    #   * `mcapAuthorizationEnforcement` is about DENYING operations. io-mon
+    #     observes; it never claimed to enforce.
+    #   * `mcapPathMutation` / `mcapPathIdentity` are OUTPUT-side and identity
+    #     fidelity. A missed mutation record leaves the output view poorer; it
+    #     is not an input a cache key would silently omit.
+    #   * `mcapSymlink` / `mcapExternalContent` are PARTIAL, with a recorded
+    #     substitute — a read through a symlink still records a path that
+    #     resolves to the same bytes, and the libc-visible content movers are
+    #     recorded. The gaps are narrower coverage, not blindness.
+    #   * `mcapAdversarialRawSyscall` / `mcapExecutableMappingLifecycle` are
+    #     THREAT MODELS the profile's own diagnostics already tell consumers to
+    #     request explicitly if they need them.
+    # `mcapLibraryLoad` was the one entry in the Linux list that was none of
+    # those: a whole class of real content inputs, observed by nothing else,
+    # absent from the capture, with no substitute record anywhere.
+    mcapProcess,
+    mcapProcessTree,
+    mcapProcessExec,
+    mcapFileRead,
+    mcapFileWrite,
+    mcapPathProbe,
+    mcapDirectoryEnumerate,
+    mcapEventLoss,
+    mcapLibraryLoad
+  }
+
   LinuxPreloadKnownUnsupportedCapabilities* = {
     mcapEndpointSecurity,
     mcapHybrid,
     mcapSymlink,
-    mcapLibraryLoad,
     mcapAuthorizationEnforcement,
     mcapPathMutation,
     mcapAdversarialRawSyscall,
@@ -303,7 +379,9 @@ proc linuxUnsupportedReason(capability: MonitorCapability): string =
   of mcapSymlink:
     "Linux preload shim does not yet normalize symlink/readlink as path mutations"
   of mcapLibraryLoad:
-    "Linux preload shim does not yet emit library-load records"
+    "Linux preload shim observes the loader's link map (dl_iterate_phdr) and " &
+      "emits library-load records; this reason applies only where library-load " &
+      "observation is not advertised"
   of mcapAuthorizationEnforcement:
     "Linux preload shim observes only and cannot authorize or deny operations"
   of mcapPathMutation:

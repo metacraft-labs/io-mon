@@ -16,13 +16,18 @@
 ## produced independently of io-mon by the tool being observed, which is the
 ## same differential the real-build oracle calls battery B.
 ##
-## SCOPE NOTE (deliberate, not an oversight): the comparison domain is the
-## compiler's declared source/header closure. It does NOT include the shared
-## libraries the compiler process itself loads. On Linux `mcapLibraryLoad` is a
-## declared-unsupported capability (`LinuxPreloadKnownUnsupportedCapabilities`),
-## so those are absent from the capture while completeness still reads
-## `mcComplete`; asserting them here would encode a false expectation. That gap
-## is real and is tracked as a capability gap, not by this test.
+## SCOPE NOTE: the comparison domain is the compiler's declared source/header
+## closure — what `cc -MD` reports. It does NOT include the shared libraries the
+## compiler process itself loads, because the compiler does not declare those and
+## this test's ground truth is the compiler's own dep data.
+##
+## Those libraries ARE captured now: `tests/linux/test_io_mon_library_load_closure.nim`
+## covers them against `strace -f` ground truth. When this note was first written
+## they were not, and `mcapLibraryLoad` was a declared-unsupported Linux
+## capability whose gap could not affect completeness — so a capture that had
+## observed none of the compiler's ten loaded shared objects still read
+## `mcComplete`. Keeping the two domains in separate tests keeps each one's
+## ground truth independent of io-mon.
 
 import std/[os, osproc, sequtils, sets, streams, strtabs, strutils, unittest]
 
