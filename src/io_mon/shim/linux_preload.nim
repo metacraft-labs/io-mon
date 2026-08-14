@@ -1707,17 +1707,72 @@ proc modeLooksReadable(mode: cstring): bool =
     inc i
   result = false
 
+proc modeLooksWritable(mode: cstring): bool =
+  ## True when the stdio mode string grants WRITE access, i.e. the open is an
+  ## OUTPUT-side event.
+  ##
+  ## `"w"`/`"w+"` create+truncate, `"a"`/`"a+"` create+append, and `"r+"` opens
+  ## an existing file for update. `modeLooksReadable` is deliberately NOT the
+  ## complement of this: `"w+"` and `"a+"` and `"r+"` are BOTH, and the two
+  ## questions have to be asked separately or the answer to one silently
+  ## overrides the other (see `recordFopen`).
+  if mode == nil or mode[0] == '\0':
+    return false
+  if mode[0] in {'w', 'a'}:
+    return true
+  var i = 0
+  while mode[i] != '\0':
+    if mode[i] == '+':
+      return true
+    inc i
+  result = false
+
 proc recordFopen(path, mode: cstring; stream: pointer) {.raises: [].} =
+  ## A stdio open is recorded on EVERY access side the mode actually grants.
+  ##
+  ## THE BUG THIS FIXES. The classification used to be a single either/or:
+  ## `if modeLooksReadable(mode): moFileOpen else: moFileWrite`. `"w+"` is
+  ## readable (it has a `+`), so a gcc-produced object file — which `as` opens
+  ## through stdio as `"w+"` — took the `moFileOpen` arm and was recorded ONLY
+  ## as an `mrFileOpen`, with the write-ness surviving nowhere but the free-text
+  ## `detail=stdio:w+` string. So a file that was CREATED and TRUNCATED by the
+  ## action produced no write-side record at all, while `mcapFileCreate` and
+  ## `mcapFileTruncate` were both advertised Linux capabilities.
+  ##
+  ## The consumer consequence is the part that matters: reprobuild splits an
+  ## action's INPUTS from its OUTPUTS by record kind. `mrFileOpen` is on the
+  ## input side (see `oracle.nim:observedPaths`), and there was no `mrFileWrite`
+  ## — so the compile's own product was classified as an input, or as neither,
+  ## depending on how the consumer reads it. Free-text `detail` parsing is not a
+  ## classification API and no consumer should have to do it.
+  ##
+  ## Both sides are now emitted when the mode grants both, because `"w+"`,
+  ## `"a+"` and `"r+"` genuinely ARE both, and the set transport dedups them
+  ## under distinct element keys.
   let resolved = pathForAt(LinuxAtFdcwd, path)
   if stream != nil:
     updateStreamPath(stream, cstring(resolved))
-  var record = baseRecord(mrFileOpen,
-    if modeLooksReadable(mode): moFileOpen else: moFileWrite)
-  record.result = cast[int64](stream)
-  record.path = resolved
-  if mode != nil:
-    record.detail = "stdio:" & $mode
-  emitRecord(record)
+  let detail = if mode != nil: "stdio:" & $mode else: ""
+  if modeLooksReadable(mode):
+    var record = baseRecord(mrFileOpen, moFileOpen)
+    record.result = cast[int64](stream)
+    record.path = resolved
+    record.detail = detail
+    emitRecord(record)
+  if modeLooksWritable(mode):
+    var record = baseRecord(mrFileWrite, moFileWrite)
+    record.result = cast[int64](stream)
+    record.path = resolved
+    record.detail = detail
+    emitRecord(record)
+  if not modeLooksReadable(mode) and not modeLooksWritable(mode):
+    # An unparseable / exotic mode string: record the open itself so the path is
+    # never lost, and leave the access side unclaimed rather than guessed.
+    var record = baseRecord(mrFileOpen, moFileOpen)
+    record.result = cast[int64](stream)
+    record.path = resolved
+    record.detail = detail
+    emitRecord(record)
 
 proc repro_hook_fopen*(ctx: var FopenContext) {.raises: [].} =
   if shouldBypass():

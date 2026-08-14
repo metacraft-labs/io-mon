@@ -95,7 +95,7 @@ Variables a user or consumer cares about:
 
 | Variable | Role |
 | --- | --- |
-| `REPRO_MONITOR_SHIM_LIB` | **Operator override** for the shim shared-library path. Honoured first by `findShimLibrary()`; otherwise the canonical `build/lib/librepro_monitor_shim.<ext>` layout is probed. |
+| `REPRO_MONITOR_SHIM_LIB` | **Operator override** for the shim shared-library path. Honoured first by `findShimLibrary()`; otherwise the canonical `build/lib/librepro_monitor_shim.<ext>` layout is probed. A set-but-nonexistent value is a **hard error**, never a silent fall-back to a discovered shim — see below. |
 | `CT_SANDBOX_TOOLS_DIR` | macOS SIP bypass: directory of non-SIP drop-ins for `/bin/sh`, `/bin/cat`, coreutils, etc. If unset, `run` creates and populates a temp one. Point it at a pre-built portable bundle (`scripts/build-sandbox-tools.sh`) to widen subtree coverage. |
 | `IO_MON_BREAKAWAY_REPORT_DIR` | Directory where a cooperating "trusted daemon" drops breakaway reports; `mergeFragments` folds the daemon-read files into the depfile and exempts the daemon's pid from the IPC-connect downgrade (BuildXL Trusted-Tools prior art). |
 
@@ -191,7 +191,13 @@ else:
   exit code.
 - `findShimLibrary(): string` — resolve the shim shared library
   (`$REPRO_MONITOR_SHIM_LIB` first, then the canonical build layout); empty
-  string if none found.
+  string if no discovery candidate is found. If `$REPRO_MONITOR_SHIM_LIB` is
+  **set but does not name an existing file**, this raises `IOError` rather than
+  returning a discovered shim: an override is a pin, so honouring it "first"
+  has to mean honouring it, not preferring it. Falling through would run the
+  capture under a *different* shim than the operator pinned and still report
+  `mcComplete`, with no diagnostic anywhere — a stale pin or a typo would
+  silently change the provenance of the evidence.
 
 ### The public host API — `runMonitored` (the blessed parent-host entry point)
 

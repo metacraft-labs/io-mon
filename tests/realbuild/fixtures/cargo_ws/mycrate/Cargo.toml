@@ -5,3 +5,13 @@ edition = "2021"
 
 [dependencies]
 mydep = { path = "../mydep" }
+
+# HERMETICITY, not decoration. Without an explicit `[workspace]` table cargo
+# walks UP from this manifest looking for a workspace root, so an unrelated
+# `Cargo.toml` anywhere above the oracle's scratch dir — e.g. a stray
+# `/tmp/Cargo.toml` left by another project, which is exactly what happened —
+# captures this fixture as a workspace member, and cargo exits non-zero trying
+# to load that workspace's members. The oracle then sees a build that never
+# ran. Declaring the fixture its own workspace root stops the upward search at
+# this file, so the fixture's outcome depends only on the fixture.
+[workspace]
