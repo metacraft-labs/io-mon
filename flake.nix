@@ -84,6 +84,14 @@
               pkgs.nimble
               pkgs.git
               pkgs.nixfmt
+              # tests/linux/test_io_mon_library_load_closure.nim derives its
+              # ground truth from `strace -f -e trace=openat`: the loader
+              # closure io-mon claims to observe is compared against the one
+              # the kernel actually opened. Without strace in the shell that
+              # comparison cannot run, and CI failed with "Could not find
+              # command: 'strace'" while it passed on developer machines that
+              # happened to have it on PATH.
+              pkgs.strace
             ];
           };
         };
