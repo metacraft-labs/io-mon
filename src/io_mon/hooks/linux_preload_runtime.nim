@@ -516,6 +516,7 @@ type
 #include <signal.h>
 #include <spawn.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1633,6 +1634,212 @@ const char *ct_linux_preload_resolve_dlopen_caller_path(const char *path,
   return out;
 }
 
+/* ---------------------------------------------------------------------------
+ * LIBRARY-LOAD OBSERVATION — ask the loader, do not interpose it.
+ *
+ * THE DEFECT THIS CLOSES. ld.so maps a shared object with its own internal
+ * __mmap / __open64_nocancel calls, which do NOT traverse LD_PRELOAD
+ * symbol interposition. So none of this shim's open/openat/mmap hooks
+ * ever fire for a loader-driven load, and the runtime shared-library closure of
+ * a monitored process was captured NOWHERE. Measured on this repo before the
+ * fix: a monitored gcc -c loads ten shared objects (libisl, libmpfr, libmpc,
+ * libgmp, libbfd, libz, libsframe, libc, libdl, libm — strace -f ground
+ * truth) and the depfile contained ZERO .so paths while reporting
+ * completeness=mcComplete. An in-place upgrade of any of those libraries
+ * changes what the compiler DOES and busts nothing: a content-addressed
+ * consumer serves a stale result. That is the cardinal sin.
+ *
+ * WHY dl_iterate_phdr AND NOT AN EVENT HOOK. The macOS shim already solved the
+ * same problem the right way: _dyld_register_func_for_add_image asks dyld for
+ * its image set instead of hooking the calls that produce it. dl_iterate_phdr
+ * is the Linux equivalent — it walks the loader's OWN link map, so what it
+ * reports is what the loader actually has, regardless of which code path put it
+ * there. Three consequences matter:
+ *
+ *   1. It is STATE, not EVENTS. Objects mapped before this shim's constructor
+ *      ran — every DT_NEEDED of the executable, every other LD_PRELOAD, the
+ *      loader itself — are all visible at the first scan, because ld.so maps
+ *      the entire initial closure BEFORE running any ELF initializer. An
+ *      event hook can only ever see what happens after it is installed; a
+ *      state scan sees what is there. This is what makes "loaded before we
+ *      were initialised" a covered case rather than a hole.
+ *   2. It cannot perturb. It resolves nothing, opens nothing, and returns the
+ *      loader's already-resolved dlpi_name. Contrast the interposed dlopen
+ *      immediately below, which had to be taught to reconstruct the caller's
+ *      RUNPATH precisely because interposing a resolution path CHANGES it.
+ *   3. It is not privileged and adds no process. LD_AUDIT's la_objopen sees
+ *      strictly more (it fires for loader-internal __libc_dlopen_mode too),
+ *      but an audit library is loaded into its OWN link-map namespace with its
+ *      own libc, so it cannot share this shim's recording state and would have
+ *      to attach to the shm transport independently — a second injected copy of
+ *      io-mon in every monitored process. That cost buys coverage of a case
+ *      this design DETECTS instead (see the accounting below), so it stays the
+ *      documented future direction, not this change.
+ *
+ * THE ACCOUNTING — why sampling is honest here. Scanning at chosen points
+ * would normally leave the question "what about a library loaded and unloaded
+ * BETWEEN two scans?" unanswerable, and an unanswerable question about input
+ * coverage must not be answered with mcComplete. struct dl_phdr_info
+ * carries dlpi_adds and dlpi_subs: the loader's own cumulative counts of
+ * objects added and removed. That turns the question into arithmetic. Between
+ * two scans the loader performed adds - lastAdds loads; a load is one this
+ * shim SAW iff the object was still present at the next scan. So if the number
+ * of newly-enumerated objects equals adds - lastAdds, every load in the
+ * window was observed — proven, not assumed. If it is short, some object was
+ * loaded and unloaded unseen, and the caller emits an event-loss marker that
+ * downgrades the capture to mcIncomplete. The gap becomes VISIBLE rather
+ * than silent, which is the entire point.
+ *
+ * SAFETY. The dl_iterate_phdr callback runs with the loader's
+ * dl_load_write_lock held. It therefore does only memcpy into a
+ * preallocated buffer: no allocation, no Nim, no locks, no recording. The sink
+ * — which allocates and records — is invoked AFTER dl_iterate_phdr returns
+ * and the loader lock is released. (This is stricter than the macOS arm, which
+ * records from inside dyld's add-image callback; on glibc a shim hook can
+ * allocate while the loader lock is held, so the lock-ordering risk is real
+ * enough to design out rather than argue about.)
+ *
+ * The snapshot buffer is a single static, and callers serialise scans, so
+ * there is no per-scan allocation on any path. Overflowing it is treated as an
+ * observation failure, not silently truncated.
+ * ------------------------------------------------------------------------- */
+#define CT_LL_MAX_OBJECTS 512
+#define CT_LL_NAME_BYTES (128 * 1024)
+#define CT_LL_SEEN_MAX 2048
+#define CT_LL_SEEN_NAME_BYTES (256 * 1024)
+
+typedef void (*ct_ll_sink_fn)(char *name, unsigned long address, char *reason);
+
+typedef struct {
+  unsigned long long adds;
+  unsigned long long subs;
+  int counters_valid;
+  int count;
+  int overflow;
+  unsigned long addrs[CT_LL_MAX_OBJECTS];
+  int name_off[CT_LL_MAX_OBJECTS];
+  int name_used;
+  char names[CT_LL_NAME_BYTES];
+} ct_ll_snapshot;
+
+static ct_ll_snapshot ct_ll_snap;
+
+/* The PERSISTENT state -- the set of link-map entries already enumerated, and
+   the loaders cumulative load count as of the previous scan -- lives HERE, in
+   C, and not in a Nim seq.
+   That is not a style preference. A scan can run on ANY thread (the interposed
+   dlopen fires on whichever thread called it), so a Nim heap object that
+   survives between scans would be allocated on one thread and freed or grown on
+   another. That is precisely the FUP-C/FUP-H mechanism documented at the top of
+   linux_preload.nim: an ORC chunk allocated on one thread and released on
+   another corrupts the process allocator, and it crashed live-Vulkan replay in
+   rawDealloc off updateFdPath. Keeping this state POD and C-owned removes the
+   class rather than hoping the lock is enough -- the lock orders the accesses,
+   it does not make the allocator cross-thread safe.
+   Nim still allocates per RECORD, but those temporaries are created and
+   released on the same thread inside one sink call, exactly like every other
+   hook. */
+static unsigned long ct_ll_seen_addr[CT_LL_SEEN_MAX];
+static int ct_ll_seen_off[CT_LL_SEEN_MAX];
+static char ct_ll_seen_names[CT_LL_SEEN_NAME_BYTES];
+static int ct_ll_seen_count;
+static int ct_ll_seen_used;
+static unsigned long long ct_ll_last_adds;
+
+static int ct_ll_collect(struct dl_phdr_info *info, size_t size, void *data) {
+  ct_ll_snapshot *s = (ct_ll_snapshot *)data;
+  const char *name;
+  size_t len;
+  /* dlpi_adds/dlpi_subs are a later addition to the struct; a runtime whose
+     struct stops short of them leaves counters_valid at 0, and the caller then
+     treats coverage as UNPROVEN rather than assuming the counters were zero. */
+  if (size >= offsetof(struct dl_phdr_info, dlpi_subs) +
+                  sizeof(info->dlpi_subs)) {
+    s->adds = (unsigned long long)info->dlpi_adds;
+    s->subs = (unsigned long long)info->dlpi_subs;
+    s->counters_valid = 1;
+  }
+  if (s->count >= CT_LL_MAX_OBJECTS) {
+    s->overflow = 1;
+    return 0;
+  }
+  name = (info->dlpi_name != NULL) ? info->dlpi_name : "";
+  len = strlen(name);
+  if (s->name_used + (int)len + 1 > CT_LL_NAME_BYTES) {
+    s->overflow = 1;
+    return 0;
+  }
+  s->addrs[s->count] = (unsigned long)info->dlpi_addr;
+  s->name_off[s->count] = s->name_used;
+  memcpy(s->names + s->name_used, name, len + 1);
+  s->name_used += (int)len + 1;
+  s->count++;
+  return 0;
+}
+
+static int ct_ll_seen_has(unsigned long addr, const char *name) {
+  int i;
+  for (i = 0; i < ct_ll_seen_count; i++)
+    if (ct_ll_seen_addr[i] == addr &&
+        strcmp(ct_ll_seen_names + ct_ll_seen_off[i], name) == 0)
+      return 1;
+  return 0;
+}
+
+static int ct_ll_seen_add(unsigned long addr, const char *name) {
+  size_t len = strlen(name);
+  if (ct_ll_seen_count >= CT_LL_SEEN_MAX) return 0;
+  if (ct_ll_seen_used + (int)len + 1 > CT_LL_SEEN_NAME_BYTES) return 0;
+  ct_ll_seen_addr[ct_ll_seen_count] = addr;
+  ct_ll_seen_off[ct_ll_seen_count] = ct_ll_seen_used;
+  memcpy(ct_ll_seen_names + ct_ll_seen_used, name, len + 1);
+  ct_ll_seen_used += (int)len + 1;
+  ct_ll_seen_count++;
+  return 1;
+}
+
+/* Callers serialise scans with a lock on the Nim side, so no locking here. */
+int ct_linux_library_scan(ct_ll_sink_fn sink, char *reason,
+                          unsigned long long *performed, int *newly_seen,
+                          int *counters_valid, int *overflow) {
+  int i, seen_new = 0;
+  ct_ll_snap.count = 0;
+  ct_ll_snap.name_used = 0;
+  ct_ll_snap.overflow = 0;
+  ct_ll_snap.adds = 0;
+  ct_ll_snap.subs = 0;
+  ct_ll_snap.counters_valid = 0;
+  dl_iterate_phdr(ct_ll_collect, &ct_ll_snap);
+
+  /* Sink calls happen HERE, with the loader lock already released. */
+  for (i = 0; i < ct_ll_snap.count; i++) {
+    const char *name = ct_ll_snap.names + ct_ll_snap.name_off[i];
+    unsigned long addr = ct_ll_snap.addrs[i];
+    if (ct_ll_seen_has(addr, name)) continue;
+    if (!ct_ll_seen_add(addr, name)) {
+      /* The seen-set is full: further entries cannot be tracked, so coverage
+         is no longer provable. Reported as an overflow, never truncated
+         silently. */
+      ct_ll_snap.overflow = 1;
+      break;
+    }
+    seen_new++;
+    if (sink != NULL) sink((char *)name, addr, reason);
+  }
+
+  if (performed != NULL) {
+    *performed = (ct_ll_snap.counters_valid && ct_ll_snap.adds >= ct_ll_last_adds)
+                     ? ct_ll_snap.adds - ct_ll_last_adds
+                     : 0;
+  }
+  if (ct_ll_snap.counters_valid && ct_ll_snap.adds >= ct_ll_last_adds)
+    ct_ll_last_adds = ct_ll_snap.adds;
+  if (newly_seen != NULL) *newly_seen = seen_new;
+  if (counters_valid != NULL) *counters_valid = ct_ll_snap.counters_valid;
+  if (overflow != NULL) *overflow = ct_ll_snap.overflow;
+  return ct_ll_snap.count;
+}
+
 void *ct_linux_preload_real_dlsym(void *handle, char *name) {
 #ifdef __GLIBC__
   if (real_dlsym_ptr == NULL)
@@ -2526,6 +2733,26 @@ proc realRenameat*(oldDirfd: cint; oldPath: cstring; newDirfd: cint;
 proc realRenameat2*(oldDirfd: cint; oldPath: cstring; newDirfd: cint;
                     newPath: cstring; flags: cuint): cint
   {.importc: "ct_linux_preload_real_renameat2", raises: [].}
+proc linuxLibraryScan*(sink: pointer; reason: cstring;
+                       performed: ptr uint64;
+                       newlySeen, countersValid, overflow: ptr cint): cint
+  {.importc: "ct_linux_library_scan", raises: [].}
+  ## Enumerate the loader's link map (see the design note above
+  ## `ct_linux_library_scan`), invoking `sink` once for each entry NOT SEEN
+  ## BEFORE — a `proc(name: cstring; address: culong; reason: cstring) {.cdecl.}`
+  ## cast to `pointer`, called after `dl_iterate_phdr` has returned so the
+  ## loader lock is no longer held and the sink may allocate and record.
+  ##
+  ## `performed` reports how many loads the loader itself performed since the
+  ## previous scan (from its cumulative `dlpi_adds`) and `newlySeen` how many
+  ## objects this scan enumerated for the first time. Equal ⇒ every load in the
+  ## window was observed; short ⇒ at least one object was loaded and unloaded
+  ## without ever being enumerated, and the caller must downgrade.
+  ##
+  ## The seen-set and the previous `dlpi_adds` live on the C side ON PURPOSE:
+  ## scans run on whichever thread called `dlopen`, and long-lived Nim heap
+  ## state shared between threads is the FUP-C allocator-corruption class.
+
 proc realDlopen*(path: cstring; flags: cint): pointer
   {.importc: "ct_linux_preload_real_dlopen", raises: [].}
 proc realDlmopen*(namespaceId: clong; path: cstring; flags: cint): pointer

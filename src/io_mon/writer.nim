@@ -1731,7 +1731,16 @@ proc summarizeRecords*(records: openArray[MonitorRecord]): MonitorSummary =
 
 proc depFileFromOwnedRecords*(records: sink seq[MonitorRecord]): MonitorDepFile =
   let summary = summarizeRecords(records)
-  var profile = profileFromRecords(records)
+  # The required-set is NOT empty, and that is the whole point. Deriving the
+  # profile with `{}` meant no declared capability gap could ever mark itself
+  # `required`, so none of them could ever clear `evidenceComplete` — the
+  # architecture doc's "every uncertainty downgrades to mcIncomplete" was
+  # stated but not wired. `InputEvidenceCapabilities` is the set whose absence
+  # means an input channel is unobserved, so a backend missing one of them
+  # cannot report `mcComplete` regardless of what the consumer asked for. A
+  # consumer wanting a WIDER bar still calls `evaluateMonitorEvidence` with its
+  # own set; this is the floor, not a ceiling.
+  var profile = profileFromRecords(records, InputEvidenceCapabilities)
   if summary.eventLossCount != 0:
     profile.evidenceComplete = false
   result = MonitorDepFile(

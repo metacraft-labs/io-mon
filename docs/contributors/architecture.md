@@ -31,6 +31,36 @@ To prevent this:
 
 - `io-mon` defines a completeness enum: `mcComplete` | `mcIncomplete`.
 - **Every uncertainty downgrades to `mcIncomplete`**.
+
+#### How that invariant is actually enforced
+
+The rule above was, for a period, stated here and not wired. `depFileFromOwnedRecords`
+derived the backend profile with an **empty required-set**, and a declared capability
+gap only clears `evidenceComplete` when it is marked `required` — which only happens
+for capabilities in that set. So every backend gap was emitted with `required=false`
+and could not affect completeness. A backend could declare in the depfile that it
+cannot observe an entire class of inputs and still report `mcComplete`; Linux did
+exactly that for library loads, and a monitored `gcc -c` reported `mcComplete` having
+observed none of the ten shared objects it loaded.
+
+The fix is `InputEvidenceCapabilities` (`src/io_mon/capabilities.nim`), passed as the
+required-set when a depfile is finalised. It is the set of capabilities whose absence
+means **an input channel is unobserved**, and it is deliberately narrower than "every
+declared gap":
+
+| Gap class | Example | Downgrades? | Why |
+| --- | --- | --- | --- |
+| Missing input channel | `mcapLibraryLoad` | **yes** | Real content inputs, observed by nothing else, no substitute record |
+| Alternative backend | `mcapEndpointSecurity`, `mcapHybrid` | no | Says another implementation was not used, not that anything went unobserved |
+| Enforcement | `mcapAuthorizationEnforcement` | no | io-mon observes; it never claimed to deny |
+| Output-side / identity | `mcapPathMutation`, `mcapPathIdentity` | no | A missed mutation record is not an input a cache key silently omits |
+| Partial with a substitute | `mcapSymlink`, `mcapExternalContent` | no | A read through a symlink still records a path resolving to the same bytes |
+| Threat model | `mcapAdversarialRawSyscall`, `mcapExecutableMappingLifecycle` | no | The profile's diagnostics already tell consumers to request these explicitly |
+
+Downgrading on *every* declared gap would make Linux permanently `mcIncomplete` and
+destroy the signal — a different way of being useless, not a fix. A consumer that
+wants a wider bar still calls `evaluateMonitorEvidence` with its own required-set;
+`InputEvidenceCapabilities` is the floor, not the ceiling.
 - Scenarios triggering `mcIncomplete` include:
   - Interrupted or corrupt fragment log writing.
   - Spawning child processes under hardened/SIP-protected environments that prevent shim insertion.
@@ -52,6 +82,23 @@ To prevent this:
 
 - **`LD_PRELOAD` Shim**: Injects wrapper symbols that route filesystem activity to the monitor.
 - **Raw Syscall Hooking**: Uses a raw-syscall SIGTRAP substrate to intercept inline `0f 05` assembly instructions inside main executable pages and custom dynamic libraries.
+- **Library-Load Observation (`dl_iterate_phdr`)**: `ld.so` maps a shared object through
+  internal `__mmap` / `__open64_nocancel` calls that do **not** traverse `LD_PRELOAD`
+  symbol interposition, so no file hook can ever see a loader-driven load. io-mon
+  therefore **asks the loader for its link map** instead of hooking the calls that
+  populate it — the Linux counterpart of the macOS arm's
+  `_dyld_register_func_for_add_image`. Scans run at shim init (which sees the *entire*
+  initial closure, because `ld.so` maps everything before running any ELF constructor),
+  after each interposed `dlopen`/`dlmopen` (before the handle is returned, so the
+  dependency is published before the program can act on it), and at shutdown.
+  Coverage is **proven, not assumed**: each scan compares the count of newly-enumerated
+  objects against the loader's own cumulative `dlpi_adds`, so a load that happened
+  without being enumerated — a loader-internal `__libc_dlopen_mode` undone before the
+  next scan — is detected and emits an event-loss marker that downgrades the capture.
+  Residual: a process `SIGKILL`ed before its shutdown scan loses the closing account
+  (the pre-existing kill-before-flush inherent-loss class). `LD_AUDIT`'s `la_objopen`
+  would close that at the cost of a second injected copy of io-mon per process, in its
+  own link-map namespace — see `docs/cases/dlopen-runpath-transparency.md` alternative C.
 - **File Transfers**: Tracks vector/zero-copy operations (`pread`, `readv`, `sendfile`, `copy_file_range`, `splice`) and records them as reads/writes.
 - **Non-File Tracking**: Logs `getenv`, `uname`, `sysconf` accesses, system time calls, and `getrandom` non-determinism events.
 

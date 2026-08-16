@@ -1,7 +1,25 @@
 # Cross-repo siblings cloned by setup-dev-env at workspace-lock-pinned
-# revisions. Both are io-mon's `uses:` library producers in repro.nim
+# revisions. They are io-mon's `uses:` library producers in repro.nim
 # (reprobuild builds each from source and threads its `src/` root onto
 # io-mon's compile); they are also the `--path` siblings config.nims
 # resolves for the plain `nim c` / `nimble` build.
 nim-stackable-hooks
 nim-shm-queue
+
+# nim-shm-gset is required by `src/io_mon/writer.nim` (`import
+# shm_gset/transport`) and by scripts/build_shim.sh, but it was missing from
+# this list, so `just build` failed with "missing nim-shm-gset at
+# ../nim-shm-gset/src" and `just test` with "cannot open file:
+# shm_gset/transport". Both were reported as PASSING jobs, because those
+# steps pipe into `tee` and the default `run` shell has no pipefail; ci.yml
+# now sets `shell: bash` so the exit status survives.
+#
+# Pinned to an explicit revision rather than resolved from the workspace
+# lock: the io-mon locks published to metacraft-manifests (8b6d0b9b,
+# ea5fa77a) list only io-mon, nim-stackable-hooks and nim-shm-queue, so a
+# bare `nim-shm-gset` entry would fail resolution instead of cloning. The
+# durable fix is to add nim-shm-gset to the io-mon workspace manifest so it
+# is locked alongside its siblings; this pin should be dropped then.
+# cf0adf2f is metacraft-labs/nim-shm-gset@dev, the revision io-mon's build
+# and full test suite are green against.
+nim-shm-gset=cf0adf2f39647f5b203b2ab694414a3c50e93951

@@ -13,9 +13,13 @@
 #   --full  — additionally the differentials B (ninja `-t deps` / cargo dep-info)
 #           and C (`strace -f`), plus the SIGKILL-under-load battery D. ~5s.
 #
-# ninja is NOT in io-mon's dev shell, so this script obtains it via
-# `nix shell nixpkgs#ninja`. cmake / cargo / rustc / strace / cc come from the
-# dev shell (or the ambient environment when already inside one).
+# TOOLCHAIN PROVENANCE (corrected): io-mon's `flake.nix` devShell provides only
+# `just nim2 nimble git nixfmt`. It does NOT provide cmake, ninja, cargo, rustc,
+# strace or cc — every one of those comes from the AMBIENT environment. ninja is
+# the only one this script pulls in itself (`nix shell nixpkgs#ninja`), because
+# it is the one that is usually absent; the rest are checked below and the run
+# aborts with a named missing tool rather than failing later inside a battery
+# where a missing binary looks like an io-mon capture gap.
 set -euo pipefail
 
 MODE=full
@@ -32,6 +36,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 WORKDIR="${WORKDIR:-$(mktemp -d "${TMPDIR:-/tmp}/io-mon-realbuild-oracle.XXXXXX")}"
 HOOKS_SRC="${STACKABLE_HOOKS_SRC:-$REPO_ROOT/../nim-stackable-hooks/src}"
+
+# Fail fast, and by NAME, on a tool this run needs but the environment does not
+# have. Discovering it later (as a fixture build exiting non-zero) reads as an
+# io-mon finding when it is an environment one.
+missing=()
+for tool in cc cmake cargo rustc; do
+  command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+done
+if [ "$MODE" = full ]; then
+  command -v strace >/dev/null 2>&1 || missing+=("strace")
+fi
+if [ ${#missing[@]} -gt 0 ]; then
+  echo "run_oracle.sh: missing required tool(s) from the ambient environment:" \
+       "${missing[*]}" >&2
+  echo "io-mon's devShell does not provide these; enter a shell that has them." >&2
+  exit 2
+fi
 
 echo "== building shim + io-mon CLI + oracle =="
 STACKABLE_HOOKS_SRC="$HOOKS_SRC" "$REPO_ROOT/scripts/build_shim.sh" >/dev/null

@@ -6,8 +6,13 @@ on:
   pull_request:
     branches: [main, dev, stable]
 
-env:
-  MANIFESTS_REF: io-mon-fixes
+# No MANIFESTS_REF pin: setup-dev-env defaults to `latest`, which is where the
+# workspace-lock publishing tooling (`repro workspace lock` / the pre-push hook)
+# actually writes. The previous `io-mon-fixes` pin pointed at a campaign branch
+# of metacraft-manifests that is now 591 commits behind `latest` and carries no
+# non-lock content of its own, so every io-mon commit failed `Setup Dev
+# Environment` with "No workspace lock for io-mon" — the lock existed, just not
+# on the pinned branch. `ci-reprobuild.yml` was never pinned and resolves fine.
 
 jobs:
   lint:
@@ -32,6 +37,11 @@ jobs:
           gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: Run lint
+        # `shell: bash` is load-bearing, not style. The default `run` shell is
+        # `bash -e` WITHOUT pipefail, so `cmd | tee` reports tee's exit status
+        # and a failing `just` was reported as a passing job. `shell: bash`
+        # selects `bash --noprofile --norc -eo pipefail`.
+        shell: bash
         run: dev-exec just lint 2>&1 | tee lint.log
 
       - name: Upload logs
@@ -68,6 +78,8 @@ jobs:
           gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: Run build
+        # See the note on `Run lint`: without pipefail, `| tee` masks failure.
+        shell: bash
         run: dev-exec just build 2>&1 | tee build.log
 
       - name: Upload logs
@@ -110,6 +122,8 @@ jobs:
           gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: Run tests
+        # See the note on `Run lint`: without pipefail, `| tee` masks failure.
+        shell: bash
         run: |
           if [ "${{ matrix.env }}" = "reprobuild" ]; then
             repro test 2>&1 | tee test.log
