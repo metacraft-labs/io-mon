@@ -940,7 +940,15 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
                                        captureStdioPath = request.captureStdioPath)
     result.exitCode = injection.exitCode
 
-    result.depFile = mergeFragments(fragmentDir, request.depFilePath)
+    var launcherRecords: seq[MonitorRecord] = @[]
+    if injection.monitoringSkipped:
+      launcherRecords.add MonitorRecord(
+        kind: mrEventLoss,
+        observationKind: moEventLoss,
+        osPid: uint64(getCurrentProcessId()),
+        detail: "unmonitored subtree/peer (" & injection.skipReason & ")")
+    result.depFile = mergeFragments(fragmentDir, request.depFilePath,
+      setRecords = launcherRecords)
     renderStreamToPath(request.depFilePath, request.streamMode,
       request.eventStreamPath)
   else:
