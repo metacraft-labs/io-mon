@@ -37,6 +37,11 @@ jobs:
           gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: Run lint
+        # `shell: bash` is load-bearing, not style. The default `run` shell is
+        # `bash -e` WITHOUT pipefail, so `cmd | tee` reports tee's exit status
+        # and a failing `just` was reported as a passing job. `shell: bash`
+        # selects `bash --noprofile --norc -eo pipefail`.
+        shell: bash
         run: dev-exec just lint 2>&1 | tee lint.log
 
       - name: Upload logs
@@ -73,6 +78,8 @@ jobs:
           gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: Run build
+        # See the note on `Run lint`: without pipefail, `| tee` masks failure.
+        shell: bash
         run: dev-exec just build 2>&1 | tee build.log
 
       - name: Upload logs
@@ -115,6 +122,8 @@ jobs:
           gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: Run tests
+        # See the note on `Run lint`: without pipefail, `| tee` masks failure.
+        shell: bash
         run: |
           if [ "${{ matrix.env }}" = "reprobuild" ]; then
             repro test 2>&1 | tee test.log
