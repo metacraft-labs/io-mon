@@ -5,8 +5,8 @@ on:
     tags:
       - 'v*'
 
-env:
-  MANIFESTS_REF: io-mon-fixes
+# See the note in ci.yml: the `io-mon-fixes` manifests branch is a stale
+# campaign branch and locks are published to `latest`, which is the default.
 
 jobs:
   build:
