@@ -729,3 +729,157 @@ int main(int argc, char **argv) {
     check fragFiles == 1
     let dep = mergeFragments(dir, dir / "fallback.rdep", currentRunId = runId)
     check dep.completeness == mcIncomplete
+
+  test "pipeline_processes_share_one_gset":
+    # IoMon-Pipeline-Capture IM-1 (required test) — segment identity reaches every
+    # member of a shell PIPELINE, so `sh -c 'a | b'` contributes to exactly ONE
+    # grow-only set rather than to per-process side channels.
+    #
+    # The two pipeline members are DISTINCT binaries reading DISTINCT markers, so
+    # the assertion is a real cross-pid attribution and not one process observed
+    # twice: the single consumer snapshot must carry BOTH markers' reads AND a
+    # `process-exec` for BOTH binaries under two DIFFERENT pids.
+    #
+    # Note on attribution: `encodeDepRecordIdentity` deliberately ZEROES the pid on
+    # path-scoped records (that normalization is what collapses probe storms), so
+    # per-pid attribution is asserted through the process-lifecycle records, which
+    # retain their full identity by design. Together they say: two distinct child
+    # pids ran, and both of their reads are in the one set.
+    check shmGSetSupported
+    let shimLib = ensureShim()
+
+    let markerA = work / "pipeline-marker-a.txt"
+    let markerB = work / "pipeline-marker-b.txt"
+    writeFile(markerA, "pipeline marker a\n")
+    writeFile(markerB, "pipeline marker b\n")
+
+    # Two separately-named binaries so `process-exec` distinguishes the producer
+    # end of the pipe from the consumer end.
+    let readerA = buildC(work, "pipeline_reader_a", markerReaderSrc())
+    let readerB = buildC(work, "pipeline_reader_b", markerReaderSrc())
+
+    let fragDir = work / "pipeline-frags"
+    createDir(fragDir)
+    var host = startHost(fragDir, "pipeline-run")
+    check host.available
+    check host.path0.endsWith(".shard0")
+
+    let env = childEnvWith(shimLib, {
+      "LD_PRELOAD": shimLib,
+      "REPRO_MONITOR_FRAGMENT_DIR": fragDir,
+      "REPRO_MONITOR_DEP_SHM": host.path0,
+      "REPRO_MONITOR_SESSION": "pipeline-run",
+    })
+    # A genuine pipeline: both members run concurrently, each in its own process.
+    let cap = run("/bin/sh", @["-c",
+      readerA & " " & markerA & " | " & readerB & " " & markerB], env)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let found = decodeSet(host)
+    let growth = host.growthFailures()
+    host.finish()
+    check growth == 0'u64
+
+    # ONE set carries BOTH pipeline members' file dependencies.
+    check found.anyIt(it.kind == mrFileRead and markerA in it.path)
+    check found.anyIt(it.kind == mrFileRead and markerB in it.path)
+
+    # ...and both members are present as distinct, pid-bearing processes.
+    let execA = found.filterIt(it.kind == mrProcessExec and readerA in it.path)
+    let execB = found.filterIt(it.kind == mrProcessExec and readerB in it.path)
+    check execA.len >= 1
+    check execB.len >= 1
+    let pidsA = execA.mapIt(it.osPid).deduplicate()
+    let pidsB = execB.mapIt(it.osPid).deduplicate()
+    check pidsA.allIt(it != 0'u64)
+    check pidsB.allIt(it != 0'u64)
+    # The producer and consumer ends of the pipe are genuinely different pids.
+    check pidsA.allIt(it notin pidsB)
+
+    # LF-2 — the pipeline never fell back to a per-process file side channel.
+    check toSeq(walkDir(fragDir)).filterIt(
+      it.path.endsWith(".rmdf-frag")).len == 0
+
+  test "killed_child_records_survive":
+    # IoMon-Pipeline-Capture IM-1 (required test) — a child SIGKILLed with what the
+    # file transport would still be holding as an un-flushed read batch loses NONE
+    # of its already-observed reads.
+    #
+    # This is the teeth of the "exit-flush replaced by an equivalent that cannot
+    # lose a killed process's records" deliverable. On the SET path LF-7 holds:
+    # every observation is published into consumer-owned shared memory BEFORE the
+    # hooked syscall returns the data to the process, so there is no buffered tail
+    # for the kill to take. SIGKILL is uncatchable — no destructor, no atexit, no
+    # signal handler, no explicit flush runs — so anything present in the snapshot
+    # got there via publish-before-return and nothing else.
+    #
+    # The existing Level-1 `kill-before-flush` loss class belongs to the `.rmdf-frag`
+    # batch writer; on the set path it must not merely be unreported, it must be
+    # UNNEEDED — hence the assertion that every read survived AND no loss marker was
+    # produced.
+    check shmGSetSupported
+    let shimLib = ensureShim()
+
+    const N = 12
+    var markers: seq[string]
+    for i in 0 ..< N:
+      let m = work / ("killed-marker-" & $i & ".txt")
+      writeFile(m, "killed marker " & $i & "\n")
+      markers.add m
+
+    # Read every marker, then die instantly and uncatchably. No exit(), so the
+    # shim's `__attribute__((destructor))` exit sweep NEVER runs.
+    let killer = buildC(work, "killed_mid_batch_reader", """
+#include <fcntl.h>
+#include <signal.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  char buf[64];
+  for (int i = 1; i < argc; i++) {
+    int fd = open(argv[i], O_RDONLY);
+    if (fd < 0) _exit(2);
+    read(fd, buf, sizeof(buf));
+    close(fd);
+  }
+  kill(getpid(), SIGKILL);
+  _exit(3);
+}
+""")
+
+    let fragDir = work / "killed-frags"
+    createDir(fragDir)
+    var host = startHost(fragDir, "killed-run")
+    check host.available
+
+    let env = childEnvWith(shimLib, {
+      "LD_PRELOAD": shimLib,
+      "REPRO_MONITOR_FRAGMENT_DIR": fragDir,
+      "REPRO_MONITOR_DEP_SHM": host.path0,
+      "REPRO_MONITOR_SESSION": "killed-run",
+    })
+    let proc0 = startProcess(killer, args = markers, env = env,
+      options = {poStdErrToStdOut, poUsePath})
+    discard proc0.outputStream.readAll()
+    let code = proc0.waitForExit()
+    proc0.close()
+    # Died by SIGKILL, not by a clean exit path that could have flushed.
+    check code != 0
+    check code != 3
+
+    let found = decodeSet(host)
+    let growth = host.growthFailures()
+    host.finish()
+    check growth == 0'u64
+
+    # Every read observed before the kill is durable in consumer-owned memory.
+    for m in markers:
+      check found.anyIt(it.kind == mrFileRead and m in it.path)
+    # Not "lost but honestly reported" — on the set path there is nothing to lose.
+    check not found.anyIt(it.kind == mrEventLoss and
+      "kill-before-flush" in it.detail)
+    check not found.anyIt(it.kind == mrEventLoss and
+      "dep-set-capture-loss" in it.detail)
+    # LF-2 — no per-process file side channel was used.
+    check toSeq(walkDir(fragDir)).filterIt(
+      it.path.endsWith(".rmdf-frag")).len == 0
