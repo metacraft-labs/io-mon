@@ -1160,6 +1160,43 @@ proc recordExternalContent(chan, role, path: string; fd: cint) {.raises: [].} =
   record.detail = "chan=" & chan & " role=" & role
   emitRecord(record)
 
+proc recordLocalFdCreate(fd: cint) {.raises: [].} =
+  ## IoMon-Pipeline-Capture IM-3 — record that a monitored (in-tree) process
+  ## CREATED a local IPC fd (`pipe`/`pipe2`/`socketpair`), stamping the kernel
+  ## (dev,ino) identity of the underlying object so the merge can PAIR a later
+  ## inherited `chan=opaque role=read` against it (writer.externalContentLossCount).
+  ##
+  ## This is the cardinal-sin guard for the Linux arm of ROUND-4 IP1, mirroring
+  ## `macos_interpose.recordLocalFdCreate`: an entirely in-tree pipeline —
+  ## `sh -c 'echo hi | cat'`, a compiler driver's driver↔cc1 pipes — is paired and
+  ## stays `mcComplete`, while an fd inherited from an OUT-OF-TREE creator has no
+  ## in-tree create, stays unpaired, and still downgrades.
+  ##
+  ## Direction of failure is deliberately one-way: the `fstat` is a raw syscall and
+  ## a failure is swallowed. A MISSING create can only leave a consume unpaired,
+  ## i.e. a conservative re-run; it can never manufacture a pairing. Conversely an
+  ## EXTRA create only suppresses a downgrade for an object the monitored tree
+  ## demonstrably made itself, which is the whole point.
+  if fd < 0:
+    return
+  var dev, ino: uint64
+  var kind: cint
+  if c_fd_identity_kind(fd, addr dev, addr ino, addr kind) == 0:
+    return
+  recordExternalContent("localfd", "create", localFdKey(dev, ino), fd)
+
+proc recordLocalFdPair(fds: ptr cint) {.raises: [].} =
+  ## Record BOTH ends of a freshly created fd pair. On Linux the two ends of a
+  ## `pipe` share ONE pipefs inode (so the second record dedups in the set), but a
+  ## `socketpair`'s ends have DISTINCT inodes and the consumer may fstat either —
+  ## so both are recorded unconditionally rather than relying on which end is
+  ## which.
+  if fds == nil:
+    return
+  let arr = cast[ptr UncheckedArray[cint]](fds)
+  recordLocalFdCreate(arr[0])
+  recordLocalFdCreate(arr[1])
+
 proc isLinuxDeletedProcFdTarget(path: string): bool {.raises: [].} =
   path.endsWith(" (deleted)")
 
@@ -1992,6 +2029,46 @@ proc repro_hook_connect*(ctx: var ConnectContext) {.raises: [].} =
     recordIpcConnect(ctx.fd, ctx.address, ctx.addrLen)
   c_set_errno(savedErrno)
 
+proc repro_hook_pipe*(ctx: var PipeContext) {.raises: [].} =
+  ## IM-3 — `pipe(2)`. Both fds are recorded as in-tree local-fd creates so a
+  ## downstream in-tree consumer's inherited opaque read pairs and does not
+  ## downgrade. Reads `ctx.fds` only after the real call reported success.
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0:
+    recordLocalFdPair(ctx.fds)
+  c_set_errno(savedErrno)
+
+proc repro_hook_pipe2*(ctx: var Pipe2Context) {.raises: [].} =
+  ## IM-3 — `pipe2(2)`. Same as `pipe`; `O_CLOEXEC`/`O_NONBLOCK` in `ctx.flags`
+  ## do not change the channel identity, so the flags are not consulted.
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0:
+    recordLocalFdPair(ctx.fds)
+  c_set_errno(savedErrno)
+
+proc repro_hook_socketpair*(ctx: var SocketpairContext) {.raises: [].} =
+  ## IM-3 — `socketpair(2)`. The two ends have DISTINCT inodes, so both must be
+  ## recorded for either end's inherited read to pair.
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0:
+    recordLocalFdPair(ctx.sv)
+  c_set_errno(savedErrno)
+
 proc repro_hook_sendfile*(ctx: var SendfileContext) {.raises: [].} =
   if shouldBypass():
     callNext(ctx)
@@ -2742,6 +2819,9 @@ registerFopen64Hook(repro_hook_fopen64)
 registerFreadHook(repro_hook_fread)
 registerFcloseHook(repro_hook_fclose)
 registerConnectHook(repro_hook_connect)
+registerPipeHook(repro_hook_pipe)
+registerPipe2Hook(repro_hook_pipe2)
+registerSocketpairHook(repro_hook_socketpair)
 registerSendfileHook(repro_hook_sendfile)
 registerCopyFileRangeHook(repro_hook_copy_file_range)
 registerSpliceHook(repro_hook_splice)

@@ -864,7 +864,26 @@ proc kindCarriesCapturedDependency(k: MonitorRecordKind): bool {.inline.} =
   else:
     true
 
-proc markReadingSentinel(recordKind: MonitorRecordKind) =
+const LocalFdCreateDetailPrefix* = "chan=localfd role=create"
+  ## IoMon-Pipeline-Capture IM-3 — the exact `detail` prefix the shims stamp on a
+  ## local-IPC-fd CREATE record. The run token is appended AFTER the existing
+  ## detail (`stampRunId`), so a prefix match identifies the class unambiguously.
+
+proc recordSuppressesOnlyADowngrade(record: MonitorRecord): bool {.inline.} =
+  ## IM-3 — true for a record whose ONLY effect downstream is to SUPPRESS a
+  ## downgrade, never to add a dependency or to cause one.
+  ##
+  ## `chan=localfd role=create` is the sole member today: `externalContentLossCount`
+  ## consults it exclusively as the right-hand side of a pairing, so losing one can
+  ## only leave a consume UNPAIRED — a conservative extra re-run. It can never
+  ## produce a false `mcComplete`. Contrast the other `mrExternalContent` roles
+  ## (`opaque read`, `shm attach`, `fifo read`), each of which is the thing that
+  ## CAUSES a downgrade: losing one of those DOES risk the cardinal sin, so they
+  ## stay fully sentinel-guarded.
+  record.kind == mrExternalContent and
+    record.detail.startsWith(LocalFdCreateDetailPrefix)
+
+proc markReadingSentinel(record: MonitorRecord) =
   ## ROUND-5 F — record that this thread's batch now holds non-durable
   ## CAPTURED-DEPENDENCY bytes, by writing a durable `read-tail-pending`
   ## marker INTO the fragment ONCE per dirty cycle (see
@@ -876,7 +895,18 @@ proc markReadingSentinel(recordKind: MonitorRecordKind) =
   ## not fire a pending sentinel it can never retire. The flag itself
   ## still switches only ONCE per dirty→clean cycle (any subsequent
   ## dep-emitting record in the same cycle is a no-op).
-  if not kindCarriesCapturedDependency(recordKind):
+  ##
+  ## IM-3 extends the same reasoning from record KIND to a record whose loss is
+  ## provably fail-safe: a `localfd create` (see
+  ## `recordSuppressesOnlyADowngrade`). Without this, arming the sentinel for a
+  ## create re-creates the M9.R.62.2 over-netting in a new place — a process that
+  ## calls `pipe()` and then loses its fragment descriptor (the
+  ## `test_io_mon_linux_fragment_fd_reuse` tracee hijacks it with `dup2`) writes a
+  ## pending it can never retire, and the run false-downgrades on a record that
+  ## could not have mattered.
+  if not kindCarriesCapturedDependency(record.kind):
+    return
+  if recordSuppressesOnlyADowngrade(record):
     return
   if fragmentSlot.readingSentinelActive or not fragmentSlot.isOpen:
     return
@@ -1676,7 +1706,7 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   # process-spawn + the ancestor exec chain. Fixes the pixman M9.R.62
   # residual of 182 shim-only escapees; regression pin in
   # tests/portable/test_io_mon_sig_safe_committed_frame.nim.
-  markReadingSentinel(record.kind)
+  markReadingSentinel(record)
 
 proc readFragmentRecords*(path: string): seq[MonitorRecord] =
   let raw = readFile(extendedPath(path)).toBytes()

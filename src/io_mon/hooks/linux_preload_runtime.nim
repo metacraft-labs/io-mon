@@ -137,6 +137,30 @@ type
     result*: cint
     nextIndex: int
 
+  PipeContext* = object
+    ## IM-3 — `pipe(2)`. `fds` points at the caller's `int[2]`, filled by the
+    ## real call; a hook reads it only AFTER `callNext`/`callReal` returns 0.
+    fds*: ptr cint
+    result*: cint
+    nextIndex: int
+
+  Pipe2Context* = object
+    ## IM-3 — `pipe2(2)`. Separate from `PipeContext` because the extra `flags`
+    ## argument is part of the ABI; the observation logic is identical.
+    fds*: ptr cint
+    flags*: cint
+    result*: cint
+    nextIndex: int
+
+  SocketpairContext* = object
+    ## IM-3 — `socketpair(2)`. `sv` points at the caller's `int[2]`.
+    domain*: cint
+    typ*: cint
+    protocol*: cint
+    sv*: ptr cint
+    result*: cint
+    nextIndex: int
+
   SendfileContext* = object
     outFd*: cint
     inFd*: cint
@@ -352,6 +376,9 @@ type
   FreadHook* = proc(ctx: var FreadContext) {.raises: [].}
   FcloseHook* = proc(ctx: var FcloseContext) {.raises: [].}
   ConnectHook* = proc(ctx: var ConnectContext) {.raises: [].}
+  PipeHook* = proc(ctx: var PipeContext) {.raises: [].}
+  Pipe2Hook* = proc(ctx: var Pipe2Context) {.raises: [].}
+  SocketpairHook* = proc(ctx: var SocketpairContext) {.raises: [].}
   SendfileHook* = proc(ctx: var SendfileContext) {.raises: [].}
   CopyFileRangeHook* = proc(ctx: var CopyFileRangeContext) {.raises: [].}
   SpliceHook* = proc(ctx: var SpliceContext) {.raises: [].}
@@ -428,6 +455,15 @@ type
   ConnectHookEntry = object
     priority: int
     callback: ConnectHook
+  PipeHookEntry = object
+    priority: int
+    callback: PipeHook
+  Pipe2HookEntry = object
+    priority: int
+    callback: Pipe2Hook
+  SocketpairHookEntry = object
+    priority: int
+    callback: SocketpairHook
   SendfileHookEntry = object
     priority: int
     callback: SendfileHook
@@ -552,6 +588,9 @@ typedef void *(*ct_fopen_hook_fn)(char *, char *);
 typedef size_t (*ct_fread_hook_fn)(void *, size_t, size_t, void *);
 typedef int (*ct_fclose_hook_fn)(void *);
 typedef int (*ct_connect_hook_fn)(int, void *, unsigned int);
+typedef int (*ct_pipe_hook_fn)(void *);
+typedef int (*ct_pipe2_hook_fn)(void *, int);
+typedef int (*ct_socketpair_hook_fn)(int, int, int, void *);
 typedef ssize_like_t (*ct_sendfile_hook_fn)(int, int, void *, size_t);
 typedef ssize_like_t (*ct_copy_file_range_hook_fn)(int, void *, int, void *,
                                                    size_t, unsigned int);
@@ -599,6 +638,9 @@ typedef FILE *(*ct_fopen_real_fn)(const char *, const char *);
 typedef size_t (*ct_fread_real_fn)(void *, size_t, size_t, FILE *);
 typedef int (*ct_fclose_real_fn)(FILE *);
 typedef int (*ct_connect_real_fn)(int, const struct sockaddr *, socklen_t);
+typedef int (*ct_pipe_real_fn)(int *);
+typedef int (*ct_pipe2_real_fn)(int *, int);
+typedef int (*ct_socketpair_real_fn)(int, int, int, int *);
 typedef ssize_t (*ct_sendfile_real_fn)(int, int, off_t *, size_t);
 typedef ssize_t (*ct_copy_file_range_real_fn)(int, off64_t *, int, off64_t *,
                                               size_t, unsigned int);
@@ -656,6 +698,9 @@ static ct_fopen_hook_fn ct_fopen64_hook = NULL;
 static ct_fread_hook_fn ct_fread_hook = NULL;
 static ct_fclose_hook_fn ct_fclose_hook = NULL;
 static ct_connect_hook_fn ct_connect_hook = NULL;
+static ct_pipe_hook_fn ct_pipe_hook = NULL;
+static ct_pipe2_hook_fn ct_pipe2_hook = NULL;
+static ct_socketpair_hook_fn ct_socketpair_hook = NULL;
 static ct_sendfile_hook_fn ct_sendfile_hook = NULL;
 static ct_copy_file_range_hook_fn ct_copy_file_range_hook = NULL;
 static ct_splice_hook_fn ct_splice_hook = NULL;
@@ -725,6 +770,9 @@ static ct_fopen_real_fn real_fopen64_ptr = NULL;
 static ct_fread_real_fn real_fread_ptr = NULL;
 static ct_fclose_real_fn real_fclose_ptr = NULL;
 static ct_connect_real_fn real_connect_ptr = NULL;
+static ct_pipe_real_fn real_pipe_ptr = NULL;
+static ct_pipe2_real_fn real_pipe2_ptr = NULL;
+static ct_socketpair_real_fn real_socketpair_ptr = NULL;
 static ct_sendfile_real_fn real_sendfile_ptr = NULL;
 static ct_copy_file_range_real_fn real_copy_file_range_ptr = NULL;
 static ct_splice_real_fn real_splice_ptr = NULL;
@@ -1181,6 +1229,9 @@ void ct_linux_preload_register_fopen64_hook(ct_fopen_hook_fn hook) { ct_fopen64_
 void ct_linux_preload_register_fread_hook(ct_fread_hook_fn hook) { ct_fread_hook = hook; }
 void ct_linux_preload_register_fclose_hook(ct_fclose_hook_fn hook) { ct_fclose_hook = hook; }
 void ct_linux_preload_register_connect_hook(ct_connect_hook_fn hook) { ct_connect_hook = hook; }
+void ct_linux_preload_register_pipe_hook(ct_pipe_hook_fn hook) { ct_pipe_hook = hook; }
+void ct_linux_preload_register_pipe2_hook(ct_pipe2_hook_fn hook) { ct_pipe2_hook = hook; }
+void ct_linux_preload_register_socketpair_hook(ct_socketpair_hook_fn hook) { ct_socketpair_hook = hook; }
 void ct_linux_preload_register_sendfile_hook(ct_sendfile_hook_fn hook) { ct_sendfile_hook = hook; }
 void ct_linux_preload_register_copy_file_range_hook(ct_copy_file_range_hook_fn hook) { ct_copy_file_range_hook = hook; }
 void ct_linux_preload_register_splice_hook(ct_splice_hook_fn hook) { ct_splice_hook = hook; }
@@ -1405,6 +1456,26 @@ int ct_linux_preload_real_fclose(void *stream) {
 int ct_linux_preload_real_connect(int fd, void *addr, unsigned int addrlen) {
   CT_REAL("connect", real_connect_ptr, ct_connect_real_fn);
   return real_connect_ptr(fd, (const struct sockaddr *)addr, (socklen_t)addrlen);
+}
+
+/* IM-3 — genuine entries for the local-IPC-fd CREATE hooks. `pipe`/`pipe2`/
+   `socketpair` are thin libc wrappers, but they are resolved through the same
+   `ct_resolve` next-object walk as every other real forwarder so the shim never
+   re-enters its own interposed symbol. */
+int ct_linux_preload_real_pipe(void *fds) {
+  CT_REAL("pipe", real_pipe_ptr, ct_pipe_real_fn);
+  return real_pipe_ptr((int *)fds);
+}
+
+int ct_linux_preload_real_pipe2(void *fds, int flags) {
+  CT_REAL("pipe2", real_pipe2_ptr, ct_pipe2_real_fn);
+  return real_pipe2_ptr((int *)fds, flags);
+}
+
+int ct_linux_preload_real_socketpair(int domain, int type, int protocol,
+                                     void *sv) {
+  CT_REAL("socketpair", real_socketpair_ptr, ct_socketpair_real_fn);
+  return real_socketpair_ptr(domain, type, protocol, (int *)sv);
 }
 
 ssize_like_t ct_linux_preload_real_sendfile(int out_fd, int in_fd, void *offset,
@@ -2162,6 +2233,28 @@ int connect(int fd, const struct sockaddr *addr, socklen_t addrlen) {
   return CT_CALL_HOOK(ct_connect_hook(fd, (void *)addr, (unsigned int)addrlen));
 }
 
+int pipe(int fds[2]) __attribute__((visibility("default")));
+int pipe(int fds[2]) {
+  if (CT_BYPASS() || ct_pipe_hook == NULL)
+    return ct_linux_preload_real_pipe((void *)fds);
+  return CT_CALL_HOOK(ct_pipe_hook((void *)fds));
+}
+
+int pipe2(int fds[2], int flags) __attribute__((visibility("default")));
+int pipe2(int fds[2], int flags) {
+  if (CT_BYPASS() || ct_pipe2_hook == NULL)
+    return ct_linux_preload_real_pipe2((void *)fds, flags);
+  return CT_CALL_HOOK(ct_pipe2_hook((void *)fds, flags));
+}
+
+int socketpair(int domain, int type, int protocol, int sv[2])
+    __attribute__((visibility("default")));
+int socketpair(int domain, int type, int protocol, int sv[2]) {
+  if (CT_BYPASS() || ct_socketpair_hook == NULL)
+    return ct_linux_preload_real_socketpair(domain, type, protocol, (void *)sv);
+  return CT_CALL_HOOK(ct_socketpair_hook(domain, type, protocol, (void *)sv));
+}
+
 ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count)
     __attribute__((visibility("default")));
 ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count) {
@@ -2711,6 +2804,12 @@ proc realFclose*(stream: pointer): cint
   {.importc: "ct_linux_preload_real_fclose", raises: [].}
 proc realConnect*(fd: cint; address: pointer; addrLen: uint32): cint
   {.importc: "ct_linux_preload_real_connect", raises: [].}
+proc realPipe*(fds: pointer): cint
+  {.importc: "ct_linux_preload_real_pipe", raises: [].}
+proc realPipe2*(fds: pointer; flags: cint): cint
+  {.importc: "ct_linux_preload_real_pipe2", raises: [].}
+proc realSocketpair*(domain, typ, protocol: cint; sv: pointer): cint
+  {.importc: "ct_linux_preload_real_socketpair", raises: [].}
 proc realSendfile*(outFd, inFd: cint; offset: pointer; count: csize_t): clong
   {.importc: "ct_linux_preload_real_sendfile", raises: [].}
 proc realCopyFileRange*(inFd: cint; offIn: pointer; outFd: cint;
@@ -2820,6 +2919,10 @@ type
     csize_t {.cdecl, raises: [].}
   FcloseDispatch = proc(stream: pointer): cint {.cdecl, raises: [].}
   ConnectDispatch = proc(fd: cint; address: pointer; addrLen: uint32): cint
+    {.cdecl, raises: [].}
+  PipeDispatch = proc(fds: pointer): cint {.cdecl, raises: [].}
+  Pipe2Dispatch = proc(fds: pointer; flags: cint): cint {.cdecl, raises: [].}
+  SocketpairDispatch = proc(domain, typ, protocol: cint; sv: pointer): cint
     {.cdecl, raises: [].}
   SendfileDispatch = proc(outFd, inFd: cint; offset: pointer;
                           count: csize_t): clong {.cdecl, raises: [].}
@@ -2943,6 +3046,12 @@ proc installFcloseDispatcher(dispatch: FcloseDispatch)
   {.importc: "ct_linux_preload_register_fclose_hook", raises: [].}
 proc installConnectDispatcher(dispatch: ConnectDispatch)
   {.importc: "ct_linux_preload_register_connect_hook", raises: [].}
+proc installPipeDispatcher(dispatch: PipeDispatch)
+  {.importc: "ct_linux_preload_register_pipe_hook", raises: [].}
+proc installPipe2Dispatcher(dispatch: Pipe2Dispatch)
+  {.importc: "ct_linux_preload_register_pipe2_hook", raises: [].}
+proc installSocketpairDispatcher(dispatch: SocketpairDispatch)
+  {.importc: "ct_linux_preload_register_socketpair_hook", raises: [].}
 proc installSendfileDispatcher(dispatch: SendfileDispatch)
   {.importc: "ct_linux_preload_register_sendfile_hook", raises: [].}
 proc installCopyFileRangeDispatcher(dispatch: CopyFileRangeDispatch)
@@ -3026,6 +3135,9 @@ var
   freadHooks: seq[FreadHookEntry] = @[]
   fcloseHooks: seq[FcloseHookEntry] = @[]
   connectHooks: seq[ConnectHookEntry] = @[]
+  pipeHooks: seq[PipeHookEntry] = @[]
+  pipe2Hooks: seq[Pipe2HookEntry] = @[]
+  socketpairHooks: seq[SocketpairHookEntry] = @[]
   sendfileHooks: seq[SendfileHookEntry] = @[]
   copyFileRangeHooks: seq[CopyFileRangeHookEntry] = @[]
   spliceHooks: seq[SpliceHookEntry] = @[]
@@ -3209,6 +3321,26 @@ proc registerConnectHook*(hook: ConnectHook; priority = 100) {.raises: [].} =
     return
   connectHooks.add(ConnectHookEntry(priority: priority, callback: hook))
   connectHooks.sort(proc(a, b: ConnectHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerPipeHook*(hook: PipeHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  pipeHooks.add(PipeHookEntry(priority: priority, callback: hook))
+  pipeHooks.sort(proc(a, b: PipeHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerPipe2Hook*(hook: Pipe2Hook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  pipe2Hooks.add(Pipe2HookEntry(priority: priority, callback: hook))
+  pipe2Hooks.sort(proc(a, b: Pipe2HookEntry): int = cmp(a.priority, b.priority))
+
+proc registerSocketpairHook*(hook: SocketpairHook; priority = 100)
+    {.raises: [].} =
+  if hook == nil:
+    return
+  socketpairHooks.add(SocketpairHookEntry(priority: priority, callback: hook))
+  socketpairHooks.sort(proc(a, b: SocketpairHookEntry): int =
+    cmp(a.priority, b.priority))
 
 proc registerSendfileHook*(hook: SendfileHook; priority = 100) {.raises: [].} =
   if hook == nil:
@@ -4077,6 +4209,15 @@ proc callReal*(ctx: var FcloseContext) {.raises: [].} =
 proc callReal*(ctx: var ConnectContext) {.raises: [].} =
   ctx.result = realConnect(ctx.fd, ctx.address, ctx.addrLen)
 
+proc callReal*(ctx: var PipeContext) {.raises: [].} =
+  ctx.result = realPipe(ctx.fds)
+
+proc callReal*(ctx: var Pipe2Context) {.raises: [].} =
+  ctx.result = realPipe2(ctx.fds, ctx.flags)
+
+proc callReal*(ctx: var SocketpairContext) {.raises: [].} =
+  ctx.result = realSocketpair(ctx.domain, ctx.typ, ctx.protocol, ctx.sv)
+
 proc callReal*(ctx: var SendfileContext) {.raises: [].} =
   ctx.result = realSendfile(ctx.outFd, ctx.inFd, ctx.offset, ctx.count)
 
@@ -4330,6 +4471,30 @@ proc callNext*(ctx: var ConnectContext) {.raises: [].} =
     let index = ctx.nextIndex
     inc ctx.nextIndex
     connectHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var PipeContext) {.raises: [].} =
+  if ctx.nextIndex < pipeHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    pipeHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var Pipe2Context) {.raises: [].} =
+  if ctx.nextIndex < pipe2Hooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    pipe2Hooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var SocketpairContext) {.raises: [].} =
+  if ctx.nextIndex < socketpairHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    socketpairHooks[index].callback(ctx)
   else:
     callReal(ctx)
 
@@ -4668,6 +4833,23 @@ proc dispatchConnect(fd: cint; address: pointer; addrLen: uint32): cint
   callNext(ctx)
   result = ctx.result
 
+proc dispatchPipe(fds: pointer): cint {.cdecl, raises: [].} =
+  var ctx = PipeContext(fds: cast[ptr cint](fds), result: -1)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchPipe2(fds: pointer; flags: cint): cint {.cdecl, raises: [].} =
+  var ctx = Pipe2Context(fds: cast[ptr cint](fds), flags: flags, result: -1)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchSocketpair(domain, typ, protocol: cint; sv: pointer): cint
+    {.cdecl, raises: [].} =
+  var ctx = SocketpairContext(domain: domain, typ: typ, protocol: protocol,
+                              sv: cast[ptr cint](sv), result: -1)
+  callNext(ctx)
+  result = ctx.result
+
 proc dispatchSendfile(outFd, inFd: cint; offset: pointer;
                       count: csize_t): clong {.cdecl, raises: [].} =
   var ctx = SendfileContext(outFd: outFd, inFd: inFd, offset: offset,
@@ -4868,6 +5050,9 @@ installFopen64Dispatcher(dispatchFopen64)
 installFreadDispatcher(dispatchFread)
 installFcloseDispatcher(dispatchFclose)
 installConnectDispatcher(dispatchConnect)
+installPipeDispatcher(dispatchPipe)
+installPipe2Dispatcher(dispatchPipe2)
+installSocketpairDispatcher(dispatchSocketpair)
 installSendfileDispatcher(dispatchSendfile)
 installCopyFileRangeDispatcher(dispatchCopyFileRange)
 installSpliceDispatcher(dispatchSplice)
