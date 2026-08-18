@@ -1662,9 +1662,12 @@ proc snoopCreateProcessW(ctx: var hr.HookContext) {.raises: [].} =
     let lpCommandLine = cast[LPWSTR](ctx.args[1])
     let lpProcessInfo = cast[ptr PROCESS_INFORMATION](ctx.args[9])
     let r = BOOL(ctx.result)
+    var childForkRuntime = ""
     var record = baseRecord(mrProcessSpawn, moExecute)
     if r != 0 and lpProcessInfo != nil:
       record.childOsPid = uint64(lpProcessInfo[].dwProcessId)
+      childForkRuntime =
+        shProp.windowsForkRuntimeForProcess(lpProcessInfo[].hProcess)
     record.result = int64(r)
     var path = ""
     if lpApplicationName != nil:
@@ -1673,6 +1676,8 @@ proc snoopCreateProcessW(ctx: var hr.HookContext) {.raises: [].} =
       path = widePtrToString(cast[LPCWSTR](lpCommandLine))
     record.path = path
     record.detail = "CreateProcessW"
+    if childForkRuntime.len > 0:
+      record.detail.add(" fork-runtime=" & childForkRuntime)
     emitRecord(record)
     # On success, inject and (if needed) resume the main thread. The
     # caller's flags determine whether we are responsible for the
@@ -1681,8 +1686,11 @@ proc snoopCreateProcessW(ctx: var hr.HookContext) {.raises: [].} =
     # double-resumes.
     if r != 0 and lpProcessInfo != nil and selfDllPathW.len > 0:
       let pi = lpProcessInfo[]
-      discard shProp.injectShimIntoChild(pi.hProcess, selfDllPath(),
-        "repro_runtime_init")
+      # A pre-main remote thread deadlocks MSYS2/Cygwin fork runtimes.
+      # The unmatched spawn record makes the skipped subtree incomplete.
+      if childForkRuntime.len == 0:
+        discard shProp.injectShimIntoChild(pi.hProcess, selfDllPath(),
+          "repro_runtime_init")
       if not callerAskedForSuspended:
         discard ResumeThread(pi.hThread)
   except CatchableError:
@@ -1707,9 +1715,12 @@ proc snoopCreateProcessA(ctx: var hr.HookContext) {.raises: [].} =
     let lpCommandLine = cast[LPSTR](ctx.args[1])
     let lpProcessInfo = cast[ptr PROCESS_INFORMATION](ctx.args[9])
     let r = BOOL(ctx.result)
+    var childForkRuntime = ""
     var record = baseRecord(mrProcessSpawn, moExecute)
     if r != 0 and lpProcessInfo != nil:
       record.childOsPid = uint64(lpProcessInfo[].dwProcessId)
+      childForkRuntime =
+        shProp.windowsForkRuntimeForProcess(lpProcessInfo[].hProcess)
     record.result = int64(r)
     var path = ""
     if lpApplicationName != nil:
@@ -1718,11 +1729,14 @@ proc snoopCreateProcessA(ctx: var hr.HookContext) {.raises: [].} =
       path = $cast[cstring](lpCommandLine)
     record.path = path
     record.detail = "CreateProcessA"
+    if childForkRuntime.len > 0:
+      record.detail.add(" fork-runtime=" & childForkRuntime)
     emitRecord(record)
     if r != 0 and lpProcessInfo != nil and selfDllPathW.len > 0:
       let pi = lpProcessInfo[]
-      discard shProp.injectShimIntoChild(pi.hProcess, selfDllPath(),
-        "repro_runtime_init")
+      if childForkRuntime.len == 0:
+        discard shProp.injectShimIntoChild(pi.hProcess, selfDllPath(),
+          "repro_runtime_init")
       if not callerAskedForSuspendedA:
         discard ResumeThread(pi.hThread)
   except CatchableError:

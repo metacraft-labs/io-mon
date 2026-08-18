@@ -448,6 +448,40 @@ proc createLocalTempDir(prefix: string): string =
     $now.toUnix & "-" & $now.nanosecond & "-" & $tempDirNonce)
   createDir(extendedPath(result))
 
+proc removeLocalTempDir(path: string) =
+  ## Recursive deletion can race a recently-exited Windows producer or a file
+  ## scanner that briefly holds a fragment without delete sharing. Cleanup must
+  ## not replace the monitored command's result after evidence was finalized.
+  when defined(windows):
+    const
+      CleanupRetryMs = 2_000
+      CleanupPollMs = 20
+      WindowsAccessDenied = 5'i32
+      WindowsSharingViolation = 32'i32
+      WindowsLockViolation = 33'i32
+      WindowsDirNotEmpty = 145'i32
+    var waitedMs = 0
+    while true:
+      try:
+        removeDir(extendedPath(path))
+        return
+      except OSError as error:
+        if not dirExists(extendedPath(path)):
+          return
+        if (error.errorCode != WindowsAccessDenied and
+            error.errorCode != WindowsSharingViolation and
+            error.errorCode != WindowsLockViolation and
+            error.errorCode != WindowsDirNotEmpty) or
+            waitedMs >= CleanupRetryMs:
+          stderr.writeLine("io-mon: warning: could not remove temporary " &
+            "directory " & path & ": " & error.msg)
+          return
+        let delayMs = min(CleanupPollMs, CleanupRetryMs - waitedMs)
+        sleep(delayMs)
+        inc(waitedMs, delayMs)
+  else:
+    removeDir(extendedPath(path))
+
 proc parseOutputMode(value: string): FsSnoopOutputMode =
   case value
   of "none":
@@ -754,7 +788,7 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
           "REPRO_MONITOR_SHIM_LIB")
 
     let fragmentDir = createLocalTempDir("repro-fs-snoop-fragments")
-    defer: removeDir(extendedPath(fragmentDir))
+    defer: removeLocalTempDir(fragmentDir)
     ensureParentDir(request.depFilePath)
 
     # SIP bypass: ensure CT_SANDBOX_TOOLS_DIR exists and contains non-SIP
@@ -773,7 +807,7 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
     # exits, and successful runs all release the same invocation-local path.
     defer:
       if ownsSandboxDir:
-        removeDir(extendedPath(sandboxDir))
+        removeLocalTempDir(sandboxDir)
     populateReproSandboxTools(sandboxDir)
 
     var oldEnv: seq[(string, string, bool)] = @[]
@@ -825,7 +859,7 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
           "REPRO_MONITOR_SHIM_LIB")
 
     let fragmentDir = createLocalTempDir("repro-fs-snoop-fragments")
-    defer: removeDir(extendedPath(fragmentDir))
+    defer: removeLocalTempDir(fragmentDir)
     ensureParentDir(request.depFilePath)
 
     var oldEnv: seq[(string, string, bool)] = @[]
@@ -948,7 +982,7 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
           "REPRO_MONITOR_SHIM_LIB")
 
     let fragmentDir = createLocalTempDir("repro-fs-snoop-fragments")
-    defer: removeDir(extendedPath(fragmentDir))
+    defer: removeLocalTempDir(fragmentDir)
     ensureParentDir(request.depFilePath)
 
     var oldEnv: seq[(string, string, bool)] = @[]
@@ -1008,7 +1042,7 @@ proc runFsSnoopCli*(programName: string; args: seq[string]): int =
         # temp directory's contents are evidence-only and never
         # cross-process consumed.
         try:
-          removeDir(extendedPath(tempRoot))
+          removeLocalTempDir(tempRoot)
         except OSError:
           discard
   except CatchableError as err:
