@@ -1153,12 +1153,39 @@ proc rememberInheritedOpenFds() {.raises: [].} =
 proc localFdKey(dev, ino: uint64): string {.raises: [].} =
   "localfd:" & $dev & ":" & $ino
 
-proc recordExternalContent(chan, role, path: string; fd: cint) {.raises: [].} =
+proc recordExternalContent(chan, role, path: string; fd: cint;
+                           peerPid: uint64 = 0) {.raises: [].} =
+  ## `peerPid` (0 = unknown) names the process on the OTHER end of the channel,
+  ## carried in `childOsPid` exactly as `mrIpcConnect` does. IoMon-Pipeline-Capture
+  ## IM-4: the merge uses it to answer "is the producer inside the monitored tree?"
+  ## directly, instead of inferring it from an in-tree create record.
   var record = baseRecord(mrExternalContent, moExternalContent)
   record.path = path
   record.flags = uint32(fd)
-  record.detail = "chan=" & chan & " role=" & role
+  record.childOsPid = peerPid
+  record.detail = "chan=" & chan & " role=" & role &
+    (if peerPid == 0: "" else: " peer=" & $peerPid)
   emitRecord(record)
+
+proc channelPeerPid(fd: cint; kind: FdKind): uint64 {.raises: [].} =
+  ## IoMon-Pipeline-Capture IM-4 — the pid of the process on the other end of a
+  ## content channel, or 0 when the channel cannot name it.
+  ##
+  ## Only an AF_UNIX socket can: `SO_PEERCRED` returns the KERNEL's record of the
+  ## credentials the peer had when the connection was established (for an accepted
+  ## fd, the connector; for a connector's fd, the listener; for a `socketpair`, its
+  ## creator). It is stamped by the kernel, not by either userspace end, so it
+  ## cannot be forged from inside the monitored tree, and it survives the peer's
+  ## exit. A pipe, a FIFO, an AF_INET socket or any other fd fails the `getsockopt`
+  ## and yields 0.
+  ##
+  ## Fails SAFE in one direction only: an unobtainable peer leaves the consume
+  ## unattributed, which at worst costs a conservative re-run. It can never invent
+  ## an in-tree producer.
+  if kind != fkSocket:
+    return 0
+  let pid = c_socket_peer_pid(fd)
+  if pid > 0: uint64(pid) else: 0
 
 proc recordLocalFdCreate(fd: cint) {.raises: [].} =
   ## IoMon-Pipeline-Capture IM-3 — record that a monitored (in-tree) process
@@ -1239,13 +1266,15 @@ proc classifyEmptyFdRead(fd: cint): bool {.raises: [].} =
       # the recorded dependency set is byte-identical.
       markEmptyFdClassified(fd)
       return false
-    recordExternalContent("opaque", "read", localFdKey(dev, ino), fd)
+    recordExternalContent("opaque", "read", localFdKey(dev, ino), fd,
+      channelPeerPid(fd, kind))
     markEmptyFdClassified(fd)
   else:
     if not inheritedFd(fd):
       markEmptyFdClassified(fd)  # FUP-K — see the fifo/socket branch above.
       return false
-    recordExternalContent("opaque", "read", localFdKey(dev, ino), fd)
+    recordExternalContent("opaque", "read", localFdKey(dev, ino), fd,
+      channelPeerPid(fd, kind))
     markEmptyFdClassified(fd)
   false
 

@@ -21,8 +21,19 @@ proc ext(chan, role, path: string; pid: uint64 = 100; fd: uint32 = 7):
   MonitorRecord(kind: mrExternalContent, observationKind: moExternalContent,
     osPid: pid, flags: fd, path: path, detail: "chan=" & chan & " role=" & role)
 
-proc start(pid: uint64): MonitorRecord =
-  MonitorRecord(kind: mrProcessStart, observationKind: moProcessStart, osPid: pid)
+proc start(pid: uint64; startTime = ""): MonitorRecord =
+  MonitorRecord(kind: mrProcessStart, observationKind: moProcessStart, osPid: pid,
+    detail: if startTime.len == 0: "" else: "start=" & startTime)
+
+proc extPeer(chan, role, path: string; peer: uint64; pid: uint64 = 100;
+    peerStart = ""): MonitorRecord =
+  ## IoMon-Pipeline-Capture IM-4 — a synthetic consume that NAMES its producer,
+  ## exactly as the shim emits it: the peer pid in `childOsPid` (kernel-supplied,
+  ## via `SO_PEERCRED` / `LOCAL_PEERPID`) and mirrored into the detail.
+  result = ext(chan, role, path, pid = pid)
+  result.childOsPid = peer
+  result.detail = result.detail & " peer=" & $peer &
+    (if peerStart.len == 0: "" else: " peerstart=" & peerStart)
 
 suite "io-mon ROUND-3 S1 external-content downgrade (externalContentLossCount)":
   test "out-of-tree shm attach (no in-tree create) downgrades":
@@ -116,3 +127,67 @@ suite "io-mon ROUND-3 S1 external-content downgrade (externalContentLossCount)":
     let dep = mergeFragments(frag, work / "out.rdep")
     check dep.completeness == mcComplete
     removeDir(work)
+
+suite "io-mon IM-4 content-channel tree membership (externalContentLossCount)":
+  ## The pairing above is a PROXY for "was the producer inside the monitored
+  ## tree?", and it only works for channel classes somebody has interposed. These
+  ## pin the DIRECT question, asked whenever the channel can name its producer.
+
+  test "unpaired consume whose producer is a monitored pid does NOT downgrade":
+    # The IM-4 class fix: NO `localfd create` exists for this key (nothing hooks
+    # `socket`/`accept` on Linux), so the pairing cannot save it — only the fact
+    # that pid 101 emitted a process-start can.
+    let recs = @[
+      start(100), start(101),
+      extPeer("opaque", "read", "localfd:0:9001", peer = 101, pid = 100)]
+    check externalContentLossCount(recs) == 0
+
+  test "unpaired consume whose producer is OUT of the tree still downgrades":
+    # Same shape, same missing create — the ONLY difference is that pid 999 never
+    # emitted a process-start. This is what stops the guard degenerating into
+    # "trust every named peer".
+    let recs = @[
+      start(100),
+      extPeer("opaque", "read", "localfd:0:9001", peer = 999, pid = 100)]
+    check externalContentLossCount(recs) == 1
+
+  test "R7 identity: a RECYCLED producer pid does not false-match a monitored one":
+    # The producer named a start-time that does NOT match the monitored process
+    # with that pid, so it is a different, out-of-tree process wearing a reused pid.
+    let recs = @[
+      start(100), start(101, startTime = "111"),
+      extPeer("opaque", "read", "localfd:0:9001", peer = 101, pid = 100,
+        peerStart = "222")]
+    check externalContentLossCount(recs) == 1
+    # …and the matching start-time is accepted.
+    let matched = @[
+      start(100), start(101, startTime = "111"),
+      extPeer("opaque", "read", "localfd:0:9001", peer = 101, pid = 100,
+        peerStart = "111")]
+    check externalContentLossCount(matched) == 0
+
+  test "a DUPLICATE peerstart token fails CLOSED (downgrades)":
+    # Ambiguous identity evidence must never degrade to the weaker bare-pid match.
+    var rec = extPeer("opaque", "read", "localfd:0:9001", peer = 101, pid = 100,
+      peerStart = "111")
+    rec.detail = rec.detail & " peerstart=222"
+    check externalContentLossCount(@[start(100), start(101), rec]) == 1
+
+  test "a TRUSTED reporting daemon peer does not downgrade":
+    # The breakaway-report exemption `unmonitoredSubtreeLossCount` already grants
+    # IPC peers, now threaded into the content-channel guard by the same caller.
+    let recs = @[
+      start(100),
+      extPeer("opaque", "read", "localfd:0:9001", peer = 777, pid = 100)]
+    check externalContentLossCount(recs) == 1
+    check externalContentLossCount(recs, toHashSet([777'u64])) == 0
+
+  test "an UNNAMED producer (pipe/FIFO/inet) is unchanged by the membership guard":
+    # `childOsPid == 0` means the channel could not name a peer; the record falls
+    # through to the pairing logic exactly as before IM-4.
+    check externalContentLossCount(
+      @[start(100), ext("opaque", "read", "localfd:0:9001")]) == 1
+    check externalContentLossCount(@[
+      start(100),
+      ext("localfd", "create", "localfd:0:9001", pid = 100),
+      ext("opaque", "read", "localfd:0:9001", pid = 100)]) == 0

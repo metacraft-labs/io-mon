@@ -2237,7 +2237,8 @@ proc nonDeterminismLossCount*(records: openArray[MonitorRecord]): int
   discard records
   0
 
-proc externalContentLossCount*(records: openArray[MonitorRecord]): int =
+proc externalContentLossCount*(records: openArray[MonitorRecord];
+    trustedPeerPids: HashSet[uint64] = initHashSet[uint64]()): int =
   ## ROUND-3 S1 (content-channel downgrade) — returns the number of synthetic
   ## event-loss records to inject because the merged evidence proves the build
   ## CONSUMED CONTENT from a channel whose producer is OUTSIDE the monitored tree:
@@ -2273,6 +2274,31 @@ proc externalContentLossCount*(records: openArray[MonitorRecord]): int =
   ## out-of-tree breakaway peer. An opaque read whose fd's (dev,ino) was
   ## unobtainable carries an EMPTY key and is NOT downgraded (fail-safe toward
   ## mcComplete — a possible missed dep, never a false re-run of a normal build).
+  ##
+  ## IoMon-Pipeline-Capture IM-4 — PROCESS-TREE MEMBERSHIP, not only fd pairing.
+  ## The create/write pairing above is a PROXY for the question that actually
+  ## matters, "was the producer one of us?", and the proxy is only as good as the
+  ## set of channel-creating calls somebody has interposed. Every channel class
+  ## with no create hook (on Linux: `socket`/`accept`, which macOS does record)
+  ## re-breaks it in exactly the way IM-3 fixed for `pipe`, and the NEXT
+  ## uninterposed class would break it again.
+  ##
+  ## So ask the question directly whenever the channel can answer it: an
+  ## `mrExternalContent` consume carries its producer's pid in `childOsPid` when
+  ## the kernel could name one (`SO_PEERCRED` / `LOCAL_PEERPID` on a unix socket;
+  ## 0 for a pipe, a FIFO or an inet socket). A consume whose producer emitted an
+  ## `mrProcessStart` — or is a `trustedPeerPids` daemon that accounted for its own
+  ## reads — is inside the monitored tree, its inputs were captured with it, and it
+  ## must NOT downgrade, PAIRED OR NOT. This is the same cardinal-sin guard, and
+  ## the same (pid, start-time) identity test, that `unmonitoredSubtreeLossCount`
+  ## case (c) already applies to `mrIpcConnect` peers.
+  ##
+  ## Both directions still fail safe. An unknown producer (`childOsPid == 0`) falls
+  ## through to the unchanged pairing logic, so a genuinely external channel — an
+  ## inherited pipe, or a socket whose creator is out of the tree — still
+  ## downgrades. The suppression fires only on kernel-supplied evidence that the
+  ## bytes came from a process io-mon was already watching.
+  let (startIdents, startPids) = processStartIdentities(records)
   var shmCreates = initHashSet[string]()
   var fifoWrites = initHashSet[string]()
   var localFdCreates = initHashSet[string]()
@@ -2307,7 +2333,21 @@ proc externalContentLossCount*(records: openArray[MonitorRecord]): int =
       # that object. An empty key (fstat failed) never downgrades (fail-safe).
       if r.path.len > 0 and r.path notin localFdCreates:
         key = r.path
-    if key.len > 0 and key notin flagged:
+    if key.len == 0:
+      continue
+    # IM-4 — the producer is a monitored in-tree process ⇒ nothing is invisible,
+    # whether or not anyone interposed the call that made this channel. Mirrors
+    # the `mrIpcConnect` peer check: identity is (pid, kernel start-time) when the
+    # producer supplied one, bare pid otherwise, and a DUPLICATE `peerstart` token
+    # is ambiguous attacker-controlled evidence that must fail CLOSED (downgrade)
+    # rather than silently degrade to the weaker bare-pid match.
+    let producer = r.childOsPid
+    if producer != 0 and not detailTokenDuplicate(r.detail, PeerStartTimeToken):
+      let producerStart = detailToken(r.detail, PeerStartTimeToken)
+      if childIsMonitored(producer, producerStart, startIdents, startPids) or
+          producer in trustedPeerPids:
+        continue
+    if key notin flagged:
       flagged.incl key
       inc result
 
@@ -2972,9 +3012,12 @@ proc mergeFragments*(fragmentDir, outputPath: string;
   # the IPC-breakaway downgrade — a conservative re-run. A
   # channel a monitored process itself created+fed is paired and does NOT downgrade
   # (the cardinal-sin guard); an inherited socket/pipe is record-not-downgrade
-  # (socket provenance is owned by the IPC-connect machinery). See
+  # (socket provenance is owned by the IPC-connect machinery). IM-4: a consume
+  # whose PRODUCER is a monitored pid (or a trusted reporting daemon) does not
+  # downgrade either, pairing or no pairing — hence `trustedPeerPids` is threaded
+  # in, exactly as it is for the subtree check above. See
   # externalContentLossCount.
-  let externalContentLosses = externalContentLossCount(records)
+  let externalContentLosses = externalContentLossCount(records, trustedPeerPids)
   for _ in 0 ..< externalContentLosses:
     records.add MonitorRecord(kind: mrEventLoss,
       observationKind: moEventLoss,
