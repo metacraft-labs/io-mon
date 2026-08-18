@@ -1728,6 +1728,40 @@ proc readFragmentRecordsTolerant*(path: string): seq[MonitorRecord] =
   var cleanEof: bool
   readFragmentRecordsTolerant(path, cleanEof)
 
+when defined(windows):
+  const
+    FragmentReadRetryMs = 2_000
+    FragmentReadPollMs = 20
+
+proc readFragmentRecordsForMerge(path: string; cleanEof: var bool):
+    seq[MonitorRecord] =
+  ## Windows scanners and recently-exited producers can retain a non-sharing
+  ## handle briefly after the root process signals. Wait for that bounded race;
+  ## all other errors remain visible to the fail-closed merge accounting.
+  when defined(windows):
+    var waitedMs = 0
+    while true:
+      try:
+        return readFragmentRecordsTolerant(path, cleanEof)
+      except IOError:
+        # std/syncio.readFile reports every failed fopen as IOError without the
+        # underlying GetLastError code. Retry that open failure only here; the
+        # merge converts a persistent failure into explicit event loss below.
+        if waitedMs >= FragmentReadRetryMs:
+          raise
+        let delayMs = min(FragmentReadPollMs, FragmentReadRetryMs - waitedMs)
+        sleep(delayMs)
+        inc(waitedMs, delayMs)
+      except OSError as error:
+        if (error.errorCode != 32'i32 and error.errorCode != 33'i32) or
+            waitedMs >= FragmentReadRetryMs:
+          raise
+        let delayMs = min(FragmentReadPollMs, FragmentReadRetryMs - waitedMs)
+        sleep(delayMs)
+        inc(waitedMs, delayMs)
+  else:
+    readFragmentRecordsTolerant(path, cleanEof)
+
 proc canonicalOrder(a, b: MonitorRecord): int =
   result = cmp(a.osPid, b.osPid)
   if result != 0: return
@@ -2811,6 +2845,7 @@ proc mergeFragments*(fragmentDir, outputPath: string;
   # ``mcIncomplete``, which the build engine already rejects for caching.
   # Recovered complete frames are still kept for diagnostics/streaming.
   var corruptFragments = 0
+  var unreadableFragments = 0
   if dirExists(extendedPath(fragmentDir)):
     for kind, path in walkDir(extendedPath(fragmentDir)):
       if kind == pcFile and path.endsWith(".rmdf-frag"):
@@ -2824,11 +2859,20 @@ proc mergeFragments*(fragmentDir, outputPath: string;
         # entry that disappeared underneath the walk.
         try:
           var cleanEof = true
-          records.add readFragmentRecordsTolerant(path, cleanEof)
+          records.add readFragmentRecordsForMerge(path, cleanEof)
           if not cleanEof:
             inc corruptFragments
         except IOError, OSError:
-          discard
+          # A vanished entry is the benign walk/read race described above. Any
+          # fragment that still exists but cannot be read is missing evidence,
+          # so retain the recovered fragments and force this depfile incomplete.
+          var vanished = false
+          try:
+            vanished = not fileExists(extendedPath(path))
+          except OSError:
+            discard
+          if not vanished:
+            inc unreadableFragments
   # io-mon-Lossless-Event-Capture M3 — fold the SET-decoded records into the SAME
   # set as the file fragments. They are appended AS-IS (already run-stamped by the
   # producer) so they pass through the identical run-scoping / read-tail-net /
@@ -2855,6 +2899,11 @@ proc mergeFragments*(fragmentDir, outputPath: string;
       records.add MonitorRecord(kind: mrEventLoss,
         observationKind: moEventLoss,
         detail: "corrupt or partial RMDF fragment in " & fragmentDir)
+  if unreadableFragments > 0:
+    for _ in 0 ..< unreadableFragments:
+      records.add MonitorRecord(kind: mrEventLoss,
+        observationKind: moEventLoss,
+        detail: "unreadable RMDF fragment in " & fragmentDir)
   # ROUND-5 F (kill-before-flush) — net the IN-FRAGMENT read-tail markers. A
   # monitored process that buffered read records wrote a durable `read-tail-pending`
   # marker to its fragment the instant a batch went dirty, and a `read-tail-committed`
