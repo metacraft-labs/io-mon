@@ -2146,6 +2146,75 @@ int main(void) {
       ("unsupported nr=186" in it.detail or
        "libc raw syscall unsupported" in it.detail))
 
+  test "raw libc SYS_getrandom is observed, not lost (IoMon-Pipeline-Capture IM-5)":
+    # Nim's `std/sysrand` reaches getrandom(2) as `syscall(SYS_getrandom, …)`
+    # rather than through the libc symbol, so EVERY Nim binary that touches
+    # `std/tempfiles` produced `libc raw syscall unsupported nr=318`. The
+    # consumer classifies an unrecognised loss detail as Level 2 (unknown
+    # scope), which sets `disableCacheHits` and skips the action-cache
+    # publish — so reprobuild's own monitored `nim c` helper edges (interface
+    # extraction, provider compile) could never hold a cache entry.
+    #
+    # This is a CLASSIFICATION gap, not a monitoring gap: the same call is
+    # already observed as `mrNonDeterministic` on both other entry points
+    # (`repro_hook_getrandom` for the libc symbol, `repro_vdso_getrandom` for
+    # the vDSO). The record is deliberately not a completeness downgrade —
+    # io-mon SAW the entropy read, so nothing is missing.
+    #
+    # Both assertions carry weight and fail together under the mutation that
+    # removes the classifier arm: the loss reappears (assertion 1, and with
+    # it mcComplete) and the observation disappears (assertion 2).
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    # Deliberately the RAW form. Calling `getrandom()` (the libc symbol)
+    # would exercise the already-hooked path and pass with or without the
+    # classifier arm — the test would be green both ways.
+    let probe = buildC(work, "raw_getrandom", """
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <stdint.h>
+#ifndef SYS_getrandom
+#define SYS_getrandom 318
+#endif
+int main(void) {
+  unsigned char buf[16];
+  long n = syscall(SYS_getrandom, buf, sizeof(buf), 0);
+  return n == (long)sizeof(buf) ? 0 : 2;
+}
+""")
+    let depfile = work / "raw-getrandom.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", probe],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    # 1. No loss, so the edge stays publishable.
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      ("unsupported nr=318" in it.detail or
+       "libc raw syscall unsupported" in it.detail))
+    check dep.completeness == mcComplete
+    # 2. The entropy read is still REPORTED — "supported" must not mean
+    #    "invisible". This is the assertion that separates the fix from
+    #    silently swallowing the syscall.
+    check dep.records.anyIt(it.kind == mrNonDeterministic and
+      it.path == "getrandom")
+
   test "raw libc io_uring_setup probe (failing) is supported (no event-loss)":
     # Regression pin for M9.R.67.2: Python 3.13's stdlib probes for io_uring
     # availability at startup by invoking `syscall(SYS_io_uring_setup)` (nr=425).

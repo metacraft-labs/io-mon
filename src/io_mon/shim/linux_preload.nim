@@ -1031,6 +1031,11 @@ proc scanLoadedLibraries(reason: cstring) {.raises: [].} =
 proc drainInlineRawSyscallEvents() {.raises: [].}
 proc installLinuxVdsoPatches() {.raises: [].}
 proc emitLinuxVdsoPatchFailures(source: string) {.raises: [].}
+# Defined next to the other `record*` helpers, below the vDSO block; forward
+# declared because `classifyRawFileSyscall` (the raw-`syscall()` classifier)
+# sits above it and must emit the same entropy observation the libc-symbol and
+# vDSO entry points do.
+proc recordNonDeterministic(source: string) {.raises: [].}
 proc repro_vdso_clock_gettime*(clockId: cint; tp: pointer): cint
     {.exportc, cdecl, dynlib, raises: [].}
 proc repro_vdso_gettimeofday*(tv, tz: pointer): cint
@@ -1793,6 +1798,29 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
     # `syscall(SYS_gettid)` per-thread) do not trip `unsupported nr=186`
     # event-loss. Documented by M9.R.65 close-out as the residual
     # `libc raw syscall unsupported nr=186` class on mesonbin-setup.
+    true
+  of LinuxSysGetrandom:
+    # `getrandom(2)` reached through libc's raw `syscall()` rather than
+    # through the `getrandom()` symbol. Nim's own `std/sysrand` does exactly
+    # this (`syscall(SYS_getrandom, …)`), so every Nim binary that touches
+    # `std/tempfiles` — including reprobuild's own monitored helper edges —
+    # tripped `libc raw syscall unsupported nr=318`. Unknown loss details
+    # classify as Level 2 (unknown scope) in the consumer, which sets
+    # `disableCacheHits` and skips the action-cache publish: the edge could
+    # never hit cache on this or any later build.
+    #
+    # This is a CLASSIFICATION gap, not a monitoring gap. The same call is
+    # already observed on both other paths into it — `repro_hook_getrandom`
+    # (the libc symbol) and `repro_vdso_getrandom` (the vDSO entry) — and
+    # both record it as `mrNonDeterministic`. Do the same here so all three
+    # entry points produce identical evidence.
+    #
+    # `mrNonDeterministic` is deliberately NOT a completeness downgrade
+    # (`io_mon/types.nim`, record 16): io-mon OBSERVED the entropy read, so
+    # nothing is missing; whether entropy invalidates a result is a caller
+    # policy decision made on the record, not a loss.
+    if callResult >= 0:
+      recordNonDeterministic("getrandom")
     true
   of LinuxSysIoUringSetup, LinuxSysIoUringEnter:
     # M9.R.67.2 — Python 3.13's stdlib uses io_uring under the hood for
