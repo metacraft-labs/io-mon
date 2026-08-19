@@ -1753,13 +1753,11 @@ const char *ct_linux_preload_resolve_dlopen_caller_path(const char *path,
  * coverage must not be answered with mcComplete. struct dl_phdr_info
  * carries dlpi_adds and dlpi_subs: the loader's own cumulative counts of
  * objects added and removed. That turns the question into arithmetic. Between
- * two scans the loader performed adds - lastAdds loads; a load is one this
- * shim SAW iff the object was still present at the next scan. So if the number
- * of newly-enumerated objects equals adds - lastAdds, every load in the
- * window was observed — proven, not assumed. If it is short, some object was
- * loaded and unloaded unseen, and the caller emits an event-loss marker that
- * downgrades the capture to mcIncomplete. The gap becomes VISIBLE rather
- * than silent, which is the entire point.
+ * two scans, adds - lastAdds reports load operations. Scans immediately before
+ * and after interposed loader calls distinguish ordinary unload/reload cycles:
+ * a reloaded object appears in the current link map relative to the pre-call
+ * snapshot. A short newly-active count plus an unload therefore identifies a
+ * load that may have disappeared without a scan and requires a downgrade.
  *
  * SAFETY. The dl_iterate_phdr callback runs with the loader's
  * dl_load_write_lock held. It therefore does only memcpy into a
@@ -1796,8 +1794,8 @@ typedef struct {
 static ct_ll_snapshot ct_ll_snap;
 
 /* The PERSISTENT state -- the set of link-map entries already enumerated, and
-   the loaders cumulative load count as of the previous scan -- lives HERE, in
-   C, and not in a Nim seq.
+   the loader's cumulative load/unload counts as of the previous scan -- live
+   HERE, in C, and not in a Nim seq.
    That is not a style preference. A scan can run on ANY thread (the interposed
    dlopen fires on whichever thread called it), so a Nim heap object that
    survives between scans would be allocated on one thread and freed or grown on
@@ -1815,7 +1813,12 @@ static int ct_ll_seen_off[CT_LL_SEEN_MAX];
 static char ct_ll_seen_names[CT_LL_SEEN_NAME_BYTES];
 static int ct_ll_seen_count;
 static int ct_ll_seen_used;
+static unsigned long ct_ll_active_addr[CT_LL_MAX_OBJECTS];
+static int ct_ll_active_off[CT_LL_MAX_OBJECTS];
+static char ct_ll_active_names[CT_LL_NAME_BYTES];
+static int ct_ll_active_count;
 static unsigned long long ct_ll_last_adds;
+static unsigned long long ct_ll_last_subs;
 
 static int ct_ll_collect(struct dl_phdr_info *info, size_t size, void *data) {
   ct_ll_snapshot *s = (ct_ll_snapshot *)data;
@@ -1869,11 +1872,32 @@ static int ct_ll_seen_add(unsigned long addr, const char *name) {
   return 1;
 }
 
+static int ct_ll_active_has(unsigned long addr, const char *name) {
+  int i;
+  for (i = 0; i < ct_ll_active_count; i++)
+    if (ct_ll_active_addr[i] == addr &&
+        strcmp(ct_ll_active_names + ct_ll_active_off[i], name) == 0)
+      return 1;
+  return 0;
+}
+
+static void ct_ll_replace_active_snapshot(void) {
+  int i;
+  ct_ll_active_count = ct_ll_snap.count;
+  memcpy(ct_ll_active_names, ct_ll_snap.names, (size_t)ct_ll_snap.name_used);
+  for (i = 0; i < ct_ll_snap.count; i++) {
+    ct_ll_active_addr[i] = ct_ll_snap.addrs[i];
+    ct_ll_active_off[i] = ct_ll_snap.name_off[i];
+  }
+}
+
 /* Callers serialise scans with a lock on the Nim side, so no locking here. */
 int ct_linux_library_scan(ct_ll_sink_fn sink, char *reason,
-                          unsigned long long *performed, int *newly_seen,
+                          unsigned long long *performed,
+                          unsigned long long *removed, int *newly_active,
+                          int *newly_seen,
                           int *counters_valid, int *overflow) {
-  int i, seen_new = 0;
+  int i, active_new = 0, seen_new = 0;
   ct_ll_snap.count = 0;
   ct_ll_snap.name_used = 0;
   ct_ll_snap.overflow = 0;
@@ -1886,6 +1910,7 @@ int ct_linux_library_scan(ct_ll_sink_fn sink, char *reason,
   for (i = 0; i < ct_ll_snap.count; i++) {
     const char *name = ct_ll_snap.names + ct_ll_snap.name_off[i];
     unsigned long addr = ct_ll_snap.addrs[i];
+    if (!ct_ll_active_has(addr, name)) active_new++;
     if (ct_ll_seen_has(addr, name)) continue;
     if (!ct_ll_seen_add(addr, name)) {
       /* The seen-set is full: further entries cannot be tracked, so coverage
@@ -1903,8 +1928,17 @@ int ct_linux_library_scan(ct_ll_sink_fn sink, char *reason,
                      ? ct_ll_snap.adds - ct_ll_last_adds
                      : 0;
   }
+  if (removed != NULL) {
+    *removed = (ct_ll_snap.counters_valid && ct_ll_snap.subs >= ct_ll_last_subs)
+                   ? ct_ll_snap.subs - ct_ll_last_subs
+                   : 0;
+  }
   if (ct_ll_snap.counters_valid && ct_ll_snap.adds >= ct_ll_last_adds)
     ct_ll_last_adds = ct_ll_snap.adds;
+  if (ct_ll_snap.counters_valid && ct_ll_snap.subs >= ct_ll_last_subs)
+    ct_ll_last_subs = ct_ll_snap.subs;
+  if (!ct_ll_snap.overflow) ct_ll_replace_active_snapshot();
+  if (newly_active != NULL) *newly_active = active_new;
   if (newly_seen != NULL) *newly_seen = seen_new;
   if (counters_valid != NULL) *counters_valid = ct_ll_snap.counters_valid;
   if (overflow != NULL) *overflow = ct_ll_snap.overflow;
@@ -2833,8 +2867,9 @@ proc realRenameat2*(oldDirfd: cint; oldPath: cstring; newDirfd: cint;
                     newPath: cstring; flags: cuint): cint
   {.importc: "ct_linux_preload_real_renameat2", raises: [].}
 proc linuxLibraryScan*(sink: pointer; reason: cstring;
-                       performed: ptr uint64;
-                       newlySeen, countersValid, overflow: ptr cint): cint
+                       performed, removed: ptr uint64;
+                       newlyActive, newlySeen, countersValid,
+                       overflow: ptr cint): cint
   {.importc: "ct_linux_library_scan", raises: [].}
   ## Enumerate the loader's link map (see the design note above
   ## `ct_linux_library_scan`), invoking `sink` once for each entry NOT SEEN
@@ -2842,13 +2877,14 @@ proc linuxLibraryScan*(sink: pointer; reason: cstring;
   ## cast to `pointer`, called after `dl_iterate_phdr` has returned so the
   ## loader lock is no longer held and the sink may allocate and record.
   ##
-  ## `performed` reports how many loads the loader itself performed since the
-  ## previous scan (from its cumulative `dlpi_adds`) and `newlySeen` how many
-  ## objects this scan enumerated for the first time. Equal ⇒ every load in the
-  ## window was observed; short ⇒ at least one object was loaded and unloaded
-  ## without ever being enumerated, and the caller must downgrade.
+  ## `performed` and `removed` report the deltas of the loader's cumulative
+  ## `dlpi_adds` and `dlpi_subs`; `newlyActive` reports entries absent from the
+  ## immediately preceding link-map snapshot, while `newlySeen` reports entries
+  ## first observed during the process. A short newly-active count is a gap only
+  ## if an unload also occurred: scans immediately before and after interposed
+  ## loads make ordinary unload/reload cycles visible as separate transitions.
   ##
-  ## The seen-set and the previous `dlpi_adds` live on the C side ON PURPOSE:
+  ## The seen-set and previous loader counters live on the C side ON PURPOSE:
   ## scans run on whichever thread called `dlopen`, and long-lived Nim heap
   ## state shared between threads is the FUP-C allocator-corruption class.
 
