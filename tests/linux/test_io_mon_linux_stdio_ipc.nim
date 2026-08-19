@@ -688,6 +688,51 @@ int main(int argc, char **argv) {
     check dep.records.anyIt(it.kind == mrFileRead and marker in it.path and
       detailToken(it.detail, "run").len > 0)
 
+  test "named device moved onto an inherited fd remains a file dependency":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let reader = buildC(work, "dup2_zero_reader", """
+#include <fcntl.h>
+#include <unistd.h>
+int main(void) {
+  int fd = open("/dev/zero", O_RDONLY);
+  if (fd < 0) return 2;
+  if (fd != STDIN_FILENO) {
+    if (dup2(fd, STDIN_FILENO) != STDIN_FILENO) return 3;
+    close(fd);
+  }
+  unsigned char buf[32];
+  ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+  return n == (ssize_t)sizeof(buf) ? 0 : 4;
+}
+""")
+    let depfile = work / "dup2-zero.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", reader],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check hasFileRead(dep, "/dev/zero")
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      "out-of-tree content channel consumed" in it.detail)
+
   test "inherited fd 3 deleted regular file does not become stable proc fd path":
     let snoopBin = work / "io-mon"
     if not fileExists(snoopBin):
@@ -2214,6 +2259,101 @@ int main(void) {
     #    silently swallowing the syscall.
     check dep.records.anyIt(it.kind == mrNonDeterministic and
       it.path == "getrandom")
+
+  test "raw libc SYS_futex is treated as supported (no event-loss)":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let probe = buildC(work, "raw_futex", """
+#define _GNU_SOURCE
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#ifndef SYS_futex
+#define SYS_futex 202
+#endif
+int main(void) {
+  int word = 0;
+  long woken = syscall(SYS_futex, &word, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
+  return woken >= 0 ? 0 : 2;
+}
+""")
+    let depfile = work / "raw-futex.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", probe],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      ("unsupported nr=202" in it.detail or
+       "libc raw syscall unsupported" in it.detail))
+
+  test "raw libc Landlock sandbox syscalls are supported (no event-loss)":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let probe = buildC(work, "raw_landlock", """
+#include <sys/syscall.h>
+#include <unistd.h>
+#ifndef SYS_landlock_create_ruleset
+#define SYS_landlock_create_ruleset 444
+#endif
+#ifndef SYS_landlock_add_rule
+#define SYS_landlock_add_rule 445
+#endif
+#ifndef SYS_landlock_restrict_self
+#define SYS_landlock_restrict_self 446
+#endif
+int main(void) {
+  (void)syscall(SYS_landlock_create_ruleset, 0, 0, 1);
+  (void)syscall(SYS_landlock_add_rule, -1, 0, 0, 0);
+  (void)syscall(SYS_landlock_restrict_self, -1, 0);
+  return 0;
+}
+""")
+    let depfile = work / "raw-landlock.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", probe],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      ("unsupported nr=444" in it.detail or
+       "unsupported nr=445" in it.detail or
+       "unsupported nr=446" in it.detail or
+       "libc raw syscall unsupported" in it.detail))
 
   test "raw libc io_uring_setup probe (failing) is supported (no event-loss)":
     # Regression pin for M9.R.67.2: Python 3.13's stdlib probes for io_uring

@@ -110,6 +110,8 @@ suite "io-mon Linux runtime library closure":
                                        output: string] =
     let res = run(snoopBin, @["run", "--depfile", depfile, "--"] & argv,
       childEnvWith(extraEnv), workDir)
+    if not fileExists(depfile):
+      checkpoint("capture produced no depfile: " & res.output)
     require fileExists(depfile)
     (readMonitorDepFile(depfile), res.code, res.output)
 
@@ -306,6 +308,62 @@ int main(int argc, char **argv) {
     checkpoint(cap.output)
     require cap.code == 0
     check canonical(plug) in libraryLoads(cap.dep)
+
+  test "reopening a startup-loaded object does not create false event loss":
+    let app = work / "reopen_app"
+    writeFile(work / "reopen_app.c", """
+#include <dlfcn.h>
+#include <stdio.h>
+int main(int argc, char **argv) {
+  void *h = dlopen(argv[1], RTLD_NOW);
+  if (h == NULL) { fprintf(stderr, "dlopen-failed: %s\n", dlerror()); return 1; }
+  dlclose(h);
+  printf("reopen ok\n");
+  return 0;
+}
+""")
+    let built = run(cc, @[work / "reopen_app.c", "-o", app, "-ldl"])
+    checkpoint(built.output)
+    require built.code == 0
+
+    let lddOut = run("bash", @[
+      "-c", "ldd " & app & " | grep -o '/[^ ]*libc\\.so[^ ]*' | head -1"])
+    let libcPath = lddOut.output.strip()
+    checkpoint("libc: " & libcPath)
+    require libcPath.len > 0
+
+    let cap = captureRun(@[app, libcPath], work / "reopen.rdep")
+    checkpoint(cap.output)
+    require cap.code == 0
+    check canonical(libcPath) in libraryLoads(cap.dep)
+    check cap.dep.completeness == mcComplete
+
+  test "unloading and reloading an observed object stays complete":
+    let plug = buildLib("reload", 23)
+    let app = work / "reload_app"
+    writeFile(work / "reload_app.c", """
+#include <dlfcn.h>
+#include <stdio.h>
+int main(int argc, char **argv) {
+  void *first = dlopen(argv[1], RTLD_NOW);
+  if (first == NULL) { fprintf(stderr, "first: %s\n", dlerror()); return 1; }
+  if (dlclose(first) != 0) { fprintf(stderr, "close: %s\n", dlerror()); return 2; }
+  void *second = dlopen(argv[1], RTLD_NOW);
+  if (second == NULL) { fprintf(stderr, "second: %s\n", dlerror()); return 3; }
+  dlclose(second);
+  printf("reload ok\n");
+  return 0;
+}
+""")
+    let built = run(cc, @[work / "reload_app.c", "-o", app, "-ldl"])
+    checkpoint(built.output)
+    require built.code == 0
+
+    let cap = captureRun(@[app, plug], work / "reload.rdep")
+    checkpoint(cap.output)
+    require cap.code == 0
+    check canonical(plug) in libraryLoads(cap.dep)
+    check cap.dep.completeness == mcComplete
 
   test "AWKWARD CASE: an UNOBSERVABLE load DOWNGRADES instead of claiming":
     # The case the design cannot observe: a load that never reaches the

@@ -27,6 +27,7 @@ const
   LinuxSysSendfile = 40.clong
   LinuxSysGettimeofday = 96.clong
   LinuxSysTime = 201.clong
+  LinuxSysFutex = 202.clong
   LinuxSysClockGettime = 228.clong
   LinuxSysClockGetres = 229.clong
   LinuxSysGettid = 186.clong
@@ -44,6 +45,9 @@ const
   LinuxSysCopyFileRange = 326.clong
   LinuxSysStatx = 332.clong
   LinuxSysOpenat2 = 437.clong
+  LinuxSysLandlockCreateRuleset = 444.clong
+  LinuxSysLandlockAddRule = 445.clong
+  LinuxSysLandlockRestrictSelf = 446.clong
   LinuxEfault = 14.clong
   LinuxRenameExchange = 2'u32
 
@@ -981,18 +985,19 @@ proc scanLoadedLibraries(reason: cstring) {.raises: [].} =
   ## The proof is what makes this honest rather than merely useful. Sampling the
   ## link map at chosen points leaves one question open — "what about an object
   ## loaded and unloaded between two samples?" — and an open question about
-  ## input coverage may not be answered with `mcComplete`. `dlpi_adds` is the
-  ## loader's own count of loads; an object loaded in a window is one this scan
-  ## enumerates iff it is still mapped now. So `newlySeen == performed` says
-  ## every load in the window was seen, and anything else says at least one was
-  ## not — at which point this emits an event-loss marker and the whole capture
-  ## downgrades to `mcIncomplete`.
+  ## input coverage may not be answered with `mcComplete`. Scanning immediately
+  ## before and after interposed loader calls separates ordinary unload/reload
+  ## transitions. The loader counters can then prove a gap only when more loads
+  ## occurred than objects appeared since the preceding link-map snapshot and
+  ## an unload confirms that an object could have vanished between scans.
   if not initialized or inForkChild:
     return
   acquire(libScanLock)
   defer: release(libScanLock)
   libScanSinkFailed = false
   var performed: uint64 = 0
+  var removed: uint64 = 0
+  var newlyActive: cint = 0
   var newlySeen: cint = 0
   var countersValid: cint = 0
   var overflow: cint = 0
@@ -1001,8 +1006,8 @@ proc scanLoadedLibraries(reason: cstring) {.raises: [].} =
   # cannot re-enter the hooks: `dl_iterate_phdr` performs no file I/O and
   # resolves no symbols.
   let count = linuxLibraryScan(cast[pointer](libraryScanSink), reason,
-                               addr performed, addr newlySeen,
-                               addr countersValid, addr overflow)
+                               addr performed, addr removed, addr newlyActive,
+                               addr newlySeen, addr countersValid, addr overflow)
   let why = if reason == nil: "" else: $reason
   if count < 0:
     emitEventLoss("library-load scan failed (" & why & ")")
@@ -1021,11 +1026,12 @@ proc scanLoadedLibraries(reason: cstring) {.raises: [].} =
     emitEventLoss("library-load coverage is unprovable: this loader does not " &
       "report dlpi_adds/dlpi_subs, so a library loaded and unloaded between " &
       "scans would be undetectable (" & why & ")")
-  elif uint64(newlySeen) != performed:
+  elif uint64(newlyActive) < performed and removed > 0:
     emitEventLoss("library-load coverage gap: the loader performed " &
       $performed & " load(s) since the previous scan but only " &
-      $newlySeen & " newly-mapped object(s) were still enumerable (" &
-      why & ") — at least one shared object was loaded and unloaded without " &
+      $newlyActive & " object(s) appeared in the link map (" &
+      why & "); " & $removed & " object(s) were unloaded — at least one " &
+      "shared object may have been loaded and unloaded without " &
       "being observed, so its bytes are an input this capture cannot name")
 
 proc drainInlineRawSyscallEvents() {.raises: [].}
@@ -1232,6 +1238,28 @@ proc recordLocalFdPair(fds: ptr cint) {.raises: [].} =
 proc isLinuxDeletedProcFdTarget(path: string): bool {.raises: [].} =
   path.endsWith(" (deleted)")
 
+proc recoverNamedFdRead(fd: cint; kind: FdKind): bool {.raises: [].} =
+  ## Recover regular files and named devices after an inherited fd or an
+  ## untracked dup replaced the descriptor that carried the original path.
+  if kind notin {fkRegular, fkOther}:
+    return false
+  var buf: array[4096, char]
+  if c_fd_proc_path(fd, addr buf[0], csize_t(buf.len)) == 0:
+    return false
+  let resolved = $cast[cstring](addr buf[0])
+  if not resolved.isAbsolute or resolved.startsWith("anon_inode:") or
+      isLinuxDeletedProcFdTarget(resolved):
+    return false
+  updateFdPath(fd, cstring(resolved))
+  var record = baseRecord(mrFileRead, moFileRead)
+  record.path = resolved
+  record.result = 0
+  record.flags = uint32(fd)
+  record.detail = "inherited-fd"
+  discard podFileReadMarkIsNew(fd)
+  emitRecord(record)
+  true
+
 proc classifyEmptyFdRead(fd: cint): bool {.raises: [].} =
   if fd < 0 or emptyFdAlreadyClassified(fd):
     return false
@@ -1242,21 +1270,9 @@ proc classifyEmptyFdRead(fd: cint): bool {.raises: [].} =
     markEmptyFdClassified(fd)
     return false
   let kind = FdKind(rawKind)
+  if recoverNamedFdRead(fd, kind):
+    return true
   if kind == fkRegular:
-    var buf: array[4096, char]
-    if c_fd_proc_path(fd, addr buf[0], csize_t(buf.len)) != 0:
-      let resolved = $cast[cstring](addr buf[0])
-      if resolved.len > 0 and not resolved.startsWith("anon_inode:") and
-          not isLinuxDeletedProcFdTarget(resolved):
-        updateFdPath(fd, cstring(resolved))
-        var record = baseRecord(mrFileRead, moFileRead)
-        record.path = resolved
-        record.result = 0
-        record.flags = uint32(fd)
-        record.detail = "inherited-fd"
-        discard podFileReadMarkIsNew(fd)
-        emitRecord(record)
-        return true
     emitEventLoss("linux inherited regular fd read unnamed key=" &
       localFdKey(dev, ino) & " fd=" & $fd)
     markEmptyFdClassified(fd)
@@ -1822,6 +1838,21 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
     if callResult >= 0:
       recordNonDeterministic("getrandom")
     true
+  of LinuxSysFutex:
+    # SYS_futex only coordinates threads through caller-owned memory. It does
+    # not access filesystem state or introduce an external input, so treating
+    # it as unknown event loss makes ordinary threaded tools permanently
+    # non-cacheable without protecting any dependency channel.
+    true
+  of LinuxSysLandlockCreateRuleset, LinuxSysLandlockAddRule,
+      LinuxSysLandlockRestrictSelf:
+    # Landlock only narrows the caller's future filesystem access. Creating a
+    # ruleset observes kernel capability state, adding a rule refers to an fd
+    # whose open was already monitored, and restricting the current thread has
+    # no filesystem read of its own. Subsequent allowed filesystem operations
+    # still pass through the regular hooks; denied operations are captured as
+    # probes. XZ uses these raw syscalls to install its optional sandbox.
+    true
   of LinuxSysIoUringSetup, LinuxSysIoUringEnter:
     # M9.R.67.2 — Python 3.13's stdlib uses io_uring under the hood for
     # its internal buffering / signal-fd / eventfd wake-ups when the
@@ -2281,6 +2312,10 @@ proc repro_hook_dlopen*(ctx: var DlopenContext) {.raises: [].} =
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
+  # Establish the exact pre-call link map. If an object was unloaded after the
+  # preceding call, a reload now appears as a normal transition instead of an
+  # unidentifiable load/unload window.
+  scanLoadedLibraries("pre-dlopen")
   callNext(ctx)
   let savedErrno = c_get_errno()
   if ctx.result != nil:
@@ -2302,6 +2337,7 @@ proc repro_hook_dlmopen*(ctx: var DlmopenContext) {.raises: [].} =
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
+  scanLoadedLibraries("pre-dlmopen")
   callNext(ctx)
   let savedErrno = c_get_errno()
   if ctx.result != nil:
