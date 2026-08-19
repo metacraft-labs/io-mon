@@ -169,12 +169,22 @@ case "${io_mon_host_platform_name}" in
       src/io_mon/shim/linux_preload.nim
     ;;
   windows)
+    # -static-libgcc: the shim is LoadLibraryW'd into arbitrary children by the
+    # engine, so it must resolve with no help from the child's DLL search path.
+    # Linked dynamically it imports libgcc_s_seh-1.dll, which lives in whichever
+    # mingw bin dir built it and is NOT on the PATH the engine composes for a
+    # monitored action -- the child then fails with
+    #   repro internal io monitor: error: LoadLibraryW in child returned NULL
+    # and every monitored action on Windows fails. Static-linking the gcc
+    # runtime leaves only KERNEL32 + the api-ms-win-crt-* UCRT stubs, all of
+    # which the system resolves unconditionally.
     nim c \
       ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
       --app:lib \
       --threads:on \
       --mm:orc \
       --cc:gcc \
+      --passL:"-static-libgcc" \
       --path:src \
       --path:"${stackable_hooks_src}" \
       --path:"${shm_queue_src}" \
@@ -182,6 +192,85 @@ case "${io_mon_host_platform_name}" in
       --nimcache:"${nimcache_dir}/io-mon-shim-dll" \
       --out:"${out_dir}/librepro_monitor_shim.dll" \
       src/io_mon/shim/windows_interpose.nim
+
+    # 32-bit (WOW64) companions.
+    #
+    # A 64-bit shim cannot be injected into a 32-bit child: LoadLibraryW
+    # returns NULL on the machine-type mismatch, the child is left
+    # unmonitored, and the action is graded an unmonitored-subtree loss --
+    # which costs the whole build its cache publication. 32-bit children are
+    # not exotic on Windows: PATH trampolines (scoop shims) and older
+    # toolchain binaries (the ezwinports make.exe) are routinely i386.
+    #
+    # Two artefacts, both found by convention rather than configuration --
+    # see the WOW64 section of nim-stackable-hooks'
+    # src/stackable_hooks/windows_injector.nim:
+    #
+    #   librepro_monitor_shim32.dll         the 32-bit shim
+    #   stackable_hooks_wow64_probe32.exe   reports the 32-bit kernel32
+    #                                       proc addresses the injector
+    #                                       cannot resolve for itself,
+    #                                       via its exit code
+    #
+    # Optional: a host with no i686 toolchain still gets a working 64-bit
+    # shim, and the injector fails with a specific "32-bit shim is missing,
+    # build it with --cpu:i386" message if it ever meets a 32-bit child.
+    # Install one with: pacman -S mingw-w64-i686-gcc
+    i686_gcc="${IO_MON_I686_GCC:-}"
+    if [ -z "${i686_gcc}" ] && command -v i686-w64-mingw32-gcc >/dev/null 2>&1; then
+      i686_gcc="$(command -v i686-w64-mingw32-gcc)"
+    fi
+    if [ -n "${i686_gcc}" ]; then
+      # The i686 gcc.exe links its own libgcc_s_dw2-1.dll +
+      # libwinpthread-1.dll from its bin dir. nim spawns the compiler with
+      # the ambient PATH, so without that directory on it the compiler fails
+      # to START -- exit 1 with no diagnostic, which reads as a compile error
+      # against whichever .c file happened to be first. Scope the addition to
+      # the 32-bit invocations only: on the global PATH it makes the 64-bit
+      # build pick up the i686 compiler and fail on a pointer-size assert.
+      i686_bin="$(dirname "${i686_gcc}")"
+      # A bash PATH is colon-separated, so a Windows-style "D:/..." entry
+      # would split at the drive colon into "D" and "/...". Convert to the
+      # shell's own path form where cygpath is available (MSYS2 / git-bash).
+      if command -v cygpath >/dev/null 2>&1; then
+        i686_bin="$(cygpath -u "${i686_bin}")"
+      fi
+      PATH="${i686_bin}:${PATH}" \
+      nim c \
+        ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
+        --app:lib \
+        --threads:on \
+        --mm:orc \
+        --cpu:i386 \
+        --cc:gcc \
+        --gcc.exe:"${i686_gcc}" \
+        --gcc.linkerexe:"${i686_gcc}" \
+        --passL:"-static-libgcc" \
+        --path:src \
+        --path:"${stackable_hooks_src}" \
+        --path:"${shm_queue_src}" \
+        --path:"${shm_gset_src}" \
+        --nimcache:"${nimcache_dir}/io-mon-shim-dll32" \
+        --out:"${out_dir}/librepro_monitor_shim32.dll" \
+        src/io_mon/shim/windows_interpose.nim
+
+      PATH="${i686_bin}:${PATH}" \
+      nim c \
+        --app:console \
+        --cpu:i386 \
+        --cc:gcc \
+        --gcc.exe:"${i686_gcc}" \
+        --gcc.linkerexe:"${i686_gcc}" \
+        --passL:"-static-libgcc" \
+        --nimcache:"${nimcache_dir}/wow64-probe32" \
+        --out:"${out_dir}/stackable_hooks_wow64_probe32.exe" \
+        "${stackable_hooks_src}/stackable_hooks/tools/wow64_proc_probe.nim"
+
+      echo "built 32-bit WOW64 shim + probe into ${out_dir}"
+    else
+      echo "note: no i686 toolchain found (set IO_MON_I686_GCC or install" \
+        "mingw-w64-i686-gcc); 32-bit children will not be injectable" >&2
+    fi
     ;;
   *)
     # Reachable only for a platform we genuinely do not support: detection
