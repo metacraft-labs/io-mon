@@ -2146,6 +2146,50 @@ int main(void) {
       ("unsupported nr=186" in it.detail or
        "libc raw syscall unsupported" in it.detail))
 
+  test "raw libc SYS_futex is treated as supported (no event-loss)":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let probe = buildC(work, "raw_futex", """
+#define _GNU_SOURCE
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#ifndef SYS_futex
+#define SYS_futex 202
+#endif
+int main(void) {
+  int word = 0;
+  long woken = syscall(SYS_futex, &word, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
+  return woken >= 0 ? 0 : 2;
+}
+""")
+    let depfile = work / "raw-futex.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", probe],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      ("unsupported nr=202" in it.detail or
+       "libc raw syscall unsupported" in it.detail))
+
   test "raw libc io_uring_setup probe (failing) is supported (no event-loss)":
     # Regression pin for M9.R.67.2: Python 3.13's stdlib probes for io_uring
     # availability at startup by invoking `syscall(SYS_io_uring_setup)` (nr=425).

@@ -27,6 +27,7 @@ const
   LinuxSysSendfile = 40.clong
   LinuxSysGettimeofday = 96.clong
   LinuxSysTime = 201.clong
+  LinuxSysFutex = 202.clong
   LinuxSysClockGettime = 228.clong
   LinuxSysClockGetres = 229.clong
   LinuxSysGettid = 186.clong
@@ -1793,6 +1794,12 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
     # `syscall(SYS_gettid)` per-thread) do not trip `unsupported nr=186`
     # event-loss. Documented by M9.R.65 close-out as the residual
     # `libc raw syscall unsupported nr=186` class on mesonbin-setup.
+    true
+  of LinuxSysFutex:
+    # SYS_futex only coordinates threads through caller-owned memory. It does
+    # not access filesystem state or introduce an external input, so treating
+    # it as unknown event loss makes ordinary threaded tools permanently
+    # non-cacheable without protecting any dependency channel.
     true
   of LinuxSysIoUringSetup, LinuxSysIoUringEnter:
     # M9.R.67.2 — Python 3.13's stdlib uses io_uring under the hood for
