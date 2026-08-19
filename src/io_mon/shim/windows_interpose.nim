@@ -760,6 +760,31 @@ proc recordProcessStart() =
   var record = baseRecord(mrProcessStart, moProcessStart)
   record.detail = "shim-loaded"
   emitRecord(record)
+  # Flush immediately: this record is written from a thread that is about to
+  # disappear.
+  #
+  # Fragment frames are batched per (osPid, threadId) and flushed on a key
+  # change, an explicit flush, or a 100 ms age bound. On Windows the shim is
+  # initialised by the injector via CreateRemoteThread -> repro_runtime_init,
+  # so recordProcessStart runs on a remote thread whose ONLY record is this
+  # one, and which then exits: no key change, no explicit flush, and gone long
+  # before the age bound. The record was therefore lost for every injected
+  # process -- which is every process, root and children alike.
+  #
+  # The consequence was not a missing diagnostic but an uncacheable build.
+  # processStartIdentities builds its monitored-process set purely from
+  # mrProcessStart records, so with none surviving, childIsMonitored answered
+  # false for every spawn and the writer synthesised "spawn child missing
+  # process-start" for children that were in fact fully monitored. That is an
+  # unknown-scope loss, which makes the evidence mcIncomplete, which makes the
+  # consumer skip action-cache publication for the entire session.
+  # Same swallow-and-continue posture as emitRecord: a failed flush costs a
+  # record, never the host process.
+  withShimMuted:
+    try:
+      flushFragmentBatch()
+    except CatchableError:
+      discard
 
 # --- Hook chain context layout ---------------------------------------------
 #
@@ -1678,21 +1703,28 @@ proc snoopCreateProcessW(ctx: var hr.HookContext) {.raises: [].} =
     record.detail = "CreateProcessW"
     if childForkRuntime.len > 0:
       record.detail.add(" fork-runtime=" & childForkRuntime)
-    emitRecord(record)
-    # On success, inject and (if needed) resume the main thread. The
-    # caller's flags determine whether we are responsible for the
-    # resume — if they passed CREATE_SUSPENDED we MUST NOT touch the
-    # main thread, otherwise the caller's own ResumeThread call later
-    # double-resumes.
+    # Inject BEFORE emitting so the spawn record can say whether the child
+    # was actually instrumented.
+    #
+    # The outcome used to be discarded. A failed injection then surfaced
+    # only downstream, as the writer synthesising "spawn child missing
+    # process-start" for a child that never reported -- which says the
+    # subtree was lost but not why, and "injection failed", "the in-flight
+    # cap was saturated" and "LoadLibraryW timed out" are a bug, a tuning
+    # knob and a hung child respectively. Record which one it was.
     if r != 0 and lpProcessInfo != nil and selfDllPathW.len > 0:
       let pi = lpProcessInfo[]
       # A pre-main remote thread deadlocks MSYS2/Cygwin fork runtimes.
       # The unmatched spawn record makes the skipped subtree incomplete.
       if childForkRuntime.len == 0:
-        discard shProp.injectShimIntoChild(pi.hProcess, selfDllPath(),
+        let outcome = shProp.injectShimIntoChild(pi.hProcess, selfDllPath(),
           "repro_runtime_init")
+        if outcome != shProp.ioInjected and
+            outcome != shProp.ioAlreadyPresent:
+          record.detail.add(" inject=" & $outcome)
       if not callerAskedForSuspended:
         discard ResumeThread(pi.hThread)
+    emitRecord(record)
   except CatchableError:
     discard
   SetLastError(savedLastError)
