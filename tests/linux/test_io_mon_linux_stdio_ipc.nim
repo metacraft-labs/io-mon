@@ -2190,6 +2190,57 @@ int main(void) {
       ("unsupported nr=202" in it.detail or
        "libc raw syscall unsupported" in it.detail))
 
+  test "raw libc Landlock sandbox syscalls are supported (no event-loss)":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let probe = buildC(work, "raw_landlock", """
+#include <sys/syscall.h>
+#include <unistd.h>
+#ifndef SYS_landlock_create_ruleset
+#define SYS_landlock_create_ruleset 444
+#endif
+#ifndef SYS_landlock_add_rule
+#define SYS_landlock_add_rule 445
+#endif
+#ifndef SYS_landlock_restrict_self
+#define SYS_landlock_restrict_self 446
+#endif
+int main(void) {
+  (void)syscall(SYS_landlock_create_ruleset, 0, 0, 1);
+  (void)syscall(SYS_landlock_add_rule, -1, 0, 0, 0);
+  (void)syscall(SYS_landlock_restrict_self, -1, 0);
+  return 0;
+}
+""")
+    let depfile = work / "raw-landlock.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", probe],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      ("unsupported nr=444" in it.detail or
+       "unsupported nr=445" in it.detail or
+       "unsupported nr=446" in it.detail or
+       "libc raw syscall unsupported" in it.detail))
+
   test "raw libc io_uring_setup probe (failing) is supported (no event-loss)":
     # Regression pin for M9.R.67.2: Python 3.13's stdlib probes for io_uring
     # availability at startup by invoking `syscall(SYS_io_uring_setup)` (nr=425).

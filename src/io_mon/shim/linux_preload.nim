@@ -45,6 +45,9 @@ const
   LinuxSysCopyFileRange = 326.clong
   LinuxSysStatx = 332.clong
   LinuxSysOpenat2 = 437.clong
+  LinuxSysLandlockCreateRuleset = 444.clong
+  LinuxSysLandlockAddRule = 445.clong
+  LinuxSysLandlockRestrictSelf = 446.clong
   LinuxEfault = 14.clong
   LinuxRenameExchange = 2'u32
 
@@ -1800,6 +1803,15 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
     # not access filesystem state or introduce an external input, so treating
     # it as unknown event loss makes ordinary threaded tools permanently
     # non-cacheable without protecting any dependency channel.
+    true
+  of LinuxSysLandlockCreateRuleset, LinuxSysLandlockAddRule,
+      LinuxSysLandlockRestrictSelf:
+    # Landlock only narrows the caller's future filesystem access. Creating a
+    # ruleset observes kernel capability state, adding a rule refers to an fd
+    # whose open was already monitored, and restricting the current thread has
+    # no filesystem read of its own. Subsequent allowed filesystem operations
+    # still pass through the regular hooks; denied operations are captured as
+    # probes. XZ uses these raw syscalls to install its optional sandbox.
     true
   of LinuxSysIoUringSetup, LinuxSysIoUringEnter:
     # M9.R.67.2 — Python 3.13's stdlib uses io_uring under the hood for
