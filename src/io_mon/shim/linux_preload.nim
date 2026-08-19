@@ -1233,6 +1233,28 @@ proc recordLocalFdPair(fds: ptr cint) {.raises: [].} =
 proc isLinuxDeletedProcFdTarget(path: string): bool {.raises: [].} =
   path.endsWith(" (deleted)")
 
+proc recoverNamedFdRead(fd: cint; kind: FdKind): bool {.raises: [].} =
+  ## Recover regular files and named devices after an inherited fd or an
+  ## untracked dup replaced the descriptor that carried the original path.
+  if kind notin {fkRegular, fkOther}:
+    return false
+  var buf: array[4096, char]
+  if c_fd_proc_path(fd, addr buf[0], csize_t(buf.len)) == 0:
+    return false
+  let resolved = $cast[cstring](addr buf[0])
+  if not resolved.isAbsolute or resolved.startsWith("anon_inode:") or
+      isLinuxDeletedProcFdTarget(resolved):
+    return false
+  updateFdPath(fd, cstring(resolved))
+  var record = baseRecord(mrFileRead, moFileRead)
+  record.path = resolved
+  record.result = 0
+  record.flags = uint32(fd)
+  record.detail = "inherited-fd"
+  discard podFileReadMarkIsNew(fd)
+  emitRecord(record)
+  true
+
 proc classifyEmptyFdRead(fd: cint): bool {.raises: [].} =
   if fd < 0 or emptyFdAlreadyClassified(fd):
     return false
@@ -1243,21 +1265,9 @@ proc classifyEmptyFdRead(fd: cint): bool {.raises: [].} =
     markEmptyFdClassified(fd)
     return false
   let kind = FdKind(rawKind)
+  if recoverNamedFdRead(fd, kind):
+    return true
   if kind == fkRegular:
-    var buf: array[4096, char]
-    if c_fd_proc_path(fd, addr buf[0], csize_t(buf.len)) != 0:
-      let resolved = $cast[cstring](addr buf[0])
-      if resolved.len > 0 and not resolved.startsWith("anon_inode:") and
-          not isLinuxDeletedProcFdTarget(resolved):
-        updateFdPath(fd, cstring(resolved))
-        var record = baseRecord(mrFileRead, moFileRead)
-        record.path = resolved
-        record.result = 0
-        record.flags = uint32(fd)
-        record.detail = "inherited-fd"
-        discard podFileReadMarkIsNew(fd)
-        emitRecord(record)
-        return true
     emitEventLoss("linux inherited regular fd read unnamed key=" &
       localFdKey(dev, ino) & " fd=" & $fd)
     markEmptyFdClassified(fd)
