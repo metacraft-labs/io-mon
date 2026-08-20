@@ -235,6 +235,19 @@ case "${io_mon_host_platform_name}" in
       if command -v cygpath >/dev/null 2>&1; then
         i686_bin="$(cygpath -u "${i686_bin}")"
       fi
+      # --kill-at: 32-bit mingw decorates stdcall exports with the callee's
+      # argument-byte count, so `repro_runtime_init` (a stdcall entry taking
+      # one pointer) is exported as `repro_runtime_init@4`, while the 64-bit
+      # build -- where there is no stdcall to decorate -- exports it plain.
+      # Every lookup asks for the undecorated name: the shim resolves its own
+      # init to compute the RVA it starts in the child, and the spawn hook
+      # passes the literal string to injectShimIntoChild. Both would return
+      # NULL against a decorated export, and neither failure is visible from
+      # outside -- LoadLibraryW succeeds, the DLL sits in the child with no
+      # hooks installed, and the process reports no records at all while the
+      # run still grades mcComplete. Stripping the decoration keeps ONE export
+      # name across both bitnesses, which is what the injector's naming
+      # convention already assumes.
       PATH="${i686_bin}:${PATH}" \
       nim c \
         ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
@@ -246,6 +259,7 @@ case "${io_mon_host_platform_name}" in
         --gcc.exe:"${i686_gcc}" \
         --gcc.linkerexe:"${i686_gcc}" \
         --passL:"-static-libgcc" \
+        --passL:"-Wl,--kill-at" \
         --path:src \
         --path:"${stackable_hooks_src}" \
         --path:"${shm_queue_src}" \

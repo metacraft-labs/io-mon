@@ -1004,7 +1004,23 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
         observationKind: moEventLoss,
         osPid: uint64(getCurrentProcessId()),
         detail: "unmonitored subtree/peer (" & injection.skipReason & ")")
+    # ROUND-2 R1, applied to Windows. macOS and Linux have always passed the
+    # root pid so the merge can PROVE the root reported; Windows did not, and
+    # the asymmetry hid a real failure: a WOW64 child whose shim loaded but
+    # never initialised emitted nothing at all, and with no expected pid to
+    # miss, the merge asserted mcComplete over a record set containing only
+    # the backend-provenance banner. An injected root that reports nothing is
+    # the one case where "no evidence" and "no dependencies" look identical
+    # from the inside, so the launcher has to supply the pid that should have
+    # appeared.
+    #
+    # Skipped when monitoring was deliberately skipped (an MSYS/Cygwin fork
+    # runtime): that subtree is already recorded as an unmonitored-peer loss
+    # just above, and demanding a process-start from a process we chose not
+    # to inject would report the same gap twice.
     result.depFile = mergeFragments(fragmentDir, request.depFilePath,
+      expectedRootPid =
+        if injection.monitoringSkipped: 0'u64 else: injection.rootPid,
       setRecords = launcherRecords)
     renderStreamToPath(request.depFilePath, request.streamMode,
       request.eventStreamPath)

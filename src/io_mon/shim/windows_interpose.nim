@@ -75,7 +75,38 @@ import stackable_hooks/propagation_windows as shProp
 # wrapper that handles the {.compile.} blocks under the hood.
 import stackable_hooks/inline_hook/windows_inline_hook
 
-const ctInlineHookAvailable = true
+const ctInlineHookAvailable = sizeof(pointer) == 8
+  ## Inline detours are 64-bit-only, and the reason is in the decoder rather
+  ## than in the patching.
+  ##
+  ## Installing a detour means relocating the bytes it overwrites into a
+  ## trampoline, which requires knowing where the instructions in the target's
+  ## prologue begin and end. `inline_hook/windows/length_decoder.c` decodes
+  ## **64-bit mode**: it consumes `0x40`-`0x4F` as REX prefixes and rejects the
+  ## opcodes that 64-bit mode does not encode. In 32-bit code those same bytes
+  ## are `INC`/`DEC reg` -- ordinary one-byte instructions -- so every length
+  ## it reports for a 32-bit prologue is potentially wrong, the trampoline
+  ## receives a truncated or mis-split instruction, and the init thread faults
+  ## on the first commit.
+  ##
+  ## What that looked like in practice is worth recording, because nothing
+  ## about it pointed at instruction decoding: WOW64 children reported their
+  ## process-start (emitted before the install pass) and then NOTHING -- no
+  ## file records, no spawns -- because the fault killed the injector's remote
+  ## init thread and left the child running normally. A monitored 32-bit
+  ## `cmd /c echo hi` produced 6 records where its 64-bit twin produced 19.
+  ##
+  ## `installAllHooks` already treats an unavailable inline backend as the
+  ## IAT-patching case, which needs no instruction decoding at all -- it swaps
+  ## pointers in the import table. That is a genuine reduction in coverage:
+  ## IAT patching sees only calls made through a module's import table, so a
+  ## target that resolves an API through `GetProcAddress` at runtime is missed
+  ## where an inline detour would have caught it. It is nevertheless the right
+  ## trade against installing nothing at all, and the evidence grading already
+  ## accounts for partial capture.
+  ##
+  ## Lifting this means teaching the length decoder 32-bit mode (a distinct
+  ## decode table, not a flag), at which point this const becomes `true` again.
 
 template ctInlineHookInstall(target, hook: pointer;
                              outTrampoline: ptr pointer): cint =
@@ -780,6 +811,33 @@ proc recordProcessStart() =
   # consumer skip action-cache publication for the entire session.
   # Same swallow-and-continue posture as emitRecord: a failed flush costs a
   # record, never the host process.
+  withShimMuted:
+    try:
+      flushFragmentBatch()
+    except CatchableError:
+      discard
+
+proc recordHookInstallLoss(unhooked: int) =
+  ## Report entry points that landed no hook at all, so the run is graded on
+  ## what was actually observable rather than on what happened to be emitted.
+  ##
+  ## Without this the failure is invisible in the only direction that matters.
+  ## A child whose hooks did not install still emits its process-start (that
+  ## record is written before the install pass), so it looks monitored: the
+  ## merge finds the pid it expected, no spawn goes unmatched, and the run
+  ## grades mcComplete over a record set that contains no file reads because
+  ## nothing was watching for them. A consumer then publishes an action-cache
+  ## entry keyed on inputs it never saw, and the next build gets a hit it has
+  ## not earned -- strictly worse than the uncacheable build this whole
+  ## investigation started from, because it is wrong rather than slow.
+  ##
+  ## mrEventLoss with an unquantified scope is the honest grade: we know
+  ## observation was incomplete and cannot bound what was missed.
+  var record = baseRecord(mrEventLoss, moEventLoss)
+  record.detail = "hook install failed for " & $unhooked &
+    " entry point(s); file and process events from this process were not " &
+    "observed"
+  emitRecord(record)
   withShimMuted:
     try:
       flushFragmentBatch()
@@ -2909,6 +2967,17 @@ const ntdllNtIatDlls = @["ntdll.dll"]
 # memory and the process dies with ``STATUS_ACCESS_VIOLATION``.
 var installedHookTargets {.global.}: seq[pointer] = @[]
 
+var unhookedEntryPoints {.global.}: int = 0
+  ## Entry points that landed NEITHER an inline detour nor an IAT patch.
+  ##
+  ## A process whose hooks did not install is not a process with no
+  ## dependencies -- it is a process whose dependencies were never observed,
+  ## and the two are indistinguishable in the record stream. Left unreported,
+  ## the run grades mcComplete over evidence that was never collected, and a
+  ## consumer publishes an action-cache entry keyed on inputs it did not see.
+  ## Counted here so `repro_monitor_shim_init` can emit an explicit
+  ## event-loss record instead.
+
 # Module-global hook table. Built once with the trampoline + origStorage
 # pointers — these are addresses of module-level statics so they're known
 # at module-init time; a `let` binding is sufficient.
@@ -3285,6 +3354,7 @@ proc installAllHooks(): int =
     if spec.origStorage[] == nil:
       dbg(cstring("[repro_monitor_shim] install FAILED for " & spec.name &
         " (neither inline nor IAT landed a hook)\n"))
+      inc unhookedEntryPoints
   result = failed.len
 
 # --- Public exports ---------------------------------------------------------
@@ -3327,6 +3397,8 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   let iatFallbackCount = installAllHooks()
   dbg(cstring("[repro_monitor_shim] installAllHooks: " &
     $iatFallbackCount & " hook(s) fell through to IAT fallback\n"))
+  if unhookedEntryPoints > 0:
+    recordHookInstallLoss(unhookedEntryPoints)
   # M73 Phase 4: post-install audit. Walk the hookTable, resolve each
   # spec's kernel32 address, and classify the first five bytes at the
   # target. The audit MUST run synchronously here — Monitor-Hook-Shim.md
