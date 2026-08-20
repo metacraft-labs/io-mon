@@ -22,6 +22,28 @@ host.
   records already runs on Windows via the `portable/` selection — do NOT
   duplicate it here.
 
-No Windows-only live tests exist yet. Add them here as the Windows injector
-matures; until then the portable suite still validates the shared core on
-Windows.
+## Synthetic fragments are not enough
+
+Most tests here drive the writer with fragments the test process writes
+itself. That is fast and hermetic, and it is blind to an entire class of
+defect: anything about *where* the shim emits from, or whether its hooks
+installed at all.
+
+`test_io_mon_windows_process_start_survives.nim` is deliberately live for that
+reason. It runs a real monitored child through `runMonitored` and asserts both
+that a `mrProcessStart` record reaches the depfile and that the run grades
+`mcComplete`. The defect it pins — the shim's process-start being emitted from
+the injector's remote thread, whose per-`(osPid, threadId)` fragment batch was
+never flushed before that thread exited — was invisible to every synthetic
+test, and made every Windows build uncacheable: with no process-start
+surviving, `childIsMonitored` answered false for every spawn, which is an
+unknown-scope loss, which skips action-cache publication.
+
+The general shape worth remembering: **a monitoring failure looks like a
+process with no dependencies.** Tests that assert on the records that *are*
+present cannot see it; assert on the completeness grade as well.
+
+Not covered here, because it needs an i686 toolchain the suite cannot assume:
+the WOW64 path (32-bit children). `nim-stackable-hooks`'
+`tests/test_windows_wow64_injection.nim` covers the injector side and skips
+when the 32-bit artefacts are absent.
