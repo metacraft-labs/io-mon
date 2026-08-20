@@ -281,6 +281,23 @@ case "${io_mon_host_platform_name}" in
         "${stackable_hooks_src}/stackable_hooks/tools/wow64_proc_probe.nim"
 
       echo "built 32-bit WOW64 shim + probe into ${out_dir}"
+
+      # The 64-bit injection helper. Built here, in the 32-bit block, because
+      # its only caller is the 32-bit shim: a WOW64 process cannot inject
+      # into a 64-bit child itself (its VirtualAllocEx / CreateRemoteThread
+      # go through the WOW64 thunk layer, which does not reach a 64-bit
+      # address space), so it delegates the whole operation. Without a
+      # 32-bit shim there is nothing to delegate, hence nothing to build.
+      #
+      # Compiled 64-bit, i.e. with the DEFAULT toolchain and no i686 PATH.
+      nim c \
+        --app:console \
+        --passL:"-static-libgcc" \
+        --nimcache:"${nimcache_dir}/inject-helper64" \
+        --out:"${out_dir}/stackable_hooks_inject64.exe" \
+        "${stackable_hooks_src}/stackable_hooks/tools/inject_helper.nim"
+
+      echo "built 64-bit injection helper into ${out_dir}"
     else
       echo "note: no i686 toolchain found (set IO_MON_I686_GCC or install" \
         "mingw-w64-i686-gcc); 32-bit children will not be injectable" >&2

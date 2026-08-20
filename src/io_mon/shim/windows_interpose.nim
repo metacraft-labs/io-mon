@@ -75,38 +75,27 @@ import stackable_hooks/propagation_windows as shProp
 # wrapper that handles the {.compile.} blocks under the hood.
 import stackable_hooks/inline_hook/windows_inline_hook
 
-const ctInlineHookAvailable = sizeof(pointer) == 8
-  ## Inline detours are 64-bit-only, and the reason is in the decoder rather
-  ## than in the patching.
+const ctInlineHookAvailable = true
+  ## Inline detours work in both bitnesses.
   ##
-  ## Installing a detour means relocating the bytes it overwrites into a
-  ## trampoline, which requires knowing where the instructions in the target's
-  ## prologue begin and end. `inline_hook/windows/length_decoder.c` decodes
-  ## **64-bit mode**: it consumes `0x40`-`0x4F` as REX prefixes and rejects the
-  ## opcodes that 64-bit mode does not encode. In 32-bit code those same bytes
-  ## are `INC`/`DEC reg` -- ordinary one-byte instructions -- so every length
-  ## it reports for a 32-bit prologue is potentially wrong, the trampoline
-  ## receives a truncated or mis-split instruction, and the init thread faults
-  ## on the first commit.
+  ## They did not always: installing one means relocating the prologue bytes
+  ## the detour overwrites, which means decoding their lengths, and the
+  ## decoder in `inline_hook/windows/length_decoder.c` originally decoded
+  ## 64-bit mode only. Run against 32-bit code it consumed 0x40-0x4F as REX
+  ## prefixes where 32-bit has `INC`/`DEC reg`, so it reported lengths for
+  ## instructions that were not there and the init thread faulted on commit
+  ## -- killing that thread only, leaving the child running and reporting
+  ## nothing but its process-start.
   ##
-  ## What that looked like in practice is worth recording, because nothing
-  ## about it pointed at instruction decoding: WOW64 children reported their
-  ## process-start (emitted before the install pass) and then NOTHING -- no
-  ## file records, no spawns -- because the fault killed the injector's remote
-  ## init thread and left the child running normally. A monitored 32-bit
-  ## `cmd /c echo hi` produced 6 records where its 64-bit twin produced 19.
+  ## The decoder, the rel32 fixup and the trampoline emitters now select
+  ## their mode from the build target (`CT_ILD_MODE64`), which is sound
+  ## because this machinery only ever rewrites code already mapped in its
+  ## own process. A monitored 32-bit `cmd /c echo hi` lands all 31 detours.
   ##
-  ## `installAllHooks` already treats an unavailable inline backend as the
-  ## IAT-patching case, which needs no instruction decoding at all -- it swaps
-  ## pointers in the import table. That is a genuine reduction in coverage:
-  ## IAT patching sees only calls made through a module's import table, so a
-  ## target that resolves an API through `GetProcAddress` at runtime is missed
-  ## where an inline detour would have caught it. It is nevertheless the right
-  ## trade against installing nothing at all, and the evidence grading already
-  ## accounts for partial capture.
-  ##
-  ## Lifting this means teaching the length decoder 32-bit mode (a distinct
-  ## decode table, not a flag), at which point this const becomes `true` again.
+  ## Still 64-bit-only: `ct_inline_hook_install_noreturn`, whose entry stub
+  ## is hand-assembled against the Win64 ABI. Nothing here calls it, and the
+  ## 32-bit build refuses it explicitly rather than emitting an untested
+  ## translation.
 
 template ctInlineHookInstall(target, hook: pointer;
                              outTrampoline: ptr pointer): cint =
@@ -1734,6 +1723,20 @@ proc snoopCreateProcessW(ctx: var hr.HookContext) {.raises: [].} =
   # main thread — unless the original caller already asked for
   # CREATE_SUSPENDED themselves, in which case we leave the suspension
   # exactly as they requested.
+  # Our own probe/helper spawns are infrastructure, not part of the traced
+  # program: they are started from inside this hook's own injection path to
+  # reach across a bitness boundary. Recording them would be wrong twice
+  # over -- their I/O is not a dependency of the action, and because they are
+  # deliberately not injected, a spawn record for them is an unmatched spawn,
+  # which the writer grades as an unmonitored subtree and which then makes an
+  # otherwise fully-observed run mcIncomplete.
+  #
+  # Passed straight through: no forced CREATE_SUSPENDED, no injection, no
+  # record.
+  if shProp.spawningHelperProcess():
+    hr.callNext(ctx)
+    return
+
   let callerCreationFlags = DWORD(ctx.args[5])
   let callerAskedForSuspended =
     (callerCreationFlags and CREATE_SUSPENDED) != 0
