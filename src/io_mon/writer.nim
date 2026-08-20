@@ -3075,6 +3075,7 @@ proc mergeFragments*(fragmentDir, outputPath: string;
         "no in-tree create) — the real input is invisible, re-run")
   records.add profileRecords(defaultHooksMonitorProfile(
     when defined(linux): LinuxPreloadSupportedCapabilities
+    elif defined(windows): WindowsInterposeSupportedCapabilities
     else: MacosMonitorShimTaxonomyCapabilities))
 
   writeCanonicalInPlace(outputPath, records)

@@ -224,6 +224,64 @@ const
     mcapExternalContent
   }
 
+  # What the Windows shim can actually observe, derived from the record and
+  # observation kinds it emits (`shim/windows_interpose.nim`) rather than
+  # from the hooks it installs -- a hooked entry point that produces no
+  # record observes nothing as far as a consumer is concerned.
+  # 
+  # Windows used to report the macOS set here, because
+  # `defaultHooksMonitorProfile` had no Windows branch and fell through to
+  # the macOS profile. That claimed rename, symlink, library-load,
+  # ipc-connect, observed-env, non-determinism and external-content on a
+  # backend that emits no such record, and labelled every Windows depfile
+  # `backend=macos-interpose-hooks`. The banner is what a consumer reads to
+  # decide what the evidence covers, so an over-claim there is the same
+  # class of defect as a monitoring failure that reports success.
+  WindowsInterposeSupportedCapabilities* = {
+    mcapProcess,              # mrProcessStart
+    mcapFileRead,             # mrFileRead / moFileRead
+    mcapFileWrite,            # mrFileWrite / moFileWrite
+    mcapPathProbe,            # mrPathProbe (GetFileAttributes*, NtQuery*)
+    mcapDirectoryEnumerate,   # mrDirectoryEnumerate (FindFirstFileEx family)
+    mcapEventLoss,            # mrEventLoss
+    mcapProcessTree,          # mrProcessSpawn + CreateRemoteThread propagation
+    mcapProcessExec,          # moExecute on the spawn record
+    mcapBackendProvenance,    # this profile record
+    # mrLibraryLoad, from LdrRegisterDllNotification plus an enumeration of
+    # the images already mapped at init. Sourced from the LOADER rather than
+    # from hooked calls, because LoadLibraryW is only one route into
+    # LdrLoadDll and a statically imported DLL is mapped before any of them
+    # runs. This capability is in InputEvidenceCapabilities -- the floor a
+    # backend must meet before a capture may claim mcComplete.
+    mcapLibraryLoad
+  }
+
+  # Capabilities with no Windows record kind behind them today. Reported as
+  # gaps so the shortfall is visible rather than silently absent.
+  # 
+  # EndpointSecurity / hybrid / authorization-enforcement are macOS
+  # concepts with no Windows analogue at all. The rest are real gaps in
+  # this backend: the entry points for several are hooked, but no record
+  # kind carries the observation, so nothing reaches the depfile.
+  WindowsInterposeKnownUnsupportedCapabilities* = {
+    mcapEndpointSecurity,
+    mcapHybrid,
+    mcapAuthorizationEnforcement,
+    mcapFileCreate,
+    mcapFileTruncate,
+    mcapFileAppend,
+    mcapRename,
+    mcapSymlink,
+    mcapPathMutation,
+    mcapIpcConnect,
+    mcapObservedEnv,
+    mcapNonDeterminism,
+    mcapAdversarialRawSyscall,
+    mcapExecutableMappingLifecycle,
+    mcapPathIdentity,
+    mcapExternalContent
+  }
+
 proc backendFamilyId*(family: MonitorBackendFamily): string =
   case family
   of mbfMacosHooks:
@@ -234,6 +292,8 @@ proc backendFamilyId*(family: MonitorBackendFamily): string =
     "macos-hybrid"
   of mbfLinuxPreloadHooks:
     "linux-preload-hooks"
+  of mbfWindowsInterposeHooks:
+    "windows-interpose-hooks"
   of mbfUnknown:
     "unknown"
 
@@ -366,6 +426,58 @@ proc unsupportedReason(capability: MonitorCapability): string =
       "applies only where non-determinism handling is not yet advertised"
   else:
     "capability is not advertised by the selected macOS interpose profile"
+
+proc windowsUnsupportedReason(capability: MonitorCapability): string =
+  ## Why the Windows interpose backend does not advertise a capability.
+  ##
+  ## The distinction that matters here is between "no Win32 analogue exists"
+  ## and "the entry point IS hooked but no record kind carries the
+  ## observation". The second is a gap a reader can close; the first is not.
+  case capability
+  of mcapEndpointSecurity:
+    "EndpointSecurity is a macOS kernel facility with no Windows analogue"
+  of mcapHybrid:
+    "hybrid native plus interpose profile is macOS-specific"
+  of mcapAuthorizationEnforcement:
+    "the Windows interpose shim observes only and cannot authorize or deny " &
+      "operations"
+  of mcapFileCreate, mcapFileTruncate, mcapFileAppend:
+    "CreateFileW/A is hooked, but the shim does not yet classify the " &
+      "creation disposition into create/truncate/append observations -- the " &
+      "access is recorded as an open/read/write"
+  of mcapRename:
+    "MoveFileExW/A is hooked but no rename record kind is emitted"
+  of mcapSymlink:
+    "CreateSymbolicLinkW is not hooked and no symlink resolution is performed"
+  of mcapLibraryLoad:
+    "LoadLibrary is not hooked and the loaded-module set is not enumerated, " &
+      "so a DLL the process maps is not recorded as a content dependency"
+  of mcapPathMutation:
+    "SetCurrentDirectory/DeleteFile/CreateDirectory are hooked but no " &
+      "path-mutation record kind is emitted"
+  of mcapIpcConnect:
+    "no socket hooks; a named-pipe or socket peer is not identified, so an " &
+      "out-of-tree breakaway daemon cannot be distinguished from an " &
+      "in-tree process"
+  of mcapObservedEnv:
+    "environment and system-info queries are not recorded as observed inputs"
+  of mcapNonDeterminism:
+    "entropy and clock sources are not hooked, so a randomness or time read " &
+      "leaves no evidence"
+  of mcapExternalContent:
+    "shared-memory, pipe and alternate-data-stream content channels are not " &
+      "covered"
+  of mcapAdversarialRawSyscall:
+    "direct NTDLL syscall stubs bypass the IAT and the detoured entry " &
+      "points; no adversarial completeness is claimed"
+  of mcapExecutableMappingLifecycle:
+    "executable mapping lifecycle (VirtualAlloc/VirtualProtect of RX pages) " &
+      "is not tracked"
+  of mcapPathIdentity:
+    "paths are recorded as the caller spelled them, without resolving to a " &
+      "canonical file identity"
+  else:
+    "not supported by the Windows interpose backend"
 
 proc linuxUnsupportedReason(capability: MonitorCapability): string =
   case capability
@@ -571,10 +683,45 @@ proc linuxPreloadMonitorProfile*(
           backendFamilyId(result.backendFamily) & ": " &
           capabilityId(capability))
 
+proc windowsInterposeMonitorProfile*(
+    required: set[MonitorCapability] = {}): MonitorBackendProfile =
+  result.profileName = "windows-interpose-hooks-m14"
+  result.backendFamily = mbfWindowsInterposeHooks
+  result.supportedCapabilities = WindowsInterposeSupportedCapabilities
+  result.requiredCapabilities = required
+  result.evidenceComplete = true
+  result.diagnostics.add MonitorDiagnostic(
+    level: mdlInfo,
+    message: "selected Windows interpose/hooks backend (inline detours with " &
+      "an IAT-patching fallback, injected via CreateRemoteThread)")
+
+  var gapCapabilities = WindowsInterposeKnownUnsupportedCapabilities
+  for capability in required:
+    if capability notin result.supportedCapabilities:
+      gapCapabilities.incl capability
+      result.evidenceComplete = false
+
+  for capability in gapCapabilities:
+    let requiredGap = capability in required and
+      capability notin result.supportedCapabilities
+    result.gaps.add MonitorCapabilityGap(
+      backendFamily: result.backendFamily,
+      capability: capability,
+      required: requiredGap,
+      reason: windowsUnsupportedReason(capability))
+    if requiredGap:
+      result.diagnostics.add MonitorDiagnostic(
+        level: mdlError,
+        message: "required monitor capability is unsupported by " &
+          backendFamilyId(result.backendFamily) & ": " &
+          capabilityId(capability))
+
 proc defaultHooksMonitorProfile*(
     required: set[MonitorCapability] = {}): MonitorBackendProfile =
   when defined(linux):
     linuxPreloadMonitorProfile(required)
+  elif defined(windows):
+    windowsInterposeMonitorProfile(required)
   else:
     macosInterposeMonitorProfile(required)
 

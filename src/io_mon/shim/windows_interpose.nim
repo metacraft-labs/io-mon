@@ -254,6 +254,44 @@ proc EnumProcessModulesEx(hProcess: HANDLE, lphModule: ptr pointer,
                           cb: DWORD, lpcbNeeded: ptr DWORD,
                           dwFilterFlag: DWORD): BOOL
   {.importc, stdcall, dynlib: "psapi".}
+proc GetCurrentProcess(): HANDLE
+  {.importc, stdcall, dynlib: "kernel32".}
+
+# ---------------------------------------------------------------------------
+# Loader notification (library-load observation)
+#
+# `LdrRegisterDllNotification` is the Windows counterpart of dyld's
+# `_dyld_register_func_for_add_image` and of asking the Linux loader for its
+# link map: the loader tells us about every image it maps, so nothing has to
+# be inferred from hooked calls. It matters that this is not a hook --
+# LoadLibraryW is only one of several routes into `LdrLoadDll`, and a
+# statically imported DLL is mapped before any of them runs.
+#
+# Documented since Vista and used by the CRT and by profilers; resolved
+# dynamically because it is an ntdll export with no import library.
+type
+  UnicodeString {.bycopy.} = object
+    Length: uint16
+    MaximumLength: uint16
+    Buffer: LPWSTR
+
+  LdrDllNotificationData {.bycopy.} = object
+    Flags: uint32
+    FullDllName: ptr UnicodeString
+    BaseDllName: ptr UnicodeString
+    DllBase: pointer
+    SizeOfImage: uint32
+
+  LdrDllNotificationFn = proc (reason: uint32;
+                               data: ptr LdrDllNotificationData;
+                               context: pointer) {.stdcall, raises: [].}
+  LdrRegisterDllNotificationFn = proc (flags: uint32;
+                                       callback: LdrDllNotificationFn;
+                                       context: pointer;
+                                       cookie: ptr pointer): int32
+                                      {.stdcall, raises: [].}
+
+const LDR_DLL_NOTIFICATION_REASON_LOADED = 1'u32
 proc GetModuleBaseNameW(hProcess: HANDLE, hModule: HANDLE,
                         lpBaseName: LPWSTR, nSize: DWORD): DWORD
   {.importc, stdcall, dynlib: "psapi".}
@@ -734,6 +772,96 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
       appendFragmentRecord(fragmentDir, record)
     except CatchableError:
       discard
+
+proc emitLibraryLoad(path: string) {.raises: [].} =
+  ## Record a mapped image as a content dependency.
+  ##
+  ## `observationKind = moFileRead` on purpose, matching the macOS and Linux
+  ## arms: an existing read-dependency consumer then fingerprints the DLL's
+  ## BYTES, which is what closes the stale-cache hole. An in-place upgrade of
+  ## a toolchain DLL behind an unchanged path must invalidate a cached action,
+  ## and it can only do that if the bytes were recorded as an input. The
+  ## distinct `mrLibraryLoad` kind keeps the observation identifiable for
+  ## inspection without changing how it is consumed.
+  if path.len == 0:
+    return
+  var record = baseRecord(mrLibraryLoad, moFileRead)
+  record.path = path
+  record.detail = "library-load"
+  emitRecord(record)
+
+proc emitAlreadyLoadedModules() {.raises: [].} =
+  ## Emit a record for every image already mapped when the shim initialises.
+  ##
+  ## Needed because the loader notification only reports images mapped AFTER
+  ## registration, and by then the process's entire static import closure --
+  ## typically the majority of what it will ever load, and all of the
+  ## toolchain DLLs that matter for cache invalidation -- is already in.
+  var mods: array[1024, HANDLE]
+  var needed: DWORD = 0
+  if EnumProcessModulesEx(GetCurrentProcess(),
+      cast[ptr pointer](addr mods[0]), DWORD(sizeof(mods)), addr needed,
+      0x3'u32) == 0:
+    return
+  let count = min(int(needed) div sizeof(HANDLE), mods.len)
+  for i in 0 ..< count:
+    var buf: array[32768, uint16]
+    let n = GetModuleFileNameW(mods[i], cast[LPWSTR](addr buf[0]),
+      DWORD(buf.len))
+    if n == 0:
+      continue
+    var path = newStringOfCap(int(n))
+    for j in 0 ..< int(n):
+      path.add(chr(int(buf[j]) and 0xFF))
+    emitLibraryLoad(path)
+
+proc dllNotificationCallback(reason: uint32;
+                             data: ptr LdrDllNotificationData;
+                             context: pointer) {.stdcall, raises: [].} =
+  ## Loader callback for images mapped after initialisation (the LoadLibrary /
+  ## delay-load / COM-activation arm).
+  ##
+  ## SAFETY: this runs with the loader lock held. `emitRecord` appends through
+  ## kernel32 entry points the shim has already resolved, and runs under
+  ## `withShimMuted`, so it neither re-enters our own hooks nor triggers a
+  ## fresh image load that would re-enter the loader. This mirrors the macOS
+  ## arm, which records from inside dyld's add-image callback under dyld's
+  ## loader lock for the same reason: the loader is the only party that sees
+  ## every load.
+  discard context
+  if reason != LDR_DLL_NOTIFICATION_REASON_LOADED:
+    return
+  if data == nil or data.FullDllName == nil or data.FullDllName.Buffer == nil:
+    return
+  let chars = int(data.FullDllName.Length) div 2
+  if chars <= 0:
+    return
+  var path = newStringOfCap(chars)
+  let buf = cast[ptr UncheckedArray[uint16]](data.FullDllName.Buffer)
+  for i in 0 ..< chars:
+    path.add(chr(int(buf[i]) and 0xFF))
+  emitLibraryLoad(path)
+
+var dllNotificationCookie: pointer = nil
+
+proc registerDllNotification() {.raises: [].} =
+  ## Subscribe to loader notifications. Failure is not fatal but it IS a
+  ## capability loss: without it, images mapped after init go unobserved while
+  ## the profile advertises library-load coverage. The caller reports that.
+  # Built inline as UTF-16 for the same reason the injector's kernel32 lookup
+  # is: this runs before any convenience helper is safe to rely on, and the
+  # name is pure ASCII.
+  var ntdllName = [uint16(ord('n')), uint16(ord('t')), uint16(ord('d')),
+    uint16(ord('l')), uint16(ord('l')), uint16(ord('.')),
+    uint16(ord('d')), uint16(ord('l')), uint16(ord('l')), 0'u16]
+  let ntdll = GetModuleHandleW(cast[LPCWSTR](addr ntdllName[0]))
+  if ntdll == nil:
+    return
+  let fn = cast[LdrRegisterDllNotificationFn](
+    GetProcAddress(ntdll, "LdrRegisterDllNotification"))
+  if fn == nil:
+    return
+  discard fn(0'u32, dllNotificationCallback, nil, addr dllNotificationCookie)
 
 proc observationForCreateFile(desiredAccess, creationDisposition: DWORD):
     MonitorObservationKind =
@@ -3414,6 +3542,31 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     $iatFallbackCount & " hook(s) fell through to IAT fallback\n"))
   if unhookedEntryPoints > 0:
     recordHookInstallLoss(unhookedEntryPoints, unhookedEntryPointNames)
+
+  # Library-load observation. Two halves, because neither alone is complete:
+  # the loader notification only reports images mapped after we subscribe, and
+  # an enumeration only sees the ones mapped so far. Registering FIRST means
+  # an image mapped between the two steps is reported twice rather than not at
+  # all; duplicate records are deduplicated downstream, a missed one is not.
+  #
+  # This is what earns `mcapLibraryLoad`, which is in
+  # `InputEvidenceCapabilities` -- the floor a backend must meet before any
+  # capture from it may claim mcComplete. Windows previously claimed it by
+  # inheriting the macOS profile while observing no loads at all.
+  registerDllNotification()
+  emitAlreadyLoadedModules()
+  # Flush for the same reason `recordProcessStart` does, and it bites harder
+  # here: these records are `moFileRead`, so they land in the per-thread READ
+  # BATCH, and this is the injector's remote init thread, which exits as soon
+  # as init returns. An unflushed read batch whose thread disappears is
+  # reported as "process killed with an un-flushed read batch" -- a loss that
+  # downgrades the whole run. Emitting the enumeration without this flush
+  # traded a capability gap for an event loss.
+  withShimMuted:
+    try:
+      flushFragmentBatch()
+    except CatchableError:
+      discard
   # M73 Phase 4: post-install audit. Walk the hookTable, resolve each
   # spec's kernel32 address, and classify the first five bytes at the
   # target. The audit MUST run synchronously here — Monitor-Hook-Shim.md

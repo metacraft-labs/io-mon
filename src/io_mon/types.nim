@@ -168,6 +168,9 @@ type
     mbfMacosEndpointSecurity
     mbfMacosHybrid
     mbfLinuxPreloadHooks
+    # Appended before mbfUnknown: the family is serialized by its STRING id
+    # (backendFamilyId), so position is not wire-visible.
+    mbfWindowsInterposeHooks
     mbfUnknown
 
   MonitorCapability* = enum
