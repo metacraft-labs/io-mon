@@ -817,7 +817,7 @@ proc recordProcessStart() =
     except CatchableError:
       discard
 
-proc recordHookInstallLoss(unhooked: int) =
+proc recordHookInstallLoss(unhooked: int; names: string) =
   ## Report entry points that landed no hook at all, so the run is graded on
   ## what was actually observable rather than on what happened to be emitted.
   ##
@@ -833,10 +833,16 @@ proc recordHookInstallLoss(unhooked: int) =
   ##
   ## mrEventLoss with an unquantified scope is the honest grade: we know
   ## observation was incomplete and cannot bound what was missed.
+  ## `names` matters as much as the count. The two ways to arrive here are
+  ## not equally alarming and the reader cannot tell them apart otherwise:
+  ## an entry point no loaded module imports has no IAT slot to patch and is
+  ## simply out of the IAT backend's reach (calls resolved through
+  ## GetProcAddress, which is why inline detours exist), whereas a name that
+  ## IS imported and still failed to patch points at a defect. Naming them
+  ## keeps that distinction available without a rebuild.
   var record = baseRecord(mrEventLoss, moEventLoss)
-  record.detail = "hook install failed for " & $unhooked &
-    " entry point(s); file and process events from this process were not " &
-    "observed"
+  record.detail = "no hook installed for " & $unhooked &
+    " entry point(s) [" & names & "]; calls through them were not observed"
   emitRecord(record)
   withShimMuted:
     try:
@@ -2967,6 +2973,9 @@ const ntdllNtIatDlls = @["ntdll.dll"]
 # memory and the process dies with ``STATUS_ACCESS_VIOLATION``.
 var installedHookTargets {.global.}: seq[pointer] = @[]
 
+var unhookedEntryPointNames {.global.}: string = ""
+  ## Names behind `unhookedEntryPoints`, for the loss record's detail.
+
 var unhookedEntryPoints {.global.}: int = 0
   ## Entry points that landed NEITHER an inline detour nor an IAT patch.
   ##
@@ -3355,6 +3364,9 @@ proc installAllHooks(): int =
       dbg(cstring("[repro_monitor_shim] install FAILED for " & spec.name &
         " (neither inline nor IAT landed a hook)\n"))
       inc unhookedEntryPoints
+      if unhookedEntryPointNames.len > 0:
+        unhookedEntryPointNames.add(", ")
+      unhookedEntryPointNames.add(spec.name)
   result = failed.len
 
 # --- Public exports ---------------------------------------------------------
@@ -3398,7 +3410,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   dbg(cstring("[repro_monitor_shim] installAllHooks: " &
     $iatFallbackCount & " hook(s) fell through to IAT fallback\n"))
   if unhookedEntryPoints > 0:
-    recordHookInstallLoss(unhookedEntryPoints)
+    recordHookInstallLoss(unhookedEntryPoints, unhookedEntryPointNames)
   # M73 Phase 4: post-install audit. Walk the hookTable, resolve each
   # spec's kernel32 address, and classify the first five bytes at the
   # target. The audit MUST run synchronously here — Monitor-Hook-Shim.md
