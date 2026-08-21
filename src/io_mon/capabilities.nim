@@ -231,7 +231,7 @@ const
   # observation kinds it emits (`shim/windows_interpose.nim`) rather than
   # from the hooks it installs -- a hooked entry point that produces no
   # record observes nothing as far as a consumer is concerned.
-  # 
+  #
   # Windows used to report the macOS set here, because
   # `defaultHooksMonitorProfile` had no Windows branch and fell through to
   # the macOS profile. That claimed rename, symlink, library-load,
@@ -261,7 +261,7 @@ const
 
   # Capabilities with no Windows record kind behind them today. Reported as
   # gaps so the shortfall is visible rather than silently absent.
-  # 
+  #
   # EndpointSecurity / hybrid / authorization-enforcement are macOS
   # concepts with no Windows analogue at all. The rest are real gaps in
   # this backend: the entry points for several are hooked, but no record
