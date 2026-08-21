@@ -1851,21 +1851,6 @@ proc snoopCreateProcessW(ctx: var hr.HookContext) {.raises: [].} =
   # main thread — unless the original caller already asked for
   # CREATE_SUSPENDED themselves, in which case we leave the suspension
   # exactly as they requested.
-  # Our own probe/helper spawns are infrastructure, not part of the traced
-  # program: they are started from inside this hook's own injection path to
-  # reach across a bitness boundary. Recording them would be wrong twice
-  # over -- their I/O is not a dependency of the action, and because they are
-  # deliberately not injected, a spawn record for them is an unmatched spawn,
-  # which the writer grades as an unmonitored subtree and which then makes an
-  # otherwise fully-observed run mcIncomplete.
-  #
-  # Passed straight through: no forced CREATE_SUSPENDED, no injection, no
-  # record. Safe to `return` here precisely BECAUSE nothing has been forced
-  # yet -- see the resume-ownership note below.
-  if shProp.spawningHelperProcess():
-    hr.callNext(ctx)
-    return
-
   # RESUME OWNERSHIP IS AN INVARIANT, NOT A HAPPY PATH. If we forced the
   # suspension, the child NEVER runs unless we resume it: every exit path
   # out of this hook owes that resume, including the ones that give up on
@@ -1879,9 +1864,8 @@ proc snoopCreateProcessW(ctx: var hr.HookContext) {.raises: [].} =
   # resume, so a hook re-entered during `callNext` handed the caller a
   # child frozen forever. Hence: ONE decision variable
   # (`shimForcedSuspend`), no `return` after the force, and the resume in
-  # a `finally`. The proc keeps growing exit paths (the helper-spawn
-  # passthrough above is the most recent); the `finally` is what makes
-  # the next one safe by construction rather than by review.
+  # a `finally`. The proc keeps growing exit paths; the `finally` is what
+  # makes the next one safe by construction rather than by review.
   #
   # The symmetric hazard is a DOUBLE resume, which is why the force is
   # skipped entirely when the caller already asked for CREATE_SUSPENDED --
