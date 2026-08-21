@@ -1979,6 +1979,151 @@ int main(void) {
     check hasRecord(dep, mrTimeRead, "time")
     check hasRecord(dep, mrNonDeterministic, "getrandom")
 
+  test "the glibc BSD entropy set is recorded, not just getrandom":
+    # CROSS-PLATFORM ENTROPY PARITY (io_mon/types.nim, record 16). The macOS
+    # shim has always recorded getentropy / arc4random / arc4random_buf /
+    # arc4random_uniform; the Linux shim recorded ONLY getrandom, so the very
+    # same program was entropy-flagged on macOS and completely invisible here.
+    #
+    # These do NOT collapse into the getrandom hook, by two different routes
+    # (glibc 2.42): getentropy issues getrandom(2) itself as an inline syscall
+    # instruction in its own body, never touching the public getrandom symbol;
+    # arc4random* call the LOCAL, non-exported __getrandom_nocancel, and only
+    # when re-seeding. Measured against the pre-change shim, this exact probe
+    # produced ZERO mrNonDeterministic records — every check below failed —
+    # even though getentropy demonstrably made a getrandom(2) syscall. Each
+    # source is asserted separately so a hook that is dropped for one API
+    # cannot hide behind the other three.
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let probe = buildC(work, "linux_bsd_entropy_set", """
+#define _GNU_SOURCE
+#include <stdlib.h>
+#include <sys/random.h>
+
+int main(void) {
+  unsigned char seed[16];
+  unsigned char buf[16];
+  unsigned int draw;
+  unsigned int bounded;
+  if (getentropy(seed, sizeof(seed)) != 0) return 2;
+  draw = arc4random();
+  arc4random_buf(buf, sizeof(buf));
+  bounded = arc4random_uniform(1000u);
+  if (bounded >= 1000u) return 3;
+  /* Consume every result so nothing is optimised away. */
+  return (seed[0] == 1 && buf[0] == 2 && draw == 3u) ? 4 : 0;
+}
+""")
+    let depfile = work / "bsd-entropy-set.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", probe],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    # Forwarding must stay genuine: the probe returns non-zero if any hooked
+    # entry point handed it an out-of-contract value.
+    check dep.completeness == mcComplete
+    check hasRecord(dep, mrNonDeterministic, "getentropy")
+    check hasRecord(dep, mrNonDeterministic, "arc4random")
+    check hasRecord(dep, mrNonDeterministic, "arc4random_buf")
+    check hasRecord(dep, mrNonDeterministic, "arc4random_uniform")
+    # Exactly the four the probe drew from — no source is invented, and the
+    # `allIt` below cannot pass vacuously on an empty record set.
+    let entropy = dep.records.filterIt(it.kind == mrNonDeterministic)
+    check entropy.len == 4
+    check entropy.allIt(it.detail.startsWith(NonDeterministicEntropyDetail))
+
+  test "repeated entropy draws collapse to one record per source":
+    # DEDUP PARITY. macOS routes entropy through recordObservedOnce (per process
+    # per source); Linux built the record by hand and called emitRecord — the
+    # only non-file recorder on that shim that skipped its own dedup helper.
+    # Identical records from one thread already collapse in the fragment merge,
+    # so the divergence only becomes visible across THREADS: measured against
+    # the pre-change shim, these 8 threads x 8 draws produced EIGHT getrandom
+    # records (one per tid) instead of one. A build's worker pool multiplied one
+    # fact by its thread count.
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let probe = buildC(work, "linux_entropy_dedup", """
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <stdlib.h>
+#include <sys/random.h>
+
+static void *worker(void *arg) {
+  unsigned char buf[8];
+  int i;
+  (void)arg;
+  for (i = 0; i < 8; i++) {
+    if (getrandom(buf, sizeof(buf), 0) != (ssize_t)sizeof(buf)) abort();
+    arc4random_buf(buf, sizeof(buf));
+  }
+  return NULL;
+}
+
+int main(void) {
+  pthread_t threads[8];
+  int i;
+  for (i = 0; i < 8; i++)
+    if (pthread_create(&threads[i], NULL, worker, NULL) != 0) return 2;
+  for (i = 0; i < 8; i++) pthread_join(threads[i], NULL);
+  return 0;
+}
+""", @["-pthread"])
+    let depfile = work / "entropy-dedup.rdep"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", probe],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    # 128 draws across 8 threads, 2 sources: exactly 2 records.
+    check dep.records.countIt(it.kind == mrNonDeterministic and
+      it.path == "getrandom") == 1
+    check dep.records.countIt(it.kind == mrNonDeterministic and
+      it.path == "arc4random_buf") == 1
+    check dep.records.countIt(it.kind == mrNonDeterministic) == 2
+    # DETAIL PARITY, asserted where a `getrandom` record exists either way: this
+    # shim used to write "linux non-deterministic source" while macOS wrote
+    # NonDeterministicEntropyDetail for the same observation, so a consumer
+    # matching on the detail string behaved differently per platform.
+    check dep.records.filterIt(it.kind == mrNonDeterministic and
+      it.path == "getrandom").allIt(
+        it.detail.startsWith(NonDeterministicEntropyDetail))
+
   test "direct linux vDSO dlsym calls record determinism evidence or fail closed":
     let snoopBin = work / "io-mon"
     if not fileExists(snoopBin):

@@ -53,24 +53,58 @@ type
     #    note (MacOS-Monitoring-Adversarial-Hardening.milestones.org §R-D).
     mrEnvRead = 14
     mrSysctlRead = 15
-    # 2. mrNonDeterministic — OBSERVED ENTROPY INPUT, GATED BY CALLER ATTRIBUTION.
-    #    The shim hooks getentropy / arc4random / arc4random_buf /
-    #    arc4random_uniform and emits this record ONLY when the call's CALLER lies
-    #    in the monitored program's OWN main-executable __TEXT range (`path` names
-    #    the source). This does NOT force `mcIncomplete`: io-mon monitored the
-    #    entropy read successfully, and caller policy decides whether that evidence
-    #    invalidates the build/cache result.
-    #    CALLER ATTRIBUTION IS ESSENTIAL (a round-1 cardinal-sin defect): an
-    #    interpose hook is NOT limited to the program's own calls — on every process
-    #    startup /usr/lib/libobjc, /usr/lib/swift, libsystem_malloc/_trace call
-    #    arc4random_buf and libcorecrypto calls getentropy, all CROSS-DYLIB (so they
-    #    cross the interpose stub). Flagging those downgraded EVERY real cc/clang/ld/
-    #    bash run (the cardinal sin); attributing to the program's main-exe __TEXT
-    #    excludes the /usr/lib baseline. A /dev/random or /dev/urandom OPEN is
-    #    DELIBERATELY NOT flagged (mktemp opens /dev/urandom for a random temp name on
-    #    essentially every build). See `nonDeterminismObservationCount`
-    #    (writer.nim) and
-    #    `ct_macos_addr_in_program`.
+    # 2. mrNonDeterministic — OBSERVED ENTROPY INPUT.
+    #
+    #    THE CROSS-PLATFORM OBSERVATION CONTRACT. Every backend either MEETS this
+    #    or DECLARES the gap; macOS and Linux used to disagree on all three
+    #    clauses below, which is what stating the contract here fixes:
+    #      a. COVERAGE — every entropy entry point the PLATFORM'S libc/system
+    #         libraries expose is hooked, not an arbitrary subset:
+    #           macOS: getentropy, arc4random, arc4random_buf, arc4random_uniform,
+    #                  SecRandomCopyBytes, CCRandomGenerateBytes.
+    #           Linux: getrandom (libc symbol + raw syscall + vDSO entry) plus the
+    #                  glibc >= 2.36 BSD set getentropy / arc4random /
+    #                  arc4random_buf / arc4random_uniform.
+    #         `SecRandomCopyBytes`/`CCRandomGenerateBytes` are Apple-only and
+    #         `getrandom` is Linux-only, so the sets differ by what EXISTS, never
+    #         by what the shim bothered to hook. Windows hooks none of them and
+    #         says so: `mcapNonDeterminism` is a DECLARED capability gap there
+    #         (`WindowsInterposeKnownUnsupportedCapabilities`), so a consumer sees
+    #         the absence instead of mistaking it for "no entropy was used".
+    #      b. IDENTITY — `path` is the API NAME ("arc4random_buf"), and `detail`
+    #         is exactly `NonDeterministicEntropyDetail` on every platform, so a
+    #         consumer that matches on the detail string behaves identically
+    #         everywhere.
+    #      c. DEDUP — recorded ONCE PER PROCESS PER SOURCE. A program that draws
+    #         entropy in a loop, or from many threads, yields ONE record per
+    #         source, not one per call: the evidence is "this process consumed
+    #         entropy from this API", and repeating it adds nothing while costing
+    #         the depfile linearly in call volume.
+    #    This does NOT force `mcIncomplete`: io-mon monitored the entropy read
+    #    successfully, and caller policy decides whether that evidence invalidates
+    #    the build/cache result. See `nonDeterminismObservationCount` (writer.nim).
+    #
+    #    CALLER ATTRIBUTION (macOS only, and deliberately so). On macOS the record
+    #    is emitted ONLY when the call's CALLER lies in a NON-SYSTEM image
+    #    (`ct_macos_addr_in_nonsystem`). That gate is essential there (a round-1
+    #    cardinal-sin defect): on every process startup /usr/lib/libobjc,
+    #    /usr/lib/swift and libsystem_malloc/_trace call arc4random_buf and
+    #    libcorecrypto calls getentropy, all CROSS-DYLIB, so they cross the
+    #    interpose stub and flagged EVERY real cc/clang/ld/bash run. Linux needs no
+    #    equivalent gate: LD_PRELOAD interposes the PUBLIC symbol, and glibc's own
+    #    internal users reach entropy by routes that never pass through an
+    #    interposed PLT entry — a LOCAL, non-exported symbol
+    #    (`__getrandom_nocancel`, behind `arc4random*`) or an inline `syscall`
+    #    instruction in libc's own text (`getentropy`) — so what the Linux shim
+    #    sees is already the program's own call. Measured: `bash -c true`, a
+    #    `cc` compile+link, and a plain `printf` program each produce ZERO
+    #    `mrNonDeterministic` records with all four hooks installed, i.e. the
+    #    macOS /usr/lib baseline has no Linux counterpart to exclude. Building
+    #    a return-address→ELF-image classifier there would add a subsystem to
+    #    re-derive an attribution the interposition already gives us.
+    #
+    #    A /dev/random or /dev/urandom OPEN is DELIBERATELY NOT flagged (mktemp
+    #    opens /dev/urandom for a random temp name on essentially every build).
     mrNonDeterministic = 16
     # 3. mrTimeRead — RECORD but do NOT auto-downgrade (high benign false-positive).
     #    The shim hooks clock_gettime / gettimeofday / time / mach_absolute_time and
@@ -348,6 +382,15 @@ const
   RmdfMagic* = "RMDF"
   RmdfTrailerMagic* = "RMDT"
   ReproMonitorDepfileProducer* = "repro_monitor_depfile_m11"
+
+  NonDeterministicEntropyDetail* = "non-deterministic entropy source"
+    ## The `detail` text EVERY backend must put on an `mrNonDeterministic`
+    ## record. It lives here — not as a literal in each shim — because the
+    ## shims previously disagreed ("non-deterministic entropy source" on macOS,
+    ## "linux non-deterministic source" on Linux), which made any consumer that
+    ## matched on the detail string behave differently per platform for the same
+    ## observation. One definition means the two cannot drift apart again.
+    ## The record's `path` carries WHICH source (see `mrNonDeterministic`).
 
 proc defaultMonitorDepFileReaderOptions*(): MonitorDepFileReaderOptions =
   MonitorDepFileReaderOptions(

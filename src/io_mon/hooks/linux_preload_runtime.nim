@@ -312,6 +312,28 @@ type
     result*: clong
     nextIndex: int
 
+  LinuxEntropySource* = enum
+    ## The libc entropy entry points hooked BESIDES `getrandom` (which keeps its
+    ## own context because it has three distinct entry paths: libc symbol, raw
+    ## syscall and vDSO). The enum's string values are the exact names that go
+    ## into the `mrNonDeterministic` record's `path`, so the recorded identity
+    ## cannot drift from the symbol that was hooked.
+    lesGetentropy = "getentropy"
+    lesArc4random = "arc4random"
+    lesArc4randomBuf = "arc4random_buf"
+    lesArc4randomUniform = "arc4random_uniform"
+
+  EntropyContext* = object
+    ## One context for all four sources: they differ only in which fields are
+    ## meaningful, and a hook that only records evidence reads `source` alone.
+    source*: LinuxEntropySource
+    buf*: pointer         ## getentropy / arc4random_buf destination
+    length*: csize_t      ## getentropy / arc4random_buf byte count
+    upper*: cuint         ## arc4random_uniform exclusive bound
+    value*: cuint         ## arc4random / arc4random_uniform RESULT
+    result*: cint         ## getentropy RESULT (0 on success, -1 on failure)
+    nextIndex: int
+
   ForkContext* = object
     result*: PidT
     nextIndex: int
@@ -400,6 +422,7 @@ type
   GettimeofdayHook* = proc(ctx: var GettimeofdayContext) {.raises: [].}
   TimeHook* = proc(ctx: var TimeContext) {.raises: [].}
   GetrandomHook* = proc(ctx: var GetrandomContext) {.raises: [].}
+  EntropyHook* = proc(ctx: var EntropyContext) {.raises: [].}
   ForkHook* = proc(ctx: var ForkContext) {.raises: [].}
   ExecveHook* = proc(ctx: var ExecveContext) {.raises: [].}
   PosixSpawnHook* = proc(ctx: var PosixSpawnContext) {.raises: [].}
@@ -527,6 +550,9 @@ type
   GetrandomHookEntry = object
     priority: int
     callback: GetrandomHook
+  EntropyHookEntry = object
+    priority: int
+    callback: EntropyHook
   ForkHookEntry = object
     priority: int
     callback: ForkHook
@@ -615,6 +641,17 @@ typedef int (*ct_clock_gettime_hook_fn)(int, void *);
 typedef int (*ct_gettimeofday_hook_fn)(void *, void *);
 typedef long (*ct_time_hook_fn)(void *);
 typedef ssize_like_t (*ct_getrandom_hook_fn)(void *, size_t, unsigned int);
+/* ENTROPY-PARITY — glibc >= 2.36 exports the BSD entropy set
+   (getentropy since 2.25; arc4random/arc4random_buf/arc4random_uniform since
+   2.36) and real programs use it in preference to getrandom(2). The macOS shim
+   has always recorded these APIs; Linux hooked only getrandom, so the SAME
+   program was flagged as an entropy consumer on macOS and invisible here.
+   They are hooked as four distinct symbols (not folded into getrandom) so the
+   record names the API the program actually called. */
+typedef int (*ct_getentropy_hook_fn)(void *, size_t);
+typedef unsigned int (*ct_arc4random_hook_fn)(void);
+typedef void (*ct_arc4random_buf_hook_fn)(void *, size_t);
+typedef unsigned int (*ct_arc4random_uniform_hook_fn)(unsigned int);
 typedef pid_t (*ct_fork_hook_fn)(void);
 typedef int (*ct_execve_hook_fn)(char *, char **, char **);
 typedef int (*ct_posix_spawn_hook_fn)(pid_t *, char *, void *, void *,
@@ -666,6 +703,10 @@ typedef int (*ct_clock_gettime_real_fn)(clockid_t, struct timespec *);
 typedef int (*ct_gettimeofday_real_fn)(struct timeval *, void *);
 typedef time_t (*ct_time_real_fn)(time_t *);
 typedef ssize_t (*ct_getrandom_real_fn)(void *, size_t, unsigned int);
+typedef int (*ct_getentropy_real_fn)(void *, size_t);
+typedef unsigned int (*ct_arc4random_real_fn)(void);
+typedef void (*ct_arc4random_buf_real_fn)(void *, size_t);
+typedef unsigned int (*ct_arc4random_uniform_real_fn)(unsigned int);
 typedef pid_t (*ct_fork_real_fn)(void);
 typedef int (*ct_execve_real_fn)(const char *, char *const [], char *const []);
 typedef int (*ct_execvp_real_fn)(const char *, char *const []);
@@ -723,6 +764,10 @@ static ct_clock_gettime_hook_fn ct_clock_gettime_hook = NULL;
 static ct_gettimeofday_hook_fn ct_gettimeofday_hook = NULL;
 static ct_time_hook_fn ct_time_hook = NULL;
 static ct_getrandom_hook_fn ct_getrandom_hook = NULL;
+static ct_getentropy_hook_fn ct_getentropy_hook = NULL;
+static ct_arc4random_hook_fn ct_arc4random_hook = NULL;
+static ct_arc4random_buf_hook_fn ct_arc4random_buf_hook = NULL;
+static ct_arc4random_uniform_hook_fn ct_arc4random_uniform_hook = NULL;
 static ct_fork_hook_fn ct_fork_hook = NULL;
 static ct_execve_hook_fn ct_execve_hook = NULL;
 static ct_posix_spawn_hook_fn ct_posix_spawn_hook = NULL;
@@ -795,6 +840,10 @@ static ct_clock_gettime_real_fn real_clock_gettime_ptr = NULL;
 static ct_gettimeofday_real_fn real_gettimeofday_ptr = NULL;
 static ct_time_real_fn real_time_ptr = NULL;
 static ct_getrandom_real_fn real_getrandom_ptr = NULL;
+static ct_getentropy_real_fn real_getentropy_ptr = NULL;
+static ct_arc4random_real_fn real_arc4random_ptr = NULL;
+static ct_arc4random_buf_real_fn real_arc4random_buf_ptr = NULL;
+static ct_arc4random_uniform_real_fn real_arc4random_uniform_ptr = NULL;
 static ct_fork_real_fn real_fork_ptr = NULL;
 static ct_execve_real_fn real_execve_ptr = NULL;
 static ct_execvp_real_fn real_execvp_ptr = NULL;
@@ -1254,6 +1303,10 @@ void ct_linux_preload_register_clock_gettime_hook(ct_clock_gettime_hook_fn hook)
 void ct_linux_preload_register_gettimeofday_hook(ct_gettimeofday_hook_fn hook) { ct_gettimeofday_hook = hook; }
 void ct_linux_preload_register_time_hook(ct_time_hook_fn hook) { ct_time_hook = hook; }
 void ct_linux_preload_register_getrandom_hook(ct_getrandom_hook_fn hook) { ct_getrandom_hook = hook; }
+void ct_linux_preload_register_getentropy_hook(ct_getentropy_hook_fn hook) { ct_getentropy_hook = hook; }
+void ct_linux_preload_register_arc4random_hook(ct_arc4random_hook_fn hook) { ct_arc4random_hook = hook; }
+void ct_linux_preload_register_arc4random_buf_hook(ct_arc4random_buf_hook_fn hook) { ct_arc4random_buf_hook = hook; }
+void ct_linux_preload_register_arc4random_uniform_hook(ct_arc4random_uniform_hook_fn hook) { ct_arc4random_uniform_hook = hook; }
 void ct_linux_preload_register_fork_hook(ct_fork_hook_fn hook) { ct_fork_hook = hook; }
 void ct_linux_preload_register_execve_hook(ct_execve_hook_fn hook) { ct_execve_hook = hook; }
 void ct_linux_preload_register_posix_spawn_hook(ct_posix_spawn_hook_fn hook) { ct_posix_spawn_hook = hook; }
@@ -2027,6 +2080,81 @@ ssize_like_t ct_linux_preload_real_getrandom(void *buf, size_t buflen,
   return (ssize_like_t)real_getrandom_ptr(buf, buflen, flags);
 }
 
+/* ENTROPY-PARITY forwarders.
+ *
+ * Each resolves the genuine libc entry with ct_resolve (dlsym(RTLD_NEXT)), so a
+ * program that supplies its own arc4random from a DSO loaded after the shim
+ * still reaches ITS implementation. If no successor definition exists at all,
+ * we fall back to real getrandom(2) rather than returning a value: these are
+ * ENTROPY primitives, and handing a caller predictable bytes because a MONITOR
+ * could not resolve a symbol would be a security defect, not a monitoring one.
+ * The fallback is unreachable on any glibc >= 2.36 (all four symbols exist);
+ * it exists so the failure mode is "still random" instead of "silently weak".
+ */
+static void ct_entropy_fallback_bytes(void *buf, size_t n) {
+  unsigned char *out = (unsigned char *)buf;
+  size_t done = 0;
+  while (done < n) {
+    ssize_like_t got =
+        ct_linux_preload_real_getrandom(out + done, n - done, 0);
+    if (got <= 0) {
+      if (errno == EINTR) continue;
+      /* No entropy source at all. Returning would hand the caller
+         uninitialised or predictable bytes; refuse instead. */
+      abort();
+    }
+    done += (size_t)got;
+  }
+}
+
+int ct_linux_preload_real_getentropy(void *buf, size_t len) {
+  if (real_getentropy_ptr == NULL)
+    real_getentropy_ptr = (ct_getentropy_real_fn)ct_resolve("getentropy");
+  if (real_getentropy_ptr != NULL)
+    return real_getentropy_ptr(buf, len);
+  if (len > 256) { errno = EIO; return -1; }
+  ct_entropy_fallback_bytes(buf, len);
+  return 0;
+}
+
+unsigned int ct_linux_preload_real_arc4random(void) {
+  unsigned int value = 0;
+  if (real_arc4random_ptr == NULL)
+    real_arc4random_ptr = (ct_arc4random_real_fn)ct_resolve("arc4random");
+  if (real_arc4random_ptr != NULL)
+    return real_arc4random_ptr();
+  ct_entropy_fallback_bytes(&value, sizeof(value));
+  return value;
+}
+
+void ct_linux_preload_real_arc4random_buf(void *buf, size_t n) {
+  if (real_arc4random_buf_ptr == NULL)
+    real_arc4random_buf_ptr =
+        (ct_arc4random_buf_real_fn)ct_resolve("arc4random_buf");
+  if (real_arc4random_buf_ptr != NULL) {
+    real_arc4random_buf_ptr(buf, n);
+    return;
+  }
+  ct_entropy_fallback_bytes(buf, n);
+}
+
+unsigned int ct_linux_preload_real_arc4random_uniform(unsigned int upper) {
+  if (real_arc4random_uniform_ptr == NULL)
+    real_arc4random_uniform_ptr =
+        (ct_arc4random_uniform_real_fn)ct_resolve("arc4random_uniform");
+  if (real_arc4random_uniform_ptr != NULL)
+    return real_arc4random_uniform_ptr(upper);
+  if (upper < 2) return 0;
+  {
+    /* Same modulo-bias rejection the BSD/glibc implementation uses. */
+    unsigned int min = (unsigned int)(-upper) % upper;
+    for (;;) {
+      unsigned int r = ct_linux_preload_real_arc4random();
+      if (r >= min) return r % upper;
+    }
+  }
+}
+
 pid_t ct_linux_preload_real_fork(void) {
   CT_REAL("fork", real_fork_ptr, ct_fork_real_fn);
   return real_fork_ptr();
@@ -2508,6 +2636,40 @@ ssize_t getrandom(void *buf, size_t buflen, unsigned int flags) {
   return (ssize_t)CT_CALL_HOOK(ct_getrandom_hook(buf, buflen, flags));
 }
 
+int getentropy(void *buf, size_t len) __attribute__((visibility("default")));
+int getentropy(void *buf, size_t len) {
+  if (CT_BYPASS() || ct_getentropy_hook == NULL)
+    return ct_linux_preload_real_getentropy(buf, len);
+  return CT_CALL_HOOK(ct_getentropy_hook(buf, len));
+}
+
+unsigned int arc4random(void) __attribute__((visibility("default")));
+unsigned int arc4random(void) {
+  if (CT_BYPASS() || ct_arc4random_hook == NULL)
+    return ct_linux_preload_real_arc4random();
+  return CT_CALL_HOOK(ct_arc4random_hook());
+}
+
+void arc4random_buf(void *buf, size_t n) __attribute__((visibility("default")));
+void arc4random_buf(void *buf, size_t n) {
+  if (CT_BYPASS() || ct_arc4random_buf_hook == NULL) {
+    ct_linux_preload_real_arc4random_buf(buf, n);
+    return;
+  }
+  /* CT_CALL_HOOK is an expression macro (__typeof__ of the call), so a void
+     hook is sequenced with the comma operator — the same idiom the exit(3)
+     interposer uses. */
+  CT_CALL_HOOK((ct_arc4random_buf_hook(buf, n), 0));
+}
+
+unsigned int arc4random_uniform(unsigned int upper)
+    __attribute__((visibility("default")));
+unsigned int arc4random_uniform(unsigned int upper) {
+  if (CT_BYPASS() || ct_arc4random_uniform_hook == NULL)
+    return ct_linux_preload_real_arc4random_uniform(upper);
+  return CT_CALL_HOOK(ct_arc4random_uniform_hook(upper));
+}
+
 pid_t fork(void) __attribute__((visibility("default")));
 pid_t fork(void) {
   if (CT_BYPASS() || ct_fork_hook == NULL)
@@ -2918,6 +3080,14 @@ proc realTime*(timePtr: pointer): clong
   {.importc: "ct_linux_preload_real_time", raises: [].}
 proc realGetrandom*(buf: pointer; buflen: csize_t; flags: cuint): clong
   {.importc: "ct_linux_preload_real_getrandom", raises: [].}
+proc realGetentropy*(buf: pointer; length: csize_t): cint
+  {.importc: "ct_linux_preload_real_getentropy", raises: [].}
+proc realArc4random*(): cuint
+  {.importc: "ct_linux_preload_real_arc4random", raises: [].}
+proc realArc4randomBuf*(buf: pointer; length: csize_t)
+  {.importc: "ct_linux_preload_real_arc4random_buf", raises: [].}
+proc realArc4randomUniform*(upper: cuint): cuint
+  {.importc: "ct_linux_preload_real_arc4random_uniform", raises: [].}
 proc realFork*(): PidT {.importc: "ct_linux_preload_real_fork", raises: [].}
 proc realExecve*(path: cstring; argv, envp: cstringArray): cint
   {.importc: "ct_linux_preload_real_execve", raises: [].}
@@ -3003,6 +3173,12 @@ type
   TimeDispatch = proc(timePtr: pointer): clong {.cdecl, raises: [].}
   GetrandomDispatch = proc(buf: pointer; buflen: csize_t; flags: cuint): clong
     {.cdecl, raises: [].}
+  GetentropyDispatch = proc(buf: pointer; length: csize_t): cint
+    {.cdecl, raises: [].}
+  Arc4randomDispatch = proc(): cuint {.cdecl, raises: [].}
+  Arc4randomBufDispatch = proc(buf: pointer; length: csize_t)
+    {.cdecl, raises: [].}
+  Arc4randomUniformDispatch = proc(upper: cuint): cuint {.cdecl, raises: [].}
   ForkDispatch = proc(): PidT {.cdecl, raises: [].}
   ExecveDispatch = proc(path: cstring; argv, envp: cstringArray): cint
     {.cdecl, raises: [].}
@@ -3132,6 +3308,14 @@ proc installTimeDispatcher(dispatch: TimeDispatch)
   {.importc: "ct_linux_preload_register_time_hook", raises: [].}
 proc installGetrandomDispatcher(dispatch: GetrandomDispatch)
   {.importc: "ct_linux_preload_register_getrandom_hook", raises: [].}
+proc installGetentropyDispatcher(dispatch: GetentropyDispatch)
+  {.importc: "ct_linux_preload_register_getentropy_hook", raises: [].}
+proc installArc4randomDispatcher(dispatch: Arc4randomDispatch)
+  {.importc: "ct_linux_preload_register_arc4random_hook", raises: [].}
+proc installArc4randomBufDispatcher(dispatch: Arc4randomBufDispatch)
+  {.importc: "ct_linux_preload_register_arc4random_buf_hook", raises: [].}
+proc installArc4randomUniformDispatcher(dispatch: Arc4randomUniformDispatch)
+  {.importc: "ct_linux_preload_register_arc4random_uniform_hook", raises: [].}
 proc installForkDispatcher(dispatch: ForkDispatch)
   {.importc: "ct_linux_preload_register_fork_hook", raises: [].}
 proc installExecveDispatcher(dispatch: ExecveDispatch)
@@ -3196,6 +3380,7 @@ var
   gettimeofdayHooks: seq[GettimeofdayHookEntry] = @[]
   timeHooks: seq[TimeHookEntry] = @[]
   getrandomHooks: seq[GetrandomHookEntry] = @[]
+  entropyHooks: seq[EntropyHookEntry] = @[]
   forkHooks: seq[ForkHookEntry] = @[]
   execveHooks: seq[ExecveHookEntry] = @[]
   posixSpawnHooks: seq[PosixSpawnHookEntry] = @[]
@@ -3519,6 +3704,15 @@ proc registerGetrandomHook*(hook: GetrandomHook; priority = 100)
     return
   getrandomHooks.add(GetrandomHookEntry(priority: priority, callback: hook))
   getrandomHooks.sort(proc(a, b: GetrandomHookEntry): int =
+    cmp(a.priority, b.priority))
+
+proc registerEntropyHook*(hook: EntropyHook; priority = 100) {.raises: [].} =
+  ## One chain for getentropy / arc4random / arc4random_buf /
+  ## arc4random_uniform; the hook reads `ctx.source` to tell them apart.
+  if hook == nil:
+    return
+  entropyHooks.add(EntropyHookEntry(priority: priority, callback: hook))
+  entropyHooks.sort(proc(a, b: EntropyHookEntry): int =
     cmp(a.priority, b.priority))
 
 proc registerForkHook*(hook: ForkHook; priority = 100) {.raises: [].} =
@@ -4328,6 +4522,17 @@ proc callReal*(ctx: var TimeContext) {.raises: [].} =
 proc callReal*(ctx: var GetrandomContext) {.raises: [].} =
   ctx.result = realGetrandom(ctx.buf, ctx.buflen, ctx.flags)
 
+proc callReal*(ctx: var EntropyContext) {.raises: [].} =
+  case ctx.source
+  of lesGetentropy:
+    ctx.result = realGetentropy(ctx.buf, ctx.length)
+  of lesArc4random:
+    ctx.value = realArc4random()
+  of lesArc4randomBuf:
+    realArc4randomBuf(ctx.buf, ctx.length)
+  of lesArc4randomUniform:
+    ctx.value = realArc4randomUniform(ctx.upper)
+
 proc callReal*(ctx: var ForkContext) {.raises: [].} =
   ctx.result = realFork()
 
@@ -4711,6 +4916,14 @@ proc callNext*(ctx: var GetrandomContext) {.raises: [].} =
   else:
     callReal(ctx)
 
+proc callNext*(ctx: var EntropyContext) {.raises: [].} =
+  if ctx.nextIndex < entropyHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    entropyHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
 proc callNext*(ctx: var ForkContext) {.raises: [].} =
   if ctx.nextIndex < forkHooks.len:
     let index = ctx.nextIndex
@@ -5035,6 +5248,27 @@ proc dispatchGetrandom(buf: pointer; buflen: csize_t; flags: cuint): clong
   callNext(ctx)
   result = ctx.result
 
+proc dispatchGetentropy(buf: pointer; length: csize_t): cint
+    {.cdecl, raises: [].} =
+  var ctx = EntropyContext(source: lesGetentropy, buf: buf, length: length,
+                           result: -1)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchArc4random(): cuint {.cdecl, raises: [].} =
+  var ctx = EntropyContext(source: lesArc4random)
+  callNext(ctx)
+  result = ctx.value
+
+proc dispatchArc4randomBuf(buf: pointer; length: csize_t) {.cdecl, raises: [].} =
+  var ctx = EntropyContext(source: lesArc4randomBuf, buf: buf, length: length)
+  callNext(ctx)
+
+proc dispatchArc4randomUniform(upper: cuint): cuint {.cdecl, raises: [].} =
+  var ctx = EntropyContext(source: lesArc4randomUniform, upper: upper)
+  callNext(ctx)
+  result = ctx.value
+
 proc dispatchFork(): PidT {.cdecl, raises: [].} =
   var ctx = ForkContext(result: -1)
   callNext(ctx)
@@ -5111,6 +5345,10 @@ installClockGettimeDispatcher(dispatchClockGettime)
 installGettimeofdayDispatcher(dispatchGettimeofday)
 installTimeDispatcher(dispatchTime)
 installGetrandomDispatcher(dispatchGetrandom)
+installGetentropyDispatcher(dispatchGetentropy)
+installArc4randomDispatcher(dispatchArc4random)
+installArc4randomBufDispatcher(dispatchArc4randomBuf)
+installArc4randomUniformDispatcher(dispatchArc4randomUniform)
 installForkDispatcher(dispatchFork)
 installExecveDispatcher(dispatchExecve)
 installPosixSpawnDispatcher(dispatchPosixSpawn)

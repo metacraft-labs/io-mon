@@ -100,7 +100,7 @@ wants a wider bar still calls `evaluateMonitorEvidence` with its own required-se
   would close that at the cost of a second injected copy of io-mon per process, in its
   own link-map namespace — see `docs/cases/dlopen-runpath-transparency.md` alternative C.
 - **File Transfers**: Tracks vector/zero-copy operations (`pread`, `readv`, `sendfile`, `copy_file_range`, `splice`) and records them as reads/writes.
-- **Non-File Tracking**: Logs `getenv`, `uname`, `sysconf` accesses, system time calls, and `getrandom` non-determinism events.
+- **Non-File Tracking**: Logs `getenv`, `uname`, `sysconf` accesses, system time calls, and entropy (non-determinism) events. The entropy surface is `getrandom` (libc symbol, raw syscall and vDSO entry) plus the glibc >= 2.36 BSD set `getentropy` / `arc4random` / `arc4random_buf` / `arc4random_uniform`, deduped once per process per source — the same cross-platform observation contract the macOS shim follows (see `mrNonDeterministic` in `src/io_mon/types.nim`).
 
 ### Windows
 

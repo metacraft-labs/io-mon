@@ -2319,7 +2319,7 @@ proc recordNonDeterministic(source: string) {.raises: [].} =
   if source.len == 0:
     return
   recordObservedOnce(mrNonDeterministic, moNonDeterministic, "nd:" & source,
-    source, "non-deterministic entropy source")
+    source, NonDeterministicEntropyDetail)
 
 proc recordTimeRead(source: string) {.raises: [].} =
   ## Record a WALL-CLOCK read (clock_gettime/gettimeofday/time/mach_absolute_time)

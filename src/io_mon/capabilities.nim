@@ -154,8 +154,11 @@ const
     mcapLibraryLoad,
     # M-FW-6C — Linux libc-visible getenv/uname/sysconf are recorded as
     # observed inputs; clock_gettime/gettimeofday/time are time-read evidence;
-    # getrandom is entropy evidence. Direct raw/vDSO variants remain outside
-    # this positive capability.
+    # getrandom (libc symbol, raw syscall and vDSO entry) plus the glibc >= 2.36
+    # BSD set getentropy/arc4random/arc4random_buf/arc4random_uniform are
+    # entropy evidence — the same per-platform-complete entropy surface the
+    # macOS profile advertises (io_mon/types.nim, record 16). Other direct raw
+    # variants remain outside this positive capability.
     mcapObservedEnv,
     mcapNonDeterminism
   }
@@ -523,8 +526,9 @@ proc linuxUnsupportedReason(capability: MonitorCapability): string =
       "system-configuration coverage is required"
   of mcapNonDeterminism:
     "Linux preload shim records libc-visible clock_gettime/gettimeofday/time " &
-      "as time reads and getrandom as non-determinism; this reason applies " &
-      "only where direct raw/vDSO or broader entropy/time APIs are required"
+      "as time reads and getrandom/getentropy/arc4random/arc4random_buf/" &
+      "arc4random_uniform as non-determinism; this reason applies " &
+      "only where direct raw or broader entropy/time APIs are required"
   of mcapExternalContent:
     "Linux preload shim records libc-visible positioned/vector and zero-copy " &
       "file movers, but broader external content channels and direct raw " &
@@ -645,7 +649,9 @@ proc linuxPreloadMonitorProfile*(
       "renameat2 record hardlink source/alias and final rename destinations; " &
       "libc-visible getenv/uname/sysconf are observed inputs, " &
       "clock_gettime/gettimeofday/time are time-read evidence, and " &
-      "getrandom is entropy evidence left to caller invalidation policy; " &
+      "getrandom/getentropy/arc4random/arc4random_buf/arc4random_uniform are " &
+      "entropy evidence (deduped per process per source) left to caller " &
+      "invalidation policy; " &
       "and io-mon fails closed for unsupported raw syscall numbers, " &
       "untracked or partially tracked anonymous executable mprotect, " &
       "partial-overlap mremap ownership escapes, or anonymous writable+" &
@@ -658,7 +664,8 @@ proc linuxPreloadMonitorProfile*(
       "direct raw zero-copy/mutation syscalls, pre-existing hardlink/inode " &
       "aliases, direct raw/vDSO non-file determinism paths, and broader Linux " &
       "non-file APIs beyond getenv/uname/sysconf/clock/gettimeofday/time/" &
-      "getrandom. Consumers that require those " &
+      "getrandom/getentropy/arc4random(_buf|_uniform). " &
+      "Consumers that require those " &
       "threat models must request the corresponding capability and treat the " &
       "gap as incomplete.")
 
