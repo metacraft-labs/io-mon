@@ -3500,6 +3500,87 @@ proc installAllHooks(): int =
       unhookedEntryPointNames.add(spec.name)
   result = failed.len
 
+proc uninstallInlineHooksBatched*(targets: openArray[pointer]): int
+    {.raises: [], discardable.} =
+  ## Restore the original prologue bytes at every target in ``targets``
+  ## inside a SINGLE thread-freeze window. Returns the number of targets
+  ## whose restore was accepted.
+  ##
+  ## The batching is not a micro-optimisation, it is the whole cost of
+  ## teardown. `ct_inline_hook_uninstall` freezes the process's other
+  ## threads around each patch, and the freeze is a
+  ## `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)` — a SYSTEM-WIDE thread
+  ## enumeration whose cost is set by the load of the whole machine, not by
+  ## how many threads this process has. Measured on this host it is ~23.5 ms
+  ## per call. Called once per hook, the 31-entry `hookTable` therefore cost
+  ## ~0.73 s of pure freeze at exit in EVERY monitored process — and since a
+  ## build is mostly short-lived compiler processes, that single loop was the
+  ## dominant cost of monitoring a build (S4: a monitored `nim c` ran 8x
+  ## slower than an unmonitored one, and ~90% of the gap was here).
+  ##
+  ## `installAllHooks` already groups its patches into one transaction for
+  ## exactly this reason and says so in its docstring; teardown simply never
+  ## got the same treatment. A transaction defers each op and applies the
+  ## whole batch inside one freeze, so the window is one round for the table
+  ## instead of one per entry. Nothing is skipped: this changes WHEN the
+  ## threads are frozen, not WHICH patches are restored — the post-exit state
+  ## is still byte-equivalent to a never-hooked process, which is the
+  ## property the exit handler exists to guarantee.
+  when ctInlineHookAvailable:
+    var pending = 0
+    for tgt in targets:
+      if tgt != nil:
+        inc pending
+    if pending == 0:
+      return 0
+    # A transaction is bounded; past its capacity the queue rejects ops and
+    # hooks would silently stay installed. Fall back to the per-hook path
+    # rather than lose a restore — slow is recoverable, a JMP into an
+    # unmapped code page is not.
+    let batched = pending <= int(inlineHookTransactionCapacity()) and
+      ctInlineHookBeginTransaction() == 0
+    for tgt in targets:
+      if tgt != nil and ctInlineHookUninstall(tgt) == 0:
+        inc result
+    if not batched:
+      return
+    let commitRc = ctInlineHookCommitTransaction()
+    if commitRc == 0:
+      return
+    # A failed commit leaves an UNKNOWN mix: `ct_inline_hook_commit_transaction`
+    # stops at the first failing op and its rollback pass only undoes queued
+    # INSTALLS (it cannot re-install an uninstall — the caller's trampoline
+    # pointer is gone), so the restores it already applied stay applied and
+    # everything from the failing op onwards is still detoured. Which is which
+    # is not reported. So retry the whole list one at a time: an already-restored
+    # target has no table entry left and `uninstall_locked` returns -1 without
+    # touching a byte, which makes the retry idempotent, and every target that
+    # IS still detoured gets its prologue back. The freeze cost is the thing
+    # this proc exists to avoid, but not at the price of leaving detours in
+    # place while the shim's code pages go away.
+    #
+    # The count is therefore a LOWER bound in this path: restores that the
+    # partial commit already performed answer -1 on the retry and are not
+    # counted. Nothing reads it here (the exit handler discards it), and
+    # under-reporting a teardown that had to fall back is the safe direction.
+    dbg(cstring("[repro_monitor_shim] uninstallInlineHooksBatched: " &
+      "commit_transaction failed rc=" & $commitRc &
+      "; restoring per-hook\n"))
+    result = 0
+    for tgt in targets:
+      if tgt != nil and ctInlineHookUninstall(tgt) == 0:
+        inc result
+  else:
+    result = 0
+
+proc uninstallAllInlineHooks(): int {.raises: [].} =
+  ## Batched teardown of every entry point THIS process inline-patched.
+  ## Split from `uninstallInlineHooksBatched` only so the batching itself
+  ## can be asserted on an explicit target set from a test, without the
+  ## test having to arrange for a live injection to populate
+  ## `installedHookTargets`.
+  uninstallInlineHooksBatched(installedHookTargets)
+
 # --- Public exports ---------------------------------------------------------
 
 proc repro_monitor_shim_init*(configPath: cstring): cint
@@ -3660,9 +3741,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
         except CatchableError, IOError, OSError:
           discard
         when ctInlineHookAvailable:
-          for tgt in installedHookTargets:
-            if tgt != nil:
-              discard ctInlineHookUninstall(tgt)
+          discard uninstallAllInlineHooks()
         installedHookTargets.setLen(0))
   result = 0
 
