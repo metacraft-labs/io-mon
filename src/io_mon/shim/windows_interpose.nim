@@ -597,6 +597,39 @@ var
   selfDllPathW: seq[uint16] = @[]
   selfDllPathReady: bool = false
 
+when defined(ioMonShimSpawnEscapeTest):
+  # Fault injection for the two abnormal ways out of the CreateProcess snoop
+  # hooks. The hooks force ``CREATE_SUSPENDED`` into every child's creation
+  # flags so they can inject before the child runs, so "did this hook resume
+  # the child on the path it actually took?" is a liveness property of a real
+  # process -- but neither abnormal path can be reached from outside the
+  # process: one depends on ``disabled``/``initialized`` flipping mid-hook (a
+  # thread-local and a teardown race), the other on a raise from inside the
+  # body that the hook's own ``except`` swallows. So the test needs a way to
+  # ask for them, and ``REPRO_MONITOR_SHIM_TEST_SPAWN_ESCAPE``
+  # ("return" / "raise"), read once at init, is it.
+  #
+  # COMPILE-GATED, and it has to stay that way. Taking either escape means
+  # the hook emits no spawn record and injects nothing, so the whole child
+  # subtree goes unobserved -- and because the record that would have named
+  # the child is the same one that is missing, the run still grades
+  # ``mcComplete``. An env var with that effect in a SHIPPED monitor is a
+  # way to obtain a clean-looking dependency set for a build whose real
+  # inputs were never watched, available to anyone who can set a variable in
+  # the build environment. The shim's value is that its evidence can be
+  # trusted; a switch that silently voids the evidence must not exist in the
+  # artefact anyone runs. Built only by
+  # ``tests/windows/test_io_mon_windows_spawn_resume_invariant.nim``, into
+  # ``build/test-bin/`` so it cannot be mistaken for, or packaged next to,
+  # the real shim in ``build/lib/``.
+  type
+    TestSpawnEscape = enum
+      tseNone
+      tseEarlyReturn  ## leave through the post-CreateProcess early `return`
+      tseRaise        ## leave through the swallowing `except CatchableError`
+
+  var testSpawnEscape: TestSpawnEscape = tseNone
+
 var disabled {.threadvar.}: int
 
 template withShimMuted(body: untyped) =
@@ -1868,16 +1901,45 @@ proc snoopCreateProcessW(ctx: var hr.HookContext) {.raises: [].} =
   let callerCreationFlags = DWORD(ctx.args[5])
   let callerAskedForSuspended =
     (callerCreationFlags and CREATE_SUSPENDED) != 0
+  # `forcedSuspend` is this hook's debt. It is true only when the suspension
+  # the child is born with is one WE introduced, and from the moment it is
+  # set, EVERY path out of this proc owes that child a `ResumeThread` -- the
+  # early return below, a raise the `except` swallows, and the ordinary end
+  # alike. That is what the `finally` at the bottom exists for; nothing else
+  # in this proc may resume, or the debt is paid twice.
+  #
+  # It stays false when the caller asked for CREATE_SUSPENDED themselves.
+  # Suspend counts are counted, not boolean: an extra ResumeThread on a
+  # caller-suspended child drops the count to zero and starts it running
+  # before the caller meant it to, which cannot be taken back.
+  var forcedSuspend = false
   if initialized and disabled == 0:
     ensureSelfDllPath()
     if selfDllPathW.len > 0:
       ctx.args[5] = uint64(callerCreationFlags or CREATE_SUSPENDED)
+      forcedSuspend = not callerAskedForSuspended
   hr.callNext(ctx)
   let savedLastError = GetLastError()
-  if disabled > 0 or not initialized:
-    SetLastError(savedLastError)
-    return
+  # Resolve the thread to resume BEFORE any branch that can leave. `disabled`
+  # and `initialized` are read again below and may have flipped underneath us
+  # (the exit handler races this hook); the child, however, is already alive
+  # and already suspended, so the debt is fixed at this point and must not
+  # depend on state that can still change.
+  var suspendedThread: HANDLE = nil
+  if forcedSuspend:
+    let piForResume = cast[ptr PROCESS_INFORMATION](ctx.args[9])
+    if BOOL(ctx.result) != 0 and piForResume != nil:
+      suspendedThread = piForResume[].hThread
   try:
+    when defined(ioMonShimSpawnEscapeTest):
+      if testSpawnEscape == tseEarlyReturn:
+        return
+    if disabled > 0 or not initialized:
+      return
+    when defined(ioMonShimSpawnEscapeTest):
+      if testSpawnEscape == tseRaise:
+        raise newException(ValueError,
+          "REPRO_MONITOR_SHIM_TEST_SPAWN_ESCAPE=raise")
     let lpApplicationName = cast[LPCWSTR](ctx.args[0])
     let lpCommandLine = cast[LPWSTR](ctx.args[1])
     let lpProcessInfo = cast[ptr PROCESS_INFORMATION](ctx.args[9])
@@ -1917,27 +1979,50 @@ proc snoopCreateProcessW(ctx: var hr.HookContext) {.raises: [].} =
         if outcome != shProp.ioInjected and
             outcome != shProp.ioAlreadyPresent:
           record.detail.add(" inject=" & $outcome)
-      if not callerAskedForSuspended:
-        discard ResumeThread(pi.hThread)
     emitRecord(record)
   except CatchableError:
     discard
-  SetLastError(savedLastError)
+  finally:
+    # The single place the forced suspension is undone, reached from the
+    # early return above, from the `except`, and from the ordinary end of
+    # the try. `suspendedThread` is non-nil only when this hook is the one
+    # that suspended the child, so this can neither strand a child nor
+    # resume one the caller wanted left asleep.
+    if suspendedThread != nil:
+      discard ResumeThread(suspendedThread)
+    # After the resume: ResumeThread clobbers the thread's last-error value,
+    # and the caller must observe the CreateProcessW one.
+    SetLastError(savedLastError)
 
 proc snoopCreateProcessA(ctx: var hr.HookContext) {.raises: [].} =
   let savedFlagsA = DWORD(ctx.args[5])
   let callerAskedForSuspendedA =
     (savedFlagsA and CREATE_SUSPENDED) != 0
+  # Same resume-debt discipline as `snoopCreateProcessW`; see the commentary
+  # there for why the flag is captured here and discharged only in `finally`.
+  var forcedSuspendA = false
   if initialized and disabled == 0:
     ensureSelfDllPath()
     if selfDllPathW.len > 0:
       ctx.args[5] = uint64(savedFlagsA or CREATE_SUSPENDED)
+      forcedSuspendA = not callerAskedForSuspendedA
   hr.callNext(ctx)
   let savedLastError = GetLastError()
-  if disabled > 0 or not initialized:
-    SetLastError(savedLastError)
-    return
+  var suspendedThreadA: HANDLE = nil
+  if forcedSuspendA:
+    let piForResume = cast[ptr PROCESS_INFORMATION](ctx.args[9])
+    if BOOL(ctx.result) != 0 and piForResume != nil:
+      suspendedThreadA = piForResume[].hThread
   try:
+    when defined(ioMonShimSpawnEscapeTest):
+      if testSpawnEscape == tseEarlyReturn:
+        return
+    if disabled > 0 or not initialized:
+      return
+    when defined(ioMonShimSpawnEscapeTest):
+      if testSpawnEscape == tseRaise:
+        raise newException(ValueError,
+          "REPRO_MONITOR_SHIM_TEST_SPAWN_ESCAPE=raise")
     let lpApplicationName = cast[LPCSTR](ctx.args[0])
     let lpCommandLine = cast[LPSTR](ctx.args[1])
     let lpProcessInfo = cast[ptr PROCESS_INFORMATION](ctx.args[9])
@@ -1964,11 +2049,12 @@ proc snoopCreateProcessA(ctx: var hr.HookContext) {.raises: [].} =
       if childForkRuntime.len == 0:
         discard shProp.injectShimIntoChild(pi.hProcess, selfDllPath(),
           "repro_runtime_init")
-      if not callerAskedForSuspendedA:
-        discard ResumeThread(pi.hThread)
   except CatchableError:
     discard
-  SetLastError(savedLastError)
+  finally:
+    if suspendedThreadA != nil:
+      discard ResumeThread(suspendedThreadA)
+    SetLastError(savedLastError)
 
 # --- M73 Phase 5 snoop callbacks -------------------------------------------
 #
@@ -3598,6 +3684,13 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   withShimMuted:
     fragmentDir = readEnvString("REPRO_MONITOR_FRAGMENT_DIR")
     ensureFragmentDir()
+    when defined(ioMonShimSpawnEscapeTest):
+      # Only this build reads it at all; in the shipped shim the variable is
+      # inert because the code that would honour it does not exist.
+      case readEnvString("REPRO_MONITOR_SHIM_TEST_SPAWN_ESCAPE")
+      of "return": testSpawnEscape = tseEarlyReturn
+      of "raise": testSpawnEscape = tseRaise
+      else: testSpawnEscape = tseNone
   let dbgMsg = "[repro_monitor_shim] fragmentDir=" & fragmentDir & "\n"
   dbg(cstring(dbgMsg))
   # M26: initialise the hook registry + register the monitor's snoop
