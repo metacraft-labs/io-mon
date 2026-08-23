@@ -1,4 +1,4 @@
-import std/[os, osproc, strutils, times]
+import std/[atomics, os, osproc, strtabs, strutils, times]
 from io_mon/paths import extendedPath
 
 import io_mon/reader
@@ -439,13 +439,18 @@ type
     request: FsSnoopRequest
     depfileWasExplicit: bool
 
-var tempDirNonce = uint64(getCurrentProcessId())
+# DH-1 — ATOMIC, because `runMonitored` is now a concurrently-callable host API.
+# Two monitors racing in one process must not be handed the same scratch name;
+# the timestamp alone does not separate them (two calls can land in the same
+# nanosecond bucket, and `getTime().nanosecond` resolution is not guaranteed).
+var tempDirNonce: Atomic[uint64]
+tempDirNonce.store(uint64(getCurrentProcessId()))
 
 proc createLocalTempDir(prefix: string): string =
-  inc tempDirNonce
+  let nonce = tempDirNonce.fetchAdd(1'u64) + 1'u64
   let now = getTime()
   result = getTempDir() / (prefix & "-" & $getCurrentProcessId() & "-" &
-    $now.toUnix & "-" & $now.nanosecond & "-" & $tempDirNonce)
+    $now.toUnix & "-" & $now.nanosecond & "-" & $nonce)
   createDir(extendedPath(result))
 
 proc removeLocalTempDir(path: string) =
@@ -679,28 +684,88 @@ proc findShimLibrary*(): string =
       return absolutePath(candidate)
   ""
 
-proc setEnvVar(name, value: string; oldValues: var seq[(string, string, bool)]) =
-  oldValues.add((name, getEnv(name), existsEnv(name)))
-  putEnv(name, value)
+# ---------------------------------------------------------------------------
+# IoMon-Decomposed-Host-API DH-1 — per-call injection environment.
+#
+# The injection variables used to be published by mutating the HOSTING process's
+# environment (`putEnv`) for the duration of the run and restoring it afterwards.
+# That made `runMonitored` un-runnable concurrently: two monitors in one process
+# overwrite each other's `LD_PRELOAD` / `REPRO_MONITOR_*`, so one tree attaches
+# the other's dependency set and both edges report a set that is not theirs. The
+# restore-on-exit `defer` made the damage invisible AFTER the fact but did
+# nothing DURING it, and a host that never opted out could not avoid it.
+#
+# The variables are therefore computed into a child-only environment table and
+# handed to the spawn. `runMonitored` performs NO `putEnv` on POSIX; see the
+# Windows arm for the one remaining exception and why it is not removable from
+# inside this repository.
+# ---------------------------------------------------------------------------
 
-proc restoreEnv(oldValues: seq[(string, string, bool)]) =
-  for i in countdown(oldValues.high, 0):
-    let (name, value, existed) = oldValues[i]
-    if existed:
-      putEnv(name, value)
-    else:
-      delEnv(name)
+proc requestEnvValue(request: FsSnoopRequest; name: string): string =
+  ## The value `name` would have in the child BEFORE io-mon's own injection: the
+  ## request's override when it supplies one (last wins), else the hosting
+  ## process's value, which the child inherits. Reads only — never mutates.
+  for i in countdown(request.env.high, 0):
+    if request.env[i][0] == name:
+      return request.env[i][1]
+  getEnv(name)
 
-proc injectionValue(shimLib: string): string =
-  when defined(linux):
-    const injectionEnv = "LD_PRELOAD"
-  else:
-    const injectionEnv = "DYLD_INSERT_LIBRARIES"
-  let existing = getEnv(injectionEnv)
+proc childEnv(request: FsSnoopRequest;
+              injected: openArray[(string, string)]): StringTableRef =
+  ## The COMPLETE environment for the monitored child: the hosting process's
+  ## environment, then the caller's per-call `request.env`, then io-mon's own
+  ## injection variables (which win, so a caller cannot switch monitoring off by
+  ## accident). Nothing here is visible to the hosting process.
+  result = newStringTable(
+    when defined(windows): modeCaseInsensitive else: modeCaseSensitive)
+  for key, value in envPairs():
+    result[key] = value
+  for (key, value) in request.env:
+    result[key] = value
+  for (key, value) in injected:
+    result[key] = value
+
+proc injectionValue(shimLib, existing: string): string =
+  ## Prepend the shim to whatever the child's preload list would otherwise be.
+  ## `existing` comes from `requestEnvValue`, so a per-call `LD_PRELOAD` is
+  ## extended exactly like an inherited one — the injection never silently
+  ## discards a caller's preload.
   if existing.len == 0:
     shimLib
   else:
     shimLib & $PathSep & existing
+
+# DH-1 — the run identity has to be unique per CALL, not merely per wall-clock
+# instant. `$epochTime()` alone is not: two concurrent `runMonitored` calls can
+# read the same value.
+#
+# What that costs is a FABRICATED event loss, not a naming clash. The run id no
+# longer names anything on disk — since nim-shm-gset HM-1 the chain is
+# `{appId}~{chainSeq}.{boot}.{pid}.shardN` and the run id lives in shard0's
+# HEADER, so two chains may legally share one (`shm_gset.createSetT`). The
+# load-bearing use is the §4.1 detached-descendant guard:
+# `liveInjectedDescendants` walks ALL of `/proc` — not a process subtree — and
+# claims every process whose `environ` carries `REPRO_MONITOR_SESSION=<runId>`
+# (or `REPRO_MONITOR_FRAGMENT_DIR=<dir>`; `createLocalTempDir`'s nonce is atomic
+# for the same reason). Two monitors sharing either value cross-attribute: the
+# one whose root exits first sees the OTHER's still-live child as its own
+# escapee, and `waitForLinuxInjectedDescendants` invents an `mrEventLoss` past
+# the grace window — a false `mcIncomplete` on an edge that lost nothing.
+# Measured; regression-tested by
+# `tests/linux/test_io_mon_per_call_env_and_cwd.nim`
+# (`t_concurrent_runs_do_not_fabricate_an_event_loss`), which reddens under a
+# forced collision of EITHER value.
+#
+# Uniqueness argument: `nonce` is distinct within a process (atomic fetch-add)
+# and `pid` is distinct between processes that are alive at the same time, so no
+# two CONCURRENT runs can collide — which is the only window in which the /proc
+# scan can misattribute. `epochTime` then separates same-pid runs across a pid
+# recycle.
+var runIdNonce: Atomic[uint64]
+
+proc newRunId(): string =
+  let nonce = runIdNonce.fetchAdd(1'u64) + 1'u64
+  $epochTime() & "-" & $getCurrentProcessId() & "-" & $nonce
 
 proc renderStreamToPath(depfilePath: string; mode: FsSnoopOutputMode;
                         streamPath: string) =
@@ -779,6 +844,24 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
   ## Never spawns a consumer-less producer; still raises on a genuine setup
   ## failure (no shim, unsupported platform) — the CLI wrapper `runFsSnoopCli`
   ## converts those to a diagnostic + non-zero exit.
+  ##
+  ## **CONCURRENCY (IoMon-Decomposed-Host-API DH-1).** On Linux and macOS this
+  ## proc mutates NOTHING process-global: the injection variables and
+  ## `request.env` are composed into a child-only environment handed to the
+  ## spawn, and `request.cwd` is the child's working directory. Two (or N) calls
+  ## may therefore run concurrently on separate threads of one host process and
+  ## each gets its own complete, uncontaminated evidence — the shape the build
+  ## engine needs. It previously `putEnv`'d seven variables into the HOSTING
+  ## process for the duration of the run, which made concurrent calls corrupt
+  ## each other's capture with no way for a caller to opt out.
+  ##
+  ## Two residual, documented exceptions:
+  ##   * **Windows** still publishes its four injection variables via `putEnv`,
+  ##     because `stackable_hooks.runWithMonitorShim` takes no `env` (see the
+  ##     Windows arm below).
+  ##   * **macOS** additionally inherits `osproc`'s own global `setCurrentDir`
+  ##     around its `posix_spawn` path, so a non-empty `request.cwd` is not
+  ##     thread-safe there. Linux forks and `chdir`s in the child, so it is.
   result.depFilePath = request.depFilePath
   when defined(macosx):
     let shimLib = findShimLibrary()
@@ -796,7 +879,7 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
     # exec. Without this, /bin/sh (used by osproc.execCmdEx) loses
     # DYLD_INSERT_LIBRARIES and the shim falls silent for the rest of
     # the process tree.
-    var sandboxDir = getEnv("CT_SANDBOX_TOOLS_DIR")
+    var sandboxDir = requestEnvValue(request, "CT_SANDBOX_TOOLS_DIR")
     let ownsSandboxDir = sandboxDir.len == 0
     if ownsSandboxDir:
       sandboxDir = createLocalTempDir("repro-fs-snoop-sandbox-tools")
@@ -810,14 +893,21 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
         removeLocalTempDir(sandboxDir)
     populateReproSandboxTools(sandboxDir)
 
-    var oldEnv: seq[(string, string, bool)] = @[]
-    setEnvVar("CT_SANDBOX_TOOLS_DIR", sandboxDir, oldEnv)
-    setEnvVar("DYLD_INSERT_LIBRARIES", injectionValue(shimLib), oldEnv)
-    setEnvVar("REPRO_MONITOR_FRAGMENT_DIR", fragmentDir, oldEnv)
-    setEnvVar("REPRO_MONITOR_OUTPUT", request.depFilePath, oldEnv)
-    setEnvVar("REPRO_MONITOR_SESSION", $epochTime(), oldEnv)
-    setEnvVar("REPRO_MONITOR_SHIM_LIB", shimLib, oldEnv)
-    defer: restoreEnv(oldEnv)
+    # DH-1 — the macOS injection set, threaded through the SPAWN. Six variables;
+    # no `putEnv`, so the hosting process's own `DYLD_INSERT_LIBRARIES` is never
+    # briefly pointed at the shim (which would have injected the monitor into
+    # anything else the host spawned in that window).
+    let injected = @[
+      ("CT_SANDBOX_TOOLS_DIR", sandboxDir),
+      ("DYLD_INSERT_LIBRARIES",
+        injectionValue(shimLib,
+          requestEnvValue(request, "DYLD_INSERT_LIBRARIES"))),
+      ("REPRO_MONITOR_FRAGMENT_DIR", fragmentDir),
+      ("REPRO_MONITOR_OUTPUT", request.depFilePath),
+      ("REPRO_MONITOR_SESSION", newRunId()),
+      ("REPRO_MONITOR_SHIM_LIB", shimLib)
+    ]
+    let spawnEnv = childEnv(request, injected)
 
     # SIP shebang bypass: if the target is a shell script whose
     # interpreter (``#!/bin/sh`` etc.) lives under a SIP-protected
@@ -836,7 +926,9 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
       else:
         @[]
     let process = startProcess(effectiveCommand[0],
+      workingDir = request.cwd,
       args = childArgs,
+      env = spawnEnv,
       options = {poUsePath, poParentStreams})
     # ROUND-2 R1 — remember the root pid so the merge can PROVE the root was
     # monitored. A SIP/hardened/notarized root (e.g. /bin/cat) strips
@@ -862,12 +954,18 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
     defer: removeLocalTempDir(fragmentDir)
     ensureParentDir(request.depFilePath)
 
-    var oldEnv: seq[(string, string, bool)] = @[]
-    let runId = $epochTime()
-    setEnvVar("LD_PRELOAD", injectionValue(shimLib), oldEnv)
-    setEnvVar("REPRO_MONITOR_FRAGMENT_DIR", fragmentDir, oldEnv)
-    setEnvVar("REPRO_MONITOR_OUTPUT", request.depFilePath, oldEnv)
-    setEnvVar("REPRO_MONITOR_SESSION", runId, oldEnv)
+    # DH-1 — the Linux injection set, threaded through the SPAWN. Seven
+    # variables in the fully-enabled case (`REPRO_MONITOR_DEP_SHM` and
+    # `REPRO_MONITOR_APP_ID` only when the shm-gset host came up); no `putEnv`,
+    # so a second monitor running concurrently in this process is unaffected.
+    let runId = newRunId()
+    var injected = @[
+      ("LD_PRELOAD",
+        injectionValue(shimLib, requestEnvValue(request, "LD_PRELOAD"))),
+      ("REPRO_MONITOR_FRAGMENT_DIR", fragmentDir),
+      ("REPRO_MONITOR_OUTPUT", request.depFilePath),
+      ("REPRO_MONITOR_SESSION", runId)
+    ]
 
     # io-mon-Lossless-Event-Capture M3 (part 1) — the CONSUMER hosts the edge's
     # shared-memory SET (nim-shm-gset, the M1-winning transport) BEFORE launching
@@ -885,24 +983,26 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
     # is set — the pure-file baseline used by the LF-6 byte-identical regression.
     var depSet: SetHost
     let depSetEnabled = shmGSetSupported and
-      getEnv("REPRO_MONITOR_DEP_SHM_DISABLE").len == 0
+      requestEnvValue(request, "REPRO_MONITOR_DEP_SHM_DISABLE").len == 0
     if depSetEnabled:
       # The appId scopes the SET's cross-restart reaper so one application never
       # reaps another's shared-memory segments (segment name gains an `{appId}~`
       # prefix; content is unaffected). Defaults to "io-mon"; a consumer that
       # shares a segments directory (reprobuild/codetracer) overrides it via
       # REPRO_MONITOR_APP_ID so its reaper stays scoped to its own segments.
-      let depSetAppId = getEnv("REPRO_MONITOR_APP_ID", "io-mon")
+      var depSetAppId = requestEnvValue(request, "REPRO_MONITOR_APP_ID")
+      if depSetAppId.len == 0:
+        depSetAppId = "io-mon"
       depSet = startHost(fragmentDir, runId, appId = depSetAppId)
       if depSet.available:
-        setEnvVar("REPRO_MONITOR_DEP_SHM", depSet.path0, oldEnv)
+        injected.add ("REPRO_MONITOR_DEP_SHM", depSet.path0)
         # Export the resolved appId too, so a producer that re-derives the
         # reaper scope (or an in-tree consumer that shares the segments dir)
         # sees the SAME tag the host created shard0 under — part of the §5
         # host owning the whole structure lifecycle, not just naming it.
-        setEnvVar("REPRO_MONITOR_APP_ID", depSetAppId, oldEnv)
-    setEnvVar("REPRO_MONITOR_SHIM_LIB", shimLib, oldEnv)
-    defer: restoreEnv(oldEnv)
+        injected.add ("REPRO_MONITOR_APP_ID", depSetAppId)
+    injected.add ("REPRO_MONITOR_SHIM_LIB", shimLib)
+    let spawnEnv = childEnv(request, injected)
     defer:
       # End the host lifecycle: announce the consumer is gone (a late orphan
       # `emit` then fast-fails with `emConsumerGone` instead of growing the set —
@@ -916,7 +1016,9 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
       else:
         @[]
     let process = startProcess(request.command[0],
+      workingDir = request.cwd,
       args = childArgs,
+      env = spawnEnv,
       options = {poUsePath, poParentStreams})
     # ROUND-2 R1 — see the macOS branch: prove the root was monitored.
     let rootPid = uint64(process.processID)
@@ -985,14 +1087,41 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
     defer: removeLocalTempDir(fragmentDir)
     ensureParentDir(request.depFilePath)
 
+    # DH-1 — THE ONE ARM THAT STILL MUTATES THE HOSTING PROCESS'S ENVIRONMENT,
+    # and it is not fixable from inside this repository.
+    #
+    # The Windows injection set is four variables: REPRO_MONITOR_FRAGMENT_DIR,
+    # REPRO_MONITOR_OUTPUT, REPRO_MONITOR_SESSION, REPRO_MONITOR_SHIM_LIB.
+    # (There is no preload variable — injection is CreateRemoteThread +
+    # LoadLibraryW — and no DEP_SHM/APP_ID, because the shm-gset arm is Linux
+    # only.) Unlike the POSIX arms, the spawn is NOT `osproc.startProcess`: it
+    # is `stackable_hooks/windows_injector.runWithMonitorShim`, whose
+    # `CreateProcessW` call passes `lpEnvironment = nil` and which exposes no
+    # `env` parameter — so the child can only receive these variables by
+    # inheriting the parent's block. Threading them through the spawn requires
+    # an `env` parameter on `runWithMonitorShim` in nim-stackable-hooks; until
+    # that exists, concurrent `runMonitored` calls on Windows still clobber each
+    # other and this scope-restore is the best available containment.
+    #
+    # `request.env` is applied the same way for the same reason, so the field
+    # behaves identically on all three arms from the caller's point of view.
     var oldEnv: seq[(string, string, bool)] = @[]
-    setEnvVar("REPRO_MONITOR_FRAGMENT_DIR", fragmentDir, oldEnv)
-    setEnvVar("REPRO_MONITOR_OUTPUT", request.depFilePath, oldEnv)
-    setEnvVar("REPRO_MONITOR_SESSION", $epochTime(), oldEnv)
-    setEnvVar("REPRO_MONITOR_SHIM_LIB", shimLib, oldEnv)
-    defer: restoreEnv(oldEnv)
+    proc setEnvVar(name, value: string) =
+      oldEnv.add((name, getEnv(name), existsEnv(name)))
+      putEnv(name, value)
+    for (key, value) in request.env:
+      setEnvVar(key, value)
+    setEnvVar("REPRO_MONITOR_FRAGMENT_DIR", fragmentDir)
+    setEnvVar("REPRO_MONITOR_OUTPUT", request.depFilePath)
+    setEnvVar("REPRO_MONITOR_SESSION", newRunId())
+    setEnvVar("REPRO_MONITOR_SHIM_LIB", shimLib)
+    defer:
+      for i in countdown(oldEnv.high, 0):
+        let (name, value, existed) = oldEnv[i]
+        if existed: putEnv(name, value) else: delEnv(name)
 
     let injection = runWithMonitorShim(request.command, shimLib,
+                                       cwd = request.cwd,
                                        captureStdio = request.captureChildStdio,
                                        captureStdioPath = request.captureStdioPath)
     result.exitCode = injection.exitCode
@@ -1018,9 +1147,24 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
     # runtime): that subtree is already recorded as an unmonitored-peer loss
     # just above, and demanding a process-start from a process we chose not
     # to inject would report the same gap twice.
+    #
+    # PRE-EXISTING BUILD BREAK, fixed here (recorded in
+    # reprobuild-specs/IoMon-Decomposed-Host-API.milestones.org, "A pre-existing
+    # Windows build break"): this read `injection.rootPid`, but
+    # `stackable_hooks.WindowsInjectionResult` has only `exitCode`,
+    # `monitoringSkipped` and `skipReason` — no `rootPid`. `nim check
+    # --os:windows` therefore failed on this line, taking the whole module (and
+    # everything importing it) with it. The injector never returned the child's
+    # pid, so the R1 root-guard the comment above describes has NEVER actually
+    # been armed on Windows; the code only looked as if it were.
+    #
+    # `0'u64` is the honest encoding of that: "no expected root pid", which is
+    # exactly what the arm has always effectively passed. It does NOT restore
+    # the guard — arming it needs `WindowsInjectionResult` to carry the pid
+    # `CreateProcessW` already hands the injector (`pi.dwProcessId`), which is a
+    # nim-stackable-hooks change and is deliberately out of scope here.
     result.depFile = mergeFragments(fragmentDir, request.depFilePath,
-      expectedRootPid =
-        if injection.monitoringSkipped: 0'u64 else: injection.rootPid,
+      expectedRootPid = 0'u64,
       setRecords = launcherRecords)
     renderStreamToPath(request.depFilePath, request.streamMode,
       request.eventStreamPath)

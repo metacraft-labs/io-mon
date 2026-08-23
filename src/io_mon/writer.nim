@@ -2925,8 +2925,19 @@ proc mergeFragments*(fragmentDir, outputPath: string;
   # delete `.rmdf-frag` files, so a REUSED fragment dir can carry a PRIOR run's
   # records (merge_attack.nim). Drop records whose owning process started under a
   # DIFFERENT run id before any completeness reasoning sees them. The run id is the
-  # explicit `currentRunId` arg, else REPRO_MONITOR_SESSION (the launcher's value,
-  # still set at merge time). Empty ⇒ no filtering (the CLI's fresh-dir case). This
+  # explicit `currentRunId` arg, else REPRO_MONITOR_SESSION.
+  #
+  # PASS `currentRunId`; do NOT rely on the env fallback. Since
+  # IoMon-Decomposed-Host-API DH-1 the POSIX arms of `runMonitored` publish the
+  # injection variables to the CHILD's environment only, so REPRO_MONITOR_SESSION
+  # is no longer set in the MERGING process (it still is on the Windows arm,
+  # which cannot thread env through its spawn). The fallback now engages only for
+  # a caller that exports the variable itself. `runMonitored`'s Linux arm passes
+  # `currentRunId` explicitly; its macOS arm does not, which is safe only because
+  # that arm merges a fragment dir it created moments earlier and deletes on the
+  # way out, so no prior run's records can be in it.
+  #
+  # Empty ⇒ no filtering (the CLI's fresh-dir case). This
   # runs BEFORE the corrupt-fragment loss injection below so a real corrupt fragment
   # of the CURRENT run is still counted.
   let runScope =

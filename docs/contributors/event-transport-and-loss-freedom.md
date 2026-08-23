@@ -492,11 +492,21 @@ library API**, not only a CLI:
   proof (public-surface-only: `mcComplete`, inputs captured, no `.rmdf-frag`
   spill).
 
+  `FsSnoopRequest` also carries a per-call `env` and `cwd`
+  (IoMon-Decomposed-Host-API DH-1). On Linux and macOS the injection variables
+  travel through the spawn and `runMonitored` mutates nothing process-global, so
+  N monitors can run concurrently in one host process without clobbering each
+  other's `LD_PRELOAD` / `REPRO_MONITOR_*`. The Windows arm still uses `putEnv`,
+  because `stackable_hooks.runWithMonitorShim` takes no `env`.
+
   The **streaming** form (`startMonitor* / drain* / finishMonitor*`) is
-  **deferred** — a streaming host would have to keep the mutated process-global
-  injection env (`LD_PRELOAD`, …) live between calls, risking a shim leak into
-  the parent; the batch form confines that mutation to one `defer`-guarded
-  scope and already covers the spawn-and-collect parent-host use case.
+  **deferred**. Its original rationale — that a streaming host would have to
+  keep a mutated process-global injection env live between calls, risking a shim
+  leak into the parent — is obsolete on POSIX after DH-1. What is left is the
+  lifecycle question: moving ownership of the wait out of `runMonitored` is
+  exactly what makes an LF-2 orphan reachable again, so the decomposed form
+  needs its own structural guarantee. Tracked as DH-2/DH-3 in
+  `reprobuild-specs/IoMon-Decomposed-Host-API.milestones.org`.
 
 ---
 

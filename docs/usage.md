@@ -246,13 +246,39 @@ that shares a segments directory (e.g. reprobuild/codetracer) sets it to its own
 tag before calling `runMonitored`, and the API re-exports the resolved value to
 the child so producers derive the same reaper scope.
 
+### Per-call environment and working directory
+
+`FsSnoopRequest.env` (a `seq[(string, string)]`) and `FsSnoopRequest.cwd` apply
+to the monitored child ONLY. `env` entries are layered on top of the environment
+this process already has (later duplicates win), and io-mon's own injection
+variables are applied on top of those, so a caller can extend `LD_PRELOAD` but
+cannot switch monitoring off by accident. `cwd` empty means "inherit the host's
+current directory".
+
+On Linux and macOS `runMonitored` mutates **nothing** process-global: the
+injection variables travel through the spawn, so N monitors may run concurrently
+on N threads of one host process and each gets its own uncontaminated evidence
+(IoMon-Decomposed-Host-API DH-1). Two residual exceptions, both documented at
+the call sites: the **Windows** arm still publishes its four variables via
+`putEnv` because `stackable_hooks.runWithMonitorShim` accepts no `env`; and on
+**macOS** `osproc` implements `workingDir` with a process-global
+`setCurrentDir` around `posix_spawn`, so a non-empty `cwd` is not thread-safe
+there.
+
+Executable resolution still uses the HOST's `PATH` (the `poUsePath` search runs
+before the child's environment is installed), so pass an absolute `command[0]`
+when `env` changes `PATH`. `depFilePath`, `eventStreamPath` and
+`captureStdioPath` are resolved by the host, not the child, and are unaffected
+by `cwd`.
+
 > **Streaming form (`startMonitor* / drain* / finishMonitor*`) — deferred.** M6
-> part A ships only the batch `runMonitored`. A streaming variant would have to
-> hold the mutated process-global injection env (`LD_PRELOAD`, …) live *between*
-> calls, which risks leaking the shim into the parent; the batch form keeps the
-> whole env mutation inside one `defer`-guarded scope. The batch API already
-> covers the parent-host use case (spawn-and-collect), so streaming is left for a
-> follow-up if an incremental/observe-while-running consumer materialises.
+> part A ships only the batch `runMonitored`. The original reason for deferring
+> it — that a streaming host would have to hold a mutated process-global
+> injection env live *between* calls, risking a shim leak into the parent — no
+> longer applies on POSIX now that DH-1 threads the env through the spawn. What
+> remains is the lifecycle question (who owns the wait, and how LF-2 stays
+> structurally impossible once the caller does), tracked as DH-2 in
+> `reprobuild-specs/IoMon-Decomposed-Host-API.milestones.org`.
 
 ### The launcher contract (completeness root-guard)
 

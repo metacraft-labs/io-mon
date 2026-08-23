@@ -376,6 +376,37 @@ type
     # means stdio is read+discarded (mimicking the engine when it
     # only cares about completion).
     captureStdioPath*: string
+    # IoMon-Decomposed-Host-API DH-1 — PER-CALL environment for the
+    # monitored child. Entries are layered on top of the parent's own
+    # environment (which the child otherwise inherits unchanged) and are
+    # applied to the SPAWN, never to the hosting process: `runMonitored`
+    # performs no `putEnv`, so two monitors running concurrently in one
+    # process cannot clobber each other's injection variables.
+    #
+    # Later duplicates win over earlier ones. io-mon's OWN injection
+    # variables (`LD_PRELOAD` / `DYLD_INSERT_LIBRARIES`,
+    # `REPRO_MONITOR_*`, `CT_SANDBOX_TOOLS_DIR`) are applied AFTER these,
+    # so a caller can never accidentally switch monitoring off — but the
+    # value a caller supplies IS honoured as the base the injection
+    # extends (a caller-supplied `LD_PRELOAD` is preserved after the
+    # shim, exactly as an inherited one is).
+    #
+    # NOTE: on POSIX the executable is still resolved via the HOSTING
+    # process's `PATH` (`osproc`'s `poUsePath` search runs before the new
+    # environment is installed), so a `PATH` entry here changes what the
+    # child sees but not which binary is launched. Pass an absolute
+    # `command[0]` when that distinction matters.
+    env*: seq[(string, string)]
+    # IoMon-Decomposed-Host-API DH-1 — PER-CALL working directory for the
+    # monitored child. Empty means "inherit the hosting process's cwd"
+    # (the historical behaviour). Set per-call rather than by `chdir`-ing
+    # the host, so concurrent monitors can each resolve their relative
+    # paths against their own action directory.
+    #
+    # `depFilePath`, `eventStreamPath` and `captureStdioPath` are resolved
+    # by the HOST, not the child, so they are unaffected by this field —
+    # pass them absolute if the host's cwd may differ.
+    cwd*: string
 
 const
   RmdfVersion* = 1'u16
