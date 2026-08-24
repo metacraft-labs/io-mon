@@ -192,6 +192,28 @@ let INVALID_HANDLE_VALUE {.used.}: HANDLE = cast[HANDLE](cast[uint](0'i64 - 1'i6
 
 # --- Win32 imports ---------------------------------------------------------
 
+proc callResultBool(raw: uint64): BOOL {.inline.} =
+  ## Narrow a hook's captured return register to Windows `BOOL` semantics.
+  ##
+  ## `HookContext.result` is `uint64` -- the full return register. Windows
+  ## `BOOL` is `int32`, and the x64 ABI does NOT require a callee to zero the
+  ## upper half of RAX for a 32-bit return; callers are simply expected to
+  ## ignore it. So the raw value can legitimately carry garbage above bit 31.
+  ##
+  ## A direct `callResultBool(ctx.result)` conversion is therefore two bugs waiting:
+  ##
+  ##   * it can raise `RangeDefect` when the raw value exceeds `int32.high`.
+  ##     These procs are `{.raises: [].}` hook callbacks and the surrounding
+  ##     `except CatchableError` does NOT catch a `Defect`, so that would take
+  ##     the whole monitored process down from inside a hook. Note the shim
+  ##     builds with `-d:release`, which KEEPS range checks -- only `-d:danger`
+  ##     removes them, so this is live in production builds, not just debug.
+  ##   * even where it does not trap, testing the full 64 bits answers a
+  ##     different question from the one Windows asked.
+  ##
+  ## Masking answers exactly the question `BOOL` encodes, and cannot trap.
+  BOOL(raw and 0xFFFF_FFFF'u64)
+
 proc GetCurrentProcessId(): DWORD
   {.importc, stdcall, dynlib: "kernel32".}
 proc GetCurrentThreadId(): DWORD
@@ -1547,7 +1569,7 @@ proc snoopReadFile(ctx: var hr.HookContext) {.raises: [].} =
   try:
     let hFile = cast[HANDLE](ctx.args[0])
     let lpBytesRead = cast[ptr DWORD](ctx.args[3])
-    let callOk = BOOL(ctx.result) != 0
+    let callOk = callResultBool(ctx.result) != 0
     var record = baseRecord(mrFileRead, moFileRead)
     record.path = pathForHandle(hFile)
     if callOk and lpBytesRead != nil:
@@ -1569,7 +1591,7 @@ proc snoopWriteFile(ctx: var hr.HookContext) {.raises: [].} =
   try:
     let hFile = cast[HANDLE](ctx.args[0])
     let lpBytesWritten = cast[ptr DWORD](ctx.args[3])
-    let callOk = BOOL(ctx.result) != 0
+    let callOk = callResultBool(ctx.result) != 0
     var record = baseRecord(mrFileWrite, moFileWrite)
     record.path = pathForHandle(hFile)
     if callOk and lpBytesWritten != nil:
@@ -1607,7 +1629,7 @@ proc snoopGetFileAttributesExW(ctx: var hr.HookContext) {.raises: [].} =
     return
   try:
     let lpFileName = cast[LPCWSTR](ctx.args[0])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var record = baseRecord(mrPathProbe, moPathProbe)
     record.path = widePtrToString(lpFileName)
     record.result = int64(r)
@@ -1626,7 +1648,7 @@ proc snoopGetFileAttributesExA(ctx: var hr.HookContext) {.raises: [].} =
     return
   try:
     let lpFileName = cast[LPCSTR](ctx.args[0])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var record = baseRecord(mrPathProbe, moPathProbe)
     if lpFileName != nil:
       record.path = $lpFileName
@@ -1903,7 +1925,7 @@ proc snoopCreateProcessW(ctx: var hr.HookContext) {.raises: [].} =
     if initialized and disabled == 0:
       let lpApplicationName = cast[LPCWSTR](ctx.args[0])
       let lpCommandLine = cast[LPWSTR](ctx.args[1])
-      let r = BOOL(ctx.result)
+      let r = callResultBool(ctx.result)
       var childForkRuntime = ""
       var record = baseRecord(mrProcessSpawn, moExecute)
       if created:
@@ -1980,7 +2002,7 @@ proc snoopCreateProcessA(ctx: var hr.HookContext) {.raises: [].} =
     if initialized and disabled == 0:
       let lpApplicationName = cast[LPCSTR](ctx.args[0])
       let lpCommandLine = cast[LPSTR](ctx.args[1])
-      let r = BOOL(ctx.result)
+      let r = callResultBool(ctx.result)
       var childForkRuntime = ""
       var record = baseRecord(mrProcessSpawn, moExecute)
       if created:
@@ -2060,7 +2082,7 @@ proc snoopDeleteFileW(ctx: var hr.HookContext) {.raises: [].} =
     return
   try:
     let lpFileName = cast[LPCWSTR](ctx.args[0])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var record = baseRecord(mrFileWrite, moFileWrite)
     record.path = widePtrToString(lpFileName)
     record.result = int64(r)
@@ -2078,7 +2100,7 @@ proc snoopDeleteFileA(ctx: var hr.HookContext) {.raises: [].} =
     return
   try:
     let lpFileName = cast[LPCSTR](ctx.args[0])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var record = baseRecord(mrFileWrite, moFileWrite)
     if lpFileName != nil:
       record.path = $lpFileName
@@ -2097,7 +2119,7 @@ proc snoopCreateDirectoryW(ctx: var hr.HookContext) {.raises: [].} =
     return
   try:
     let lpPathName = cast[LPCWSTR](ctx.args[0])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var record = baseRecord(mrFileWrite, moFileWrite)
     record.path = widePtrToString(lpPathName)
     record.result = int64(r)
@@ -2115,7 +2137,7 @@ proc snoopCreateDirectoryA(ctx: var hr.HookContext) {.raises: [].} =
     return
   try:
     let lpPathName = cast[LPCSTR](ctx.args[0])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var record = baseRecord(mrFileWrite, moFileWrite)
     if lpPathName != nil:
       record.path = $lpPathName
@@ -2135,7 +2157,7 @@ proc snoopCopyFileW(ctx: var hr.HookContext) {.raises: [].} =
   try:
     let lpExisting = cast[LPCWSTR](ctx.args[0])
     let lpNew      = cast[LPCWSTR](ctx.args[1])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var src = baseRecord(mrFileOpen, moFileRead)
     src.path = widePtrToString(lpExisting)
     src.result = int64(r)
@@ -2159,7 +2181,7 @@ proc snoopCopyFileA(ctx: var hr.HookContext) {.raises: [].} =
   try:
     let lpExisting = cast[LPCSTR](ctx.args[0])
     let lpNew      = cast[LPCSTR](ctx.args[1])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var src = baseRecord(mrFileOpen, moFileRead)
     if lpExisting != nil:
       src.path = $lpExisting
@@ -2185,7 +2207,7 @@ proc snoopMoveFileExW(ctx: var hr.HookContext) {.raises: [].} =
   try:
     let lpExisting = cast[LPCWSTR](ctx.args[0])
     let lpNew      = cast[LPCWSTR](ctx.args[1])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var src = baseRecord(mrFileWrite, moFileWrite)
     src.path = widePtrToString(lpExisting)
     src.result = int64(r)
@@ -2213,7 +2235,7 @@ proc snoopMoveFileExA(ctx: var hr.HookContext) {.raises: [].} =
   try:
     let lpExisting = cast[LPCSTR](ctx.args[0])
     let lpNew      = cast[LPCSTR](ctx.args[1])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var src = baseRecord(mrFileWrite, moFileWrite)
     if lpExisting != nil:
       src.path = $lpExisting
@@ -2238,7 +2260,7 @@ proc snoopGetFileInformationByHandleEx(ctx: var hr.HookContext) {.raises: [].} =
     return
   try:
     let hFile = cast[HANDLE](ctx.args[0])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var record = baseRecord(mrPathProbe, moPathProbe)
     record.path = pathForHandle(hFile)
     record.result = int64(r)
@@ -2257,7 +2279,7 @@ proc snoopSetCurrentDirectoryW(ctx: var hr.HookContext) {.raises: [].} =
     return
   try:
     let lpPathName = cast[LPCWSTR](ctx.args[0])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var record = baseRecord(mrFileOpen, moExecute)
     record.path = widePtrToString(lpPathName)
     record.result = int64(r)
@@ -2275,7 +2297,7 @@ proc snoopSetCurrentDirectoryA(ctx: var hr.HookContext) {.raises: [].} =
     return
   try:
     let lpPathName = cast[LPCSTR](ctx.args[0])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var record = baseRecord(mrFileOpen, moExecute)
     if lpPathName != nil:
       record.path = $lpPathName
@@ -2964,14 +2986,14 @@ proc trampolineFindNextFileW(hFindFile: HANDLE;
     cast[uint64](lpFindFileData)
   ])
   hr.dispatchShimHook(hr.HookFindNextFileW, ctx)
-  result = BOOL(ctx.result)
+  result = callResultBool(ctx.result)
 
 proc trampolineFindClose(hFindFile: HANDLE): BOOL {.stdcall.} =
   if origFindClose == nil:
     return 0
   var ctx = hr.HookContext(args: @[cast[uint64](hFindFile)])
   hr.dispatchShimHook(hr.HookFindClose, ctx)
-  result = BOOL(ctx.result)
+  result = callResultBool(ctx.result)
 
 proc trampolineGetProcAddress(hModule: HANDLE;
                                lpProcName: LPCSTR): pointer {.stdcall.} =
