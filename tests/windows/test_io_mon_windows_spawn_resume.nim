@@ -90,6 +90,10 @@ const
   CREATE_NO_WINDOW = 0x08000000'u32
   WAIT_OBJECT_0 = 0x00000000'u32
   ChildExitCode = 42'u32
+  # Win64 callers may not inspect the upper half of RAX for a 32-bit BOOL
+  # return, so a conforming callee may leave arbitrary bits there. Poison them
+  # in the fake chain tail to exercise the narrowing performed by the hook.
+  PoisonedRaxUpperBits = 0xA5A5_A5A5_0000_0000'u64
   # A `cmd /c exit 42` takes tens of milliseconds. This budget only has to
   # separate "ran" from "frozen forever", so it is generous.
   ChildRunBudgetMs = 20_000'u32
@@ -155,7 +159,7 @@ proc originalCreateProcessWStub(ctx: var hr.HookContext) {.raises: [].} =
     BOOL(ctx.args[4]), flags, cast[LPVOID](ctx.args[6]),
     cast[LPCWSTR](ctx.args[7]), cast[ptr STARTUPINFOW](ctx.args[8]),
     cast[ptr PROCESS_INFORMATION](ctx.args[9]))
-  ctx.result = uint64(uint32(r))
+  ctx.result = PoisonedRaxUpperBits or uint64(uint32(r))
   applyDisruption()
 
 proc originalCreateProcessAStub(ctx: var hr.HookContext) {.raises: [].} =
@@ -167,7 +171,7 @@ proc originalCreateProcessAStub(ctx: var hr.HookContext) {.raises: [].} =
     BOOL(ctx.args[4]), flags, cast[LPVOID](ctx.args[6]),
     cast[LPCSTR](ctx.args[7]), cast[ptr STARTUPINFOA](ctx.args[8]),
     cast[ptr PROCESS_INFORMATION](ctx.args[9]))
-  ctx.result = uint64(uint32(r))
+  ctx.result = PoisonedRaxUpperBits or uint64(uint32(r))
   applyDisruption()
 
 proc toWide(s: string): seq[uint16] =
@@ -245,7 +249,7 @@ proc spawnThroughHookW(callerFlags: DWORD; disruption: Disruption):
   gDisruption = drNone
   disabled = 0
   initialized = true
-  SpawnOutcome(created: ctx.result != 0'u64,
+  SpawnOutcome(created: (ctx.result and 0xFFFF_FFFF'u64) != 0'u64,
                flagsSeenByWin32: DWORD(ctx.args[5]),
                pi: pi)
 
@@ -268,7 +272,7 @@ proc spawnThroughHookA(callerFlags: DWORD; disruption: Disruption):
   gDisruption = drNone
   disabled = 0
   initialized = true
-  SpawnOutcome(created: ctx.result != 0'u64,
+  SpawnOutcome(created: (ctx.result and 0xFFFF_FFFF'u64) != 0'u64,
                flagsSeenByWin32: DWORD(ctx.args[5]),
                pi: pi)
 
