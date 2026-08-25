@@ -932,22 +932,31 @@ var
   monitorsStartedCount: Atomic[uint64]
   monitorsFinishedCount: Atomic[uint64]
   monitorsReleasedCount: Atomic[uint64]
+  monitorsSettledCount: Atomic[uint64]
 
-proc monitorLifecycleCounts*(): tuple[started, finished, released, live: int] =
+proc monitorLifecycleCounts*():
+    tuple[started, finished, released, live, settled: int] =
   ## Process-wide census of monitors handled by THIS module.
   ##
   ## `started` counts `startMonitor` calls that got as far as owning something
   ## (past shim resolution); `finished` counts `finishMonitor` calls;
   ## `released` counts monitors whose consumer structure and scratch state have
   ## been torn down — by `finishMonitor` OR by a dropped handle's destructor.
-  ## `live` is `started - released`.
+  ## `live` is `started - released`. `settled` counts monitors whose §4.1
+  ## detached-descendant guard has run (`settleMonitorDescendants`).
   ##
-  ## Two jobs, both real rather than test-only:
+  ## Three jobs, all real rather than test-only:
   ##
   ##  * a long-lived host can assert `live == 0` at shutdown, which is the LF-2
-  ##    property stated as a number it can check; and
+  ##    property stated as a number it can check;
   ##  * `finished < released` is exactly "somebody dropped a handle", which is a
-  ##    host bug worth reporting even though this module survives it.
+  ##    host bug worth reporting even though this module survives it; and
+  ##  * `settled == finished` is the DH-3 property stated as a number: every
+  ##    monitor that produced evidence went through the descendant guard first.
+  ##    It cannot be violated by a host — the guard is inside the funnel every
+  ##    `MonitorResult` comes out of (see `collectMonitorEvidence`) — so what
+  ##    this number catches is a change to THIS module, which is the only way it
+  ##    could be violated at all.
   ##
   ## It is also what pins `runMonitored`'s delegation executably: a
   ## reimplementation that stopped going through `startMonitor`/`finishMonitor`
@@ -955,8 +964,9 @@ proc monitorLifecycleCounts*(): tuple[started, finished, released, live: int] =
   let started = int(monitorsStartedCount.load())
   let finished = int(monitorsFinishedCount.load())
   let released = int(monitorsReleasedCount.load())
+  let settled = int(monitorsSettledCount.load())
   (started: started, finished: finished, released: released,
-   live: started - released)
+   live: started - released, settled: settled)
 
 type
   MonitorHandle* = object
@@ -1016,7 +1026,12 @@ type
     ## from `runMonitored`.
     active: bool                   ## owns something releasable
     exited: bool                   ## the monitored root has been reaped
-    settled: bool                  ## the §4.1 descendant grace has run
+    settled: bool                  ## the §4.1 descendant grace has run.
+                                   ## Written ONLY by `settleMonitorDescendants`
+                                   ## and read by `collectMonitorEvidence`'s
+                                   ## gate — the DH-3 mechanism that makes the
+                                   ## guard unskippable rather than merely
+                                   ## present.
     exitCode: int
     rootPid: uint64
     runId: string
@@ -1093,26 +1108,43 @@ proc waitForMonitorRoot(h: var MonitorHandle) =
 proc settleMonitorDescendants(h: var MonitorHandle) =
   ## The §4.1 detached-descendant grace (Linux). Idempotent.
   ##
-  ## This is an EVIDENCE step, not a safety step, which is why `finishMonitor`
-  ## runs it and a dropped handle's destructor does not: what it produces is an
-  ## `mrEventLoss` marker that downgrades the edge to `mcIncomplete`, and a
+  ## This is an EVIDENCE step, not a safety step, which is why the evidence
+  ## funnel runs it and a dropped handle's destructor does not: what it produces
+  ## is an `mrEventLoss` marker that downgrades the edge to `mcIncomplete`, and a
   ## dropped handle publishes no edge for it to downgrade. The safety of a
   ## surviving descendant is provided by the release order instead — the root is
   ## reaped first, and a descendant that outlives the consumer then fast-fails
   ## with `emConsumerGone` (LF-4).
   ##
-  ## (Making the guard unskippable for a host that owns its OWN spawn is DH-3;
-  ## this only keeps it on the one path `runMonitored` already took.)
+  ## **DH-3 — this is the guard an external host must not be able to skip.**
+  ## `waitForLinuxInjectedDescendants` and its detector `liveInjectedDescendants`
+  ## stay PRIVATE deliberately: exporting them would hand a host a proc it can
+  ## forget to call, which reproduces the false-`mcComplete` hazard one level up
+  ## instead of closing it. The guard is instead the FIRST act of
+  ## `collectMonitorEvidence`, the single funnel every `MonitorResult` is
+  ## produced through, and that funnel REFUSES to merge for a handle this proc
+  ## has not marked. So "a host that owns its own spawn" is not a configuration
+  ## the public surface can reach: `startMonitor` is the only spawn site, and
+  ## `finishMonitor` is the only exit.
+  ##
+  ## `h.settled` is the flag the funnel's gate reads, and this proc is its ONLY
+  ## writer — which is what makes the gate a check on the guard rather than a
+  ## restatement of it.
+  if h.settled:
+    return
+  h.settled = true
+  discard monitorsSettledCount.fetchAdd(1'u64)
   when defined(linux):
-    if h.settled:
-      return
-    h.settled = true
     let launcherLossPath0 =
       if h.depSetLive and h.depSet.available: h.depSet.path0 else: ""
     waitForLinuxInjectedDescendants(h.fragmentDir, h.runId, h.rootPid,
       launcherLossPath0)
   else:
-    h.settled = true
+    # macOS and Windows have no §4.1 equivalent yet — the detached-descendant
+    # scan is a `/proc` walk. The STEP still runs (and still marks the handle),
+    # so an arm that grows a real guard later inherits the gate below for free
+    # rather than having to remember to re-add it.
+    discard
 
 proc releaseMonitor(h: var MonitorHandle) =
   ## Release everything the monitor owns: mark the consumer gone and unmap it,
@@ -1492,50 +1524,64 @@ proc pollMonitor*(handle: var MonitorHandle): bool =
   else:
     return true
 
-proc finishMonitor*(handle: sink MonitorHandle): MonitorResult =
-  ## **Public parent-host API (IoMon-Decomposed-Host-API DH-2).** Consume the
-  ## handle and produce the evidence: wait for the root if it has not exited,
-  ## run the §4.1 detached-descendant grace, snapshot the consumer-owned set,
-  ## write the canonical depfile, and release everything.
+proc collectMonitorEvidence(h: var MonitorHandle): MonitorDepFile =
+  ## **The single funnel every `MonitorResult`'s evidence comes out of
+  ## (IoMon-Decomposed-Host-API DH-3).** Runs the §4.1 detached-descendant guard,
+  ## then merges the edge's evidence into the canonical depfile.
   ##
-  ## Takes the handle by `sink`: the result is obtainable only by GIVING UP the
-  ## handle, so a caller cannot keep polling (or finishing) a monitor whose
-  ## consumer has been released. Pass a `move`d handle when the caller's binding
-  ## is not dead at the call site.
+  ## WHY THIS PROC EXISTS AT ALL — it would be shorter to inline these steps back
+  ## into `finishMonitor`, and that is exactly what DH-2 had. The problem with an
+  ## inlined guard is that it is a STATEMENT: it holds only while the statement
+  ## is where somebody put it, and the failure mode of losing it is the cardinal
+  ## sin — a `mcComplete` edge over a dependency set a detached descendant was
+  ## still adding to. So the guard and the merge are made ONE step with the guard
+  ## first, and the step is gated on the guard's own flag:
   ##
-  ## The steps are the same procs a dropped handle's destructor runs, in the
-  ## same order, with the evidence collected between them — `waitForMonitorRoot`
-  ## then `releaseMonitor` — so LF-2's ordering has one implementation and this
-  ## path cannot drift from that one.
+  ##  * `settleMonitorDescendants` is the only writer of `h.settled`;
+  ##  * nothing here merges anything for a handle where that flag is false;
+  ##  * `finishMonitor` contains no merge of its own, so there is no second
+  ##    route to a `MonitorDepFile` for a handle.
   ##
-  ## Raises `ValueError` for a handle that is not live.
-  var h = move(handle)
-  if not h.active:
+  ## What each half catches is different, and both are needed. Deleting or
+  ## reordering the guard call trips the gate, so a bypass surfaces as a LOUD
+  ## `ValueError` on every arm instead of a quiet false `mcComplete` — the
+  ## cardinal sin is converted into a crash. A guard that is called but does
+  ## nothing still passes the gate, and that is what
+  ## `tests/linux/test_io_mon_external_host_descendant_guard.nim` catches, by
+  ## running a real detached descendant past a real grace window and demanding
+  ## the `mcIncomplete` downgrade.
+  ##
+  ## ORDER IS LOAD-BEARING ON LINUX, which is the other reason this is one proc.
+  ## The guard publishes its `mrEventLoss` INTO the consumer-owned `nim-shm-gset`
+  ## (`appendLauncherEventLoss` → `emitLauncherLossToSet`), and the snapshot
+  ## below is taken ONCE. A settle that ran after the snapshot would insert a
+  ## marker nobody ever reads: `summarizeRecords` would never count it into
+  ## `eventLossCount`, and the edge would publish `mcComplete`. So "the guard
+  ## ran" and "the guard ran in time" are the same requirement here, and keeping
+  ## both inside one proc is what stops them drifting apart.
+  settleMonitorDescendants(h)
+  if not h.settled:
+    # Unreachable while `settleMonitorDescendants` is what runs above — which is
+    # the point. This is not a defensive nicety: it is the mechanism that makes
+    # the guard unskippable rather than merely present, and it fails CLOSED.
     raise newException(ValueError,
-      "finishMonitor: this MonitorHandle does not own a live monitor (it was " &
-        "default-constructed, moved from, or already finished)")
-  discard monitorsFinishedCount.fetchAdd(1'u64)
-  result.depFilePath = h.request.depFilePath
-
-  waitForMonitorRoot(h)
-  result.exitCode = h.exitCode
-
+      "io-mon internal invariant: refusing to produce evidence for a monitor " &
+        "whose §4.1 detached-descendant guard has not run — that would risk a " &
+        "false mcComplete over a set a detached descendant is still growing")
   when defined(macosx):
-    result.depFile = mergeFragments(h.fragmentDir, h.request.depFilePath,
+    result = mergeFragments(h.fragmentDir, h.request.depFilePath,
       expectedRootPid = h.rootPid)
   elif defined(linux):
-    # io-mon-Lossless-Event-Capture M7 (Linux slice) — the live set's shard0
-    # path goes to the grace guard, so a launcher-side event-loss (a descendant
-    # still alive past the grace window) is inserted into the CONSUMER-OWNED set,
-    # folded into the depfile by the snapshot below, with NO `.rmdf-frag` file —
-    # Linux is file-free end-to-end.
-    settleMonitorDescendants(h)
     # io-mon-Lossless-Event-Capture M3 part 2a — SINGLE-THREADED final merge over
     # the SET's DISTINCT elements. The DEP-FLUSH shutdown guarantees every producer
     # published its last record, so snapshot the deduped union of all shards and
     # decode each element (identity element-key + trailing incarnation-image bytes)
     # back to a `MonitorRecord` (seq reconstructs as 0). These fold into the
     # merge via the `setRecords` argument.
+    #
+    # The guard above already ran, so a launcher-side event-loss (a descendant
+    # still alive past the grace window) is ALREADY in the consumer-owned set and
+    # this snapshot picks it up — file-free end-to-end on Linux, no `.rmdf-frag`.
     #
     # DETERMINISM: `snapshot` yields elements in hash-slot order (non-deterministic
     # across runs), and two DISTINCT elements can tie in `canonicalOrder` because
@@ -1562,7 +1608,7 @@ proc finishMonitor*(handle: sink MonitorHandle): MonitorResult =
       if growthFailed > 0'u64:
         stderr.writeLine("io-mon: dep-set growth failed " & $growthFailed &
           " time(s); dependency capture may be incomplete for this edge")
-    result.depFile = mergeFragments(h.fragmentDir, h.request.depFilePath,
+    result = mergeFragments(h.fragmentDir, h.request.depFilePath,
       expectedRootPid = h.rootPid, currentRunId = h.runId,
       setRecords = depDrained)
   elif defined(windows):
@@ -1595,8 +1641,53 @@ proc finishMonitor*(handle: sink MonitorHandle): MonitorResult =
     # pass. What changes: an injected root that emits NOTHING used to be
     # published as `mcComplete` over an empty record set — a zero-effort false
     # cache hit for the whole action — and is now downgraded to `mcIncomplete`.
-    result.depFile = mergeFragments(h.fragmentDir, h.request.depFilePath,
+    result = mergeFragments(h.fragmentDir, h.request.depFilePath,
       expectedRootPid = h.rootPid, setRecords = launcherRecords)
+
+proc finishMonitor*(handle: sink MonitorHandle): MonitorResult =
+  ## **Public parent-host API (IoMon-Decomposed-Host-API DH-2).** Consume the
+  ## handle and produce the evidence: wait for the root if it has not exited,
+  ## run the §4.1 detached-descendant grace, snapshot the consumer-owned set,
+  ## write the canonical depfile, and release everything.
+  ##
+  ## Takes the handle by `sink`: the result is obtainable only by GIVING UP the
+  ## handle, so a caller cannot keep polling (or finishing) a monitor whose
+  ## consumer has been released. Pass a `move`d handle when the caller's binding
+  ## is not dead at the call site.
+  ##
+  ## The steps are the same procs a dropped handle's destructor runs, in the
+  ## same order, with the evidence collected between them — `waitForMonitorRoot`
+  ## then `releaseMonitor` — so LF-2's ordering has one implementation and this
+  ## path cannot drift from that one.
+  ##
+  ## **DH-3 — the §4.1 descendant guard is NOT SKIPPABLE from out here.** It is
+  ## not a step this proc politely remembers to take: the evidence is produced by
+  ## `collectMonitorEvidence`, whose first act is the guard and which refuses to
+  ## merge for a handle the guard has not marked. Combined with `startMonitor`
+  ## being the module's only spawn site and this proc being the only producer of
+  ## a `MonitorResult`, a host CANNOT reach an edge's completeness verdict along
+  ## a path the guard did not run on — which is why
+  ## `waitForLinuxInjectedDescendants` / `liveInjectedDescendants` stay private
+  ## rather than being exported for hosts to call themselves.
+  ##
+  ## Raises `ValueError` for a handle that is not live.
+  var h = move(handle)
+  if not h.active:
+    raise newException(ValueError,
+      "finishMonitor: this MonitorHandle does not own a live monitor (it was " &
+        "default-constructed, moved from, or already finished)")
+  discard monitorsFinishedCount.fetchAdd(1'u64)
+  result.depFilePath = h.request.depFilePath
+
+  waitForMonitorRoot(h)
+  result.exitCode = h.exitCode
+
+  # DH-3 — the evidence is produced HERE and only here, by the one funnel that
+  # runs the §4.1 descendant guard first and refuses to merge without it. There
+  # is deliberately no per-arm merge in this proc: a second route to a
+  # `MonitorDepFile` is a second route around the guard.
+  result.depFile = collectMonitorEvidence(h)
+
   renderStreamToPath(h.request.depFilePath, h.request.streamMode,
     h.request.eventStreamPath)
   releaseMonitor(h)

@@ -331,12 +331,34 @@ while remaining > 0:
   consumer-side work done sooner — what it buys is the caller's own scheduling.
   Raises `ValueError` on a handle that is not live.
 - `finishMonitor(h: sink MonitorHandle): MonitorResult` — waits if the root has
-  not exited, runs the §4.1 descendant grace, snapshots the set, writes the
-  canonical depfile, releases the consumer. The result is obtainable only by
-  giving up the handle.
-- `monitorLifecycleCounts(): tuple[started, finished, released, live: int]` — the
-  process-wide census. A host can assert `live == 0` at shutdown; `finished <
-  released` means somebody dropped a handle.
+  not exited, runs the §4.1 descendant grace (unskippably — see below),
+  snapshots the set, writes the canonical depfile, releases the consumer. The
+  result is obtainable only by giving up the handle.
+- `monitorLifecycleCounts(): tuple[started, finished, released, live, settled: int]`
+  — the process-wide census. A host can assert `live == 0` at shutdown;
+  `finished < released` means somebody dropped a handle; `settled` counts the
+  monitors whose §4.1 descendant guard ran, and equals `finished` (see below).
+
+**The §4.1 descendant guard is not yours to remember** (DH-3). A monitored tree
+can leave a DETACHED DESCENDANT behind — the root exits, but a daemonized child
+keeps reading and writing files outside the evidence. io-mon detects that by
+scanning `/proc/*/environ` for this run's injection needles and, past a grace
+window (`IO_MON_LINUX_DESCENDANT_GRACE_MS`, default 500), publishing an
+event-loss marker that downgrades the edge to `mcIncomplete`. Reporting
+`mcComplete` where the batch entry point reports `mcIncomplete` would be a false
+cache hit for the whole action, so the guard is **not** exported as a step you
+call: it is the first act of the single funnel every `MonitorResult`'s evidence
+is produced by, and that funnel refuses to merge for a monitor the guard has not
+marked. A decomposed host therefore grades an edge exactly as `runMonitored`
+does, and cannot opt out. Pinned by
+`tests/linux/test_io_mon_external_host_descendant_guard.nim`, which runs a real
+detached descendant past a real grace window down both launch paths.
+
+A DROPPED handle does not run the guard, deliberately: it is an EVIDENCE step,
+and a dropped handle publishes no edge for a loss marker to downgrade. The
+SAFETY of a surviving descendant does not depend on it — the root is reaped
+before the consumer is released, and a descendant that outlives the consumer
+then fast-fails with `emConsumerGone` instead of growing a set with no reader.
 
 **`MonitorHandle` is exclusive, and dropping it finishes it.** Moving the wait
 out of `runMonitored` is what re-opens the LF-2 window (§4.1: a producer still

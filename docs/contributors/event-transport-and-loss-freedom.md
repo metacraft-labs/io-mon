@@ -530,8 +530,32 @@ library API**, not only a CLI:
   loop, and `runMonitored`'s delegation asserted both at runtime and at source
   level) and `tests/portable/test_io_mon_monitor_handle_exclusivity.nim` (the
   real compiler refusing every copy of a handle, with positive controls).
-  Making the §4.1 descendant guard unskippable for a host that owns its OWN
-  spawn is DH-3, still open.
+
+  **The §4.1 descendant guard is unskippable from outside (DH-3).** The
+  detector (`liveInjectedDescendants`) and its grace wait
+  (`waitForLinuxInjectedDescendants`) are private, and stay private: exporting
+  them would hand a host a proc it can forget to call, which reproduces the
+  false-`mcComplete` hazard one level up instead of closing it. Instead the
+  guard is the FIRST act of `collectMonitorEvidence` — the single funnel every
+  `MonitorResult`'s evidence is produced by — and that funnel refuses to merge
+  for a monitor the guard has not marked, so a bypass surfaces as a loud raise
+  rather than a quiet false `mcComplete`. With `startMonitor` the only spawn
+  site and `finishMonitor` the only producer of a `MonitorResult`, "a host that
+  owns its own spawn" is not a configuration the public surface can reach, and a
+  decomposed host grades a detached descendant exactly as `runMonitored` does.
+  Order is load-bearing on Linux and is held by the same proc: the guard
+  publishes its `mrEventLoss` INTO the consumer-owned set, which is snapshotted
+  once, so a settle that ran after the snapshot would publish a marker nothing
+  ever reads. Pinned by
+  `tests/linux/test_io_mon_external_host_descendant_guard.nim` — a real
+  detached descendant held alive across a real grace window, graded by both
+  launch paths, with a quiescing control; the structural claim asserted against
+  the source; and LF-4's `markConsumerGone` pinned by a real producer whose
+  late `emit` must answer `emConsumerGone`.
+
+  A DROPPED handle deliberately does NOT run the guard: it is an evidence step
+  and a dropped handle publishes no edge for a loss marker to downgrade. That
+  asymmetry is asserted, not just documented (the census's `settled` counter).
 
 ---
 
