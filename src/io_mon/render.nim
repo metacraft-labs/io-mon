@@ -79,6 +79,11 @@ proc capabilityGapJson(gap: MonitorCapabilityGap): JsonNode =
   result["backendFamily"] = %backendFamilyId(gap.backendFamily)
   result["capability"] = %capabilityId(gap.capability)
   result["required"] = %gap.required
+  # Whether the shortfall is on the INPUT side. `required` says only whether
+  # the caller asked for the capability, so without this a consumer had to
+  # read the English `reason` to tell an unobserved input from output-side
+  # bookkeeping.
+  result["inputChannel"] = %gap.inputChannel
   result["reason"] = %gap.reason
 
 proc backendProfileJson(profile: MonitorBackendProfile): JsonNode =

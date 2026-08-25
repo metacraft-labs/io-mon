@@ -142,8 +142,41 @@ const
   # stub prologue), so we have to intercept the pointer LOOKUP
   # instead of the function body.
   HookGetProcAddress* = "GetProcAddress"
+  # M5 — IPC-connect (mcapIpcConnect). The socket half lives in ws2_32.dll;
+  # the named-pipe half needs no new entry point at all, because a Windows
+  # pipe CLIENT connects by opening `\\.\pipe\<name>` through the already
+  # hooked CreateFileW/A + NtCreateFile. That half is therefore a
+  # CLASSIFICATION change in those snoops, not a new hook.
+  HookConnect* = "connect"
+  HookWSAConnect* = "WSAConnect"
+  # M5 — external content (mcapExternalContent). Windows' analogues of the
+  # POSIX shm / FIFO / inherited-fd channels the macOS arm covers:
+  #   * file mappings — a NAMED section is the shm analogue, and a view of a
+  #     FILE-backed section is a content read that NEVER passes ReadFile;
+  #   * anonymous pipes — CreatePipe is the `pipe(2)` analogue, and the
+  #     kernel object it makes has a process-independent name
+  #     (`\Win32Pipes.<hi>.<lo>`) that the merge can pair create against read;
+  #   * NTFS alternate data streams — `file:stream`, already visible to
+  #     CreateFileW but never classified.
+  HookCreateFileMappingW* = "CreateFileMappingW"
+  HookCreateFileMappingA* = "CreateFileMappingA"
+  HookOpenFileMappingW* = "OpenFileMappingW"
+  HookOpenFileMappingA* = "OpenFileMappingA"
+  HookMapViewOfFile* = "MapViewOfFile"
+  HookMapViewOfFileEx* = "MapViewOfFileEx"
+  HookCreatePipe* = "CreatePipe"
+  # M5 — non-determinism (mcapNonDeterminism). Entropy sources live in
+  # bcrypt.dll / advapi32.dll / bcryptprimitives.dll; clock sources in
+  # kernel32.dll.
+  HookBCryptGenRandom* = "BCryptGenRandom"
+  HookProcessPrng* = "ProcessPrng"
+  HookSystemFunction036* = "SystemFunction036"
+  HookCryptGenRandom* = "CryptGenRandom"
+  HookQueryPerformanceCounter* = "QueryPerformanceCounter"
+  HookGetSystemTimeAsFileTime* = "GetSystemTimeAsFileTime"
+  HookGetTickCount64* = "GetTickCount64"
 
-const MonitorShimHookNames*: array[33, string] = [
+const MonitorShimHookNames*: array[49, string] = [
   HookCreateFileW, HookCreateFileA, HookReadFile, HookWriteFile,
   HookCloseHandle,
   HookGetFileAttributesExW, HookGetFileAttributesExA,
@@ -160,7 +193,15 @@ const MonitorShimHookNames*: array[33, string] = [
   HookNtQueryDirectoryFile, HookNtQueryInformationByName,
   HookNtQueryDirectoryFileEx,
   HookFindFirstFileW, HookFindFirstFileExW, HookFindNextFileW, HookFindClose,
-  HookGetProcAddress
+  HookGetProcAddress,
+  HookConnect, HookWSAConnect,
+  HookCreateFileMappingW, HookCreateFileMappingA,
+  HookOpenFileMappingW, HookOpenFileMappingA,
+  HookMapViewOfFile, HookMapViewOfFileEx, HookCreatePipe,
+  HookBCryptGenRandom, HookProcessPrng, HookSystemFunction036,
+  HookCryptGenRandom,
+  HookQueryPerformanceCounter, HookGetSystemTimeAsFileTime,
+  HookGetTickCount64
 ]
 
 # --- Standard hook priorities ----------------------------------------------

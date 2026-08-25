@@ -258,6 +258,51 @@ proc GetCurrentProcess(): HANDLE
   {.importc, stdcall, dynlib: "kernel32".}
 
 # ---------------------------------------------------------------------------
+# M5 — Win32 imports for the IPC-connect / external-content / non-determinism
+# observation surface.
+#
+# `LoadLibraryW` is used to FORCE the modules those hooks live in to be mapped
+# before the install pass runs. That is not a convenience: a hook can only be
+# installed into a module that is loaded, and a module loaded LATER would carry
+# an un-hooked entry point while the profile advertises the capability -- the
+# exact shape of over-claim M4 exists to prevent. Mapping ws2_32 / bcrypt /
+# advapi32 up front makes "the entry point is hooked" true for the whole
+# lifetime of the process rather than only for processes that happened to
+# import them statically.
+proc LoadLibraryW(lpLibFileName: LPCWSTR): HANDLE
+  {.importc, stdcall, dynlib: "kernel32".}
+# The pipe analogue of `LOCAL_PEERPID`: it names the process on the SERVER end
+# of a pipe the caller opened, which is what lets the merge prove whether a
+# named-pipe peer is one of this run's monitored processes or an out-of-tree
+# breakaway daemon.
+proc GetNamedPipeServerProcessId(Pipe: HANDLE, ServerProcessId: ptr DWORD): BOOL
+  {.importc, stdcall, dynlib: "kernel32".}
+proc GetNamedPipeClientProcessId(Pipe: HANDLE, ClientProcessId: ptr DWORD): BOOL
+  {.importc, stdcall, dynlib: "kernel32".}
+proc GetFileType(hFile: HANDLE): DWORD
+  {.importc, stdcall, dynlib: "kernel32".}
+
+# `__builtin_return_address(0)` inside a trampoline yields the address the
+# CALLER will return to. With an inline detour the caller's `call kernel32!Xxx`
+# lands directly on the trampoline, so this is the program's own call site --
+# the Windows counterpart of the macOS arm's `ct_macos_addr_in_program` caller
+# attribution, and needed for the same reason: an entropy hook is not limited
+# to the program's own calls, and flagging the CRT's or the loader's would make
+# the observation meaningless.
+proc builtinReturnAddress(level: cint): pointer
+  {.importc: "__builtin_return_address", nodecl, raises: [].}
+
+const
+  FILE_TYPE_PIPE = 0x0003'u32
+  AfUnixW = 1'u16
+  AfInetW = 2'u16
+  AfInet6W = 23'u16
+  FILE_MAP_COPY = 0x0001'u32
+  FILE_MAP_WRITE = 0x0002'u32
+  FILE_MAP_READ = 0x0004'u32
+  FILE_MAP_ALL_ACCESS = 0x000F001F'u32
+
+# ---------------------------------------------------------------------------
 # Loader notification (library-load observation)
 #
 # `LdrRegisterDllNotification` is the Windows counterpart of dyld's
@@ -538,6 +583,74 @@ type
                              lpProcName: LPCSTR): pointer
                              {.stdcall, raises: [].}
 
+  # --- M5: IPC-connect (ws2_32.dll) --------------------------------------
+  #
+  # SOCKET is UINT_PTR, i.e. pointer-sized in both bitnesses; `uint` matches.
+  ConnectProc = proc(s: uint; name: pointer; namelen: int32): int32
+                     {.stdcall, raises: [].}
+  WSAConnectProc = proc(s: uint; name: pointer; namelen: int32;
+                        lpCallerData: pointer; lpCalleeData: pointer;
+                        lpSQOS: pointer; lpGQOS: pointer): int32
+                        {.stdcall, raises: [].}
+
+  # --- M5: external content (kernel32.dll) --------------------------------
+  CreateFileMappingWProc = proc(hFile: HANDLE;
+                                lpAttributes: LPSECURITY_ATTRIBUTES;
+                                flProtect: DWORD;
+                                dwMaximumSizeHigh: DWORD;
+                                dwMaximumSizeLow: DWORD;
+                                lpName: LPCWSTR): HANDLE
+                                {.stdcall, raises: [].}
+  CreateFileMappingAProc = proc(hFile: HANDLE;
+                                lpAttributes: LPSECURITY_ATTRIBUTES;
+                                flProtect: DWORD;
+                                dwMaximumSizeHigh: DWORD;
+                                dwMaximumSizeLow: DWORD;
+                                lpName: LPCSTR): HANDLE
+                                {.stdcall, raises: [].}
+  OpenFileMappingWProc = proc(dwDesiredAccess: DWORD; bInheritHandle: BOOL;
+                              lpName: LPCWSTR): HANDLE
+                              {.stdcall, raises: [].}
+  OpenFileMappingAProc = proc(dwDesiredAccess: DWORD; bInheritHandle: BOOL;
+                              lpName: LPCSTR): HANDLE
+                              {.stdcall, raises: [].}
+  MapViewOfFileProc = proc(hFileMappingObject: HANDLE; dwDesiredAccess: DWORD;
+                           dwFileOffsetHigh: DWORD; dwFileOffsetLow: DWORD;
+                           dwNumberOfBytesToMap: SIZE_T): LPVOID
+                           {.stdcall, raises: [].}
+  MapViewOfFileExProc = proc(hFileMappingObject: HANDLE;
+                             dwDesiredAccess: DWORD;
+                             dwFileOffsetHigh: DWORD; dwFileOffsetLow: DWORD;
+                             dwNumberOfBytesToMap: SIZE_T;
+                             lpBaseAddress: LPVOID): LPVOID
+                             {.stdcall, raises: [].}
+  CreatePipeProc = proc(hReadPipe: ptr HANDLE; hWritePipe: ptr HANDLE;
+                        lpPipeAttributes: LPSECURITY_ATTRIBUTES;
+                        nSize: DWORD): BOOL
+                        {.stdcall, raises: [].}
+
+  # --- M5: non-determinism -----------------------------------------------
+  #
+  # `SystemFunction036` (the export behind the documented `RtlGenRandom`)
+  # returns BOOLEAN -- one BYTE in AL, with the rest of EAX undefined. It is
+  # declared with a byte-wide result so the trampoline round-trips exactly
+  # what the callee produced rather than widening undefined bits.
+  BCryptGenRandomProc = proc(hAlgorithm: HANDLE; pbBuffer: pointer;
+                             cbBuffer: DWORD; dwFlags: DWORD): NTSTATUS
+                             {.stdcall, raises: [].}
+  ProcessPrngProc = proc(pbData: pointer; cbData: SIZE_T): BOOL
+                          {.stdcall, raises: [].}
+  SystemFunction036Proc = proc(RandomBuffer: pointer;
+                               RandomBufferLength: DWORD): uint8
+                               {.stdcall, raises: [].}
+  CryptGenRandomProc = proc(hProv: uint; dwLen: DWORD; pbBuffer: pointer): BOOL
+                            {.stdcall, raises: [].}
+  QueryPerformanceCounterProc = proc(lpPerformanceCount: ptr LARGE_INTEGER): BOOL
+                                     {.stdcall, raises: [].}
+  GetSystemTimeAsFileTimeProc = proc(lpSystemTimeAsFileTime: pointer)
+                                     {.stdcall, raises: [].}
+  GetTickCount64Proc = proc(): uint64 {.stdcall, raises: [].}
+
 # --- Original function pointer storage -------------------------------------
 
 var
@@ -579,6 +692,23 @@ var
   # the first GetProcAddress("NtQueryDirectoryFile") query so the
   # wrapper has the real function to forward to.
   realNtQueryDirectoryFile: NtQueryDirectoryFileProc
+  # M5 — IPC-connect / external-content / non-determinism surface.
+  origConnect: ConnectProc
+  origWSAConnect: WSAConnectProc
+  origCreateFileMappingW: CreateFileMappingWProc
+  origCreateFileMappingA: CreateFileMappingAProc
+  origOpenFileMappingW: OpenFileMappingWProc
+  origOpenFileMappingA: OpenFileMappingAProc
+  origMapViewOfFile: MapViewOfFileProc
+  origMapViewOfFileEx: MapViewOfFileExProc
+  origCreatePipe: CreatePipeProc
+  origBCryptGenRandom: BCryptGenRandomProc
+  origProcessPrng: ProcessPrngProc
+  origSystemFunction036: SystemFunction036Proc
+  origCryptGenRandom: CryptGenRandomProc
+  origQueryPerformanceCounter: QueryPerformanceCounterProc
+  origGetSystemTimeAsFileTime: GetSystemTimeAsFileTimeProc
+  origGetTickCount64: GetTickCount64Proc
 
 # --- Runtime state ---------------------------------------------------------
 
@@ -596,6 +726,36 @@ var
   # ``LoadLibraryW`` argument when re-injecting into spawned children.
   selfDllPathW: seq[uint16] = @[]
   selfDllPathReady: bool = false
+  # M5 — external content: the source file behind a file-backed section, so a
+  # `MapViewOfFile` can be recorded as a READ of that file. A mapped view is
+  # the one content channel on Windows that NEVER passes ReadFile, so without
+  # this the bytes a compiler mmaps out of a header or an archive are invisible
+  # to a capture that nonetheless grades complete.
+  mappingPaths = initTable[uint64, string]()
+  # M5 — handles whose channel class has already been decided, so the
+  # GetFileType/FileNameInfo probe on the ReadFile path runs once per handle
+  # instead of once per read.
+  channelClassified = initTable[uint64, bool]()
+  # KNOWN RESIDUAL for both tables above (and for `handlePaths`): they are
+  # pruned ONLY from the `CloseHandle` snoop. `NtClose` is not hooked, so a
+  # handle closed through the NT export leaves its entry behind. The cost is
+  # bounded per handle (one path string, one flag) but UNBOUNDED over the life
+  # of a long-lived process that closes handles that way -- and a recycled
+  # handle value could then read a stale mapping->file association, which is
+  # why `forgetMappingPath` exists at all. Not fixed here: hooking `NtClose`
+  # puts a detour on one of the hottest exports in the process, and the
+  # measurement that would justify it has not been made.
+  # M5 — non-determinism: per-source, per-caller-origin "already recorded"
+  # flags. Entropy and clock entry points are called at a rate that makes a
+  # per-call record both useless (the evidence is "this program consumed
+  # randomness", not how often) and expensive, so each source is recorded ONCE
+  # per process and every later call takes a fast path that skips the registry
+  # dispatch entirely.
+  ndTimeSeen: array[3, bool]
+  ndEntropySeen: array[8, bool]   ## [source * 2 + (1 if caller in program)]
+  # Bounds of the monitored program's OWN main image, for caller attribution.
+  mainImageLo: uint = 0
+  mainImageHi: uint = 0
 
 when defined(ioMonShimSpawnEscapeTest):
   # Fault injection for the two abnormal ways out of the CreateProcess snoop
@@ -732,18 +892,32 @@ proc unicodeStringToString(uniPtr: pointer): string =
     cast[LPCWSTR](bufferPtr), codeUnits,
     cast[LPSTR](addr result[0]), needed, nil, nil)
 
-proc objectAttributesToString(oaPtr: pointer): string =
-  ## Extract the path from a Windows OBJECT_ATTRIBUTES.
-  ## ObjectName field at offset 16 (x64). Strips NT-style prefixes
-  ## (\??\, \DosDevices\) so downstream record consumers see the same
-  ## form GetFileAttributesExW records.
+proc objectAttributesRawName(oaPtr: pointer): string =
+  ## The ObjectName of a Windows OBJECT_ATTRIBUTES, EXACTLY as the caller
+  ## supplied it (field at offset 16 on x64).
+  ##
+  ## Kept separate from the prefix-stripped form because the two cannot be
+  ## told apart afterwards and the difference decides whether a path is an IPC
+  ## peer. `NtCreateFile` accepts a name RELATIVE to `RootDirectory`, so an
+  ## ordinary open of `pipe\x.txt` from a directory containing `pipe` arrives
+  ## with ObjectName `pipe\x.txt` -- byte-for-byte what `\??\pipe\x` becomes
+  ## once the NT prefix is stripped. Classifying on the stripped form would
+  ## report that file open as a connection to an unknown peer and downgrade
+  ## the capture over it.
   if oaPtr == nil:
     return ""
   let objectName = cast[ptr pointer](
     cast[ByteAddress](oaPtr) + 16)[]
   if objectName == nil:
     return ""
-  let raw = unicodeStringToString(objectName)
+  unicodeStringToString(objectName)
+
+proc objectAttributesToString(oaPtr: pointer): string =
+  ## Extract the path from a Windows OBJECT_ATTRIBUTES.
+  ## ObjectName field at offset 16 (x64). Strips NT-style prefixes
+  ## (\??\, \DosDevices\) so downstream record consumers see the same
+  ## form GetFileAttributesExW records.
+  let raw = objectAttributesRawName(oaPtr)
   if raw.len >= 4 and raw[0 .. 3] == "\\??\\":
     return raw[4 .. ^1]
   if raw.len >= 12 and raw[0 .. 11] == "\\DosDevices\\":
@@ -914,6 +1088,368 @@ proc probeFromBool(callResult: BOOL): ProbeResult =
     prExistingOther
   else:
     prAbsent
+
+# ---------------------------------------------------------------------------
+# M5 — IPC-connect, external-content and non-determinism helpers
+# ---------------------------------------------------------------------------
+
+proc initMainImageRange() {.raises: [].} =
+  ## Cache [base, base+SizeOfImage) of the process's main executable.
+  ##
+  ## Used to attribute an entropy call to the monitored PROGRAM rather than to
+  ## the CRT or the loader. Parsed from the PE header rather than asked of the
+  ## loader per call because it sits on a hot path: `SizeOfImage` is at offset
+  ## 56 of the optional header in BOTH PE32 and PE32+ (the 32-bit-only
+  ## `BaseOfData` field and the widened `ImageBase` cancel out), so one
+  ## expression covers both bitnesses.
+  let base = GetModuleHandleW(nil)
+  if base == nil:
+    return
+  let b = cast[uint](base)
+  if cast[ptr uint16](b)[] != 0x5A4D'u16:        # 'MZ'
+    return
+  let lfanew = cast[ptr uint32](b + 0x3C'u)[]
+  if lfanew == 0'u32 or lfanew > 0x1000'u32:
+    return
+  let nt = b + uint(lfanew)
+  if cast[ptr uint32](nt)[] != 0x00004550'u32:   # 'PE\0\0'
+    return
+  let sizeOfImage = cast[ptr uint32](nt + 24'u + 56'u)[]
+  if sizeOfImage == 0'u32:
+    return
+  mainImageLo = b
+  mainImageHi = b + uint(sizeOfImage)
+
+proc callerInProgram(retAddr: pointer): bool {.inline, raises: [].} =
+  ## True when `retAddr` lies inside the MAIN EXECUTABLE IMAGE.
+  ##
+  ## READ THE NAME LITERALLY. The test is `retAddr in [mainImageBase,
+  ## +SizeOfImage)`, which is "main EXE image vs everything else", NOT "program
+  ## vs system". Both directions are lossy and neither is a rounding error:
+  ##
+  ##   * A program whose randomness arrives through a BUNDLED DLL -- libcrypto,
+  ##     a compiler plugin, a Python native extension, any interpreter host --
+  ##     reports `caller=system`, indistinguishable from ntdll's baseline. The
+  ##     per-(source, origin) dedup then collapses even the count, so there is
+  ##     no residual signal to notice it by.
+  ##   * With a STATICALLY LINKED mingw CRT the CRT's own startup randomness
+  ##     sits inside the main image and reports `caller=program`.
+  ##
+  ## CONSEQUENCE FOR A CONSUMER (M6's entropy blessing): `caller=program` may be
+  ## treated as "definitely the main image", but `caller=system` must NOT be
+  ## treated as "no program randomness". Doing so would grade an unblessed
+  ## program deterministic when its randomness came through its own DLL --
+  ## precisely the false-complete this machinery exists to prevent.
+  ##
+  ## The unknown-range case below returns false, which is safe only under the
+  ## first reading and NOT under the second: it under-reports the main image,
+  ## and a consumer that reads `caller=system` as "no program randomness" turns
+  ## that under-report into a false blessing. This is stated here rather than
+  ## claimed as a fail-closed property, because it is not one.
+  if mainImageHi == 0'u or retAddr == nil:
+    return false
+  let a = cast[uint](retAddr)
+  a >= mainImageLo and a < mainImageHi
+
+proc normalizedPathKey(path: string): string {.raises: [].} =
+  ## Lowercased, forward-slashes-folded copy, for prefix tests only.
+  result = newStringOfCap(path.len)
+  for c in path:
+    if c == '/':
+      result.add('\\')
+    elif c >= 'A' and c <= 'Z':
+      result.add(chr(ord(c) + 32))
+    else:
+      result.add(c)
+
+proc isNamedPipePath(path: string): bool {.raises: [].} =
+  ## True for a named-pipe CLIENT path.
+  ##
+  ## A Windows pipe client does not call a socket API at all -- it OPENS
+  ## `\\.\pipe\<name>`, which the shim's CreateFileW/A and NtCreateFile hooks
+  ## already see. So the named-pipe arm of `mcapIpcConnect` is a
+  ## CLASSIFICATION of paths those hooks already carry, not a new entry point.
+  ##
+  ## Every accepted spelling is ANCHORED, never found by searching for `\pipe\`
+  ## anywhere in the path, and the caller must pass the path as the program
+  ## SPELLED it (for the NT layer, `objectAttributesRawName`, not the
+  ## prefix-stripped form). Both restrictions exist for one reason: an
+  ## unknown-peer IPC record DOWNGRADES the capture, so a rule that fired on an
+  ## ordinary path would make every build with a `pipe` directory a permanent
+  ## conservative re-run -- a false re-run produced by the machinery that
+  ## exists to prevent false completes.
+  ##
+  ## `C:\src\pipe\x.c` is the obvious decoy. The one that actually gets through
+  ## is the RELATIVE `pipe\x.c`: it is byte-for-byte the `\??\pipe\<name>` NT
+  ## form after the prefix strip, and NtCreateFile really does receive it that
+  ## way, because a relative Win32 open reaches the NT layer as an ObjectName
+  ## relative to `RootDirectory` rather than canonicalised.
+  if path.len < 6:
+    return false
+  let n = normalizedPathKey(path)
+  if n.startsWith("\\device\\namedpipe"):
+    return true
+  if n.startsWith("\\??\\pipe\\"):
+    return true
+  if n.len > 2 and n[0] == '\\' and n[1] == '\\':
+    let hostEnd = n.find('\\', 2)
+    if hostEnd > 2 and n.len >= hostEnd + 6 and
+        n[hostEnd + 1 .. hostEnd + 5] == "pipe\\":
+      return true
+  false
+
+proc adsStreamOf(path: string): string {.raises: [].} =
+  ## Return the `:stream[:type]` suffix of an NTFS alternate-data-stream path,
+  ## or "" when the path names no stream.
+  ##
+  ## `CreateFileW` already SEES `file:stream`; nothing classified it, so the
+  ## channel was uncovered. The stream is part of the recorded path, so its
+  ## bytes are fingerprinted by the ordinary read record -- this classification
+  ## makes the channel identifiable, it is not what makes the content a
+  ## dependency.
+  var i = 0
+  if path.len >= 4 and path[0] == '\\' and path[1] == '\\' and
+      (path[2] == '?' or path[2] == '.') and path[3] == '\\':
+    i = 4
+  if path.len >= i + 2 and path[i + 1] == ':':
+    i += 2                                   # skip the drive-letter colon
+  while i < path.len:
+    if path[i] == ':':
+      return path[i .. ^1]
+    inc i
+  ""
+
+proc namedPipeServerPid(h: HANDLE): uint64 {.raises: [].} =
+  ## Pid of the process serving the pipe `h` was opened on; 0 when unknown.
+  if h == nil or h == INVALID_HANDLE_VALUE:
+    return 0'u64
+  var pid: DWORD = 0
+  if GetNamedPipeServerProcessId(h, addr pid) == 0:
+    return 0'u64
+  uint64(pid)
+
+proc pipePairIdentity(h: HANDLE; otherPid: var uint64): string {.raises: [].} =
+  ## A process-independent identity for an anonymous pipe, plus the pid on the
+  ## OTHER end of it.
+  ##
+  ## The obvious key -- the kernel object's name -- does not exist. On Win11,
+  ## `CreatePipe` makes an UNNAMED pipe pair: `GetFileInformationByHandleEx`
+  ## with `FileNameInfo` succeeds with a zero-length name and
+  ## `NtQueryObject(ObjectNameInformation)` answers
+  ## `STATUS_OBJECT_PATH_INVALID`, so there is nothing to key on the way the
+  ## POSIX arms key on `dev:ino` (measured on this host, not assumed).
+  ##
+  ## What the kernel WILL name is the pair of processes holding the two ends,
+  ## and it names them consistently: `GetNamedPipeServerProcessId` and
+  ## `GetNamedPipeClientProcessId` both answer on an anonymous pipe, from
+  ## EITHER end, with the same two pids. `pipe:<server>:<client>` is therefore
+  ## the same string in the producer and in the consumer -- which is exactly
+  ## what the merge needs to pair an in-tree `create` against a later `read`.
+  ##
+  ## The pid pair also supplies the IM-4 producer identity directly: the end
+  ## that is not us is the process on the other side.
+  otherPid = 0'u64
+  if h == nil or h == INVALID_HANDLE_VALUE:
+    return ""
+  var serverPid: DWORD = 0
+  var clientPid: DWORD = 0
+  if GetNamedPipeServerProcessId(h, addr serverPid) == 0:
+    return ""
+  if GetNamedPipeClientProcessId(h, addr clientPid) == 0:
+    return ""
+  let self = GetCurrentProcessId()
+  otherPid = if serverPid == self: uint64(clientPid) else: uint64(serverPid)
+  "pipe:" & $serverPid & ":" & $clientPid
+
+proc sockaddrDestination(name: pointer; namelen: int32;
+                         family: var uint16): string {.raises: [].} =
+  ## Render a `sockaddr` as the destination string the merge keys on.
+  ## Returns "" (and leaves `family` 0) for families that cannot carry a
+  ## file-serving peer, so they are never recorded and never downgrade.
+  family = 0'u16
+  if name == nil or namelen < 4:
+    return ""
+  let fam = cast[ptr uint16](name)[]
+  let bytes = cast[ptr UncheckedArray[byte]](name)
+  case fam
+  of AfInetW:
+    if namelen < 8:
+      return ""
+    let port = (uint16(bytes[2]) shl 8) or uint16(bytes[3])
+    family = fam
+    return $bytes[4] & "." & $bytes[5] & "." & $bytes[6] & "." & $bytes[7] &
+      ":" & $port
+  of AfInet6W:
+    if namelen < 24:
+      return ""
+    let port = (uint16(bytes[2]) shl 8) or uint16(bytes[3])
+    family = fam
+    var hex = ""
+    for i in 0 ..< 8:
+      if i > 0:
+        hex.add ':'
+      hex.add toHex(int((uint16(bytes[8 + i * 2]) shl 8) or
+        uint16(bytes[9 + i * 2])), 4)
+    return "[" & hex.toLowerAscii & "]:" & $port
+  of AfUnixW:
+    # Win10 1803+ supports AF_UNIX; the path is a NUL-terminated char[108].
+    family = fam
+    var p = ""
+    var i = 2
+    while i < namelen and i < 110 and bytes[i] != 0'u8:
+      p.add chr(int(bytes[i]))
+      inc i
+    return p
+  else:
+    return ""
+
+proc emitIpcConnect(dest: string; peerPid: uint64; family: uint16;
+                    callResult: int64; kind: string) {.raises: [].} =
+  ## Record a connection to a peer, with the peer's pid when the OS names one.
+  ##
+  ## This is what lets the merge (`writer.unmonitoredSubtreeLossCount` case (c))
+  ## tell an in-tree process from an OUT-OF-TREE breakaway daemon. Without it a
+  ## build tool could take its inputs from a persistent daemon -- an sccache
+  ## server, a language server, a build daemon -- that opens and reads files on
+  ## its behalf, and the capture would contain neither the reads nor any
+  ## evidence that they happened, while grading complete.
+  ##
+  ## `childOsPid` carries the peer pid because that is the field the merge
+  ## already reads for the macOS `LOCAL_PEERPID` arm; a Windows named pipe can
+  ## fill it from `GetNamedPipeServerProcessId`, a socket generally cannot.
+  ## NO `peerstart=` token is stamped: Windows `mrProcessStart` records carry no
+  ## start-time token either, so an identity match would never succeed and would
+  ## turn every in-tree peer into a false downgrade. The merge therefore falls
+  ## back to bare-pid membership, which is exactly right for a record set whose
+  ## process identities are bare pids. Residual, stated rather than papered
+  ## over: a peer pid RECYCLED within one capture could match a stale monitored
+  ## process, which fails toward mcComplete.
+  if dest.len == 0:
+    return
+  var record = baseRecord(mrIpcConnect, moIpcConnect)
+  record.result = callResult
+  record.flags = uint32(family)
+  record.childOsPid = peerPid
+  record.path = dest
+  record.detail = "connect " & kind &
+    (if peerPid != 0'u64: " peer=" & $peerPid else: " peer=unknown")
+  emitRecord(record)
+
+proc emitExternalContent(chan, role, identity: string; producerPid: uint64;
+                         callResult: int64) {.raises: [].} =
+  ## Describe one side of a content channel.
+  ##
+  ## The provenance decision is deliberately NOT made here: whether a consume
+  ## is an invisible input depends on whether some MONITORED process produced
+  ## it, which only the cross-process merge can know. The shim states the facts
+  ## (`chan=`/`role=`/identity/producer) and `writer.externalContentLossCount`
+  ## pairs them -- the same division of labour as the macOS arm, and the reason
+  ## an entirely in-tree pipeline does not downgrade.
+  if identity.len == 0:
+    return
+  var record = baseRecord(mrExternalContent, moExternalContent)
+  record.path = identity
+  record.childOsPid = producerPid
+  record.result = callResult
+  record.detail = "chan=" & chan & " role=" & role
+  emitRecord(record)
+
+proc emitNonDeterministic(source: string; inProgram: bool) {.raises: [].} =
+  ## Record that the process read from an entropy source.
+  ##
+  ## Evidence, not loss: `writer.nonDeterminismObservationCount` counts these
+  ## and nothing downgrades on them, because io-mon DID observe the read. The
+  ## caller decides what it means -- which is the half of the entropy-blessing
+  ## design (M6) that did not exist on Windows at all before this.
+  var record = baseRecord(mrNonDeterministic, moNonDeterministic)
+  record.path = source
+  record.detail = "entropy source=" & source &
+    (if inProgram: " caller=program" else: " caller=system")
+  emitRecord(record)
+
+proc emitTimeRead(source: string) {.raises: [].} =
+  ## Record that the process read a clock. Marker only -- almost every program
+  ## times something, so downgrading on it would re-run everything.
+  var record = baseRecord(mrTimeRead, moTimeRead)
+  record.path = source
+  record.detail = "time source=" & source
+  emitRecord(record)
+
+proc rememberMappingPath(h: HANDLE; path: string) {.raises: [].} =
+  if h == nil or h == INVALID_HANDLE_VALUE or path.len == 0:
+    return
+  acquire(fdLock)
+  mappingPaths[handleKey(h)] = path
+  release(fdLock)
+
+proc pathForMapping(h: HANDLE): string {.raises: [].} =
+  if h == nil or h == INVALID_HANDLE_VALUE:
+    return ""
+  acquire(fdLock)
+  result = mappingPaths.getOrDefault(handleKey(h), "")
+  release(fdLock)
+
+proc forgetMappingPath(h: HANDLE) {.raises: [].} =
+  if h == nil or h == INVALID_HANDLE_VALUE:
+    return
+  acquire(fdLock)
+  mappingPaths.del(handleKey(h))
+  release(fdLock)
+
+proc markHandleChannelClassified(h: HANDLE): bool {.raises: [].} =
+  ## Mark `h` as channel-classified and report whether it ALREADY was.
+  if h == nil or h == INVALID_HANDLE_VALUE:
+    return true
+  acquire(fdLock)
+  result = channelClassified.getOrDefault(handleKey(h), false)
+  channelClassified[handleKey(h)] = true
+  release(fdLock)
+
+proc forgetHandleChannelClass(h: HANDLE) {.raises: [].} =
+  if h == nil or h == INVALID_HANDLE_VALUE:
+    return
+  acquire(fdLock)
+  channelClassified.del(handleKey(h))
+  release(fdLock)
+
+proc mayBeNamedPipe(path: string): bool {.inline, raises: [].} =
+  ## Cheap pre-filter for `isNamedPipePath`, which allocates.
+  ##
+  ## Every open goes through here, so the full test must not run for an
+  ## ordinary `C:\...` path. Every named-pipe spelling starts with a separator
+  ## or with the bare `pipe\` the NT prefix strip leaves behind. This is a
+  ## PERFORMANCE filter only -- correctness lives in `isNamedPipePath`, which
+  ## must reject everything this lets through that is not a pipe.
+  path.len >= 6 and (path[0] == '\\' or path[0] == '/' or
+                     path[0] == 'p' or path[0] == 'P')
+
+proc classifyOpenedPath(path: string; h: HANDLE; desiredAccess: DWORD;
+                        spelledPath = "") {.raises: [].} =
+  ## M5 — classify what an open actually reached, on top of the file record the
+  ## caller already emitted.
+  ##
+  ## Only SUCCESSFUL opens are classified. A failed pipe open consumed nothing,
+  ## and recording it as an IPC connect to an unknown peer would downgrade the
+  ## capture over a connection that never happened -- a false re-run, which is
+  ## the failure direction this machinery is supposed to avoid.
+  if path.len == 0 or h == nil or h == INVALID_HANDLE_VALUE:
+    return
+  # The pipe test runs against the spelling the PROGRAM used, which the NT arm
+  # supplies separately because the recorded path there has had its `\??\`
+  # prefix stripped and is then indistinguishable from a relative path.
+  let asSpelled = if spelledPath.len > 0: spelledPath else: path
+  if mayBeNamedPipe(asSpelled) and isNamedPipePath(asSpelled):
+    emitIpcConnect(path, namedPipeServerPid(h), 0'u16,
+      int64(cast[int](h)), "named-pipe")
+    return
+  let stream = adsStreamOf(path)
+  if stream.len > 0:
+    let role = if (desiredAccess and GENERIC_WRITE) != 0: "write" else: "read"
+    # `chan=ads` is deliberately NOT one of the roles
+    # `writer.externalContentLossCount` downgrades on: the stream is part of
+    # the path the read record already carries, so its bytes ARE fingerprinted.
+    # What was missing was that the channel could not be identified at all.
+    emitExternalContent("ads", role, path, 0'u64, 0'i64)
 
 proc readEnvString(name: cstring): string =
   var buf: array[32768, char]
@@ -1536,6 +2072,11 @@ proc snoopCreateFileW(ctx: var hr.HookContext) {.raises: [].} =
     record.path = path
     record.detail = "CreateFileW"
     emitRecord(record)
+    # M5 — a Windows pipe CLIENT and an NTFS alternate data stream both arrive
+    # here, as opens; neither was classified before, so a named-pipe peer was
+    # indistinguishable from an in-tree process and a stream read looked like a
+    # plain file read.
+    classifyOpenedPath(path, h, dwDesiredAccess)
   except CatchableError:
     discard
   SetLastError(savedLastError)
@@ -1563,6 +2104,7 @@ proc snoopCreateFileA(ctx: var hr.HookContext) {.raises: [].} =
     record.path = path
     record.detail = "CreateFileA"
     emitRecord(record)
+    classifyOpenedPath(path, h, dwDesiredAccess)
   except CatchableError:
     discard
   SetLastError(savedLastError)
@@ -1581,8 +2123,31 @@ proc snoopReadFile(ctx: var hr.HookContext) {.raises: [].} =
     let hFile = cast[HANDLE](ctx.args[0])
     let lpBytesRead = cast[ptr DWORD](ctx.args[3])
     let callOk = BOOL(ctx.result) != 0
+    let path = pathForHandle(hFile)
+    # M5 — external content: a read from a handle the shim never saw opened is
+    # the Windows shape of the inherited-pipe channel (`chan=opaque`). The
+    # bytes are a real INPUT and there is no file path anywhere in the capture
+    # to fingerprint, so the merge has to decide provenance -- and it can,
+    # because a Windows pipe object carries a name both ends agree on.
+    #
+    # The classification runs ONLY for an unknown handle and the fact that it
+    # ran is recorded in `channelClassified` (NOT in `handlePaths`, which holds
+    # paths and is left empty for exactly these handles), so the
+    # GetFileType/FileNameInfo pair costs one call per handle rather than one
+    # per read. ReadFile is the hottest hook in the table; an unconditional
+    # probe here would undo S4's batching win on its own.
+    if callOk and path.len == 0 and not markHandleChannelClassified(hFile):
+      if GetFileType(hFile) == FILE_TYPE_PIPE:
+        var producer = 0'u64
+        let identity = pipePairIdentity(hFile, producer)
+        # An identity the kernel would not supply (the far end has already
+        # gone, or the handle is a socket rather than a pipe) yields an EMPTY
+        # key, which the merge deliberately never downgrades on: a possible
+        # missed dependency is the safe direction, a false re-run of every
+        # normal build is not.
+        emitExternalContent("opaque", "read", identity, producer, 0'i64)
     var record = baseRecord(mrFileRead, moFileRead)
-    record.path = pathForHandle(hFile)
+    record.path = path
     if callOk and lpBytesRead != nil:
       record.result = int64(lpBytesRead[])
     else:
@@ -1627,6 +2192,11 @@ proc snoopCloseHandle(ctx: var hr.HookContext) {.raises: [].} =
   try:
     let hObject = cast[HANDLE](ctx.args[0])
     forgetHandlePath(hObject)
+    # M5 — a section handle is closed through the same call; drop its
+    # mapping->file association so a recycled handle value cannot attribute a
+    # later view to the wrong file.
+    forgetMappingPath(hObject)
+    forgetHandleChannelClass(hObject)
   except CatchableError:
     discard
   hr.callNext(ctx)
@@ -2382,6 +2952,15 @@ proc snoopNtCreateFile(ctx: var hr.HookContext) {.raises: [].} =
           let h = phPtr[]
           if h != nil and h != INVALID_HANDLE_VALUE:
             rememberHandlePath(h, path)
+            # M5 — the NT-layer arm of the named-pipe / ADS classification.
+            # CreateFileW lowers to NtCreateFile, so a client that calls the NT
+            # export directly (or whose kernel32 hook did not land) is still
+            # seen. A duplicate record for the same open is harmless: the merge
+            # dedups an IPC peer by (pid, destination).
+            classifyOpenedPath(path, h, desiredAccess,
+              spelledPath = (if mayBeNamedPipe(path):
+                               objectAttributesRawName(oaPtr)
+                             else: ""))
   except CatchableError:
     discard
   SetLastError(savedLastError)
@@ -3062,6 +3641,650 @@ proc trampolineNtQueryDirectoryFile(FileHandle: HANDLE;
   hr.dispatchShimHook(hr.HookNtQueryDirectoryFile, ctx)
   result = cast[NTSTATUS](uint32(ctx.result and 0xFFFFFFFF'u64))
 
+# ---------------------------------------------------------------------------
+# M5 — original wrappers, snoop callbacks and trampolines for the IPC-connect,
+# external-content and non-determinism surface.
+#
+# Three capabilities the M4 profile declared as gaps, each now backed by a
+# record kind rather than by a hooked entry point that produces nothing:
+#
+#   mcapIpcConnect      -> mrIpcConnect      (connect / WSAConnect, plus the
+#                          named-pipe classification in the CreateFile snoops)
+#   mcapExternalContent -> mrExternalContent (file mappings, anonymous pipes,
+#                          NTFS alternate data streams) + mrFileRead/mrFileWrite
+#                          for a view of a FILE-backed section
+#   mcapNonDeterminism  -> mrNonDeterministic (entropy) + mrTimeRead (clocks)
+# ---------------------------------------------------------------------------
+
+proc originalConnect(ctx: var hr.HookContext) {.raises: [].} =
+  if origConnect == nil:
+    ctx.result = uint64(0xFFFFFFFF'u32)          # SOCKET_ERROR
+    return
+  let r = origConnect(uint(ctx.args[0]), cast[pointer](ctx.args[1]),
+    cast[int32](uint32(ctx.args[2])))
+  ctx.result = uint64(uint32(r))
+
+proc originalWSAConnect(ctx: var hr.HookContext) {.raises: [].} =
+  if origWSAConnect == nil:
+    ctx.result = uint64(0xFFFFFFFF'u32)
+    return
+  let r = origWSAConnect(uint(ctx.args[0]), cast[pointer](ctx.args[1]),
+    cast[int32](uint32(ctx.args[2])), cast[pointer](ctx.args[3]),
+    cast[pointer](ctx.args[4]), cast[pointer](ctx.args[5]),
+    cast[pointer](ctx.args[6]))
+  ctx.result = uint64(uint32(r))
+
+proc originalCreateFileMappingW(ctx: var hr.HookContext) {.raises: [].} =
+  if origCreateFileMappingW == nil:
+    ctx.result = 0
+    return
+  ctx.result = cast[uint64](origCreateFileMappingW(
+    cast[HANDLE](ctx.args[0]), cast[LPSECURITY_ATTRIBUTES](ctx.args[1]),
+    DWORD(ctx.args[2]), DWORD(ctx.args[3]), DWORD(ctx.args[4]),
+    cast[LPCWSTR](ctx.args[5])))
+
+proc originalCreateFileMappingA(ctx: var hr.HookContext) {.raises: [].} =
+  if origCreateFileMappingA == nil:
+    ctx.result = 0
+    return
+  ctx.result = cast[uint64](origCreateFileMappingA(
+    cast[HANDLE](ctx.args[0]), cast[LPSECURITY_ATTRIBUTES](ctx.args[1]),
+    DWORD(ctx.args[2]), DWORD(ctx.args[3]), DWORD(ctx.args[4]),
+    cast[LPCSTR](ctx.args[5])))
+
+proc originalOpenFileMappingW(ctx: var hr.HookContext) {.raises: [].} =
+  if origOpenFileMappingW == nil:
+    ctx.result = 0
+    return
+  ctx.result = cast[uint64](origOpenFileMappingW(
+    DWORD(ctx.args[0]), BOOL(uint32(ctx.args[1])), cast[LPCWSTR](ctx.args[2])))
+
+proc originalOpenFileMappingA(ctx: var hr.HookContext) {.raises: [].} =
+  if origOpenFileMappingA == nil:
+    ctx.result = 0
+    return
+  ctx.result = cast[uint64](origOpenFileMappingA(
+    DWORD(ctx.args[0]), BOOL(uint32(ctx.args[1])), cast[LPCSTR](ctx.args[2])))
+
+proc originalMapViewOfFile(ctx: var hr.HookContext) {.raises: [].} =
+  if origMapViewOfFile == nil:
+    ctx.result = 0
+    return
+  ctx.result = cast[uint64](origMapViewOfFile(
+    cast[HANDLE](ctx.args[0]), DWORD(ctx.args[1]), DWORD(ctx.args[2]),
+    DWORD(ctx.args[3]), SIZE_T(ctx.args[4])))
+
+proc originalMapViewOfFileEx(ctx: var hr.HookContext) {.raises: [].} =
+  if origMapViewOfFileEx == nil:
+    ctx.result = 0
+    return
+  ctx.result = cast[uint64](origMapViewOfFileEx(
+    cast[HANDLE](ctx.args[0]), DWORD(ctx.args[1]), DWORD(ctx.args[2]),
+    DWORD(ctx.args[3]), SIZE_T(ctx.args[4]), cast[LPVOID](ctx.args[5])))
+
+proc originalCreatePipe(ctx: var hr.HookContext) {.raises: [].} =
+  if origCreatePipe == nil:
+    ctx.result = 0
+    return
+  let r = origCreatePipe(cast[ptr HANDLE](ctx.args[0]),
+    cast[ptr HANDLE](ctx.args[1]), cast[LPSECURITY_ATTRIBUTES](ctx.args[2]),
+    DWORD(ctx.args[3]))
+  ctx.result = uint64(uint32(r))
+
+proc originalBCryptGenRandom(ctx: var hr.HookContext) {.raises: [].} =
+  if origBCryptGenRandom == nil:
+    ctx.result = uint64(0xC0000001'u32)          # STATUS_UNSUCCESSFUL
+    return
+  let r = origBCryptGenRandom(cast[HANDLE](ctx.args[0]),
+    cast[pointer](ctx.args[1]), DWORD(ctx.args[2]), DWORD(ctx.args[3]))
+  ctx.result = uint64(uint32(r))
+
+proc originalProcessPrng(ctx: var hr.HookContext) {.raises: [].} =
+  if origProcessPrng == nil:
+    ctx.result = 0
+    return
+  let r = origProcessPrng(cast[pointer](ctx.args[0]), SIZE_T(ctx.args[1]))
+  ctx.result = uint64(uint32(r))
+
+proc originalSystemFunction036(ctx: var hr.HookContext) {.raises: [].} =
+  if origSystemFunction036 == nil:
+    ctx.result = 0
+    return
+  let r = origSystemFunction036(cast[pointer](ctx.args[0]), DWORD(ctx.args[1]))
+  ctx.result = uint64(r)
+
+proc originalCryptGenRandom(ctx: var hr.HookContext) {.raises: [].} =
+  if origCryptGenRandom == nil:
+    ctx.result = 0
+    return
+  let r = origCryptGenRandom(uint(ctx.args[0]), DWORD(ctx.args[1]),
+    cast[pointer](ctx.args[2]))
+  ctx.result = uint64(uint32(r))
+
+proc originalQueryPerformanceCounter(ctx: var hr.HookContext) {.raises: [].} =
+  if origQueryPerformanceCounter == nil:
+    ctx.result = 0
+    return
+  let r = origQueryPerformanceCounter(cast[ptr LARGE_INTEGER](ctx.args[0]))
+  ctx.result = uint64(uint32(r))
+
+proc originalGetSystemTimeAsFileTime(ctx: var hr.HookContext) {.raises: [].} =
+  if origGetSystemTimeAsFileTime == nil:
+    return
+  origGetSystemTimeAsFileTime(cast[pointer](ctx.args[0]))
+
+proc originalGetTickCount64(ctx: var hr.HookContext) {.raises: [].} =
+  if origGetTickCount64 == nil:
+    ctx.result = 0
+    return
+  ctx.result = origGetTickCount64()
+
+# --- M5 snoop callbacks ----------------------------------------------------
+
+const
+  WSAEWOULDBLOCK = 10035'u32
+  WSAEINPROGRESS = 10036'u32
+
+proc socketConnectReachedPeer(rc: int32; wsaError: uint32): bool
+    {.inline, raises: [].} =
+  ## Did this `connect`/`WSAConnect` call actually reach a peer?
+  ##
+  ## THE SAME RULE `classifyOpenedPath` STATES FOR PIPES, applied to the socket
+  ## arm: only a connect that reached somebody is recorded. An `mrIpcConnect`
+  ## naming an UNKNOWN peer is a downgrade signal -- the merge cannot prove the
+  ## peer was in-tree, so the whole capture grades `mcIncomplete` and the action
+  ## loses its cache publication. Emitting one for a connect that was REFUSED
+  ## means a connection that never happened costs a build its cache hit: a
+  ## false re-run, which is the failure direction this machinery exists to
+  ## avoid. Windows programs probe localhost constantly (daemon discovery,
+  ## sccache and language-server probes, "is the server already up?" checks),
+  ## and every one of those probes ends in WSAECONNREFUSED by design.
+  ##
+  ## IN-FLIGHT CONNECTS ARE RECORDED, deliberately, matching the macOS arm's
+  ## `EInProgress` case. A non-blocking `connect` returns SOCKET_ERROR with
+  ## WSAEWOULDBLOCK (the Winsock spelling of EINPROGRESS; WSAEINPROGRESS is the
+  ## WinSock 1.1 blocking-call form and is accepted for completeness) and then
+  ## COMPLETES asynchronously -- that is the ordinary shape of an async client
+  ## talking to a daemon, so treating it as "reached nobody" would be a silent
+  ## false skip over a real peer. The two errors are not symmetric in cost: an
+  ## in-flight connect that later fails costs a conservative re-run, while a
+  ## refused connect recorded as a peer costs one too, and an in-flight connect
+  ## NOT recorded costs a false `mcComplete` over content that arrived from an
+  ## out-of-tree daemon. Only the last of those is unrecoverable, so the guard
+  ## is drawn to include exactly the states in which a peer may yet be reached.
+  ##
+  ## `GetLastError` is the source of `wsaError`: `WSAGetLastError` is documented
+  ## as returning the same thread-local value, and the snoops already capture it
+  ## immediately after `callNext` before anything can clobber it.
+  if rc == 0:
+    return true
+  wsaError == WSAEWOULDBLOCK or wsaError == WSAEINPROGRESS
+
+proc snoopConnect(ctx: var hr.HookContext) {.raises: [].} =
+  hr.callNext(ctx)
+  let savedLastError = GetLastError()
+  if disabled > 0 or not initialized:
+    SetLastError(savedLastError)
+    return
+  try:
+    let rc = cast[int32](uint32(ctx.result))
+    if socketConnectReachedPeer(rc, savedLastError):
+      var family: uint16 = 0
+      let dest = sockaddrDestination(cast[pointer](ctx.args[1]),
+        cast[int32](uint32(ctx.args[2])), family)
+      if dest.len > 0:
+        # A socket peer's pid is not obtainable in-process on Windows (there is
+        # no SO_PEERCRED / LOCAL_PEERPID), so it is reported as unknown and the
+        # merge treats it conservatively as out-of-tree -- the same
+        # downgrade-on-uncertainty stance the macOS arm takes for an AF_INET
+        # peer. The named-pipe arm, which is how Windows build daemons actually
+        # talk, DOES supply the pid.
+        emitIpcConnect(dest, 0'u64, family, int64(rc), "socket")
+  except CatchableError:
+    discard
+  SetLastError(savedLastError)
+
+proc snoopWSAConnect(ctx: var hr.HookContext) {.raises: [].} =
+  hr.callNext(ctx)
+  let savedLastError = GetLastError()
+  if disabled > 0 or not initialized:
+    SetLastError(savedLastError)
+    return
+  try:
+    let rc = cast[int32](uint32(ctx.result))
+    if socketConnectReachedPeer(rc, savedLastError):
+      var family: uint16 = 0
+      let dest = sockaddrDestination(cast[pointer](ctx.args[1]),
+        cast[int32](uint32(ctx.args[2])), family)
+      if dest.len > 0:
+        emitIpcConnect(dest, 0'u64, family, int64(rc), "socket")
+  except CatchableError:
+    discard
+  SetLastError(savedLastError)
+
+proc recordFileMappingCreate(hFile: HANDLE; h: HANDLE; name: string;
+                             alreadyExisted: bool) {.raises: [].} =
+  ## Shared body of the CreateFileMappingW/A snoops.
+  ##
+  ## Two distinct facts come out of one call. A section over a real FILE gives
+  ## the mapping handle a source path, so a later view can be recorded as a
+  ## READ of that file -- the one content channel on Windows that never passes
+  ## ReadFile. A NAMED section is the shm analogue, and whether this process
+  ## PRODUCED it or merely joined it is decided by ERROR_ALREADY_EXISTS:
+  ## `CreateFileMapping` opens an existing section rather than failing, so
+  ## recording every call as a `create` would let an out-of-tree producer's
+  ## section be paired against a consumer's own record and never downgrade.
+  if h == nil or h == INVALID_HANDLE_VALUE:
+    return
+  if hFile != nil and hFile != INVALID_HANDLE_VALUE:
+    let p = pathForHandle(hFile)
+    if p.len > 0:
+      rememberMappingPath(h, p)
+  if name.len > 0:
+    emitExternalContent("shm",
+      (if alreadyExisted: "attach" else: "create"), name, 0'u64,
+      int64(cast[int](h)))
+
+proc snoopCreateFileMappingW(ctx: var hr.HookContext) {.raises: [].} =
+  hr.callNext(ctx)
+  let savedLastError = GetLastError()
+  if disabled > 0 or not initialized:
+    SetLastError(savedLastError)
+    return
+  try:
+    recordFileMappingCreate(cast[HANDLE](ctx.args[0]),
+      cast[HANDLE](ctx.result), widePtrToString(cast[LPCWSTR](ctx.args[5])),
+      savedLastError == 183'u32)               # ERROR_ALREADY_EXISTS
+  except CatchableError:
+    discard
+  SetLastError(savedLastError)
+
+proc snoopCreateFileMappingA(ctx: var hr.HookContext) {.raises: [].} =
+  hr.callNext(ctx)
+  let savedLastError = GetLastError()
+  if disabled > 0 or not initialized:
+    SetLastError(savedLastError)
+    return
+  try:
+    let lpName = cast[LPCSTR](ctx.args[5])
+    recordFileMappingCreate(cast[HANDLE](ctx.args[0]),
+      cast[HANDLE](ctx.result), (if lpName != nil: $lpName else: ""),
+      savedLastError == 183'u32)
+  except CatchableError:
+    discard
+  SetLastError(savedLastError)
+
+proc recordFileMappingOpen(h: HANDLE; name: string) {.raises: [].} =
+  ## `OpenFileMapping` can only ever JOIN a section somebody else made, so it is
+  ## unconditionally the consume side. An attach with no in-tree create is the
+  ## out-of-tree shared-memory producer the merge downgrades on.
+  if h == nil or h == INVALID_HANDLE_VALUE or name.len == 0:
+    return
+  emitExternalContent("shm", "attach", name, 0'u64, int64(cast[int](h)))
+
+proc snoopOpenFileMappingW(ctx: var hr.HookContext) {.raises: [].} =
+  hr.callNext(ctx)
+  let savedLastError = GetLastError()
+  if disabled > 0 or not initialized:
+    SetLastError(savedLastError)
+    return
+  try:
+    recordFileMappingOpen(cast[HANDLE](ctx.result),
+      widePtrToString(cast[LPCWSTR](ctx.args[2])))
+  except CatchableError:
+    discard
+  SetLastError(savedLastError)
+
+proc snoopOpenFileMappingA(ctx: var hr.HookContext) {.raises: [].} =
+  hr.callNext(ctx)
+  let savedLastError = GetLastError()
+  if disabled > 0 or not initialized:
+    SetLastError(savedLastError)
+    return
+  try:
+    let lpName = cast[LPCSTR](ctx.args[2])
+    recordFileMappingOpen(cast[HANDLE](ctx.result),
+      (if lpName != nil: $lpName else: ""))
+  except CatchableError:
+    discard
+  SetLastError(savedLastError)
+
+proc recordMappedView(hMap: HANDLE; access: DWORD; view: pointer;
+                      detail: string) {.raises: [].} =
+  ## A view of a FILE-backed section is a content access to that file that no
+  ## ReadFile hook can see. Recording it under the ordinary read/write
+  ## observation kinds is what makes the bytes a real dependency for a
+  ## content-addressed cache rather than merely visible to inspection.
+  if view == nil:
+    return
+  let p = pathForMapping(hMap)
+  if p.len == 0:
+    return
+  if (access and (FILE_MAP_READ or FILE_MAP_COPY or FILE_MAP_ALL_ACCESS)) != 0:
+    var rec = baseRecord(mrFileRead, moFileRead)
+    rec.path = p
+    rec.flags = uint32(access)
+    rec.detail = detail & ":read"
+    emitRecord(rec)
+  if (access and FILE_MAP_WRITE) != 0:
+    var rec = baseRecord(mrFileWrite, moFileWrite)
+    rec.path = p
+    rec.flags = uint32(access)
+    rec.detail = detail & ":write"
+    emitRecord(rec)
+
+proc snoopMapViewOfFile(ctx: var hr.HookContext) {.raises: [].} =
+  hr.callNext(ctx)
+  let savedLastError = GetLastError()
+  if disabled > 0 or not initialized:
+    SetLastError(savedLastError)
+    return
+  try:
+    recordMappedView(cast[HANDLE](ctx.args[0]), DWORD(ctx.args[1]),
+      cast[pointer](ctx.result), "MapViewOfFile")
+  except CatchableError:
+    discard
+  SetLastError(savedLastError)
+
+proc snoopMapViewOfFileEx(ctx: var hr.HookContext) {.raises: [].} =
+  hr.callNext(ctx)
+  let savedLastError = GetLastError()
+  if disabled > 0 or not initialized:
+    SetLastError(savedLastError)
+    return
+  try:
+    recordMappedView(cast[HANDLE](ctx.args[0]), DWORD(ctx.args[1]),
+      cast[pointer](ctx.result), "MapViewOfFileEx")
+  except CatchableError:
+    discard
+  SetLastError(savedLastError)
+
+proc snoopCreatePipe(ctx: var hr.HookContext) {.raises: [].} =
+  hr.callNext(ctx)
+  let savedLastError = GetLastError()
+  if disabled > 0 or not initialized:
+    SetLastError(savedLastError)
+    return
+  try:
+    if BOOL(uint32(ctx.result)) != 0:
+      # `chan=localfd role=create` is the in-tree PRODUCER side the merge pairs
+      # an `opaque` read against. Both ends are recorded because either can be
+      # the one a monitored child inherits, and a Windows anonymous pipe
+      # reports the SAME kernel object name from both -- which is precisely
+      # what makes the pairing work across processes.
+      let hp = cast[ptr HANDLE](ctx.args[0])
+      if hp != nil:
+        var other = 0'u64
+        let identity = pipePairIdentity(hp[], other)
+        emitExternalContent("localfd", "create", identity,
+          uint64(GetCurrentProcessId()), 0'i64)
+  except CatchableError:
+    discard
+  SetLastError(savedLastError)
+
+proc snoopEntropy(ctx: var hr.HookContext; slot: int; source: string;
+                  inProgramArg: int) {.raises: [].} =
+  ## Shared body of the four entropy snoops.
+  ##
+  ## Recorded ONCE per (source, caller-origin) per process. The evidence M6
+  ## needs is "this program consumed randomness", not a count, and these entry
+  ## points are called at a rate where a per-call record would cost more than
+  ## every file observation put together.
+  hr.callNext(ctx)
+  let savedLastError = GetLastError()
+  if disabled > 0 or not initialized or fragmentDir.len == 0:
+    SetLastError(savedLastError)
+    return
+  try:
+    let inProgram = ctx.args.len > inProgramArg and
+      ctx.args[inProgramArg] != 0'u64
+    let idx = slot * 2 + (if inProgram: 1 else: 0)
+    if not ndEntropySeen[idx]:
+      ndEntropySeen[idx] = true
+      emitNonDeterministic(source, inProgram)
+  except CatchableError:
+    discard
+  SetLastError(savedLastError)
+
+proc snoopBCryptGenRandom(ctx: var hr.HookContext) {.raises: [].} =
+  snoopEntropy(ctx, 0, "BCryptGenRandom", 4)
+
+proc snoopProcessPrng(ctx: var hr.HookContext) {.raises: [].} =
+  snoopEntropy(ctx, 1, "ProcessPrng", 2)
+
+proc snoopSystemFunction036(ctx: var hr.HookContext) {.raises: [].} =
+  snoopEntropy(ctx, 2, "RtlGenRandom", 2)
+
+proc snoopCryptGenRandom(ctx: var hr.HookContext) {.raises: [].} =
+  snoopEntropy(ctx, 3, "CryptGenRandom", 3)
+
+proc snoopTime(ctx: var hr.HookContext; slot: int; source: string)
+    {.raises: [].} =
+  hr.callNext(ctx)
+  let savedLastError = GetLastError()
+  if disabled > 0 or not initialized or fragmentDir.len == 0:
+    SetLastError(savedLastError)
+    return
+  try:
+    if not ndTimeSeen[slot]:
+      ndTimeSeen[slot] = true
+      emitTimeRead(source)
+  except CatchableError:
+    discard
+  SetLastError(savedLastError)
+
+proc snoopQueryPerformanceCounter(ctx: var hr.HookContext) {.raises: [].} =
+  snoopTime(ctx, 0, "QueryPerformanceCounter")
+
+proc snoopGetSystemTimeAsFileTime(ctx: var hr.HookContext) {.raises: [].} =
+  snoopTime(ctx, 1, "GetSystemTimeAsFileTime")
+
+proc snoopGetTickCount64(ctx: var hr.HookContext) {.raises: [].} =
+  snoopTime(ctx, 2, "GetTickCount64")
+
+# --- M5 trampolines --------------------------------------------------------
+#
+# The non-determinism trampolines carry a FAST PATH the file trampolines do
+# not need: once a source has been recorded for a given caller origin, the call
+# goes straight to the original and never builds a HookContext or walks the
+# registry. QueryPerformanceCounter and GetSystemTimeAsFileTime are called
+# orders of magnitude more often than any file API, and a per-call seq
+# allocation plus a string-keyed chain lookup on them would give back the
+# monitoring overhead S4 recovered by batching hook teardown.
+
+proc trampolineConnect(s: uint; name: pointer; namelen: int32): int32
+    {.stdcall.} =
+  if origConnect == nil:
+    return -1
+  var ctx = hr.HookContext(args: @[
+    uint64(s), cast[uint64](name), uint64(uint32(namelen))])
+  hr.dispatchShimHook(hr.HookConnect, ctx)
+  result = cast[int32](uint32(ctx.result))
+
+proc trampolineWSAConnect(s: uint; name: pointer; namelen: int32;
+                          lpCallerData: pointer; lpCalleeData: pointer;
+                          lpSQOS: pointer; lpGQOS: pointer): int32
+                          {.stdcall.} =
+  if origWSAConnect == nil:
+    return -1
+  var ctx = hr.HookContext(args: @[
+    uint64(s), cast[uint64](name), uint64(uint32(namelen)),
+    cast[uint64](lpCallerData), cast[uint64](lpCalleeData),
+    cast[uint64](lpSQOS), cast[uint64](lpGQOS)])
+  hr.dispatchShimHook(hr.HookWSAConnect, ctx)
+  result = cast[int32](uint32(ctx.result))
+
+proc trampolineCreateFileMappingW(hFile: HANDLE;
+                                  lpAttributes: LPSECURITY_ATTRIBUTES;
+                                  flProtect: DWORD;
+                                  dwMaximumSizeHigh: DWORD;
+                                  dwMaximumSizeLow: DWORD;
+                                  lpName: LPCWSTR): HANDLE {.stdcall.} =
+  if origCreateFileMappingW == nil:
+    return nil
+  var ctx = hr.HookContext(args: @[
+    cast[uint64](hFile), cast[uint64](lpAttributes), uint64(flProtect),
+    uint64(dwMaximumSizeHigh), uint64(dwMaximumSizeLow), cast[uint64](lpName)])
+  hr.dispatchShimHook(hr.HookCreateFileMappingW, ctx)
+  result = cast[HANDLE](ctx.result)
+
+proc trampolineCreateFileMappingA(hFile: HANDLE;
+                                  lpAttributes: LPSECURITY_ATTRIBUTES;
+                                  flProtect: DWORD;
+                                  dwMaximumSizeHigh: DWORD;
+                                  dwMaximumSizeLow: DWORD;
+                                  lpName: LPCSTR): HANDLE {.stdcall.} =
+  if origCreateFileMappingA == nil:
+    return nil
+  var ctx = hr.HookContext(args: @[
+    cast[uint64](hFile), cast[uint64](lpAttributes), uint64(flProtect),
+    uint64(dwMaximumSizeHigh), uint64(dwMaximumSizeLow), cast[uint64](lpName)])
+  hr.dispatchShimHook(hr.HookCreateFileMappingA, ctx)
+  result = cast[HANDLE](ctx.result)
+
+proc trampolineOpenFileMappingW(dwDesiredAccess: DWORD; bInheritHandle: BOOL;
+                                lpName: LPCWSTR): HANDLE {.stdcall.} =
+  if origOpenFileMappingW == nil:
+    return nil
+  var ctx = hr.HookContext(args: @[
+    uint64(dwDesiredAccess), uint64(uint32(bInheritHandle)),
+    cast[uint64](lpName)])
+  hr.dispatchShimHook(hr.HookOpenFileMappingW, ctx)
+  result = cast[HANDLE](ctx.result)
+
+proc trampolineOpenFileMappingA(dwDesiredAccess: DWORD; bInheritHandle: BOOL;
+                                lpName: LPCSTR): HANDLE {.stdcall.} =
+  if origOpenFileMappingA == nil:
+    return nil
+  var ctx = hr.HookContext(args: @[
+    uint64(dwDesiredAccess), uint64(uint32(bInheritHandle)),
+    cast[uint64](lpName)])
+  hr.dispatchShimHook(hr.HookOpenFileMappingA, ctx)
+  result = cast[HANDLE](ctx.result)
+
+proc trampolineMapViewOfFile(hFileMappingObject: HANDLE;
+                             dwDesiredAccess: DWORD;
+                             dwFileOffsetHigh: DWORD;
+                             dwFileOffsetLow: DWORD;
+                             dwNumberOfBytesToMap: SIZE_T): LPVOID
+                             {.stdcall.} =
+  if origMapViewOfFile == nil:
+    return nil
+  var ctx = hr.HookContext(args: @[
+    cast[uint64](hFileMappingObject), uint64(dwDesiredAccess),
+    uint64(dwFileOffsetHigh), uint64(dwFileOffsetLow),
+    uint64(dwNumberOfBytesToMap)])
+  hr.dispatchShimHook(hr.HookMapViewOfFile, ctx)
+  result = cast[LPVOID](ctx.result)
+
+proc trampolineMapViewOfFileEx(hFileMappingObject: HANDLE;
+                               dwDesiredAccess: DWORD;
+                               dwFileOffsetHigh: DWORD;
+                               dwFileOffsetLow: DWORD;
+                               dwNumberOfBytesToMap: SIZE_T;
+                               lpBaseAddress: LPVOID): LPVOID {.stdcall.} =
+  if origMapViewOfFileEx == nil:
+    return nil
+  var ctx = hr.HookContext(args: @[
+    cast[uint64](hFileMappingObject), uint64(dwDesiredAccess),
+    uint64(dwFileOffsetHigh), uint64(dwFileOffsetLow),
+    uint64(dwNumberOfBytesToMap), cast[uint64](lpBaseAddress)])
+  hr.dispatchShimHook(hr.HookMapViewOfFileEx, ctx)
+  result = cast[LPVOID](ctx.result)
+
+proc trampolineCreatePipe(hReadPipe: ptr HANDLE; hWritePipe: ptr HANDLE;
+                          lpPipeAttributes: LPSECURITY_ATTRIBUTES;
+                          nSize: DWORD): BOOL {.stdcall.} =
+  if origCreatePipe == nil:
+    return 0
+  var ctx = hr.HookContext(args: @[
+    cast[uint64](hReadPipe), cast[uint64](hWritePipe),
+    cast[uint64](lpPipeAttributes), uint64(nSize)])
+  hr.dispatchShimHook(hr.HookCreatePipe, ctx)
+  result = BOOL(uint32(ctx.result))
+
+proc trampolineBCryptGenRandom(hAlgorithm: HANDLE; pbBuffer: pointer;
+                               cbBuffer: DWORD; dwFlags: DWORD): NTSTATUS
+                               {.stdcall.} =
+  if origBCryptGenRandom == nil:
+    return cast[NTSTATUS](0xC0000001'u32)
+  let inProgram = callerInProgram(builtinReturnAddress(0))
+  if ndEntropySeen[0 * 2 + (if inProgram: 1 else: 0)]:
+    return origBCryptGenRandom(hAlgorithm, pbBuffer, cbBuffer, dwFlags)
+  var ctx = hr.HookContext(args: @[
+    cast[uint64](hAlgorithm), cast[uint64](pbBuffer), uint64(cbBuffer),
+    uint64(dwFlags), (if inProgram: 1'u64 else: 0'u64)])
+  hr.dispatchShimHook(hr.HookBCryptGenRandom, ctx)
+  result = cast[NTSTATUS](uint32(ctx.result))
+
+proc trampolineProcessPrng(pbData: pointer; cbData: SIZE_T): BOOL {.stdcall.} =
+  if origProcessPrng == nil:
+    return 0
+  let inProgram = callerInProgram(builtinReturnAddress(0))
+  if ndEntropySeen[1 * 2 + (if inProgram: 1 else: 0)]:
+    return origProcessPrng(pbData, cbData)
+  var ctx = hr.HookContext(args: @[
+    cast[uint64](pbData), uint64(cbData),
+    (if inProgram: 1'u64 else: 0'u64)])
+  hr.dispatchShimHook(hr.HookProcessPrng, ctx)
+  result = BOOL(uint32(ctx.result))
+
+proc trampolineSystemFunction036(RandomBuffer: pointer;
+                                 RandomBufferLength: DWORD): uint8
+                                 {.stdcall.} =
+  if origSystemFunction036 == nil:
+    return 0
+  let inProgram = callerInProgram(builtinReturnAddress(0))
+  if ndEntropySeen[2 * 2 + (if inProgram: 1 else: 0)]:
+    return origSystemFunction036(RandomBuffer, RandomBufferLength)
+  var ctx = hr.HookContext(args: @[
+    cast[uint64](RandomBuffer), uint64(RandomBufferLength),
+    (if inProgram: 1'u64 else: 0'u64)])
+  hr.dispatchShimHook(hr.HookSystemFunction036, ctx)
+  result = uint8(ctx.result and 0xFF'u64)
+
+proc trampolineCryptGenRandom(hProv: uint; dwLen: DWORD;
+                              pbBuffer: pointer): BOOL {.stdcall.} =
+  if origCryptGenRandom == nil:
+    return 0
+  let inProgram = callerInProgram(builtinReturnAddress(0))
+  if ndEntropySeen[3 * 2 + (if inProgram: 1 else: 0)]:
+    return origCryptGenRandom(hProv, dwLen, pbBuffer)
+  var ctx = hr.HookContext(args: @[
+    uint64(hProv), uint64(dwLen), cast[uint64](pbBuffer),
+    (if inProgram: 1'u64 else: 0'u64)])
+  hr.dispatchShimHook(hr.HookCryptGenRandom, ctx)
+  result = BOOL(uint32(ctx.result))
+
+proc trampolineQueryPerformanceCounter(lpPerformanceCount: ptr LARGE_INTEGER):
+    BOOL {.stdcall.} =
+  if origQueryPerformanceCounter == nil:
+    return 0
+  if ndTimeSeen[0]:
+    return origQueryPerformanceCounter(lpPerformanceCount)
+  var ctx = hr.HookContext(args: @[cast[uint64](lpPerformanceCount)])
+  hr.dispatchShimHook(hr.HookQueryPerformanceCounter, ctx)
+  result = BOOL(uint32(ctx.result))
+
+proc trampolineGetSystemTimeAsFileTime(lpSystemTimeAsFileTime: pointer)
+    {.stdcall.} =
+  if origGetSystemTimeAsFileTime == nil:
+    return
+  if ndTimeSeen[1]:
+    origGetSystemTimeAsFileTime(lpSystemTimeAsFileTime)
+    return
+  var ctx = hr.HookContext(args: @[cast[uint64](lpSystemTimeAsFileTime)])
+  hr.dispatchShimHook(hr.HookGetSystemTimeAsFileTime, ctx)
+
+proc trampolineGetTickCount64(): uint64 {.stdcall.} =
+  if origGetTickCount64 == nil:
+    return 0
+  if ndTimeSeen[2]:
+    return origGetTickCount64()
+  var ctx = hr.HookContext(args: @[])
+  hr.dispatchShimHook(hr.HookGetTickCount64, ctx)
+  result = ctx.result
+
 # --- Registry wiring -------------------------------------------------------
 #
 # Called once from repro_monitor_shim_init AFTER the registry has been
@@ -3128,6 +4351,28 @@ proc registerMonitorSnoopCallbacks*() =
   hr.registerMonitorHook(hr.HookGetProcAddress, snoopGetProcAddress)
   # hr.registerMonitorHook(hr.HookNtQueryDirectoryFileEx,
   #                        snoopNtQueryDirectoryFileEx)
+  # M5 — IPC-connect (socket arm; the named-pipe arm is classified inside the
+  # CreateFile / NtCreateFile snoops above).
+  hr.registerMonitorHook(hr.HookConnect, snoopConnect)
+  hr.registerMonitorHook(hr.HookWSAConnect, snoopWSAConnect)
+  # M5 — external content.
+  hr.registerMonitorHook(hr.HookCreateFileMappingW, snoopCreateFileMappingW)
+  hr.registerMonitorHook(hr.HookCreateFileMappingA, snoopCreateFileMappingA)
+  hr.registerMonitorHook(hr.HookOpenFileMappingW, snoopOpenFileMappingW)
+  hr.registerMonitorHook(hr.HookOpenFileMappingA, snoopOpenFileMappingA)
+  hr.registerMonitorHook(hr.HookMapViewOfFile, snoopMapViewOfFile)
+  hr.registerMonitorHook(hr.HookMapViewOfFileEx, snoopMapViewOfFileEx)
+  hr.registerMonitorHook(hr.HookCreatePipe, snoopCreatePipe)
+  # M5 — non-determinism.
+  hr.registerMonitorHook(hr.HookBCryptGenRandom, snoopBCryptGenRandom)
+  hr.registerMonitorHook(hr.HookProcessPrng, snoopProcessPrng)
+  hr.registerMonitorHook(hr.HookSystemFunction036, snoopSystemFunction036)
+  hr.registerMonitorHook(hr.HookCryptGenRandom, snoopCryptGenRandom)
+  hr.registerMonitorHook(hr.HookQueryPerformanceCounter,
+                         snoopQueryPerformanceCounter)
+  hr.registerMonitorHook(hr.HookGetSystemTimeAsFileTime,
+                         snoopGetSystemTimeAsFileTime)
+  hr.registerMonitorHook(hr.HookGetTickCount64, snoopGetTickCount64)
 
 # --- Unified install backend (M73 Phase 1) ---------------------------------
 #
@@ -3165,6 +4410,13 @@ type
                                 # audit paths resolve the function from
                                 # (default "kernel32.dll"). NtCreateFile
                                 # sets this to "ntdll.dll".
+    optionalModule: bool        # M5: the entry point may legitimately not
+                                # exist on a supported host (a newer-Windows
+                                # export). A missing module is then NOT an
+                                # unhooked entry point, because there is no
+                                # API for a call to escape through -- as
+                                # opposed to a module that IS present and
+                                # whose hook failed, which stays a loss.
 
 const kernel32FileIatDlls = @[
   "kernel32.dll", "kernelbase.dll",
@@ -3180,6 +4432,18 @@ const kernel32FileIatDlls = @[
 # api-ms-win-* shims forward to it but no module advertises it under a
 # different ExportName, so the IAT-fallback list can stay minimal here.
 const ntdllNtIatDlls = @["ntdll.dll"]
+
+# M5 — the modules the IPC / entropy entry points live in. They are
+# force-loaded before the install pass (see `forceLoadObservedModules`) so the
+# hook is in place before any user code can call through them.
+const ws2IatDlls = @["ws2_32.dll", "wsock32.dll"]
+const bcryptIatDlls = @["bcrypt.dll"]
+const bcryptPrimitivesIatDlls = @["bcryptprimitives.dll"]
+# `SystemFunction036` / `CryptGenRandom` are advapi32 exports that FORWARD to
+# cryptbase / cryptsp; GetProcAddress resolves the forward, so the inline
+# detour lands on the real body. The IAT fallback list names all three because
+# a caller may import from whichever module its SDK headers pointed at.
+const advapi32IatDlls = @["advapi32.dll", "cryptbase.dll", "cryptsp.dll"]
 
 # Addresses of the kernel32 / ntdll entry points we successfully
 # inline-patched. The C-runtime atexit handler walks this and calls
@@ -3411,8 +4675,134 @@ let hookTable {.global.}: seq[HookSpec] = @[
     origStorage: cast[ptr pointer](addr origGetProcAddress),
     origCallback: originalGetProcAddress,
     iatDlls: kernel32FileIatDlls,
+    moduleDll: "kernel32.dll"),
+  # --- M5: IPC-connect (ws2_32.dll) ---------------------------------------
+  HookSpec(name: hr.HookConnect,
+    trampoline: cast[pointer](trampolineConnect),
+    origStorage: cast[ptr pointer](addr origConnect),
+    origCallback: originalConnect,
+    iatDlls: ws2IatDlls,
+    moduleDll: "ws2_32.dll"),
+  HookSpec(name: hr.HookWSAConnect,
+    trampoline: cast[pointer](trampolineWSAConnect),
+    origStorage: cast[ptr pointer](addr origWSAConnect),
+    origCallback: originalWSAConnect,
+    iatDlls: ws2IatDlls,
+    moduleDll: "ws2_32.dll"),
+  # --- M5: external content (kernel32.dll) --------------------------------
+  HookSpec(name: hr.HookCreateFileMappingW,
+    trampoline: cast[pointer](trampolineCreateFileMappingW),
+    origStorage: cast[ptr pointer](addr origCreateFileMappingW),
+    origCallback: originalCreateFileMappingW,
+    iatDlls: kernel32FileIatDlls,
+    moduleDll: "kernel32.dll"),
+  HookSpec(name: hr.HookCreateFileMappingA,
+    trampoline: cast[pointer](trampolineCreateFileMappingA),
+    origStorage: cast[ptr pointer](addr origCreateFileMappingA),
+    origCallback: originalCreateFileMappingA,
+    iatDlls: kernel32FileIatDlls,
+    moduleDll: "kernel32.dll"),
+  HookSpec(name: hr.HookOpenFileMappingW,
+    trampoline: cast[pointer](trampolineOpenFileMappingW),
+    origStorage: cast[ptr pointer](addr origOpenFileMappingW),
+    origCallback: originalOpenFileMappingW,
+    iatDlls: kernel32FileIatDlls,
+    moduleDll: "kernel32.dll"),
+  HookSpec(name: hr.HookOpenFileMappingA,
+    trampoline: cast[pointer](trampolineOpenFileMappingA),
+    origStorage: cast[ptr pointer](addr origOpenFileMappingA),
+    origCallback: originalOpenFileMappingA,
+    iatDlls: kernel32FileIatDlls,
+    moduleDll: "kernel32.dll"),
+  HookSpec(name: hr.HookMapViewOfFile,
+    trampoline: cast[pointer](trampolineMapViewOfFile),
+    origStorage: cast[ptr pointer](addr origMapViewOfFile),
+    origCallback: originalMapViewOfFile,
+    iatDlls: kernel32FileIatDlls,
+    moduleDll: "kernel32.dll"),
+  HookSpec(name: hr.HookMapViewOfFileEx,
+    trampoline: cast[pointer](trampolineMapViewOfFileEx),
+    origStorage: cast[ptr pointer](addr origMapViewOfFileEx),
+    origCallback: originalMapViewOfFileEx,
+    iatDlls: kernel32FileIatDlls,
+    moduleDll: "kernel32.dll"),
+  HookSpec(name: hr.HookCreatePipe,
+    trampoline: cast[pointer](trampolineCreatePipe),
+    origStorage: cast[ptr pointer](addr origCreatePipe),
+    origCallback: originalCreatePipe,
+    iatDlls: kernel32FileIatDlls,
+    moduleDll: "kernel32.dll"),
+  # --- M5: non-determinism ------------------------------------------------
+  HookSpec(name: hr.HookBCryptGenRandom,
+    trampoline: cast[pointer](trampolineBCryptGenRandom),
+    origStorage: cast[ptr pointer](addr origBCryptGenRandom),
+    origCallback: originalBCryptGenRandom,
+    iatDlls: bcryptIatDlls,
+    moduleDll: "bcrypt.dll"),
+  # ProcessPrng is the Win10 1809+ export that bcrypt / the modern CRT / Go /
+  # Rust actually bottom out in. Optional because a host without it has no such
+  # API for a call to escape through.
+  HookSpec(name: hr.HookProcessPrng,
+    trampoline: cast[pointer](trampolineProcessPrng),
+    origStorage: cast[ptr pointer](addr origProcessPrng),
+    origCallback: originalProcessPrng,
+    iatDlls: bcryptPrimitivesIatDlls,
+    moduleDll: "bcryptprimitives.dll",
+    optionalModule: true),
+  HookSpec(name: hr.HookSystemFunction036,
+    trampoline: cast[pointer](trampolineSystemFunction036),
+    origStorage: cast[ptr pointer](addr origSystemFunction036),
+    origCallback: originalSystemFunction036,
+    iatDlls: advapi32IatDlls,
+    moduleDll: "advapi32.dll"),
+  HookSpec(name: hr.HookCryptGenRandom,
+    trampoline: cast[pointer](trampolineCryptGenRandom),
+    origStorage: cast[ptr pointer](addr origCryptGenRandom),
+    origCallback: originalCryptGenRandom,
+    iatDlls: advapi32IatDlls,
+    moduleDll: "advapi32.dll"),
+  HookSpec(name: hr.HookQueryPerformanceCounter,
+    trampoline: cast[pointer](trampolineQueryPerformanceCounter),
+    origStorage: cast[ptr pointer](addr origQueryPerformanceCounter),
+    origCallback: originalQueryPerformanceCounter,
+    iatDlls: kernel32FileIatDlls,
+    moduleDll: "kernel32.dll"),
+  HookSpec(name: hr.HookGetSystemTimeAsFileTime,
+    trampoline: cast[pointer](trampolineGetSystemTimeAsFileTime),
+    origStorage: cast[ptr pointer](addr origGetSystemTimeAsFileTime),
+    origCallback: originalGetSystemTimeAsFileTime,
+    iatDlls: kernel32FileIatDlls,
+    moduleDll: "kernel32.dll"),
+  HookSpec(name: hr.HookGetTickCount64,
+    trampoline: cast[pointer](trampolineGetTickCount64),
+    origStorage: cast[ptr pointer](addr origGetTickCount64),
+    origCallback: originalGetTickCount64,
+    iatDlls: kernel32FileIatDlls,
     moduleDll: "kernel32.dll")
 ]
+
+proc forceLoadObservedModules() {.raises: [].} =
+  ## Map the modules the M5 entry points live in, before the install pass.
+  ##
+  ## A hook can only be installed into a LOADED module. ws2_32 / bcrypt /
+  ## advapi32 / bcryptprimitives are not part of every process's static import
+  ## closure, so without this the install would skip them in exactly the
+  ## processes that later `LoadLibrary` one and call through it -- an entry
+  ## point advertised as hooked and in fact not, which is the M4 over-claim in
+  ## a new place. Forcing them in makes "hooked for the whole process
+  ## lifetime" true rather than incidental.
+  ##
+  ## The cost is that these images join the process's recorded module set, so
+  ## they appear as library-load reads. That is not a fiction -- they really
+  ## are mapped -- and it is the same status the shim's own DLL already has.
+  const names = ["ws2_32.dll", "bcrypt.dll", "advapi32.dll",
+                 "bcryptprimitives.dll"]
+  for n in names:
+    var wide = newSeq[uint16](n.len + 1)
+    for i, c in n:
+      wide[i] = uint16(ord(c))
+    wide[n.len] = 0'u16
+    discard LoadLibraryW(cast[LPCWSTR](addr wide[0]))
 
 proc queueInlineInstall(spec: HookSpec; hModule: HANDLE): cint =
   ## Queue an inline JMP rel32 install for ``spec.name`` against
@@ -3508,6 +4898,15 @@ proc installAllHooks(): int =
         if spec.moduleDll.len > 0: spec.moduleDll else: "kernel32.dll"
       let hModule = resolveModule(modName)
       if hModule == nil:
+        if spec.optionalModule:
+          # The module is not present on this host, so the entry point does not
+          # exist and no call can escape through it. Skipping is honest here;
+          # routing it to the IAT fallback would end with an event-loss record
+          # naming an API the OS does not have, which would downgrade every
+          # capture on that host for no observational shortfall.
+          dbg(cstring("[repro_monitor_shim] installAllHooks: optional module " &
+            modName & " absent; skipping " & spec.name & "\n"))
+          continue
         dbg(cstring("[repro_monitor_shim] installAllHooks: " &
           "GetModuleHandleA(" & modName & ") returned NULL; falling back to IAT for " &
           spec.name & "\n"))
@@ -3701,6 +5100,13 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   # hooked call sees a fully-built chain.
   hr.initShimRegistry()
   registerMonitorSnoopCallbacks()
+  # M5 — caller attribution for the entropy hooks needs the program's own image
+  # bounds, and the IPC / entropy entry points need their modules mapped before
+  # the install pass can patch them. Both are cheap and must precede
+  # installAllHooks.
+  initMainImageRange()
+  withShimMuted:
+    forceLoadObservedModules()
   initialized = true
   release(initLockVar)
   recordProcessStart()
@@ -3767,6 +5173,9 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
       except KeyError:
         hMod = GetModuleHandleA(cast[LPCSTR](modName.cstring))
       if hMod == nil:
+        if spec.optionalModule:
+          # Absent optional module: nothing to audit and nothing missing.
+          continue
         dbg(cstring("[repro_monitor_shim] install-audit SKIPPED for " &
           spec.name & ": GetModuleHandleA(" & modName & ") returned NULL\n"))
         # Pass nil so the audit module reports the failure consistently

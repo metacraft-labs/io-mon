@@ -234,6 +234,24 @@ type
     backendFamily*: MonitorBackendFamily
     capability*: MonitorCapability
     required*: bool
+    ## Is the missing capability an INPUT channel -- something bytes or
+    ## decisions can reach the monitored program through -- as opposed to
+    ## output-side bookkeeping, identity fidelity, an alternative backend or a
+    ## threat model?
+    ##
+    ## This exists because the distinction decides what a consumer must DO, and
+    ## it was previously only expressible in the free-text `reason`. A depfile
+    ## consumer weighing whether a capture may be trusted for cache publication
+    ## cannot tell "renames are not classified" (nothing unseen on the way in)
+    ## from "environment reads are not recorded" (a real input observed by
+    ## nothing) by string-matching English prose. `required` does not answer it
+    ## either: `required` says only whether the CALLER asked for the capability.
+    ##
+    ## `true` does NOT imply the capture is unusable -- see
+    ## `InputEvidenceCapabilities` for the subset whose absence forces
+    ## `mcIncomplete`. It means the shortfall is on the input side and a
+    ## consumer that cares about input completeness must weigh it.
+    inputChannel*: bool
     reason*: string
 
   MonitorBackendProfile* = object

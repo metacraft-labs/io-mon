@@ -80,7 +80,91 @@ Not covered by it, and not fixable by the same means: a parent killed with
 `finally` unwinds nothing, so a tree-kill of a monitored build can still
 strand the child it was mid-way through injecting.
 
+## The M5 capability tests, and why they come in pairs
+
+`test_io_mon_windows_ipc_connect.nim`,
+`test_io_mon_windows_external_content.nim` and
+`test_io_mon_windows_non_determinism.nim` cover the three capability gaps M5
+closed. They share `tests/helpers/windows_channel_fixture.nim`, and each test
+binary re-invokes *itself* as the monitored program (the
+`--io-mon-channel-fixture <mode> [arg]` dispatch), following
+`test_io_mon_windows_spawn_resume_invariant.nim`.
+
+Three conventions in there are worth copying:
+
+- **The fixture reports whether the channel was exercised.** Every mode returns
+  a distinct non-zero code on failure and the tests assert `exitCode == 0`
+  before asserting on records. Without that, a fixture that silently failed to
+  open its pipe would produce a run with no IPC record and a records-only
+  assertion would call it a pass — the same shape as the monitoring failure
+  being tested.
+- **Provenance is tested in both directions.** For each channel there is an
+  in-tree case that must stay `mcComplete` and an out-of-tree case that must
+  grade `mcIncomplete`. Only one of the two would pass against an
+  implementation that always answered the same way, and the false-downgrade
+  direction is as damaging as the false-complete one: it makes every build
+  that uses a pipe uncacheable.
+- **The out-of-tree peer is the test process itself.** It serves the named
+  pipe / owns the named section while staying outside the monitored tree, so
+  the breakaway-daemon case needs no daemon installed on the host.
+
+The `pipe`-directory cases in the IPC test exist because the first
+implementation got them wrong in two ways that only mutation testing found: a
+*relative* `pipe\x.txt` is byte-for-byte the NT object form after the `\??\`
+strip, and an *extended-length* `\\?\C:\...\pipe\x.txt` passes any
+first-character filter while containing `\pipe\`. Both were recorded as
+connections to an unknown peer, which downgrades the capture. An absolute
+`C:\...\pipe\x.txt` never reaches the classifier at all, so testing only that
+spelling pins nothing.
+
+### The cases a *successful* channel cannot reach
+
+Review found four branches with no test, and the pattern behind all four is
+worth stating once: **every case exercised a channel that worked.** A fixture
+that connects to a live listener, opens a pipe that exists, or creates a
+section under a fresh name can never reach the code that decides what to do
+when the call *fails* or when somebody else got there first — and those are
+exactly the branches where a wrong answer is a false grade rather than a
+missing detail. The added cases are therefore all about the *other* outcome:
+
+- `socket-connect-refused` — a `connect` to a closed port. A refusal reached no
+  peer, and recording it as an ipc-connect to an unknown peer downgrades the
+  whole capture over a connection that never happened. Build hosts probe
+  localhost constantly, so this is not rare.
+- `socket-connect-nonblocking` — the opposite direction of the same guard. A
+  non-blocking connect returns `WSAEWOULDBLOCK` and completes asynchronously:
+  the peer *is* reached, so accepting only `rc == 0` would make an async
+  client's out-of-tree daemon invisible.
+- `pipe-client-missing` — the pipe-arm counterpart of the refused connect.
+- `shm-create-existing` — `CreateFileMapping` over a name the test process
+  already owns. It does not fail on an existing name; it opens the section and
+  sets `ERROR_ALREADY_EXISTS`, so the same call is both producer and consumer
+  and only the last-error tells them apart. Both pre-existing shm cases used a
+  *fresh* name, so the branch that decides "this content came from outside the
+  tree" had no coverage at all.
+- `nt-pipe-client` — `NtCreateFile` called **directly**. `CreateFileW` lowers to
+  it, so every other pipe case fires the kernel32 arm first and would pass with
+  the NT arm deleted. The NT arm sees a path whose `\??\` prefix has been
+  stripped, leaving `pipe\<name>` — byte-for-byte the ordinary relative open the
+  classifier must *reject* — which is why it classifies on
+  `objectAttributesRawName` instead.
+- `anon-pipe-inherit` — create in one process, read in another. `pipe:<server>:
+  <client>` is claimed to be process-independent, and an in-process fixture
+  makes *any* key look process-independent, including one with the caller's own
+  pid in it.
+
+Each fixture mode **asserts the outcome it needs** rather than assuming it: the
+refused connect requires `WSAECONNREFUSED`, the pre-owned section requires
+`ERROR_ALREADY_EXISTS`, the non-blocking connect requires `WSAEWOULDBLOCK`. A
+mode that silently got the *other* outcome would make a
+"no record was emitted" assertion pass for the wrong reason — the same failure
+shape as the monitoring bug being tested.
+
 Not covered here, because it needs an i686 toolchain the suite cannot assume:
 the WOW64 path (32-bit children). `nim-stackable-hooks`'
 `tests/test_windows_wow64_injection.nim` covers the injector side and skips
-when the 32-bit artefacts are absent.
+when the 32-bit artefacts are absent. Note that `nt-pipe-client` is therefore
+64-bit-only, and `objectAttributesToString` reads `ObjectName` at the x64
+offset unconditionally — so a 32-bit client calling `NtCreateFile` directly on
+a pipe has no coverage *and* no classification. The kernel32 arm covers every
+client that goes through `CreateFileW`, which is nearly all of them.
