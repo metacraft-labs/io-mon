@@ -908,58 +908,280 @@ proc records*(r: MonitorResult): seq[MonitorRecord] =
   ## Convenience accessor: the merged, canonicalised dependency records.
   r.depFile.records
 
-proc runMonitored*(request: FsSnoopRequest): MonitorResult =
-  ## **Public parent-host API (io-mon-Lossless-Event-Capture §5, M6 part A).**
+# ---------------------------------------------------------------------------
+# IoMon-Decomposed-Host-API DH-2 — the lifecycle behind a handle.
+#
+# `runMonitored` used to BE the lifecycle: one call created the consumer, spawned
+# the tree, blocked on it, and finalised the evidence. That is unusable for a
+# build engine, whose scheduler polls N in-flight children in one loop — calling
+# a blocking `runMonitored` per action serialises the whole build.
+#
+# So the lifecycle is now three steps a caller can interleave:
+#
+#     var h = startMonitor(request)        # consumer up, tree spawned
+#     while not pollMonitor(h): ...        # non-blocking; poll N of these
+#     let res = finishMonitor(move h)      # evidence
+#
+# and `runMonitored` is `finishMonitor(startMonitor(request))` — the SAME code
+# path, not a second implementation of it (see its docstring, and
+# `tests/linux/test_io_mon_decomposed_host_api.nim`, which asserts the
+# delegation at RUNTIME through the lifecycle counters below).
+# ---------------------------------------------------------------------------
+
+var
+  monitorsStartedCount: Atomic[uint64]
+  monitorsFinishedCount: Atomic[uint64]
+  monitorsReleasedCount: Atomic[uint64]
+
+proc monitorLifecycleCounts*(): tuple[started, finished, released, live: int] =
+  ## Process-wide census of monitors handled by THIS module.
   ##
-  ## The blessed, batch consumer-side entry point for hosting an io-mon monitor.
-  ## This proc OWNS the entire producer/consumer lifecycle so a well-formed
-  ## parent can never end up with a producer and no consumer (the structural
-  ## cause of an LF-2 orphan spill):
+  ## `started` counts `startMonitor` calls that got as far as owning something
+  ## (past shim resolution); `finished` counts `finishMonitor` calls;
+  ## `released` counts monitors whose consumer structure and scratch state have
+  ## been torn down — by `finishMonitor` OR by a dropped handle's destructor.
+  ## `live` is `started - released`.
   ##
-  ##   1. resolves the interpose shim (`findShimLibrary`);
-  ##   2. on Linux, CREATES the consumer-owned `nim-shm-gset` (via
-  ##      `transport.startHost`, appId defaulting to `"io-mon"` or
-  ##      `REPRO_MONITOR_APP_ID`) and exports `REPRO_MONITOR_DEP_SHM` +
-  ##      `REPRO_MONITOR_APP_ID` so the shim's producers attach the RIGHT set;
-  ##   3. injects the shim and SPAWNS the monitored process tree;
-  ##   4. waits for the tree, SNAPSHOTS the deduped set, and writes the canonical
-  ##      depfile via `mergeFragments` (passing the spawned root pid as the R1
-  ##      root-guard, so an un-monitored root downgrades to `mcIncomplete`
-  ##      instead of a false `mcComplete`);
-  ##   5. on FINISH calls `SetHost.finish` (`markConsumerGone` + detach), so a
-  ##      late orphan `emit` fast-fails with `emConsumerGone` (LF-4) and the
-  ##      consumer-owned memory is released.
+  ## Two jobs, both real rather than test-only:
   ##
-  ## Because the consumer structure is created, named, and torn down HERE — not
-  ## by the caller — LF-2 (no orphan spill) and LF-4 (consumer liveness) hold by
-  ## construction for any parent that uses this proc. Prefer this over copying
-  ## the driver: a copy that skips step 2 is exactly the producer-with-no-consumer
-  ## bug this API exists to prevent.
+  ##  * a long-lived host can assert `live == 0` at shutdown, which is the LF-2
+  ##    property stated as a number it can check; and
+  ##  * `finished < released` is exactly "somebody dropped a handle", which is a
+  ##    host bug worth reporting even though this module survives it.
   ##
-  ## Never spawns a consumer-less producer; still raises on a genuine setup
-  ## failure (no shim, unsupported platform) — the CLI wrapper `runFsSnoopCli`
-  ## converts those to a diagnostic + non-zero exit.
+  ## It is also what pins `runMonitored`'s delegation executably: a
+  ## reimplementation that stopped going through `startMonitor`/`finishMonitor`
+  ## would stop moving these numbers.
+  let started = int(monitorsStartedCount.load())
+  let finished = int(monitorsFinishedCount.load())
+  let released = int(monitorsReleasedCount.load())
+  (started: started, finished: finished, released: released,
+   live: started - released)
+
+type
+  MonitorHandle* = object
+    ## A monitor whose WAIT the caller owns: `startMonitor` produces one,
+    ## `pollMonitor` advances it without blocking, `finishMonitor` consumes it
+    ## and yields the `MonitorResult`.
+    ##
+    ## ── THE LF-2 GUARANTEE, RESTATED FOR A CALLER-OWNED WAIT ───────────────
+    ##
+    ## `runMonitored` could promise "a producer never runs without a consumer"
+    ## the easy way: it OWNED the whole lifecycle, so the consumer-owned
+    ## `nim-shm-gset` and the fragment directory were created and destroyed
+    ## inside one call and no caller could ever hold one end of it. Moving the
+    ## wait out is precisely what re-opens that window. A host that starts a
+    ## monitor and then loses interest — an early `return`, a raised exception,
+    ## a `break` out of its poll loop — would release (or, on process exit,
+    ## simply abandon) the consumer while the monitored tree is still running
+    ## and still publishing. §4.1's incident is that shape: a descendant
+    ## appending to an unlinked `.rmdf-frag` until it filled the root tmpfs.
+    ##
+    ## A documented "you must always call `finishMonitor`" would not hold that
+    ## line, so the type holds it instead. Three properties, none of them a rule
+    ## a caller can forget:
+    ##
+    ##  1. **The handle is the only way to reach a producer.** `startMonitor` is
+    ##     the sole spawn site for a monitored tree in this module, and it
+    ##     hands back the consumer's owner in the same value. "Spawned but
+    ##     unowned" is not a state that can be constructed. The fields are
+    ##     private and there is no public constructor, so a caller cannot
+    ##     assemble a half-handle either.
+    ##  2. **The handle cannot be copied** — `=copy` is `{.error.}`. Two owners
+    ##     of one consumer cannot be written down, so "the other copy will
+    ##     finish it" is never an argument. Non-copyability propagates
+    ##     transitively through `seq`, arrays and any wrapping object, so the
+    ##     `seq[MonitorHandle]` an N-way poll loop holds is itself exclusive.
+    ##     (Prior art: `nim-shm-gset`'s `SetLease`, which made "two leases over
+    ##     one chain" unrepresentable in the same way.)
+    ##  3. **Dropping the handle FINISHES it** — `=destroy` runs the safety half
+    ##     of the lifecycle: it waits for the monitored root to exit, and only
+    ##     then marks the consumer gone and removes the fragment directory. So
+    ##     the ordering that makes an orphan possible — release the consumer
+    ##     while a producer still runs — is not reachable by dropping,
+    ##     returning early, unwinding, or moving the handle somewhere it is
+    ##     never finished. What a dropped handle costs is the WAIT the caller
+    ##     was trying to skip and the EVIDENCE it never asked for; what it can
+    ##     never cost is an orphaned producer.
+    ##
+    ## Point 3 is why the destructor waits rather than killing the tree: killing
+    ## would make dropping a handle destroy the caller's work, and `runMonitored`
+    ## does not kill either. Note the honest consequence — a dropped handle whose
+    ## child never exits blocks in the destructor exactly as long as
+    ## `runMonitored` would have blocked in the wait.
+    ##
+    ## ── WHAT IS NOT COVERED ────────────────────────────────────────────────
+    ## A host killed with `SIGKILL` runs no destructor; that is the reaper's job
+    ## (`shm_gset`'s cross-restart sweep), not this type's, and it is unchanged
+    ## from `runMonitored`.
+    active: bool                   ## owns something releasable
+    exited: bool                   ## the monitored root has been reaped
+    settled: bool                  ## the §4.1 descendant grace has run
+    exitCode: int
+    rootPid: uint64
+    runId: string
+    fragmentDir: string
+    request: FsSnoopRequest
+    when defined(linux) or defined(macosx):
+      process: Process
+    when defined(linux):
+      depSet: SetHost
+      depSetLive: bool
+    when defined(macosx):
+      sandboxDir: string
+      ownsSandboxDir: bool
+    when defined(windows):
+      shimLib: string
+      spawnEnv: StringTableRef
+      injection: WindowsInjectionResult
+      spawned: bool
+
+proc `=copy`*(dst: var MonitorHandle; src: MonitorHandle) {.error:
+  "a MonitorHandle exclusively owns one live monitor: `move` it (or take it by " &
+  "`sink`), or start another monitor. Copying would give two owners to one " &
+  "consumer, which is how a producer ends up with none (LF-2).".}
+
+proc live*(h: MonitorHandle): bool =
+  ## Does this handle still own a monitor? False for a default-constructed
+  ## handle, for one that has been moved from, and for one already finished.
+  h.active
+
+proc hasExited*(h: MonitorHandle): bool =
+  ## Has the monitored ROOT been reaped? Equivalent to the last `pollMonitor`
+  ## result, without polling again.
+  h.exited
+
+proc rootPid*(h: MonitorHandle): uint64 =
+  ## The monitored root's OS pid — what the R1 root-guard is stated over, and
+  ## what a scheduler reports in its own diagnostics. `0` when nothing has been
+  ## spawned yet (which on Windows is the whole window between `startMonitor`
+  ## and the first `pollMonitor`; see `pollMonitor`).
+  h.rootPid
+
+proc waitForMonitorRoot(h: var MonitorHandle) =
+  ## BLOCK until the monitored root has exited, and record its status.
+  ## Idempotent: a root already reaped by `pollMonitor` is not waited on twice.
   ##
-  ## **CONCURRENCY (IoMon-Decomposed-Host-API DH-1).** On ALL THREE arms this
-  ## proc mutates NOTHING process-global: the injection variables and
-  ## `request.env` are composed into a child-only environment handed to the
-  ## spawn, and `request.cwd` is the child's working directory. Two (or N) calls
-  ## may therefore run concurrently on separate threads of one host process and
-  ## each gets its own complete, uncontaminated evidence — the shape the build
-  ## engine needs. It previously `putEnv`'d seven variables into the HOSTING
-  ## process for the duration of the run, which made concurrent calls corrupt
-  ## each other's capture with no way for a caller to opt out.
+  ## This is the first half of the safety teardown, and the reason the second
+  ## half is safe: nothing that releases the consumer runs before this returns.
+  if h.exited:
+    return
+  when defined(linux) or defined(macosx):
+    if h.process != nil:
+      h.exitCode = waitForExit(h.process)
+      close(h.process)
+      h.process = nil
+      h.exited = true
+  elif defined(windows):
+    # The Windows spawn is `stackable_hooks/windows_injector.runWithMonitorShim`,
+    # which spawns AND waits in one blocking call and returns only a completed
+    # `WindowsInjectionResult`. There is no handle to poll, so this arm performs
+    # the SPAWN here rather than in `startMonitor` — see `pollMonitor` for what
+    # that costs and why it is still the honest shape.
+    if not h.spawned:
+      h.spawned = true
+      h.injection = runWithMonitorShim(h.request.command, h.shimLib,
+                                       cwd = h.request.cwd,
+                                       captureStdio = h.request.captureChildStdio,
+                                       captureStdioPath = h.request.captureStdioPath,
+                                       env = h.spawnEnv)
+      h.exitCode = h.injection.exitCode
+      h.rootPid =
+        if h.injection.monitoringSkipped: 0'u64 else: h.injection.rootPid
+      h.exited = true
+
+proc settleMonitorDescendants(h: var MonitorHandle) =
+  ## The §4.1 detached-descendant grace (Linux). Idempotent.
   ##
-  ## One residual, documented exception: **macOS** inherits `osproc`'s own
-  ## global `setCurrentDir` around its `posix_spawn` path, so a non-empty
-  ## `request.cwd` is not thread-safe there. Linux forks and `chdir`s in the
-  ## child and Windows passes `lpCurrentDirectory`, so both are.
+  ## This is an EVIDENCE step, not a safety step, which is why `finishMonitor`
+  ## runs it and a dropped handle's destructor does not: what it produces is an
+  ## `mrEventLoss` marker that downgrades the edge to `mcIncomplete`, and a
+  ## dropped handle publishes no edge for it to downgrade. The safety of a
+  ## surviving descendant is provided by the release order instead — the root is
+  ## reaped first, and a descendant that outlives the consumer then fast-fails
+  ## with `emConsumerGone` (LF-4).
   ##
-  ## The Windows arm was the last to get here: it published its four injection
-  ## variables with a scope-restored `putEnv` until
-  ## `stackable_hooks.runWithMonitorShim` gained an `env` parameter. All three
-  ## arms now compose the child's environment with the one `childEnv` helper.
-  result.depFilePath = request.depFilePath
+  ## (Making the guard unskippable for a host that owns its OWN spawn is DH-3;
+  ## this only keeps it on the one path `runMonitored` already took.)
+  when defined(linux):
+    if h.settled:
+      return
+    h.settled = true
+    let launcherLossPath0 =
+      if h.depSetLive and h.depSet.available: h.depSet.path0 else: ""
+    waitForLinuxInjectedDescendants(h.fragmentDir, h.runId, h.rootPid,
+      launcherLossPath0)
+  else:
+    h.settled = true
+
+proc releaseMonitor(h: var MonitorHandle) =
+  ## Release everything the monitor owns: mark the consumer gone and unmap it,
+  ## then delete the scratch directories. Idempotent.
+  ##
+  ## MUST NOT be called while the monitored root can still be running — that
+  ## ordering IS the LF-2 hazard. Every caller goes through `endMonitor` or
+  ## `finishMonitor`, both of which reap the root first.
+  ##
+  ## The order inside mirrors what `runMonitored`'s `defer`s executed in before
+  ## DH-2 (consumer first, then sandbox, then fragment dir), so the decomposition
+  ## did not quietly reorder teardown.
+  if not h.active:
+    return
+  h.active = false
+  when defined(linux):
+    if h.depSetLive:
+      h.depSetLive = false
+      # Announce the consumer is gone (a late orphan `emit` then fast-fails with
+      # `emConsumerGone` instead of growing the set — LF-4), then unmap.
+      h.depSet.finish()
+  when defined(macosx):
+    if h.ownsSandboxDir and h.sandboxDir.len > 0:
+      removeLocalTempDir(h.sandboxDir)
+      h.sandboxDir = ""
+      h.ownsSandboxDir = false
+  if h.fragmentDir.len > 0:
+    removeLocalTempDir(h.fragmentDir)
+    h.fragmentDir = ""
+  discard monitorsReleasedCount.fetchAdd(1'u64)
+
+proc endMonitor(h: var MonitorHandle) =
+  ## The SAFETY half of the lifecycle, whole and in order: reap the root, THEN
+  ## release the consumer. `finishMonitor` runs these same two steps with the
+  ## evidence collected between them, and `=destroy` runs them alone — so the
+  ## ordering that LF-2 depends on has ONE implementation, not one per path.
+  if not h.active:
+    return
+  waitForMonitorRoot(h)
+  releaseMonitor(h)
+
+proc `=destroy`*(h: MonitorHandle) =
+  ## Dropping a live handle finishes it — see `MonitorHandle`, point 3. This is
+  ## what makes an LF-2 orphan unrepresentable rather than merely forbidden: the
+  ## producer is reaped before the consumer is released, on EVERY path out of the
+  ## scope that owns the handle, including an exception unwinding through it.
+  ##
+  ## A handle that `finishMonitor` already consumed, and one that was moved from
+  ## (`wasMoved` zeroes it), is inactive here, so this is a no-op for it — no
+  ## double release, no double wait.
+  let self = cast[ptr MonitorHandle](addr h)
+  try:
+    endMonitor(self[])
+  except CatchableError as err:
+    try:
+      stderr.writeLine("io-mon: warning: a dropped MonitorHandle could not be " &
+        "released cleanly: " & err.msg)
+    except CatchableError:
+      discard
+  # Release every field GENERICALLY. A custom `=destroy` suppresses the
+  # compiler's own field destruction (measured: 200k drops of an object with a
+  # string and a seq leak ~28 MB when the hook forgets them), and this handle
+  # carries strings, a `seq`, a `Process` ref and a `StringTableRef`. Walking
+  # `fieldPairs` means a field added later cannot silently start leaking.
+  for name, value in fieldPairs(self[]):
+    `=destroy`(value)
+
+proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
+  h.request = request
   when defined(macosx):
     let shimLib = findShimLibrary()
     if shimLib.len == 0:
@@ -967,8 +1189,9 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
         "cannot find librepro_monitor_shim.dylib; run just build or set " &
           "REPRO_MONITOR_SHIM_LIB")
 
-    let fragmentDir = createLocalTempDir("repro-fs-snoop-fragments")
-    defer: removeLocalTempDir(fragmentDir)
+    h.fragmentDir = createLocalTempDir("repro-fs-snoop-fragments")
+    h.active = true
+    discard monitorsStartedCount.fetchAdd(1'u64)
     ensureParentDir(request.depFilePath)
 
     # SIP bypass: ensure CT_SANDBOX_TOOLS_DIR exists and contains non-SIP
@@ -977,17 +1200,16 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
     # DYLD_INSERT_LIBRARIES and the shim falls silent for the rest of
     # the process tree.
     var sandboxDir = requestEnvValue(request, "CT_SANDBOX_TOOLS_DIR")
-    let ownsSandboxDir = sandboxDir.len == 0
-    if ownsSandboxDir:
+    h.ownsSandboxDir = sandboxDir.len == 0
+    if h.ownsSandboxDir:
       sandboxDir = createLocalTempDir("repro-fs-snoop-sandbox-tools")
     # Only the fallback created by this invocation belongs to io-mon.  An
     # operator-provided CT_SANDBOX_TOOLS_DIR may be a persistent, pre-built
-    # bundle and must never be removed.  Register ownership cleanup before
-    # populating the tree so setup failures, spawn failures, non-zero child
-    # exits, and successful runs all release the same invocation-local path.
-    defer:
-      if ownsSandboxDir:
-        removeLocalTempDir(sandboxDir)
+    # bundle and must never be removed.  Recording ownership on the HANDLE
+    # before populating the tree is what releases the same invocation-local
+    # path on setup failures, spawn failures, non-zero child exits, successful
+    # runs — and now on a dropped handle too.
+    h.sandboxDir = sandboxDir
     populateReproSandboxTools(sandboxDir)
 
     # DH-1 — the macOS injection set, threaded through the SPAWN. Six variables;
@@ -999,7 +1221,7 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
       ("DYLD_INSERT_LIBRARIES",
         injectionValue(shimLib,
           requestEnvValue(request, "DYLD_INSERT_LIBRARIES"))),
-      ("REPRO_MONITOR_FRAGMENT_DIR", fragmentDir),
+      ("REPRO_MONITOR_FRAGMENT_DIR", h.fragmentDir),
       ("REPRO_MONITOR_OUTPUT", request.depFilePath),
       ("REPRO_MONITOR_SESSION", newRunId()),
       ("REPRO_MONITOR_SHIM_LIB", shimLib)
@@ -1022,7 +1244,7 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
         effectiveCommand[1 .. ^1]
       else:
         @[]
-    let process = startProcess(effectiveCommand[0],
+    h.process = startProcess(effectiveCommand[0],
       workingDir = request.cwd,
       args = childArgs,
       env = spawnEnv,
@@ -1032,14 +1254,7 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
     # DYLD_INSERT_LIBRARIES and emits no process-start; passing its pid to
     # mergeFragments downgrades that case to mcIncomplete instead of asserting a
     # false mcComplete over an empty record set.
-    let rootPid = uint64(process.processID)
-    result.exitCode = waitForExit(process)
-    close(process)
-
-    result.depFile = mergeFragments(fragmentDir, request.depFilePath,
-      expectedRootPid = rootPid)
-    renderStreamToPath(request.depFilePath, request.streamMode,
-      request.eventStreamPath)
+    h.rootPid = uint64(h.process.processID)
   elif defined(linux):
     let shimLib = findShimLibrary()
     if shimLib.len == 0:
@@ -1047,21 +1262,22 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
         "cannot find librepro_monitor_shim.so; run just build or set " &
           "REPRO_MONITOR_SHIM_LIB")
 
-    let fragmentDir = createLocalTempDir("repro-fs-snoop-fragments")
-    defer: removeLocalTempDir(fragmentDir)
+    h.fragmentDir = createLocalTempDir("repro-fs-snoop-fragments")
+    h.active = true
+    discard monitorsStartedCount.fetchAdd(1'u64)
     ensureParentDir(request.depFilePath)
 
     # DH-1 — the Linux injection set, threaded through the SPAWN. Seven
     # variables in the fully-enabled case (`REPRO_MONITOR_DEP_SHM` and
     # `REPRO_MONITOR_APP_ID` only when the shm-gset host came up); no `putEnv`,
     # so a second monitor running concurrently in this process is unaffected.
-    let runId = newRunId()
+    h.runId = newRunId()
     var injected = @[
       ("LD_PRELOAD",
         injectionValue(shimLib, requestEnvValue(request, "LD_PRELOAD"))),
-      ("REPRO_MONITOR_FRAGMENT_DIR", fragmentDir),
+      ("REPRO_MONITOR_FRAGMENT_DIR", h.fragmentDir),
       ("REPRO_MONITOR_OUTPUT", request.depFilePath),
-      ("REPRO_MONITOR_SESSION", runId)
+      ("REPRO_MONITOR_SESSION", h.runId)
     ]
 
     # io-mon-Lossless-Event-Capture M3 (part 1) — the CONSUMER hosts the edge's
@@ -1078,7 +1294,6 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
     # that outlives every producer, so a producer SIGKILLed after publishing loses
     # ZERO records (LF-3). DISABLED (env left unset) when REPRO_MONITOR_DEP_SHM_DISABLE
     # is set — the pure-file baseline used by the LF-6 byte-identical regression.
-    var depSet: SetHost
     let depSetEnabled = shmGSetSupported and
       requestEnvValue(request, "REPRO_MONITOR_DEP_SHM_DISABLE").len == 0
     if depSetEnabled:
@@ -1090,9 +1305,13 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
       var depSetAppId = requestEnvValue(request, "REPRO_MONITOR_APP_ID")
       if depSetAppId.len == 0:
         depSetAppId = "io-mon"
-      depSet = startHost(fragmentDir, runId, appId = depSetAppId)
-      if depSet.available:
-        injected.add ("REPRO_MONITOR_DEP_SHM", depSet.path0)
+      h.depSet = startHost(h.fragmentDir, h.runId, appId = depSetAppId)
+      # From here the CONSUMER structure exists, so the handle owns it: every
+      # exit from this proc, and every exit from the caller's scope, goes
+      # through `releaseMonitor`'s `finish()` (markConsumerGone + unmap).
+      h.depSetLive = h.depSet.available
+      if h.depSetLive:
+        injected.add ("REPRO_MONITOR_DEP_SHM", h.depSet.path0)
         # Export the resolved appId too, so a producer that re-derives the
         # reaper scope (or an in-tree consumer that shares the segments dir)
         # sees the SAME tag the host created shard0 under — part of the §5
@@ -1100,88 +1319,34 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
         injected.add ("REPRO_MONITOR_APP_ID", depSetAppId)
     injected.add ("REPRO_MONITOR_SHIM_LIB", shimLib)
     let spawnEnv = childEnv(request, injected)
-    defer:
-      # End the host lifecycle: announce the consumer is gone (a late orphan
-      # `emit` then fast-fails with `emConsumerGone` instead of growing the set —
-      # LF-4 / the orphan-bounded property), then unmap.
-      if depSet.available:
-        depSet.finish()
 
     let childArgs =
       if request.command.len > 1:
         request.command[1 .. ^1]
       else:
         @[]
-    let process = startProcess(request.command[0],
+    h.process = startProcess(request.command[0],
       workingDir = request.cwd,
       args = childArgs,
       env = spawnEnv,
       options = {poUsePath, poParentStreams})
     # ROUND-2 R1 — see the macOS branch: prove the root was monitored.
-    let rootPid = uint64(process.processID)
-
-    # The set requires NO concurrent drain (idempotent inserts, no backpressure),
-    # so just wait for the tree to exit.
-    result.exitCode = waitForExit(process)
-    close(process)
-
-    # io-mon-Lossless-Event-Capture M7 (Linux slice) — hand the live set's shard0
-    # path so a launcher-side event-loss (a descendant still alive past the grace
-    # window) is inserted into the CONSUMER-OWNED set, folded into the depfile by
-    # the snapshot below, with NO `.rmdf-frag` file — Linux is file-free end-to-end.
-    let launcherLossPath0 = if depSet.available: depSet.path0 else: ""
-    waitForLinuxInjectedDescendants(fragmentDir, runId, rootPid, launcherLossPath0)
-    # io-mon-Lossless-Event-Capture M3 part 2a — SINGLE-THREADED final merge over
-    # the SET's DISTINCT elements. The DEP-FLUSH shutdown guarantees every producer
-    # published its last record, so snapshot the deduped union of all shards and
-    # decode each element (identity element-key + trailing incarnation-image bytes)
-    # back to a `MonitorRecord` (seq reconstructs as 0). These fold into the
-    # merge via the `setRecords` argument.
-    #
-    # DETERMINISM: `snapshot` yields elements in hash-slot order (non-deterministic
-    # across runs), and two DISTINCT elements can tie in `canonicalOrder` because
-    # the identity key drops `seq` (decoded to 0). Sort the raw distinct elements —
-    # a total order, since they are unique — BEFORE decoding, so the stable
-    # canonical sort in `writeCanonicalInPlace` breaks those ties deterministically
-    # and the depfile is byte-reproducible (the golden-regression invariant).
-    var depDrained: seq[MonitorRecord] = @[]
-    if depSet.available:
-      var elems = depSet.snapshot()
-      elems.sort(proc (a, b: seq[byte]): int =
-        let m = min(a.len, b.len)
-        for i in 0 ..< m:
-          if a[i] != b[i]: return cmp(a[i], b[i])
-        cmp(a.len, b.len))
-      for elem in elems:
-        var ok = false
-        let rec = decodeDepRecord(elem, ok)
-        if ok:
-          depDrained.add rec
-      # A SIGNALLED growth failure (OOM) is LOUD, never a silent drop: surface it
-      # so the merged edge is understood as potentially incomplete.
-      let growthFailed = depSet.growthFailures()
-      if growthFailed > 0'u64:
-        stderr.writeLine("io-mon: dep-set growth failed " & $growthFailed &
-          " time(s); dependency capture may be incomplete for this edge")
-    result.depFile = mergeFragments(fragmentDir, request.depFilePath,
-      expectedRootPid = rootPid, currentRunId = runId,
-      setRecords = depDrained)
-    renderStreamToPath(request.depFilePath, request.streamMode,
-      request.eventStreamPath)
+    h.rootPid = uint64(h.process.processID)
   elif defined(windows):
     # Windows: same end-to-end flow as macOS, but the injection uses
     # CreateProcess(CREATE_SUSPENDED) + CreateRemoteThread(LoadLibraryW)
     # instead of the DYLD_INSERT_LIBRARIES env var. Fragment-dir + output
     # path env vars are still set so the in-DLL hook bodies know where to
     # append RMDF fragments.
-    let shimLib = findShimLibrary()
-    if shimLib.len == 0:
+    h.shimLib = findShimLibrary()
+    if h.shimLib.len == 0:
       raise newException(IOError,
         "cannot find librepro_monitor_shim.dll; run just build or set " &
           "REPRO_MONITOR_SHIM_LIB")
 
-    let fragmentDir = createLocalTempDir("repro-fs-snoop-fragments")
-    defer: removeLocalTempDir(fragmentDir)
+    h.fragmentDir = createLocalTempDir("repro-fs-snoop-fragments")
+    h.active = true
+    discard monitorsStartedCount.fetchAdd(1'u64)
     ensureParentDir(request.depFilePath)
 
     # DH-1 — the Windows injection set, threaded through the SPAWN. Four
@@ -1208,12 +1373,12 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
     # winning) has one implementation rather than three. NO arm mutates the
     # host any more.
     let injected = @[
-      ("REPRO_MONITOR_FRAGMENT_DIR", fragmentDir),
+      ("REPRO_MONITOR_FRAGMENT_DIR", h.fragmentDir),
       ("REPRO_MONITOR_OUTPUT", request.depFilePath),
       ("REPRO_MONITOR_SESSION", newRunId()),
-      ("REPRO_MONITOR_SHIM_LIB", shimLib)
+      ("REPRO_MONITOR_SHIM_LIB", h.shimLib)
     ]
-    let spawnEnv = childEnv(request, injected)
+    h.spawnEnv = childEnv(request, injected)
 
     # NOTE (executable resolution, unchanged by the above): a bare
     # `request.command[0]` is resolved from the HOST's `PATH`, not `spawnEnv`'s.
@@ -1233,20 +1398,181 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
     # `envp` it is given. Same answer on all three, three mechanisms; see
     # `types.nim`'s `env*`. Pass an absolute `command[0]` when that distinction
     # matters.
-    let injection = runWithMonitorShim(request.command, shimLib,
-                                       cwd = request.cwd,
-                                       captureStdio = request.captureChildStdio,
-                                       captureStdioPath = request.captureStdioPath,
-                                       env = spawnEnv)
-    result.exitCode = injection.exitCode
+    #
+    # THE SPAWN ITSELF IS DEFERRED to `waitForMonitorRoot` on this arm, because
+    # `runWithMonitorShim` spawns and waits in one blocking call. See
+    # `pollMonitor`.
+  else:
+    raise newException(OSError,
+      "fs-snoop hooks backend currently supports macOS, Linux, and Windows only")
 
+proc startMonitor*(request: FsSnoopRequest): MonitorHandle =
+  ## **Public parent-host API (IoMon-Decomposed-Host-API DH-2).** Bring the
+  ## consumer up and launch the monitored process tree, returning the handle
+  ## that owns both. Does NOT wait.
+  ##
+  ## Everything `runMonitored` does before its wait happens here: the shim is
+  ## resolved, the fragment directory is created, on Linux the consumer-owned
+  ## `nim-shm-gset` is created via `transport.startHost`, the injection
+  ## variables are composed into a CHILD-ONLY environment (DH-1: no `putEnv` on
+  ## any arm) and the tree is spawned with `request.cwd` as its working
+  ## directory.
+  ##
+  ## The returned handle must be finished — but "must" here is a description of
+  ## what happens, not an obligation on the caller: dropping it runs the same
+  ## safety teardown, in the same order (see `MonitorHandle`). A caller that
+  ## wants the EVIDENCE calls `finishMonitor`.
+  ##
+  ## Raises on a genuine setup failure (no shim, unsupported platform). A raise
+  ## here leaves nothing behind: the partially-built handle is released on the
+  ## way out, so a failed start cannot leave a spawned tree, a mapped consumer,
+  ## or a scratch directory.
+  ##
+  ## **WINDOWS.** `runWithMonitorShim` spawns and waits in one call, so this arm
+  ## prepares the injection and defers the spawn to the first `pollMonitor` /
+  ## `finishMonitor`. Nothing is running when this returns there.
+  try:
+    startMonitorInner(result, request)
+  except CatchableError as err:
+    # Release whatever was built before the failure — including a tree that was
+    # spawned before a later step raised, which `endMonitor` reaps before
+    # letting go of the consumer. The cleanup's own failure must not REPLACE
+    # the diagnostic the caller needs, so it is swallowed and `err` is re-raised
+    # explicitly rather than with a bare `raise`.
+    try:
+      endMonitor(result)
+    except CatchableError:
+      discard
+    raise err
+
+proc pollMonitor*(handle: var MonitorHandle): bool =
+  ## Advance the monitor WITHOUT blocking. `true` means the monitored root has
+  ## exited, i.e. `finishMonitor` will not block on it.
+  ##
+  ## This is the whole point of DH-2: a scheduler holding N handles polls them
+  ## in one loop and finishes each as it completes, instead of serialising the
+  ## build behind N blocking `runMonitored` calls.
+  ##
+  ## Polling is NOT required — `finishMonitor` waits by itself, which is exactly
+  ## what `runMonitored` relies on. It is also not a drain: the `nim-shm-gset`
+  ## transport dedups at the producer and is snapshotted once at finish, so
+  ## there is no consumer-side work that polling more often would get done
+  ## sooner. What polling buys is the caller's own scheduling.
+  ##
+  ## Raises `ValueError` for a handle that is not live (default-constructed,
+  ## moved-from, or already finished) rather than answering `true`, which would
+  ## read as "your monitor is done".
+  ##
+  ## **WINDOWS — this call BLOCKS.** `runWithMonitorShim` gives no pollable
+  ## handle: it spawns the child, waits for it and returns a completed result.
+  ## So the first poll on that arm performs the whole run and returns `true`,
+  ## and an N-way poll loop there executes serially. Stated as a limit rather
+  ## than hidden behind a `false`, which would spin forever. Lifting it needs a
+  ## non-blocking spawn in nim-stackable-hooks and is not DH-2's scope.
+  if not handle.active:
+    raise newException(ValueError,
+      "pollMonitor: this MonitorHandle does not own a live monitor (it was " &
+        "default-constructed, moved from, or already finished)")
+  if handle.exited:
+    return true
+  when defined(linux) or defined(macosx):
+    if handle.process == nil:
+      return true
+    let code = peekExitCode(handle.process)
+    if code < 0:
+      return false
+    handle.exitCode = code
+    handle.exited = true
+    close(handle.process)
+    handle.process = nil
+    return true
+  elif defined(windows):
+    waitForMonitorRoot(handle)
+    return true
+  else:
+    return true
+
+proc finishMonitor*(handle: sink MonitorHandle): MonitorResult =
+  ## **Public parent-host API (IoMon-Decomposed-Host-API DH-2).** Consume the
+  ## handle and produce the evidence: wait for the root if it has not exited,
+  ## run the §4.1 detached-descendant grace, snapshot the consumer-owned set,
+  ## write the canonical depfile, and release everything.
+  ##
+  ## Takes the handle by `sink`: the result is obtainable only by GIVING UP the
+  ## handle, so a caller cannot keep polling (or finishing) a monitor whose
+  ## consumer has been released. Pass a `move`d handle when the caller's binding
+  ## is not dead at the call site.
+  ##
+  ## The steps are the same procs a dropped handle's destructor runs, in the
+  ## same order, with the evidence collected between them — `waitForMonitorRoot`
+  ## then `releaseMonitor` — so LF-2's ordering has one implementation and this
+  ## path cannot drift from that one.
+  ##
+  ## Raises `ValueError` for a handle that is not live.
+  var h = move(handle)
+  if not h.active:
+    raise newException(ValueError,
+      "finishMonitor: this MonitorHandle does not own a live monitor (it was " &
+        "default-constructed, moved from, or already finished)")
+  discard monitorsFinishedCount.fetchAdd(1'u64)
+  result.depFilePath = h.request.depFilePath
+
+  waitForMonitorRoot(h)
+  result.exitCode = h.exitCode
+
+  when defined(macosx):
+    result.depFile = mergeFragments(h.fragmentDir, h.request.depFilePath,
+      expectedRootPid = h.rootPid)
+  elif defined(linux):
+    # io-mon-Lossless-Event-Capture M7 (Linux slice) — the live set's shard0
+    # path goes to the grace guard, so a launcher-side event-loss (a descendant
+    # still alive past the grace window) is inserted into the CONSUMER-OWNED set,
+    # folded into the depfile by the snapshot below, with NO `.rmdf-frag` file —
+    # Linux is file-free end-to-end.
+    settleMonitorDescendants(h)
+    # io-mon-Lossless-Event-Capture M3 part 2a — SINGLE-THREADED final merge over
+    # the SET's DISTINCT elements. The DEP-FLUSH shutdown guarantees every producer
+    # published its last record, so snapshot the deduped union of all shards and
+    # decode each element (identity element-key + trailing incarnation-image bytes)
+    # back to a `MonitorRecord` (seq reconstructs as 0). These fold into the
+    # merge via the `setRecords` argument.
+    #
+    # DETERMINISM: `snapshot` yields elements in hash-slot order (non-deterministic
+    # across runs), and two DISTINCT elements can tie in `canonicalOrder` because
+    # the identity key drops `seq` (decoded to 0). Sort the raw distinct elements —
+    # a total order, since they are unique — BEFORE decoding, so the stable
+    # canonical sort in `writeCanonicalInPlace` breaks those ties deterministically
+    # and the depfile is byte-reproducible (the golden-regression invariant).
+    var depDrained: seq[MonitorRecord] = @[]
+    if h.depSetLive:
+      var elems = h.depSet.snapshot()
+      elems.sort(proc (a, b: seq[byte]): int =
+        let m = min(a.len, b.len)
+        for i in 0 ..< m:
+          if a[i] != b[i]: return cmp(a[i], b[i])
+        cmp(a.len, b.len))
+      for elem in elems:
+        var ok = false
+        let rec = decodeDepRecord(elem, ok)
+        if ok:
+          depDrained.add rec
+      # A SIGNALLED growth failure (OOM) is LOUD, never a silent drop: surface it
+      # so the merged edge is understood as potentially incomplete.
+      let growthFailed = h.depSet.growthFailures()
+      if growthFailed > 0'u64:
+        stderr.writeLine("io-mon: dep-set growth failed " & $growthFailed &
+          " time(s); dependency capture may be incomplete for this edge")
+    result.depFile = mergeFragments(h.fragmentDir, h.request.depFilePath,
+      expectedRootPid = h.rootPid, currentRunId = h.runId,
+      setRecords = depDrained)
+  elif defined(windows):
     var launcherRecords: seq[MonitorRecord] = @[]
-    if injection.monitoringSkipped:
+    if h.injection.monitoringSkipped:
       launcherRecords.add MonitorRecord(
         kind: mrEventLoss,
         observationKind: moEventLoss,
         osPid: uint64(getCurrentProcessId()),
-        detail: "unmonitored subtree/peer (" & injection.skipReason & ")")
+        detail: "unmonitored subtree/peer (" & h.injection.skipReason & ")")
     # ROUND-2 R1, applied to Windows. macOS and Linux have always passed the
     # root pid so the merge can PROVE the root reported; Windows did not, and
     # the asymmetry hid a real failure: a WOW64 child whose shim loaded but
@@ -1260,29 +1586,80 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
     # Skipped when monitoring was deliberately skipped (an MSYS/Cygwin fork
     # runtime): that subtree is already recorded as an unmonitored-peer loss
     # just above, and demanding a process-start from a process we chose not
-    # to inject would report the same gap twice.
+    # to inject would report the same gap twice. `h.rootPid` is already 0 in
+    # that case (`waitForMonitorRoot`).
     #
-    # ARMED HERE FOR THE FIRST TIME — this is new capability, not a restored
-    # regression. Until DH-1 this line read `injection.rootPid` against a
-    # `WindowsInjectionResult` that carried only `exitCode`,
-    # `monitoringSkipped` and `skipReason`, so `nim check --os:windows` failed
-    # on it and the arm never compiled; DH-1 made it compile by passing the
-    # honest `0'u64` ("no expected root pid"), which left the guard OFF.
-    # nim-stackable-hooks 485a30c added `rootPid` — the pid `CreateProcessW`
-    # already produces (`pi.dwProcessId`) — so the pid now exists to pass.
-    #
-    # What changes: an injected root that emits NOTHING used to be published as
-    # `mcComplete` over an empty record set — a zero-effort false cache hit for
-    # the whole action — and is now downgraded to `mcIncomplete`.
-    result.depFile = mergeFragments(fragmentDir, request.depFilePath,
-      expectedRootPid =
-        if injection.monitoringSkipped: 0'u64 else: injection.rootPid,
-      setRecords = launcherRecords)
-    renderStreamToPath(request.depFilePath, request.streamMode,
-      request.eventStreamPath)
-  else:
-    raise newException(OSError,
-      "fs-snoop hooks backend currently supports macOS, Linux, and Windows only")
+    # ARMED SINCE DH-1's follow-up — this is new capability, not a restored
+    # regression. nim-stackable-hooks 485a30c added `rootPid` (the pid
+    # `CreateProcessW` already produces, `pi.dwProcessId`), so the pid exists to
+    # pass. What changes: an injected root that emits NOTHING used to be
+    # published as `mcComplete` over an empty record set — a zero-effort false
+    # cache hit for the whole action — and is now downgraded to `mcIncomplete`.
+    result.depFile = mergeFragments(h.fragmentDir, h.request.depFilePath,
+      expectedRootPid = h.rootPid, setRecords = launcherRecords)
+  renderStreamToPath(h.request.depFilePath, h.request.streamMode,
+    h.request.eventStreamPath)
+  releaseMonitor(h)
+
+proc runMonitored*(request: FsSnoopRequest): MonitorResult =
+  ## **Public parent-host API (io-mon-Lossless-Event-Capture §5, M6 part A).**
+  ##
+  ## The blessed BATCH consumer-side entry point: run one monitored command to
+  ## completion and return its evidence. It is the CLI's entry point
+  ## (`runFsSnoopCli`) and the reference behaviour every other launch path is
+  ## diffed against.
+  ##
+  ## Since DH-2 it is **exactly** `finishMonitor(startMonitor(request))` — one
+  ## expression, and the ONLY implementation of the lifecycle lives in those two
+  ## procs. That is deliberate rather than tidy: a batch form and a decomposed
+  ## form maintained side by side would drift, and the whole premise of DH-4
+  ## (byte-identical evidence from an external host) is that they agree. The
+  ## delegation is asserted at RUNTIME, not just here, by
+  ## `tests/linux/test_io_mon_decomposed_host_api.nim` via
+  ## `monitorLifecycleCounts`.
+  ##
+  ## What the two halves do, unchanged from the pre-DH-2 single proc:
+  ##
+  ##   1. resolve the interpose shim (`findShimLibrary`);
+  ##   2. on Linux, CREATE the consumer-owned `nim-shm-gset` (via
+  ##      `transport.startHost`, appId defaulting to `"io-mon"` or
+  ##      `REPRO_MONITOR_APP_ID`) and export `REPRO_MONITOR_DEP_SHM` +
+  ##      `REPRO_MONITOR_APP_ID` so the shim's producers attach the RIGHT set;
+  ##   3. inject the shim and SPAWN the monitored process tree;
+  ##   4. wait for the tree, run the §4.1 descendant grace, SNAPSHOT the deduped
+  ##      set, and write the canonical depfile via `mergeFragments` (passing the
+  ##      spawned root pid as the R1 root-guard, so an un-monitored root
+  ##      downgrades to `mcIncomplete` instead of a false `mcComplete`);
+  ##   5. on FINISH call `SetHost.finish` (`markConsumerGone` + detach), so a
+  ##      late orphan `emit` fast-fails with `emConsumerGone` (LF-4) and the
+  ##      consumer-owned memory is released.
+  ##
+  ## **LF-2 (no orphan spill) and LF-4 (consumer liveness) still hold by
+  ## construction** — but for a different reason than before DH-2, and the
+  ## difference matters to anyone reading this as the reference. It used to be
+  ## that this proc owned the whole lifecycle so no caller could hold one end of
+  ## it. Now the GUARANTEE lives in `MonitorHandle`: it cannot be copied and
+  ## dropping it reaps the monitored root before releasing the consumer. This
+  ## proc inherits that like any other host; it is not privileged.
+  ##
+  ## Never spawns a consumer-less producer; still raises on a genuine setup
+  ## failure (no shim, unsupported platform) — the CLI wrapper `runFsSnoopCli`
+  ## converts those to a diagnostic + non-zero exit.
+  ##
+  ## **CONCURRENCY (IoMon-Decomposed-Host-API DH-1).** On ALL THREE arms this
+  ## proc mutates NOTHING process-global: the injection variables and
+  ## `request.env` are composed into a child-only environment handed to the
+  ## spawn, and `request.cwd` is the child's working directory. Two (or N) calls
+  ## may therefore run concurrently on separate threads of one host process and
+  ## each gets its own complete, uncontaminated evidence. Since DH-2 a host does
+  ## not even need the threads: `startMonitor` + `pollMonitor` interleaves N
+  ## monitors in ONE thread.
+  ##
+  ## One residual, documented exception: **macOS** inherits `osproc`'s own
+  ## global `setCurrentDir` around its `posix_spawn` path, so a non-empty
+  ## `request.cwd` is not thread-safe there. Linux forks and `chdir`s in the
+  ## child and Windows passes `lpCurrentDirectory`, so both are.
+  finishMonitor(startMonitor(request))
 
 proc runFsSnoopCli*(programName: string; args: seq[string]): int =
   try:

@@ -222,19 +222,22 @@ else:
 ```
 
 - `runMonitored(req: FsSnoopRequest): MonitorResult` — the §5 consumer-side
-  batch entry point. It **owns the whole producer/consumer lifecycle**: resolve
+  batch entry point, and the reference behaviour every other launch path is
+  diffed against. It runs the whole producer/consumer lifecycle: resolve
   the shim → (Linux) create the consumer-owned `nim-shm-gset` and export
   `REPRO_MONITOR_DEP_SHM` + `REPRO_MONITOR_APP_ID` → inject the shim and spawn
-  the process tree → snapshot the deduped set → write the canonical depfile
-  (passing the spawned root pid as the R1 root-guard) → on finish
-  `markConsumerGone` + detach. Because the consumer structure is created,
-  named, and torn down inside this proc — not by the caller — **LF-2** (no
-  orphan spill: a producer never runs without a consumer) and **LF-4**
-  (consumer liveness) hold *by construction* for any parent that uses it.
+  the process tree → wait → run the §4.1 descendant grace → snapshot the deduped
+  set → write the canonical depfile (passing the spawned root pid as the R1
+  root-guard) → on finish `markConsumerGone` + detach. **LF-2** (no orphan
+  spill: a producer never runs without a consumer) and **LF-4** (consumer
+  liveness) hold *by construction* for any parent that uses it.
   Prefer this to copying `fs_snoop`'s driver: a copy that skips the set/consumer
   setup is exactly the producer-with-no-consumer bug (LF-2) this API prevents.
   It still raises on a genuine setup failure (no shim / unsupported platform);
   the CLI wrapper `runFsSnoopCli` converts those to a diagnostic + non-zero exit.
+  Since DH-2 it is literally `finishMonitor(startMonitor(req))` — see
+  *The decomposed host API* below — so the batch and streaming forms are one
+  implementation and cannot drift apart.
 - `MonitorResult` — `exitCode` (the monitored command's status), `depFilePath`
   (where the canonical RMDF depfile was written), and `depFile` (the merged
   `MonitorDepFile`: `records`, `completeness`, summary, …). Convenience
@@ -297,14 +300,71 @@ two are read off the platform contracts. Pass an absolute `command[0]` when
 `eventStreamPath` and `captureStdioPath` are resolved by the host, not the
 child, and are unaffected by `cwd`.
 
-> **Streaming form (`startMonitor* / drain* / finishMonitor*`) — deferred.** M6
-> part A ships only the batch `runMonitored`. The original reason for deferring
-> it — that a streaming host would have to hold a mutated process-global
-> injection env live *between* calls, risking a shim leak into the parent — no
-> longer applies on any arm now that DH-1 threads the env through the spawn. What
-> remains is the lifecycle question (who owns the wait, and how LF-2 stays
-> structurally impossible once the caller does), tracked as DH-2 in
-> `reprobuild-specs/IoMon-Decomposed-Host-API.milestones.org`.
+### The decomposed host API — `startMonitor` / `pollMonitor` / `finishMonitor`
+
+`runMonitored` blocks until the monitored command exits, which serialises a
+caller whose scheduler polls N in-flight children in one loop. The same
+lifecycle is therefore available in three steps (IoMon-Decomposed-Host-API
+DH-2):
+
+```nim
+var handles: seq[MonitorHandle] = @[]
+for req in requests:
+  handles.add startMonitor(req)          # consumer up, tree spawned, no wait
+
+var results: seq[MonitorResult] = @[]
+var remaining = handles.len
+while remaining > 0:
+  for i in 0 ..< handles.len:
+    if handles[i].live and pollMonitor(handles[i]):   # never blocks (see below)
+      results.add finishMonitor(move(handles[i]))     # CONSUMES the handle
+      dec remaining
+  sleep(5)
+```
+
+- `startMonitor(req: FsSnoopRequest): MonitorHandle` — everything `runMonitored`
+  does before its wait. Raises on a genuine setup failure, and a raise leaves
+  nothing behind (no spawned tree, no mapped consumer, no scratch directory).
+- `pollMonitor(h: var MonitorHandle): bool` — `true` once the monitored root has
+  exited. Non-blocking on POSIX. It is not a drain: the transport dedups at the
+  producer and is snapshotted once at finish, so polling more often gets no
+  consumer-side work done sooner — what it buys is the caller's own scheduling.
+  Raises `ValueError` on a handle that is not live.
+- `finishMonitor(h: sink MonitorHandle): MonitorResult` — waits if the root has
+  not exited, runs the §4.1 descendant grace, snapshots the set, writes the
+  canonical depfile, releases the consumer. The result is obtainable only by
+  giving up the handle.
+- `monitorLifecycleCounts(): tuple[started, finished, released, live: int]` — the
+  process-wide census. A host can assert `live == 0` at shutdown; `finished <
+  released` means somebody dropped a handle.
+
+**`MonitorHandle` is exclusive, and dropping it finishes it.** Moving the wait
+out of `runMonitored` is what re-opens the LF-2 window (§4.1: a producer still
+publishing into a fragment directory its launcher has already deleted), so the
+handle carries the guarantee itself rather than asking the caller to remember a
+rule:
+
+- it **cannot be copied** (`=copy` is `{.error.}`), so two owners of one consumer
+  is not a state that can be written down — and the restriction propagates
+  through `seq`s, arrays and wrapping objects, which is what an N-way poll loop
+  holds; and
+- **dropping it reaps the monitored root before releasing the consumer**
+  (`=destroy`), on every path out of the owning scope including an exception.
+  So an early `return`, a `break`, or a forgotten `finishMonitor` costs you the
+  WAIT you tried to skip and the EVIDENCE you did not ask for — never an
+  orphaned producer. Nothing is killed: dropping a handle blocks exactly as long
+  as `runMonitored` would have.
+
+A host killed with `SIGKILL` runs no destructor; that case belongs to the
+`shm_gset` cross-restart reaper and is no different from `runMonitored`.
+
+> **WINDOWS.** `stackable_hooks.runWithMonitorShim` spawns and waits in one
+> blocking call and exposes no pollable handle, so on that arm `startMonitor`
+> only prepares the injection (nothing is running when it returns) and the first
+> `pollMonitor` performs the whole run before answering `true`. An N-way poll
+> loop therefore executes serially there. Stated rather than hidden behind a
+> `false`, which would spin forever. Lifting it needs a non-blocking spawn
+> upstream.
 
 ### The launcher contract (completeness root-guard)
 

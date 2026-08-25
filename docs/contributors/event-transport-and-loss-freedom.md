@@ -505,14 +505,33 @@ library API**, not only a CLI:
   then `request.env`, then io-mon's injection, injection winning) rather than
   three that can drift.
 
-  The **streaming** form (`startMonitor* / drain* / finishMonitor*`) is
-  **deferred**. Its original rationale — that a streaming host would have to
-  keep a mutated process-global injection env live between calls, risking a shim
-  leak into the parent — is obsolete on every arm after DH-1. What is left is the
-  lifecycle question: moving ownership of the wait out of `runMonitored` is
-  exactly what makes an LF-2 orphan reachable again, so the decomposed form
-  needs its own structural guarantee. Tracked as DH-2/DH-3 in
-  `reprobuild-specs/IoMon-Decomposed-Host-API.milestones.org`.
+  The **decomposed** form has landed (DH-2): `startMonitor` → `pollMonitor` →
+  `finishMonitor`, so a caller can own the wait and interleave N monitors in one
+  poll loop — the shape the build engine's scheduler needs. `runMonitored` is
+  now literally `finishMonitor(startMonitor(req))`, so there is still exactly
+  one implementation of the lifecycle.
+
+  Moving ownership of the wait out is precisely what makes an LF-2 orphan
+  reachable again, so the guarantee moved into the TYPE rather than into a rule
+  callers are asked to follow. `MonitorHandle` cannot be copied (`=copy` is
+  `{.error.}`, propagating through `seq`s, arrays and wrapping objects, so "the
+  other copy will finish it" is not an argument that can be made), and dropping
+  one runs `=destroy`, which **reaps the monitored root before releasing the
+  consumer** — on every path out of the owning scope, including an unwinding
+  exception. The ordering that produced §4.1's incident (release the consumer
+  and delete the fragment directory while a producer is still publishing into
+  it) is therefore not reachable by forgetting anything: a dropped handle costs
+  the caller the wait and the evidence, never an orphan. The wait/release
+  ordering has ONE implementation (`endMonitor`), shared by `finishMonitor` and
+  the destructor, so the two cannot drift.
+
+  Pinned by `tests/linux/test_io_mon_decomposed_host_api.nim` (a handle dropped
+  over a demonstrably-live producer, three monitors interleaved in one poll
+  loop, and `runMonitored`'s delegation asserted both at runtime and at source
+  level) and `tests/portable/test_io_mon_monitor_handle_exclusivity.nim` (the
+  real compiler refusing every copy of a handle, with positive controls).
+  Making the §4.1 descendant guard unskippable for a host that owns its OWN
+  spawn is DH-3, still open.
 
 ---
 
