@@ -696,9 +696,12 @@ proc findShimLibrary*(): string =
 # nothing DURING it, and a host that never opted out could not avoid it.
 #
 # The variables are therefore computed into a child-only environment table and
-# handed to the spawn. `runMonitored` performs NO `putEnv` on POSIX; see the
-# Windows arm for the one remaining exception and why it is not removable from
-# inside this repository.
+# handed to the spawn. `runMonitored` performs NO `putEnv` on ANY arm: the two
+# POSIX arms pass the table to `osproc.startProcess(env = …)`, and the Windows
+# arm passes it to `runWithMonitorShim(env = …)`, which encodes it into an
+# explicit `CreateProcessW` environment block. Windows was the last holdout —
+# its injector took no `env` at all until nim-stackable-hooks 6a53408 — and
+# `childEnv` below is the single composition all three share.
 # ---------------------------------------------------------------------------
 
 proc requestEnvValue(request: FsSnoopRequest; name: string): string =
@@ -710,16 +713,108 @@ proc requestEnvValue(request: FsSnoopRequest; name: string): string =
       return request.env[i][1]
   getEnv(name)
 
+proc windowsHiddenEnvEntry(value: string): tuple[name, value: string] =
+  ## Undo `envPairs`' index-0 split of a Windows HIDDEN environment variable.
+  ##
+  ## Windows keeps variables whose NAME BEGINS WITH `=`: the per-drive current
+  ## directories (`=C:=C:\some\dir`), `cmd.exe`'s `=ExitCode=00000000`, and
+  ## `=::=::\`. `std/envvars.envPairsImpl` reads `GetEnvironmentStringsW` and
+  ## splits every entry on the FIRST `=` (`substr(kv, 0, p-1)` /
+  ## `substr(kv, p+1)`); for these p is 0, so it yields an EMPTY name with the
+  ## real name folded into the front of the value. This proc takes that value
+  ## and returns the pair the entry actually encoded.
+  ##
+  ## It is load-bearing rather than cosmetic. `encodeWindowsEnvironmentBlock`
+  ## REFUSES an empty name — it would frame as a leading `=VALUE` entry — and
+  ## `runWithMonitorShim` turns that `ValueError` into an `OSError`. So without
+  ## this repair a host launched from `cmd.exe`, where these entries are normal
+  ## and inherited, could not spawn a monitored child AT ALL: `childEnv` would
+  ## carry the empty name straight into the block encoder. Both directions are
+  ## pinned, EXECUTABLY on a POSIX host, by
+  ## `tests/portable/test_io_mon_windows_child_env_block.nim`.
+  ##
+  ## An entry with no `=` anywhere is dropped (`("", "")`), not guessed: it is
+  ## not a well-formed Win32 entry, and emitting a name of `=` with the whole
+  ## text as its value would invent a variable the parent never had.
+  ##
+  ## Not gated behind `when defined(windows)` deliberately — it is pure string
+  ## work, and gating it would put the one piece of the Windows spawn path this
+  ## workspace can actually EXECUTE behind a `when` that never fires here.
+  ## The split must be on the FIRST `=`, mirroring the one `envPairs` made: the
+  ## VALUE may legally contain further `=` characters (a directory named `a=b`
+  ## in a per-drive entry is a valid NTFS path), and splitting on the last one
+  ## would fold them into the NAME — where an `=` past index 0 is exactly what
+  ## `encodeWindowsEnvironmentBlock` rejects, turning a repairable entry back
+  ## into the `OSError` this proc exists to prevent.
+  let sep = value.find('=')
+  if sep < 0:
+    return ("", "")
+  ("=" & value[0 ..< sep], value[sep + 1 .. ^1])
+
+proc addHostEnvEntry(dest: StringTableRef; key, value: string) =
+  ## Put ONE entry of the hosting process's environment into the child's table.
+  ##
+  ## Split out of `childEnv` so it can be EXERCISED: `envPairs()` on a POSIX
+  ## development host never yields the empty-named entry the repair below
+  ## exists for, so a test driving `childEnv` cannot reach that branch and
+  ## unwiring the repair reddened nothing. Called directly, it can. See
+  ## `tests/portable/test_io_mon_windows_child_env_block.nim`.
+  if key.len == 0:
+    # A Windows hidden `=NAME=VALUE` entry, which `envPairs` reports with an
+    # empty name (see `windowsHiddenEnvEntry`). Repairing it rather than
+    # dropping it keeps the child's per-drive current directories intact AND
+    # keeps the empty name — which the block encoder rejects — out of the
+    # table. Unreachable on POSIX, where `environ` has no such entries.
+    let hidden = windowsHiddenEnvEntry(value)
+    if hidden.name.len > 0:
+      dest[hidden.name] = hidden.value
+  else:
+    dest[key] = value
+
+# The name-matching discipline the child's environment table uses: Windows
+# environment variable names are case-INSENSITIVE, every POSIX arm's are not.
+#
+# Named, and a parameter of `childEnv` below, rather than written inline as a
+# `when` inside the constructor call. The reason is testability, and it was
+# found by mutation: flipping the Windows arm of that inline `when` to
+# `modeCaseSensitive` reddened NOTHING — not the suite (the branch is not
+# compiled on a POSIX host) and not `nim check --os:windows` (both mode names
+# are valid `StringTableMode` values, so the swap type-checks). Meanwhile
+# `docs/usage.md` promises callers a behaviour that rests entirely on it: on
+# Windows a `Path` entry in `request.env` OVERRIDES the inherited `PATH`
+# instead of joining the table as a second, competing variable — and, more to
+# the point, a caller cannot dodge io-mon's injection by spelling
+# `repro_monitor_shim_lib` in a different case.
+#
+# With the mode as an argument, that promise is EXECUTABLE on any host: see
+# `tests/portable/test_io_mon_child_env_layering.nim`, which composes under
+# `modeCaseInsensitive` explicitly. What stays compile-only is one thing only —
+# that Windows is the arm that selects it.
+const ChildEnvMode =
+  when defined(windows): modeCaseInsensitive else: modeCaseSensitive
+
 proc childEnv(request: FsSnoopRequest;
-              injected: openArray[(string, string)]): StringTableRef =
+              injected: openArray[(string, string)];
+              mode: StringTableMode = ChildEnvMode): StringTableRef =
   ## The COMPLETE environment for the monitored child: the hosting process's
   ## environment, then the caller's per-call `request.env`, then io-mon's own
   ## injection variables (which win, so a caller cannot switch monitoring off by
   ## accident). Nothing here is visible to the hosting process.
-  result = newStringTable(
-    when defined(windows): modeCaseInsensitive else: modeCaseSensitive)
+  ##
+  ## ONE implementation for all three arms. Linux and macOS hand the result to
+  ## `osproc.startProcess(env = …)`; Windows hands it to `runWithMonitorShim`'s
+  ## `env`, which encodes it into an explicit `CreateProcessW` environment
+  ## block. Composing the child environment in one place is the point: the
+  ## layering rule above is a correctness rule (injection must WIN), and three
+  ## copies of it are three chances for one arm to drift into letting a caller
+  ## switch monitoring off.
+  ##
+  ## `mode` defaults to `ChildEnvMode`, which is what every production call
+  ## passes; it is a parameter so a test can drive the WINDOWS discipline on a
+  ## POSIX host (see `ChildEnvMode`).
+  result = newStringTable(mode)
   for key, value in envPairs():
-    result[key] = value
+    addHostEnvEntry(result, key, value)
   for (key, value) in request.env:
     result[key] = value
   for (key, value) in injected:
@@ -845,7 +940,7 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
   ## failure (no shim, unsupported platform) — the CLI wrapper `runFsSnoopCli`
   ## converts those to a diagnostic + non-zero exit.
   ##
-  ## **CONCURRENCY (IoMon-Decomposed-Host-API DH-1).** On Linux and macOS this
+  ## **CONCURRENCY (IoMon-Decomposed-Host-API DH-1).** On ALL THREE arms this
   ## proc mutates NOTHING process-global: the injection variables and
   ## `request.env` are composed into a child-only environment handed to the
   ## spawn, and `request.cwd` is the child's working directory. Two (or N) calls
@@ -855,13 +950,15 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
   ## process for the duration of the run, which made concurrent calls corrupt
   ## each other's capture with no way for a caller to opt out.
   ##
-  ## Two residual, documented exceptions:
-  ##   * **Windows** still publishes its four injection variables via `putEnv`,
-  ##     because `stackable_hooks.runWithMonitorShim` takes no `env` (see the
-  ##     Windows arm below).
-  ##   * **macOS** additionally inherits `osproc`'s own global `setCurrentDir`
-  ##     around its `posix_spawn` path, so a non-empty `request.cwd` is not
-  ##     thread-safe there. Linux forks and `chdir`s in the child, so it is.
+  ## One residual, documented exception: **macOS** inherits `osproc`'s own
+  ## global `setCurrentDir` around its `posix_spawn` path, so a non-empty
+  ## `request.cwd` is not thread-safe there. Linux forks and `chdir`s in the
+  ## child and Windows passes `lpCurrentDirectory`, so both are.
+  ##
+  ## The Windows arm was the last to get here: it published its four injection
+  ## variables with a scope-restored `putEnv` until
+  ## `stackable_hooks.runWithMonitorShim` gained an `env` parameter. All three
+  ## arms now compose the child's environment with the one `childEnv` helper.
   result.depFilePath = request.depFilePath
   when defined(macosx):
     let shimLib = findShimLibrary()
@@ -1087,43 +1184,60 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
     defer: removeLocalTempDir(fragmentDir)
     ensureParentDir(request.depFilePath)
 
-    # DH-1 — THE ONE ARM THAT STILL MUTATES THE HOSTING PROCESS'S ENVIRONMENT,
-    # and it is not fixable from inside this repository.
+    # DH-1 — the Windows injection set, threaded through the SPAWN. Four
+    # variables: REPRO_MONITOR_FRAGMENT_DIR, REPRO_MONITOR_OUTPUT,
+    # REPRO_MONITOR_SESSION, REPRO_MONITOR_SHIM_LIB. (There is no preload
+    # variable — injection is CreateRemoteThread + LoadLibraryW — and no
+    # DEP_SHM/APP_ID, because the shm-gset arm is Linux only.)
     #
-    # The Windows injection set is four variables: REPRO_MONITOR_FRAGMENT_DIR,
-    # REPRO_MONITOR_OUTPUT, REPRO_MONITOR_SESSION, REPRO_MONITOR_SHIM_LIB.
-    # (There is no preload variable — injection is CreateRemoteThread +
-    # LoadLibraryW — and no DEP_SHM/APP_ID, because the shm-gset arm is Linux
-    # only.) Unlike the POSIX arms, the spawn is NOT `osproc.startProcess`: it
-    # is `stackable_hooks/windows_injector.runWithMonitorShim`, whose
-    # `CreateProcessW` call passes `lpEnvironment = nil` and which exposes no
-    # `env` parameter — so the child can only receive these variables by
-    # inheriting the parent's block. Threading them through the spawn requires
-    # an `env` parameter on `runWithMonitorShim` in nim-stackable-hooks; until
-    # that exists, concurrent `runMonitored` calls on Windows still clobber each
-    # other and this scope-restore is the best available containment.
+    # This arm used to be the ONE that still mutated the hosting process's
+    # environment, scope-restored by a `defer`: the spawn is not
+    # `osproc.startProcess` but `stackable_hooks/windows_injector`'s
+    # `runWithMonitorShim`, whose `CreateProcessW` passed
+    # `lpEnvironment = nil`, so the child could only receive the variables by
+    # inheriting the parent's block. Two concurrent `runMonitored` calls
+    # therefore clobbered each other's monitoring, and the restore made the
+    # damage invisible AFTER the fact while doing nothing DURING it.
     #
-    # `request.env` is applied the same way for the same reason, so the field
-    # behaves identically on all three arms from the caller's point of view.
-    var oldEnv: seq[(string, string, bool)] = @[]
-    proc setEnvVar(name, value: string) =
-      oldEnv.add((name, getEnv(name), existsEnv(name)))
-      putEnv(name, value)
-    for (key, value) in request.env:
-      setEnvVar(key, value)
-    setEnvVar("REPRO_MONITOR_FRAGMENT_DIR", fragmentDir)
-    setEnvVar("REPRO_MONITOR_OUTPUT", request.depFilePath)
-    setEnvVar("REPRO_MONITOR_SESSION", newRunId())
-    setEnvVar("REPRO_MONITOR_SHIM_LIB", shimLib)
-    defer:
-      for i in countdown(oldEnv.high, 0):
-        let (name, value, existed) = oldEnv[i]
-        if existed: putEnv(name, value) else: delEnv(name)
+    # `runWithMonitorShim` now takes an `env` (nim-stackable-hooks 6a53408): a
+    # non-nil table is the child's COMPLETE environment, encoded into an
+    # explicit `CreateProcessW` block. `nil` still means "inherit", so the
+    # parameter costs nothing to callers that do not use it. We compose that
+    # table with the SAME `childEnv` the two POSIX arms use, so the layering
+    # rule (host env, then `request.env`, then io-mon's injection, injection
+    # winning) has one implementation rather than three. NO arm mutates the
+    # host any more.
+    let injected = @[
+      ("REPRO_MONITOR_FRAGMENT_DIR", fragmentDir),
+      ("REPRO_MONITOR_OUTPUT", request.depFilePath),
+      ("REPRO_MONITOR_SESSION", newRunId()),
+      ("REPRO_MONITOR_SHIM_LIB", shimLib)
+    ]
+    let spawnEnv = childEnv(request, injected)
 
+    # NOTE (executable resolution, unchanged by the above): a bare
+    # `request.command[0]` is resolved from the HOST's `PATH`, not `spawnEnv`'s.
+    # `CreateProcessW` is called with `lpApplicationName = NULL`, whose
+    # documented search runs in the CALLING process and never consults
+    # `lpEnvironment`; `runWithMonitorShim`'s MSYS/Cygwin fork-runtime check
+    # resolves the same bare name with `findExe`, i.e. from that same host
+    # `PATH`. The two therefore agree on WHICH image is being talked about,
+    # which is what matters — the upstream `env`/`findExe` hazard note is about
+    # a caller whose `env` PATH disagrees with the host's, and here that
+    # disagreement cannot separate the checked image from the launched one.
+    # It does mean a `PATH` in `request.env` changes what the CHILD sees but
+    # not which binary is launched. The POSIX arms answer the same way, though
+    # by different routes — Linux `findExe`s in the forked child (whose
+    # `environ` is still the parent's) and then `execve`s; macOS uses
+    # `posix_spawnp`, which reads `PATH` from the CALLING process, not from the
+    # `envp` it is given. Same answer on all three, three mechanisms; see
+    # `types.nim`'s `env*`. Pass an absolute `command[0]` when that distinction
+    # matters.
     let injection = runWithMonitorShim(request.command, shimLib,
                                        cwd = request.cwd,
                                        captureStdio = request.captureChildStdio,
-                                       captureStdioPath = request.captureStdioPath)
+                                       captureStdioPath = request.captureStdioPath,
+                                       env = spawnEnv)
     result.exitCode = injection.exitCode
 
     var launcherRecords: seq[MonitorRecord] = @[]
@@ -1148,23 +1262,21 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
     # just above, and demanding a process-start from a process we chose not
     # to inject would report the same gap twice.
     #
-    # PRE-EXISTING BUILD BREAK, fixed here (recorded in
-    # reprobuild-specs/IoMon-Decomposed-Host-API.milestones.org, "A pre-existing
-    # Windows build break"): this read `injection.rootPid`, but
-    # `stackable_hooks.WindowsInjectionResult` has only `exitCode`,
-    # `monitoringSkipped` and `skipReason` — no `rootPid`. `nim check
-    # --os:windows` therefore failed on this line, taking the whole module (and
-    # everything importing it) with it. The injector never returned the child's
-    # pid, so the R1 root-guard the comment above describes has NEVER actually
-    # been armed on Windows; the code only looked as if it were.
+    # ARMED HERE FOR THE FIRST TIME — this is new capability, not a restored
+    # regression. Until DH-1 this line read `injection.rootPid` against a
+    # `WindowsInjectionResult` that carried only `exitCode`,
+    # `monitoringSkipped` and `skipReason`, so `nim check --os:windows` failed
+    # on it and the arm never compiled; DH-1 made it compile by passing the
+    # honest `0'u64` ("no expected root pid"), which left the guard OFF.
+    # nim-stackable-hooks 485a30c added `rootPid` — the pid `CreateProcessW`
+    # already produces (`pi.dwProcessId`) — so the pid now exists to pass.
     #
-    # `0'u64` is the honest encoding of that: "no expected root pid", which is
-    # exactly what the arm has always effectively passed. It does NOT restore
-    # the guard — arming it needs `WindowsInjectionResult` to carry the pid
-    # `CreateProcessW` already hands the injector (`pi.dwProcessId`), which is a
-    # nim-stackable-hooks change and is deliberately out of scope here.
+    # What changes: an injected root that emits NOTHING used to be published as
+    # `mcComplete` over an empty record set — a zero-effort false cache hit for
+    # the whole action — and is now downgraded to `mcIncomplete`.
     result.depFile = mergeFragments(fragmentDir, request.depFilePath,
-      expectedRootPid = 0'u64,
+      expectedRootPid =
+        if injection.monitoringSkipped: 0'u64 else: injection.rootPid,
       setRecords = launcherRecords)
     renderStreamToPath(request.depFilePath, request.streamMode,
       request.eventStreamPath)

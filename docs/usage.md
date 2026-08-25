@@ -253,29 +253,55 @@ to the monitored child ONLY. `env` entries are layered on top of the environment
 this process already has (later duplicates win), and io-mon's own injection
 variables are applied on top of those, so a caller can extend `LD_PRELOAD` but
 cannot switch monitoring off by accident. `cwd` empty means "inherit the host's
-current directory".
+current directory". On Windows the composed environment is case-insensitive, as
+the OS's is, so a `Path` entry in `env` overrides the inherited `PATH` rather
+than joining it as a second variable — and, for the same reason, spelling an
+injection variable in a different case does not get you a second copy that might
+win: `repro_monitor_shim_lib` in `env` still loses to io-mon's
+`REPRO_MONITOR_SHIM_LIB`.
 
-On Linux and macOS `runMonitored` mutates **nothing** process-global: the
+`runMonitored` mutates **nothing** process-global on any of the three arms: the
 injection variables travel through the spawn, so N monitors may run concurrently
 on N threads of one host process and each gets its own uncontaminated evidence
-(IoMon-Decomposed-Host-API DH-1). Two residual exceptions, both documented at
-the call sites: the **Windows** arm still publishes its four variables via
-`putEnv` because `stackable_hooks.runWithMonitorShim` accepts no `env`; and on
-**macOS** `osproc` implements `workingDir` with a process-global
-`setCurrentDir` around `posix_spawn`, so a non-empty `cwd` is not thread-safe
-there.
+(IoMon-Decomposed-Host-API DH-1). On POSIX the spawn is
+`osproc.startProcess(env = …)`; on Windows it is
+`stackable_hooks.runWithMonitorShim`, whose `env` parameter takes the child's
+**complete** environment and encodes it into an explicit `CreateProcessW`
+environment block. All three arms compose that environment with one helper
+(`fs_snoop.childEnv`), so the layering rule above holds identically everywhere.
 
-Executable resolution still uses the HOST's `PATH` (the `poUsePath` search runs
-before the child's environment is installed), so pass an absolute `command[0]`
-when `env` changes `PATH`. `depFilePath`, `eventStreamPath` and
-`captureStdioPath` are resolved by the host, not the child, and are unaffected
-by `cwd`.
+One residual exception, documented at the call site: on **macOS** `osproc`
+implements `workingDir` with a process-global `setCurrentDir` around
+`posix_spawn`, so a non-empty `cwd` is not thread-safe there. Linux `chdir`s in
+the forked child and Windows passes `lpCurrentDirectory`, so both are.
+
+Executable resolution still uses the HOST's `PATH` on every arm, and `env` does
+not redirect it — same answer on all three arms, reached three different ways:
+
+- **Linux.** `osproc`'s fork path resolves `command[0]` with `findExe` *inside
+  the forked child*, whose `environ` is still the parent's, and then `execve`s
+  the resolved absolute path with the child's environment. The search therefore
+  never sees `env`.
+- **macOS.** `osproc` uses `posix_spawnp(…, env)` instead, and `posix_spawnp`
+  takes its `PATH` from the **calling** process's environment, not from the
+  `envp` it is handed.
+- **Windows.** `CreateProcessW` is called with `lpApplicationName = NULL`, whose
+  documented search uses the **calling** process's `PATH` and never
+  `lpEnvironment`'s. (`runWithMonitorShim` resolves a bare `command[0]` with
+  `findExe` for its MSYS/Cygwin fork-runtime check, i.e. from that same host
+  `PATH`, so the image it inspects is the image that runs.)
+
+Only the Linux row has been verified by execution in this workspace; the other
+two are read off the platform contracts. Pass an absolute `command[0]` when
+`env` changes `PATH` and you care which binary runs. `depFilePath`,
+`eventStreamPath` and `captureStdioPath` are resolved by the host, not the
+child, and are unaffected by `cwd`.
 
 > **Streaming form (`startMonitor* / drain* / finishMonitor*`) — deferred.** M6
 > part A ships only the batch `runMonitored`. The original reason for deferring
 > it — that a streaming host would have to hold a mutated process-global
 > injection env live *between* calls, risking a shim leak into the parent — no
-> longer applies on POSIX now that DH-1 threads the env through the spawn. What
+> longer applies on any arm now that DH-1 threads the env through the spawn. What
 > remains is the lifecycle question (who owns the wait, and how LF-2 stays
 > structurally impossible once the caller does), tracked as DH-2 in
 > `reprobuild-specs/IoMon-Decomposed-Host-API.milestones.org`.
@@ -284,11 +310,14 @@ by `cwd`.
 
 A consumer that spawns the **root** process under the shim itself (rather than
 via `runFsSnoopCli`) **must** pass the root pid it spawned as `expectedRootPid`
-to `mergeFragments`. This is the R1 root-guard: a SIP/hardened/notarized root
-(e.g. `/bin/cat`) strips `DYLD_INSERT_LIBRARIES`, emits no `mrProcessStart`, and
-leaves an empty fragment set — without the root pid the merge would falsely
-assert `mcComplete` over that empty set (a zero-effort false cache hit). Passing
-the pid makes the merge downgrade an un-monitored root to `mcIncomplete`. The
-built-in `runMonitoredCommand` already does this; any custom launcher must too.
-Passing `0` (the default) preserves legacy behaviour for callers merging
-hand-built fragment dirs with no single known root.
+to `mergeFragments`. This is the R1 root-guard. A root can fail to be monitored
+without failing to run: on macOS a SIP/hardened/notarized root (e.g. `/bin/cat`)
+strips `DYLD_INSERT_LIBRARIES`; on Windows an injected root whose shim loaded but
+never initialised installs no hooks. Either way it emits no `mrProcessStart` and
+leaves an empty fragment set, and without the root pid the merge falsely asserts
+`mcComplete` over that empty set (a zero-effort false cache hit). Passing the pid
+makes the merge downgrade an un-monitored root to `mcIncomplete`. The built-in
+`runMonitored` already does this on all three arms — Windows since
+nim-stackable-hooks' `WindowsInjectionResult` gained `rootPid`; any custom
+launcher must too. Passing `0` (the default) preserves legacy behaviour for
+callers merging hand-built fragment dirs with no single known root.

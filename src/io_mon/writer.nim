@@ -2928,14 +2928,15 @@ proc mergeFragments*(fragmentDir, outputPath: string;
   # explicit `currentRunId` arg, else REPRO_MONITOR_SESSION.
   #
   # PASS `currentRunId`; do NOT rely on the env fallback. Since
-  # IoMon-Decomposed-Host-API DH-1 the POSIX arms of `runMonitored` publish the
+  # IoMon-Decomposed-Host-API DH-1 ALL THREE arms of `runMonitored` publish the
   # injection variables to the CHILD's environment only, so REPRO_MONITOR_SESSION
-  # is no longer set in the MERGING process (it still is on the Windows arm,
-  # which cannot thread env through its spawn). The fallback now engages only for
-  # a caller that exports the variable itself. `runMonitored`'s Linux arm passes
-  # `currentRunId` explicitly; its macOS arm does not, which is safe only because
-  # that arm merges a fragment dir it created moments earlier and deletes on the
-  # way out, so no prior run's records can be in it.
+  # is no longer set in the MERGING process on any platform. (The Windows arm was
+  # the last to stop `putEnv`-ing it, once `runWithMonitorShim` gained an `env`
+  # parameter.) The fallback now engages only for a caller that exports the
+  # variable itself. `runMonitored`'s Linux arm passes `currentRunId` explicitly;
+  # its macOS and Windows arms do not, which is safe only because each merges a
+  # fragment dir it created moments earlier and deletes on the way out, so no
+  # prior run's records can be in it.
   #
   # Empty ⇒ no filtering (the CLI's fresh-dir case). This
   # runs BEFORE the corrupt-fragment loss injection below so a real corrupt fragment

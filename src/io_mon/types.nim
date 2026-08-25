@@ -391,11 +391,22 @@ type
     # extends (a caller-supplied `LD_PRELOAD` is preserved after the
     # shim, exactly as an inherited one is).
     #
-    # NOTE: on POSIX the executable is still resolved via the HOSTING
-    # process's `PATH` (`osproc`'s `poUsePath` search runs before the new
-    # environment is installed), so a `PATH` entry here changes what the
-    # child sees but not which binary is launched. Pass an absolute
-    # `command[0]` when that distinction matters.
+    # NOTE: on EVERY arm the executable is still resolved via the HOSTING
+    # process's `PATH`, but by a DIFFERENT route on each, so do not generalise
+    # from one of them:
+    #   * Linux   — `osproc`'s fork path calls `findExe` IN THE FORKED CHILD,
+    #               whose `environ` is still the parent's, then `execve`s the
+    #               resolved absolute path with this `env`. The search predates
+    #               the new environment.
+    #   * macOS   — `osproc` takes the `posix_spawnp(…, env)` path instead, and
+    #               `posix_spawnp` reads `PATH` from the CALLING process's
+    #               environment, never from the `envp` argument.
+    #   * Windows — `CreateProcessW` is called with `lpApplicationName = NULL`,
+    #               whose documented search runs in the calling process and
+    #               never consults `lpEnvironment`.
+    # So a `PATH` entry here changes what the child sees but not which binary is
+    # launched. Pass an absolute `command[0]` when that distinction matters.
+    # Only the Linux row is verified by execution in this workspace.
     env*: seq[(string, string)]
     # IoMon-Decomposed-Host-API DH-1 — PER-CALL working directory for the
     # monitored child. Empty means "inherit the hosting process's cwd"
