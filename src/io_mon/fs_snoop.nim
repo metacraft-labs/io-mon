@@ -14,11 +14,49 @@ import shm_gset as shmset_core
 import shm_gset/transport as shmset
 
 when defined(linux):
-  import std/[algorithm, monotimes, sequtils]
+  import std/[algorithm, monotimes, posix]
 
   const
     LinuxInjectedDescendantGraceMsDefault = 500
     LinuxInjectedDescendantPollMsDefault = 25
+    ## `/proc/<pid>/stat` is one generated line: a 16-byte comm plus ~50 numeric
+    ## fields, so 4 KiB holds it with room to spare. A pid whose line somehow did
+    ## NOT fit still yields its run state (field 3, immediately after the comm)
+    ## and is then treated as "start time unknown", which keeps it a CANDIDATE —
+    ## the safe direction, and the same answer HEAD gave.
+    ProcStatBufLen = 4096
+    ## STARTING capacity for the `/proc/<pid>/environ` read, not a cap: the
+    ## read loop doubles the buffer whenever it fills, so an environ larger than
+    ## this is read WHOLE and a needle sitting past 64 KiB is still found. That
+    ## matters — environs here reach 244 KiB, and a truncating read would be a
+    ## missed descendant, i.e. a false `mcComplete`. Sized so the common case
+    ## takes one allocation. With the prune armed only a handful of processes
+    ## per sweep get this far; with it disabled (`rootStartTicks == 0`) every
+    ## process whose environ is readable does.
+    ##
+    ## THE GROWTH IS NOT PINNED BY THE SUITE, and the reason is worth knowing
+    ## before someone "simplifies" it away. Replacing the doubling with a
+    ## `break` reddens NOTHING in the tree — not because the fixtures' environs
+    ## are small (they are not; a fixture given 320 KiB through
+    ## `FsSnoopRequest.env` really carries it) but because `childEnv` composes a
+    ## `StringTable` and the two needles land at whatever byte offsets its
+    ## iteration order gives them. Measured across padded runs, the SESSION
+    ## needle lands late (110 KiB / 543 KiB / 1018 KiB for 360 KiB / 843 KiB /
+    ## 1647 KiB environs) while the FRAGMENT_DIR needle lands at 123 B / 4 KiB /
+    ## 12 KiB — so the OR of the two conjuncts finds the descendant through the
+    ## early needle no matter how badly the read truncates. That is an accident
+    ## of hashing over a caller-controlled key set, not a property anything
+    ## guarantees, so the growth stays. It IS measured, by driving
+    ## `liveInjectedDescendants` directly against a carrier whose ONLY needle
+    ## sits at the end of a 400 KiB environ; that check fails without the
+    ## doubling and passes with it.
+    ProcEnvironChunkLen = 64 * 1024
+
+  proc openat(dirfd: cint; path: cstring; flags: cint): cint
+    {.importc, header: "<fcntl.h>", sideEffect.}
+  let AT_FDCWD {.importc, header: "<fcntl.h>".}: cint
+  proc dirfd(dirp: ptr DIR): cint
+    {.importc, header: "<dirent.h>", sideEffect.}
 
   proc envInt(name: string; defaultValue, minValue: int): int =
     let raw = getEnv(name)
@@ -31,55 +69,295 @@ when defined(linux):
     except ValueError:
       result = defaultValue
 
-  proc linuxProcState(pid: int): tuple[state: char; ok: bool] =
-    let statPath = "/proc" / $pid / "stat"
-    try:
-      let stat = readFile(extendedPath(statPath))
-      let closeParen = stat.rfind(")")
-      if closeParen < 0 or closeParen + 2 >= stat.len:
-        return ('\0', false)
-      return (stat[closeParen + 2], true)
-    except IOError, OSError:
-      return ('\0', false)
+  proc readProcFileAt(dirfd: cint; relPath: cstring; buf: var openArray[char]):
+      int =
+    ## open+read+close one small `/proc` file into a caller-owned buffer.
+    ## `-1` means "could not read it", which every caller treats exactly as the
+    ## old `readFile` exception did: skip this pid.
+    ##
+    ## The point of doing this by hand rather than with `readFile` is that a
+    ## `/proc` sweep performs 2-3 of these PER PROCESS ON THE MACHINE, and
+    ## `readFile` on a procfs file (apparent size 0) allocates a string, grows
+    ## it, and copies — measured at roughly 2x the raw syscall cost, on top of
+    ## the GC traffic.
+    let fd = openat(dirfd, relPath, O_RDONLY or O_CLOEXEC)
+    if fd < 0:
+      return -1
+    let n = posix.read(fd, addr buf[0], buf.len)
+    discard posix.close(fd)
+    if n <= 0:
+      return -1
+    int(n)
 
-  proc environCarriesInvocation(environ, runId, fragmentDir: string): bool =
-    let sessionNeedle = "REPRO_MONITOR_SESSION=" & runId
-    let fragmentNeedle = "REPRO_MONITOR_FRAGMENT_DIR=" & fragmentDir
-    for entry in environ.split('\0'):
-      if entry == sessionNeedle or entry == fragmentNeedle:
+  proc parseProcStat(buf: openArray[char]; n: int;
+                     state: var char; startTicks: var uint64): bool =
+    ## Pull field 3 (run state) and field 22 (start time, in USER_HZ ticks since
+    ## boot) out of one `/proc/<pid>/stat` line. Both live after the ')' that
+    ## closes the comm field, which is the only field that may itself contain
+    ## spaces or parentheses — hence the scan from the END for ')'.
+    ##
+    ## The RESULT reports only whether the run state was recovered, because that
+    ## is the conjunct HEAD's `linuxProcState` gated on and skipped the pid for.
+    ## The start time is reported out-of-band: `startTicks = 0` means "could not
+    ## tell", and every caller reads that as "do not prune this pid". So a stat
+    ## line this parser cannot fully understand costs a wasted environ read, not
+    ## a missed descendant.
+    startTicks = 0
+    var closeParen = -1
+    for i in countdown(n - 1, 0):
+      if buf[i] == ')':
+        closeParen = i
+        break
+    if closeParen < 0 or closeParen + 2 >= n:
+      return false
+    state = buf[closeParen + 2]
+    var idx = closeParen + 2
+    var field = 3
+    while idx < n and field < 22:
+      while idx < n and buf[idx] != ' ': inc idx
+      while idx < n and buf[idx] == ' ': inc idx
+      inc field
+    if field != 22 or idx >= n:
+      return true
+    var value = 0'u64
+    var digits = 0
+    while idx < n and buf[idx] in {'0' .. '9'}:
+      value = value * 10 + uint64(ord(buf[idx]) - ord('0'))
+      inc idx
+      inc digits
+    if digits > 0:
+      startTicks = value
+    true
+
+  proc procStartTicks(pid: uint64): uint64 =
+    ## Field 22 of `/proc/<pid>/stat`: when this process was created, in USER_HZ
+    ## ticks since boot. `0` means "unknown" (the process is already gone, or
+    ## `/proc` is not mounted), and every caller reads `0` as "do not filter" —
+    ## i.e. the old exhaustive sweep, never a narrower one.
+    ##
+    ## PRIVATE on purpose, like `liveInjectedDescendants` itself: `io_mon`
+    ## re-exports all of `fs_snoop`, so a `*` here would put a raw `/proc` reader
+    ## on the package's public surface for no caller that needs it.
+    var buf {.noinit.}: array[ProcStatBufLen, char]
+    let path = "/proc/" & $pid & "/stat"
+    let n = readProcFileAt(AT_FDCWD, path.cstring, buf)
+    if n <= 0:
+      return 0
+    var state = '\0'
+    var ticks = 0'u64
+    if not parseProcStat(buf, n, state, ticks):
+      return 0
+    ticks
+
+  proc environCarriesInvocation(buf: openArray[char]; n: int;
+                                sessionNeedle, fragmentNeedle: string): bool =
+    ## Does this `/proc/<pid>/environ` image contain either needle as a WHOLE
+    ## NUL-delimited entry? Same predicate as the old
+    ## `environ.split('\0')` + `==` loop, without materialising one Nim string
+    ## per environment variable: environs on a dev box routinely run to 200 KiB,
+    ## and the split alone measured ~76 ms across one machine's processes.
+    var start = 0
+    while start < n:
+      var stop = start
+      while stop < n and buf[stop] != '\0': inc stop
+      let entryLen = stop - start
+      if entryLen == sessionNeedle.len and
+         equalMem(unsafeAddr buf[start], unsafeAddr sessionNeedle[0],
+                  entryLen):
         return true
+      if entryLen == fragmentNeedle.len and
+         equalMem(unsafeAddr buf[start], unsafeAddr fragmentNeedle[0],
+                  entryLen):
+        return true
+      start = stop + 1
     false
 
-  proc liveInjectedDescendants(runId, fragmentDir: string; rootPid: uint64):
+  proc liveInjectedDescendants(runId, fragmentDir: string; rootPid: uint64;
+                               minStartTicks: uint64):
       tuple[pids: seq[int]; scanFailed: bool] =
-    if not dirExists("/proc"):
+    ## The §4.1 detector: which processes on this machine still carry THIS
+    ## monitor's injection markers in their environment?
+    ##
+    ## ── THE PREDICATE (unchanged) ──────────────────────────────────────────
+    ## A pid counts iff its `/proc/<pid>/stat` is readable, its run state is not
+    ## `Z`, its `/proc/<pid>/environ` is readable, and that environ contains
+    ## `REPRO_MONITOR_SESSION=<runId>` or `REPRO_MONITOR_FRAGMENT_DIR=<dir>` as
+    ## a whole entry. Every one of those conjuncts is still evaluated here, and
+    ## a pid failing any of them is skipped exactly as before. What changed is
+    ## the ORDER and the START-TIME PRUNE below, not the answer.
+    ##
+    ## ── WHY THE ORDER CHANGED ──────────────────────────────────────────────
+    ## This sweep is O(processes on the machine) and it runs on the critical
+    ## path of every `finishMonitor`. The old shape cost ~105 ms per monitored
+    ## action on a 900-process box and ~160 ms on the same box at ~1100
+    ## processes — measured — because it read `/proc/<pid>/stat` AND the full
+    ## `/proc/<pid>/environ` for every process, then split each environ into one
+    ## Nim string per variable. Where that time went, measured at 900 processes
+    ## by building each step on its own (medians of 25 sweeps):
+    ##
+    ##   ~105 ms   HEAD
+    ##    ~43 ms   raw syscalls instead of `readFile`/`walkDir`/`split`, old
+    ##             conjunct order  (so the allocation and copying were the
+    ##             LARGEST single item, not the wasted opens)
+    ##    ~29 ms   + conjuncts evaluated cheapest-first (below)
+    ##   5-11 ms   + the start-time prune
+    ##
+    ## So the conjuncts are now evaluated cheapest-first:
+    ##
+    ##   1. `openat` the environ. Failure here is the same skip the old code
+    ##      took when `readFile` raised, so this is the SAME test, moved
+    ##      earlier: it costs one failed `open` (~10 us) instead of a stat read
+    ##      plus a failed open, and on a shared machine it retires ~90% of pids.
+    ##   2. read `/proc/<pid>/stat` (state AND start time, one read).
+    ##   3. the START-TIME PRUNE (below).
+    ##   4. only now, read the environ and scan it.
+    ##
+    ## ── WHY THE START-TIME PRUNE IS SOUND ──────────────────────────────────
+    ## `minStartTicks` is the monitored ROOT's own start time, taken from field
+    ## 22 of its `/proc/<pid>/stat` in `startMonitor`. Both needles are minted
+    ## before the spawn and travel ONLY through the spawn's environment
+    ## (DH-1: nothing outside `childEnv` writes either name into any
+    ## environment), so a process can carry one only by having inherited it
+    ## from the root — i.e. only by being a descendant of the root,
+    ## and therefore only by having been created after the root was. A process
+    ## whose start time is strictly less than the root's is not a descendant of
+    ## the root; it is a fact about process creation, not a heuristic, and it
+    ## does not depend on permissions, pid ordering, pid reuse, or the clock
+    ## (both values are the same kernel counter, in the same units, read from
+    ## the same file).
+    ##
+    ## `minStartTicks == 0` disables the prune entirely, which is what a handle
+    ## carries when the root's start time could not be read. That degrades to
+    ## the old full sweep — slower, never blinder.
+    ##
+    ## The prune's soundness is a CROSS-MILESTONE dependency, not a local one:
+    ## it holds only because nothing outside `childEnv` ever writes either
+    ## needle into any environment (DH-1). See the note on `childEnv`, which is
+    ## where a future editor would break it.
+    ##
+    ## ── AN OPTIMISATION DELIBERATELY NOT TAKEN ─────────────────────────────
+    ## A UID pre-filter — skip any pid whose `/proc/<pid>` is not owned by us,
+    ## before doing anything else — was built and measured, and is REJECTED.
+    ## It is not even faster once the start-time prune is in place: on a
+    ## 900-process box, medians of 25 sweeps, 5.0-6.4 ms with the uid filter
+    ## against 5.5-10.7 ms without it, which is inside the run-to-run spread.
+    ## And it would not be worth taking if it were, because its premise is not
+    ## a fact about process creation but a fact about ptrace permissions: "a
+    ## descendant running as another user is one whose environ we could not
+    ## have read anyway". That is true for an ordinary host and
+    ## FALSE for a privileged one — a host holding `CAP_SYS_PTRACE` (or running
+    ## as root) passes `ptrace_may_access` for any pid, so it CAN read the
+    ## environ of a setuid or `sudo`-launched descendant that the uid filter
+    ## would have skipped. The guard would then be narrowest on exactly the
+    ## hosts that can see the most, and nothing here would say why. The
+    ## start-time prune has no such dependency: a descendant cannot predate its
+    ## own ancestor whatever the caller's capabilities are.
+    var dir = opendir("/proc")
+    if dir == nil:
+      return (@[], true)
+    defer: discard closedir(dir)
+    let fd = dirfd(dir)
+    if fd < 0:
       return (@[], true)
     let selfPid = getCurrentProcessId()
-    try:
-      for kind, path in walkDir("/proc"):
-        if kind != pcDir:
-          continue
-        let name = path.extractFilename
-        if name.len == 0 or not name.allIt(it in {'0' .. '9'}):
-          continue
-        let pid = parseInt(name)
-        if pid == selfPid or uint64(pid) == rootPid:
-          continue
-        let procState = linuxProcState(pid)
-        if not procState.ok:
-          continue
-        if procState.state == 'Z':
-          continue
-        let envPath = path / "environ"
-        var envBytes = ""
-        try:
-          envBytes = readFile(extendedPath(envPath))
-        except IOError, OSError:
-          continue
-        if environCarriesInvocation(envBytes, runId, fragmentDir):
-          result.pids.add pid
-    except OSError:
-      return (@[], true)
+    let sessionNeedle = "REPRO_MONITOR_SESSION=" & runId
+    let fragmentNeedle = "REPRO_MONITOR_FRAGMENT_DIR=" & fragmentDir
+    var statBuf {.noinit.}: array[ProcStatBufLen, char]
+    var envBuf = newSeq[char](ProcEnvironChunkLen)
+    var relPath {.noinit.}: array[32, char]
+    while true:
+      # `readdir` answers `nil` both for "end of directory" and for a read
+      # error, told apart only by `errno` — so zeroing it before every call is
+      # load-bearing, not hygiene. A read error must become `scanFailed`, which
+      # is what publishes an `mrEventLoss` instead of a silent "no descendants".
+      #
+      # This is STRICTER than HEAD rather than a translation of it. HEAD walked
+      # `/proc` with `walkDir`, whose `checkDir` parameter defaults to FALSE: a
+      # failed `opendir` yields nothing and raises nothing, and the read loop is
+      # `if x == nil: break` with no `errno` check at all — so HEAD's `except
+      # OSError` never fired for either fault, and both were reported as "no
+      # descendants live", i.e. a silent `mcComplete`. Measured by fault
+      # injection on this box (an `LD_PRELOAD` failing `opendir("/proc")` with
+      # `EACCES`, and one returning `nil` + `EIO` from the 20th `readdir` on
+      # that `DIR*`): HEAD grades `mcComplete` with no marker under both, this
+      # shape grades `mcIncomplete` with `linux injected-descendant /proc scan
+      # failed` under both, and both grade `mcComplete` with the injector loaded
+      # but disarmed. NOT covered by any test in the suite — forcing a `readdir`
+      # error needs an out-of-tree `LD_PRELOAD`, and the suite has no hook for
+      # one.
+      errno = 0.cint
+      let entry = readdir(dir)
+      if entry == nil:
+        if errno != 0.cint:
+          return (@[], true)
+        break
+      let name = cast[cstring](addr entry.d_name[0])
+      if name[0] notin {'0' .. '9'}:
+        continue
+      # A real pid fits in 7 digits (`pid_max` maxes out at 2^22); the loop
+      # bound below is 10, the point at which a name has stopped being plausibly
+      # a pid at all. Either figure keeps `pid` far from overflow and `relPath`
+      # far from its 32-byte capacity (10 digits + "/environ" + NUL = 19).
+      var pid = 0
+      var i = 0
+      var numeric = true
+      while name[i] != '\0':
+        if name[i] notin {'0' .. '9'} or i >= 10:
+          numeric = false
+          break
+        pid = pid * 10 + (ord(name[i]) - ord('0'))
+        inc i
+      if not numeric or i == 0:
+        continue
+      if pid == selfPid or uint64(pid) == rootPid:
+        continue
+
+      # (1) Can we read this process's environment at all? The old code found
+      # this out by letting `readFile` raise after it had already read the stat
+      # file; asking first is the same question, one syscall earlier.
+      for k in 0 ..< i: relPath[k] = char(name[k])
+      var w = i
+      for c in "/environ": relPath[w] = c; inc w
+      relPath[w] = '\0'
+      let envFd = openat(fd, cast[cstring](addr relPath[0]),
+                         O_RDONLY or O_CLOEXEC)
+      if envFd < 0:
+        continue
+
+      # (2) run state + start time, from ONE read of `/proc/<pid>/stat`.
+      w = i
+      for c in "/stat": relPath[w] = c; inc w
+      relPath[w] = '\0'
+      let statLen = readProcFileAt(fd, cast[cstring](addr relPath[0]), statBuf)
+      var state = '\0'
+      var startTicks = 0'u64
+      if statLen <= 0 or not parseProcStat(statBuf, statLen, state, startTicks):
+        discard posix.close(envFd)
+        continue
+      if state == 'Z':
+        discard posix.close(envFd)
+        continue
+
+      # (3) the start-time prune. `startTicks == 0` is "this stat line did not
+      # tell us", and it keeps the pid as a CANDIDATE — an unparseable stat line
+      # must never be the reason a live descendant goes unreported.
+      if minStartTicks > 0 and startTicks > 0 and startTicks < minStartTicks:
+        discard posix.close(envFd)
+        continue
+
+      # (4) only now is the environ worth reading.
+      var total = 0
+      while true:
+        if total == envBuf.len:
+          envBuf.setLen(envBuf.len * 2)
+        let r = posix.read(envFd, addr envBuf[total], envBuf.len - total)
+        if r <= 0:
+          break
+        total += int(r)
+      discard posix.close(envFd)
+      if total > 0 and
+         environCarriesInvocation(envBuf, total, sessionNeedle, fragmentNeedle):
+        result.pids.add pid
 
   proc emitLauncherLossToSet(path0: string; rec: MonitorRecord): bool =
     ## io-mon-Lossless-Event-Capture M7 (Linux slice) — insert a consumer-side
@@ -126,14 +404,15 @@ when defined(linux):
     appendFragmentRecord(fragmentDir, rec)
 
   proc waitForLinuxInjectedDescendants(fragmentDir, runId: string;
-      rootPid: uint64; depSetPath0 = "") =
+      rootPid: uint64; minStartTicks: uint64; depSetPath0 = "") =
     let graceMs = envInt("IO_MON_LINUX_DESCENDANT_GRACE_MS",
       LinuxInjectedDescendantGraceMsDefault, 0)
     let pollMs = envInt("IO_MON_LINUX_DESCENDANT_POLL_MS",
       LinuxInjectedDescendantPollMsDefault, 1)
     let start = getMonoTime()
     while true:
-      let live = liveInjectedDescendants(runId, fragmentDir, rootPid)
+      let live = liveInjectedDescendants(runId, fragmentDir, rootPid,
+        minStartTicks)
       if live.scanFailed:
         appendLauncherEventLoss(fragmentDir, runId,
           "linux injected-descendant /proc scan failed", depSetPath0)
@@ -812,6 +1091,21 @@ proc childEnv(request: FsSnoopRequest;
   ## `mode` defaults to `ChildEnvMode`, which is what every production call
   ## passes; it is a parameter so a test can drive the WINDOWS discipline on a
   ## POSIX host (see `ChildEnvMode`).
+  ##
+  ## **The §4.1 start-time prune depends on this proc being the ONLY route by
+  ## which an injection needle reaches a process.** `liveInjectedDescendants`
+  ## skips every process that PREDATES the monitored root, which is sound only
+  ## because `REPRO_MONITOR_SESSION` and `REPRO_MONITOR_FRAGMENT_DIR` travel
+  ## exclusively through this child-only environment — so a carrier is
+  ## necessarily a descendant, and a descendant is necessarily younger than its
+  ## root. A `putEnv`/`setenv` of either name in the HOSTING process, followed
+  ## by any spawn at all, would put a needle in a process that is not descended
+  ## from the root; the prune would then drop it silently and the edge would
+  ## grade `mcComplete` with a live escapee — the cardinal sin. If a host-side
+  ## write of either name ever becomes necessary, the prune has to go first.
+  ## (The shim's own `setenv("REPRO_MONITOR_EXEC_GEN", …)` in
+  ## `hooks/linux_preload_runtime.nim` is not a needle and runs only inside
+  ## processes that are already descendants, so it does not bear on this.)
   result = newStringTable(mode)
   for key, value in envPairs():
     addHostEnvEntry(result, key, value)
@@ -1042,6 +1336,14 @@ type
     when defined(linux):
       depSet: SetHost
       depSetLive: bool
+      rootStartTicks: uint64   ## The monitored ROOT's own start time (field 22
+                               ## of `/proc/<rootPid>/stat`, USER_HZ ticks since
+                               ## boot), captured immediately after the spawn.
+                               ## The §4.1 sweep uses it to skip processes that
+                               ## PREDATE the root and therefore cannot be its
+                               ## descendants — see `liveInjectedDescendants`.
+                               ## `0` means "unknown", which disables the skip
+                               ## and restores the exhaustive sweep.
     when defined(macosx):
       sandboxDir: string
       ownsSandboxDir: bool
@@ -1170,7 +1472,7 @@ proc settleMonitorDescendants(h: var MonitorHandle) =
     let launcherLossPath0 =
       if h.depSetLive and h.depSet.available: h.depSet.path0 else: ""
     waitForLinuxInjectedDescendants(h.fragmentDir, h.runId, h.rootPid,
-      launcherLossPath0)
+      h.rootStartTicks, launcherLossPath0)
   else:
     # macOS and Windows have no §4.1 equivalent yet — the detached-descendant
     # scan is a `/proc` walk. The STEP still runs (and still marks the handle),
@@ -1396,6 +1698,17 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
       options = {poUsePath, poParentStreams})
     # ROUND-2 R1 — see the macOS branch: prove the root was monitored.
     h.rootPid = uint64(h.process.processID)
+    # The root's own creation time, read the moment it exists. Every process
+    # that can carry this monitor's injection markers is a descendant of this
+    # root, so none of them can be older than it — which is what lets the §4.1
+    # sweep skip the (overwhelming) majority of the machine's processes without
+    # narrowing the guard by one pid. Reading it here rather than at settle time
+    # is not an optimisation but a necessity: by then the root is gone.
+    #
+    # A `0` (the root exited between `startProcess` returning and this read —
+    # a real race, just a vanishingly rare one) disables the skip for this
+    # monitor and it pays the old exhaustive sweep. Slower, never blinder.
+    h.rootStartTicks = procStartTicks(h.rootPid)
   elif defined(windows):
     # Windows: same end-to-end flow as macOS, but the injection uses
     # CreateProcess(CREATE_SUSPENDED) + CreateRemoteThread(LoadLibraryW)
