@@ -1073,20 +1073,53 @@ proc rootPid*(h: MonitorHandle): uint64 =
   ## and the first `pollMonitor`; see `pollMonitor`).
   h.rootPid
 
+proc recordRootExit(h: var MonitorHandle; code: int) =
+  ## **The ONLY writer of `h.exitCode` and `h.exited`
+  ## (IoMon-Decomposed-Host-API DH-4).**
+  ##
+  ## The root's exit status used to have TWO writers: `pollMonitor` on the polled
+  ## path and `waitForMonitorRoot` on the batch path. They agreed, and nothing
+  ## pinned that they must — which matters more here than it would elsewhere,
+  ## because the two launch paths differ ONLY in which of them runs
+  ## (`waitForMonitorRoot` returns at its `if h.exited: return` for a handle a
+  ## host already polled). So a change to either one is a change to ONE launch
+  ## path's evidence and not the other's, and DH-4's whole claim is that the two
+  ## agree. That is the same shape as the `h.settled` divergence DH-3 measured,
+  ## one field over; folding both writers into one makes the agreement true by
+  ## construction instead of by coincidence.
+  ##
+  ## Reaping the `Process` belongs here too, so "the monitored root has exited"
+  ## is ONE state transition rather than a four-line sequence each caller
+  ## repeats — and so a caller that reaps without recording, or records without
+  ## reaping, is not a shape that can be written.
+  h.exitCode = code
+  h.exited = true
+  when defined(linux) or defined(macosx):
+    if h.process != nil:
+      close(h.process)
+      h.process = nil
+
 proc waitForMonitorRoot(h: var MonitorHandle) =
   ## BLOCK until the monitored root has exited, and record its status.
   ## Idempotent: a root already reaped by `pollMonitor` is not waited on twice.
   ##
   ## This is the first half of the safety teardown, and the reason the second
   ## half is safe: nothing that releases the consumer runs before this returns.
+  ##
+  ## NOTE for anyone changing this proc — the early return below is not merely
+  ## the idempotence guard DH-2 classified it as. It is the ONE code-level seam
+  ## along which the two launch paths can differ: `h.exited` is `false` here for
+  ## `runMonitored` (so the whole body runs) and `true` for a host that polled
+  ## (so this returns at its first statement). **Any state a change puts after
+  ## it executes on the batch path and is skipped on the polled one**, which is
+  ## how DH-3's M5 produced a false `mcComplete` on one path while the other
+  ## stayed honest. Put per-run state transitions in `recordRootExit`, which both
+  ## paths reach, not after the guard.
   if h.exited:
     return
   when defined(linux) or defined(macosx):
     if h.process != nil:
-      h.exitCode = waitForExit(h.process)
-      close(h.process)
-      h.process = nil
-      h.exited = true
+      recordRootExit(h, waitForExit(h.process))
   elif defined(windows):
     # The Windows spawn is `stackable_hooks/windows_injector.runWithMonitorShim`,
     # which spawns AND waits in one blocking call and returns only a completed
@@ -1100,10 +1133,9 @@ proc waitForMonitorRoot(h: var MonitorHandle) =
                                        captureStdio = h.request.captureChildStdio,
                                        captureStdioPath = h.request.captureStdioPath,
                                        env = h.spawnEnv)
-      h.exitCode = h.injection.exitCode
       h.rootPid =
         if h.injection.monitoringSkipped: 0'u64 else: h.injection.rootPid
-      h.exited = true
+      recordRootExit(h, h.injection.exitCode)
 
 proc settleMonitorDescendants(h: var MonitorHandle) =
   ## The §4.1 detached-descendant grace (Linux). Idempotent.
@@ -1513,10 +1545,9 @@ proc pollMonitor*(handle: var MonitorHandle): bool =
     let code = peekExitCode(handle.process)
     if code < 0:
       return false
-    handle.exitCode = code
-    handle.exited = true
-    close(handle.process)
-    handle.process = nil
+    # DH-4 — through the SAME writer the batch path uses, so the two launch
+    # paths cannot disagree about the status they report.
+    recordRootExit(handle, code)
     return true
   elif defined(windows):
     waitForMonitorRoot(handle)

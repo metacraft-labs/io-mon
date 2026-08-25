@@ -109,6 +109,18 @@ proc buildC(work, name, source: string): string =
       "failed to compile fixture " & name & " (exit " & $built.code & "): " &
         built.output)
 
+proc awaitFile(path: string; timeoutMs: int) =
+  ## Block until `path` appears. RAISES on timeout rather than carrying on, so a
+  ## descendant that never acknowledged its release cannot be mistaken for one
+  ## that exited.
+  var waited = 0
+  while not fileExists(path):
+    if waited >= timeoutMs:
+      raise newException(IOError,
+        "timed out after " & $timeoutMs & "ms waiting for " & path)
+    sleep(10)
+    waited += 10
+
 proc ensureShim(): string =
   ## Build the shim the way the rest of the Linux suite does and resolve it with
   ## the same discovery `startMonitor` uses.
@@ -158,6 +170,14 @@ proc hasFileRead(dep: MonitorDepFile; path: string): bool =
 ##         The harness drops that file only after the monitor has been finished,
 ##         so the descendant is guaranteed live across the ENTIRE grace window
 ##         regardless of host load. Expected verdict: `mcIncomplete`.
+##
+##         Having seen its sentinel the descendant writes `<path>.ack` and the
+##         harness WAITS for it before tearing the work directory down. That is
+##         not tidiness: without it the sentinel and the `removeDir` are a race
+##         the descendant loses about half the time, and a descendant that never
+##         observes its release polls a vanished path at 500Hz forever. Measured
+##         while verifying DH-4: three leaked spinners out of five runs of this
+##         file, and 35 accumulated across the DH-3/DH-4 campaigns.
 ##
 ## The gated arm closes every fd but the pipe: the shim dups its own channels
 ## onto inherited descriptors, and a blocking daemon holding them can keep a
@@ -235,6 +255,17 @@ int main(int argc, char **argv) {
     close(rp[1]);
     struct stat st;
     while (stat(release, &st) != 0) usleep(2000);
+    /* Acknowledge the release before exiting, so the harness can wait for this
+       process to be past its last file operation before it removes the work
+       directory. Without the ack the two are a RACE the descendant always
+       loses: `removeDir` takes the sentinel with it, `stat` then fails
+       forever, and this daemon spins at 500Hz for the life of the machine.
+       MEASURED on this host: three leaked spinners out of five runs of this
+       file, each still polling a path that no longer exists. */
+    char ack[4096];
+    snprintf(ack, sizeof(ack), "%s.ack", release);
+    int af = open(ack, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (af >= 0) { if (write(af, "gone\n", 5) < 0) {} close(af); }
     _exit(n > 0 ? 0 : 7);
   }
   msleep_arg(argv[4]);
@@ -468,6 +499,7 @@ suite "io-mon external host descendant guard (DH-3)":
     # Release the descendant IMMEDIATELY, before any assertion — so it is let go
     # (and reaped by init) even if an assertion below fails.
     writeFile(batchRelease, "release\n")
+    awaitFile(batchRelease & ".ack", 20_000)
     let afterBatch = monitorLifecycleCounts()
 
     let hostProof = work / "host.proof"
@@ -486,6 +518,7 @@ suite "io-mon external host descendant guard (DH-3)":
       sleep(5)
     let hostRes = finishMonitor(move(handle))
     writeFile(hostRelease, "release\n")
+    awaitFile(hostRelease & ".ack", 20_000)
     let afterHost = monitorLifecycleCounts()
 
     checkpoint("runMonitored: exit=" & $batchRes.exitCode & " completeness=" &

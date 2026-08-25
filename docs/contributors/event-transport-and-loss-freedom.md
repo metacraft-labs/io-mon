@@ -557,6 +557,28 @@ library API**, not only a CLI:
   and a dropped handle publishes no edge for a loss marker to downgrade. That
   asymmetry is asserted, not just documented (the census's `settled` counter).
 
+  **And the two launch paths are now measured against each other (DH-4).** That
+  the guard is unskippable says the decomposed host CANNOT miss it; it does not
+  by itself say the two paths agree about everything else. DH-4 renders every
+  field of both edges — records, completeness, loss markers, backend
+  diagnostics — and compares them byte for byte for the same action, including
+  the detached-descendant case
+  (`tests/linux/test_io_mon_evidence_identical_across_launch_paths.nim`). Only
+  kernel-allocated identifiers that cannot be equal are normalised (pids, the
+  per-call run id, a `localfd:` inode), each through a bijection, and the file
+  perturbs the real evidence to prove the comparison still sees a dropped
+  record, a flipped verdict, a changed path or two processes collapsed into one.
+
+  Three seams make that agreement a property to hold rather than a formality.
+  `waitForMonitorRoot`'s `if h.exited: return` is the ONE code-level place the
+  paths differ, so state added after it runs on the batch path only. The root's
+  exit status now has a SINGLE writer (`recordRootExit`), reached by both paths,
+  so they cannot disagree about it. And the grace window opens when
+  `finishMonitor` runs, which a polled host chooses — a descendant that dies in
+  that interval is graded differently by the two paths with nothing wrong, which
+  is inherent to owning the wait and is documented for callers in
+  `docs/usage.md` rather than papered over.
+
 ---
 
 ## 7. Invariants checklist (for reviewers)

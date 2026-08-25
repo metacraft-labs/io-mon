@@ -354,6 +354,32 @@ does, and cannot opt out. Pinned by
 `tests/linux/test_io_mon_external_host_descendant_guard.nim`, which runs a real
 detached descendant past a real grace window down both launch paths.
 
+**The two launch paths produce the same evidence, and that is measured** (DH-4).
+`runMonitored` and a host driving `startMonitor` → `pollMonitor` →
+`finishMonitor` yield an identical `MonitorDepFile` for the same action — the
+same records, the same completeness, the same loss markers, the same backend
+diagnostics — down to the detached-descendant case, not just the happy path.
+Pinned by `tests/linux/test_io_mon_evidence_identical_across_launch_paths.nim`,
+which renders every field of both edges and compares them byte for byte.
+
+Two things a host should know about that guarantee, because they bound it:
+
+- **What cannot be equal, and is normalised in the comparison:** OS pids (and
+  the child pid an `mrProcessSpawn` carries in `result`), the per-call run id
+  stamped into a record's `detail` as `run=<id>`, the pid list a §4.1 marker
+  carries as `pids=…`, and the kernel object id in a `localfd:<dev>:<ino>`
+  channel pseudo-path. Everything else — every real filesystem path included —
+  matches exactly.
+- **WHEN you finish a monitor is yours to choose, and it moves the grace
+  window.** The §4.1 window opens when `finishMonitor` runs, which for a polled
+  host is whenever its scheduler gets round to it. A descendant that dies in
+  that extra interval is graded `mcComplete` by a host that dawdled and
+  `mcIncomplete` by one that did not — on identical inputs, with nothing wrong.
+  That is inherent to owning the wait, not a defect: the grade is an honest
+  statement about what was still alive when the launcher looked. A host that
+  wants the batch entry point's timing should call `finishMonitor` as soon as
+  `pollMonitor` answers `true`.
+
 A DROPPED handle does not run the guard, deliberately: it is an EVIDENCE step,
 and a dropped handle publishes no edge for a loss marker to downgrade. The
 SAFETY of a surviving descendant does not depend on it — the root is reaped
