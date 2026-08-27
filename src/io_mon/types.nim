@@ -1,4 +1,4 @@
-import std/[options]
+import std/[options, strutils]
 
 type
   MonitorRecordKind* = enum
@@ -185,6 +185,22 @@ type
     # path (the dir/file was created or removed); it is recorded for output-tree
     # state tracking and is NOT a determinism downgrade.
     moPathMutation = 17
+
+  EventCategory* = enum
+    ## The classes of observation a consumer can opt in / out of. See
+    ## docs/contributors/event-interest-filter.md. Gating a category makes io-mon
+    ## skip the work (record construction + gset publish, and where cheap the hook
+    ## install itself) for the `MonitorRecordKind`s in it. The META kinds
+    ## (`mrEventLoss`/`mrBackendProfile`/`mrCapabilityGap`) belong to NO category
+    ## and are never gated — a suppressed loss marker would risk a false
+    ## `mcComplete` (LF-1).
+    ecFileDeps       ## mrFileOpen, mrFileRead, mrFileWrite, mrPathProbe,
+                     ## mrDirectoryEnumerate, mrPathMutation
+    ecProcessTree    ## mrProcessStart, mrProcessExec, mrProcessSpawn
+    ecLibraryLoads   ## mrLibraryLoad
+    ecNonDeterminism ## mrNonDeterministic, mrTimeRead, mrEnvRead, mrSysctlRead,
+                     ## mrExternalContent
+    ecIpc            ## mrIpcConnect
 
   ProbeResult* = enum
     prUnknown = 0
@@ -418,6 +434,13 @@ type
     # by the HOST, not the child, so they are unaffected by this field —
     # pass them absolute if the host's cwd may differ.
     cwd*: string
+    # The observation categories this consumer wants. io-mon skips the work
+    # (record build + gset publish, and where cheap the hook install) for the
+    # categories NOT in this set. See docs/contributors/event-interest-filter.md.
+    # The empty set is normalised to `FullInterest` on ingest, so an unset field
+    # captures everything (the safe, back-compatible default) rather than
+    # silently disabling all observation. META/loss records are never gated.
+    interest*: set[EventCategory]
 
 const
   IomonVersion* = 1'u16
@@ -454,3 +477,72 @@ proc raiseMonitorDepFileReaderError*(kind: MonitorDepFileReaderErrorKind;
   var err = newException(MonitorDepFileReaderError, message)
   err.kind = kind
   raise err
+
+# ---------------------------------------------------------------------------
+# Event-interest categories — docs/contributors/event-interest-filter.md
+# ---------------------------------------------------------------------------
+
+const FullInterest* = {EventCategory.low .. EventCategory.high}
+  ## Every category — io-mon's default, and what an empty request interest is
+  ## normalised to. A generic consumer captures everything unless it opts out.
+
+func categoryOf*(kind: MonitorRecordKind): Option[EventCategory] =
+  ## The gate-able category a record kind belongs to, or `none` for META kinds
+  ## (`mrEventLoss`/`mrBackendProfile`/`mrCapabilityGap`) that are NEVER gated.
+  ## Exhaustive over `MonitorRecordKind`, so a new kind must state its category
+  ## (or be declared META) here rather than silently defaulting.
+  case kind
+  of mrFileOpen, mrFileRead, mrFileWrite, mrPathProbe, mrDirectoryEnumerate,
+     mrPathMutation:
+    some(ecFileDeps)
+  of mrProcessStart, mrProcessExec, mrProcessSpawn:
+    some(ecProcessTree)
+  of mrLibraryLoad:
+    some(ecLibraryLoads)
+  of mrNonDeterministic, mrTimeRead, mrEnvRead, mrSysctlRead, mrExternalContent:
+    some(ecNonDeterminism)
+  of mrIpcConnect:
+    some(ecIpc)
+  of mrEventLoss, mrBackendProfile, mrCapabilityGap:
+    none(EventCategory)
+
+func normalizeInterest*(interest: set[EventCategory]): set[EventCategory] =
+  ## The empty set means "unset" -> capture everything; any non-empty set is
+  ## honoured as-is. Callers normalise on ingest so a zero-initialised request
+  ## never silently disables all observation.
+  if interest == {}: FullInterest else: interest
+
+func recordWanted*(interest: set[EventCategory]; kind: MonitorRecordKind): bool =
+  ## Should a record of `kind` be captured under `interest`? META kinds (no
+  ## category) are always wanted; a categorised kind is wanted iff its category
+  ## is in the (normalised) set.
+  let c = categoryOf(kind)
+  if c.isNone: true
+  else: c.get in normalizeInterest(interest)
+
+const
+  # Wire tokens for `REPRO_MONITOR_INTEREST` (the env channel to the shim).
+  interestTokenPairs = [
+    (ecFileDeps, "file"), (ecProcessTree, "proc"), (ecLibraryLoads, "lib"),
+    (ecNonDeterminism, "nondet"), (ecIpc, "ipc")]
+
+func interestToTokens*(interest: set[EventCategory]): string =
+  ## Encode an interest set as the comma-separated `REPRO_MONITOR_INTEREST`
+  ## value. `FullInterest` encodes to every token (never empty, so an older
+  ## reader cannot mistake "all" for "unset").
+  let normalized = normalizeInterest(interest)
+  var parts: seq[string] = @[]
+  for (cat, tok) in interestTokenPairs:
+    if cat in normalized: parts.add(tok)
+  parts.join(",")
+
+func parseInterestTokens*(s: string): set[EventCategory] =
+  ## Decode a `REPRO_MONITOR_INTEREST` value. Empty/absent -> `FullInterest`
+  ## (back-compat). Unknown tokens are ignored (forward-compat: an older shim
+  ## treats a new category as "not mine"; the host filter is the source of truth).
+  let trimmed = s.strip()
+  if trimmed.len == 0: return FullInterest
+  for raw in trimmed.split(','):
+    let tok = raw.strip()
+    for (cat, known) in interestTokenPairs:
+      if tok == known: result.incl(cat)

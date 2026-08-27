@@ -363,6 +363,11 @@ var
   # paired-down breakaway, never a false skip). See repro_hook_xpc_*.
   pendingAppleXpc = initTable[uint, string]()
   fragmentDir: string
+  # The consumer's event-interest set (REPRO_MONITOR_INTEREST), set once at init
+  # and only read in `emitRecord` thereafter. `FullInterest` by default so a shim
+  # never told an interest captures everything. See
+  # docs/contributors/event-interest-filter.md.
+  gInterest: set[EventCategory] = FullInterest
   nextProcessSeq: uint64 = 0
   fdPaths = initTable[cint, string]()
   dirPaths = initTable[uint, string]()
@@ -463,6 +468,12 @@ proc baseRecord(kind: MonitorRecordKind; observationKind: MonitorObservationKind
 
 proc emitRecord(record: MonitorRecord) {.raises: [].} =
   if not initialized or fragmentDir.len == 0 or disabled > 0:
+    return
+  # Event-interest gate — skip a category the consumer did not ask for before the
+  # fragment write. `recordWanted` returns true for META/loss kinds, so an
+  # `mrEventLoss` is never suppressed (LF-1). See
+  # docs/contributors/event-interest-filter.md §4.1.
+  if not recordWanted(gInterest, record.kind):
     return
   withShimMuted:
     appendFragmentRecord(fragmentDir, record)
@@ -1384,6 +1395,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
     return 0
   withShimMuted:
     fragmentDir = getEnv("REPRO_MONITOR_FRAGMENT_DIR")
+    gInterest = parseInterestTokens(getEnv("REPRO_MONITOR_INTEREST"))
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))
     # ROUND-2 R8 — capture the invocation run id for report authentication.

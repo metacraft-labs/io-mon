@@ -1052,6 +1052,13 @@ proc childEnv(request: FsSnoopRequest;
     result[key] = value
   for (key, value) in injected:
     result[key] = value
+  # The event-interest set is an io-mon injection variable (so it WINS over any
+  # caller `request.env`, exactly like the other REPRO_MONITOR_* needles) that the
+  # shim reads at init to gate which observation categories it captures. Encoded
+  # via `interestToTokens`, which is never empty even for `FullInterest`, so the
+  # shim distinguishes "capture all" from "unset". See
+  # docs/contributors/event-interest-filter.md.
+  result["REPRO_MONITOR_INTEREST"] = interestToTokens(request.interest)
 
 proc injectionValue(shimLib, existing: string): string =
   ## Prepend the shim to whatever the child's preload list would otherwise be.
@@ -1926,6 +1933,28 @@ proc collectMonitorEvidence(h: var MonitorHandle): MonitorDepFile =
     # cache hit for the whole action — and is now downgraded to `mcIncomplete`.
     result = mergeFragments(h.fragmentDir, h.request.depFilePath,
       expectedRootPid = h.rootPid, setRecords = launcherRecords)
+
+  # Host-side event-interest filter (belt-and-suspenders — see
+  # docs/contributors/event-interest-filter.md §5). The shim is meant to skip
+  # emitting the categories the consumer did not ask for, so with a current shim
+  # nothing is dropped here. But the HOST is the source of truth for "the depfile
+  # contains only requested categories": an OLDER shim that ignores
+  # REPRO_MONITOR_INTEREST still yields a correctly-filtered result. META/loss
+  # records (`recordWanted` returns true) are never dropped, so completeness is
+  # unaffected — disabling a category is a consumer choice, not data loss. Only
+  # when the interest is reduced AND something was actually dropped do we
+  # re-summarize and re-write the on-disk depfile to match the in-memory result.
+  if normalizeInterest(h.request.interest) != FullInterest:
+    var kept: seq[MonitorRecord] = @[]
+    var dropped = false
+    for rec in result.records:
+      if recordWanted(h.request.interest, rec.kind): kept.add rec
+      else: dropped = true
+    if dropped:
+      result.records = kept
+      result.summary = summarizeRecords(kept)
+      if h.request.depFilePath.len > 0:
+        writeCanonical(h.request.depFilePath, kept)
 
 proc finishMonitor*(handle: sink MonitorHandle): MonitorResult =
   ## **Public parent-host API (IoMon-Decomposed-Host-API DH-2).** Consume the

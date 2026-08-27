@@ -73,6 +73,12 @@ var
   # module; the accessor procs below just forward to it.
   fragmentDir: string
   runId: string
+  # The consumer's event-interest set (REPRO_MONITOR_INTEREST). Set ONCE at init
+  # and only read thereafter, so the concurrent reads in `emitRecord` need no
+  # lock. `FullInterest` until init runs and if the var is absent, so a shim that
+  # is never told an interest captures everything (back-compat). See
+  # docs/contributors/event-interest-filter.md.
+  gInterest: set[EventCategory] = FullInterest
   # DEP-SHM-2 — the shared-memory dependency-queue segment path (the value of
   # REPRO_MONITOR_DEP_SHM). Empty when the engine did not create a ring, in
   # which case every record takes the file path unchanged. Remembered so the
@@ -855,6 +861,14 @@ proc stampRunId(record: var MonitorRecord) {.raises: [].} =
 proc emitRecord(record: MonitorRecord) {.raises: [].} =
   if not initialized or fragmentDir.len == 0 or shouldBypass():
     return
+  # Event-interest gate (docs/contributors/event-interest-filter.md §4.1). Skip
+  # the whole record — construction already happened at the call site, but the
+  # expensive publish (gset insert + dedup, or fragment write) is avoided — for a
+  # category the consumer did not ask for. `recordWanted` returns true for
+  # META/loss kinds, so a suppressed interest can never drop an `mrEventLoss`
+  # (LF-1: that would risk a false `mcComplete`).
+  if not recordWanted(gInterest, record.kind):
+    return
   # M9.R.62.2 — refresh the diagnostic context on every emit so an
   # unmatched pending marker carries the LAST-observed record kind
   # instead of the stale "phase=init" from the constructor. A process
@@ -1368,6 +1382,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   withShimMuted:
     fragmentDir = getEnv("REPRO_MONITOR_FRAGMENT_DIR")
     runId = getEnv("REPRO_MONITOR_SESSION")
+    gInterest = parseInterestTokens(getEnv("REPRO_MONITOR_INTEREST"))
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))
     # DEP-SHM-2 — attach the process to the edge's shared-memory dependency
