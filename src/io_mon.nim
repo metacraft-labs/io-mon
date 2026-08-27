@@ -12,6 +12,7 @@
 
 import io_mon/types
 import io_mon/capabilities
+import io_mon/encode
 import io_mon/writer
 import io_mon/reader
 import io_mon/render
@@ -19,6 +20,7 @@ import io_mon/fs_snoop
 
 export types
 export capabilities
+export encode
 export writer
 export reader
 export render

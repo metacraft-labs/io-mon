@@ -3,7 +3,7 @@ from io_mon/paths import extendedPath
 
 import io_mon/codec
 import io_mon/types
-import io_mon/writer
+import io_mon/encode
 
 proc classifyEnvelopeError(err: ref EnvelopeError): MonitorDepFileReaderErrorKind =
   case err.kind
