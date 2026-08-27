@@ -110,7 +110,7 @@ suite "io-mon shim-library override is honoured or fails":
     for k, v in envPairs(): childEnv[k] = v
     childEnv["REPRO_MONITOR_SHIM_LIB"] = work / "no" / "such" / "shim.so"
 
-    let depfile = work / "bogus.rdep"
+    let depfile = work / "bogus.iomon"
     let res = run(snoopBin,
       @["run", "--depfile", depfile, "--", "/bin/sh", "-c", "true"], childEnv)
     checkpoint("driver output: " & res.output)

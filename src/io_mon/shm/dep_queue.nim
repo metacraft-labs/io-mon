@@ -11,7 +11,7 @@
 ## (`decodeDepRecord`), plus the real-`seq` variant (`encodeDepRecord`).
 ##
 ## The codec is domain-only (no ring, no segment, no atomics): a fixed header +
-## varint-length path/detail encoding of the SAME `MonitorRecord` the RMDF frames
+## varint-length path/detail encoding of the SAME `MonitorRecord` the iomon frames
 ## carry. The real-sequence codec preserves every field. The SET identity codec
 ## preserves every field for process/completeness records, while path-scoped file
 ## observations discard process-local coordinates that do not change the observed

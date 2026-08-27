@@ -92,7 +92,7 @@ int main(int argc, char **argv) {
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
     childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
-    let depfile = work / ("stdio-" & tag & ".rdep")
+    let depfile = work / ("stdio-" & tag & ".iomon")
     let res = run(snoopBin,
       @["run", "--depfile", depfile, "--", app, target, mode], childEnv)
     checkpoint("mode " & mode & ": " & res.output)

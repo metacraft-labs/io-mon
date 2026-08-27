@@ -371,7 +371,7 @@ when defined(linux):
     ## launcher event-loss marker into the edge's consumer-owned `nim-shm-gset` (the
     ## same set the shim's producers publish into), so `runFsSnoop`'s finalize
     ## `snapshot` folds it into the depfile as an `mrEventLoss` → `mcIncomplete`,
-    ## with NO `.rmdf-frag` file. Attaches a short-lived producer to the host's
+    ## with NO `.iomon-frag` file. Attaches a short-lived producer to the host's
     ## `path0` (the host is still alive here — `finish()` runs later, on proc exit),
     ## emits ONE idempotent element, and detaches. Returns true when the marker is
     ## durable in consumer-owned memory (LF-3). The element is run-stamped in
@@ -398,7 +398,7 @@ when defined(linux):
     ## Record a launcher-side event-loss for THIS run. On Linux the loss is
     ## published into the consumer-owned `nim-shm-gset` at `depSetPath0` (M7 Linux
     ## slice — file-free), so `writer.hostUsesFileFallback` is `false` and no
-    ## `.rmdf-frag` is written. The `.rmdf-frag` writer is used ONLY as the fallback
+    ## `.iomon-frag` is written. The `.iomon-frag` writer is used ONLY as the fallback
     ## when the set is unavailable (the `REPRO_MONITOR_DEP_SHM_DISABLE` pure-file
     ## baseline) — matching the shared file producer that macOS/Windows still use.
     let rec = MonitorRecord(
@@ -801,7 +801,7 @@ proc splitFlagValue(arg, flag: string): string =
 
 proc parseInspect(args: seq[string]): ParsedFsSnoopCommand =
   if args.len < 2:
-    raise newException(ValueError, "inspect requires an RMDF path")
+    raise newException(ValueError, "inspect requires an iomon path")
   result.inspectMode = true
   result.inspectPath = args[1]
   result.inspectFormat = "text"
@@ -1128,7 +1128,7 @@ type
     ## decoded records, and the honest completeness signal without re-reading the
     ## file or reasoning about the shm/fragment lifecycle itself.
     exitCode*: int              ## the monitored command's exit status
-    depFilePath*: string        ## where the canonical RMDF depfile was written
+    depFilePath*: string        ## where the canonical iomon depfile was written
     depFile*: MonitorDepFile    ## the merged depfile: `.records`, `.completeness`, …
 
 proc completeness*(r: MonitorResult): MonitorCompleteness =
@@ -1218,7 +1218,7 @@ type
     ## a `break` out of its poll loop — would release (or, on process exit,
     ## simply abandon) the consumer while the monitored tree is still running
     ## and still publishing. §4.1's incident is that shape: a descendant
-    ## appending to an unlinked `.rmdf-frag` until it filled the root tmpfs.
+    ## appending to an unlinked `.iomon-frag` until it filled the root tmpfs.
     ##
     ## A documented "you must always call `finishMonitor`" would not hold that
     ## line, so the type holds it instead. Three properties, none of them a rule
@@ -1592,7 +1592,7 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
     # legacy ring). Producers IDEMPOTENTLY INSERT each observed record into this
     # consumer-owned set as the PRIMARY channel; anything they cannot publish
     # (oversize encoding for the stack buffer, or a saturated/gone set) falls back
-    # to a `.rmdf-frag` file (the correctness FALLBACK retained for part 1). Unlike
+    # to a `.iomon-frag` file (the correctness FALLBACK retained for part 1). Unlike
     # the ring, the set needs NO drain loop — it dedups at source and grows by
     # sharding — so we simply `snapshot` it ONCE at finalize and decode each
     # element back to a `MonitorRecord`. The set lives in consumer-owned memory
@@ -1653,7 +1653,7 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
     # CreateProcess(CREATE_SUSPENDED) + CreateRemoteThread(LoadLibraryW)
     # instead of the DYLD_INSERT_LIBRARIES env var. Fragment-dir + output
     # path env vars are still set so the in-DLL hook bodies know where to
-    # append RMDF fragments.
+    # append iomon fragments.
     h.shimLib = findShimLibrary()
     if h.shimLib.len == 0:
       raise newException(IOError,
@@ -1864,7 +1864,7 @@ proc collectMonitorEvidence(h: var MonitorHandle): MonitorDepFile =
     #
     # The guard above already ran, so a launcher-side event-loss (a descendant
     # still alive past the grace window) is ALREADY in the consumer-owned set and
-    # this snapshot picks it up — file-free end-to-end on Linux, no `.rmdf-frag`.
+    # this snapshot picks it up — file-free end-to-end on Linux, no `.iomon-frag`.
     #
     # DETERMINISM: `snapshot` yields elements in hash-slot order (non-deterministic
     # across runs), and two DISTINCT elements can tie in `canonicalOrder` because
@@ -2045,7 +2045,7 @@ proc runFsSnoopCli*(programName: string; args: seq[string]): int =
     var tempRoot = ""
     if parsed.request.depFilePath.len == 0:
       tempRoot = createLocalTempDir("repro-fs-snoop")
-      parsed.request.depFilePath = tempRoot / "evidence.rdep"
+      parsed.request.depFilePath = tempRoot / "evidence.iomon"
     try:
       # The CLI is a thin wrapper over the public batch host API — no duplicated
       # lifecycle. `runMonitored` owns the shm/consumer setup; we only surface

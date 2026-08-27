@@ -1,7 +1,7 @@
 # io-mon test layout
 
 io-mon's **core is cross-platform**. The depfile model, the writer / merge /
-completeness algorithm, the RMDF codec, the capabilities, and the render are
+completeness algorithm, the iomon codec, the capabilities, and the render are
 shared Nim (`src/io_mon/{writer,codec,types,render,capabilities,reader,paths}.nim`);
 only the shim and hooks are per-OS (`src/io_mon/{shim,hooks,backends}/`).
 

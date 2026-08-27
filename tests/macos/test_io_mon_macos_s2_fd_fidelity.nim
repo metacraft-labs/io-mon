@@ -115,7 +115,7 @@ when defined(macosx):
       $code & " out=" & outText)
     if requireExit0:
       doAssert code == 0, "probe should exit 0 (" & probe & "): " & outText
-    let depfile = work / "cap.rdep"
+    let depfile = work / "cap.iomon"
     let dep = mergeFragments(fragmentDir, depfile)
     result.records = readMonitorDepFile(depfile).records
     result.completeness = dep.completeness

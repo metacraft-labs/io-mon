@@ -130,7 +130,7 @@ suite "io-mon macOS R5 Phase-3 mmap of out-of-tree fd (Break B)":
       ccExe(r5ipc / "F3_client.c", client)
       let launcher = work / "F3_launcher"
       ccExe(r5ipc / "F3_launcher.c", launcher)
-      let depfile = work / "breakB.rdep"
+      let depfile = work / "breakB.iomon"
       let dep = runIomon(cli, shim, depfile,
         @[launcher, marker, cli, depfile, client])
       # The marker is now recorded as a content read on its canonical path,
@@ -167,7 +167,7 @@ suite "io-mon macOS R5 Phase-3 mmap of out-of-tree fd (Break B)":
       discard p.outputStream.readAll()
       doAssert p.waitForExit() == 0
       p.close()
-      let depfile = work / "intree.rdep"
+      let depfile = work / "intree.iomon"
       discard mergeFragments(runWork, depfile)
       let dep = readMonitorDepFile(depfile)
       # The dep IS captured (via the in-tree open), but NOT via a mmap-inherited-fd
@@ -213,7 +213,7 @@ int main(int argc, char **argv) {
 """)
       let bin = work / "mprotect_promote"
       ccExe(src, bin)
-      let dep = runProbe(shim, bin, @[target], work / "mprotect.rdep")
+      let dep = runProbe(shim, bin, @[target], work / "mprotect.iomon")
       check readFile(target).startsWith("Zaaaaa")
       check dep.completeness == mcComplete
       check countMprotectWrites(dep, "mprotect_promote.bin") == 1

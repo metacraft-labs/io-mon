@@ -295,7 +295,7 @@ suite "io-mon detached-descendant scan start-time prune":
     let quietReport = work / "quiet.report"
     var quietReq: FsSnoopRequest
     quietReq.command = @[probe, marker, work / "quiet.proof", quietReport, "-"]
-    quietReq.depFilePath = work / "quiet.rdep"
+    quietReq.depFilePath = work / "quiet.iomon"
     quietReq.streamMode = fsoNone
     let quietRes = runMonitored(quietReq)
     checkpoint("control: exit=" & $quietRes.exitCode & " completeness=" &
@@ -318,7 +318,7 @@ suite "io-mon detached-descendant scan start-time prune":
       removeFile(release)
       var req: FsSnoopRequest
       req.command = @[probe, marker, work / (tag & ".proof"), report, release]
-      req.depFilePath = work / (tag & ".rdep")
+      req.depFilePath = work / (tag & ".iomon")
       req.streamMode = fsoNone
 
       var handle = startMonitor(req)

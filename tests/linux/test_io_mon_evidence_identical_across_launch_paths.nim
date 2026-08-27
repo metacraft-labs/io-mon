@@ -700,7 +700,7 @@ proc runOneAction(path: LaunchPath; command: proc (runDir: string): seq[string];
 
   var req: FsSnoopRequest
   req.command = command(runDir)
-  req.depFilePath = runDir / "evidence.rdep"
+  req.depFilePath = runDir / "evidence.iomon"
   req.streamMode = fsoNone
 
   case path

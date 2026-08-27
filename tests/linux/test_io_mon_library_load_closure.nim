@@ -140,7 +140,7 @@ suite "io-mon Linux runtime library closure":
     # loads nothing.
     require truth.len >= 3
 
-    let cap = captureRun(compileArgs, work / "gcc.rdep", workDir = work)
+    let cap = captureRun(compileArgs, work / "gcc.iomon", workDir = work)
     require cap.code == 0
     let observed = libraryLoads(cap.dep)
     checkpoint(describe("io-mon library-load records", observed))
@@ -168,7 +168,7 @@ suite "io-mon Linux runtime library closure":
     # A blunt, hard-to-game restatement. Before the fix this set was EMPTY while
     # completeness read mcComplete; any assertion that can pass on an empty set
     # is not pinning the defect.
-    let dep = readMonitorDepFile(work / "gcc.rdep")
+    let dep = readMonitorDepFile(work / "gcc.iomon")
     let observed = libraryLoads(dep)
     check observed.len > 0
     check observed.anyIt(it.endsWith(".so") or ".so." in it)
@@ -192,7 +192,7 @@ suite "io-mon Linux runtime library closure":
     checkpoint(built.output)
     require built.code == 0
 
-    let cap = captureRun(@[app], work / "early.rdep")
+    let cap = captureRun(@[app], work / "early.iomon")
     checkpoint(cap.output)
     require cap.code == 0
     let observed = libraryLoads(cap.dep)
@@ -236,7 +236,7 @@ int main(void) {
     checkpoint(built.output)
     require built.code == 0
 
-    let cap = captureRun(@[app], work / "killed.rdep")
+    let cap = captureRun(@[app], work / "killed.iomon")
     checkpoint(cap.output)
     let observed = libraryLoads(cap.dep)
     checkpoint(describe("observed", observed))
@@ -275,7 +275,7 @@ int main(int argc, char **argv) {
     checkpoint(built.output)
     require built.code == 0
 
-    let cap = captureRun(@[app, a, b], work / "thread.rdep")
+    let cap = captureRun(@[app, a, b], work / "thread.iomon")
     checkpoint(cap.output)
     require cap.code == 0
     let observed = libraryLoads(cap.dep)
@@ -304,7 +304,7 @@ int main(int argc, char **argv) {
     checkpoint(built.output)
     require built.code == 0
 
-    let cap = captureRun(@[app, plug], work / "transient.rdep")
+    let cap = captureRun(@[app, plug], work / "transient.iomon")
     checkpoint(cap.output)
     require cap.code == 0
     check canonical(plug) in libraryLoads(cap.dep)
@@ -332,7 +332,7 @@ int main(int argc, char **argv) {
     checkpoint("libc: " & libcPath)
     require libcPath.len > 0
 
-    let cap = captureRun(@[app, libcPath], work / "reopen.rdep")
+    let cap = captureRun(@[app, libcPath], work / "reopen.iomon")
     checkpoint(cap.output)
     require cap.code == 0
     check canonical(libcPath) in libraryLoads(cap.dep)
@@ -359,7 +359,7 @@ int main(int argc, char **argv) {
     checkpoint(built.output)
     require built.code == 0
 
-    let cap = captureRun(@[app, plug], work / "reload.rdep")
+    let cap = captureRun(@[app, plug], work / "reload.iomon")
     checkpoint(cap.output)
     require cap.code == 0
     check canonical(plug) in libraryLoads(cap.dep)
@@ -411,7 +411,7 @@ int main(int argc, char **argv) {
     checkpoint("libc: " & libcPath)
     require libcPath.len > 0
 
-    let cap = captureRun(@[app, plug, libcPath], work / "hidden.rdep")
+    let cap = captureRun(@[app, plug, libcPath], work / "hidden.iomon")
     checkpoint(cap.output)
     require cap.code == 0
 
@@ -458,7 +458,7 @@ void _start(void) {
     else:
       let bare = run(app, @[])
       require bare.code == 0
-      let cap = captureRun(@[app], work / "static.rdep")
+      let cap = captureRun(@[app], work / "static.iomon")
       checkpoint(cap.output)
       check cap.code == 0
       check cap.dep.completeness == mcIncomplete

@@ -115,4 +115,4 @@ wants a wider bar still calls `evaluateMonitorEvidence` with its own required-se
 
 - It maintains zero dependency on `reprobuild`.
 - It depends solely on `nim-stackable-hooks`.
-- Standardized binary format (`RMDF` version 1) and ABI names (`repro_monitor_shim_*`) are kept byte-identical so it remains a drop-in replacement across the suite.
+- The binary depfile format (`IOMN` version 1) is io-mon's own; the shim ABI names (`repro_monitor_shim_*`) are kept byte-identical so the observation stack remains a drop-in replacement across the suite.

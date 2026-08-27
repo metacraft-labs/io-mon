@@ -240,7 +240,7 @@ when defined(macosx):
       $code & " out=" & outText)
     if requireExit0:
       doAssert code == 0, "probe should exit 0 (" & probe & "): " & outText
-    mergeAndRead(fragmentDir, work / "cap.rdep")
+    mergeAndRead(fragmentDir, work / "cap.iomon")
 
   proc hasPathRead(records: seq[MonitorRecord]; path: string): bool =
     for r in records:
@@ -405,7 +405,7 @@ suite "io-mon macOS ROUND-3 S1 content-channel hooks":
       discard feederProc.waitForExit()
       feederProc.close()
       doAssert rcode == 0, "fifo reader should exit 0"
-      let res = mergeAndRead(fragmentDir, readerWork / "cap.rdep")
+      let res = mergeAndRead(fragmentDir, readerWork / "cap.iomon")
       check res.completeness == mcIncomplete
 
     test "S1d in-tree FIFO pipeline stays mcComplete (cardinal sin)":

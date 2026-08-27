@@ -94,7 +94,7 @@ when defined(macosx):
     checkpoint(probe.extractFilename() & " exit=" & $code & " out=" & stdoutText)
     doAssert code == 0, "probe should exit 0 (" & probe & ", out=" &
       stdoutText & ")"
-    let depfile = runWork / "cap.rdep"
+    let depfile = runWork / "cap.iomon"
     discard mergeFragments(fragmentDir, depfile)
     doAssert fileExists(depfile)
     readMonitorDepFile(depfile)

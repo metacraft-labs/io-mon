@@ -252,7 +252,7 @@ int main(void) {
     checkpoint("[spawn sandbox=" & $useSandbox & "] exit=" & $result.probeExit &
       " out=" & stdoutText)
 
-    let depfile = runWork / "cap.rdep"
+    let depfile = runWork / "cap.iomon"
     discard mergeFragments(fragmentDir, depfile)
     if not fileExists(depfile):
       return result
@@ -336,7 +336,7 @@ int main(void) {
       $result.probeExit & " injectedProcs=" & $result.injectedProcs &
       " out=" & combined)
 
-    let depfile = runWork / "cap.rdep"
+    let depfile = runWork / "cap.iomon"
     discard mergeFragments(fragmentDir, depfile)
     if fileExists(depfile):
       let dep = readMonitorDepFile(depfile)

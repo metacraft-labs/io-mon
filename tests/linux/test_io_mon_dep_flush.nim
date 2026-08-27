@@ -1,6 +1,6 @@
 ## test_io_mon_dep_flush — milestone io-mon-DEP-FLUSH integration tests.
 ##
-## Closes the "exit/thread-exit/fork-before-flush loses buffered RMDF records"
+## Closes the "exit/thread-exit/fork-before-flush loses buffered iomon records"
 ## gap in the file-based dependency channel (see
 ## reprobuild-specs/io-mon-Dependency-Flush-Robustness.md). Each test drives the
 ## LIVE Linux LD_PRELOAD shim (rebuilt from source) against a short-lived C
@@ -114,7 +114,7 @@ int main(int argc, char **argv) {
 }
 """, @["-ldl"])
 
-    let depfile = work / "shim-flush.rdep"
+    let depfile = work / "shim-flush.iomon"
     let cap = run(snoopBin, @["run", "--depfile", depfile, "--", reader] & markers,
       childEnvWith(shimLib))
     checkpoint(cap.output)
@@ -159,7 +159,7 @@ int main(int argc, char **argv) {
 }
 """)
 
-    let depfile = work / "short-lived.rdep"
+    let depfile = work / "short-lived.iomon"
     let cap = run(snoopBin, @["run", "--depfile", depfile, "--", reader] & markers,
       childEnvWith(shimLib))
     checkpoint(cap.output)
@@ -217,7 +217,7 @@ int main(int argc, char **argv) {
 }
 """, @["-pthread"])
 
-    let depfile = work / "worker-thread.rdep"
+    let depfile = work / "worker-thread.iomon"
     let cap = run(snoopBin, @["run", "--depfile", depfile, "--", reader] & markers,
       childEnvWith(shimLib))
     checkpoint(cap.output)
@@ -273,7 +273,7 @@ int main(int argc, char **argv) {
 }
 """)
 
-    let depfile = work / "fork-no-dup.rdep"
+    let depfile = work / "fork-no-dup.iomon"
     let cap = run(snoopBin, @["run", "--depfile", depfile, "--",
       forker, parentPre, childMarker, parentPost], childEnvWith(shimLib))
     checkpoint(cap.output)
@@ -338,7 +338,7 @@ int main(int argc, char **argv) {
 """)
 
     proc canonicalBytes(sleepMs: string; tag: string): seq[byte] =
-      let depfile = work / ("determinism-" & tag & ".rdep")
+      let depfile = work / ("determinism-" & tag & ".iomon")
       let cap = run(snoopBin, @["run", "--depfile", depfile, "--",
         reader, sleepMs] & markers, childEnvWith(shimLib))
       checkpoint(tag & ": " & cap.output)

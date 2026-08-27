@@ -101,7 +101,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "marker.txt"
     writeFile(marker, "stdio marker\n")
-    let depfile = work / "stdio.rdep"
+    let depfile = work / "stdio.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -145,7 +145,7 @@ int main(int argc, char **argv) {
     createDir(buildDir)
     createDir(buildDir / "src")
     let expected = buildDir / "src" / "result.o"
-    let depfile = work / "chdir-relative.rdep"
+    let depfile = work / "chdir-relative.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -195,7 +195,7 @@ int main(int argc, char **argv) {
 }
 """)
     let output = work / "otmpfile-mode-output"
-    let depfile = work / "otmpfile-mode.rdep"
+    let depfile = work / "otmpfile-mode.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -240,7 +240,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "byte-reader-marker.txt"
     writeFile(marker, repeat("x", 4096))
-    let depfile = work / "byte-reader.rdep"
+    let depfile = work / "byte-reader.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -281,7 +281,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "direct-exit-marker.txt"
     writeFile(marker, "direct exit marker\n")
-    let depfile = work / "direct-exit.rdep"
+    let depfile = work / "direct-exit.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -329,7 +329,7 @@ int main(int argc, char **argv) {
     check trueBin.len > 0
     let marker = work / "read-then-exec-marker.txt"
     writeFile(marker, "read then exec marker\n")
-    let depfile = work / "read-then-exec.rdep"
+    let depfile = work / "read-then-exec.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -480,7 +480,7 @@ int main(int argc, char **argv) {
     writeFile(marker, "daemon late marker\n")
 
     block quiescesInsideGrace:
-      let depfile = work / "daemon-quiesce.rdep"
+      let depfile = work / "daemon-quiesce.iomon"
       let proof = work / "daemon-quiesce.proof"
       try: removeFile(proof)
       except OSError: discard
@@ -503,7 +503,7 @@ int main(int argc, char **argv) {
         "linux injected descendants still live" in it.detail)
 
     block livePastGrace:
-      let depfile = work / "daemon-live-past-grace.rdep"
+      let depfile = work / "daemon-live-past-grace.iomon"
       let proof = work / "daemon-live-past-grace.proof"
       # Gated mode: the daemon blocks on this sentinel until we drop it, so it
       # is deterministically still alive across the whole grace window. We
@@ -620,7 +620,7 @@ int main(int argc, char **argv) {
     for mode in ["pread", "readv", "preadv", "sendfile",
                  "copy_file_range", "splice"]:
       let outPath = work / ("content-channel-" & mode & ".out")
-      let depfile = work / ("content-channel-" & mode & ".rdep")
+      let depfile = work / ("content-channel-" & mode & ".iomon")
       let cap = run(snoopBin, @["run", "--depfile", depfile, "--", mover,
         mode, source, outPath], childEnv)
       checkpoint(mode & " output: " & cap.output)
@@ -671,7 +671,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "inherited-fd3-marker.txt"
     writeFile(marker, "inherited fd marker\n")
-    let depfile = work / "inherited-fd3-file.rdep"
+    let depfile = work / "inherited-fd3-file.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -717,7 +717,7 @@ int main(void) {
   return n == (ssize_t)sizeof(buf) ? 0 : 4;
 }
 """)
-    let depfile = work / "dup2-zero.rdep"
+    let depfile = work / "dup2-zero.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -775,7 +775,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "inherited-fd3-deleted-marker.txt"
     writeFile(marker, "deleted inherited fd marker\n")
-    let depfile = work / "inherited-fd3-deleted-file.rdep"
+    let depfile = work / "inherited-fd3-deleted-file.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -888,7 +888,7 @@ int main(int argc, char **argv) {
     writeFile(source, "source identity marker\n")
     writeFile(exchangeLeft, "exchange left marker\n")
     writeFile(exchangeRight, "exchange right marker\n")
-    let depfile = work / "path-mutation.rdep"
+    let depfile = work / "path-mutation.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1001,7 +1001,7 @@ int main(int argc, char **argv) {
       var childEnv = newStringTable(modeCaseSensitive)
       for k, v in envPairs(): childEnv[k] = v
       childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
-      let depfile = work / "ipc.rdep"
+      let depfile = work / "ipc.iomon"
       let cap = run(snoopBin, @["run", "--depfile", depfile, "--", client, socketPath],
         childEnv)
       checkpoint(cap.output)
@@ -1045,7 +1045,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "raw-marker.txt"
     writeFile(marker, "raw marker\n")
-    let depfile = work / "raw-syscall.rdep"
+    let depfile = work / "raw-syscall.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1100,7 +1100,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "raw-openat2-marker.txt"
     writeFile(marker, "raw openat2 marker\n")
-    let depfile = work / "raw-openat2.rdep"
+    let depfile = work / "raw-openat2.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1191,7 +1191,7 @@ int main(int argc, char **argv) {
 
     for mode in ["sendfile", "copy_file_range", "splice"]:
       let outPath = work / ("raw-zero-copy-" & mode & ".out")
-      let depfile = work / ("raw-zero-copy-" & mode & ".rdep")
+      let depfile = work / ("raw-zero-copy-" & mode & ".iomon")
       let cap = run(snoopBin, @["run", "--depfile", depfile, "--", mover,
         mode, marker, outPath], childEnv)
       checkpoint(mode & ": " & cap.output)
@@ -1246,7 +1246,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "inline-raw-marker.txt"
     writeFile(marker, "inline raw marker\n")
-    let depfile = work / "inline-raw-syscall.rdep"
+    let depfile = work / "inline-raw-syscall.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1310,7 +1310,7 @@ int main(int argc, char **argv) {
 """, @["-L" & work, "-lrawdso", "-Wl,-rpath," & work])
     let marker = work / "inline-dso-marker.txt"
     writeFile(marker, "inline dso marker\n")
-    let depfile = work / "inline-dso-syscall.rdep"
+    let depfile = work / "inline-dso-syscall.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1390,7 +1390,7 @@ int main(int argc, char **argv) {
     childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
 
     for mode in ["dlopen", "dlmopen-base"]:
-      let depfile = work / ("late-load-" & mode & ".rdep")
+      let depfile = work / ("late-load-" & mode & ".iomon")
       let cap = run(snoopBin, @["run", "--depfile", depfile, "--", loader,
         mode, plugin, marker], childEnv)
       checkpoint(mode & ": " & cap.output)
@@ -1404,7 +1404,7 @@ int main(int argc, char **argv) {
       check not dep.records.anyIt(it.kind == mrEventLoss and
         "late inline raw-syscall scanner unavailable" in it.detail)
 
-    let newlmDepfile = work / "late-load-dlmopen-newlm.rdep"
+    let newlmDepfile = work / "late-load-dlmopen-newlm.iomon"
     let newlm = run(snoopBin, @["run", "--depfile", newlmDepfile, "--",
       loader, "dlmopen-newlm", plugin, marker], childEnv)
     checkpoint("dlmopen-newlm: " & newlm.output)
@@ -1480,7 +1480,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "jit-mprotect-marker.txt"
     writeFile(marker, "jit mprotect marker\n")
-    let depfile = work / "jit-mprotect-syscall.rdep"
+    let depfile = work / "jit-mprotect-syscall.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1523,7 +1523,7 @@ int main(void) {
   return 0;
 }
 """)
-    let depfile = work / "rwx-mmap.rdep"
+    let depfile = work / "rwx-mmap.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1611,7 +1611,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "jit-munmap-reuse-marker.txt"
     writeFile(marker, "jit munmap reuse marker\n")
-    let depfile = work / "jit-munmap-reuse.rdep"
+    let depfile = work / "jit-munmap-reuse.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1697,7 +1697,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "jit-mprotect-mixed-marker.txt"
     writeFile(marker, "jit mixed mprotect marker\n")
-    let depfile = work / "jit-mprotect-mixed.rdep"
+    let depfile = work / "jit-mprotect-mixed.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1783,7 +1783,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "jit-mremap-marker.txt"
     writeFile(marker, "jit mremap marker\n")
-    let depfile = work / "jit-mremap.rdep"
+    let depfile = work / "jit-mremap.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1839,7 +1839,7 @@ int main(void) {
   return 0;
 }
 """)
-    let depfile = work / "jit-mremap-partial.rdep"
+    let depfile = work / "jit-mremap-partial.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1894,7 +1894,7 @@ int main(int argc, char **argv) {
     let linkPath = work / "raw-probe-link.txt"
     writeFile(marker, "raw probe marker\n")
     createSymlink(marker, linkPath)
-    let depfile = work / "raw-probe.rdep"
+    let depfile = work / "raw-probe.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1956,7 +1956,7 @@ int main(void) {
   return rnd[0] == 255 ? 9 : 0;
 }
 """)
-    let depfile = work / "non-file-determinism.rdep"
+    let depfile = work / "non-file-determinism.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -2026,7 +2026,7 @@ int main(void) {
   return (seed[0] == 1 && buf[0] == 2 && draw == 3u) ? 4 : 0;
 }
 """)
-    let depfile = work / "bsd-entropy-set.rdep"
+    let depfile = work / "bsd-entropy-set.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -2098,7 +2098,7 @@ int main(void) {
   return 0;
 }
 """, @["-pthread"])
-    let depfile = work / "entropy-dedup.rdep"
+    let depfile = work / "entropy-dedup.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -2220,7 +2220,7 @@ int main(void) {
   return called > 0 ? 0 : 9;
 }
 """, @["-ldl"])
-    let depfile = work / "direct-vdso-dlsym.rdep"
+    let depfile = work / "direct-vdso-dlsym.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -2274,7 +2274,7 @@ int main(void) {
   return pid > 0 ? 0 : 2;
 }
 """)
-    let depfile = work / "raw-unknown.rdep"
+    let depfile = work / "raw-unknown.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -2320,7 +2320,7 @@ int main(void) {
   return tid > 0 ? 0 : 2;
 }
 """)
-    let depfile = work / "raw-gettid.rdep"
+    let depfile = work / "raw-gettid.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -2383,7 +2383,7 @@ int main(void) {
   return n == (long)sizeof(buf) ? 0 : 2;
 }
 """)
-    let depfile = work / "raw-getrandom.rdep"
+    let depfile = work / "raw-getrandom.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -2433,7 +2433,7 @@ int main(void) {
   return woken >= 0 ? 0 : 2;
 }
 """)
-    let depfile = work / "raw-futex.rdep"
+    let depfile = work / "raw-futex.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -2482,7 +2482,7 @@ int main(void) {
   return 0;
 }
 """)
-    let depfile = work / "raw-landlock.rdep"
+    let depfile = work / "raw-landlock.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -2570,7 +2570,7 @@ int main(void) {
   return 0;
 }
 """)
-    let depfile = work / "raw-io-uring-setup.rdep"
+    let depfile = work / "raw-io-uring-setup.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -2648,7 +2648,7 @@ int main(int argc, char **argv) {
   return 3;
 }
 """)
-    let depfile = work / "execvp-path-search.rdep"
+    let depfile = work / "execvp-path-search.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -2686,7 +2686,7 @@ int main(void) {
   return 77;
 }
 """)
-    let depfile = work / "sigtrap-unrelated.rdep"
+    let depfile = work / "sigtrap-unrelated.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v

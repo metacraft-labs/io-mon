@@ -162,7 +162,7 @@ int main(int argc, char **argv) {
     result.names = stdoutText.splitLines().filterIt(it.len > 0)
     result.names.sort()
 
-    let depfile = runWork / "cap.rdep"
+    let depfile = runWork / "cap.iomon"
     discard mergeFragments(fragmentDir, depfile)
     if fileExists(depfile):
       let dep = readMonitorDepFile(depfile)

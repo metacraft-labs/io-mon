@@ -146,7 +146,7 @@ suite "io-mon Linux propagation to descendants (IoMon-Pipeline-Capture IM-2)":
     let reader = buildC(work, "grandchild_reader", readerSrc)
     let marker = work / "grandchild-marker.txt"
     writeFile(marker, "grandchild marker payload\n")
-    let depfile = work / "grandchild.rdep"
+    let depfile = work / "grandchild.iomon"
 
     let inner = reader & " " & marker & "; :"
     let outer = "/bin/sh -c '" & inner & "'; :"
@@ -197,7 +197,7 @@ int main(int argc, char **argv) {
   _exit(9);
 }
 """)
-    let depA = work / "execchain-inherit.rdep"
+    let depA = work / "execchain-inherit.iomon"
     let capA = run(snoopBin, @["run", "--depfile", depA, "--",
       execer, reader, markerA], childEnvWith(shimLib))
     checkpoint(capA.output)
@@ -237,7 +237,7 @@ int main(int argc, char **argv) {
   _exit(9);
 }
 """)
-    let depB = work / "execchain-stripped.rdep"
+    let depB = work / "execchain-stripped.iomon"
     let capB = run(snoopBin, @["run", "--depfile", depB, "--",
       stripper, reader, markerB], childEnvWith(shimLib))
     checkpoint(capB.output)

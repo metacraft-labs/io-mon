@@ -58,7 +58,7 @@ proc runUninitialisedShimRoot(inertShim, cmdExe: string): MonitorResult =
   try:
     result = runMonitored(FsSnoopRequest(
       command: @[cmdExe, "/c", "exit 0"],
-      depFilePath: work / "evidence.rdep"))
+      depFilePath: work / "evidence.iomon"))
   finally:
     if hadOverride: putEnv(ShimLibOverrideEnv, oldOverride)
     else: delEnv(ShimLibOverrideEnv)

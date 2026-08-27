@@ -12,10 +12,10 @@ A monitored `gcc -c` of a trivial translation unit:
 
 ```
 $ strace -f -e trace=openat gcc -c unit.c    # 10 shared objects opened
-$ io-mon run --depfile gcc.rdep -- gcc -c unit.c
-$ io-mon inspect gcc.rdep | head -1
-RMDF version=1 records=365 completeness=mcComplete
-$ io-mon inspect gcc.rdep | grep -c '\.so'
+$ io-mon run --depfile gcc.iomon -- gcc -c unit.c
+$ io-mon inspect gcc.iomon | head -1
+iomon version=1 records=365 completeness=mcComplete
+$ io-mon inspect gcc.iomon | grep -c '\.so'
 0
 ```
 

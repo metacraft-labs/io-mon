@@ -3,7 +3,7 @@
 ## io-mon is a relocation of reprobuild's `repro_monitor_depfile` fs-snoop
 ## stack, lifted into a standalone package on top of `nim-stackable-hooks`.
 ## It captures the read/written file sets of a monitored process tree and
-## persists them in the binary RMDF depfile format (reader/writer/render),
+## persists them in the binary iomon depfile format (reader/writer/render),
 ## and exposes the `fs_snoop` driver that runs a command under the interpose
 ## monitor.
 ##

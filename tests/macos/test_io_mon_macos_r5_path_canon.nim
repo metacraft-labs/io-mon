@@ -20,7 +20,7 @@
 ## So the same logical file got two different key strings depending on existence → a
 ## realpath-keying consumer could not match → a false cache hit when the absent file
 ## appears. See research/adversarial-2026-07-round5/pathfidelity/ (prober.c,
-## dualspell.c) and the preserved t_*.rdep repro depfiles.
+## dualspell.c) and the preserved t_*.iomon repro depfiles.
 ##
 ## # The fix
 ##
@@ -115,7 +115,7 @@ when defined(macosx):
     checkpoint(probe.extractFilename() & " exit=" & $code & " out=" & stdoutText)
     doAssert code == 0,
       "monitored probe failed (" & probe & "): " & stdoutText
-    let depfile = runWork / "cap.rdep"
+    let depfile = runWork / "cap.iomon"
     discard mergeFragments(fragmentDir, depfile,
       expectedRootPid = result.rootPid)
     doAssert fileExists(depfile)

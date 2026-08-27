@@ -70,7 +70,7 @@ when defined(macosx):
     discard p.outputStream.readAll()
     discard p.waitForExit()
     p.close()
-    let depfile = runWork / "cap.rdep"
+    let depfile = runWork / "cap.iomon"
     discard mergeFragments(fragmentDir, depfile)
     doAssert fileExists(depfile)
     result = readMonitorDepFile(depfile)

@@ -263,8 +263,8 @@ suite "io-mon per-call injection env and cwd (DH-1)":
     let readyBeta = work / "beta.ready"
     let reader = buildC(work, "dh1_rendezvous_reader", rendezvousReaderSrc)
 
-    let depAlpha = work / "alpha.rdep"
-    let depBeta = work / "beta.rdep"
+    let depAlpha = work / "alpha.iomon"
+    let depBeta = work / "beta.iomon"
 
     jobs[0] = MonitorJob()
     jobs[0].req.command = @[reader, readyAlpha, readyBeta, inputAlpha]
@@ -358,7 +358,7 @@ suite "io-mon per-call injection env and cwd (DH-1)":
 
     var req: FsSnoopRequest
     req.command = @[reader, input]
-    req.depFilePath = work / "parent-env.rdep"
+    req.depFilePath = work / "parent-env.iomon"
     req.streamMode = fsoNone
     let res = runMonitored(req)
 
@@ -411,7 +411,7 @@ suite "io-mon per-call injection env and cwd (DH-1)":
     var req: FsSnoopRequest
     req.command = @[reader, relativeName]   # RELATIVE — resolvable only in `cwd`
     req.cwd = actionDir
-    req.depFilePath = work / "cwd.rdep"
+    req.depFilePath = work / "cwd.iomon"
     req.streamMode = fsoNone
     let res = runMonitored(req)
 
@@ -456,13 +456,13 @@ suite "io-mon per-call injection env and cwd (DH-1)":
     # grace, so the outcome does not depend on scheduling.
     jobs[0] = MonitorJob()
     jobs[0].req.command = @[reader, readyFirst, readySecond, inputFirst, "0"]
-    jobs[0].req.depFilePath = work / "first.rdep"
+    jobs[0].req.depFilePath = work / "first.iomon"
     jobs[0].req.streamMode = fsoNone
 
     jobs[1] = MonitorJob()
     jobs[1].req.command =
       @[reader, readySecond, readyFirst, inputSecond, "3000000"]
-    jobs[1].req.depFilePath = work / "second.rdep"
+    jobs[1].req.depFilePath = work / "second.iomon"
     jobs[1].req.streamMode = fsoNone
 
     var threads: array[2, Thread[int]]

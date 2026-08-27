@@ -1,6 +1,6 @@
 # io-mon
 
-`io-mon` is a cross-platform filesystem and process monitoring library and command-line tool written in Nim. It tracks the exact files read, written, and probed by a monitored process tree, exporting them to a compact, canonical binary format called the Repro Monitor Depfile Format (`RMDF`).
+`io-mon` is a cross-platform filesystem and process monitoring library and command-line tool written in Nim. It tracks the exact files read, written, and probed by a monitored process tree, exporting them to a compact, canonical binary format called the iomon depfile format (`IOMN`).
 
 It is used by incremental build systems and test runners (like `reprobuild` and `CodeTracer`) to determine dependency sets with a strong completeness guarantee.
 
@@ -31,13 +31,13 @@ just build
 Capture the dependencies of a compilation run:
 
 ```bash
-build/bin/io-mon run --depfile compile.rdep -- gcc main.c -o main
+build/bin/io-mon run --depfile compile.iomon -- gcc main.c -o main
 ```
 
 Inspect the generated binary depfile in text format:
 
 ```bash
-build/bin/io-mon inspect compile.rdep
+build/bin/io-mon inspect compile.iomon
 ```
 
 For full CLI options, environment variables, and config configurations, see [docs/usage.md](docs/usage.md).
@@ -49,7 +49,7 @@ Import `io_mon` to programmatically parse, validate, and query dependency files 
 ```nim
 import io_mon
 
-let dep = readMonitorDepFile("compile.rdep")
+let dep = readMonitorDepFile("compile.iomon")
 if dep.completeness == mcComplete:
   for record in dep.records:
     if record.kind == mrFileRead:

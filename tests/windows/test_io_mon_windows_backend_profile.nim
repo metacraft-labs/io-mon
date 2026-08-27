@@ -76,7 +76,7 @@ suite "Windows library-load observation":
       try: removeDir(dir)
       except CatchableError: discard
 
-    let depFilePath = dir / "run.rdep"
+    let depFilePath = dir / "run.iomon"
     var request = FsSnoopRequest(
       command: @[getEnv("ComSpec", r"C:\Windows\System32\cmd.exe"), "/c", "ver"],
       depFilePath: depFilePath,
@@ -105,7 +105,7 @@ suite "Windows library-load observation":
 
     var request = FsSnoopRequest(
       command: @[getEnv("ComSpec", r"C:\Windows\System32\cmd.exe"), "/c", "ver"],
-      depFilePath: dir / "run.rdep",
+      depFilePath: dir / "run.iomon",
       captureChildStdio: true)
     let result = runMonitored(request)
 

@@ -159,7 +159,7 @@ proc renderMonitorStreamItemJsonl*(item: FsSnoopStreamItem): string =
 
 proc renderMonitorDepFileText*(dep: MonitorDepFile): string =
   var lines: seq[string] = @[
-    "RMDF version=" & $dep.version &
+    "iomon version=" & $dep.version &
       " records=" & $dep.summary.recordCount &
       " completeness=" & $dep.completeness
   ]
@@ -173,7 +173,7 @@ proc renderMonitorDepFileText*(dep: MonitorDepFile): string =
 
 proc renderMonitorDepFileJson*(dep: MonitorDepFile): string =
   var root = newJObject()
-  root["format"] = %"RMDF"
+  root["format"] = %"iomon"
   root["version"] = %int(dep.version)
   root["producerVersion"] = %dep.producerVersion
   root["backendFamily"] = %backendFamilyId(dep.backendFamily)

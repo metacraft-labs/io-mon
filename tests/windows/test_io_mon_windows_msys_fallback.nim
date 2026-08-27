@@ -25,7 +25,7 @@ proc runDirectFallbackProbe(): int =
 
   let monitored = runMonitored(FsSnoopRequest(
     command: @[shell, "-c", "/usr/bin/true; echo io-mon-msys-fallback-ok"],
-    depFilePath: work / "evidence.rdep",
+    depFilePath: work / "evidence.iomon",
     captureChildStdio: true,
     captureStdioPath: work / "stdio.log"))
   if monitored.exitCode != 0:
@@ -66,7 +66,7 @@ proc runNestedFallbackProbe(): int =
 
   let monitored = runMonitored(FsSnoopRequest(
     command: @[getAppFilename(), NativeSpawnerArg],
-    depFilePath: work / "evidence.rdep",
+    depFilePath: work / "evidence.iomon",
     captureChildStdio: true,
     captureStdioPath: stdioPath))
   if monitored.exitCode != 0:

@@ -34,7 +34,7 @@ if runLockHelper():
 
 proc onlyFragment(dir: string): string =
   for kind, path in walkDir(dir):
-    if kind == pcFile and path.endsWith(".rmdf-frag"):
+    if kind == pcFile and path.endsWith(".iomon-frag"):
       if result.len > 0:
         raise newException(ValueError, "expected exactly one fragment in " & dir)
       result = path
@@ -80,7 +80,7 @@ suite "Windows fragment finalization":
       discard waitForExit(locker)
       close(locker)
 
-    let merged = mergeFragments(dir, dir / "merged.rmdf")
+    let merged = mergeFragments(dir, dir / "merged.iomon")
     check merged.records.anyIt(it.path == inputPath)
     check summarizeRecords(merged.records).eventLossCount == 0'u64
 
@@ -98,6 +98,6 @@ suite "Windows fragment finalization":
       discard waitForExit(locker)
       close(locker)
 
-    let merged = mergeFragments(dir, dir / "merged.rmdf")
+    let merged = mergeFragments(dir, dir / "merged.iomon")
     check merged.completeness == mcIncomplete
     check summarizeRecords(merged.records).eventLossCount > 0'u64

@@ -530,7 +530,7 @@ proc metaSuffix(detail: string; mtime, size: uint64): string {.raises: [].} =
   ## when a directory gains/loses an entry or a stat-only file's content changes,
   ## so the consumer (folding mtime/size into its key) re-runs iff they changed.
   ## Same whitespace-separated `key=value` wire encoding as devInoSuffix (read back
-  ## via writer.detailToken), so no RMDF wire-format field is added.
+  ## via writer.detailToken), so no iomon wire-format field is added.
   result = detail
   if result.len > 0: result.add ' '
   result.add "mtime=" & $mtime & " size=" & $size
@@ -715,7 +715,7 @@ proc devInoSuffix(detail: string; dev, ino: uint64): string {.raises: [].} =
   ## Append a ` dev=<n> ino=<n>` token pair to `detail` (ROUND-2 R4 hardlink
   ## identity). The tokens are whitespace-separated `key=value` pairs read back via
   ## writer.detailToken, exactly like the round-2 R7/R8 start/peer tokens — so no
-  ## wire-format field is added (RMDF stays byte-stable). realpath collapses two
+  ## wire-format field is added (iomon stays byte-stable). realpath collapses two
   ## NAMES of one file to one canonical path, but it CANNOT collapse a HARDLINK
   ## (distinct directory entries, same inode); the (dev, ino) lets a consumer match
   ## that alternate-name case by inode identity.

@@ -15,7 +15,7 @@ type
     mrCapabilityGap = 11
     # T3a (Phase 2 / findings-doc break #1): a `connect(2)` (or connectionless
     # `sendmsg`/`sendto`) to an AF_UNIX / AF_INET(6) peer. APPENDED AT THE END to
-    # preserve RMDF wire-compat (the dgNoRuntimeDependencies lesson — never
+    # preserve iomon wire-compat (the dgNoRuntimeDependencies lesson — never
     # renumber an existing enum case). Carries the destination in `path` and the
     # PEER PID in `childOsPid` (AF_UNIX via LOCAL_PEERPID; 0 when unobtainable).
     mrIpcConnect = 12
@@ -26,7 +26,7 @@ type
     # hooked open, so without this they were recorded NOWHERE — a content-addressed
     # cache fingerprinting only the depfile would then serve a STALE result after
     # an in-place compiler-library upgrade. Captured via the `_dyld` add-image
-    # callback (NOT by hooking open). APPENDED AT THE END to preserve RMDF
+    # callback (NOT by hooking open). APPENDED AT THE END to preserve iomon
     # wire-compat (the dgNoRuntimeDependencies / mrIpcConnect lesson — never
     # renumber an existing case). The path is the dylib's REAL on-disk path; the
     # `observationKind` is deliberately `moFileRead` so the dylib is treated as a
@@ -38,7 +38,7 @@ type
     # build's output may depend on that are NOT file reads, so a depfile-only
     # fingerprint can false-cache-hit when they change. io-mon records evidence
     # only; callers decide whether a given observation invalidates their cache key.
-    # All four APPENDED AT THE END for RMDF wire-compat (never renumber).
+    # All four APPENDED AT THE END for iomon wire-compat (never renumber).
     #
     # 1. mrEnvRead / mrSysctlRead — OBSERVED DECLARED INPUTS (record, do NOT
     #    downgrade). The shim hooks getenv / sysctlbyname / sysctl / uname /
@@ -126,7 +126,7 @@ type
     # (`externalContentLossCount`) pairs the create/write side against the
     # attach/read side and injects an event-loss ONLY for an unpaired (out-of-tree)
     # consume — the SAME conservative-re-run machinery as the IPC-breakaway /
-    # un-injected-subtree downgrade. APPENDED AT THE END to preserve RMDF
+    # un-injected-subtree downgrade. APPENDED AT THE END to preserve iomon
     # wire-compat (the dgNoRuntimeDependencies / mrIpcConnect / mrLibraryLoad lesson
     # — never renumber an existing case). The channel identity (shm name / FIFO
     # path / "" for an anonymous socket/pipe) is in `path`; `detail` carries a
@@ -143,7 +143,7 @@ type
     # gap marked required=false, so completeness stayed mcComplete despite the
     # unhooked surface (research/adversarial-2026-06-round4/r4_dir/misc_probe.c).
     # The shim now records each successful mutation against the canonical path so
-    # the output-dir state is tracked. APPENDED AT THE END to preserve RMDF
+    # the output-dir state is tracked. APPENDED AT THE END to preserve iomon
     # wire-compat (the dgNoRuntimeDependencies / mrIpcConnect / mrExternalContent
     # lesson — never renumber an existing case). `detail` names the syscall
     # (`mkdir`/`mkdirat`/`rmdir`/`unlink`/`unlinkat`). This is an OUTPUT-side fact,
@@ -420,10 +420,10 @@ type
     cwd*: string
 
 const
-  RmdfVersion* = 1'u16
-  RmdfMagic* = "RMDF"
-  RmdfTrailerMagic* = "RMDT"
-  ReproMonitorDepfileProducer* = "repro_monitor_depfile_m11"
+  IomonVersion* = 1'u16
+  IomonMagic* = "IOMN"
+  IomonTrailerMagic* = "IOMT"
+  IoMonDepfileProducer* = "iomon_depfile_v1"
 
   NonDeterministicEntropyDetail* = "non-deterministic entropy source"
     ## The `detail` text EVERY backend must put on an `mrNonDeterministic`

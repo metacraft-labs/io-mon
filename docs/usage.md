@@ -25,7 +25,7 @@ io-mon run [options] -- <command> [args...]
 `run` injects the interpose shim around `<command>` (via
 `DYLD_INSERT_LIBRARIES` on macOS, `LD_PRELOAD` on Linux,
 `CreateRemoteThread`+`LoadLibraryW` on Windows), runs the command, merges the
-captured fragments, and writes the RMDF depfile. The CLI's own exit code is the
+captured fragments, and writes the iomon depfile. The CLI's own exit code is the
 monitored command's exit status on success, or non-zero on a capture error
 (the driver never raises — it converts errors to a stderr diagnostic + non-zero
 exit so an out-of-process caller can fail-safe).
@@ -38,7 +38,7 @@ Options (each accepts both `--flag value` and `--flag=value`):
 
 | Option | Meaning |
 | --- | --- |
-| `--depfile PATH` | Where to write the captured RMDF depfile. If omitted, a temp file is used and discarded after rendering. |
+| `--depfile PATH` | Where to write the captured iomon depfile. If omitted, a temp file is used and discarded after rendering. |
 | `--events MODE` | Stream the captured records in MODE. One of `none` (default), `text`, `jsonl`, `binary` / `binary-stream`. |
 | `--format MODE` | Alias for `--events` (same `FsSnoopOutputMode` values). |
 | `--event-stream PATH` | Write the streamed events to PATH instead of stderr. **Required** when MODE is `binary`/`binary-stream` (so the binary stream stays separate from child output). |
@@ -52,8 +52,8 @@ event stream goes to **stderr**.
 Example — capture what a compile reads/writes:
 
 ```sh
-io-mon run --depfile build.rdep -- cc -c hello.c -o hello.o
-io-mon inspect build.rdep
+io-mon run --depfile build.iomon -- cc -c hello.c -o hello.o
+io-mon inspect build.iomon
 ```
 
 ### `io-mon inspect` — render an existing depfile
@@ -62,7 +62,7 @@ io-mon inspect build.rdep
 io-mon inspect <depfile> [--format text|json]
 ```
 
-`inspect` decodes and prints a previously captured RMDF depfile. The format
+`inspect` decodes and prints a previously captured iomon depfile. The format
 defaults to `text`; `json` emits the full structured form. (`--events` is
 accepted as an alias for `--format` here.)
 
@@ -74,7 +74,7 @@ accepted as an alias for `--format` here.)
 Sample `text` output:
 
 ```
-RMDF version=1 records=4 completeness=mcComplete
+iomon version=1 records=4 completeness=mcComplete
 #0 mrProcessStart pid=54321 tid=1
 #1 mrFileRead pid=54321 tid=1 path=/usr/include/stdio.h
 #2 mrLibraryLoad pid=54321 tid=1 path=/usr/lib/libfoo.dylib detail=...
@@ -145,7 +145,7 @@ importable API.)
 ```nim
 import io_mon
 
-let dep = readMonitorDepFile("build.rdep")   # raises MonitorDepFileReaderError on bad/partial data
+let dep = readMonitorDepFile("build.iomon")   # raises MonitorDepFileReaderError on bad/partial data
 if dep.completeness == mcComplete:
   for r in dep.records:
     if r.kind in {mrFileRead, mrLibraryLoad}:
@@ -160,7 +160,7 @@ else:
 
 - `readMonitorDepFile(path)` / `readMonitorDepFile(path, options)` — decode +
   validate; raises `MonitorDepFileReaderError` on a missing/truncated/corrupt
-  file (a partial RMDF write fails validation by design — it must not be
+  file (a partial iomon write fails validation by design — it must not be
   trusted).
 - `tryReadMonitorDepFile(path, options): MonitorDepFileReaderResult` — non-raising
   variant returning `Option[MonitorDepFile]` + diagnostics.
@@ -210,7 +210,7 @@ import io_mon
 
 var req: FsSnoopRequest
 req.command = @["cc", "-c", "hello.c", "-o", "hello.o"]
-req.depFilePath = "build.rdep"
+req.depFilePath = "build.iomon"
 req.streamMode = fsoNone
 
 let res = runMonitored(req)          # owns the ENTIRE lifecycle
@@ -239,7 +239,7 @@ else:
   *The decomposed host API* below — so the batch and streaming forms are one
   implementation and cannot drift apart.
 - `MonitorResult` — `exitCode` (the monitored command's status), `depFilePath`
-  (where the canonical RMDF depfile was written), and `depFile` (the merged
+  (where the canonical iomon depfile was written), and `depFile` (the merged
   `MonitorDepFile`: `records`, `completeness`, summary, …). Convenience
   accessors `res.completeness` and `res.records` read through to `depFile`.
 

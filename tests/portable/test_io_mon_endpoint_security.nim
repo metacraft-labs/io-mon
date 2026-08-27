@@ -6,7 +6,7 @@
 ##     the build's own root pid + descendants (grown via FORK/EXEC) are kept;
 ##   - the event-loss detector (EsSeqTracker.observeSeq) — a `global_seq_num` gap
 ##     maps to dropped events → an `mrEventLoss` record → `mcIncomplete`;
-##   - the ES-event → RMDF-record mapping (classifyOpenFlags + es*Record), which
+##   - the ES-event → iomon-record mapping (classifyOpenFlags + es*Record), which
 ##     reuses the EXISTING record/observation kinds (no new wire-format enum).
 ## Also asserts the default build's `start()` is an HONEST design stub (refuses to
 ## start with a clear reason), so nothing mistakes the skeleton for a live backend.

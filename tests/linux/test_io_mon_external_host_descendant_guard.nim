@@ -461,7 +461,7 @@ suite "io-mon external host descendant guard (DH-3)":
     let quietProof = work / "quiesced.proof"
     var quietReq: FsSnoopRequest
     quietReq.command = @[probe, marker, quietProof, "10", "0", "-"]
-    quietReq.depFilePath = work / "quiesced.rdep"
+    quietReq.depFilePath = work / "quiesced.iomon"
     quietReq.streamMode = fsoNone
 
     var quietHandle = startMonitor(quietReq)
@@ -491,7 +491,7 @@ suite "io-mon external host descendant guard (DH-3)":
     removeFile(batchRelease)
     var batchReq: FsSnoopRequest
     batchReq.command = @[probe, marker, batchProof, "0", "0", batchRelease]
-    batchReq.depFilePath = work / "batch.rdep"
+    batchReq.depFilePath = work / "batch.iomon"
     batchReq.streamMode = fsoNone
 
     let beforeBatch = monitorLifecycleCounts()
@@ -507,7 +507,7 @@ suite "io-mon external host descendant guard (DH-3)":
     removeFile(hostRelease)
     var hostReq: FsSnoopRequest
     hostReq.command = @[probe, marker, hostProof, "0", "0", hostRelease]
-    hostReq.depFilePath = work / "host.rdep"
+    hostReq.depFilePath = work / "host.iomon"
     hostReq.streamMode = fsoNone
 
     let beforeHost = monitorLifecycleCounts()
@@ -715,7 +715,7 @@ suite "io-mon external host descendant guard (DH-3)":
     # (B1) The decomposed path settles exactly once …
     var hostReq: FsSnoopRequest
     hostReq.command = @[probe, marker, work / "skip-host.proof", "0", "0", "-"]
-    hostReq.depFilePath = work / "skip-host.rdep"
+    hostReq.depFilePath = work / "skip-host.iomon"
     hostReq.streamMode = fsoNone
 
     let beforeHost = monitorLifecycleCounts()
@@ -730,7 +730,7 @@ suite "io-mon external host descendant guard (DH-3)":
     # (B2) … and so does the batch path, so neither is privileged.
     var batchReq: FsSnoopRequest
     batchReq.command = @[probe, marker, work / "skip-batch.proof", "0", "0", "-"]
-    batchReq.depFilePath = work / "skip-batch.rdep"
+    batchReq.depFilePath = work / "skip-batch.iomon"
     batchReq.streamMode = fsoNone
 
     let beforeBatch = monitorLifecycleCounts()
@@ -746,7 +746,7 @@ suite "io-mon external host descendant guard (DH-3)":
     #      drop still does is RELEASE, which is the safety half.
     var dropReq: FsSnoopRequest
     dropReq.command = @[probe, marker, work / "skip-drop.proof", "0", "0", "-"]
-    dropReq.depFilePath = work / "skip-drop.rdep"
+    dropReq.depFilePath = work / "skip-drop.iomon"
     dropReq.streamMode = fsoNone
 
     let beforeDrop = monitorLifecycleCounts()
@@ -787,7 +787,7 @@ suite "io-mon external host descendant guard (DH-3)":
 
     var req: FsSnoopRequest
     req.command = @[reporter, shmPathFile]
-    req.depFilePath = work / "lf4.rdep"
+    req.depFilePath = work / "lf4.iomon"
     req.streamMode = fsoNone
 
     var handle = startMonitor(req)

@@ -41,7 +41,7 @@ The historical design (milestone `io-mon-DEP-SHM`, see
 **bounded, drop-on-full** ring. That was only self-consistent because it was
 paired with a **file fallback**: `dep_queue.tryPushRecord` returns `dpsDropped`
 on a full ring, and the caller was *required* to re-emit the dropped record to a
-per-thread `.rmdf-frag` file (`writer.nim`). Under that two-channel design a ring
+per-thread `.iomon-frag` file (`writer.nim`). Under that two-channel design a ring
 drop was **not** a loss event — the file caught it — so the ring's drop-on-full
 looked "signalled, never silent, never lossy."
 
@@ -74,7 +74,7 @@ gets its own structure, the action cache keeps its ring).
    └───────────────────────────────────────────────┘
         │  single consumer reads/drains
         ▼
-   io-mon run driver / reprobuild engine  →  canonical RMDF depfile + completeness
+   io-mon run driver / reprobuild engine  →  canonical iomon depfile + completeness
 ```
 
 - **Producers** are the shim instances injected into every process/thread of the
@@ -397,7 +397,7 @@ swappable.
 
 ## 4. No fallback file
 
-**The `.rmdf-frag` per-process file spill is removed as a producer path.** Its
+**The `.iomon-frag` per-process file spill is removed as a producer path.** Its
 two historical jobs are both subsumed:
 
 - *Durability across producer death* → provided by consumer-owned ring memory
@@ -422,7 +422,7 @@ treated as a **hard error, not a reason to write a file**:
 A long-lived `repro-full daemon serve --dev` was left as an **orphaned monitored
 descendant**: its monitor's root command had exited, the grace period lapsed, and
 `fs_snoop` removed the fragment directory — but the descendant kept running and
-kept appending to its now-*unlinked* `.rmdf-frag` fd. With no consumer draining
+kept appending to its now-*unlinked* `.iomon-frag` fd. With no consumer draining
 it, that single fragment grew to **~61 GiB** and filled the root tmpfs. This is
 exactly the `dpsUnavailable`/orphan class: a producer on the file fallback with
 no consumer. LF-2 makes it structurally impossible — there is no file to grow.
@@ -489,7 +489,7 @@ library API**, not only a CLI:
   for any well-formed parent: "the set was never set up" is structurally
   impossible. See `io-mon/docs/usage.md` → *The public host API* for the caller
   contract, and `tests/linux/test_io_mon_public_host_api.nim` for the end-to-end
-  proof (public-surface-only: `mcComplete`, inputs captured, no `.rmdf-frag`
+  proof (public-surface-only: `mcComplete`, inputs captured, no `.iomon-frag`
   spill).
 
   `FsSnoopRequest` also carries a per-call `env` and `cwd`

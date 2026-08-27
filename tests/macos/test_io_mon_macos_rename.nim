@@ -132,7 +132,7 @@ int main(int argc, char **argv) {
     if fileExists(fx.dstPath) and not fileExists(fx.tmpPath):
       result.completed = readFile(fx.dstPath).contains("second")
 
-    let depfile = runWork / "cap.rdep"
+    let depfile = runWork / "cap.iomon"
     discard mergeFragments(fragmentDir, depfile)
     if not fileExists(depfile):
       return

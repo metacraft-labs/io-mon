@@ -139,7 +139,7 @@ proc processIsRunning(pid: uint64): bool =
 proc fragmentDirsOfThisProcess(): seq[string] =
   ## Every `repro-fs-snoop-fragments-*` scratch directory `createLocalTempDir`
   ## could have made for THIS host process (the name carries our pid). This is
-  ## the §4.1 artefact: the incident was a descendant appending to a `.rmdf-frag`
+  ## the §4.1 artefact: the incident was a descendant appending to a `.iomon-frag`
   ## inside a directory the launcher had already removed, so "did the drop clean
   ## up" is a question about exactly these directories.
   result = @[]
@@ -302,7 +302,7 @@ suite "io-mon decomposed host API (DH-2)":
     writeFile(input, "dropped handle marker\n")
     let ready = work / "producer.ready"
     let done = work / "producer.done"
-    let depPath = work / "dropped.rdep"
+    let depPath = work / "dropped.iomon"
     let producer = buildC(work, "dh2_lingering_producer", lingeringProducerSrc)
 
     let before = monitorLifecycleCounts()
@@ -352,7 +352,7 @@ suite "io-mon decomposed host API (DH-2)":
     #     released only after the monitored root has been reaped, so there is no
     #     window in which a live producer faces a deleted fragment directory —
     #     which is precisely the §4.1 incident (a descendant appending to an
-    #     unlinked `.rmdf-frag` until it filled the root tmpfs). The child
+    #     unlinked `.iomon-frag` until it filled the root tmpfs). The child
     #     `stat`s its own `REPRO_MONITOR_FRAGMENT_DIR` as its last act and
     #     reports what it found.
     check fileExists(done)                       # …and it ran to completion
@@ -407,7 +407,7 @@ suite "io-mon decomposed host API (DH-2)":
 
     var req: FsSnoopRequest
     req.command = @[producer, ready, input, $(DropLingerMs * 1000), done]
-    req.depFilePath = work / "drop-wait.rdep"
+    req.depFilePath = work / "drop-wait.iomon"
     req.streamMode = fsoNone
 
     var dropStart: MonoTime
@@ -453,7 +453,7 @@ suite "io-mon decomposed host API (DH-2)":
       writeFile(inputs[i], "job " & $i & "\n")
       readys[i] = work / ("job" & $i & ".ready")
       dones[i] = work / ("job" & $i & ".done")
-      depPaths[i] = work / ("job" & $i & ".rdep")
+      depPaths[i] = work / ("job" & $i & ".iomon")
 
     let before = monitorLifecycleCounts()
 
@@ -578,7 +578,7 @@ suite "io-mon decomposed host API (DH-2)":
     # ---- (A) RUNTIME: `runMonitored` goes through the decomposed entry points.
     var req: FsSnoopRequest
     req.command = @[producer, ready, input, "0", done]
-    req.depFilePath = work / "delegate.rdep"
+    req.depFilePath = work / "delegate.iomon"
     req.streamMode = fsoNone
 
     let before = monitorLifecycleCounts()
@@ -608,7 +608,7 @@ suite "io-mon decomposed host API (DH-2)":
     let done2 = work / "decomposed.done"
     var req2: FsSnoopRequest
     req2.command = @[producer, ready2, input, "0", done2]
-    req2.depFilePath = work / "decomposed.rdep"
+    req2.depFilePath = work / "decomposed.iomon"
     req2.streamMode = fsoNone
 
     var handle = startMonitor(req2)

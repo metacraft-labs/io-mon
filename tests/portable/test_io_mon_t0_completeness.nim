@@ -249,7 +249,7 @@ suite "io-mon R1 ROOT-process completeness guard (mergeFragments)":
     removeDir(work); createDir(work)
     let frag = work / "frags"
     createDir(frag)            # empty fragment set — the SIP-root reality
-    let dep = mergeFragments(frag, work / "out.rdep", expectedRootPid = 4321'u64)
+    let dep = mergeFragments(frag, work / "out.iomon", expectedRootPid = 4321'u64)
     check dep.completeness == mcIncomplete
     removeDir(work)
 
@@ -261,7 +261,7 @@ suite "io-mon R1 ROOT-process completeness guard (mergeFragments)":
     let frag = work / "frags"
     createDir(frag)
     appendFragmentRecord(frag, startAt(4321'u64, "9000"))
-    let dep = mergeFragments(frag, work / "out.rdep", expectedRootPid = 4321'u64)
+    let dep = mergeFragments(frag, work / "out.iomon", expectedRootPid = 4321'u64)
     check dep.completeness == mcComplete
     removeDir(work)
 
@@ -271,7 +271,7 @@ suite "io-mon R1 ROOT-process completeness guard (mergeFragments)":
     let frag = work / "frags"
     createDir(frag)
     appendFragmentRecord(frag, start(4321'u64))
-    check mergeFragments(frag, work / "out.rdep").completeness == mcComplete
+    check mergeFragments(frag, work / "out.iomon").completeness == mcComplete
     removeDir(work)
 
 suite "io-mon R7 (pid, start-time) identity (defeat pid-reuse)":
@@ -339,9 +339,9 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
       "io-mon-breakaway-report v1\nrun " & runId & "\nclient 4242\ndaemon 9999\n" &
         "read " & served & "\ncomplete\n")
     # WITHOUT the report the out-of-tree peer downgrades…
-    check mergeFragments(frag, work / "no.rdep").completeness == mcIncomplete
+    check mergeFragments(frag, work / "no.iomon").completeness == mcIncomplete
     # …WITH the authenticated report it stays complete and the read is folded in.
-    let dep = mergeFragments(frag, work / "yes.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "yes.iomon", reportDir)
     check dep.completeness == mcComplete
     var sawServed = false
     for r in dep.records:
@@ -359,7 +359,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     let frag = clientFrag(work, 4242'u64, 9999'u64)
     writeFile(reportDir / "forged.io-mon-report",
       "io-mon-breakaway-report v1\nrun " & runId & "\nclient 4242\ndaemon 9999\n")
-    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir)
     check dep.completeness == mcIncomplete
     removeDir(work)
 
@@ -372,7 +372,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "partial.io-mon-report",
       "io-mon-breakaway-report v1\nrun " & runId &
         "\nclient 4242\ndaemon 9999\nread /x/y.h\n")  # no `complete`
-    check mergeFragments(frag, work / "out.rdep", reportDir).completeness ==
+    check mergeFragments(frag, work / "out.iomon", reportDir).completeness ==
       mcIncomplete
     removeDir(work)
 
@@ -386,7 +386,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "no-header.io-mon-report",
       "run " & runId & "\nclient 4242\ndaemon 9999\n" &
         "read " & decoy & "\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir)
     check dep.completeness == mcIncomplete
     for r in dep.records:
       check r.path != decoy
@@ -402,7 +402,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "padded-header.io-mon-report",
       " " & BreakawayReportMagic & "\nrun " & runId &
         "\nclient 4242\ndaemon 9999\nread " & decoy & "\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir)
     check dep.completeness == mcIncomplete
     for r in dep.records:
       check r.path != decoy
@@ -418,7 +418,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "stale.io-mon-report",
       "io-mon-breakaway-report v1\nrun OLD-SESSION-999\nclient 4242\ndaemon 9999\n" &
         "read /stale/build/file.h\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir)
     check dep.completeness == mcIncomplete
     for r in dep.records:
       check r.path != "/stale/build/file.h"
@@ -437,7 +437,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "duplicate-run.io-mon-report",
       "io-mon-breakaway-report v1\nrun OLD-SESSION-999\nrun " & runId &
         "\nclient 4242\ndaemon 9999\nread " & decoy & "\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir)
     check dep.completeness == mcIncomplete
     for r in dep.records:
       check r.path != decoy
@@ -454,7 +454,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
       "io-mon-breakaway-report v1\nrun " & runId &
         "\nclient 4242\ndaemon 9999\nunexpected structural-field\nread " &
         decoy & "\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir)
     check dep.completeness == mcIncomplete
     for r in dep.records:
       check r.path != decoy
@@ -470,7 +470,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "wrong.io-mon-report",
       "io-mon-breakaway-report v1\nrun " & runId &
         "\nclient 4242\ndaemon 7777\nread /x.h\ncomplete\n")  # daemon 7777!
-    check mergeFragments(frag, work / "out.rdep", reportDir).completeness ==
+    check mergeFragments(frag, work / "out.iomon", reportDir).completeness ==
       mcIncomplete
     removeDir(work)
 
@@ -483,7 +483,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "foreign.io-mon-report",
       "io-mon-breakaway-report v1\nrun " & runId &
         "\nclient 1111\ndaemon 9999\nread /other/build/file.h\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir)
     check dep.completeness == mcIncomplete
     for r in dep.records:
       check r.path != "/other/build/file.h"
@@ -556,7 +556,7 @@ suite "io-mon R5 kill-before-flush durability (in-fragment marker)":
     doAssert open(f, path, fmAppend)
     doAssert f.writeBuffer(unsafeAddr frame[0], frame.len) == frame.len
     close(f)
-    let dep = mergeFragments(frag, work / "out.rdep")
+    let dep = mergeFragments(frag, work / "out.iomon")
     check dep.completeness == mcIncomplete
     # A kill-before-flush event-loss was injected; no read-tail bookkeeping leaked.
     var sawKill = false
@@ -578,7 +578,7 @@ suite "io-mon R5 kill-before-flush durability (in-fragment marker)":
     appendFragmentRecord(frag, startAt(700'u64, "1000"))
     appendFragmentRecord(frag, readRec(700'u64, "/dep/header.h"))
     flushFragmentBatch()
-    let dep = mergeFragments(frag, work / "out.rdep")
+    let dep = mergeFragments(frag, work / "out.iomon")
     check dep.completeness == mcComplete
     # The pending/committed bookkeeping markers are stripped from the output, and no
     # kill-before-flush was injected (the netting cancelled cleanly).
@@ -600,7 +600,7 @@ suite "io-mon R5 kill-before-flush durability (in-fragment marker)":
     for i in 0 ..< 500:
       appendFragmentRecord(frag, readRec(700'u64, "/dep/h" & $i & ".h"))
       flushFragmentBatch()   # each cycle: pending (on dirty) + committed (on flush)
-    let dep = mergeFragments(frag, work / "out.rdep")
+    let dep = mergeFragments(frag, work / "out.iomon")
     check dep.completeness == mcComplete
     var kills = 0
     for r in dep.records:
@@ -650,7 +650,7 @@ suite "io-mon S3a self-authored breakaway-report forgery (write provenance)":
     writeFile(reportPath,
       "io-mon-breakaway-report v1\nrun " & runId & "\nclient 4242\ndaemon 9999\n" &
         "read /tmp/DECOY.txt\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir)
     check dep.completeness == mcIncomplete
     # The decoy must NOT have been folded as a dependency.
     for r in dep.records:
@@ -682,7 +682,7 @@ suite "io-mon S3a self-authored breakaway-report forgery (write provenance)":
       observationKind: moFileWrite, osPid: 4242'u64,
       path: "/some/other/spelling.io-mon-report",
       detail: "dev=" & dev & " ino=" & ino))
-    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir)
     check dep.completeness == mcIncomplete
     removeDir(work)
 
@@ -703,7 +703,7 @@ suite "io-mon S3a self-authored breakaway-report forgery (write provenance)":
     writeFile(reportDir / "report-4242-9999-0.io-mon-report",
       "io-mon-breakaway-report v1\nrun " & runId & "\nclient 4242\ndaemon 9999\n" &
         "read " & served & "\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir)
     check dep.completeness == mcComplete
     var sawServed = false
     for r in dep.records:
@@ -713,7 +713,7 @@ suite "io-mon S3a self-authored breakaway-report forgery (write provenance)":
 
 suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
   # ROUND-3 S3c — mergeFragments consumes the kill-sentinels but does NOT delete the
-  # `.rmdf-frag` files, so a library caller that RE-MERGES a reused fragment dir
+  # `.iomon-frag` files, so a library caller that RE-MERGES a reused fragment dir
   # (a warm restart) would fold a PRIOR run's records (merge_attack.nim): a stale
   # run-1 process-start makes a run-2 out-of-tree breakaway peer look in-tree ⇒ a
   # FALSE mcComplete, plus the stale reads pollute the depfile. The guard namespaces
@@ -731,7 +731,7 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
     appendFragmentRecord(frag, startAt(500'u64, "111", "r1"))
     appendFragmentRecord(frag, readRec(500'u64, "/fileA"))
     closeFragmentSlot()
-    check mergeFragments(frag, work / "r1.rdep", currentRunId = "r1").completeness ==
+    check mergeFragments(frag, work / "r1.iomon", currentRunId = "r1").completeness ==
       mcComplete
     # RUN 2 reuses the SAME dir (warm restart). A DIFFERENT client pid 600 connects
     # to an OUT-OF-TREE daemon whose pid is 500 (recycled) — the stale run-1
@@ -739,7 +739,7 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
     appendFragmentRecord(frag, startAt(600'u64, "222", "r2"))
     appendFragmentRecord(frag, ipcPeerAt(600'u64, 500'u64, "", "/tmp/d.sock", "r2"))
     closeFragmentSlot()
-    let dep = mergeFragments(frag, work / "r2.rdep", currentRunId = "r2")
+    let dep = mergeFragments(frag, work / "r2.iomon", currentRunId = "r2")
     # The stale run-1 start for pid 500 is dropped, so peer 500 is out-of-tree…
     check dep.completeness == mcIncomplete
     # …and the stale run-1 read /fileA is NOT folded into run-2's depfile.
@@ -757,7 +757,7 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
     appendFragmentRecord(frag, startAt(700'u64, "1000", "r2"))
     appendFragmentRecord(frag, readRec(700'u64, "/dep/header.h"))
     closeFragmentSlot()
-    let dep = mergeFragments(frag, work / "out.rdep", currentRunId = "r2")
+    let dep = mergeFragments(frag, work / "out.iomon", currentRunId = "r2")
     check dep.completeness == mcComplete
     var sawDep = false
     for r in dep.records:
@@ -778,7 +778,7 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
     closeFragmentSlot()
     appendFragmentRecord(frag, startAt(500'u64, "222", "CURRENT"))
     closeFragmentSlot()
-    let dep = mergeFragments(frag, work / "current.rdep",
+    let dep = mergeFragments(frag, work / "current.iomon",
       currentRunId = "CURRENT")
     check dep.completeness == mcIncomplete
     var sawAmbiguousLoss = false
@@ -814,7 +814,7 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
     currentRead.detail = "run=CURRENT"
     appendFragmentRecord(frag, currentRead)
     closeFragmentSlot()
-    let dep = mergeFragments(frag, work / "current.rdep",
+    let dep = mergeFragments(frag, work / "current.iomon",
       currentRunId = "CURRENT")
     check dep.completeness == mcComplete
     var sawCurrent = false
@@ -847,7 +847,7 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
     currentRead.detail = "run=CURRENT"
     appendFragmentRecord(frag, currentRead)
     closeFragmentSlot()
-    let dep = mergeFragments(frag, work / "current.rdep",
+    let dep = mergeFragments(frag, work / "current.iomon",
       currentRunId = "CURRENT")
     check dep.completeness == mcIncomplete
     var sawCurrent = false
@@ -878,7 +878,7 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
     appendFragmentRecord(frag, ipcPeerAt(503'u64, 900'u64, "",
       "/tmp/d.sock", "CURRENT"))
     closeFragmentSlot()
-    let dep = mergeFragments(frag, work / "current.rdep",
+    let dep = mergeFragments(frag, work / "current.iomon",
       currentRunId = "CURRENT")
     check dep.completeness == mcIncomplete
     var sawDuplicateLoss = false
@@ -899,7 +899,7 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
     appendFragmentRecord(frag, startAt(800'u64, "1000", "r9"))
     appendFragmentRecord(frag, readRec(800'u64, "/dep/x.h"))
     closeFragmentSlot()
-    let dep = mergeFragments(frag, work / "out.rdep")
+    let dep = mergeFragments(frag, work / "out.iomon")
     check dep.completeness == mcComplete
     removeDir(work)
 
@@ -918,7 +918,7 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
         observationKind: moFileRead, osPid: 801'u64,
         path: "/deps/header-" & $i & ".h"))
     closeFragmentSlot()
-    let dep = mergeFragments(frag, work / "current.rdep",
+    let dep = mergeFragments(frag, work / "current.iomon",
       currentRunId = "CURRENT")
     check dep.completeness == mcComplete
     var sawLast = false

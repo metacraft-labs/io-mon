@@ -72,7 +72,7 @@ static int fragment_fd(void) {
     ssize_t size = readlink(link_path, target, sizeof(target) - 1);
     if (size <= 0) continue;
     target[size] = '\0';
-    if (strstr(target, ".rmdf-frag") != NULL) return fd;
+    if (strstr(target, ".iomon-frag") != NULL) return fd;
   }
   return -1;
 }
@@ -119,7 +119,7 @@ int main(int argc, char **argv) {
     let second = work / "second-marker.txt"
     writeFile(first, "first\n")
     writeFile(second, "second\n")
-    let depfile = work / "fragment-fd-reuse.rdep"
+    let depfile = work / "fragment-fd-reuse.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for key, value in envPairs():

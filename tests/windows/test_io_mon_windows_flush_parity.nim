@@ -63,7 +63,7 @@ suite "windows shim flush parity (ROUND-5 F)":
     closeFragmentSlot()
 
     # Merge — no synthetic loss expected.
-    let outPath = dir / "merged.rmdf"
+    let outPath = dir / "merged.iomon"
     let merged = mergeFragments(dir, outPath)
     let summary = summarizeRecords(merged.records)
     check summary.eventLossCount == 0'u64
@@ -99,7 +99,7 @@ suite "windows shim flush parity (ROUND-5 F)":
     # fix's exit-proc callback must retire it.
     closeFragmentSlot()
 
-    let outPath = dir / "merged.rmdf"
+    let outPath = dir / "merged.iomon"
     let merged = mergeFragments(dir, outPath)
     let summary = summarizeRecords(merged.records)
     check summary.eventLossCount == 0'u64

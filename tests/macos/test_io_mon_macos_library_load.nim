@@ -128,7 +128,7 @@ suite "io-mon macOS library-load / dependent-dylib + dlopen (T3b, breaks #4/#7)"
       createDir(frag)
       let outText = runUnderShim(shim, loaderBin, @[], frag, work)
       checkpoint("loader stdout: " & outText)
-      let dep = mergeFragments(frag, work / "dlopen.rdep")
+      let dep = mergeFragments(frag, work / "dlopen.iomon")
       let loads = libraryLoads(dep)
       checkpoint("library-loads: " & $loads)
       # The plugin now appears as a library-load…
@@ -158,7 +158,7 @@ suite "io-mon macOS library-load / dependent-dylib + dlopen (T3b, breaks #4/#7)"
       createDir(frag)
       let outText = runUnderShim(shim, depBin, @[], frag, work)
       checkpoint("dep stdout: " & outText)
-      let dep = mergeFragments(frag, work / "dep.rdep")
+      let dep = mergeFragments(frag, work / "dep.iomon")
       let loads = libraryLoads(dep)
       checkpoint("library-loads: " & $loads)
       # The non-system dependent dylib is recorded…
@@ -183,7 +183,7 @@ suite "io-mon macOS library-load / dependent-dylib + dlopen (T3b, breaks #4/#7)"
       let frag = work / "trivialFrag"
       createDir(frag)
       discard runUnderShim(shim, trivialBin, @[], frag, work)
-      let dep = mergeFragments(frag, work / "trivial.rdep")
+      let dep = mergeFragments(frag, work / "trivial.iomon")
       let loads = libraryLoads(dep)
       checkpoint("trivial library-loads (" & $loads.len & "): " & $loads)
       # A trivial program must never flood the depfile with the system baseline.
