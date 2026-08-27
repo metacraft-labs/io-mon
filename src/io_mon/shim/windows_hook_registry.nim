@@ -175,8 +175,39 @@ const
   HookQueryPerformanceCounter* = "QueryPerformanceCounter"
   HookGetSystemTimeAsFileTime* = "GetSystemTimeAsFileTime"
   HookGetTickCount64* = "GetTickCount64"
+  # M10 — observed environment (mcapObservedEnv). Windows reaches its
+  # environment through TWO independent copies, and a hook on either one alone
+  # sees only half the programs:
+  #
+  #   * the PEB block, read by the Win32 APIs below (kernel32.dll);
+  #   * the C runtime's OWN snapshot, taken from the PEB block once at CRT
+  #     startup and served by `getenv` from then on. A program linked against
+  #     a CRT may therefore never call a Win32 environment API at all.
+  #
+  # Both CRTs a Windows toolchain actually links are covered, and they are
+  # SEPARATE modules with separate copies in the same process: `ucrtbase.dll`
+  # (MSVC, clang-cl, mingw-w64 UCRT builds, Node, Python) and `msvcrt.dll`
+  # (classic mingw-w64, cmd.exe, and much of the shipped system). Since the
+  # registry is keyed by NAME and both export `getenv`, the CRT keys are
+  # qualified by module and the hook table carries the undecorated
+  # `exportName` for the install pass.
+  HookGetEnvironmentVariableW* = "GetEnvironmentVariableW"
+  HookGetEnvironmentVariableA* = "GetEnvironmentVariableA"
+  HookGetEnvironmentStringsW* = "GetEnvironmentStringsW"
+  HookGetEnvironmentStringsA* = "GetEnvironmentStringsA"
+  HookGetEnvironmentStrings* = "GetEnvironmentStrings"
+  HookUcrtGetenv* = "ucrtbase!getenv"
+  HookUcrtWGetenv* = "ucrtbase!_wgetenv"
+  HookUcrtGetenvS* = "ucrtbase!getenv_s"
+  HookUcrtWGetenvS* = "ucrtbase!_wgetenv_s"
+  HookUcrtDupenvS* = "ucrtbase!_dupenv_s"
+  HookUcrtWDupenvS* = "ucrtbase!_wdupenv_s"
+  HookMsvcrtGetenv* = "msvcrt!getenv"
+  HookMsvcrtWGetenv* = "msvcrt!_wgetenv"
+  HookMsvcrtGetenvS* = "msvcrt!getenv_s"
+  HookMsvcrtWGetenvS* = "msvcrt!_wgetenv_s"
 
-const MonitorShimHookNames*: array[49, string] = [
+const MonitorShimHookNames*: array[64, string] = [
   HookCreateFileW, HookCreateFileA, HookReadFile, HookWriteFile,
   HookCloseHandle,
   HookGetFileAttributesExW, HookGetFileAttributesExA,
@@ -201,7 +232,13 @@ const MonitorShimHookNames*: array[49, string] = [
   HookBCryptGenRandom, HookProcessPrng, HookSystemFunction036,
   HookCryptGenRandom,
   HookQueryPerformanceCounter, HookGetSystemTimeAsFileTime,
-  HookGetTickCount64
+  HookGetTickCount64,
+  HookGetEnvironmentVariableW, HookGetEnvironmentVariableA,
+  HookGetEnvironmentStringsW, HookGetEnvironmentStringsA,
+  HookGetEnvironmentStrings,
+  HookUcrtGetenv, HookUcrtWGetenv, HookUcrtGetenvS, HookUcrtWGetenvS,
+  HookUcrtDupenvS, HookUcrtWDupenvS,
+  HookMsvcrtGetenv, HookMsvcrtWGetenv, HookMsvcrtGetenvS, HookMsvcrtWGetenvS
 ]
 
 # --- Standard hook priorities ----------------------------------------------

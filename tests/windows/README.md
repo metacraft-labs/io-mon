@@ -160,6 +160,67 @@ mode that silently got the *other* outcome would make a
 "no record was emitted" assertion pass for the wrong reason — the same failure
 shape as the monitoring bug being tested.
 
+## The M10 capability test, and why its "both directions" are different ones
+
+`test_io_mon_windows_observed_env.nim` covers the gap M5 left open that was an
+INPUT channel — the only remaining kind that could produce a false
+`mcComplete` over something unseen. It uses the same fixture and the same
+self-re-invocation, and it keeps the two conventions above that transfer
+unchanged (every mode returns a distinct non-zero code; every case checks
+`exitCode == 0` before looking at records).
+
+What does **not** transfer is the in-tree/out-of-tree pair. An environment
+read has no peer and no provenance, so the pair that carries the same weight
+here is READ / NOT-READ:
+
+- a variable the fixture reads must appear, and the run must stay
+  `mcComplete` — an env read is evidence, not loss;
+- a variable that is SET in the child's environment and never looked at must
+  NOT appear.
+
+Only one of the two passes against an implementation that always answers the
+same way, which is the property that made the original pair worth having. The
+second direction is not cosmetic: recording every variable would put the whole
+environment into every action's cache key, so an unrelated change would re-run
+the build — the cardinal sin arriving through the consumer rather than through
+a missed read.
+
+Three things this file learned that are worth copying:
+
+- **One variable per entry point.** The obvious fixture reads one variable
+  through a whole API family. It cannot tell the family's members apart,
+  because the records are deduped by NAME: the first entry point to fire
+  produces the only record, and deleting the hook on any of the others changes
+  nothing an assertion can see. Mutation testing is what made this concrete —
+  with a shared variable, "the ANSI arm records nothing" SURVIVED. Each entry
+  point now reads `<base>_<SUFFIX>` and each suffix is asserted on its own.
+
+- **A branch with no test looks exactly like a branch that works.** The
+  caller-origin gate on the whole-block expansion — which stops a C runtime's
+  startup snapshot from turning every action's entire environment into an
+  input — had no coverage at all, and removing it broke nothing. Nothing in an
+  ordinary fixture process performs a block read from a system image;
+  measured, a monitored `cmd /c ver` records no environment read whatsoever.
+  The mode that reaches it (`env-block-system`) manufactures a system-image
+  caller by running `GetEnvironmentStringsW` AS A THREAD START ROUTINE, so it
+  is entered from `kernel32!BaseThreadInitThunk`. Prefer that shape over
+  giving up on a branch: no system component has to cooperate.
+
+- **A dozen names never exercise a hash table.** The trampoline's dedup table
+  is fixed-size and open-addressed, and mutations that made its lookup
+  approximate survived every case until one read three hundred distinct
+  variables. An approximate lookup answers "already recorded" for a name it
+  has never seen, which drops the first read of a real variable from a capture
+  that still grades `mcComplete`.
+
+The residual that is stated rather than closed, in the profile's own
+diagnostics: coverage is limited to reads that go through a CALL. A program
+that walks the C runtime's environment ARRAY directly (`msvcrt!_environ`,
+`ucrtbase!__p__environ`), or reads the PEB block itself as `cmd.exe` does,
+performs nothing for a detour to intercept. That is the Windows counterpart of
+the POSIX `environ` walk, which the macOS and Linux arms do not cover either
+while advertising the same capability.
+
 Not covered here, because it needs an i686 toolchain the suite cannot assume:
 the WOW64 path (32-bit children). `nim-stackable-hooks`'
 `tests/test_windows_wow64_injection.nim` covers the injector side and skips

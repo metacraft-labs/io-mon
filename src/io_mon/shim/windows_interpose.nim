@@ -113,6 +113,13 @@ template ctInlineHookCommitTransaction(): cint =
 template ctInlineHookAbortTransaction(): cint =
   inlineHookAbortTransaction()
 
+const
+  # M10 — geometry of the trampoline-side dedup table. Declared up here
+  # because `EnvFastEntry` below is sized from it.
+  EnvFastSlots = 1024           ## power of two
+  EnvFastNameMax = 96
+  EnvFastProbe = 8
+
 # --- Win32 typedefs ---------------------------------------------------------
 
 type
@@ -212,6 +219,20 @@ proc WideCharToMultiByte(CodePage: DWORD, dwFlags: DWORD,
                          lpUsedDefaultChar: ptr BOOL): int32
   {.importc, stdcall, dynlib: "kernel32".}
 proc lstrlenW(lpString: LPCWSTR): int32
+  {.importc, stdcall, dynlib: "kernel32".}
+# M10 -- used ONLY to enumerate the environment block from inside the
+# whole-block snoops, and always under `withShimMuted`.
+#
+# These resolve to the same kernel32 bodies the shim detours, so the call
+# re-enters our own trampoline. That is deliberate and bounded: the muted
+# snoop returns before it records, so the re-entry costs one chain dispatch
+# and cannot recurse further. The alternative -- decoding the block the call
+# actually RETURNED -- would have to guess whether `GetEnvironmentStrings`
+# handed back ANSI or UTF-16 bytes, and a wrong guess yields one-character
+# junk variable names in the capture rather than an error.
+proc GetEnvironmentStringsWRaw(): LPWSTR
+  {.importc: "GetEnvironmentStringsW", stdcall, dynlib: "kernel32".}
+proc FreeEnvironmentStringsW(penv: LPWSTR): BOOL
   {.importc, stdcall, dynlib: "kernel32".}
 
 # --- Grandchild injection: pull the shim into every CreateProcess descendant.
@@ -651,6 +672,61 @@ type
                                      {.stdcall, raises: [].}
   GetTickCount64Proc = proc(): uint64 {.stdcall, raises: [].}
 
+  # --- M10: observed environment -----------------------------------------
+  #
+  # Two families, because Windows keeps TWO copies of the environment and a
+  # program reads exactly one of them:
+  #
+  #   * the Win32 APIs read the PEB's block directly;
+  #   * a CRT's `getenv` reads the CRT's OWN snapshot, taken from that block
+  #     once at startup. Hooking only the Win32 side would therefore observe
+  #     nothing at all for a program built with any C runtime -- which is
+  #     most of a toolchain.
+  #
+  # The CRT entry points are `cdecl`, not `stdcall`: they are C library
+  # functions, and getting this wrong on i386 corrupts the stack on every
+  # call (the callee would pop arguments the caller also pops). On x64 the
+  # two conventions coincide, so a 32-bit build is where a mistake here
+  # shows up.
+  GetEnvironmentVariableWProc = proc(lpName: LPCWSTR; lpBuffer: LPWSTR;
+                                     nSize: DWORD): DWORD
+                                     {.stdcall, raises: [].}
+  GetEnvironmentVariableAProc = proc(lpName: LPCSTR; lpBuffer: LPSTR;
+                                     nSize: DWORD): DWORD
+                                     {.stdcall, raises: [].}
+  GetEnvironmentStringsWProc = proc(): LPWSTR {.stdcall, raises: [].}
+  GetEnvironmentStringsAProc = proc(): LPSTR {.stdcall, raises: [].}
+  CrtGetenvProc = proc(name: LPCSTR): LPSTR {.cdecl, raises: [].}
+  CrtWGetenvProc = proc(name: LPCWSTR): LPWSTR {.cdecl, raises: [].}
+  CrtGetenvSProc = proc(pReturnValue: ptr SIZE_T; buffer: LPSTR;
+                        numberOfElements: SIZE_T; varname: LPCSTR): cint
+                        {.cdecl, raises: [].}
+  CrtWGetenvSProc = proc(pReturnValue: ptr SIZE_T; buffer: LPWSTR;
+                         numberOfElements: SIZE_T; varname: LPCWSTR): cint
+                         {.cdecl, raises: [].}
+  CrtDupenvSProc = proc(buffer: ptr LPSTR; numberOfElements: ptr SIZE_T;
+                        varname: LPCSTR): cint {.cdecl, raises: [].}
+  CrtWDupenvSProc = proc(buffer: ptr LPWSTR; numberOfElements: ptr SIZE_T;
+                         varname: LPCWSTR): cint {.cdecl, raises: [].}
+
+  EnvFastEntry = object
+    ## One already-recorded variable name, upper-cased, stored FLAT and
+    ## NUL-TERMINATED.
+    ##
+    ## Flat rather than a `string` because this table is read from the
+    ## trampoline on every environment lookup, and a `string` field would be a
+    ## heap allocation to compare against and a refcounted object to race on.
+    ##
+    ## NUL-terminated rather than length-prefixed because it makes the
+    ## comparison SELF-SUFFICIENT. An earlier version carried a `len` and
+    ## compared `len` first, then the bytes -- and mutation testing showed the
+    ## length check was doing no work that the byte comparison could not do
+    ## itself, while being one more branch nothing could reach. Comparing
+    ## through the terminator makes a strict PREFIX mismatch structurally
+    ## (`"PATH"` cannot match `"PATHEXT"`: at index 4 one has NUL and the other
+    ## has 'E'), which is the only way the two could ever have differed.
+    used: bool
+    name: array[EnvFastNameMax + 1, char]
 # --- Original function pointer storage -------------------------------------
 
 var
@@ -709,6 +785,24 @@ var
   origQueryPerformanceCounter: QueryPerformanceCounterProc
   origGetSystemTimeAsFileTime: GetSystemTimeAsFileTimeProc
   origGetTickCount64: GetTickCount64Proc
+  # M10 — observed environment. Win32 side, then one set per CRT: the two
+  # runtimes are distinct modules with distinct snapshots in the same
+  # process, so a single pointer could not serve both.
+  origGetEnvironmentVariableW: GetEnvironmentVariableWProc
+  origGetEnvironmentVariableA: GetEnvironmentVariableAProc
+  origGetEnvironmentStringsW: GetEnvironmentStringsWProc
+  origGetEnvironmentStringsA: GetEnvironmentStringsAProc
+  origGetEnvironmentStrings: GetEnvironmentStringsAProc
+  origUcrtGetenv: CrtGetenvProc
+  origUcrtWGetenv: CrtWGetenvProc
+  origUcrtGetenvS: CrtGetenvSProc
+  origUcrtWGetenvS: CrtWGetenvSProc
+  origUcrtDupenvS: CrtDupenvSProc
+  origUcrtWDupenvS: CrtWDupenvSProc
+  origMsvcrtGetenv: CrtGetenvProc
+  origMsvcrtWGetenv: CrtWGetenvProc
+  origMsvcrtGetenvS: CrtGetenvSProc
+  origMsvcrtWGetenvS: CrtWGetenvSProc
 
 # --- Runtime state ---------------------------------------------------------
 
@@ -753,6 +847,30 @@ var
   # dispatch entirely.
   ndTimeSeen: array[3, bool]
   ndEntropySeen: array[8, bool]   ## [source * 2 + (1 if caller in program)]
+  # M10 — observed environment: the DISTINCT variable names this process has
+  # already recorded, upper-cased. Upper-cased because Windows environment
+  # lookup is case-INSENSITIVE: `getenv("path")` and `GetEnvironmentVariableW
+  # (L"PATH")` name one variable with one value, and keying the dedup on the
+  # spelling would record it twice. The RECORD still carries the name as the
+  # caller spelled it, matching how every other Windows record keeps the
+  # caller's spelling.
+  #
+  # A per-name dedup rather than the per-source flag the entropy hooks use:
+  # the evidence a consumer needs here is WHICH variables were read (it folds
+  # each one's value into the cache key), so collapsing to "some variable was
+  # read" would make the capability useless. It is bounded and cleared
+  # wholesale at the cap, exactly as the macOS arm's `seenObservedInputs` is.
+  seenEnvNames = initTable[string, bool]()
+  envLock: Lock
+  # The ALLOCATION-FREE mirror of `seenEnvNames`, consulted by the trampoline
+  # before it builds a hook context. See `envFastSeen` for why this exists and
+  # why it is EXACT rather than a hash filter.
+  envFast: array[EnvFastSlots, EnvFastEntry]
+  # Whether the whole-block APIs have already been handled, per
+  # [api * 2 + (1 if the caller is the main image)] -- the same shape as
+  # `ndEntropySeen`, and for the same reason: it lets the trampoline take a
+  # fast path that never builds a hook context.
+  envBlockSeen: array[6, bool]
   # Bounds of the monitored program's OWN main image, for caller attribution.
   mainImageLo: uint = 0
   mainImageHi: uint = 0
@@ -1374,6 +1492,316 @@ proc emitTimeRead(source: string) {.raises: [].} =
   record.path = source
   record.detail = "time source=" & source
   emitRecord(record)
+
+# ---------------------------------------------------------------------------
+# M10 -- observed environment (mcapObservedEnv)
+# ---------------------------------------------------------------------------
+#
+# THE CONTRACT, and it is deliberately the SAME one the POSIX arms implement,
+# because consumers compare captures across platforms: an environment read is
+# an OBSERVED DECLARED INPUT. `mrEnvRead`/`moEnvRead` carries the variable
+# NAME in `path`; nothing downgrades on it; the CONSUMER folds that variable's
+# VALUE (or its absence) into the action's cache key. That is BuildXL's
+# observed-environment model, and it is what makes a build that reads
+# SOURCE_DATE_EPOCH or CFLAGS re-run when the value changes and NOT re-run
+# when it does not.
+#
+# It is also the only Windows capability whose absence could produce a false
+# `mcComplete` over an unseen INPUT: a build reads a variable, nothing records
+# it, the capture grades complete, and the action cache serves a stale result
+# the next time the variable changes. Every other Windows gap costs detail.
+
+const
+  # The shim's / engine's OWN control variables are NOT build inputs. They are
+  # set per-run (a session id, a fragment directory under a temp path), so
+  # folding them into a consumer's cache key would change the key on EVERY
+  # run -- a monitor that makes every action uncacheable, which is the
+  # cardinal sin arriving through the consumer instead of through a missed
+  # read. The macOS arm denylists the same class (`ObservedEnvDenylistPrefixes`
+  # there); this list is its Windows counterpart, with the POSIX-only injection
+  # variable replaced by nothing, because Windows injects by
+  # `CreateRemoteThread` and has no `DYLD_INSERT_LIBRARIES` analogue to leak.
+  ObservedEnvDenylistPrefixes = [
+    "REPRO_MONITOR_", "IO_MON_", "CT_SANDBOX_TOOLS_DIR"]
+  ObservedEnvCacheCap = 4096
+    ## Bound on the dedup set. Cleared wholesale at the cap, like the macOS
+    ## arm: past a few thousand DISTINCT names a process is generating names
+    ## rather than reading configuration, and the cost of remembering them is
+    ## worse than re-recording a repeat.
+
+proc envDedupKey(name: string): string {.raises: [].} =
+  ## Upper-case ASCII fold. Windows environment lookup is case-insensitive, so
+  ## `Path` and `PATH` are ONE variable and must dedup to one record.
+  result = newStringOfCap(name.len)
+  for c in name:
+    if c >= 'a' and c <= 'z':
+      result.add(chr(ord(c) - 32))
+    else:
+      result.add(c)
+
+proc isDenylistedEnvName(name: string): bool {.raises: [].} =
+  let key = envDedupKey(name)
+  for prefix in ObservedEnvDenylistPrefixes:
+    if key.startsWith(prefix):
+      return true
+  false
+
+# --- The trampoline-side dedup ---------------------------------------------
+#
+# WHY THIS EXISTS. `getenv` is called at a rate no file API approaches: a build
+# re-reads PATH and its toolchain variables thousands of times per process, and
+# a shell's configure loop can do hundreds of thousands. Measured on this host,
+# routing every one of those through the registry -- a per-call `seq`
+# allocation for the hook context, a string-keyed chain lookup, then a Nim
+# string built from the caller's pointer -- cost 1.5 us per call, which is
+# 75 ms per 50 000 reads and 17 % on a monitored `cmd /c ver`.
+#
+# The entropy and clock trampolines solve the same problem with a boolean per
+# source, but they can: their "source" is a fixed entry point. Here the source
+# is a variable NAME, known only once the argument has been read.
+#
+# WHY IT IS EXACT AND NOT A HASH FILTER. The obvious cheap version stores
+# 64-bit hashes and skips on a hit. A hash COLLISION would then silently drop
+# the first read of a real variable -- an input missing from a capture that
+# still grades `mcComplete`, which is precisely the failure this whole
+# capability exists to prevent. Improbable is not the same as impossible, and
+# "improbable" is not a property a correctness claim can rest on. So the table
+# stores the NAMES and compares them, and the hash is only used to pick a slot.
+#
+# The two ways a name can miss the fast path -- longer than `EnvFastNameMax`,
+# or its probe window full -- both fail SAFE: the call takes the slow path,
+# which records or dedups correctly and merely costs what it cost before.
+
+proc envFastHash(buf: array[EnvFastNameMax + 1, char]; n: int32): uint64
+    {.inline, raises: [].} =
+  ## FNV-1a over the upper-cased name. Used only to pick a slot.
+  result = 0xcbf29ce484222325'u64
+  for i in 0 ..< int(n):
+    result = result xor uint64(uint8(buf[i]))
+    result = result * 0x100000001b3'u64
+
+proc envFastKeyFromCstr(p: LPCSTR;
+                        buf: var array[EnvFastNameMax + 1, char]): int32
+    {.raises: [].} =
+  ## Upper-case ASCII copy of a NUL-terminated narrow name into `buf`.
+  ## Returns -1 when the name cannot be keyed (nil, empty, or too long), which
+  ## sends the caller to the slow path.
+  if p == nil:
+    return -1
+  let src = cast[ptr UncheckedArray[char]](p)
+  var i = 0
+  while i < EnvFastNameMax:
+    let c = src[i]
+    if c == '\0':
+      return (if i == 0: -1'i32 else: int32(i))
+    buf[i] = (if c >= 'a' and c <= 'z': chr(ord(c) - 32) else: c)
+    inc i
+  -1
+
+proc envFastKeyFromWide(p: LPCWSTR;
+                        buf: var array[EnvFastNameMax + 1, char]): int32
+    {.raises: [].} =
+  ## The same for a UTF-16 name. A non-ASCII code unit returns -1 rather than
+  ## being folded: the slow path handles it, and inventing a byte for it here
+  ## could make two DIFFERENT names compare equal, which would drop a read.
+  if p == nil:
+    return -1
+  let src = cast[ptr UncheckedArray[uint16]](p)
+  var i = 0
+  while i < EnvFastNameMax:
+    let u = src[i]
+    if u == 0'u16:
+      return (if i == 0: -1'i32 else: int32(i))
+    if u > 0x7F'u16:
+      return -1
+    let c = chr(int(u))
+    buf[i] = (if c >= 'a' and c <= 'z': chr(ord(c) - 32) else: c)
+    inc i
+  -1
+
+proc envFastLookupLocked(buf: array[EnvFastNameMax + 1, char]; n: int32): int
+    {.raises: [].} =
+  ## Slot index of `buf[0..<n]` if present, else -1. Caller holds `envLock`.
+  ##
+  ## The comparison runs THROUGH the terminator (`0 .. n`, not `0 ..< n`), so
+  ## a stored name that merely starts with `buf` cannot match: at index `n` the
+  ## probe has NUL and the stored name has its next character. That is what
+  ## makes this lookup exact without a separate length field.
+  if n <= 0:
+    return -1
+  var idx = int(envFastHash(buf, n) and uint64(EnvFastSlots - 1))
+  for _ in 0 ..< EnvFastProbe:
+    if not envFast[idx].used:
+      return -1
+    var same = true
+    for i in 0 .. int(n):
+      if envFast[idx].name[i] != buf[i]:
+        same = false
+        break
+    if same:
+      return idx
+    idx = (idx + 1) and (EnvFastSlots - 1)
+  -1
+
+proc envFastInsertLocked(buf: array[EnvFastNameMax + 1, char]; n: int32)
+    {.raises: [].} =
+  ## Caller holds `envLock`. A full probe window is simply not inserted: the
+  ## name then always takes the slow path, which is correct and only slower.
+  if n <= 0:
+    return
+  var idx = int(envFastHash(buf, n) and uint64(EnvFastSlots - 1))
+  for _ in 0 ..< EnvFastProbe:
+    if not envFast[idx].used:
+      # Copy the terminator too. A slot reused after a wholesale clear would
+      # otherwise keep a longer previous name's bytes past `n`, and the
+      # through-the-terminator comparison above would read one of them.
+      for i in 0 .. int(n):
+        envFast[idx].name[i] = buf[i]
+      envFast[idx].used = true
+      return
+    idx = (idx + 1) and (EnvFastSlots - 1)
+
+proc envFastClearLocked() {.raises: [].} =
+  for i in 0 ..< EnvFastSlots:
+    envFast[i].used = false
+
+proc envFastSeenCstr(p: LPCSTR): bool {.raises: [].} =
+  ## Has this narrow name already been recorded? Takes `envLock`, which is a
+  ## few tens of nanoseconds uncontended -- two orders below the hook-context
+  ## allocation it saves.
+  ##
+  ## The buffer is zero-initialised by Nim, so `buf[n]` is the NUL the
+  ## comparison in `envFastLookupLocked` relies on.
+  var buf: array[EnvFastNameMax + 1, char]
+  let n = envFastKeyFromCstr(p, buf)
+  if n <= 0:
+    return false
+  acquire(envLock)
+  result = envFastLookupLocked(buf, n) >= 0
+  release(envLock)
+
+proc envFastSeenWide(p: LPCWSTR): bool {.raises: [].} =
+  var buf: array[EnvFastNameMax + 1, char]
+  let n = envFastKeyFromWide(p, buf)
+  if n <= 0:
+    return false
+  acquire(envLock)
+  result = envFastLookupLocked(buf, n) >= 0
+  release(envLock)
+
+proc emitEnvRead(name, source, scope: string) {.raises: [].} =
+  ## Record one environment variable as an observed declared input.
+  ##
+  ## `path` is the name AS THE CALLER SPELLED IT. `detail` names the entry
+  ## point it came through and, for a name that arrived from a whole-block
+  ## read, says `scope=block` -- so a consumer can tell "the program asked for
+  ## this variable" from "the program read the entire block, and this variable
+  ## was in it". Both are dependencies; only the first is evidence the program
+  ## cared.
+  if name.len == 0:
+    return
+  var record = baseRecord(mrEnvRead, moEnvRead)
+  record.path = name
+  record.detail = "env-read source=" & source & " scope=" & scope
+  emitRecord(record)
+
+proc recordEnvRead(name, source: string; scope = "name") {.raises: [].} =
+  ## Dedup then emit. The dedup lookup is done OUTSIDE `emitRecord` so the
+  ## emit's own muting cannot interfere with it, matching the macOS arm.
+  if name.len == 0:
+    return
+  if not initialized or fragmentDir.len == 0 or disabled > 0:
+    return
+  if isDenylistedEnvName(name):
+    return
+  let key = envDedupKey(name)
+  # The flat mirror is filled from the SAME critical section as the
+  # authoritative table, so the two can never disagree about a name having
+  # been recorded -- which is what lets the trampoline trust it.
+  var fastBuf: array[EnvFastNameMax + 1, char]
+  var fastLen = -1'i32
+  if key.len <= EnvFastNameMax:
+    var ok = true
+    for i, c in key:
+      if ord(c) > 0x7F:
+        ok = false
+        break
+      fastBuf[i] = c
+    if ok and key.len > 0:
+      fastLen = int32(key.len)
+  var fresh = false
+  acquire(envLock)
+  if not seenEnvNames.getOrDefault(key, false):
+    if seenEnvNames.len >= ObservedEnvCacheCap:
+      seenEnvNames.clear()
+      envFastClearLocked()
+    seenEnvNames[key] = true
+    fresh = true
+    envFastInsertLocked(fastBuf, fastLen)
+  release(envLock)
+  if not fresh:
+    return
+  emitEnvRead(name, source, scope)
+
+proc recordEnvBlockRead(source: string) {.raises: [].} =
+  ## A whole-block read: record EVERY variable in the block as an observed
+  ## input.
+  ##
+  ## The alternative -- a single marker meaning "the whole environment is an
+  ## input" -- would need a new token every consumer had to learn, and would
+  ## be invisible to the per-name machinery the POSIX arms already feed. So
+  ## the block is expanded into the SAME per-name records a named read
+  ## produces, which means the denylist applies to it (the per-run control
+  ## variables do not enter anybody's cache key) and a cross-platform consumer
+  ## needs no Windows-specific case.
+  ##
+  ## It over-approximates on purpose: the program received all of these names
+  ## and we cannot see which of them it went on to use. Over-approximating an
+  ## input costs a re-run that was not needed; under-approximating it serves a
+  ## stale result, and only one of those is a correctness bug.
+  if not initialized or fragmentDir.len == 0 or disabled > 0:
+    return
+  var block0: LPWSTR = nil
+  withShimMuted:
+    block0 = GetEnvironmentStringsWRaw()
+  if block0 == nil:
+    return
+  var names: seq[string] = @[]
+  let p = cast[ptr UncheckedArray[uint16]](block0)
+  # A hard bound on the walk. The block is double-NUL terminated and kernel32
+  # produced it, so this cannot trip on a well-formed block; it is here so a
+  # corrupted one costs a truncated record set rather than a walk off the end
+  # of the mapping inside a hook the whole process is calling through.
+  const MaxBlockCodeUnits = 1 shl 20
+  var i = 0
+  while i < MaxBlockCodeUnits:
+    if p[i] == 0'u16:                      # empty entry ends the block
+      break
+    var entryLen = 0
+    while i + entryLen < MaxBlockCodeUnits and p[i + entryLen] != 0'u16:
+      inc entryLen
+    # `=` at index 0 marks a hidden per-drive variable (`=C:`, `=ExitCode`).
+    # They are process bookkeeping, not configuration, and Windows will not
+    # let a program set them through the documented API -- recording them
+    # would put the shell's last exit code into every cache key.
+    var eq = -1
+    for j in 1 ..< entryLen:
+      if p[i + j] == uint16(ord('=')):
+        eq = j
+        break
+    if eq > 0:
+      var n = newStringOfCap(eq)
+      for j in 0 ..< eq:
+        # The names in the block are ASCII in every practical environment; a
+        # non-ASCII code unit is folded to its low byte rather than dropped,
+        # so the variable is still SEEN even if its name renders oddly.
+        n.add(chr(int(p[i + j]) and 0xFF))
+      names.add n
+    i += entryLen + 1
+  withShimMuted:
+    discard FreeEnvironmentStringsW(block0)
+  for n in names:
+    recordEnvRead(n, source, "block")
 
 proc rememberMappingPath(h: HANDLE; path: string) {.raises: [].} =
   if h == nil or h == INVALID_HANDLE_VALUE or path.len == 0:
@@ -3779,6 +4207,109 @@ proc originalGetTickCount64(ctx: var hr.HookContext) {.raises: [].} =
     return
   ctx.result = origGetTickCount64()
 
+# --- M10 original callbacks (observed environment) -------------------------
+#
+# Every one of these returns the callee's value UNCHANGED. An environment read
+# is observed, never altered: a shim that answered a getenv itself would be
+# changing the build it is supposed to be describing.
+
+proc originalGetEnvironmentVariableW(ctx: var hr.HookContext) {.raises: [].} =
+  if origGetEnvironmentVariableW == nil:
+    ctx.result = 0
+    return
+  ctx.result = uint64(origGetEnvironmentVariableW(
+    cast[LPCWSTR](ctx.args[0]), cast[LPWSTR](ctx.args[1]), DWORD(ctx.args[2])))
+
+proc originalGetEnvironmentVariableA(ctx: var hr.HookContext) {.raises: [].} =
+  if origGetEnvironmentVariableA == nil:
+    ctx.result = 0
+    return
+  ctx.result = uint64(origGetEnvironmentVariableA(
+    cast[LPCSTR](ctx.args[0]), cast[LPSTR](ctx.args[1]), DWORD(ctx.args[2])))
+
+proc originalGetEnvironmentStringsW(ctx: var hr.HookContext) {.raises: [].} =
+  if origGetEnvironmentStringsW == nil:
+    ctx.result = 0
+    return
+  ctx.result = cast[uint64](origGetEnvironmentStringsW())
+
+proc originalGetEnvironmentStringsA(ctx: var hr.HookContext) {.raises: [].} =
+  if origGetEnvironmentStringsA == nil:
+    ctx.result = 0
+    return
+  ctx.result = cast[uint64](origGetEnvironmentStringsA())
+
+proc originalGetEnvironmentStrings(ctx: var hr.HookContext) {.raises: [].} =
+  if origGetEnvironmentStrings == nil:
+    ctx.result = 0
+    return
+  ctx.result = cast[uint64](origGetEnvironmentStrings())
+
+template crtGetenvOriginal(orig, ctx: untyped) =
+  if orig == nil:
+    ctx.result = 0
+  else:
+    ctx.result = cast[uint64](orig(cast[LPCSTR](ctx.args[0])))
+
+template crtWGetenvOriginal(orig, ctx: untyped) =
+  if orig == nil:
+    ctx.result = 0
+  else:
+    ctx.result = cast[uint64](orig(cast[LPCWSTR](ctx.args[0])))
+
+template crtGetenvSOriginal(orig, ctx: untyped) =
+  if orig == nil:
+    ctx.result = uint64(uint32(22))              # EINVAL
+  else:
+    ctx.result = uint64(uint32(orig(
+      cast[ptr SIZE_T](ctx.args[0]), cast[LPSTR](ctx.args[1]),
+      SIZE_T(ctx.args[2]), cast[LPCSTR](ctx.args[3]))))
+
+template crtWGetenvSOriginal(orig, ctx: untyped) =
+  if orig == nil:
+    ctx.result = uint64(uint32(22))              # EINVAL
+  else:
+    ctx.result = uint64(uint32(orig(
+      cast[ptr SIZE_T](ctx.args[0]), cast[LPWSTR](ctx.args[1]),
+      SIZE_T(ctx.args[2]), cast[LPCWSTR](ctx.args[3]))))
+
+template crtDupenvSOriginal(orig, ctx: untyped) =
+  if orig == nil:
+    ctx.result = uint64(uint32(22))              # EINVAL
+  else:
+    ctx.result = uint64(uint32(orig(
+      cast[ptr LPSTR](ctx.args[0]), cast[ptr SIZE_T](ctx.args[1]),
+      cast[LPCSTR](ctx.args[2]))))
+
+template crtWDupenvSOriginal(orig, ctx: untyped) =
+  if orig == nil:
+    ctx.result = uint64(uint32(22))              # EINVAL
+  else:
+    ctx.result = uint64(uint32(orig(
+      cast[ptr LPWSTR](ctx.args[0]), cast[ptr SIZE_T](ctx.args[1]),
+      cast[LPCWSTR](ctx.args[2]))))
+
+proc originalUcrtGetenv(ctx: var hr.HookContext) {.raises: [].} =
+  crtGetenvOriginal(origUcrtGetenv, ctx)
+proc originalUcrtWGetenv(ctx: var hr.HookContext) {.raises: [].} =
+  crtWGetenvOriginal(origUcrtWGetenv, ctx)
+proc originalUcrtGetenvS(ctx: var hr.HookContext) {.raises: [].} =
+  crtGetenvSOriginal(origUcrtGetenvS, ctx)
+proc originalUcrtWGetenvS(ctx: var hr.HookContext) {.raises: [].} =
+  crtWGetenvSOriginal(origUcrtWGetenvS, ctx)
+proc originalUcrtDupenvS(ctx: var hr.HookContext) {.raises: [].} =
+  crtDupenvSOriginal(origUcrtDupenvS, ctx)
+proc originalUcrtWDupenvS(ctx: var hr.HookContext) {.raises: [].} =
+  crtWDupenvSOriginal(origUcrtWDupenvS, ctx)
+proc originalMsvcrtGetenv(ctx: var hr.HookContext) {.raises: [].} =
+  crtGetenvOriginal(origMsvcrtGetenv, ctx)
+proc originalMsvcrtWGetenv(ctx: var hr.HookContext) {.raises: [].} =
+  crtWGetenvOriginal(origMsvcrtWGetenv, ctx)
+proc originalMsvcrtGetenvS(ctx: var hr.HookContext) {.raises: [].} =
+  crtGetenvSOriginal(origMsvcrtGetenvS, ctx)
+proc originalMsvcrtWGetenvS(ctx: var hr.HookContext) {.raises: [].} =
+  crtWGetenvSOriginal(origMsvcrtWGetenvS, ctx)
+
 # --- M5 snoop callbacks ----------------------------------------------------
 
 const
@@ -4082,6 +4613,119 @@ proc snoopGetSystemTimeAsFileTime(ctx: var hr.HookContext) {.raises: [].} =
 proc snoopGetTickCount64(ctx: var hr.HookContext) {.raises: [].} =
   snoopTime(ctx, 2, "GetTickCount64")
 
+# --- M10 snoop callbacks (observed environment) ----------------------------
+
+proc cstrToString(p: LPCSTR): string {.raises: [].} =
+  if p == nil:
+    return ""
+  var n = 0
+  # Bounded for the same reason the block walk is: this pointer came from the
+  # monitored program, not from us.
+  while n < 32767 and cast[ptr UncheckedArray[char]](p)[n] != '\0':
+    inc n
+  result = newString(n)
+  for i in 0 ..< n:
+    result[i] = cast[ptr UncheckedArray[char]](p)[i]
+
+proc snoopEnvName(ctx: var hr.HookContext; nameArg: int; wide: bool;
+                  source: string) {.raises: [].} =
+  ## Shared body of every NAMED environment read, Win32 and CRT alike.
+  ##
+  ## The call is forwarded FIRST and the record is written afterwards, so a
+  ## record can never be the reason a program saw a different answer.
+  ##
+  ## The result is NOT consulted. A lookup that returns nothing is still a
+  ## dependency on that variable's ABSENCE: a build that behaves one way when
+  ## `CFLAGS` is unset and another way when it is set must re-run when someone
+  ## sets it, and it can only do that if the failed lookup was recorded. This
+  ## is the opposite of the rule the IPC arm follows -- a refused connect
+  ## reached no peer and is not recorded -- because there the record would
+  ## DOWNGRADE the capture, while here it only adds a name to a cache key.
+  hr.callNext(ctx)
+  let savedLastError = GetLastError()
+  if disabled > 0 or not initialized or fragmentDir.len == 0:
+    SetLastError(savedLastError)
+    return
+  try:
+    if ctx.args.len > nameArg:
+      let name =
+        if wide: widePtrToString(cast[LPCWSTR](ctx.args[nameArg]))
+        else: cstrToString(cast[LPCSTR](ctx.args[nameArg]))
+      recordEnvRead(name, source)
+  except CatchableError:
+    discard
+  SetLastError(savedLastError)
+
+proc snoopEnvBlock(ctx: var hr.HookContext; slot: int; source: string;
+                   inProgramArg: int) {.raises: [].} =
+  ## Shared body of the three whole-block reads.
+  ##
+  ## CALLER ATTRIBUTION IS LOAD-BEARING HERE, unlike on the named reads. Every
+  ## C runtime calls `GetEnvironmentStringsW` ONCE at startup to build the
+  ## snapshot `getenv` is served from -- in EVERY process, whatever the program
+  ## goes on to do. Expanding that call into per-name records would make every
+  ## action on Windows depend on its entire environment, which is a monitor
+  ## that makes everything uncacheable. So a block read from a SYSTEM image is
+  ## the CRT taking its snapshot and is not recorded; the reads that snapshot
+  ## then serves are recorded individually, by the `getenv` hooks, which is
+  ## strictly more precise.
+  ##
+  ## A block read from the program's OWN image is a different act: the program
+  ## has the whole environment in hand and we cannot see which parts of it
+  ## matter, so every name in the block is recorded.
+  ##
+  ## The attribution is `callerInProgram`'s, with its stated limits: a program
+  ## whose block read comes through a BUNDLED DLL reports `caller=system` and
+  ## is treated as a CRT snapshot. Such a program is not blind -- its named
+  ## reads are still recorded -- it just does not get the block expansion.
+  hr.callNext(ctx)
+  let savedLastError = GetLastError()
+  if disabled > 0 or not initialized or fragmentDir.len == 0:
+    SetLastError(savedLastError)
+    return
+  try:
+    let inProgram = ctx.args.len > inProgramArg and
+      ctx.args[inProgramArg] != 0'u64
+    let idx = slot * 2 + (if inProgram: 1 else: 0)
+    if not envBlockSeen[idx]:
+      envBlockSeen[idx] = true
+      if inProgram:
+        recordEnvBlockRead(source)
+  except CatchableError:
+    discard
+  SetLastError(savedLastError)
+
+proc snoopGetEnvironmentVariableW(ctx: var hr.HookContext) {.raises: [].} =
+  snoopEnvName(ctx, 0, true, "GetEnvironmentVariableW")
+proc snoopGetEnvironmentVariableA(ctx: var hr.HookContext) {.raises: [].} =
+  snoopEnvName(ctx, 0, false, "GetEnvironmentVariableA")
+proc snoopGetEnvironmentStringsW(ctx: var hr.HookContext) {.raises: [].} =
+  snoopEnvBlock(ctx, 0, "GetEnvironmentStringsW", 0)
+proc snoopGetEnvironmentStringsA(ctx: var hr.HookContext) {.raises: [].} =
+  snoopEnvBlock(ctx, 1, "GetEnvironmentStringsA", 0)
+proc snoopGetEnvironmentStrings(ctx: var hr.HookContext) {.raises: [].} =
+  snoopEnvBlock(ctx, 2, "GetEnvironmentStrings", 0)
+proc snoopUcrtGetenv(ctx: var hr.HookContext) {.raises: [].} =
+  snoopEnvName(ctx, 0, false, "getenv")
+proc snoopUcrtWGetenv(ctx: var hr.HookContext) {.raises: [].} =
+  snoopEnvName(ctx, 0, true, "_wgetenv")
+proc snoopUcrtGetenvS(ctx: var hr.HookContext) {.raises: [].} =
+  snoopEnvName(ctx, 3, false, "getenv_s")
+proc snoopUcrtWGetenvS(ctx: var hr.HookContext) {.raises: [].} =
+  snoopEnvName(ctx, 3, true, "_wgetenv_s")
+proc snoopUcrtDupenvS(ctx: var hr.HookContext) {.raises: [].} =
+  snoopEnvName(ctx, 2, false, "_dupenv_s")
+proc snoopUcrtWDupenvS(ctx: var hr.HookContext) {.raises: [].} =
+  snoopEnvName(ctx, 2, true, "_wdupenv_s")
+proc snoopMsvcrtGetenv(ctx: var hr.HookContext) {.raises: [].} =
+  snoopEnvName(ctx, 0, false, "getenv")
+proc snoopMsvcrtWGetenv(ctx: var hr.HookContext) {.raises: [].} =
+  snoopEnvName(ctx, 0, true, "_wgetenv")
+proc snoopMsvcrtGetenvS(ctx: var hr.HookContext) {.raises: [].} =
+  snoopEnvName(ctx, 3, false, "getenv_s")
+proc snoopMsvcrtWGetenvS(ctx: var hr.HookContext) {.raises: [].} =
+  snoopEnvName(ctx, 3, true, "_wgetenv_s")
+
 # --- M5 trampolines --------------------------------------------------------
 #
 # The non-determinism trampolines carry a FAST PATH the file trampolines do
@@ -4285,6 +4929,167 @@ proc trampolineGetTickCount64(): uint64 {.stdcall.} =
   hr.dispatchShimHook(hr.HookGetTickCount64, ctx)
   result = ctx.result
 
+# --- M10 trampolines (observed environment) --------------------------------
+#
+# THE FAST PATH IS THE POINT. `getenv` is called at a rate no file API
+# approaches, and a build's reads are overwhelmingly REPEATS of names already
+# recorded -- the first read of PATH is the evidence, the next nine thousand
+# are not. So a named read whose variable is already in the capture goes
+# straight to the original: no hook context, no chain lookup, no string built
+# from the caller's pointer. Measured on this host, that is the difference
+# between 1.43 us and ~100-150 ns per repeat read (the marginal cost of the
+# loop case over a no-lookup case, measured across three interleaved runs;
+# the whole-run percentages on a 90 ms process are noise).
+#
+# `envFastSeen*` is EXACT, not a hash filter, and `envFastSeen*`'s own comment
+# says why: a filter that answered "seen" for a name it had not seen would
+# drop the first read of a real variable, leaving an input missing from a
+# capture that still grades `mcComplete`.
+#
+# The residual, stated because the entropy trampolines have the same one: a
+# co-resident interposer registered on these chains does not see the calls the
+# fast path skips. It sees the first read of every distinct variable, which is
+# every event the monitor itself acts on.
+#
+# The WHOLE-BLOCK reads take the entropy hooks' shape instead -- a boolean per
+# (entry point, caller origin) -- because for them at most one act is
+# interesting and every later call repeats a decision already recorded.
+
+template envFastSkip(cond: untyped): untyped =
+  ## The guard every named-read trampoline shares. `fragmentDir.len == 0` is
+  ## in here rather than only in the snoop so an UNMONITORED process -- one
+  ## the shim is loaded into with nowhere to write -- pays nothing per call
+  ## instead of dispatching a chain whose only outcome is an early return.
+  disabled > 0 or not initialized or fragmentDir.len == 0 or (cond)
+
+proc trampolineGetEnvironmentVariableW(lpName: LPCWSTR; lpBuffer: LPWSTR;
+                                       nSize: DWORD): DWORD {.stdcall.} =
+  if origGetEnvironmentVariableW == nil:
+    return 0
+  if envFastSkip(envFastSeenWide(lpName)):
+    return origGetEnvironmentVariableW(lpName, lpBuffer, nSize)
+  var ctx = hr.HookContext(args: @[
+    cast[uint64](lpName), cast[uint64](lpBuffer), uint64(nSize)])
+  hr.dispatchShimHook(hr.HookGetEnvironmentVariableW, ctx)
+  result = DWORD(ctx.result)
+
+proc trampolineGetEnvironmentVariableA(lpName: LPCSTR; lpBuffer: LPSTR;
+                                       nSize: DWORD): DWORD {.stdcall.} =
+  if origGetEnvironmentVariableA == nil:
+    return 0
+  if envFastSkip(envFastSeenCstr(lpName)):
+    return origGetEnvironmentVariableA(lpName, lpBuffer, nSize)
+  var ctx = hr.HookContext(args: @[
+    cast[uint64](lpName), cast[uint64](lpBuffer), uint64(nSize)])
+  hr.dispatchShimHook(hr.HookGetEnvironmentVariableA, ctx)
+  result = DWORD(ctx.result)
+
+proc trampolineGetEnvironmentStringsW(): LPWSTR {.stdcall.} =
+  if origGetEnvironmentStringsW == nil:
+    return nil
+  let inProgram = callerInProgram(builtinReturnAddress(0))
+  if envBlockSeen[0 * 2 + (if inProgram: 1 else: 0)]:
+    return origGetEnvironmentStringsW()
+  var ctx = hr.HookContext(args: @[(if inProgram: 1'u64 else: 0'u64)])
+  hr.dispatchShimHook(hr.HookGetEnvironmentStringsW, ctx)
+  result = cast[LPWSTR](ctx.result)
+
+proc trampolineGetEnvironmentStringsA(): LPSTR {.stdcall.} =
+  if origGetEnvironmentStringsA == nil:
+    return nil
+  let inProgram = callerInProgram(builtinReturnAddress(0))
+  if envBlockSeen[1 * 2 + (if inProgram: 1 else: 0)]:
+    return origGetEnvironmentStringsA()
+  var ctx = hr.HookContext(args: @[(if inProgram: 1'u64 else: 0'u64)])
+  hr.dispatchShimHook(hr.HookGetEnvironmentStringsA, ctx)
+  result = cast[LPSTR](ctx.result)
+
+proc trampolineGetEnvironmentStrings(): LPSTR {.stdcall.} =
+  ## `GetEnvironmentStrings` is a SEPARATE export from
+  ## `GetEnvironmentStringsA` -- measured on this host they resolve to
+  ## different kernel32 bodies, so hooking one does not cover the other and a
+  ## caller that imports the undecorated name would escape.
+  if origGetEnvironmentStrings == nil:
+    return nil
+  let inProgram = callerInProgram(builtinReturnAddress(0))
+  if envBlockSeen[2 * 2 + (if inProgram: 1 else: 0)]:
+    return origGetEnvironmentStrings()
+  var ctx = hr.HookContext(args: @[(if inProgram: 1'u64 else: 0'u64)])
+  hr.dispatchShimHook(hr.HookGetEnvironmentStrings, ctx)
+  result = cast[LPSTR](ctx.result)
+
+template crtGetenvTrampoline(orig, hookName, nameArg, seenFn: untyped): untyped =
+  if orig == nil:
+    return nil
+  if envFastSkip(seenFn(nameArg)):
+    return orig(nameArg)
+  var ctx = hr.HookContext(args: @[cast[uint64](nameArg)])
+  hr.dispatchShimHook(hookName, ctx)
+  return cast[typeof(result)](ctx.result)
+
+template crtGetenvSTrampoline(orig, hookName, a0, a1, a2, a3,
+                              seenFn: untyped): untyped =
+  if orig == nil:
+    return cint(22)                              # EINVAL
+  if envFastSkip(seenFn(a3)):
+    return orig(a0, a1, a2, a3)
+  var ctx = hr.HookContext(args: @[
+    cast[uint64](a0), cast[uint64](a1), uint64(a2), cast[uint64](a3)])
+  hr.dispatchShimHook(hookName, ctx)
+  return cint(int32(uint32(ctx.result)))
+
+template crtDupenvSTrampoline(orig, hookName, a0, a1, a2,
+                              seenFn: untyped): untyped =
+  if orig == nil:
+    return cint(22)                              # EINVAL
+  if envFastSkip(seenFn(a2)):
+    return orig(a0, a1, a2)
+  var ctx = hr.HookContext(args: @[
+    cast[uint64](a0), cast[uint64](a1), cast[uint64](a2)])
+  hr.dispatchShimHook(hookName, ctx)
+  return cint(int32(uint32(ctx.result)))
+
+proc trampolineUcrtGetenv(name: LPCSTR): LPSTR {.cdecl.} =
+  crtGetenvTrampoline(origUcrtGetenv, hr.HookUcrtGetenv, name,
+    envFastSeenCstr)
+proc trampolineUcrtWGetenv(name: LPCWSTR): LPWSTR {.cdecl.} =
+  crtGetenvTrampoline(origUcrtWGetenv, hr.HookUcrtWGetenv, name,
+    envFastSeenWide)
+proc trampolineUcrtGetenvS(pReturnValue: ptr SIZE_T; buffer: LPSTR;
+                           numberOfElements: SIZE_T; varname: LPCSTR): cint
+                           {.cdecl.} =
+  crtGetenvSTrampoline(origUcrtGetenvS, hr.HookUcrtGetenvS,
+    pReturnValue, buffer, numberOfElements, varname, envFastSeenCstr)
+proc trampolineUcrtWGetenvS(pReturnValue: ptr SIZE_T; buffer: LPWSTR;
+                            numberOfElements: SIZE_T; varname: LPCWSTR): cint
+                            {.cdecl.} =
+  crtGetenvSTrampoline(origUcrtWGetenvS, hr.HookUcrtWGetenvS,
+    pReturnValue, buffer, numberOfElements, varname, envFastSeenWide)
+proc trampolineUcrtDupenvS(buffer: ptr LPSTR; numberOfElements: ptr SIZE_T;
+                           varname: LPCSTR): cint {.cdecl.} =
+  crtDupenvSTrampoline(origUcrtDupenvS, hr.HookUcrtDupenvS,
+    buffer, numberOfElements, varname, envFastSeenCstr)
+proc trampolineUcrtWDupenvS(buffer: ptr LPWSTR; numberOfElements: ptr SIZE_T;
+                            varname: LPCWSTR): cint {.cdecl.} =
+  crtDupenvSTrampoline(origUcrtWDupenvS, hr.HookUcrtWDupenvS,
+    buffer, numberOfElements, varname, envFastSeenWide)
+proc trampolineMsvcrtGetenv(name: LPCSTR): LPSTR {.cdecl.} =
+  crtGetenvTrampoline(origMsvcrtGetenv, hr.HookMsvcrtGetenv, name,
+    envFastSeenCstr)
+proc trampolineMsvcrtWGetenv(name: LPCWSTR): LPWSTR {.cdecl.} =
+  crtGetenvTrampoline(origMsvcrtWGetenv, hr.HookMsvcrtWGetenv, name,
+    envFastSeenWide)
+proc trampolineMsvcrtGetenvS(pReturnValue: ptr SIZE_T; buffer: LPSTR;
+                             numberOfElements: SIZE_T; varname: LPCSTR): cint
+                             {.cdecl.} =
+  crtGetenvSTrampoline(origMsvcrtGetenvS, hr.HookMsvcrtGetenvS,
+    pReturnValue, buffer, numberOfElements, varname, envFastSeenCstr)
+proc trampolineMsvcrtWGetenvS(pReturnValue: ptr SIZE_T; buffer: LPWSTR;
+                              numberOfElements: SIZE_T; varname: LPCWSTR): cint
+                              {.cdecl.} =
+  crtGetenvSTrampoline(origMsvcrtWGetenvS, hr.HookMsvcrtWGetenvS,
+    pReturnValue, buffer, numberOfElements, varname, envFastSeenWide)
+
 # --- Registry wiring -------------------------------------------------------
 #
 # Called once from repro_monitor_shim_init AFTER the registry has been
@@ -4373,6 +5178,29 @@ proc registerMonitorSnoopCallbacks*() =
   hr.registerMonitorHook(hr.HookGetSystemTimeAsFileTime,
                          snoopGetSystemTimeAsFileTime)
   hr.registerMonitorHook(hr.HookGetTickCount64, snoopGetTickCount64)
+  # M10 — observed environment. Both halves of the Windows environment: the
+  # PEB block through kernel32, and each C runtime's own startup snapshot
+  # through its `getenv` family.
+  hr.registerMonitorHook(hr.HookGetEnvironmentVariableW,
+                         snoopGetEnvironmentVariableW)
+  hr.registerMonitorHook(hr.HookGetEnvironmentVariableA,
+                         snoopGetEnvironmentVariableA)
+  hr.registerMonitorHook(hr.HookGetEnvironmentStringsW,
+                         snoopGetEnvironmentStringsW)
+  hr.registerMonitorHook(hr.HookGetEnvironmentStringsA,
+                         snoopGetEnvironmentStringsA)
+  hr.registerMonitorHook(hr.HookGetEnvironmentStrings,
+                         snoopGetEnvironmentStrings)
+  hr.registerMonitorHook(hr.HookUcrtGetenv, snoopUcrtGetenv)
+  hr.registerMonitorHook(hr.HookUcrtWGetenv, snoopUcrtWGetenv)
+  hr.registerMonitorHook(hr.HookUcrtGetenvS, snoopUcrtGetenvS)
+  hr.registerMonitorHook(hr.HookUcrtWGetenvS, snoopUcrtWGetenvS)
+  hr.registerMonitorHook(hr.HookUcrtDupenvS, snoopUcrtDupenvS)
+  hr.registerMonitorHook(hr.HookUcrtWDupenvS, snoopUcrtWDupenvS)
+  hr.registerMonitorHook(hr.HookMsvcrtGetenv, snoopMsvcrtGetenv)
+  hr.registerMonitorHook(hr.HookMsvcrtWGetenv, snoopMsvcrtWGetenv)
+  hr.registerMonitorHook(hr.HookMsvcrtGetenvS, snoopMsvcrtGetenvS)
+  hr.registerMonitorHook(hr.HookMsvcrtWGetenvS, snoopMsvcrtWGetenvS)
 
 # --- Unified install backend (M73 Phase 1) ---------------------------------
 #
@@ -4417,6 +5245,14 @@ type
                                 # API for a call to escape through -- as
                                 # opposed to a module that IS present and
                                 # whose hook failed, which stays a loss.
+    exportName: string          # M10: the UNDECORATED export to resolve, when
+                                # it differs from the registry key. The
+                                # registry is keyed by name and BOTH C
+                                # runtimes export `getenv`, so the two chains
+                                # are keyed `ucrtbase!getenv` /
+                                # `msvcrt!getenv` while the install pass and
+                                # the audit still ask each module for plain
+                                # `getenv`. Empty means "same as `name`".
 
 const kernel32FileIatDlls = @[
   "kernel32.dll", "kernelbase.dll",
@@ -4444,6 +5280,24 @@ const bcryptPrimitivesIatDlls = @["bcryptprimitives.dll"]
 # detour lands on the real body. The IAT fallback list names all three because
 # a caller may import from whichever module its SDK headers pointed at.
 const advapi32IatDlls = @["advapi32.dll", "cryptbase.dll", "cryptsp.dll"]
+
+# M10 — the environment surface.
+#
+# kernel32's environment APIs are re-exported through the `api-ms-win-core-
+# processenvironment-*` sets, so a caller's IAT may name either. The inline
+# detour at the kernel32 body covers both; these are the fallback list.
+const kernel32EnvIatDlls = @[
+  "kernel32.dll", "kernelbase.dll",
+  "api-ms-win-core-processenvironment-l1-1-0.dll",
+  "api-ms-win-core-processenvironment-l1-2-0.dll"
+]
+# The UCRT's environment functions are exported by `ucrtbase.dll` and
+# re-exported by `api-ms-win-crt-environment-l1-1-0.dll`; a program compiled
+# against the UCRT imports from the api-set, which FORWARDS, so the inline
+# detour on the ucrtbase body catches it either way.
+const ucrtEnvIatDlls = @[
+  "ucrtbase.dll", "api-ms-win-crt-environment-l1-1-0.dll"]
+const msvcrtEnvIatDlls = @["msvcrt.dll"]
 
 # Addresses of the kernel32 / ntdll entry points we successfully
 # inline-patched. The C-runtime atexit handler walks this and calls
@@ -4778,8 +5632,137 @@ let hookTable {.global.}: seq[HookSpec] = @[
     origStorage: cast[ptr pointer](addr origGetTickCount64),
     origCallback: originalGetTickCount64,
     iatDlls: kernel32FileIatDlls,
-    moduleDll: "kernel32.dll")
+    moduleDll: "kernel32.dll"),
+  # --- M10: observed environment (kernel32.dll) ---------------------------
+  HookSpec(name: hr.HookGetEnvironmentVariableW,
+    trampoline: cast[pointer](trampolineGetEnvironmentVariableW),
+    origStorage: cast[ptr pointer](addr origGetEnvironmentVariableW),
+    origCallback: originalGetEnvironmentVariableW,
+    iatDlls: kernel32EnvIatDlls,
+    moduleDll: "kernel32.dll"),
+  HookSpec(name: hr.HookGetEnvironmentVariableA,
+    trampoline: cast[pointer](trampolineGetEnvironmentVariableA),
+    origStorage: cast[ptr pointer](addr origGetEnvironmentVariableA),
+    origCallback: originalGetEnvironmentVariableA,
+    iatDlls: kernel32EnvIatDlls,
+    moduleDll: "kernel32.dll"),
+  HookSpec(name: hr.HookGetEnvironmentStringsW,
+    trampoline: cast[pointer](trampolineGetEnvironmentStringsW),
+    origStorage: cast[ptr pointer](addr origGetEnvironmentStringsW),
+    origCallback: originalGetEnvironmentStringsW,
+    iatDlls: kernel32EnvIatDlls,
+    moduleDll: "kernel32.dll"),
+  HookSpec(name: hr.HookGetEnvironmentStringsA,
+    trampoline: cast[pointer](trampolineGetEnvironmentStringsA),
+    origStorage: cast[ptr pointer](addr origGetEnvironmentStringsA),
+    origCallback: originalGetEnvironmentStringsA,
+    iatDlls: kernel32EnvIatDlls,
+    moduleDll: "kernel32.dll"),
+  HookSpec(name: hr.HookGetEnvironmentStrings,
+    trampoline: cast[pointer](trampolineGetEnvironmentStrings),
+    origStorage: cast[ptr pointer](addr origGetEnvironmentStrings),
+    origCallback: originalGetEnvironmentStrings,
+    iatDlls: kernel32EnvIatDlls,
+    moduleDll: "kernel32.dll"),
+  # --- M10: observed environment (the UCRT) -------------------------------
+  #
+  # `optionalModule` on every UCRT entry, because a process built against the
+  # legacy msvcrt need not have `ucrtbase.dll` mapped at all. `forceLoad
+  # ObservedModules` asks for it, but an absent module means there is no
+  # entry point for a call to escape through -- the same judgement M5 made for
+  # `bcryptprimitives.dll`.
+  HookSpec(name: hr.HookUcrtGetenv,
+    trampoline: cast[pointer](trampolineUcrtGetenv),
+    origStorage: cast[ptr pointer](addr origUcrtGetenv),
+    origCallback: originalUcrtGetenv,
+    iatDlls: ucrtEnvIatDlls,
+    moduleDll: "ucrtbase.dll",
+    optionalModule: true,
+    exportName: "getenv"),
+  HookSpec(name: hr.HookUcrtWGetenv,
+    trampoline: cast[pointer](trampolineUcrtWGetenv),
+    origStorage: cast[ptr pointer](addr origUcrtWGetenv),
+    origCallback: originalUcrtWGetenv,
+    iatDlls: ucrtEnvIatDlls,
+    moduleDll: "ucrtbase.dll",
+    optionalModule: true,
+    exportName: "_wgetenv"),
+  HookSpec(name: hr.HookUcrtGetenvS,
+    trampoline: cast[pointer](trampolineUcrtGetenvS),
+    origStorage: cast[ptr pointer](addr origUcrtGetenvS),
+    origCallback: originalUcrtGetenvS,
+    iatDlls: ucrtEnvIatDlls,
+    moduleDll: "ucrtbase.dll",
+    optionalModule: true,
+    exportName: "getenv_s"),
+  HookSpec(name: hr.HookUcrtWGetenvS,
+    trampoline: cast[pointer](trampolineUcrtWGetenvS),
+    origStorage: cast[ptr pointer](addr origUcrtWGetenvS),
+    origCallback: originalUcrtWGetenvS,
+    iatDlls: ucrtEnvIatDlls,
+    moduleDll: "ucrtbase.dll",
+    optionalModule: true,
+    exportName: "_wgetenv_s"),
+  HookSpec(name: hr.HookUcrtDupenvS,
+    trampoline: cast[pointer](trampolineUcrtDupenvS),
+    origStorage: cast[ptr pointer](addr origUcrtDupenvS),
+    origCallback: originalUcrtDupenvS,
+    iatDlls: ucrtEnvIatDlls,
+    moduleDll: "ucrtbase.dll",
+    optionalModule: true,
+    exportName: "_dupenv_s"),
+  HookSpec(name: hr.HookUcrtWDupenvS,
+    trampoline: cast[pointer](trampolineUcrtWDupenvS),
+    origStorage: cast[ptr pointer](addr origUcrtWDupenvS),
+    origCallback: originalUcrtWDupenvS,
+    iatDlls: ucrtEnvIatDlls,
+    moduleDll: "ucrtbase.dll",
+    optionalModule: true,
+    exportName: "_wdupenv_s"),
+  # --- M10: observed environment (the legacy CRT) -------------------------
+  #
+  # `msvcrt.dll` exports NEITHER `_dupenv_s` NOR `_wdupenv_s` (probed on this
+  # host, Win11 26200), so there is nothing to hook and nothing to escape
+  # through; only the four it does export are listed.
+  HookSpec(name: hr.HookMsvcrtGetenv,
+    trampoline: cast[pointer](trampolineMsvcrtGetenv),
+    origStorage: cast[ptr pointer](addr origMsvcrtGetenv),
+    origCallback: originalMsvcrtGetenv,
+    iatDlls: msvcrtEnvIatDlls,
+    moduleDll: "msvcrt.dll",
+    optionalModule: true,
+    exportName: "getenv"),
+  HookSpec(name: hr.HookMsvcrtWGetenv,
+    trampoline: cast[pointer](trampolineMsvcrtWGetenv),
+    origStorage: cast[ptr pointer](addr origMsvcrtWGetenv),
+    origCallback: originalMsvcrtWGetenv,
+    iatDlls: msvcrtEnvIatDlls,
+    moduleDll: "msvcrt.dll",
+    optionalModule: true,
+    exportName: "_wgetenv"),
+  HookSpec(name: hr.HookMsvcrtGetenvS,
+    trampoline: cast[pointer](trampolineMsvcrtGetenvS),
+    origStorage: cast[ptr pointer](addr origMsvcrtGetenvS),
+    origCallback: originalMsvcrtGetenvS,
+    iatDlls: msvcrtEnvIatDlls,
+    moduleDll: "msvcrt.dll",
+    optionalModule: true,
+    exportName: "getenv_s"),
+  HookSpec(name: hr.HookMsvcrtWGetenvS,
+    trampoline: cast[pointer](trampolineMsvcrtWGetenvS),
+    origStorage: cast[ptr pointer](addr origMsvcrtWGetenvS),
+    origCallback: originalMsvcrtWGetenvS,
+    iatDlls: msvcrtEnvIatDlls,
+    moduleDll: "msvcrt.dll",
+    optionalModule: true,
+    exportName: "_wgetenv_s")
 ]
+
+proc specExportName(spec: HookSpec): string {.raises: [].} =
+  ## The undecorated export to resolve for `spec`. Differs from the registry
+  ## key only for the CRT entries, whose keys are module-qualified because two
+  ## modules export the same name into one process.
+  if spec.exportName.len > 0: spec.exportName else: spec.name
 
 proc forceLoadObservedModules() {.raises: [].} =
   ## Map the modules the M5 entry points live in, before the install pass.
@@ -4795,8 +5778,14 @@ proc forceLoadObservedModules() {.raises: [].} =
   ## The cost is that these images join the process's recorded module set, so
   ## they appear as library-load reads. That is not a fiction -- they really
   ## are mapped -- and it is the same status the shim's own DLL already has.
+  ## M10 adds the two C runtimes for the same reason. `ucrtbase.dll` and
+  ## `msvcrt.dll` each keep their OWN copy of the environment, and a process
+  ## may map either, both, or one of them late (a plugin DLL built against the
+  ## other runtime). Mapping both up front makes "the `getenv` family is
+  ## hooked" true for the whole process lifetime instead of true only when the
+  ## program happened to be linked the way we guessed.
   const names = ["ws2_32.dll", "bcrypt.dll", "advapi32.dll",
-                 "bcryptprimitives.dll"]
+                 "bcryptprimitives.dll", "ucrtbase.dll", "msvcrt.dll"]
   for n in names:
     var wide = newSeq[uint16](n.len + 1)
     for i, c in n:
@@ -4827,7 +5816,8 @@ proc queueInlineInstall(spec: HookSpec; hModule: HANDLE): cint =
     if spec.origStorage[] != nil:
       # Already installed (idempotent call). Treat as success.
       return 0
-    let target = GetProcAddress(hModule, cast[LPCSTR](spec.name.cstring))
+    let exportName = specExportName(spec)
+    let target = GetProcAddress(hModule, cast[LPCSTR](exportName.cstring))
     if target == nil:
       return -1
     let rc = ctInlineHookInstall(target, spec.trampoline, spec.origStorage)
@@ -4840,9 +5830,10 @@ proc installIatFor(spec: HookSpec) =
   ## Walks every fallback DLL the spec declares and patches the first IAT
   ## slot that yields a non-nil original pointer; subsequent DLLs only
   ## redirect (the chain already has the original wired).
+  let exportName = specExportName(spec)
   for dll in spec.iatDlls:
     if spec.origStorage[] == nil:
-      let orig = patchIATAllModules(dll.cstring, spec.name.cstring,
+      let orig = patchIATAllModules(dll.cstring, exportName.cstring,
                                     spec.trampoline)
       if orig != nil:
         spec.origStorage[] = orig
@@ -4851,7 +5842,7 @@ proc installIatFor(spec: HookSpec) =
           " from " & dll & " (IAT fallback)\n"))
     else:
       # We already captured the real function pointer; only redirect the IAT.
-      discard patchIATAllModules(dll.cstring, spec.name.cstring,
+      discard patchIATAllModules(dll.cstring, exportName.cstring,
                                  spec.trampoline)
 
 proc installAllHooks(): int =
@@ -5075,6 +6066,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     initLock(initLockVar)
     initLock(recordLock)
     initLock(fdLock)
+    initLock(envLock)
     locksReady = true
   acquire(initLockVar)
   if initialized:
@@ -5182,7 +6174,8 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
         # with its existing "addr == nil -> failing name" branch.
         targets.add((spec.name, pointer(nil)))
         continue
-      let addr0 = GetProcAddress(hMod, cast[LPCSTR](spec.name.cstring))
+      let auditExport = specExportName(spec)
+      let addr0 = GetProcAddress(hMod, cast[LPCSTR](auditExport.cstring))
       targets.add((spec.name, addr0))
     runInstallAudit(targets, dbg)
   dbg("[repro_monitor_shim] initialization complete\n")

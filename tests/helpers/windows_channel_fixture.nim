@@ -153,6 +153,65 @@ proc GetExitCodeProcess(h: H; code: ptr DW): BL
 proc SetHandleInformation(h: H; mask, flags: DW): BL
   {.importc, stdcall, dynlib: "kernel32".}
 
+# --- M10: the environment surfaces -----------------------------------------
+#
+# Two families, declared separately on purpose, because Windows keeps TWO
+# copies of the environment and a program reads exactly one of them:
+#
+#   * kernel32's `GetEnvironmentVariable*` / `GetEnvironmentStrings*` read the
+#     PEB block;
+#   * a C runtime's `getenv` reads that runtime's OWN snapshot, taken from the
+#     block once at CRT startup. A program linked against a CRT can therefore
+#     run to completion without calling a single Win32 environment API.
+#
+# BOTH runtimes are exercised, and they are genuinely different modules with
+# different copies in one process: `msvcrt.dll` is what classic mingw-w64
+# links (and what these test binaries themselves import), `ucrtbase.dll` is
+# what MSVC, clang-cl, mingw-w64 UCRT builds, Node and Python use. Hooking one
+# and testing the other would prove nothing about the one that shipped.
+proc GetEnvironmentVariableW(name: ptr uint16; buf: ptr uint16; size: DW): DW
+  {.importc, stdcall, dynlib: "kernel32".}
+proc GetEnvironmentVariableA(name: cstring; buf: cstring; size: DW): DW
+  {.importc, stdcall, dynlib: "kernel32".}
+proc GetEnvironmentStringsW(): ptr uint16
+  {.importc, stdcall, dynlib: "kernel32".}
+proc FreeEnvironmentStringsW(p: ptr uint16): BL
+  {.importc, stdcall, dynlib: "kernel32".}
+proc CreateThread(sa: pointer; stackSize: uint; start: pointer;
+                  param: pointer; flags: DW; tid: ptr DW): H
+  {.importc, stdcall, dynlib: "kernel32".}
+proc GetExitCodeThread(h: H; code: ptr DW): BL
+  {.importc, stdcall, dynlib: "kernel32".}
+proc GetProcAddress(m: H; name: cstring): pointer
+  {.importc, stdcall, dynlib: "kernel32".}
+proc GetModuleHandleA(name: cstring): H
+  {.importc, stdcall, dynlib: "kernel32".}
+
+proc msvcrtGetenv(name: cstring): cstring
+  {.importc: "getenv", cdecl, dynlib: "msvcrt".}
+proc msvcrtWGetenv(name: ptr uint16): ptr uint16
+  {.importc: "_wgetenv", cdecl, dynlib: "msvcrt".}
+proc msvcrtGetenvS(ret: ptr uint; buf: cstring; n: uint; name: cstring): int32
+  {.importc: "getenv_s", cdecl, dynlib: "msvcrt".}
+proc msvcrtWGetenvS(ret: ptr uint; buf: ptr uint16; n: uint;
+                    name: ptr uint16): int32
+  {.importc: "_wgetenv_s", cdecl, dynlib: "msvcrt".}
+
+proc ucrtGetenv(name: cstring): cstring
+  {.importc: "getenv", cdecl, dynlib: "ucrtbase".}
+proc ucrtWGetenv(name: ptr uint16): ptr uint16
+  {.importc: "_wgetenv", cdecl, dynlib: "ucrtbase".}
+proc ucrtGetenvS(ret: ptr uint; buf: cstring; n: uint; name: cstring): int32
+  {.importc: "getenv_s", cdecl, dynlib: "ucrtbase".}
+proc ucrtWGetenvS(ret: ptr uint; buf: ptr uint16; n: uint;
+                  name: ptr uint16): int32
+  {.importc: "_wgetenv_s", cdecl, dynlib: "ucrtbase".}
+proc ucrtDupenvS(buf: ptr cstring; n: ptr uint; name: cstring): int32
+  {.importc: "_dupenv_s", cdecl, dynlib: "ucrtbase".}
+proc ucrtWDupenvS(buf: ptr ptr uint16; n: ptr uint; name: ptr uint16): int32
+  {.importc: "_wdupenv_s", cdecl, dynlib: "ucrtbase".}
+proc ucrtFree(p: pointer) {.importc: "free", cdecl, dynlib: "ucrtbase".}
+
 proc NtCreateFile(fileHandle: ptr H; desiredAccess: DW;
                   objectAttributes: ptr ObjectAttributesT;
                   ioStatusBlock: ptr IoStatusBlockT;
@@ -607,6 +666,302 @@ proc fxAds(path: string): int =
     return 83
   0
 
+# --- M10 fixture modes: observed environment --------------------------------
+#
+# Every mode below ASSERTS THE OUTCOME IT NEEDS, for the reason the M5 modes
+# do: a lookup that silently failed would produce a run with no env record,
+# and a records-only assertion in the test would then pass for the wrong
+# reason -- the same shape as the monitoring failure being tested.
+
+proc envBufW(): seq[uint16] = newSeq[uint16](32768)
+
+# EVERY ENTRY POINT READS ITS OWN VARIABLE, and that is not fussiness.
+#
+# The obvious fixture reads one variable through all of an API family's entry
+# points. It cannot distinguish them: the records are deduped by NAME, so the
+# first entry point to fire produces the only record and deleting the hook on
+# any of the others changes nothing the test can see. Mutation testing is what
+# makes this concrete -- with one shared variable, "the ANSI arm is never
+# recorded" survives. So each entry point below reads `<base>_<SUFFIX>`, and
+# each suffix appears in the test's assertions on its own.
+proc envVarFor(base, suffix: string): string = base & "_" & suffix
+
+proc fxEnvWin32(base: string): int =
+  ## The two Win32 named entry points, one variable each.
+  ##
+  ## `GetEnvironmentVariableA` is not a legacy curiosity: it is what the shim's
+  ## own `readEnvString` uses, and what any ANSI-built tool uses.
+  let nw = envVarFor(base, "GEVW")
+  var w = wide(nw)
+  var buf = envBufW()
+  if GetEnvironmentVariableW(addr w[0], addr buf[0], DW(buf.len)) == 0'u32:
+    stderr.writeLine "GetEnvironmentVariableW(" & nw & ") found nothing; " &
+      "this run cannot test the recorded-read path"
+    return 101
+  let na = envVarFor(base, "GEVA")
+  var abuf = newString(32768)
+  if GetEnvironmentVariableA(na.cstring, cast[cstring](addr abuf[0]),
+      DW(abuf.len)) == 0'u32:
+    stderr.writeLine "GetEnvironmentVariableA(" & na & ") found nothing"
+    return 102
+  0
+
+proc fxEnvOne(name: string): int =
+  ## Read exactly ONE named variable, through one entry point.
+  ##
+  ## Used by the cases that are about a specific NAME rather than about a
+  ## specific entry point -- the denylisted control variable, and the
+  ## read/not-read pair.
+  var w = wide(name)
+  var buf = envBufW()
+  if GetEnvironmentVariableW(addr w[0], addr buf[0], DW(buf.len)) == 0'u32:
+    stderr.writeLine "GetEnvironmentVariableW(" & name & ") found nothing"
+    return 120
+  0
+
+proc fxEnvBlock(): int =
+  ## Read the WHOLE environment block from the fixture's own image.
+  ##
+  ## The caller origin is the point. Every C runtime calls this once at startup
+  ## to build the snapshot `getenv` is served from, in every process; that call
+  ## comes from a system image and must NOT be expanded into per-variable
+  ## records, or every action on Windows would depend on its entire
+  ## environment. A call from the PROGRAM's own image is a different act -- the
+  ## program now holds the whole environment and nothing can see which parts of
+  ## it matter -- and must be expanded. This mode produces the second.
+  let p = GetEnvironmentStringsW()
+  if p == nil:
+    stderr.writeLine "GetEnvironmentStringsW returned NULL"
+    return 103
+  # Touch the block so this is a genuine read rather than a pointer fetch.
+  let arr = cast[ptr UncheckedArray[uint16]](p)
+  var entries = 0
+  var i = 0
+  while i < 1 shl 20 and arr[i] != 0'u16:
+    while i < 1 shl 20 and arr[i] != 0'u16:
+      inc i
+    inc entries
+    inc i
+  discard FreeEnvironmentStringsW(p)
+  if entries == 0:
+    stderr.writeLine "the environment block was EMPTY; this run cannot test " &
+      "the block expansion"
+    return 104
+  0
+
+proc fxEnvBlockSystem(): int =
+  ## A whole-block read whose CALLER IS A SYSTEM IMAGE.
+  ##
+  ## This mode exists because mutation testing found that the caller-origin
+  ## gate on the block expansion had NO test able to see it: nothing in any
+  ## other fixture mode -- and, measured, not `cmd /c ver` either -- performs a
+  ## block read from a system image, so "expand for every caller" changed
+  ## nothing an assertion could reach. It is not an academic branch: a
+  ## UCRT-linked program's startup DOES call `GetEnvironmentStringsW` from
+  ## `ucrtbase`, in every process, and expanding that would make every action
+  ## on Windows depend on its entire environment.
+  ##
+  ## The trick is to run `GetEnvironmentStringsW` AS A THREAD START ROUTINE.
+  ## The thread is entered from `kernel32!BaseThreadInitThunk`, so the return
+  ## address the shim attributes on is inside kernel32 rather than inside this
+  ## binary -- a genuine system-image caller, with no system component needing
+  ## to cooperate. The signature matches: `LPTHREAD_START_ROUTINE` takes one
+  ## ignored pointer and returns one, which is what the exit code carries back.
+  let k32 = GetModuleHandleA("kernel32.dll")
+  if k32 == nil:
+    return 121
+  let fn = GetProcAddress(k32, "GetEnvironmentStringsW")
+  if fn == nil:
+    return 122
+  var tid: DW = 0
+  let th = CreateThread(nil, 0'u, fn, nil, 0'u32, addr tid)
+  if th == nil or th == Invalid:
+    stderr.writeLine "CreateThread on GetEnvironmentStringsW failed err=" &
+      $GetLastError()
+    return 123
+  if WaitForSingleObject(th, InfiniteWait) != 0'u32:
+    closeH(th)
+    return 124
+  var code: DW = 0
+  let gotCode = GetExitCodeThread(th, addr code)
+  closeH(th)
+  if gotCode == 0:
+    return 125
+  # The exit code is the low half of the returned block pointer. Zero would
+  # mean the call did not happen (or returned NULL), and the test's
+  # "the block was NOT expanded" assertion would then pass for the wrong
+  # reason -- the same shape as the monitoring failure being tested.
+  if code == 0'u32:
+    stderr.writeLine "the system-caller GetEnvironmentStringsW returned NULL; " &
+      "this run does not exercise the caller-origin gate"
+    return 126
+  0
+
+proc fxEnvMany(base: string; count: int): int =
+  ## Read `count` DISTINCT variables, twice each.
+  ##
+  ## Also a mutation-driven mode. The trampoline's dedup table is a
+  ## fixed-size open-addressed table, and with a dozen names its collision
+  ## handling is never exercised at all: mutations that made the lookup match
+  ## on the slot alone, or drop its length check, both survived. Several
+  ## hundred names in a 1024-slot table make same-slot pairs a near-certainty,
+  ## so an inexact lookup drops the first read of some real variable -- which
+  ## is a missing input in a capture that still grades complete.
+  ##
+  ## Twice each, because the first read populates the table and the second is
+  ## the one that consults it.
+  for pass in 0 .. 1:
+    for i in 0 ..< count:
+      var idx = $i
+      while idx.len < 3:
+        idx = "0" & idx
+      let name = base & "_K" & idx
+      if msvcrtGetenv(name.cstring) == nil:
+        stderr.writeLine "pass " & $pass & ": getenv(" & name & ") returned NULL"
+        return 127
+  0
+
+proc fxEnvMsvcrt(base: string): int =
+  ## The legacy CRT's four environment entry points, one variable each.
+  let nGetenv = envVarFor(base, "MGETENV")
+  if msvcrtGetenv(nGetenv.cstring) == nil:
+    stderr.writeLine "msvcrt getenv(" & nGetenv & ") returned NULL"
+    return 105
+  let nWGetenv = envVarFor(base, "MWGETENV")
+  var w = wide(nWGetenv)
+  if msvcrtWGetenv(addr w[0]) == nil:
+    stderr.writeLine "msvcrt _wgetenv(" & nWGetenv & ") returned NULL"
+    return 106
+  # `getenv_s` on a name that EXISTS: rc 0 and a non-zero length.
+  let nGetenvS = envVarFor(base, "MGETENVS")
+  var got: uint = 0
+  var buf = newString(4096)
+  if msvcrtGetenvS(addr got, cast[cstring](addr buf[0]), uint(buf.len),
+      nGetenvS.cstring) != 0'i32 or got == 0'u:
+    stderr.writeLine "msvcrt getenv_s(" & nGetenvS & ") failed"
+    return 107
+  let nWGetenvS = envVarFor(base, "MWGETENVS")
+  var sw = wide(nWGetenvS)
+  var wgot: uint = 0
+  var wbuf = envBufW()
+  if msvcrtWGetenvS(addr wgot, addr wbuf[0], uint(wbuf.len),
+      addr sw[0]) != 0'i32 or wgot == 0'u:
+    stderr.writeLine "msvcrt _wgetenv_s(" & nWGetenvS & ") failed"
+    return 108
+  0
+
+proc fxEnvUcrt(base: string): int =
+  ## The UCRT's six, one variable each. `_dupenv_s` / `_wdupenv_s` exist here
+  ## and NOT in `msvcrt.dll` (probed, not assumed), which is why the two arms
+  ## differ in size.
+  let nGetenv = envVarFor(base, "UGETENV")
+  if ucrtGetenv(nGetenv.cstring) == nil:
+    stderr.writeLine "ucrtbase getenv(" & nGetenv & ") returned NULL"
+    return 109
+  let nWGetenv = envVarFor(base, "UWGETENV")
+  var w = wide(nWGetenv)
+  if ucrtWGetenv(addr w[0]) == nil:
+    stderr.writeLine "ucrtbase _wgetenv(" & nWGetenv & ") returned NULL"
+    return 110
+  let nGetenvS = envVarFor(base, "UGETENVS")
+  var got: uint = 0
+  var buf = newString(4096)
+  if ucrtGetenvS(addr got, cast[cstring](addr buf[0]), uint(buf.len),
+      nGetenvS.cstring) != 0'i32 or got == 0'u:
+    stderr.writeLine "ucrtbase getenv_s(" & nGetenvS & ") failed"
+    return 111
+  let nWGetenvS = envVarFor(base, "UWGETENVS")
+  var sw = wide(nWGetenvS)
+  var wgot: uint = 0
+  var wbuf = envBufW()
+  if ucrtWGetenvS(addr wgot, addr wbuf[0], uint(wbuf.len),
+      addr sw[0]) != 0'i32 or wgot == 0'u:
+    stderr.writeLine "ucrtbase _wgetenv_s(" & nWGetenvS & ") failed"
+    return 112
+  let nDupenvS = envVarFor(base, "UDUPENVS")
+  var dup: cstring = nil
+  var dupLen: uint = 0
+  if ucrtDupenvS(addr dup, addr dupLen, nDupenvS.cstring) != 0'i32 or
+      dup == nil:
+    stderr.writeLine "ucrtbase _dupenv_s(" & nDupenvS & ") failed"
+    return 113
+  ucrtFree(cast[pointer](dup))
+  let nWDupenvS = envVarFor(base, "UWDUPENVS")
+  var dw = wide(nWDupenvS)
+  var wdup: ptr uint16 = nil
+  var wdupLen: uint = 0
+  if ucrtWDupenvS(addr wdup, addr wdupLen, addr dw[0]) != 0'i32 or wdup == nil:
+    stderr.writeLine "ucrtbase _wdupenv_s(" & nWDupenvS & ") failed"
+    return 114
+  ucrtFree(cast[pointer](wdup))
+  0
+
+proc fxEnvAbsent(name: string): int =
+  ## Look up a variable that is NOT set, and REQUIRE the miss.
+  ##
+  ## A failed lookup is still a dependency -- on the variable's ABSENCE. A
+  ## build that behaves one way with `CFLAGS` unset and another way with it set
+  ## must re-run when somebody sets it, and it can only do that if the miss was
+  ## recorded. This is deliberately the opposite of the rule the IPC arm
+  ## follows for a refused connect, because there the record would DOWNGRADE
+  ## the capture while here it only adds a name to a cache key.
+  ##
+  ## The miss is asserted: if the variable turned out to be set, the test's
+  ## "the absent lookup was still recorded" assertion would pass for the
+  ## ordinary reason instead.
+  var w = wide(name)
+  var buf = envBufW()
+  if GetEnvironmentVariableW(addr w[0], addr buf[0], DW(buf.len)) != 0'u32:
+    stderr.writeLine "the variable " & name & " unexpectedly EXISTS; this " &
+      "run does not test the absent-lookup path"
+    return 115
+  if msvcrtGetenv(name.cstring) != nil:
+    stderr.writeLine "msvcrt getenv(" & name & ") unexpectedly found a value"
+    return 116
+  0
+
+proc fxEnvCase(name: string): int =
+  ## Read ONE variable under two spellings.
+  ##
+  ## Windows environment lookup is case-insensitive, so `Path` and `PATH` are
+  ## one variable with one value. A dedup keyed on the spelling would record it
+  ## twice and a consumer would fold the same value in twice under two names.
+  var lower = name.toLowerAscii
+  var upper = name.toUpperAscii
+  var wl = wide(lower)
+  var wu = wide(upper)
+  var buf = envBufW()
+  if GetEnvironmentVariableW(addr wl[0], addr buf[0], DW(buf.len)) == 0'u32:
+    stderr.writeLine "lower-case lookup of " & name & " found nothing"
+    return 117
+  if GetEnvironmentVariableW(addr wu[0], addr buf[0], DW(buf.len)) == 0'u32:
+    stderr.writeLine "upper-case lookup of " & name & " found nothing"
+    return 118
+  0
+
+proc fxEnvLoop(name: string; rounds: int): int =
+  ## `rounds` reads of ONE name, through the CRT this binary actually links.
+  ##
+  ## Two things at once. It is the dedup test -- a per-call record would bury
+  ## the depfile and defeat the point of an observed-input SET -- and it is the
+  ## cost measurement, because `getenv` is called at a rate no file API
+  ## approaches. All but the first of these `rounds` reads is a REPEAT, so this
+  ## is precisely the case the trampoline's fast path exists for: an exact,
+  ## allocation-free lookup of an already-recorded name. Exact and not a hash
+  ## filter, because a filter that answered "seen" wrongly would drop the first
+  ## read of a real variable.
+  for _ in 0 ..< rounds:
+    if msvcrtGetenv(name.cstring) == nil:
+      return 119
+  0
+
+proc fxEnvNone(): int =
+  ## Read NOTHING. The control for the other direction: a variable that is set
+  ## in this process's environment and never looked at must not appear in the
+  ## capture. Without it, an implementation that recorded the whole block
+  ## unconditionally would pass every positive assertion in the file.
+  0
+
 proc channelFixtureMain*(mode: string; arg: string): int =
   ## Run one channel exercise. Non-zero means the channel was NOT exercised.
   case mode
@@ -630,6 +985,18 @@ proc channelFixtureMain*(mode: string; arg: string): int =
   of "anon-pipe-child": fxAnonPipeChild(arg)
   of "open-as-spelled": fxOpenAsSpelled(arg)
   of "ads": fxAds(arg)
+  # M10 — observed environment.
+  of "env-win32": fxEnvWin32(arg)
+  of "env-one": fxEnvOne(arg)
+  of "env-block": fxEnvBlock()
+  of "env-block-system": fxEnvBlockSystem()
+  of "env-many": fxEnvMany(arg, 300)
+  of "env-msvcrt": fxEnvMsvcrt(arg)
+  of "env-ucrt": fxEnvUcrt(arg)
+  of "env-absent": fxEnvAbsent(arg)
+  of "env-case": fxEnvCase(arg)
+  of "env-loop": fxEnvLoop(arg, 50_000)
+  of "env-none": fxEnvNone()
   else: 99
 
 proc runChannelFixtureIfRequested*() =

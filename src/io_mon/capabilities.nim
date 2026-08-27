@@ -174,9 +174,14 @@ const
     # not recorded as observed inputs" by reading English. Those two demand
     # opposite responses and are one string-match apart. The Windows profile is
     # the case that forced it: after M5 closed ipc-connect and external-content
-    # it has five declared gaps, FOUR of them output-side or identity fidelity
-    # and exactly one -- `mcapObservedEnv` -- an input channel. Nothing in the
-    # record said which.
+    # it HAD five declared gaps, four of them output-side or identity fidelity
+    # and exactly one -- `mcapObservedEnv` -- an input channel, with nothing in
+    # the record saying which. M10 then gave that one records, so Windows now
+    # declares NO input-channel gap at all. The key is not thereby decoration:
+    # older Windows depfiles still carry `input=true` for it, the other
+    # profiles still have gaps of both kinds, and a capability's membership
+    # here is a property of the CAPABILITY rather than of whether any
+    # particular backend happens to implement it.
     #
     # THIS IS NOT `InputEvidenceCapabilities`, which is a SUBSET: the floor
     # whose absence forces `mcIncomplete` outright. A capability can be an input
@@ -341,7 +346,51 @@ const
     # MAPPED VIEW of a file, whose bytes arrive by page fault and pass no read
     # hook anywhere -- recorded as an ordinary `moFileRead` on the underlying
     # path so the bytes land in the cache key rather than merely in the log.
-    mcapExternalContent
+    mcapExternalContent,
+    # M10 -------------------------------------------------------------------
+    #
+    # mrEnvRead / moEnvRead, carrying the variable NAME, deduped per process,
+    # never downgrading -- the SAME contract the macOS and Linux arms
+    # implement, because a consumer compares captures across platforms and a
+    # Windows record that meant something subtly different would be worse than
+    # the honest gap it replaces.
+    #
+    # This was the last Windows gap that was an INPUT channel, and the only
+    # one that could produce a false `mcComplete` over something unseen: a
+    # build reads a variable, nothing records it, the capture grades complete,
+    # and the action cache serves a stale result the next time the value
+    # changes. The four gaps left below are output-side or identity fidelity.
+    #
+    # WHAT IS COVERED, stated as the claim rather than as a list of hooks:
+    # every read that goes through a CALL. Windows keeps TWO copies of the
+    # environment and a program reads exactly one of them, so both are hooked:
+    #
+    #   * the PEB block, through kernel32's `GetEnvironmentVariableW`/`A` and
+    #     the three whole-block exports `GetEnvironmentStringsW`/`A`/
+    #     `GetEnvironmentStrings` (three, because they are three separate
+    #     bodies -- measured, not assumed);
+    #   * each C runtime's OWN snapshot, taken from that block once at CRT
+    #     startup and served by `getenv` thereafter, so a program linked
+    #     against a CRT may never call a Win32 environment API at all. Both
+    #     runtimes a Windows toolchain actually links are covered:
+    #     `ucrtbase.dll` (`getenv`, `_wgetenv`, `getenv_s`, `_wgetenv_s`,
+    #     `_dupenv_s`, `_wdupenv_s`) and `msvcrt.dll` (the same four minus
+    #     `_dupenv_s`/`_wdupenv_s`, which it does not export).
+    #
+    # A whole-block read is expanded into per-name records ONLY when the
+    # caller is the monitored program's own image. Every CRT reads the block
+    # once at startup, in every process; expanding that would make every
+    # Windows action depend on its entire environment, which is a monitor that
+    # makes everything uncacheable.
+    #
+    # WHAT IS NOT COVERED, and it is a residual rather than a hole in the
+    # claim: a program that walks the CRT's environment ARRAY directly --
+    # `msvcrt!_environ`, `ucrtbase!__p__environ`/`__p__wenviron` -- performs no
+    # call for a detour to intercept. This is the exact Windows counterpart of
+    # the POSIX `environ` walk, which the macOS and Linux arms do not cover
+    # either while advertising this same capability; the claim is "every
+    # environment read that goes through a call", on all three platforms.
+    mcapObservedEnv
   }
 
   # Capabilities with no Windows record kind behind them today. Reported as
@@ -353,12 +402,14 @@ const
   # kind carries the observation, so nothing reaches the depfile.
   #
   # M5 closed three of the eight gaps M4 declared -- ipc-connect,
-  # non-determinism and external-content -- and DELIBERATELY left the five
-  # below open rather than half-closing all eight. The ordering came from the
-  # consequence, not from effort: ipc-connect and external-content are the two
-  # that can hide a real INPUT, and non-determinism is the prerequisite for the
-  # entropy-blessing design (M6). What remains is OUTPUT-side or identity
-  # fidelity, none of it inside `InputEvidenceCapabilities`:
+  # non-determinism and external-content -- and DELIBERATELY left five open
+  # rather than half-closing all eight. M10 then closed the one of those five
+  # that was an INPUT channel, `mcapObservedEnv`, which is why the list is now
+  # four. The ordering came from the consequence, not from effort: a missing
+  # input channel is the only kind of gap that can produce a false
+  # `mcComplete`. WHAT REMAINS IS OUTPUT-SIDE OR IDENTITY FIDELITY, none of it
+  # inside `InputEvidenceCapabilities` and none of it inside
+  # `InputChannelCapabilities`:
   #
   #   * mcapFileCreate / mcapFileTruncate / mcapFileAppend -- the access IS
   #     recorded, as an open/read/write; what is missing is the finer
@@ -372,11 +423,11 @@ const
   #   * mcapSymlink -- CreateSymbolicLinkW is not hooked and no path is
   #     resolved to its link target. Identity fidelity: a read THROUGH a
   #     symlink still records a path that resolves to the same bytes.
-  #   * mcapObservedEnv -- environment and system-info queries are not recorded
-  #     as observed inputs. This one IS an input channel and is the strongest
-  #     candidate for the next pass; it is left declared rather than
-  #     half-implemented, because an advertised capability with partial
-  #     coverage is worse than an honest gap.
+  #
+  # `mcapObservedEnv` is NOT here any more. See the M10 block in
+  # `WindowsInterposeSupportedCapabilities` for what the capability now claims
+  # and for the one residual it does not (a direct walk of the CRT's `_environ`
+  # array, which performs no call and is uncovered on POSIX too).
   WindowsInterposeKnownUnsupportedCapabilities* = {
     mcapEndpointSecurity,
     mcapHybrid,
@@ -387,7 +438,6 @@ const
     mcapRename,
     mcapSymlink,
     mcapPathMutation,
-    mcapObservedEnv,
     mcapAdversarialRawSyscall,
     mcapExecutableMappingLifecycle,
     mcapPathIdentity
@@ -575,17 +625,22 @@ proc windowsUnsupportedReason(capability: MonitorCapability): string =
       "Windows interpose shim; this reason applies only where IPC-connect " &
       "is not yet advertised"
   of mcapObservedEnv:
-    # The ONE remaining Windows gap that is an INPUT channel. The record itself
-    # now says so -- `input=true` in the gap detail, from
-    # `InputChannelCapabilities` -- because the four gaps beside it are
-    # output-side or identity fidelity and a consumer cannot be asked to tell
-    # them apart by reading this sentence.
-    "environment and system-info queries are not recorded as observed " &
-      "inputs; this is an INPUT channel (input=true) and the only remaining " &
-      "Windows gap that is one -- a value read from the environment or from " &
-      "GetSystemInfo/GetComputerName can change a build's output with " &
-      "nothing in the capture to show for it, unlike the four output-side " &
-      "and identity-fidelity gaps alongside it"
+    # M10: environment reads ARE recorded now, through both the Win32 block
+    # and both C runtimes' getenv families. This branch is retained only for
+    # profiles that share this enum and have not wired it, and as a defensive
+    # default -- the same status the ipc-connect / non-determinism /
+    # external-content branches took when M5 closed them.
+    #
+    # It is worth saying why the sentence this replaces mattered. It was the
+    # one Windows gap that was an INPUT channel, and the record carried
+    # `input=true` from `InputChannelCapabilities` precisely so a consumer did
+    # not have to tell it apart from "renames are not classified" by reading
+    # English. That machinery is unchanged and still distinguishes the four
+    # remaining gaps, all of which are `input=false`.
+    "environment reads are recorded as observed inputs by the Windows " &
+      "interpose shim (kernel32's GetEnvironmentVariable/Strings plus the " &
+      "getenv families of both ucrtbase and msvcrt); this reason applies " &
+      "only where observed-env recording is not yet advertised"
   of mcapNonDeterminism:
     # M5: entropy (BCryptGenRandom / ProcessPrng / RtlGenRandom /
     # CryptGenRandom) and clocks (QueryPerformanceCounter /
@@ -865,6 +920,37 @@ proc windowsInterposeMonitorProfile*(
       "and clock observations are recorded once per source per caller origin " &
       "(program vs system image), so they are evidence that a source was " &
       "used, not a count of uses.")
+  result.diagnostics.add MonitorDiagnostic(
+    level: mdlInfo,
+    message: "M10 coverage: environment reads are recorded as observed " &
+      "declared inputs (mrEnvRead, the variable name, deduped " &
+      "case-insensitively per process, never downgrading). Windows keeps two " &
+      "copies of the environment and a program reads exactly one, so both " &
+      "are hooked: the PEB block through kernel32 " &
+      "GetEnvironmentVariableW/A and GetEnvironmentStringsW/A/" &
+      "GetEnvironmentStrings, and each C runtime's own startup snapshot " &
+      "through its getenv family -- ucrtbase (getenv, _wgetenv, getenv_s, " &
+      "_wgetenv_s, _dupenv_s, _wdupenv_s) and msvcrt (the same minus " &
+      "_dupenv_s/_wdupenv_s, which it does not export). A lookup that found " &
+      "nothing is recorded too: absence is a dependency. The monitor's own " &
+      "per-run control variables (REPRO_MONITOR_*, IO_MON_*) are excluded, " &
+      "because folding them into a consumer's cache key would change that " &
+      "key on every run.")
+  result.diagnostics.add MonitorDiagnostic(
+    level: mdlWarning,
+    message: "Windows observed-env coverage is limited to reads that go " &
+      "through a CALL. A program that walks the C runtime's environment " &
+      "ARRAY directly -- msvcrt's _environ, ucrtbase's __p__environ / " &
+      "__p__wenviron -- performs no call for a detour to intercept, so such " &
+      "a read is neither observed nor detected. This is the Windows " &
+      "counterpart of the POSIX environ walk, which the macOS and Linux arms " &
+      "do not cover either. A whole-block read (GetEnvironmentStrings*) is " &
+      "expanded into one record per variable only when the CALLER is the " &
+      "monitored program's own image: every C runtime reads the block once " &
+      "at startup in every process, and expanding that would make every " &
+      "action depend on its entire environment. A program whose block read " &
+      "comes through a bundled DLL is attributed to the system image and " &
+      "gets no expansion; its named reads are still recorded.")
 
   var gapCapabilities = WindowsInterposeKnownUnsupportedCapabilities
   for capability in required:

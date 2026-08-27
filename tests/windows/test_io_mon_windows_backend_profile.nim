@@ -67,15 +67,20 @@ suite "Windows backend profile":
       check capability in WindowsInterposeSupportedCapabilities
       check capability notin WindowsInterposeKnownUnsupportedCapabilities
 
-  test "the capabilities M5 did NOT attempt are still declared as gaps":
-    ## Closing three of eight and quietly advertising the rest would be the
-    ## exact over-claim M4 exists to prevent. These five have no Windows
-    ## record kind behind them and must keep saying so.
+  test "the capabilities still unattempted are declared as gaps":
+    ## Closing some and quietly advertising the rest would be the exact
+    ## over-claim M4 exists to prevent. These have no Windows record kind
+    ## behind them and must keep saying so.
+    ##
+    ## The list was five after M5 and is FOUR after M10, which moved
+    ## `mcapObservedEnv` out by giving it records. Nothing else moved: the
+    ## four below are output-side or identity fidelity, exactly as they were.
     for capability in [mcapFileCreate, mcapFileTruncate, mcapFileAppend,
-                       mcapRename, mcapSymlink, mcapPathMutation,
-                       mcapObservedEnv]:
+                       mcapRename, mcapSymlink, mcapPathMutation]:
       check capability in WindowsInterposeKnownUnsupportedCapabilities
       check capability notin WindowsInterposeSupportedCapabilities
+    check mcapObservedEnv notin WindowsInterposeKnownUnsupportedCapabilities
+    check mcapObservedEnv in WindowsInterposeSupportedCapabilities
 
   test "adding M5's capabilities did not make every Windows capture incomplete":
     ## None of the three is in `InputEvidenceCapabilities`, so advertising them
@@ -87,37 +92,62 @@ suite "Windows backend profile":
     let profile = defaultHooksMonitorProfile()
     check profile.evidenceComplete
 
-  test "the one remaining INPUT-channel gap says so in the record":
-    ## Windows has five declared gaps and exactly ONE of them -- observed-env --
-    ## is an input channel; the other four are output-side or identity
-    ## fidelity. That distinction decides what a consumer must do about the
-    ## capture, and until now it lived only in the free-text `reason`, where
-    ## "renames are not classified" and "environment reads are not recorded"
-    ## are one string-match apart and demand opposite responses.
+  test "no Windows gap is an INPUT channel any more, and the record says so":
+    ## This case used to read "the ONE remaining input-channel gap says so in
+    ## the record", and the one was `mcapObservedEnv`. M10 gave it records, so
+    ## the count is now ZERO and the assertion is the stronger one: every gap
+    ## Windows declares is output-side, identity fidelity, an alternative
+    ## backend or a threat model, and each says `input=false` in the record a
+    ## depfile actually carries.
     ##
-    ## `required` does not answer it either: `required` says only whether the
-    ## CALLER asked for the capability. So the fact is carried in the gap
-    ## record itself, and it has to survive the trip through the depfile --
-    ## which is the half a set-membership assertion alone would not pin.
+    ## The distinction is still what decides what a consumer must DO about a
+    ## capture, and it still lives in the record rather than in the free-text
+    ## `reason`, where "renames are not classified" and "environment reads are
+    ## not recorded" are one string-match apart and demand opposite responses.
+    ## `required` does not answer it either -- `required` says only whether the
+    ## CALLER asked for the capability. So a future capability added to the gap
+    ## list without this being considered fails here.
     let profile = defaultHooksMonitorProfile()
-    var sawObservedEnv = false
+    check profile.gaps.len > 0                # not vacuous
     for gap in profile.gaps:
-      if gap.capability == mcapObservedEnv:
-        sawObservedEnv = true
-        check gap.inputChannel
-        # Serialised, parsed back, and still true -- the record is what a
-        # depfile consumer actually reads.
-        let detail = gapDetail(gap)
-        check detail.contains(";input=true;")
-        check parseGapDetail(detail).inputChannel
-      else:
-        # Everything else Windows declares is output-side, identity fidelity,
-        # an alternative backend or a threat model. A future capability added
-        # to the gap list without this being considered will fail here.
-        checkpoint("gap claimed as an input channel: " &
-          capabilityId(gap.capability))
-        check not gap.inputChannel
-    check sawObservedEnv
+      checkpoint("gap: " & capabilityId(gap.capability))
+      check not gap.inputChannel
+      # Serialised, parsed back, and still false -- the record is what a
+      # depfile consumer actually reads, and this is the half a set-membership
+      # assertion alone would not pin.
+      let detail = gapDetail(gap)
+      check detail.contains(";input=false;")
+      check not parseGapDetail(detail).inputChannel
+
+  test "the input= key still carries BOTH answers through the depfile":
+    ## With no input-channel gap left on Windows, the profile above can only
+    ## exercise `input=false`. That would let the true arm rot: a change that
+    ## hard-coded `false` would pass every assertion in this file while
+    ## silently telling every consumer that no gap anywhere is ever an input
+    ## channel.
+    ##
+    ## So the true arm is pinned directly, on the capability that used to
+    ## supply it. `mcapObservedEnv` is still in `InputChannelCapabilities` --
+    ## being an input channel is a property of the CAPABILITY, not of whether
+    ## this backend happens to implement it -- so a profile that does not
+    ## support it must still emit `input=true`, which is what an older depfile
+    ## from a pre-M10 shim contains and what a consumer reading one must get.
+    check mcapObservedEnv in InputChannelCapabilities
+    let gap = MonitorCapabilityGap(
+      backendFamily: mbfWindowsInterposeHooks,
+      capability: mcapObservedEnv,
+      required: false,
+      inputChannel: mcapObservedEnv in InputChannelCapabilities,
+      reason: "pre-M10 Windows shim")
+    let detail = gapDetail(gap)
+    check detail.contains(";input=true;")
+    check parseGapDetail(detail).inputChannel
+    # And the derivation an OLD depfile relies on -- one written before the
+    # `input=` key existed at all -- still answers true rather than defaulting
+    # to false, which would be the same over-claim in a new place.
+    let legacyDetail = "backend=windows-interpose-hooks;capability=" &
+      "observed-env;required=false;reason=pre-M10 Windows shim"
+    check parseGapDetail(legacyDetail).inputChannel
 
   test "a gap outside the required set does not clear evidenceComplete":
     # The gaps are real but none of them is an unobserved INPUT channel, so
