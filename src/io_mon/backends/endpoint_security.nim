@@ -45,7 +45,7 @@ import io_mon/types
 type
   EsRecordSink* = proc(record: MonitorRecord) {.closure, gcsafe.}
     ## Where mapped records are delivered. In the live integration this would
-    ## route into the SAME RMDF fragment store the interpose runtime uses
+    ## route into the SAME iomon fragment store the interpose runtime uses
     ## (`appendFragmentRecord` / `mergeFragments`), so ES-sourced records flow
     ## through the identical completeness machinery (`summarizeRecords` →
     ## `depFileFromRecords`). Kept as an injected callback here for low coupling
@@ -164,7 +164,7 @@ proc eventLossRecord*(droppedCount: uint64): MonitorRecord =
 # These take PLAIN fields (not `es_message_t`) so the mapping is fully testable
 # without the SDK or the entitlement. Under `-d:ioMonEndpointSecurity` the live
 # message handler extracts these fields from the `es_message_t` union and calls
-# the matching builder. Records reuse the EXISTING RMDF record/observation kinds
+# the matching builder. Records reuse the EXISTING iomon record/observation kinds
 # (no new wire-format enum cases), so the codec, reader, and every consumer keep
 # working unchanged — ES is just another SOURCE feeding the same record model.
 # ---------------------------------------------------------------------------

@@ -83,7 +83,7 @@ when defined(macosx):
       setFilePermissions(fragmentDir,
         {fpUserRead, fpUserWrite, fpUserExec})
     except OSError, IOError: discard
-    let depfile = workDir / "cap.rdep"
+    let depfile = workDir / "cap.iomon"
     discard mergeFragments(fragmentDir, depfile)
     doAssert fileExists(depfile)
     readMonitorDepFile(depfile)

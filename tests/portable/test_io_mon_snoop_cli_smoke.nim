@@ -48,10 +48,10 @@ suite "io-mon CLI (M8) — portable build + inspect":
     check fileExists(snoopBin)
 
   test "inspect round-trips a captured depfile":
-    # Build a real RMDF depfile through the public writer, then `inspect` it. This
+    # Build a real iomon depfile through the public writer, then `inspect` it. This
     # exercises the CLI's decode + render path with no live capture — fully
     # portable. (The live-capture-produced depfile is inspected in the posix test.)
-    let depfile = work / "smoke.rdep"
+    let depfile = work / "smoke.iomon"
     let records = @[
       MonitorRecord(kind: mrFileRead, observationKind: moFileRead,
         seq: 1, osPid: 100, path: work / "input.txt"),
@@ -63,6 +63,6 @@ suite "io-mon CLI (M8) — portable build + inspect":
       @["inspect", depfile, "--format", "text"])
     checkpoint(output)
     check code == 0
-    check "RMDF" in output
+    check "iomon" in output
 
   removeDir(work)

@@ -186,8 +186,8 @@ when defined(macosx):
     if requireExit0:
       doAssert result.code == 0, "probe should exit 0 (" & probe & "): " &
         result.output
-    let dep = mergeFragments(fragmentDir, work / (probe.extractFilename() & ".rdep"))
-    result.records = readMonitorDepFile(work / (probe.extractFilename() & ".rdep")).records
+    let dep = mergeFragments(fragmentDir, work / (probe.extractFilename() & ".iomon"))
+    result.records = readMonitorDepFile(work / (probe.extractFilename() & ".iomon")).records
     result.completeness = dep.completeness
 
   proc externalContentDowngrades(records: seq[MonitorRecord]): int =
@@ -248,7 +248,7 @@ suite "io-mon macOS ROUND-4 RW3 exempt-by-name re-breaks":
       let ioMon = repoRoot / "build" / "bin" / "io-mon"
       doAssert fileExists(ioMon), "io-mon CLI not built at " & ioMon &
         " (run `nimble buildSnoop`)"
-      let depfile = work / "ip1.rdep"
+      let depfile = work / "ip1.iomon"
       let outFile = work / "ip1.out"
       # pipe_launcher argv: io-mon depfile client out marker
       let p = startProcess(launcher,

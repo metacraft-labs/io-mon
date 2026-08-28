@@ -20,6 +20,13 @@ test:
 
 # Real-build completeness oracle (§4.5(h)) — fast fixtures + class-(a) gate.
 # The heavier B/C/D differentials run with: tests/realbuild/run_oracle.sh --full
+#
+# Needs io-mon's OWN devShell: the real builds it drives use cc, cmake, ninja,
+# cargo, rustc (+ strace for --full), and those are pinned in this repo's
+# flake.nix, not in the workspace shell. Run it as
+#   nix develop <io-mon> -c just test-realbuild-oracle
+# From a shell without them the script aborts naming the missing tool, so an
+# environment gap can never be misread as an io-mon capture gap.
 test-realbuild-oracle:
     tests/realbuild/run_oracle.sh --fast
 

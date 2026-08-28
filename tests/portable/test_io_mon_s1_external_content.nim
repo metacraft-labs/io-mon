@@ -111,7 +111,7 @@ suite "io-mon ROUND-3 S1 external-content downgrade (externalContentLossCount)":
     createDir(frag)
     appendFragmentRecord(frag, start(100))
     appendFragmentRecord(frag, ext("shm", "attach", "shm:/r3shm", pid = 100))
-    let dep = mergeFragments(frag, work / "out.rdep")
+    let dep = mergeFragments(frag, work / "out.iomon")
     check dep.completeness == mcIncomplete
     removeDir(work)
 
@@ -124,7 +124,7 @@ suite "io-mon ROUND-3 S1 external-content downgrade (externalContentLossCount)":
     appendFragmentRecord(frag, start(100))
     appendFragmentRecord(frag, ext("shm", "create", "shm:/own", pid = 100))
     appendFragmentRecord(frag, ext("shm", "attach", "shm:/own", pid = 100))
-    let dep = mergeFragments(frag, work / "out.rdep")
+    let dep = mergeFragments(frag, work / "out.iomon")
     check dep.completeness == mcComplete
     removeDir(work)
 

@@ -86,7 +86,7 @@ when defined(macosx):
     checkpoint("[" & tag & "] exit=" & $code & " out=" & stdoutText)
     doAssert code == 0, "pspawn should exit 0 (" & tag & ", out=" & stdoutText & ")"
 
-    let depfile = runWork / "cap.rdep"
+    let depfile = runWork / "cap.iomon"
     let dep = mergeFragments(fragmentDir, depfile)
     result.completeness = dep.completeness
     for rec in dep.records:

@@ -134,7 +134,7 @@ int main(void) {
     require bare.code == 0
     require "plug_answer=42" in bare.output
 
-    let depfile = work / "runpath.rdep"
+    let depfile = work / "runpath.iomon"
     let monitored = captureRun(runpathApp, depfile)
     checkpoint("monitored: " & monitored.output)
 
@@ -155,7 +155,7 @@ int main(void) {
     require bare.code == 0
     require "plug_answer=42" in bare.output
 
-    let depfile = work / "rpath.rdep"
+    let depfile = work / "rpath.iomon"
     let monitored = captureRun(rpathApp, depfile)
     checkpoint("monitored: " & monitored.output)
     check monitored.code == bare.code
@@ -174,7 +174,7 @@ int main(void) {
     require bare.code == 0
     require "plug_answer=7" in bare.output
 
-    let depfile = work / "precedence.rdep"
+    let depfile = work / "precedence.iomon"
     let monitored = captureRun(runpathApp, depfile,
       [("LD_LIBRARY_PATH", envDir)])
     checkpoint("monitored: " & monitored.output)
@@ -198,7 +198,7 @@ int main(void) {
     require bare.code == 1
     require "dlopen-failed" in bare.output
 
-    let depfile = work / "missing.rdep"
+    let depfile = work / "missing.iomon"
     let monitored = captureRun(missingApp, depfile)
     checkpoint("monitored: " & monitored.output)
     check monitored.code == bare.code

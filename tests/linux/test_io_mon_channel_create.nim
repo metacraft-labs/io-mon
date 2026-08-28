@@ -170,7 +170,7 @@ suite "io-mon Linux channel-create records (IoMon-Pipeline-Capture IM-3)":
     # monitoring and nothing is invisible.
     let snoopBin = ensureSnoop(work)
     let shimLib = ensureShim()
-    let depfile = work / "self-pipe.rdep"
+    let depfile = work / "self-pipe.iomon"
 
     let cap = run(snoopBin, @["run", "--depfile", depfile, "--",
       "/bin/sh", "-c", "echo hi | cat"], monitorEnv(shimLib))
@@ -209,7 +209,7 @@ suite "io-mon Linux channel-create records (IoMon-Pipeline-Capture IM-3)":
 
     let client = buildC(work, "external_pipe_client", dualConsumerSrc)
     let launcher = buildC(work, "external_pipe_launcher", externalLauncherSrc)
-    let depfile = work / "external-pipe.rdep"
+    let depfile = work / "external-pipe.iomon"
     let outFile = work / "external-pipe.out"
     const marker = "OUT_OF_TREE_PIPE_SECRET"
 

@@ -142,7 +142,7 @@ int main(void) {
     checkpoint("[" & backend & "] probe exit=" & $code & " out=" & stdoutText)
     doAssert code == 0, "probe under shim should exit 0 (backend=" & backend & ")"
 
-    let depfile = runWork / "cap.rdep"
+    let depfile = runWork / "cap.iomon"
     discard mergeFragments(fragmentDir, depfile)
     if not fileExists(depfile):
       return Counts()

@@ -276,7 +276,7 @@ suite "io-mon Linux content-channel tree membership (IoMon-Pipeline-Capture IM-4
     let shimLib = ensureShim()
     let root = buildC(work, "tree_socket_root", treeProducerSrc)
     let consumer = buildC(work, "inherited_fd_consumer", inheritedFdConsumerSrc)
-    let depfile = work / "in-tree-socket.rdep"
+    let depfile = work / "in-tree-socket.iomon"
     let outFile = work / "in-tree-socket.out"
     const marker = "IN_TREE_SOCKET_PAYLOAD"
 
@@ -326,7 +326,7 @@ suite "io-mon Linux content-channel tree membership (IoMon-Pipeline-Capture IM-4
     let consumer = buildC(work, "inherited_fd_consumer", inheritedFdConsumerSrc)
     let launcher = buildC(work, "external_socket_launcher",
       externalSocketLauncherSrc)
-    let depfile = work / "external-socket.rdep"
+    let depfile = work / "external-socket.iomon"
     let outFile = work / "external-socket-intree.out"
     let extOut = work / "external-socket-external.out"
     const

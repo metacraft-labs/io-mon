@@ -1,9 +1,11 @@
-import std/[algorithm, atomics, locks, monotimes, os, sets, strutils, tables, times]
+import std/[atomics, locks, monotimes, os, sets, strutils, tables, times]
 from io_mon/paths import extendedPath
 
 import io_mon/codec
 import io_mon/capabilities
 import io_mon/types
+import io_mon/encode
+export encode
 import io_mon/shm/dep_queue
 # io-mon-Lossless-Event-Capture M3 (part 1) — the SET transport (nim-shm-gset,
 # Candidate C / the M1 winner) is the new PRIMARY Linux dependency channel. The
@@ -16,18 +18,18 @@ import shm_gset/transport as shmset
 const
   hostUsesFileFallback* = not defined(linux)
     ## io-mon-Lossless-Event-Capture M7 (Linux slice) — the platform boundary for
-    ## the ``.rmdf-frag`` FILE producer / DEP-FLUSH read-tail / ``.io-mon-reading``
+    ## the ``.iomon-frag`` FILE producer / DEP-FLUSH read-tail / ``.io-mon-reading``
     ## sentinel / sig-safe committed frame / ``FragmentMaxBytesDefault`` byte-cap
     ## and ``mergeFragments``' fragment-dir SCAN + netting.
     ##
     ## ``true``  on macOS / Windows — those shims (``macos_interpose.nim`` /
-    ##           ``windows_interpose.nim``) still PRODUCE ``.rmdf-frag`` fragments
+    ##           ``windows_interpose.nim``) still PRODUCE ``.iomon-frag`` fragments
     ##           (their shm producer arms are M4/M5), so the whole file subsystem is
     ##           live for them and the reader still SCANS + NETS the fragment dir.
     ## ``false`` on Linux — the producer publishes into the consumer-owned
     ##           ``nim-shm-gset`` (part 2a) and, as of M7, the CONSUMER's launcher-
     ##           side event-loss also goes into that set (``fs_snoop`` no longer
-    ##           writes a ``.rmdf-frag``), so the REAL Linux shim flow is file-free
+    ##           writes a ``.iomon-frag``), so the REAL Linux shim flow is file-free
     ##           end-to-end and never scans a fragment dir it did not fill.
     ##
     ## RETIREMENT (per platform, as each arm lands): flip the corresponding OS out
@@ -40,9 +42,6 @@ const
     ## pure-logic coverage of that shared code, so guarding the symbols off the
     ## Linux build would delete ~90 [OK] of verifiable coverage. Leaving that code
     ## compiled-but-runtime-dead on Linux is deliberate conservative under-guarding.
-  CanonicalFileKind = 1'u16
-  FnvOffset = 14695981039346656037'u64
-  FnvPrime = 1099511628211'u64
 
 # DSL-port M9.R.15c.1 (fs-snoop fragment-log perf): the fragment log
 # was opened, written, and closed once per emitted record. cmake's
@@ -109,7 +108,7 @@ const
   BatchStalenessProbeInterval = 64        # check time every 64 emits
   FragmentMaxBytesDefault = 2'i64 * 1024 * 1024 * 1024  # 2 GiB
     ## LEAK-GUARD — default hard cap on the on-disk size of a SINGLE
-    ## (osPid, threadId) `.rmdf-frag` file. The batch buffer above bounds only
+    ## (osPid, threadId) `.iomon-frag` file. The batch buffer above bounds only
     ## the in-MEMORY tail; nothing bounded the FILE, so a monitored process that
     ## OUTLIVES its monitor (a daemon the launcher gave up waiting for — see
     ## `fs_snoop.waitForLinuxInjectedDescendants`, whose grace-period timeout
@@ -134,7 +133,7 @@ const
     ## covers longer run tokens without risking silent truncation.
   ReadingSentinelExt* = ".io-mon-reading"
     ## ROUND-2 R5 — extension of the per-thread "un-flushed read tail" sentinel
-    ## file (see `FragmentSlot.readingSentinelActive`). Distinct from `.rmdf-frag`
+    ## file (see `FragmentSlot.readingSentinelActive`). Distinct from `.iomon-frag`
     ## and `.io-mon-report` so the merge's fragment / report scans never collide
     ## with it. RETAINED for warm-restart cleanup of any stale round-2 sidecars;
     ## the live kill-before-flush guard is now the in-fragment marker below.
@@ -286,12 +285,12 @@ var
   # M3 part 2a — LF-7 + LF-2. `appendFragmentRecord` publishes each record here
   # UNBUFFERED and returns; a durable insert (`emInserted`/`emExists`) does NOT
   # travel the file path. On the ACTIVE set path (any `.shard0` REPRO_MONITOR_DEP_SHM,
-  # even one that failed to map) the producer NEVER spills to a `.rmdf-frag` file
+  # even one that failed to map) the producer NEVER spills to a `.iomon-frag` file
   # (LF-2): a capture that cannot be published is surfaced as `mcIncomplete` (a
   # loss-marker element for oversize, the SIGNALLED `growthFailures` counter for
   # OOM saturation, or — when the shim could not attach at all — the absence of the
   # root process-start that the consumer's root-spawn guard downgrades on). The
-  # dormant `.rmdf-frag` writer + DEP-FLUSH machinery below stay COMPILED but are
+  # dormant `.iomon-frag` writer + DEP-FLUSH machinery below stay COMPILED but are
   # reachable only via the legacy ring path or REPRO_MONITOR_DEP_SHM_DISABLE (the
   # golden pure-file baseline). Their deletion is part 2b.
   setProducer: shmset.SetProducer
@@ -512,12 +511,6 @@ proc readingSentinelPath*(fragmentDir: string; osPid, threadId: uint64): string 
   ## file inside `fragmentDir`. Keyed on (osPid, threadId) like the fragment file
   ## itself so one process's worker threads never clobber each other's sentinel.
   fragmentDir / ("repro-reading-" & $osPid & "-" & $threadId & ReadingSentinelExt)
-
-proc encodeFrame*(record: MonitorRecord): seq[byte] {.raises: [].}
-  ## Forward declaration — `writeReadTailMarker` (the in-fragment kill-before-flush
-  ## marker, ROUND-5 F) encodes a single frame; the full definition is below. The
-  ## explicit `{.raises: [].}` keeps effect inference from pessimistically assuming
-  ## the not-yet-seen body can raise (which would poison every caller's raises list).
 
 proc fragmentPath*(fragmentDir: string; osPid, threadId: uint64): string
     {.raises: [].}
@@ -1049,7 +1042,7 @@ proc flushFragmentBatch*() =
     return
   if not fragmentHandleIsCurrent() and not reopenFragmentHandle():
     raiseEnvelopeError(eeMalformed,
-      "cannot recover externally replaced RMDF fragment handle")
+      "cannot recover externally replaced iomon fragment handle")
   let bufLen = fragmentSlot.batchLen
   let written = fragmentSlot.file.writeBuffer(
     addr fragmentSlot.batchBuf[0], bufLen)
@@ -1060,7 +1053,7 @@ proc flushFragmentBatch*() =
     fragmentSlot.batchLen = 0
     fragmentSlot.batchOpenedAtNs = 0
     raiseEnvelopeError(eeMalformed,
-      "short write to RMDF fragment for osPid=" & $fragmentSlot.osPid &
+      "short write to iomon fragment for osPid=" & $fragmentSlot.osPid &
       " threadId=" & $fragmentSlot.threadId)
   flushFile(fragmentSlot.file)
   discard fragmentWriteCount.fetchAdd(1, moRelaxed)
@@ -1226,142 +1219,8 @@ proc fragmentSlotIsRegistered*(): bool =
   ## a live registry index.
   fragmentSlot.registryIndex != 0
 
-proc checksumUpdate(seed: uint64; bytes: openArray[byte]): uint64 =
-  result = seed
-  for b in bytes:
-    result = result xor uint64(b)
-    result = result * FnvPrime
-
-proc checksum*(bytes: openArray[byte]): uint64 =
-  checksumUpdate(FnvOffset, bytes)
-
-proc writeBytes(outp: var File; bytes: seq[byte]) =
-  if bytes.len == 0:
-    return
-  let written = outp.writeBuffer(unsafeAddr bytes[0], bytes.len)
-  if written != bytes.len:
-    raiseEnvelopeError(eeMalformed, "short write to RMDF depfile")
-
-proc writeI64Le(outp: var seq[byte]; value: int64) =
-  outp.writeU64Le(cast[uint64](value))
-
-proc readI64Le(bytes: openArray[byte]; pos: var int): int64 =
-  cast[int64](readU64Le(bytes, pos))
-
-proc encodeRecordPayload*(record: MonitorRecord): seq[byte] =
-  result = @[]
-  result.writeU16Le(uint16(ord(record.kind)))
-  result.writeU16Le(uint16(ord(record.observationKind)))
-  result.writeU64Le(record.seq)
-  result.writeU64Le(record.osPid)
-  result.writeU64Le(record.parentOsPid)
-  result.writeU64Le(record.threadId)
-  result.writeU64Le(record.childOsPid)
-  result.writeI64Le(record.result)
-  result.writeU32Le(record.flags)
-  result.writeU32Le(uint32(ord(record.probeResult)))
-  result.writeString(record.path)
-  result.writeString(record.detail)
-
-proc decodeRecordPayload*(payload: openArray[byte]): MonitorRecord =
-  var pos = 0
-  let kindOrd = readU16Le(payload, pos)
-  let obsOrd = readU16Le(payload, pos)
-  if kindOrd < uint16(ord(low(MonitorRecordKind))) or
-      kindOrd > uint16(ord(high(MonitorRecordKind))):
-    raiseEnvelopeError(eeUnknownType, "unknown RMDF record kind")
-  if obsOrd < uint16(ord(low(MonitorObservationKind))) or
-      obsOrd > uint16(ord(high(MonitorObservationKind))):
-    raiseEnvelopeError(eeUnknownType, "unknown RMDF observation kind")
-
-  result.kind = MonitorRecordKind(kindOrd.int)
-  result.observationKind = MonitorObservationKind(obsOrd.int)
-  result.seq = readU64Le(payload, pos)
-  result.osPid = readU64Le(payload, pos)
-  result.parentOsPid = readU64Le(payload, pos)
-  result.threadId = readU64Le(payload, pos)
-  result.childOsPid = readU64Le(payload, pos)
-  result.result = readI64Le(payload, pos)
-  result.flags = readU32Le(payload, pos)
-  let probeOrd = readU32Le(payload, pos)
-  if probeOrd > uint32(ord(high(ProbeResult))):
-    raiseEnvelopeError(eeUnknownType, "unknown RMDF probe result")
-  result.probeResult = ProbeResult(probeOrd.int)
-  result.path = readString(payload, pos)
-  result.detail = readString(payload, pos)
-  if pos != payload.len:
-    raiseEnvelopeError(eeMalformed, "RMDF record has trailing bytes")
-
-proc encodeFrame*(record: MonitorRecord): seq[byte] =
-  let payload = encodeRecordPayload(record)
-  result = @[]
-  result.writeU32Le(uint32(payload.len))
-  result.add(payload)
-
-proc decodeFrames*(bytes: openArray[byte]): seq[MonitorRecord] =
-  var pos = 0
-  while pos < bytes.len:
-    let length = int(readU32Le(bytes, pos))
-    if length <= 0 or pos + length > bytes.len:
-      raiseEnvelopeError(eeMalformed, "truncated RMDF record frame")
-    result.add decodeRecordPayload(bytes.toOpenArray(pos, pos + length - 1))
-    pos += length
-
-proc decodeFramesTolerant*(bytes: openArray[byte]; cleanEof: var bool):
-    seq[MonitorRecord] =
-  ## DSL-port M9.R.15c.1 — like ``decodeFrames`` but stops at the first
-  ## truncated trailing frame instead of raising. This is the crash-
-  ## recovery path: a SIGKILL between ``writeBuffer`` and ``flushFile``
-  ## may leave the fragment with a partial length-prefix or partial
-  ## payload at the tail. Every complete frame ahead of it remains
-  ## byte-identical to what the producer wrote.
-  ##
-  ## ``cleanEof`` reports whether decoding consumed the WHOLE buffer with
-  ## no leftover bytes. ``false`` means the fragment ended with bytes that
-  ## could not be decoded as a complete frame — a partial RMDF write (e.g.
-  ## a SIGKILL'd shim) or outright corruption. Per Monitor-Hook-Shim.md
-  ## §"Failure Semantics" ("partial RMDF writes MUST fail reader
-  ## validation"; "shim crash MUST reject cache publication"), the caller
-  ## MUST treat ``cleanEof == false`` as monitor-evidence incompleteness so
-  ## the action fails closed and is not published to the cache. We still
-  ## recover every complete leading frame so diagnostics/streaming can show
-  ## what was captured before the truncation point.
-  cleanEof = true
-  var pos = 0
-  while pos < bytes.len:
-    if pos + 4 > bytes.len:
-      # A trailing run of < 4 bytes can never form a frame's length
-      # prefix: the producer was cut mid-write. Surface as not-clean.
-      cleanEof = false
-      break
-    var lengthCursor = pos
-    let length = int(readU32Le(bytes, lengthCursor))
-    if length <= 0 or lengthCursor + length > bytes.len:
-      # Either a non-positive/garbage length (corruption) or a length
-      # prefix promising more payload bytes than remain (truncated tail).
-      # Both leave the fragment not cleanly consumed.
-      cleanEof = false
-      break
-    try:
-      result.add decodeRecordPayload(
-        bytes.toOpenArray(lengthCursor, lengthCursor + length - 1))
-    except EnvelopeError:
-      # A length that points at a payload the codec rejects is corruption,
-      # not a clean tail truncation. Stop and flag incompleteness.
-      cleanEof = false
-      break
-    pos = lengthCursor + length
-
-proc decodeFramesTolerant*(bytes: openArray[byte]): seq[MonitorRecord] =
-  ## Backwards-compatible overload that discards the clean-EOF signal.
-  ## Prefer the ``cleanEof``-aware overload on any path that decides cache
-  ## publication; this one is for callers that only want the recovered
-  ## records (e.g. record-level parity assertions).
-  var cleanEof: bool
-  decodeFramesTolerant(bytes, cleanEof)
-
 proc fragmentPath*(fragmentDir: string; osPid, threadId: uint64): string =
-  fragmentDir / ("repro-monitor-" & $osPid & "-" & $threadId & ".rmdf-frag")
+  fragmentDir / ("repro-monitor-" & $osPid & "-" & $threadId & ".iomon-frag")
 
 proc precomputeSigSafeCommittedFrame(slot: var FragmentSlot) =
   ## M9.R.62.2 — pre-encode the `read-tail-committed` marker frame for
@@ -1491,7 +1350,7 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   # io-mon-Lossless-Event-Capture M3 part 2a — PRIMARY path is the SET transport
   # (nim-shm-gset, the M1-winning Candidate-C channel). Part 2b removed the
   # superseded DEP-SHM ring, so the only channels are the SET (Linux) and the
-  # `.rmdf-frag` file writer below (the retained macOS/Windows arm + the Linux
+  # `.iomon-frag` file writer below (the retained macOS/Windows arm + the Linux
   # launcher-side loss marker).
   #
   # LF-7 (unbuffered publish-before-return): encode the record's DEDUP element-key
@@ -1506,7 +1365,7 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   #
   # LF-2 (unattached ⇒ hard fail, NO file spill): once we are on the active set
   # path (`setProducerAttached` — REPRO_MONITOR_DEP_SHM named a `.shard0`), a record
-  # NEVER falls through to the `.rmdf-frag` writer. A durable insert returns; any
+  # NEVER falls through to the `.iomon-frag` writer. A durable insert returns; any
   # capture failure is surfaced as `mcIncomplete` instead of a silent file spill:
   #   * emInserted/emExists  — durable in consumer-owned memory (LF-3). Return.
   #   * emSaturated          — OOM growth failure, SIGNALLED via `growthFailures()`;
@@ -1557,7 +1416,7 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   if fragmentSlot.isOpen and not fragmentHandleIsCurrent() and
       not reopenFragmentHandle():
     raiseEnvelopeError(eeMalformed,
-      "cannot recover externally replaced RMDF fragment handle")
+      "cannot recover externally replaced iomon fragment handle")
 
   let needsReopen = not fragmentSlot.isOpen or
     not slotFragmentDirEquals(fragmentSlot, fragmentDir) or
@@ -1577,7 +1436,7 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
     let path = fragmentPath(fragmentDir, record.osPid, record.threadId)
     if not openFragmentSlot(fragmentDir, record.osPid, record.threadId, path):
       raiseEnvelopeError(eeMalformed,
-        "cannot open RMDF fragment for append: " & path)
+        "cannot open iomon fragment for append: " & path)
 
   # M9.R.15f.1 — compute exact frame size first (4-byte length prefix
   # + fixed 58-byte header + 4 + path-bytes + 4 + detail-bytes) so we
@@ -1605,7 +1464,7 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
     let n = fragmentSlot.file.writeBuffer(unsafeAddr frame[0], frame.len)
     if n != frame.len:
       raiseEnvelopeError(eeMalformed,
-        "short write to RMDF fragment for osPid=" & $record.osPid &
+        "short write to iomon fragment for osPid=" & $record.osPid &
         " threadId=" & $record.threadId)
     flushFile(fragmentSlot.file)
     discard fragmentWriteCount.fetchAdd(1, moRelaxed)
@@ -1762,133 +1621,6 @@ proc readFragmentRecordsForMerge(path: string; cleanEof: var bool):
   else:
     readFragmentRecordsTolerant(path, cleanEof)
 
-proc canonicalOrder(a, b: MonitorRecord): int =
-  result = cmp(a.osPid, b.osPid)
-  if result != 0: return
-  result = cmp(a.threadId, b.threadId)
-  if result != 0: return
-  result = cmp(a.seq, b.seq)
-  if result != 0: return
-  result = cmp(ord(a.kind), ord(b.kind))
-  if result != 0: return
-  result = cmp(a.path, b.path)
-
-proc summarizeRecords*(records: openArray[MonitorRecord]): MonitorSummary =
-  result.recordCount = uint64(records.len)
-  # M9.R.68.4 — drive-by fix: use a HashSet instead of `seq.find`. The
-  # previous O(N^2) scan (`processPids.find(...) < 0`) is O(N * P) where
-  # N is total records and P is unique-pid count. For a monitored
-  # reproos-image build (7.7 GB depfile ≈ ~10⁸ records over ~10⁴
-  # unique pids) this is ~10¹² comparisons and effectively hangs the
-  # merge (measured 22 GB RSS + 30+ min CPU-bound with zero I/O
-  # progress on the m9r68 phase D rebuild). HashSet incl+contains is
-  # O(1) amortised so the whole summarise pass drops to O(N).
-  var processPids = initHashSet[uint64]()
-  for record in records:
-    if record.osPid != 0:
-      processPids.incl record.osPid
-    if record.kind == mrEventLoss or record.observationKind == moEventLoss:
-      inc result.eventLossCount
-    else:
-      inc result.observationCount
-  result.processCount = uint64(processPids.len)
-
-proc depFileFromOwnedRecords*(records: sink seq[MonitorRecord]): MonitorDepFile =
-  let summary = summarizeRecords(records)
-  # The required-set is NOT empty, and that is the whole point. Deriving the
-  # profile with `{}` meant no declared capability gap could ever mark itself
-  # `required`, so none of them could ever clear `evidenceComplete` — the
-  # architecture doc's "every uncertainty downgrades to mcIncomplete" was
-  # stated but not wired. `InputEvidenceCapabilities` is the set whose absence
-  # means an input channel is unobserved, so a backend missing one of them
-  # cannot report `mcComplete` regardless of what the consumer asked for. A
-  # consumer wanting a WIDER bar still calls `evaluateMonitorEvidence` with its
-  # own set; this is the floor, not a ceiling.
-  var profile = profileFromRecords(records, InputEvidenceCapabilities)
-  if summary.eventLossCount != 0:
-    profile.evidenceComplete = false
-  result = MonitorDepFile(
-    version: RmdfVersion,
-    producerVersion: ReproMonitorDepfileProducer,
-    backendFamily: profile.backendFamily,
-    requiredFeatures: profile.requiredCapabilities,
-    completeness: if profile.evidenceComplete and summary.eventLossCount == 0:
-        mcComplete
-      else:
-        mcIncomplete,
-    profile: profile,
-    capabilityGaps: profile.gaps,
-    summary: summary)
-  result.records = move(records)
-
-proc depFileFromRecords*(records: openArray[MonitorRecord]): MonitorDepFile =
-  var owned = @records
-  depFileFromOwnedRecords(move(owned))
-
-proc encodeCanonical*(records: openArray[MonitorRecord]): seq[byte] =
-  var ordered = @records
-  ordered.sort(canonicalOrder)
-  for i in 0 ..< ordered.len:
-    ordered[i].seq = uint64(i + 1)
-
-  var body: seq[byte] = @[]
-  for record in ordered:
-    body.add encodeFrame(record)
-
-  result = @[]
-  result.add RmdfMagic.toBytes()
-  result.writeU16Le(RmdfVersion)
-  result.writeU16Le(CanonicalFileKind)
-  result.writeU64Le(uint64(ordered.len))
-  result.writeU64Le(uint64(body.len))
-  result.add body
-  result.add RmdfTrailerMagic.toBytes()
-  result.writeU64Le(uint64(ordered.len))
-  result.writeU64Le(checksum(body))
-
-proc writeCanonicalInPlace(outputPath: string; records: var seq[MonitorRecord]) =
-  ## Write the canonical RMDF envelope without materializing the full body/file.
-  ##
-  ## Large monitored builds can produce enough frames that `encodeCanonical`'s
-  ## ordered copy + body buffer + final file buffer dominate the monitor process'
-  ## RSS. The merge path already owns its record seq, so sort it in place, compute
-  ## body length/checksum in one frame-at-a-time pass, then stream the envelope to
-  ## disk in a second pass.
-  records.sort(canonicalOrder)
-  for i in 0 ..< records.len:
-    records[i].seq = uint64(i + 1)
-
-  var bodyLen = 0'u64
-  var bodyChecksum = FnvOffset
-  for record in records:
-    let frame = encodeFrame(record)
-    bodyLen += uint64(frame.len)
-    bodyChecksum = checksumUpdate(bodyChecksum, frame)
-
-  var outp: File
-  if not open(outp, extendedPath(outputPath), fmWrite):
-    raiseEnvelopeError(eeMalformed, "cannot open RMDF depfile for write: " &
-      outputPath)
-  try:
-    var header: seq[byte] = @[]
-    header.add RmdfMagic.toBytes()
-    header.writeU16Le(RmdfVersion)
-    header.writeU16Le(CanonicalFileKind)
-    header.writeU64Le(uint64(records.len))
-    header.writeU64Le(bodyLen)
-    outp.writeBytes(header)
-
-    for record in records:
-      outp.writeBytes(encodeFrame(record))
-
-    var trailer: seq[byte] = @[]
-    trailer.add RmdfTrailerMagic.toBytes()
-    trailer.writeU64Le(uint64(records.len))
-    trailer.writeU64Le(bodyChecksum)
-    outp.writeBytes(trailer)
-  finally:
-    close(outp)
-
 proc monitoredStartPids*(records: openArray[MonitorRecord]): HashSet[uint64] =
   ## The set of osPids that emitted an `mrProcessStart` — i.e. every process that
   ## actually loaded the shim and is therefore INSIDE the monitored injected tree.
@@ -1901,7 +1633,7 @@ proc monitoredStartPids*(records: openArray[MonitorRecord]): HashSet[uint64] =
 const
   # ROUND-2 R7/R8 — identity metadata is carried as space-separated `key=value`
   # tokens APPENDED to a record's free-form `detail` field rather than as new
-  # struct fields, so the RMDF wire format (magic/version/payload layout) stays
+  # struct fields, so the iomon wire format (magic/version/payload layout) stays
   # BYTE-STABLE and every existing reader/codec path is untouched (the
   # dgNoRuntimeDependencies / mrIpcConnect "append, never renumber" lesson applied
   # to record metadata). A record that predates these tokens simply lacks them and
@@ -2388,7 +2120,7 @@ proc externalContentLossCount*(records: openArray[MonitorRecord];
 const
   BreakawayReportExt* = ".io-mon-report"
     ## File extension a COOPERATING daemon writes its breakaway report under,
-    ## inside the `IO_MON_BREAKAWAY_REPORT_DIR`. Distinct from `.rmdf-frag` so the
+    ## inside the `IO_MON_BREAKAWAY_REPORT_DIR`. Distinct from `.iomon-frag` so the
     ## report scan never collides with the per-process fragment files.
   BreakawayReportMagic* = "io-mon-breakaway-report v1"
     ## Required first non-empty line of a trusted-daemon breakaway report.
@@ -2754,7 +2486,7 @@ proc dropStaleRunRecords(records: seq[MonitorRecord];
   ## ROUND-3 S3c — drop records left in a REUSED fragment dir by a PRIOR run.
   ##
   ## `mergeFragments` consumes the `.io-mon-reading` kill-sentinels but does NOT
-  ## delete the `.rmdf-frag` fragment files, so a caller that RE-MERGES a fragment
+  ## delete the `.iomon-frag` fragment files, so a caller that RE-MERGES a fragment
   ## dir (a warm restart, a library `mergeFragments` over a reused dir) would fold a
   ## prior run's records into THIS verdict (research/.../r3_merge/merge_attack.nim:
   ## a stale run-1 process-start makes a run-2 out-of-tree breakaway peer look
@@ -2876,8 +2608,8 @@ proc mergeFragments*(fragmentDir, outputPath: string;
   closeFragmentSlot()
   var records: seq[MonitorRecord] = @[]
   # Fail-closed accounting: any fragment that does not decode cleanly to EOF
-  # is a partial or corrupt RMDF write. Per Monitor-Hook-Shim.md §"Failure
-  # Semantics" ("partial RMDF writes MUST fail reader validation"; "shim
+  # is a partial or corrupt iomon write. Per Monitor-Hook-Shim.md §"Failure
+  # Semantics" ("partial iomon writes MUST fail reader validation"; "shim
   # crash MUST reject cache publication"; "successful child exit MUST NOT
   # hide monitor failure"), such evidence MUST NOT be published. We surface
   # it in-band as event-loss so the existing completeness machinery
@@ -2888,9 +2620,9 @@ proc mergeFragments*(fragmentDir, outputPath: string;
   var unreadableFragments = 0
   if dirExists(extendedPath(fragmentDir)):
     for kind, path in walkDir(extendedPath(fragmentDir)):
-      if kind == pcFile and path.endsWith(".rmdf-frag"):
+      if kind == pcFile and path.endsWith(".iomon-frag"):
         # TOCTOU tolerance: a monitored build spawns many short-lived children,
-        # each writing its own .rmdf-frag. A producer can remove/rotate its
+        # each writing its own .iomon-frag. A producer can remove/rotate its
         # fragment (or its whole per-process fragment dir) between this walkDir
         # enumeration and the read below — `readFile` then raises IOError
         # ("cannot open"). A vanished fragment carries no recoverable records, so
@@ -2922,11 +2654,23 @@ proc mergeFragments*(fragmentDir, outputPath: string;
     for r in setRecords:
       records.add r
   # ROUND-3 S3c — warm-restart stale-fragment guard. `mergeFragments` does not
-  # delete `.rmdf-frag` files, so a REUSED fragment dir can carry a PRIOR run's
+  # delete `.iomon-frag` files, so a REUSED fragment dir can carry a PRIOR run's
   # records (merge_attack.nim). Drop records whose owning process started under a
   # DIFFERENT run id before any completeness reasoning sees them. The run id is the
-  # explicit `currentRunId` arg, else REPRO_MONITOR_SESSION (the launcher's value,
-  # still set at merge time). Empty ⇒ no filtering (the CLI's fresh-dir case). This
+  # explicit `currentRunId` arg, else REPRO_MONITOR_SESSION.
+  #
+  # PASS `currentRunId`; do NOT rely on the env fallback. Since
+  # IoMon-Decomposed-Host-API DH-1 ALL THREE arms of `runMonitored` publish the
+  # injection variables to the CHILD's environment only, so REPRO_MONITOR_SESSION
+  # is no longer set in the MERGING process on any platform. (The Windows arm was
+  # the last to stop `putEnv`-ing it, once `runWithMonitorShim` gained an `env`
+  # parameter.) The fallback now engages only for a caller that exports the
+  # variable itself. `runMonitored`'s Linux arm passes `currentRunId` explicitly;
+  # its macOS and Windows arms do not, which is safe only because each merges a
+  # fragment dir it created moments earlier and deletes on the way out, so no
+  # prior run's records can be in it.
+  #
+  # Empty ⇒ no filtering (the CLI's fresh-dir case). This
   # runs BEFORE the corrupt-fragment loss injection below so a real corrupt fragment
   # of the CURRENT run is still counted.
   let runScope =
@@ -2938,12 +2682,12 @@ proc mergeFragments*(fragmentDir, outputPath: string;
     for _ in 0 ..< corruptFragments:
       records.add MonitorRecord(kind: mrEventLoss,
         observationKind: moEventLoss,
-        detail: "corrupt or partial RMDF fragment in " & fragmentDir)
+        detail: "corrupt or partial iomon fragment in " & fragmentDir)
   if unreadableFragments > 0:
     for _ in 0 ..< unreadableFragments:
       records.add MonitorRecord(kind: mrEventLoss,
         observationKind: moEventLoss,
-        detail: "unreadable RMDF fragment in " & fragmentDir)
+        detail: "unreadable iomon fragment in " & fragmentDir)
   # ROUND-5 F (kill-before-flush) — net the IN-FRAGMENT read-tail markers. A
   # monitored process that buffered read records wrote a durable `read-tail-pending`
   # marker to its fragment the instant a batch went dirty, and a `read-tail-committed`
@@ -3081,6 +2825,3 @@ proc mergeFragments*(fragmentDir, outputPath: string;
   writeCanonicalInPlace(outputPath, records)
   depFileFromOwnedRecords(move(records))
 
-proc writeCanonical*(outputPath: string; records: openArray[MonitorRecord]) =
-  var owned = @records
-  writeCanonicalInPlace(outputPath, owned)

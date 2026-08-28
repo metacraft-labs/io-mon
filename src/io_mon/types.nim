@@ -1,4 +1,4 @@
-import std/[options]
+import std/[options, strutils]
 
 type
   MonitorRecordKind* = enum
@@ -15,7 +15,7 @@ type
     mrCapabilityGap = 11
     # T3a (Phase 2 / findings-doc break #1): a `connect(2)` (or connectionless
     # `sendmsg`/`sendto`) to an AF_UNIX / AF_INET(6) peer. APPENDED AT THE END to
-    # preserve RMDF wire-compat (the dgNoRuntimeDependencies lesson — never
+    # preserve iomon wire-compat (the dgNoRuntimeDependencies lesson — never
     # renumber an existing enum case). Carries the destination in `path` and the
     # PEER PID in `childOsPid` (AF_UNIX via LOCAL_PEERPID; 0 when unobtainable).
     mrIpcConnect = 12
@@ -26,7 +26,7 @@ type
     # hooked open, so without this they were recorded NOWHERE — a content-addressed
     # cache fingerprinting only the depfile would then serve a STALE result after
     # an in-place compiler-library upgrade. Captured via the `_dyld` add-image
-    # callback (NOT by hooking open). APPENDED AT THE END to preserve RMDF
+    # callback (NOT by hooking open). APPENDED AT THE END to preserve iomon
     # wire-compat (the dgNoRuntimeDependencies / mrIpcConnect lesson — never
     # renumber an existing case). The path is the dylib's REAL on-disk path; the
     # `observationKind` is deliberately `moFileRead` so the dylib is treated as a
@@ -38,7 +38,7 @@ type
     # build's output may depend on that are NOT file reads, so a depfile-only
     # fingerprint can false-cache-hit when they change. io-mon records evidence
     # only; callers decide whether a given observation invalidates their cache key.
-    # All four APPENDED AT THE END for RMDF wire-compat (never renumber).
+    # All four APPENDED AT THE END for iomon wire-compat (never renumber).
     #
     # 1. mrEnvRead / mrSysctlRead — OBSERVED DECLARED INPUTS (record, do NOT
     #    downgrade). The shim hooks getenv / sysctlbyname / sysctl / uname /
@@ -53,24 +53,58 @@ type
     #    note (MacOS-Monitoring-Adversarial-Hardening.milestones.org §R-D).
     mrEnvRead = 14
     mrSysctlRead = 15
-    # 2. mrNonDeterministic — OBSERVED ENTROPY INPUT, GATED BY CALLER ATTRIBUTION.
-    #    The shim hooks getentropy / arc4random / arc4random_buf /
-    #    arc4random_uniform and emits this record ONLY when the call's CALLER lies
-    #    in the monitored program's OWN main-executable __TEXT range (`path` names
-    #    the source). This does NOT force `mcIncomplete`: io-mon monitored the
-    #    entropy read successfully, and caller policy decides whether that evidence
-    #    invalidates the build/cache result.
-    #    CALLER ATTRIBUTION IS ESSENTIAL (a round-1 cardinal-sin defect): an
-    #    interpose hook is NOT limited to the program's own calls — on every process
-    #    startup /usr/lib/libobjc, /usr/lib/swift, libsystem_malloc/_trace call
-    #    arc4random_buf and libcorecrypto calls getentropy, all CROSS-DYLIB (so they
-    #    cross the interpose stub). Flagging those downgraded EVERY real cc/clang/ld/
-    #    bash run (the cardinal sin); attributing to the program's main-exe __TEXT
-    #    excludes the /usr/lib baseline. A /dev/random or /dev/urandom OPEN is
-    #    DELIBERATELY NOT flagged (mktemp opens /dev/urandom for a random temp name on
-    #    essentially every build). See `nonDeterminismObservationCount`
-    #    (writer.nim) and
-    #    `ct_macos_addr_in_program`.
+    # 2. mrNonDeterministic — OBSERVED ENTROPY INPUT.
+    #
+    #    THE CROSS-PLATFORM OBSERVATION CONTRACT. Every backend either MEETS this
+    #    or DECLARES the gap; macOS and Linux used to disagree on all three
+    #    clauses below, which is what stating the contract here fixes:
+    #      a. COVERAGE — every entropy entry point the PLATFORM'S libc/system
+    #         libraries expose is hooked, not an arbitrary subset:
+    #           macOS: getentropy, arc4random, arc4random_buf, arc4random_uniform,
+    #                  SecRandomCopyBytes, CCRandomGenerateBytes.
+    #           Linux: getrandom (libc symbol + raw syscall + vDSO entry) plus the
+    #                  glibc >= 2.36 BSD set getentropy / arc4random /
+    #                  arc4random_buf / arc4random_uniform.
+    #         `SecRandomCopyBytes`/`CCRandomGenerateBytes` are Apple-only and
+    #         `getrandom` is Linux-only, so the sets differ by what EXISTS, never
+    #         by what the shim bothered to hook. Windows hooks none of them and
+    #         says so: `mcapNonDeterminism` is a DECLARED capability gap there
+    #         (`WindowsInterposeKnownUnsupportedCapabilities`), so a consumer sees
+    #         the absence instead of mistaking it for "no entropy was used".
+    #      b. IDENTITY — `path` is the API NAME ("arc4random_buf"), and `detail`
+    #         is exactly `NonDeterministicEntropyDetail` on every platform, so a
+    #         consumer that matches on the detail string behaves identically
+    #         everywhere.
+    #      c. DEDUP — recorded ONCE PER PROCESS PER SOURCE. A program that draws
+    #         entropy in a loop, or from many threads, yields ONE record per
+    #         source, not one per call: the evidence is "this process consumed
+    #         entropy from this API", and repeating it adds nothing while costing
+    #         the depfile linearly in call volume.
+    #    This does NOT force `mcIncomplete`: io-mon monitored the entropy read
+    #    successfully, and caller policy decides whether that evidence invalidates
+    #    the build/cache result. See `nonDeterminismObservationCount` (writer.nim).
+    #
+    #    CALLER ATTRIBUTION (macOS only, and deliberately so). On macOS the record
+    #    is emitted ONLY when the call's CALLER lies in a NON-SYSTEM image
+    #    (`ct_macos_addr_in_nonsystem`). That gate is essential there (a round-1
+    #    cardinal-sin defect): on every process startup /usr/lib/libobjc,
+    #    /usr/lib/swift and libsystem_malloc/_trace call arc4random_buf and
+    #    libcorecrypto calls getentropy, all CROSS-DYLIB, so they cross the
+    #    interpose stub and flagged EVERY real cc/clang/ld/bash run. Linux needs no
+    #    equivalent gate: LD_PRELOAD interposes the PUBLIC symbol, and glibc's own
+    #    internal users reach entropy by routes that never pass through an
+    #    interposed PLT entry — a LOCAL, non-exported symbol
+    #    (`__getrandom_nocancel`, behind `arc4random*`) or an inline `syscall`
+    #    instruction in libc's own text (`getentropy`) — so what the Linux shim
+    #    sees is already the program's own call. Measured: `bash -c true`, a
+    #    `cc` compile+link, and a plain `printf` program each produce ZERO
+    #    `mrNonDeterministic` records with all four hooks installed, i.e. the
+    #    macOS /usr/lib baseline has no Linux counterpart to exclude. Building
+    #    a return-address→ELF-image classifier there would add a subsystem to
+    #    re-derive an attribution the interposition already gives us.
+    #
+    #    A /dev/random or /dev/urandom OPEN is DELIBERATELY NOT flagged (mktemp
+    #    opens /dev/urandom for a random temp name on essentially every build).
     mrNonDeterministic = 16
     # 3. mrTimeRead — RECORD but do NOT auto-downgrade (high benign false-positive).
     #    The shim hooks clock_gettime / gettimeofday / time / mach_absolute_time and
@@ -92,7 +126,7 @@ type
     # (`externalContentLossCount`) pairs the create/write side against the
     # attach/read side and injects an event-loss ONLY for an unpaired (out-of-tree)
     # consume — the SAME conservative-re-run machinery as the IPC-breakaway /
-    # un-injected-subtree downgrade. APPENDED AT THE END to preserve RMDF
+    # un-injected-subtree downgrade. APPENDED AT THE END to preserve iomon
     # wire-compat (the dgNoRuntimeDependencies / mrIpcConnect / mrLibraryLoad lesson
     # — never renumber an existing case). The channel identity (shm name / FIFO
     # path / "" for an anonymous socket/pipe) is in `path`; `detail` carries a
@@ -109,7 +143,7 @@ type
     # gap marked required=false, so completeness stayed mcComplete despite the
     # unhooked surface (research/adversarial-2026-06-round4/r4_dir/misc_probe.c).
     # The shim now records each successful mutation against the canonical path so
-    # the output-dir state is tracked. APPENDED AT THE END to preserve RMDF
+    # the output-dir state is tracked. APPENDED AT THE END to preserve iomon
     # wire-compat (the dgNoRuntimeDependencies / mrIpcConnect / mrExternalContent
     # lesson — never renumber an existing case). `detail` names the syscall
     # (`mkdir`/`mkdirat`/`rmdir`/`unlink`/`unlinkat`). This is an OUTPUT-side fact,
@@ -151,6 +185,22 @@ type
     # path (the dir/file was created or removed); it is recorded for output-tree
     # state tracking and is NOT a determinism downgrade.
     moPathMutation = 17
+
+  EventCategory* = enum
+    ## The classes of observation a consumer can opt in / out of. See
+    ## docs/contributors/event-interest-filter.md. Gating a category makes io-mon
+    ## skip the work (record construction + gset publish, and where cheap the hook
+    ## install itself) for the `MonitorRecordKind`s in it. The META kinds
+    ## (`mrEventLoss`/`mrBackendProfile`/`mrCapabilityGap`) belong to NO category
+    ## and are never gated — a suppressed loss marker would risk a false
+    ## `mcComplete` (LF-1).
+    ecFileDeps       ## mrFileOpen, mrFileRead, mrFileWrite, mrPathProbe,
+                     ## mrDirectoryEnumerate, mrPathMutation
+    ecProcessTree    ## mrProcessStart, mrProcessExec, mrProcessSpawn
+    ecLibraryLoads   ## mrLibraryLoad
+    ecNonDeterminism ## mrNonDeterministic, mrTimeRead, mrEnvRead, mrSysctlRead,
+                     ## mrExternalContent
+    ecIpc            ## mrIpcConnect
 
   ProbeResult* = enum
     prUnknown = 0
@@ -360,12 +410,70 @@ type
     # means stdio is read+discarded (mimicking the engine when it
     # only cares about completion).
     captureStdioPath*: string
+    # IoMon-Decomposed-Host-API DH-1 — PER-CALL environment for the
+    # monitored child. Entries are layered on top of the parent's own
+    # environment (which the child otherwise inherits unchanged) and are
+    # applied to the SPAWN, never to the hosting process: `runMonitored`
+    # performs no `putEnv`, so two monitors running concurrently in one
+    # process cannot clobber each other's injection variables.
+    #
+    # Later duplicates win over earlier ones. io-mon's OWN injection
+    # variables (`LD_PRELOAD` / `DYLD_INSERT_LIBRARIES`,
+    # `REPRO_MONITOR_*`, `CT_SANDBOX_TOOLS_DIR`) are applied AFTER these,
+    # so a caller can never accidentally switch monitoring off — but the
+    # value a caller supplies IS honoured as the base the injection
+    # extends (a caller-supplied `LD_PRELOAD` is preserved after the
+    # shim, exactly as an inherited one is).
+    #
+    # NOTE: on EVERY arm the executable is still resolved via the HOSTING
+    # process's `PATH`, but by a DIFFERENT route on each, so do not generalise
+    # from one of them:
+    #   * Linux   — `osproc`'s fork path calls `findExe` IN THE FORKED CHILD,
+    #               whose `environ` is still the parent's, then `execve`s the
+    #               resolved absolute path with this `env`. The search predates
+    #               the new environment.
+    #   * macOS   — `osproc` takes the `posix_spawnp(…, env)` path instead, and
+    #               `posix_spawnp` reads `PATH` from the CALLING process's
+    #               environment, never from the `envp` argument.
+    #   * Windows — `CreateProcessW` is called with `lpApplicationName = NULL`,
+    #               whose documented search runs in the calling process and
+    #               never consults `lpEnvironment`.
+    # So a `PATH` entry here changes what the child sees but not which binary is
+    # launched. Pass an absolute `command[0]` when that distinction matters.
+    # Only the Linux row is verified by execution in this workspace.
+    env*: seq[(string, string)]
+    # IoMon-Decomposed-Host-API DH-1 — PER-CALL working directory for the
+    # monitored child. Empty means "inherit the hosting process's cwd"
+    # (the historical behaviour). Set per-call rather than by `chdir`-ing
+    # the host, so concurrent monitors can each resolve their relative
+    # paths against their own action directory.
+    #
+    # `depFilePath`, `eventStreamPath` and `captureStdioPath` are resolved
+    # by the HOST, not the child, so they are unaffected by this field —
+    # pass them absolute if the host's cwd may differ.
+    cwd*: string
+    # The observation categories this consumer wants. io-mon skips the work
+    # (record build + gset publish, and where cheap the hook install) for the
+    # categories NOT in this set. See docs/contributors/event-interest-filter.md.
+    # The empty set is normalised to `FullInterest` on ingest, so an unset field
+    # captures everything (the safe, back-compatible default) rather than
+    # silently disabling all observation. META/loss records are never gated.
+    interest*: set[EventCategory]
 
 const
-  RmdfVersion* = 1'u16
-  RmdfMagic* = "RMDF"
-  RmdfTrailerMagic* = "RMDT"
-  ReproMonitorDepfileProducer* = "repro_monitor_depfile_m11"
+  IomonVersion* = 1'u16
+  IomonMagic* = "IOMN"
+  IomonTrailerMagic* = "IOMT"
+  IoMonDepfileProducer* = "iomon_depfile_v1"
+
+  NonDeterministicEntropyDetail* = "non-deterministic entropy source"
+    ## The `detail` text EVERY backend must put on an `mrNonDeterministic`
+    ## record. It lives here — not as a literal in each shim — because the
+    ## shims previously disagreed ("non-deterministic entropy source" on macOS,
+    ## "linux non-deterministic source" on Linux), which made any consumer that
+    ## matched on the detail string behave differently per platform for the same
+    ## observation. One definition means the two cannot drift apart again.
+    ## The record's `path` carries WHICH source (see `mrNonDeterministic`).
 
 proc defaultMonitorDepFileReaderOptions*(): MonitorDepFileReaderOptions =
   MonitorDepFileReaderOptions(
@@ -387,3 +495,72 @@ proc raiseMonitorDepFileReaderError*(kind: MonitorDepFileReaderErrorKind;
   var err = newException(MonitorDepFileReaderError, message)
   err.kind = kind
   raise err
+
+# ---------------------------------------------------------------------------
+# Event-interest categories — docs/contributors/event-interest-filter.md
+# ---------------------------------------------------------------------------
+
+const FullInterest* = {EventCategory.low .. EventCategory.high}
+  ## Every category — io-mon's default, and what an empty request interest is
+  ## normalised to. A generic consumer captures everything unless it opts out.
+
+func categoryOf*(kind: MonitorRecordKind): Option[EventCategory] =
+  ## The gate-able category a record kind belongs to, or `none` for META kinds
+  ## (`mrEventLoss`/`mrBackendProfile`/`mrCapabilityGap`) that are NEVER gated.
+  ## Exhaustive over `MonitorRecordKind`, so a new kind must state its category
+  ## (or be declared META) here rather than silently defaulting.
+  case kind
+  of mrFileOpen, mrFileRead, mrFileWrite, mrPathProbe, mrDirectoryEnumerate,
+     mrPathMutation:
+    some(ecFileDeps)
+  of mrProcessStart, mrProcessExec, mrProcessSpawn:
+    some(ecProcessTree)
+  of mrLibraryLoad:
+    some(ecLibraryLoads)
+  of mrNonDeterministic, mrTimeRead, mrEnvRead, mrSysctlRead, mrExternalContent:
+    some(ecNonDeterminism)
+  of mrIpcConnect:
+    some(ecIpc)
+  of mrEventLoss, mrBackendProfile, mrCapabilityGap:
+    none(EventCategory)
+
+func normalizeInterest*(interest: set[EventCategory]): set[EventCategory] =
+  ## The empty set means "unset" -> capture everything; any non-empty set is
+  ## honoured as-is. Callers normalise on ingest so a zero-initialised request
+  ## never silently disables all observation.
+  if interest == {}: FullInterest else: interest
+
+func recordWanted*(interest: set[EventCategory]; kind: MonitorRecordKind): bool =
+  ## Should a record of `kind` be captured under `interest`? META kinds (no
+  ## category) are always wanted; a categorised kind is wanted iff its category
+  ## is in the (normalised) set.
+  let c = categoryOf(kind)
+  if c.isNone: true
+  else: c.get in normalizeInterest(interest)
+
+const
+  # Wire tokens for `REPRO_MONITOR_INTEREST` (the env channel to the shim).
+  interestTokenPairs = [
+    (ecFileDeps, "file"), (ecProcessTree, "proc"), (ecLibraryLoads, "lib"),
+    (ecNonDeterminism, "nondet"), (ecIpc, "ipc")]
+
+func interestToTokens*(interest: set[EventCategory]): string =
+  ## Encode an interest set as the comma-separated `REPRO_MONITOR_INTEREST`
+  ## value. `FullInterest` encodes to every token (never empty, so an older
+  ## reader cannot mistake "all" for "unset").
+  let normalized = normalizeInterest(interest)
+  var parts: seq[string] = @[]
+  for (cat, tok) in interestTokenPairs:
+    if cat in normalized: parts.add(tok)
+  parts.join(",")
+
+func parseInterestTokens*(s: string): set[EventCategory] =
+  ## Decode a `REPRO_MONITOR_INTEREST` value. Empty/absent -> `FullInterest`
+  ## (back-compat). Unknown tokens are ignored (forward-compat: an older shim
+  ## treats a new category as "not mine"; the host filter is the source of truth).
+  let trimmed = s.strip()
+  if trimmed.len == 0: return FullInterest
+  for raw in trimmed.split(','):
+    let tok = raw.strip()
+    for (cat, known) in interestTokenPairs:
+      if tok == known: result.incl(cat)

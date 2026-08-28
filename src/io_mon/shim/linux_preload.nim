@@ -73,6 +73,12 @@ var
   # module; the accessor procs below just forward to it.
   fragmentDir: string
   runId: string
+  # The consumer's event-interest set (REPRO_MONITOR_INTEREST). Set ONCE at init
+  # and only read thereafter, so the concurrent reads in `emitRecord` need no
+  # lock. `FullInterest` until init runs and if the var is absent, so a shim that
+  # is never told an interest captures everything (back-compat). See
+  # docs/contributors/event-interest-filter.md.
+  gInterest: set[EventCategory] = FullInterest
   # DEP-SHM-2 — the shared-memory dependency-queue segment path (the value of
   # REPRO_MONITOR_DEP_SHM). Empty when the engine did not create a ring, in
   # which case every record takes the file path unchanged. Remembered so the
@@ -855,6 +861,14 @@ proc stampRunId(record: var MonitorRecord) {.raises: [].} =
 proc emitRecord(record: MonitorRecord) {.raises: [].} =
   if not initialized or fragmentDir.len == 0 or shouldBypass():
     return
+  # Event-interest gate (docs/contributors/event-interest-filter.md §4.1). Skip
+  # the whole record — construction already happened at the call site, but the
+  # expensive publish (gset insert + dedup, or fragment write) is avoided — for a
+  # category the consumer did not ask for. `recordWanted` returns true for
+  # META/loss kinds, so a suppressed interest can never drop an `mrEventLoss`
+  # (LF-1: that would risk a false `mcComplete`).
+  if not recordWanted(gInterest, record.kind):
+    return
   # M9.R.62.2 — refresh the diagnostic context on every emit so an
   # unmatched pending marker carries the LAST-observed record kind
   # instead of the stale "phase=init" from the constructor. A process
@@ -1368,6 +1382,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   withShimMuted:
     fragmentDir = getEnv("REPRO_MONITOR_FRAGMENT_DIR")
     runId = getEnv("REPRO_MONITOR_SESSION")
+    gInterest = parseInterestTokens(getEnv("REPRO_MONITOR_INTEREST"))
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))
     # DEP-SHM-2 — attach the process to the edge's shared-memory dependency
@@ -2493,10 +2508,23 @@ proc recordTimeRead(source: string) {.raises: [].} =
   recordObservedNonFile(mrTimeRead, moTimeRead, source, "linux time")
 
 proc recordNonDeterministic(source: string) {.raises: [].} =
-  var record = baseRecord(mrNonDeterministic, moNonDeterministic)
-  record.path = source
-  record.detail = "linux non-deterministic source"
-  emitRecord(record)
+  ## Record the program's consumption of ENTROPY as policy evidence, on the same
+  ## terms as every other non-file observation and as the macOS shim
+  ## (`io_mon/types.nim`, record 16): DEDUPED per process per source, `path` =
+  ## the API name, `detail` = the shared `NonDeterministicEntropyDetail`.
+  ##
+  ## This used to build the record by hand and call `emitRecord` directly — the
+  ## ONLY non-file recorder on this shim that skipped `recordObservedNonFile` —
+  ## so a program drawing entropy in a loop or from N threads emitted N records
+  ## for one fact, while the same program on macOS emitted one. Nothing needed
+  ## the extra copies: the evidence is "this process consumed entropy from this
+  ## API", and it is complete after the first observation.
+  ##
+  ## This does NOT downgrade completeness: io-mon SAW the entropy read, so
+  ## nothing is missing; whether entropy invalidates a cached result is a caller
+  ## policy decision made on the record.
+  recordObservedNonFile(mrNonDeterministic, moNonDeterministic, source,
+    NonDeterministicEntropyDetail)
 
 proc ptrArg(value: pointer): clong {.inline, raises: [].} =
   clong(cast[int](value))
@@ -2705,6 +2733,47 @@ proc repro_hook_getrandom*(ctx: var GetrandomContext) {.raises: [].} =
   let savedErrno = c_get_errno()
   if ctx.result >= 0:
     recordNonDeterministic("getrandom")
+  c_set_errno(savedErrno)
+
+proc repro_hook_entropy*(ctx: var EntropyContext) {.raises: [].} =
+  ## ENTROPY-PARITY — getentropy / arc4random / arc4random_buf /
+  ## arc4random_uniform, the glibc >= 2.36 BSD entropy set. These were
+  ## previously INVISIBLE on Linux while macOS recorded all four, so a program
+  ## seeding a PRNG through `arc4random_buf` was flagged as an entropy consumer
+  ## on one platform and not the other.
+  ##
+  ## They do NOT reduce to the existing `getrandom` hook — by two DIFFERENT
+  ## mechanisms, both read out of the shipped glibc 2.42 `libc.so.6`:
+  ##   * `getentropy` issues `getrandom(2)` ITSELF, as an inline `syscall`
+  ##     instruction in its own body (`mov $0x13e,%eax; syscall`). It never
+  ##     calls the public `getrandom` symbol, and an instruction inside libc's
+  ##     own text is not on the `syscall()`-wrapper path either
+  ##     (`repro_hook_raw_syscall`), so the kernel entry happens with no
+  ##     interposed frame anywhere in the chain.
+  ##   * `arc4random` / `arc4random_buf` / `arc4random_uniform` funnel into
+  ##     `__GI___arc4random_buf`, which calls `__getrandom_nocancel` — a LOCAL
+  ##     symbol, absent from libc's DYNAMIC symbol table, so it cannot cross an
+  ##     interposed PLT entry — and only when re-seeding its ChaCha20 stream:
+  ##     2000 `arc4random*` calls made exactly 2 `getrandom` syscalls, so
+  ##     nearly every call reaches the kernel not at all.
+  ## Net effect, measured: a probe calling all four produced ZERO entropy
+  ## records before this hook existed, even though a real `getrandom(2)`
+  ## syscall demonstrably occurred inside it.
+  ##
+  ## `ctx.value`/`ctx.result` are the forwarded genuine results — the hook only
+  ## observes. No caller attribution: LD_PRELOAD interposes the PUBLIC symbol,
+  ## which libc's own internal users bypass, so what arrives here is the
+  ## program's own call (see `io_mon/types.nim`, record 16).
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  # `getentropy` is the only one of the four that can fail; a failed call
+  # produced no entropy, so it is not evidence that the program consumed any.
+  if ctx.source != lesGetentropy or ctx.result == 0:
+    recordNonDeterministic($ctx.source)
   c_set_errno(savedErrno)
 
 proc repro_hook_raw_syscall*(number, a1, a2, a3, a4, a5, a6,
@@ -2937,6 +3006,7 @@ registerClockGettimeHook(repro_hook_clock_gettime)
 registerGettimeofdayHook(repro_hook_gettimeofday)
 registerTimeHook(repro_hook_time)
 registerGetrandomHook(repro_hook_getrandom)
+registerEntropyHook(repro_hook_entropy)
 registerForkHook(repro_hook_fork)
 registerExecveHook(repro_hook_execve)
 registerPosixSpawnHook(repro_hook_posix_spawn)

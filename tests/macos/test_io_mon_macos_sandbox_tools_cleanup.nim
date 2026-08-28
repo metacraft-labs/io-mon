@@ -102,7 +102,7 @@ proc runMonitorWorker(): int =
   defer: restoreOwnedRun(saved)
   try:
     let request = monitoredSelfRequest(
-      scratch, scratch / ("concurrent-" & workerId & ".rdep"))
+      scratch, scratch / ("concurrent-" & workerId & ".iomon"))
     let monitored = runMonitored(request)
     if monitored.exitCode != 0:
       return 91
@@ -138,9 +138,9 @@ suite "macOS sandbox-tools fallback cleanup":
     defer: restoreOwnedRun(saved)
 
     let monitored = runMonitored(
-      monitoredSelfRequest(scratch, work / "success.rdep"))
+      monitoredSelfRequest(scratch, work / "success.iomon"))
     check monitored.exitCode == 0
-    check fileExists(work / "success.rdep")
+    check fileExists(work / "success.iomon")
     check not existsEnv("CT_SANDBOX_TOOLS_DIR")
     check sandboxDirsUnder(scratch).len == 0
     check fragmentDirsUnder(scratch).len == 0
@@ -156,7 +156,7 @@ suite "macOS sandbox-tools fallback cleanup":
 
     var request: FsSnoopRequest
     request.command = @[work / "definitely-missing-command"]
-    request.depFilePath = work / "failure.rdep"
+    request.depFilePath = work / "failure.iomon"
     request.streamMode = fsoNone
     expect OSError:
       discard runMonitored(request)
@@ -173,7 +173,7 @@ suite "macOS sandbox-tools fallback cleanup":
     let saved = configureOwnedRun(scratch, shim)
     defer: restoreOwnedRun(saved)
 
-    let depfile = work / "nonzero.rdep"
+    let depfile = work / "nonzero.iomon"
     let monitored = runMonitored(
       monitoredSelfRequest(scratch, depfile, exitCode = 23))
     check monitored.exitCode == 23
@@ -205,7 +205,7 @@ suite "macOS sandbox-tools fallback cleanup":
     putEnv("REPRO_MONITOR_SHIM_LIB", shim)
 
     let monitored = runMonitored(
-      monitoredSelfRequest(scratch, work / "custom.rdep"))
+      monitoredSelfRequest(scratch, work / "custom.iomon"))
     check monitored.exitCode == 0
     check dirExists(customSandbox)
     check fileExists(sentinel)
@@ -232,6 +232,6 @@ suite "macOS sandbox-tools fallback cleanup":
       worker.close()
 
     for i in 0 ..< WorkerCount:
-      check fileExists(scratch / ("concurrent-" & $i & ".rdep"))
+      check fileExists(scratch / ("concurrent-" & $i & ".iomon"))
     check sandboxDirsUnder(scratch).len == 0
     check fragmentDirsUnder(scratch).len == 0

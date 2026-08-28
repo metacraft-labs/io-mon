@@ -118,7 +118,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "inline-asm-marker.txt"
     writeFile(marker, "inline asm exit_group marker\n")
-    let depfile = work / "inline-asm-exit.rdep"
+    let depfile = work / "inline-asm-exit.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v

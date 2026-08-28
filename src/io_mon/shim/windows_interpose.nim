@@ -199,6 +199,28 @@ let INVALID_HANDLE_VALUE {.used.}: HANDLE = cast[HANDLE](cast[uint](0'i64 - 1'i6
 
 # --- Win32 imports ---------------------------------------------------------
 
+proc callResultBool(raw: uint64): BOOL {.inline.} =
+  ## Narrow a hook's captured return register to Windows `BOOL` semantics.
+  ##
+  ## `HookContext.result` is `uint64` -- the full return register. Windows
+  ## `BOOL` is `int32`, and the x64 ABI does NOT require a callee to zero the
+  ## upper half of RAX for a 32-bit return; callers are simply expected to
+  ## ignore it. So the raw value can legitimately carry garbage above bit 31.
+  ##
+  ## A direct `callResultBool(ctx.result)` conversion is therefore two bugs waiting:
+  ##
+  ##   * it can raise `RangeDefect` when the raw value exceeds `int32.high`.
+  ##     These procs are `{.raises: [].}` hook callbacks and the surrounding
+  ##     `except CatchableError` does NOT catch a `Defect`, so that would take
+  ##     the whole monitored process down from inside a hook. Note the shim
+  ##     builds with `-d:release`, which KEEPS range checks -- only `-d:danger`
+  ##     removes them, so this is live in production builds, not just debug.
+  ##   * even where it does not trap, testing the full 64 bits answers a
+  ##     different question from the one Windows asked.
+  ##
+  ## Masking answers exactly the question `BOOL` encodes, and cannot trap.
+  BOOL(raw and 0xFFFF_FFFF'u64)
+
 proc GetCurrentProcessId(): DWORD
   {.importc, stdcall, dynlib: "kernel32".}
 proc GetCurrentThreadId(): DWORD
@@ -2550,7 +2572,7 @@ proc snoopReadFile(ctx: var hr.HookContext) {.raises: [].} =
   try:
     let hFile = cast[HANDLE](ctx.args[0])
     let lpBytesRead = cast[ptr DWORD](ctx.args[3])
-    let callOk = BOOL(ctx.result) != 0
+    let callOk = callResultBool(ctx.result) != 0
     let path = pathForHandle(hFile)
     # M5 — external content: a read from a handle the shim never saw opened is
     # the Windows shape of the inherited-pipe channel (`chan=opaque`). The
@@ -2595,7 +2617,7 @@ proc snoopWriteFile(ctx: var hr.HookContext) {.raises: [].} =
   try:
     let hFile = cast[HANDLE](ctx.args[0])
     let lpBytesWritten = cast[ptr DWORD](ctx.args[3])
-    let callOk = BOOL(ctx.result) != 0
+    let callOk = callResultBool(ctx.result) != 0
     var record = baseRecord(mrFileWrite, moFileWrite)
     record.path = pathForHandle(hFile)
     if callOk and lpBytesWritten != nil:
@@ -2638,7 +2660,7 @@ proc snoopGetFileAttributesExW(ctx: var hr.HookContext) {.raises: [].} =
     return
   try:
     let lpFileName = cast[LPCWSTR](ctx.args[0])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var record = baseRecord(mrPathProbe, moPathProbe)
     record.path = widePtrToString(lpFileName)
     record.result = int64(r)
@@ -2657,7 +2679,7 @@ proc snoopGetFileAttributesExA(ctx: var hr.HookContext) {.raises: [].} =
     return
   try:
     let lpFileName = cast[LPCSTR](ctx.args[0])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var record = baseRecord(mrPathProbe, moPathProbe)
     if lpFileName != nil:
       record.path = $lpFileName
@@ -2882,40 +2904,46 @@ proc snoopCreateProcessW(ctx: var hr.HookContext) {.raises: [].} =
   # main thread — unless the original caller already asked for
   # CREATE_SUSPENDED themselves, in which case we leave the suspension
   # exactly as they requested.
-  # Our own probe/helper spawns are infrastructure, not part of the traced
-  # program: they are started from inside this hook's own injection path to
-  # reach across a bitness boundary. Recording them would be wrong twice
-  # over -- their I/O is not a dependency of the action, and because they are
-  # deliberately not injected, a spawn record for them is an unmatched spawn,
-  # which the writer grades as an unmonitored subtree and which then makes an
-  # otherwise fully-observed run mcIncomplete.
+  # RESUME OWNERSHIP IS AN INVARIANT, NOT A HAPPY PATH. If we forced the
+  # suspension, the child NEVER runs unless we resume it: every exit path
+  # out of this hook owes that resume, including the ones that give up on
+  # the snooping (re-entrancy `disabled`, a torn-down `initialized`, an
+  # exception out of record building or injection). Nothing else in the
+  # system knows the child is suspended, so a missed resume is not a lost
+  # record -- it is a caller waiting forever on a process that will never
+  # run a single instruction.
   #
-  # Passed straight through: no forced CREATE_SUSPENDED, no injection, no
-  # record.
-  if shProp.spawningHelperProcess():
-    hr.callNext(ctx)
-    return
-
+  # The earlier shape had a bare `return` between the force and the
+  # resume, so a hook re-entered during `callNext` handed the caller a
+  # child frozen forever. Hence: ONE decision variable
+  # (`shimForcedSuspend`), no `return` after the force, and the resume in
+  # a `finally`. The proc keeps growing exit paths; the `finally` is what
+  # makes the next one safe by construction rather than by review.
+  #
+  # The symmetric hazard is a DOUBLE resume, which is why the force is
+  # skipped entirely when the caller already asked for CREATE_SUSPENDED --
+  # then their own later ResumeThread is the only one.
   let callerCreationFlags = DWORD(ctx.args[5])
   let callerAskedForSuspended =
     (callerCreationFlags and CREATE_SUSPENDED) != 0
-  # `forcedSuspend` is this hook's debt. It is true only when the suspension
-  # the child is born with is one WE introduced, and from the moment it is
-  # set, EVERY path out of this proc owes that child a `ResumeThread` -- the
-  # early return below, a raise the `except` swallows, and the ordinary end
-  # alike. That is what the `finally` at the bottom exists for; nothing else
-  # in this proc may resume, or the debt is paid twice.
+  # `shimForcedSuspend` is this hook's debt. It is true only when the
+  # suspension the child is born with is one WE introduced, and from the
+  # moment it is set, EVERY path out of this proc owes that child a
+  # `ResumeThread` -- the test escapes below, a raise the `except` swallows,
+  # and the ordinary end alike. That is what the `finally` at the bottom
+  # exists for; nothing else in this proc may resume, or the debt is paid
+  # twice.
   #
   # It stays false when the caller asked for CREATE_SUSPENDED themselves.
   # Suspend counts are counted, not boolean: an extra ResumeThread on a
   # caller-suspended child drops the count to zero and starts it running
   # before the caller meant it to, which cannot be taken back.
-  var forcedSuspend = false
+  var shimForcedSuspend = false
   if initialized and disabled == 0:
     ensureSelfDllPath()
-    if selfDllPathW.len > 0:
+    if selfDllPathW.len > 0 and not callerAskedForSuspended:
       ctx.args[5] = uint64(callerCreationFlags or CREATE_SUSPENDED)
-      forcedSuspend = not callerAskedForSuspended
+      shimForcedSuspend = true
   hr.callNext(ctx)
   let savedLastError = GetLastError()
   # Resolve the thread to resume BEFORE any branch that can leave. `disabled`
@@ -2923,135 +2951,156 @@ proc snoopCreateProcessW(ctx: var hr.HookContext) {.raises: [].} =
   # (the exit handler races this hook); the child, however, is already alive
   # and already suspended, so the debt is fixed at this point and must not
   # depend on state that can still change.
-  var suspendedThread: HANDLE = nil
-  if forcedSuspend:
-    let piForResume = cast[ptr PROCESS_INFORMATION](ctx.args[9])
-    if BOOL(ctx.result) != 0 and piForResume != nil:
-      suspendedThread = piForResume[].hThread
+  let lpProcessInfo = cast[ptr PROCESS_INFORMATION](ctx.args[9])
+  # `ctx.result` is compared as the raw register value; the narrowing
+  # `BOOL(...)` conversion is only done inside the `try`, where the record
+  # actually needs the BOOL-typed value.
+  # Windows BOOL is 32-bit and the x64 ABI lets a callee leave garbage in
+  # the upper half of RAX, so mask before testing: a FAILED CreateProcess
+  # whose high bits happen to be set would otherwise read as created, and
+  # we would ResumeThread an unset hThread and inject into a garbage
+  # handle. Masking keeps BOOL semantics without a narrowing conversion,
+  # which in a `raises: []` proc could raise RangeDefect and take the
+  # process down inside a hook.
+  let created = (ctx.result and 0xFFFF_FFFF'u64) != 0'u64 and
+    lpProcessInfo != nil
+  # Non-nil ONLY when WE suspended a child that actually got created; the
+  # `finally` below then resumes it unconditionally.
+  var childMainThread: HANDLE = nil
+  if created and shimForcedSuspend:
+    childMainThread = lpProcessInfo[].hThread
   try:
     when defined(ioMonShimSpawnEscapeTest):
       if testSpawnEscape == tseEarlyReturn:
         return
-    if disabled > 0 or not initialized:
-      return
-    when defined(ioMonShimSpawnEscapeTest):
-      if testSpawnEscape == tseRaise:
-        raise newException(ValueError,
-          "REPRO_MONITOR_SHIM_TEST_SPAWN_ESCAPE=raise")
-    let lpApplicationName = cast[LPCWSTR](ctx.args[0])
-    let lpCommandLine = cast[LPWSTR](ctx.args[1])
-    let lpProcessInfo = cast[ptr PROCESS_INFORMATION](ctx.args[9])
-    let r = BOOL(ctx.result)
-    var childForkRuntime = ""
-    var record = baseRecord(mrProcessSpawn, moExecute)
-    if r != 0 and lpProcessInfo != nil:
-      record.childOsPid = uint64(lpProcessInfo[].dwProcessId)
-      childForkRuntime =
-        shProp.windowsForkRuntimeForProcess(lpProcessInfo[].hProcess)
-    record.result = int64(r)
-    var path = ""
-    if lpApplicationName != nil:
-      path = widePtrToString(lpApplicationName)
-    elif lpCommandLine != nil:
-      path = widePtrToString(cast[LPCWSTR](lpCommandLine))
-    record.path = path
-    record.detail = "CreateProcessW"
-    if childForkRuntime.len > 0:
-      record.detail.add(" fork-runtime=" & childForkRuntime)
-    # Inject BEFORE emitting so the spawn record can say whether the child
-    # was actually instrumented.
-    #
-    # The outcome used to be discarded. A failed injection then surfaced
-    # only downstream, as the writer synthesising "spawn child missing
-    # process-start" for a child that never reported -- which says the
-    # subtree was lost but not why, and "injection failed", "the in-flight
-    # cap was saturated" and "LoadLibraryW timed out" are a bug, a tuning
-    # knob and a hung child respectively. Record which one it was.
-    if r != 0 and lpProcessInfo != nil and selfDllPathW.len > 0:
-      let pi = lpProcessInfo[]
-      # A pre-main remote thread deadlocks MSYS2/Cygwin fork runtimes.
-      # The unmatched spawn record makes the skipped subtree incomplete.
-      if childForkRuntime.len == 0:
-        let outcome = shProp.injectShimIntoChild(pi.hProcess, selfDllPath(),
-          "repro_runtime_init")
+    if initialized and disabled == 0:
+      when defined(ioMonShimSpawnEscapeTest):
+        if testSpawnEscape == tseRaise:
+          raise newException(ValueError,
+            "REPRO_MONITOR_SHIM_TEST_SPAWN_ESCAPE=raise")
+      let lpApplicationName = cast[LPCWSTR](ctx.args[0])
+      let lpCommandLine = cast[LPWSTR](ctx.args[1])
+      let r = callResultBool(ctx.result)
+      var childForkRuntime = ""
+      var record = baseRecord(mrProcessSpawn, moExecute)
+      if created:
+        record.childOsPid = uint64(lpProcessInfo[].dwProcessId)
+        childForkRuntime =
+          shProp.windowsForkRuntimeForProcess(lpProcessInfo[].hProcess)
+      record.result = int64(r)
+      var path = ""
+      if lpApplicationName != nil:
+        path = widePtrToString(lpApplicationName)
+      elif lpCommandLine != nil:
+        path = widePtrToString(cast[LPCWSTR](lpCommandLine))
+      record.path = path
+      record.detail = "CreateProcessW"
+      if childForkRuntime.len > 0:
+        record.detail.add(" fork-runtime=" & childForkRuntime)
+      # Inject BEFORE emitting so the spawn record can say whether the child
+      # was actually instrumented.
+      #
+      # The outcome used to be discarded. A failed injection then surfaced
+      # only downstream, as the writer synthesising "spawn child missing
+      # process-start" for a child that never reported -- which says the
+      # subtree was lost but not why, and "injection failed", "the in-flight
+      # cap was saturated" and "LoadLibraryW timed out" are a bug, a tuning
+      # knob and a hung child respectively. Record which one it was.
+      #
+      # A pre-main remote thread deadlocks MSYS2/Cygwin fork runtimes, so
+      # those are left uninjected; the unmatched spawn record makes the
+      # skipped subtree incomplete. They are still resumed -- skipping the
+      # injection does not transfer the suspension to anyone else.
+      if created and selfDllPathW.len > 0 and childForkRuntime.len == 0:
+        let outcome = shProp.injectShimIntoChild(lpProcessInfo[].hProcess,
+          selfDllPath(), "repro_runtime_init")
         if outcome != shProp.ioInjected and
             outcome != shProp.ioAlreadyPresent:
           record.detail.add(" inject=" & $outcome)
-    emitRecord(record)
+      emitRecord(record)
   except CatchableError:
     discard
   finally:
-    # The single place the forced suspension is undone, reached from the
-    # early return above, from the `except`, and from the ordinary end of
-    # the try. `suspendedThread` is non-nil only when this hook is the one
-    # that suspended the child, so this can neither strand a child nor
-    # resume one the caller wanted left asleep.
-    if suspendedThread != nil:
-      discard ResumeThread(suspendedThread)
+    # The single place the forced suspension is undone, reached from the test
+    # escapes above, from the `except`, and from the ordinary end of the try.
+    # `childMainThread` is non-nil only when this hook is the one that
+    # suspended the child, so this can neither strand a child nor resume one
+    # the caller wanted left asleep.
+    if childMainThread != nil:
+      discard ResumeThread(childMainThread)
     # After the resume: ResumeThread clobbers the thread's last-error value,
     # and the caller must observe the CreateProcessW one.
     SetLastError(savedLastError)
 
 proc snoopCreateProcessA(ctx: var hr.HookContext) {.raises: [].} =
+  # Byte-for-byte the same resume-ownership contract as
+  # snoopCreateProcessW -- see the note there. Only the string width and
+  # the record/inject ordering differ.
   let savedFlagsA = DWORD(ctx.args[5])
   let callerAskedForSuspendedA =
     (savedFlagsA and CREATE_SUSPENDED) != 0
   # Same resume-debt discipline as `snoopCreateProcessW`; see the commentary
   # there for why the flag is captured here and discharged only in `finally`.
-  var forcedSuspendA = false
+  var shimForcedSuspend = false
   if initialized and disabled == 0:
     ensureSelfDllPath()
-    if selfDllPathW.len > 0:
+    if selfDllPathW.len > 0 and not callerAskedForSuspendedA:
       ctx.args[5] = uint64(savedFlagsA or CREATE_SUSPENDED)
-      forcedSuspendA = not callerAskedForSuspendedA
+      shimForcedSuspend = true
   hr.callNext(ctx)
   let savedLastError = GetLastError()
-  var suspendedThreadA: HANDLE = nil
-  if forcedSuspendA:
-    let piForResume = cast[ptr PROCESS_INFORMATION](ctx.args[9])
-    if BOOL(ctx.result) != 0 and piForResume != nil:
-      suspendedThreadA = piForResume[].hThread
+  # Resolved before any branch that can leave, for the reason given in
+  # `snoopCreateProcessW`.
+  let lpProcessInfo = cast[ptr PROCESS_INFORMATION](ctx.args[9])
+  # Windows BOOL is 32-bit and the x64 ABI lets a callee leave garbage in
+  # the upper half of RAX, so mask before testing: a FAILED CreateProcess
+  # whose high bits happen to be set would otherwise read as created, and
+  # we would ResumeThread an unset hThread and inject into a garbage
+  # handle. Masking keeps BOOL semantics without a narrowing conversion,
+  # which in a `raises: []` proc could raise RangeDefect and take the
+  # process down inside a hook.
+  let created = (ctx.result and 0xFFFF_FFFF'u64) != 0'u64 and
+    lpProcessInfo != nil
+  var childMainThread: HANDLE = nil
+  if created and shimForcedSuspend:
+    childMainThread = lpProcessInfo[].hThread
   try:
     when defined(ioMonShimSpawnEscapeTest):
       if testSpawnEscape == tseEarlyReturn:
         return
-    if disabled > 0 or not initialized:
-      return
-    when defined(ioMonShimSpawnEscapeTest):
-      if testSpawnEscape == tseRaise:
-        raise newException(ValueError,
-          "REPRO_MONITOR_SHIM_TEST_SPAWN_ESCAPE=raise")
-    let lpApplicationName = cast[LPCSTR](ctx.args[0])
-    let lpCommandLine = cast[LPSTR](ctx.args[1])
-    let lpProcessInfo = cast[ptr PROCESS_INFORMATION](ctx.args[9])
-    let r = BOOL(ctx.result)
-    var childForkRuntime = ""
-    var record = baseRecord(mrProcessSpawn, moExecute)
-    if r != 0 and lpProcessInfo != nil:
-      record.childOsPid = uint64(lpProcessInfo[].dwProcessId)
-      childForkRuntime =
-        shProp.windowsForkRuntimeForProcess(lpProcessInfo[].hProcess)
-    record.result = int64(r)
-    var path = ""
-    if lpApplicationName != nil:
-      path = $lpApplicationName
-    elif lpCommandLine != nil:
-      path = $cast[cstring](lpCommandLine)
-    record.path = path
-    record.detail = "CreateProcessA"
-    if childForkRuntime.len > 0:
-      record.detail.add(" fork-runtime=" & childForkRuntime)
-    emitRecord(record)
-    if r != 0 and lpProcessInfo != nil and selfDllPathW.len > 0:
-      let pi = lpProcessInfo[]
-      if childForkRuntime.len == 0:
-        discard shProp.injectShimIntoChild(pi.hProcess, selfDllPath(),
-          "repro_runtime_init")
+    if initialized and disabled == 0:
+      when defined(ioMonShimSpawnEscapeTest):
+        if testSpawnEscape == tseRaise:
+          raise newException(ValueError,
+            "REPRO_MONITOR_SHIM_TEST_SPAWN_ESCAPE=raise")
+      let lpApplicationName = cast[LPCSTR](ctx.args[0])
+      let lpCommandLine = cast[LPSTR](ctx.args[1])
+      let r = callResultBool(ctx.result)
+      var childForkRuntime = ""
+      var record = baseRecord(mrProcessSpawn, moExecute)
+      if created:
+        record.childOsPid = uint64(lpProcessInfo[].dwProcessId)
+        childForkRuntime =
+          shProp.windowsForkRuntimeForProcess(lpProcessInfo[].hProcess)
+      record.result = int64(r)
+      var path = ""
+      if lpApplicationName != nil:
+        path = $lpApplicationName
+      elif lpCommandLine != nil:
+        path = $cast[cstring](lpCommandLine)
+      record.path = path
+      record.detail = "CreateProcessA"
+      if childForkRuntime.len > 0:
+        record.detail.add(" fork-runtime=" & childForkRuntime)
+      emitRecord(record)
+      if created and selfDllPathW.len > 0 and childForkRuntime.len == 0:
+        discard shProp.injectShimIntoChild(lpProcessInfo[].hProcess,
+          selfDllPath(), "repro_runtime_init")
   except CatchableError:
     discard
   finally:
-    if suspendedThreadA != nil:
-      discard ResumeThread(suspendedThreadA)
+    if childMainThread != nil:
+      discard ResumeThread(childMainThread)
     SetLastError(savedLastError)
 
 # --- M73 Phase 5 snoop callbacks -------------------------------------------
@@ -3106,7 +3155,7 @@ proc snoopDeleteFileW(ctx: var hr.HookContext) {.raises: [].} =
     return
   try:
     let lpFileName = cast[LPCWSTR](ctx.args[0])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var record = baseRecord(mrFileWrite, moFileWrite)
     record.path = widePtrToString(lpFileName)
     record.result = int64(r)
@@ -3124,7 +3173,7 @@ proc snoopDeleteFileA(ctx: var hr.HookContext) {.raises: [].} =
     return
   try:
     let lpFileName = cast[LPCSTR](ctx.args[0])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var record = baseRecord(mrFileWrite, moFileWrite)
     if lpFileName != nil:
       record.path = $lpFileName
@@ -3143,7 +3192,7 @@ proc snoopCreateDirectoryW(ctx: var hr.HookContext) {.raises: [].} =
     return
   try:
     let lpPathName = cast[LPCWSTR](ctx.args[0])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var record = baseRecord(mrFileWrite, moFileWrite)
     record.path = widePtrToString(lpPathName)
     record.result = int64(r)
@@ -3161,7 +3210,7 @@ proc snoopCreateDirectoryA(ctx: var hr.HookContext) {.raises: [].} =
     return
   try:
     let lpPathName = cast[LPCSTR](ctx.args[0])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var record = baseRecord(mrFileWrite, moFileWrite)
     if lpPathName != nil:
       record.path = $lpPathName
@@ -3181,7 +3230,7 @@ proc snoopCopyFileW(ctx: var hr.HookContext) {.raises: [].} =
   try:
     let lpExisting = cast[LPCWSTR](ctx.args[0])
     let lpNew      = cast[LPCWSTR](ctx.args[1])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var src = baseRecord(mrFileOpen, moFileRead)
     src.path = widePtrToString(lpExisting)
     src.result = int64(r)
@@ -3205,7 +3254,7 @@ proc snoopCopyFileA(ctx: var hr.HookContext) {.raises: [].} =
   try:
     let lpExisting = cast[LPCSTR](ctx.args[0])
     let lpNew      = cast[LPCSTR](ctx.args[1])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var src = baseRecord(mrFileOpen, moFileRead)
     if lpExisting != nil:
       src.path = $lpExisting
@@ -3231,7 +3280,7 @@ proc snoopMoveFileExW(ctx: var hr.HookContext) {.raises: [].} =
   try:
     let lpExisting = cast[LPCWSTR](ctx.args[0])
     let lpNew      = cast[LPCWSTR](ctx.args[1])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var src = baseRecord(mrFileWrite, moFileWrite)
     src.path = widePtrToString(lpExisting)
     src.result = int64(r)
@@ -3259,7 +3308,7 @@ proc snoopMoveFileExA(ctx: var hr.HookContext) {.raises: [].} =
   try:
     let lpExisting = cast[LPCSTR](ctx.args[0])
     let lpNew      = cast[LPCSTR](ctx.args[1])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var src = baseRecord(mrFileWrite, moFileWrite)
     if lpExisting != nil:
       src.path = $lpExisting
@@ -3284,7 +3333,7 @@ proc snoopGetFileInformationByHandleEx(ctx: var hr.HookContext) {.raises: [].} =
     return
   try:
     let hFile = cast[HANDLE](ctx.args[0])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var record = baseRecord(mrPathProbe, moPathProbe)
     record.path = pathForHandle(hFile)
     record.result = int64(r)
@@ -3303,7 +3352,7 @@ proc snoopSetCurrentDirectoryW(ctx: var hr.HookContext) {.raises: [].} =
     return
   try:
     let lpPathName = cast[LPCWSTR](ctx.args[0])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var record = baseRecord(mrFileOpen, moExecute)
     record.path = widePtrToString(lpPathName)
     record.result = int64(r)
@@ -3321,7 +3370,7 @@ proc snoopSetCurrentDirectoryA(ctx: var hr.HookContext) {.raises: [].} =
     return
   try:
     let lpPathName = cast[LPCSTR](ctx.args[0])
-    let r = BOOL(ctx.result)
+    let r = callResultBool(ctx.result)
     var record = baseRecord(mrFileOpen, moExecute)
     if lpPathName != nil:
       record.path = $lpPathName
@@ -4019,14 +4068,14 @@ proc trampolineFindNextFileW(hFindFile: HANDLE;
     cast[uint64](lpFindFileData)
   ])
   hr.dispatchShimHook(hr.HookFindNextFileW, ctx)
-  result = BOOL(ctx.result)
+  result = callResultBool(ctx.result)
 
 proc trampolineFindClose(hFindFile: HANDLE): BOOL {.stdcall.} =
   if origFindClose == nil:
     return 0
   var ctx = hr.HookContext(args: @[cast[uint64](hFindFile)])
   hr.dispatchShimHook(hr.HookFindClose, ctx)
-  result = BOOL(ctx.result)
+  result = callResultBool(ctx.result)
 
 proc trampolineGetProcAddress(hModule: HANDLE;
                                lpProcName: LPCSTR): pointer {.stdcall.} =

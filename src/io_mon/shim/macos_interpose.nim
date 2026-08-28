@@ -363,6 +363,11 @@ var
   # paired-down breakaway, never a false skip). See repro_hook_xpc_*.
   pendingAppleXpc = initTable[uint, string]()
   fragmentDir: string
+  # The consumer's event-interest set (REPRO_MONITOR_INTEREST), set once at init
+  # and only read in `emitRecord` thereafter. `FullInterest` by default so a shim
+  # never told an interest captures everything. See
+  # docs/contributors/event-interest-filter.md.
+  gInterest: set[EventCategory] = FullInterest
   nextProcessSeq: uint64 = 0
   fdPaths = initTable[cint, string]()
   dirPaths = initTable[uint, string]()
@@ -464,6 +469,12 @@ proc baseRecord(kind: MonitorRecordKind; observationKind: MonitorObservationKind
 proc emitRecord(record: MonitorRecord) {.raises: [].} =
   if not initialized or fragmentDir.len == 0 or disabled > 0:
     return
+  # Event-interest gate — skip a category the consumer did not ask for before the
+  # fragment write. `recordWanted` returns true for META/loss kinds, so an
+  # `mrEventLoss` is never suppressed (LF-1). See
+  # docs/contributors/event-interest-filter.md §4.1.
+  if not recordWanted(gInterest, record.kind):
+    return
   withShimMuted:
     appendFragmentRecord(fragmentDir, record)
     # Threaded-write capture fix: if this record was emitted from a WORKER thread
@@ -530,7 +541,7 @@ proc metaSuffix(detail: string; mtime, size: uint64): string {.raises: [].} =
   ## when a directory gains/loses an entry or a stat-only file's content changes,
   ## so the consumer (folding mtime/size into its key) re-runs iff they changed.
   ## Same whitespace-separated `key=value` wire encoding as devInoSuffix (read back
-  ## via writer.detailToken), so no RMDF wire-format field is added.
+  ## via writer.detailToken), so no iomon wire-format field is added.
   result = detail
   if result.len > 0: result.add ' '
   result.add "mtime=" & $mtime & " size=" & $size
@@ -715,7 +726,7 @@ proc devInoSuffix(detail: string; dev, ino: uint64): string {.raises: [].} =
   ## Append a ` dev=<n> ino=<n>` token pair to `detail` (ROUND-2 R4 hardlink
   ## identity). The tokens are whitespace-separated `key=value` pairs read back via
   ## writer.detailToken, exactly like the round-2 R7/R8 start/peer tokens — so no
-  ## wire-format field is added (RMDF stays byte-stable). realpath collapses two
+  ## wire-format field is added (iomon stays byte-stable). realpath collapses two
   ## NAMES of one file to one canonical path, but it CANNOT collapse a HARDLINK
   ## (distinct directory entries, same inode); the (dev, ino) lets a consumer match
   ## that alternate-name case by inode identity.
@@ -1384,6 +1395,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
     return 0
   withShimMuted:
     fragmentDir = getEnv("REPRO_MONITOR_FRAGMENT_DIR")
+    gInterest = parseInterestTokens(getEnv("REPRO_MONITOR_INTEREST"))
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))
     # ROUND-2 R8 — capture the invocation run id for report authentication.
@@ -2319,7 +2331,7 @@ proc recordNonDeterministic(source: string) {.raises: [].} =
   if source.len == 0:
     return
   recordObservedOnce(mrNonDeterministic, moNonDeterministic, "nd:" & source,
-    source, "non-deterministic entropy source")
+    source, NonDeterministicEntropyDetail)
 
 proc recordTimeRead(source: string) {.raises: [].} =
   ## Record a WALL-CLOCK read (clock_gettime/gettimeofday/time/mach_absolute_time)

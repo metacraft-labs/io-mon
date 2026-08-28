@@ -133,7 +133,7 @@ int main(int argc, char **argv) {
     checkpoint("[" & backend & "] probe exit=" & $code & " stderr=" & stderrOut)
     doAssert code == 0, "probe under shim should exit 0"
 
-    let depfile = work / "cap.rdep"
+    let depfile = work / "cap.iomon"
     discard mergeFragments(fragmentDir, depfile)
     doAssert fileExists(depfile)
     let dep = readMonitorDepFile(depfile)

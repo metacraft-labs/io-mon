@@ -126,7 +126,7 @@ int main(void) { printf("%d\n", TOP_VALUE); return 0; }
     for k, v in envPairs(): childEnv[k] = v
     childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
 
-    let depfile = work / "compile.rdep"
+    let depfile = work / "compile.iomon"
     let monitored = run(snoopBin,
       @["run", "--depfile", depfile, "--", cc] &
         compileArgs("monitored.o", "monitored.d"),

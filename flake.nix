@@ -92,6 +92,32 @@
               # command: 'strace'" while it passed on developer machines that
               # happened to have it on PATH.
               pkgs.strace
+              # The §4.5(h) REAL-BUILD COMPLETENESS ORACLE
+              # (`just test-realbuild-oracle`, tests/realbuild/run_oracle.sh) —
+              # the cardinal-sin gate: it drives real cmake+ninja and cargo
+              # builds under the shim and checks io-mon's captured input set
+              # against the toolchain's OWN dependency data (`ninja -t deps`,
+              # cargo/rustc `--emit=dep-info`) and against `strace -f`.
+              #
+              # These were left to the AMBIENT environment, and the result was a
+              # documented `just` target that could not run from ANY shell:
+              # measured, `just test-realbuild-oracle` exited 2 with
+              # "missing required tool(s) from the ambient environment: cmake
+              # cargo rustc" in io-mon's own devShell AND in a bare workspace
+              # shell. The script also pulled ninja in with
+              # `nix shell nixpkgs#ninja`, a MUTABLE FLAKE-REGISTRY lookup that
+              # resolves against whatever nixpkgs the machine last synced.
+              #
+              # Pinning them is not merely convenience. The oracle's verdict is
+              # a comparison against the toolchain's own dep data, so the
+              # toolchain is part of the EXPERIMENT: an unpinned cmake/rustc/
+              # ninja means the gate measures a different thing on every
+              # machine, and a capture gap could appear or vanish with a
+              # compiler bump rather than with an io-mon change.
+              pkgs.cmake
+              pkgs.ninja
+              pkgs.cargo
+              pkgs.rustc
             ];
           };
         };

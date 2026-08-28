@@ -145,7 +145,7 @@ int main(int argc, char **argv) {
       let (outT, codeT) = runUnderShim(shim, trivial, @[input], frag)
       check codeT == 0
       checkpoint("trivial: " & outT)
-      let dep = mergeFragments(frag, work / "trivial.rdep")
+      let dep = mergeFragments(frag, work / "trivial.iomon")
       # No Mach/XPC service was touched, so no mach-service record exists…
       check machServiceRecords(dep).len == 0
       # …and the build stays complete — the shim's OWN startup bootstrap calls
@@ -186,7 +186,7 @@ int main(void) {
       let (outA, codeA) = runUnderShim(shim, apple, @[], frag)
       check codeA == 0
       checkpoint("apple: " & outA)
-      let dep = mergeFragments(frag, work / "apple.rdep")
+      let dep = mergeFragments(frag, work / "apple.iomon")
       # com.apple.* lookups are the system baseline — NEVER recorded…
       check machServiceRecords(dep).len == 0
       # …so a build doing only system-service traffic stays complete.
@@ -211,7 +211,7 @@ int main(void) {
       # the create-entry record is what matters.
       let (outX, _) = runUnderShim(shim, xpcClient, @[marker], frag)
       checkpoint("xpc_client: " & outX)
-      let dep = mergeFragments(frag, work / "xpc.rdep")
+      let dep = mergeFragments(frag, work / "xpc.iomon")
       let recs = machServiceRecords(dep)
       # The XPC client entry to the non-system service was recorded…
       check recs.len >= 1
@@ -269,7 +269,7 @@ int main(void) {
 
         if markText in outM:
           # The breakaway DID happen (the out-of-tree server served the marker)…
-          let dep = mergeFragments(frag, work / "mach.rdep")
+          let dep = mergeFragments(frag, work / "mach.iomon")
           let recs = machServiceRecords(dep)
           check recs.len >= 1            # the bootstrap_look_up was recorded
           var sawSvc = false
@@ -333,7 +333,7 @@ int main(void) {
 
         if markText in outM:
           # The forged-com.apple.* breakaway DID happen…
-          let dep = mergeFragments(frag, work / "r3mach.rdep")
+          let dep = mergeFragments(frag, work / "r3mach.iomon")
           let recs = machServiceRecords(dep)
           check recs.len >= 1            # the com.apple.* lookup is now recorded
           var sawSvc = false

@@ -48,19 +48,20 @@ required-set when a depfile is finalised. It is the set of capabilities whose ab
 means **an input channel is unobserved**, and it is deliberately narrower than "every
 declared gap":
 
-| Gap class | Example | Downgrades? | Why |
-| --- | --- | --- | --- |
-| Missing input channel | `mcapLibraryLoad` | **yes** | Real content inputs, observed by nothing else, no substitute record |
-| Alternative backend | `mcapEndpointSecurity`, `mcapHybrid` | no | Says another implementation was not used, not that anything went unobserved |
-| Enforcement | `mcapAuthorizationEnforcement` | no | io-mon observes; it never claimed to deny |
-| Output-side / identity | `mcapPathMutation`, `mcapPathIdentity` | no | A missed mutation record is not an input a cache key silently omits |
-| Partial with a substitute | `mcapSymlink`, `mcapExternalContent` | no | A read through a symlink still records a path resolving to the same bytes |
-| Threat model | `mcapAdversarialRawSyscall`, `mcapExecutableMappingLifecycle` | no | The profile's diagnostics already tell consumers to request these explicitly |
+| Gap class                 | Example                                                       | Downgrades? | Why                                                                          |
+| ------------------------- | ------------------------------------------------------------- | ----------- | ---------------------------------------------------------------------------- |
+| Missing input channel     | `mcapLibraryLoad`                                             | **yes**     | Real content inputs, observed by nothing else, no substitute record          |
+| Alternative backend       | `mcapEndpointSecurity`, `mcapHybrid`                          | no          | Says another implementation was not used, not that anything went unobserved  |
+| Enforcement               | `mcapAuthorizationEnforcement`                                | no          | io-mon observes; it never claimed to deny                                    |
+| Output-side / identity    | `mcapPathMutation`, `mcapPathIdentity`                        | no          | A missed mutation record is not an input a cache key silently omits          |
+| Partial with a substitute | `mcapSymlink`, `mcapExternalContent`                          | no          | A read through a symlink still records a path resolving to the same bytes    |
+| Threat model              | `mcapAdversarialRawSyscall`, `mcapExecutableMappingLifecycle` | no          | The profile's diagnostics already tell consumers to request these explicitly |
 
-Downgrading on *every* declared gap would make Linux permanently `mcIncomplete` and
+Downgrading on _every_ declared gap would make Linux permanently `mcIncomplete` and
 destroy the signal — a different way of being useless, not a fix. A consumer that
 wants a wider bar still calls `evaluateMonitorEvidence` with its own required-set;
 `InputEvidenceCapabilities` is the floor, not the ceiling.
+
 - Scenarios triggering `mcIncomplete` include:
   - Interrupted or corrupt fragment log writing.
   - Spawning child processes under hardened/SIP-protected environments that prevent shim insertion.
@@ -87,7 +88,7 @@ wants a wider bar still calls `evaluateMonitorEvidence` with its own required-se
   symbol interposition, so no file hook can ever see a loader-driven load. io-mon
   therefore **asks the loader for its link map** instead of hooking the calls that
   populate it — the Linux counterpart of the macOS arm's
-  `_dyld_register_func_for_add_image`. Scans run at shim init (which sees the *entire*
+  `_dyld_register_func_for_add_image`. Scans run at shim init (which sees the _entire_
   initial closure, because `ld.so` maps everything before running any ELF constructor),
   after each interposed `dlopen`/`dlmopen` (before the handle is returned, so the
   dependency is published before the program can act on it), and at shutdown.
@@ -100,7 +101,7 @@ wants a wider bar still calls `evaluateMonitorEvidence` with its own required-se
   would close that at the cost of a second injected copy of io-mon per process, in its
   own link-map namespace — see `docs/cases/dlopen-runpath-transparency.md` alternative C.
 - **File Transfers**: Tracks vector/zero-copy operations (`pread`, `readv`, `sendfile`, `copy_file_range`, `splice`) and records them as reads/writes.
-- **Non-File Tracking**: Logs `getenv`, `uname`, `sysconf` accesses, system time calls, and `getrandom` non-determinism events.
+- **Non-File Tracking**: Logs `getenv`, `uname`, `sysconf` accesses, system time calls, and entropy (non-determinism) events. The entropy surface is `getrandom` (libc symbol, raw syscall and vDSO entry) plus the glibc >= 2.36 BSD set `getentropy` / `arc4random` / `arc4random_buf` / `arc4random_uniform`, deduped once per process per source — the same cross-platform observation contract the macOS shim follows (see `mrNonDeterministic` in `src/io_mon/types.nim`).
 
 ### Windows
 
@@ -114,4 +115,4 @@ wants a wider bar still calls `evaluateMonitorEvidence` with its own required-se
 
 - It maintains zero dependency on `reprobuild`.
 - It depends solely on `nim-stackable-hooks`.
-- Standardized binary format (`RMDF` version 1) and ABI names (`repro_monitor_shim_*`) are kept byte-identical so it remains a drop-in replacement across the suite.
+- The binary depfile format (`IOMN` version 1) is io-mon's own; the shim ABI names (`repro_monitor_shim_*`) are kept byte-identical so the observation stack remains a drop-in replacement across the suite.

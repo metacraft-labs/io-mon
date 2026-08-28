@@ -50,7 +50,7 @@ suite "Windows process-start survives the merge":
       try: removeDir(dir)
       except CatchableError: discard
 
-    let depFilePath = dir / "run.rdep"
+    let depFilePath = dir / "run.iomon"
     let result = monitorSimpleCommand(depFilePath)
 
     var processStarts = 0
@@ -67,7 +67,7 @@ suite "Windows process-start survives the merge":
       try: removeDir(dir)
       except CatchableError: discard
 
-    let depFilePath = dir / "run.rdep"
+    let depFilePath = dir / "run.iomon"
     let result = monitorSimpleCommand(depFilePath)
 
     # A dropped process-start does not merely lose a record: it makes every

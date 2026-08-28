@@ -11,7 +11,7 @@
 ##
 ##   t_run_monitored_end_to_end — `runMonitored(req)` on a real marker-reading
 ##       command returns `mcComplete`, captures every expected input path, and
-##       the consumer-owned run leaves NO `.rmdf-frag` spill (LF-2) and no
+##       the consumer-owned run leaves NO `.iomon-frag` spill (LF-2) and no
 ##       orphaned fragment directory behind (the host owns + tears down the
 ##       whole lifecycle). The depfile it wrote on disk decodes to the same.
 
@@ -70,10 +70,10 @@ proc hasFileRead(recs: seq[MonitorRecord]; path: string): bool =
     path in it.path)
 
 proc fragFilesUnder(dir: string): seq[string] =
-  ## Any `.rmdf-frag` spill anywhere under `dir` — the file-fallback the active
+  ## Any `.iomon-frag` spill anywhere under `dir` — the file-fallback the active
   ## set path must NEVER touch.
   for path in walkDirRec(dir):
-    if path.endsWith(".rmdf-frag"):
+    if path.endsWith(".iomon-frag"):
       result.add path
 
 proc fragmentDirsUnder(dir: string): seq[string] =
@@ -104,7 +104,7 @@ suite "io-mon public parent-host API (runMonitored, M6 part A)":
       writeFile(m, "public host api marker " & $i & "\n")
       markers.add m
     let reader = buildC(work, "public_marker_reader", markerReaderSrc())
-    let depfile = work / "public.rdep"
+    let depfile = work / "public.iomon"
 
     # Redirect getTempDir() at runMonitored's scratch into `scratch`, and pin the
     # shim so findShimLibrary() (called INSIDE runMonitored) resolves it.
@@ -145,7 +145,7 @@ suite "io-mon public parent-host API (runMonitored, M6 part A)":
     for m in markers:
       check hasFileRead(onDisk.records, m)
 
-    # (4) LF-2: the consumer-owned run left NO `.rmdf-frag` spill anywhere, and
+    # (4) LF-2: the consumer-owned run left NO `.iomon-frag` spill anywhere, and
     #     NO orphaned fragment directory — the host owned + reaped the whole
     #     lifecycle. (The active set path never writes the file fallback, and
     #     runMonitored's `defer removeDir` cleans its scratch.)

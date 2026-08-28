@@ -1,4 +1,4 @@
-## Capability-surface tests for production consumers. These are pure RMDF/profile
+## Capability-surface tests for production consumers. These are pure iomon/profile
 ## checks: they do not depend on a live shim, but they exercise the same
 ## backend-profile records that merged depfiles carry.
 

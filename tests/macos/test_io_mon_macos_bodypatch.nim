@@ -98,7 +98,7 @@ int main(void) {
 
     # Merge the per-thread fragments the child wrote into a single depfile and
     # decode it with the production reader (no string-grepping of raw bytes).
-    let depfile = work / "cap.rdep"
+    let depfile = work / "cap.iomon"
     discard mergeFragments(fragmentDir, depfile)
     if not fileExists(depfile):
       return false
