@@ -70,7 +70,7 @@ jobs:
         # revisions before materialising the env. Those two are io-mon's
         # `uses:` library producers in repro.nim; reprobuild builds each
         # from source and threads their `src/` roots onto io-mon's compile.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: reprobuild
           gh-token: ${{ steps.ci_token.outputs.token }}
@@ -109,7 +109,7 @@ jobs:
       - name: Mirror logs to S3 (non-blocking)
         if: failure()
         continue-on-error: true
-        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@main
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@dev
         with:
           path: build/
           prefix: reprobuild-logs-${{ matrix.os }}-${{ matrix.arch }}/${{ github.run_id }}
