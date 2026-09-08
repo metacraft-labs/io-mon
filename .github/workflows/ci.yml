@@ -58,7 +58,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runs-on: [eph-linux-x64, eph-macos-arm64]
+        # linux-arm64 is NOT redundant with linux-x64. The shim is the one
+        # component of this repo whose source is genuinely architecture-split:
+        # `src/io_mon/shim/linux_preload.nim` and
+        # `src/io_mon/hooks/linux_preload_runtime.nim` both compile different
+        # code under `#if defined(__x86_64__)`, and five of the ten
+        # `stackable_linux_*` symbols they reference are defined by
+        # nim-stackable-hooks ONLY under `when defined(linux) and
+        # defined(amd64)`. An unguarded reference to one of those is invisible
+        # on x64 and fatal on aarch64 -- which is exactly the bug fixed in PR
+        # #11 (`undefined symbol: stackable_linux_chain_sigtrap`), which
+        # survived from 2026-06-30 to 2026-09-08 because no lane in THIS
+        # workflow ever compiled or loaded the shim on aarch64.
+        runs-on: [eph-linux-x64, eph-linux-arm64, eph-macos-arm64]
     steps:
       - name: Generate CI token
         id: app-token
@@ -82,6 +94,83 @@ jobs:
         shell: bash
         run: dev-exec just build 2>&1 | tee build.log
 
+      - name: Shim resolves every symbol it references (Linux)
+        # THE TEETH of the arm64 lane.
+        #
+        # `just build` is NOT a gate on this defect class. A shared library
+        # links successfully with undefined symbols -- that is the whole point
+        # of an ELF .so -- so `nim c --app:lib` reports success and the failure
+        # only appears when the dynamic loader is asked to resolve the
+        # relocations, i.e. when the shim is LD_PRELOADed into a real process.
+        # `tests/posix/test_io_mon_shim_builds_standalone.nim` says so in as
+        # many words ("A LIVE interpose run ... is NOT exercised here"), and
+        # the amd64-only-substrate bug is precisely a symbol that is present on
+        # x86_64 and absent on aarch64.
+        #
+        # So: dlopen the shim this checkout just built, with RTLD_NOW, which
+        # forces every relocation immediately. `dlerror()` then reports the
+        # exact string that shipped to users
+        #   .../librepro_monitor_shim.so: undefined symbol: stackable_linux_chain_sigtrap
+        #
+        # The step carries its own NEGATIVE CONTROL: before trusting a pass on
+        # the real shim it builds a library with a deliberately unresolvable
+        # symbol and requires the probe to REJECT it. Without that, a green
+        # here would be indistinguishable from a probe that cannot fail --
+        # which is the failure mode this whole PR exists to fix.
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shim="${GITHUB_WORKSPACE}/build/lib/librepro_monitor_shim.so"
+          if [ ! -f "${shim}" ]; then
+            echo "::error::'just build' did not produce ${shim}"
+            exit 1
+          fi
+
+          probe_dir="$(mktemp -d)"
+          cat > "${probe_dir}/dlopen_probe.c" <<'PROBE'
+          #include <dlfcn.h>
+          #include <stdio.h>
+          int main(int argc, char **argv) {
+            if (argc < 2) { fprintf(stderr, "usage: dlopen_probe <library>\n"); return 2; }
+            /* RTLD_NOW: resolve every relocation now, do not defer to first
+               call. RTLD_LOCAL: do not pollute the global scope. */
+            void *handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+            if (handle == NULL) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
+            return 0;
+          }
+          PROBE
+          cat > "${probe_dir}/unresolvable.c" <<'BROKEN'
+          /* Never defined anywhere. A correct RTLD_NOW probe must reject this. */
+          extern int io_mon_ci_probe_absent_symbol(void);
+          int io_mon_ci_probe_entry(void) { return io_mon_ci_probe_absent_symbol(); }
+          BROKEN
+
+          dev-exec bash -c '
+            set -euo pipefail
+            cd "'"${probe_dir}"'"
+            # glibc >= 2.34 folds libdl into libc; older ones need -ldl.
+            cc dlopen_probe.c -o dlopen_probe 2>/dev/null \
+              || cc dlopen_probe.c -o dlopen_probe -ldl
+            cc -shared -fPIC unresolvable.c -o libunresolvable.so
+          '
+
+          echo "--- negative control: the probe must REJECT a library with an unresolvable symbol ---"
+          if "${probe_dir}/dlopen_probe" "${probe_dir}/libunresolvable.so"; then
+            echo "::error::the dlopen probe ACCEPTED a library with an undefined symbol."
+            echo "::error::A pass on the real shim would therefore prove nothing. Refusing to continue."
+            exit 1
+          fi
+          echo "negative control OK: probe rejected libunresolvable.so"
+
+          echo "--- the shim built from THIS checkout must load on $(uname -m) ---"
+          if ! "${probe_dir}/dlopen_probe" "${shim}"; then
+            echo "::error::the io-mon shim built from this checkout cannot be loaded on $(uname -m)."
+            echo "::error::This is the failure users see as 'symbol lookup error' when the shim is LD_PRELOADed."
+            exit 1
+          fi
+          echo "the shim built from this checkout loads on $(uname -m)"
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -99,10 +188,21 @@ jobs:
         include:
           - env: nix
             runs-on: eph-linux-x64
+          # `just test` on aarch64 Linux is a second, independent gate on the
+          # same defect: tests/linux/test_io_mon_propagation.nim builds the shim
+          # from THIS checkout (scripts/build_shim.sh) and then LD_PRELOADs it
+          # into a real monitored process tree, so a shim with an unresolvable
+          # symbol fails there too -- as `symbol lookup error` in the child.
+          # Kept alongside the Build job's dlopen probe on purpose: the probe is
+          # fast and names the cause, the suite proves the shim actually works.
+          - env: nix
+            runs-on: eph-linux-arm64
           - env: nix
             runs-on: eph-macos-arm64
           - env: reprobuild
             runs-on: eph-linux-x64
+          - env: reprobuild
+            runs-on: eph-linux-arm64
     steps:
       - name: Generate CI token
         id: app-token

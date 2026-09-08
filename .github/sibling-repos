@@ -1,10 +1,44 @@
-# Cross-repo siblings cloned by setup-dev-env at workspace-lock-pinned
-# revisions. They are io-mon's `uses:` library producers in repro.nim
-# (reprobuild builds each from source and threads its `src/` root onto
-# io-mon's compile); they are also the `--path` siblings config.nims
-# resolves for the plain `nim c` / `nimble` build.
-nim-stackable-hooks
-nim-shm-queue
+# Cross-repo siblings cloned by setup-dev-env. They are io-mon's `uses:`
+# library producers in repro.nim (reprobuild builds each from source and
+# threads its `src/` root onto io-mon's compile); they are also the `--path`
+# siblings config.nims resolves for the plain `nim c` / `nimble` build.
+#
+# WHY THESE CARRY EXPLICIT SHAs RATHER THAN RESOLVING FROM THE WORKSPACE LOCK
+#
+# A bare entry makes `clone-siblings.sh` ask metacraft-manifests for the
+# workspace lock of the io-mon commit under test, and a missing lock is FATAL:
+#
+#   ::error::No workspace lock for io-mon (candidates: ...). Neither a
+#   repo-workspaces locks/<project>/io-mon/<sha>.xml nor a reprobuild
+#   locks/<project>/io-mon/<sha>.toml exists in
+#   metacraft-labs/metacraft-manifests@latest.
+#
+# ...before a single dependency is provisioned. That is not hypothetical here.
+# Enumerated over every `ci-reprobuild.yml` run in this repository's history
+# (73 runs, hence 73 linux-arm64 jobs): 40 of those jobs failed in `Setup dev
+# env` with exactly that message and had `repro build` marked `skipped`, 32
+# never started at all, and exactly ONE ever reached `repro build`. The lock is
+# written by a post-commit/pre-push hook that REFUSES to write one whenever any
+# unrelated sibling in the developer's workspace has uncommitted changes, so
+# whole stretches of io-mon commits carry no lock at all and every lane on them
+# is dead before it compiles anything.
+#
+# With no bare entry left, nothing needs a revision FROM the lock, so
+# `lock_unavailable()` degrades to a `::warning::` and the clones proceed.
+#
+# THIS IS THE FALLBACK, NOT THE GOAL, and `clone-siblings.sh` prescribes that
+# order: (1) declare these repos in io-mon's project manifest in
+# metacraft-labs/metacraft-manifests so the lock pins them for every future
+# commit with nothing to maintain; (2) only where (1) is impossible, name a
+# 40-hex commit SHA here -- a commit, never a branch, because a branch tip is
+# exactly the unpinned resolve the mechanism exists to prevent. Delete the
+# `=<sha>` suffixes as soon as (1) lands.
+#
+# Both SHAs below are reachable from their repository's `origin/dev`
+# (`git branch -r --contains <sha>`) and are the revisions the io-mon
+# workspace that produced the aarch64 shim fix was built against.
+nim-stackable-hooks=f3367d44b668e16e9eaa42dc77e51b2e6f5e5954  # on metacraft-labs/nim-stackable-hooks@dev
+nim-shm-queue=5a8e43b52fa202859658692c9f8432967f3971ea  # on metacraft-labs/nim-shm-queue@dev
 
 # nim-shm-gset is required by `src/io_mon/writer.nim` (`import
 # shm_gset/transport`) and by scripts/build_shim.sh, but it was missing from
