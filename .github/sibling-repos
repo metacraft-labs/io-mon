@@ -1,7 +1,35 @@
-# Cross-repo siblings cloned by setup-dev-env at workspace-lock-pinned
-# revisions. Both are io-mon's `uses:` library producers in repro.nim
+# WHY EVERY ENTRY BELOW CARRIES AN EXPLICIT `=<40-hex sha>`
+#
+# `clone-siblings` resolves a BARE entry from the workspace lock, and raises
+# NEED_LOCK for it -- which makes a missing lock FATAL. No lock is published
+# for this repo's branch tip, so every reprobuild run died in `clone-siblings`
+# with:
+#
+#     ::error::No workspace lock for io-mon (candidates: ...). Neither a
+#     repo-workspaces locks/<project>/io-mon/<sha>.xml nor a reprobuild
+#     locks/<project>/io-mon/<sha>.toml exists in
+#     metacraft-labs/metacraft-manifests@latest.
+#
+# before a single dependency was provisioned. With no bare entry left, nothing
+# needs a revision FROM the lock, so `lock_unavailable()` degrades to a
+# `::warning::` and the clones proceed.
+#
+# Each SHA below is the tip of the ref that sibling's own repository actually
+# uses as its default branch, verified to exist with `git ls-remote` (the refs
+# are NOT uniformly `main` -- see the `@<branch>` note on each line).
+#
+# THIS IS THE FALLBACK, NOT THE GOAL. `clone-siblings.sh` prescribes it in
+# that order: (1) declare these repos in io-mon's project manifest in
+# metacraft-labs/metacraft-manifests so the lock pins them for every future
+# commit with nothing to maintain; (2) only where (1) is impossible, name a
+# 40-hex commit SHA here -- a commit, never a branch, because a branch tip is
+# exactly the unpinned resolve the mechanism exists to prevent. Delete these
+# `=<sha>` suffixes as soon as (1) lands.
+#
+# Cross-repo siblings cloned by setup-dev-env at the explicit SHAs
+# pinned below. Both are io-mon's `uses:` library producers in repro.nim
 # (reprobuild builds each from source and threads its `src/` root onto
 # io-mon's compile); they are also the `--path` siblings config.nims
 # resolves for the plain `nim c` / `nimble` build.
-nim-stackable-hooks
-nim-shm-queue
+nim-stackable-hooks=4a2e65b94a6f073cb08e86f8115194318801be78  # nim-stackable-hooks@stable tip
+nim-shm-queue=d162a5119be5233e16ecb41c503f751f0b5c4600  # nim-shm-queue@dev tip
