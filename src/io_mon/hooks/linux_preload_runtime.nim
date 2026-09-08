@@ -865,6 +865,30 @@ extern void *stackable_linux_preload_resolve_next(const char *name);
 extern int stackable_linux_preload_hooks_allowed(void);
 extern void stackable_linux_preload_enter_hook(void);
 extern void stackable_linux_preload_exit_hook(void);
+/* The raw-syscall / INT3 substrate below lives in nim-stackable-hooks'
+ * ``platform/linux_raw_syscalls.nim``, whose entire ``{.emit.}`` body is
+ * guarded by ``when defined(linux) and defined(amd64)``. On any other Linux
+ * architecture NONE of these symbols exist, and the same module's
+ * ``linuxRawSyscallSupported()`` reports ``lrsUnsupportedArchitecture``.
+ *
+ * The Nim side of this file already honours that predicate:
+ * ``installRawSyscallWrapperPatch`` and ``installInlineSyscallPatches`` both
+ * return early when ``linuxRawSyscallSupported() != lrsOk``, so on aarch64 the
+ * substrate is never *used*. But a runtime guard does not stop the C below from
+ * being COMPILED and REFERENCING the symbols, and ``librepro_monitor_shim.so``
+ * is consumed via ``LD_PRELOAD`` — which binds every undefined symbol eagerly.
+ * The result on ``eph-linux-arm64`` was that the very first monitored process
+ * died before ``main``:
+ *
+ *   repro: symbol lookup error: .../build/lib/librepro_monitor_shim.so:
+ *     undefined symbol: stackable_linux_chain_sigtrap
+ *
+ * So the reference has to disappear at COMPILE time, not merely go untaken at
+ * run time. ``__x86_64__`` is the C-preprocessor spelling of Nim's ``amd64``
+ * define, keeping this guard byte-for-byte aligned with the producing module's.
+ * Every entry point the Nim ``importc``s below still exists on non-x86_64 — the
+ * stubs just never touch the absent substrate. */
+#if defined(__x86_64__)
 extern long stackable_linux_raw_syscall6(long nr, long a1, long a2, long a3,
                                          long a4, long a5, long a6);
 struct stackable_linux_syscall_regs {
@@ -883,6 +907,7 @@ extern int stackable_linux_write_syscall_result_to_ucontext(
     void *ucontext_ptr, long result, unsigned long resume_rip);
 extern int stackable_linux_chain_sigtrap(int signum, void *siginfo_ptr,
                                          void *ucontext_ptr);
+#endif /* __x86_64__ */
 
 /* Provided by shim/linux_preload.nim. Async-signal-safe: writes the
  * batched read frames + the pre-encoded committed marker via raw
@@ -975,6 +1000,7 @@ int ct_linux_inline_syscall_record_site(unsigned long address) {
   return 0;
 }
 
+#if defined(__x86_64__)
 static void ct_linux_inline_syscall_sigtrap_handler(
     int signum, siginfo_t *info, void *ucontext) {
   struct stackable_linux_syscall_regs regs;
@@ -1033,6 +1059,15 @@ static void ct_linux_inline_syscall_sigtrap_handler(
 void *ct_linux_inline_syscall_handler_address(void) {
   return (void *)&ct_linux_inline_syscall_sigtrap_handler;
 }
+#else /* !__x86_64__ */
+/* No INT3 syscall-trap substrate on this architecture. Returning NULL is the
+ * value ``installInlineSyscallPatches`` already treats as "no handler" — it
+ * records ``lrsInvalidArgument`` and installs nothing. In practice that branch
+ * is unreachable because the caller bails on
+ * ``linuxRawSyscallSupported() != lrsOk`` first; this keeps the symbol defined
+ * so the Nim ``importc`` binding resolves. */
+void *ct_linux_inline_syscall_handler_address(void) { return NULL; }
+#endif /* __x86_64__ */
 
 long ct_linux_inline_syscall_site_count(void) {
   return (long)ct_inline_syscall_site_count_value;
@@ -1323,9 +1358,51 @@ void ct_linux_preload_real_exit(int status) {
   __builtin_unreachable();
 }
 
+/* Raw (un-interposed) syscall entry. On x86_64 this is nim-stackable-hooks'
+ * hand-written ``syscall`` instruction wrapper, which returns the kernel's
+ * ``-errno`` convention directly. On other architectures that substrate does
+ * not exist (see the ``__x86_64__`` note above the extern block), so fall back
+ * to libc ``syscall(2)`` and re-encode its ``-1``/``errno`` convention into the
+ * kernel convention the callers below expect.
+ *
+ * It must NOT fall back to libc ``syscall(2)``. ``shim/linux_preload.nim``
+ * DEFINES ``long syscall(long, ...)`` with default visibility -- that is the
+ * LD_PRELOAD interposer for libc's ``syscall``. Since this shim is preloaded it
+ * is first in the lookup scope, so a call to ``syscall`` from anywhere inside
+ * it binds back to that interposer: unbounded recursion in every monitored
+ * process. The non-amd64 arm therefore issues the syscall instruction directly,
+ * exactly as nim-stackable-hooks does for x86_64.
+ *
+ * aarch64 Linux ABI: number in x8, args in x0-x5, ``svc #0``, result in x0
+ * under the kernel ``-errno`` convention -- which is already the convention the
+ * callers below test against, so there is nothing to re-encode. */
+static long ct_raw_syscall6(long nr, long a1, long a2, long a3, long a4,
+                            long a5, long a6) {
+#if defined(__x86_64__)
+  return stackable_linux_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
+#elif defined(__aarch64__)
+  register long x8 __asm__("x8") = nr;
+  register long x0 __asm__("x0") = a1;
+  register long x1 __asm__("x1") = a2;
+  register long x2 __asm__("x2") = a3;
+  register long x3 __asm__("x3") = a4;
+  register long x4 __asm__("x4") = a5;
+  register long x5 __asm__("x5") = a6;
+  __asm__ volatile("svc #0"
+                   : "+r"(x0)
+                   : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+                   : "memory", "cc");
+  return x0;
+#else
+#error "io-mon: no raw syscall primitive for this architecture. Add one here \
+rather than routing through libc syscall(2) -- this shim interposes that \
+symbol, so calling it would recurse forever."
+#endif
+}
+
 static long ct_linux_preload_raw_syscall6(long nr, long a1, long a2, long a3,
                                           long a4, long a5, long a6) {
-  long result = stackable_linux_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
+  long result = ct_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
   if (result < 0 && result >= -4095) {
     errno = (int)-result;
     return -1;
@@ -1338,7 +1415,7 @@ long ct_linux_preload_syscall_replacement(long nr, long a1, long a2, long a3,
     __attribute__((visibility("default")));
 long ct_linux_preload_syscall_replacement(long nr, long a1, long a2, long a3,
                                           long a4, long a5, long a6) {
-  long result = stackable_linux_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
+  long result = ct_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
   if (!CT_BYPASS() && ct_raw_syscall_hook != NULL) {
     CT_CALL_HOOK((ct_raw_syscall_hook(nr, a1, a2, a3, a4, a5, a6, result,
                                       CT_RAW_SYSCALL_SOURCE_LIBC), 0));
