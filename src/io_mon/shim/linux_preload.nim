@@ -138,7 +138,7 @@ var
 #include <errno.h>
 #include <dlfcn.h>
 
-/* nim-stackable-hooks emits ``repro_raw_syscall6`` (and the rest of
+/* nim-stackable-hooks emits ``stackable_linux_raw_syscall6`` (and the rest of
  * its raw-syscall substrate) only under
  * ``when defined(linux) and defined(amd64)``. This file is LD_PRELOADed, so an
  * undefined symbol here is not a dormant reference — the loader binds it
@@ -147,16 +147,21 @@ var
  *
  * ``repro_raw_syscall6`` is the arch-portable spelling every call site below
  * uses. On x86_64 it is a direct passthrough, so nothing about the amd64 build
- * changes. Elsewhere it goes through libc ``syscall(2)`` and re-encodes its
- * ``-1``/``errno`` convention into the kernel ``-errno`` convention the callers
- * here test against (``!= 0``, ``< 0``).
+ * changes. Elsewhere it issues the syscall instruction directly.
  *
- * Async-signal-safety is preserved: these call sites include the sig-safe flush
- * path, and libc ``syscall(2)`` is itself async-signal-safe. The reason the
- * stackable primitive exists at all is to bypass an INTERPOSED libc
- * ``syscall`` — and the interposer (``installRawSyscallWrapperPatch``) is only
- * ever installed on amd64, so off amd64 libc's ``syscall`` is un-interposed and
- * the two are equivalent. */
+ * It must NOT fall back to libc ``syscall(2)``. THIS FILE defines
+ * ``long syscall(long number, ...)`` with default visibility a few hundred
+ * lines below — that is the LD_PRELOAD interposer for libc's ``syscall``.
+ * Because the shim is preloaded it sits first in the lookup scope, so a call to
+ * ``syscall`` from inside it binds back to that interposer and recurses until
+ * the stack is gone. Several call sites here are also on the async-signal-safe
+ * flush path, where that would be especially unpleasant.
+ *
+ * aarch64 Linux ABI: number in x8, args in x0-x5, ``svc #0``, result in x0
+ * under the kernel ``-errno`` convention — already the convention every call
+ * site here tests against (``!= 0``, ``< 0``), so nothing is re-encoded.
+ * Issuing the instruction directly is also strictly more async-signal-safe than
+ * any libc route. */
 #if defined(__x86_64__)
 extern long stackable_linux_raw_syscall6(long nr, long a1, long a2, long a3,
                                          long a4, long a5, long a6);
@@ -166,17 +171,23 @@ static long repro_raw_syscall6(long nr, long a1, long a2, long a3, long a4,
                                long a5, long a6) {
 #if defined(__x86_64__)
   return stackable_linux_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
+#elif defined(__aarch64__)
+  register long x8 __asm__("x8") = nr;
+  register long x0 __asm__("x0") = a1;
+  register long x1 __asm__("x1") = a2;
+  register long x2 __asm__("x2") = a3;
+  register long x3 __asm__("x3") = a4;
+  register long x4 __asm__("x4") = a5;
+  register long x5 __asm__("x5") = a6;
+  __asm__ volatile("svc #0"
+                   : "+r"(x0)
+                   : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+                   : "memory", "cc");
+  return x0;
 #else
-  int saved_errno = errno;
-  errno = 0;
-  long raw = syscall(nr, a1, a2, a3, a4, a5, a6);
-  if (raw == -1 && errno != 0) {
-    long encoded = -(long)errno;
-    errno = saved_errno;
-    return encoded;
-  }
-  errno = saved_errno;
-  return raw;
+#error "io-mon: no raw syscall primitive for this architecture. Add one here \
+rather than routing through libc syscall(2) — this shim interposes that \
+symbol, so calling it would recurse forever."
 #endif
 }
 

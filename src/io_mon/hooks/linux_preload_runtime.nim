@@ -1365,27 +1365,38 @@ void ct_linux_preload_real_exit(int status) {
  * to libc ``syscall(2)`` and re-encode its ``-1``/``errno`` convention into the
  * kernel convention the callers below expect.
  *
- * Falling back to libc here is safe from re-entrancy: the libc ``syscall``
- * interposer (``ct_linux_preload_syscall_replacement``) is installed by
- * ``installRawSyscallWrapperPatch``, which returns early on non-amd64 because
- * ``linuxRawSyscallSupported()`` reports ``lrsUnsupportedArchitecture``. So on
- * these architectures libc's ``syscall`` is never patched and this cannot
- * recurse into itself. */
+ * It must NOT fall back to libc ``syscall(2)``. ``shim/linux_preload.nim``
+ * DEFINES ``long syscall(long, ...)`` with default visibility -- that is the
+ * LD_PRELOAD interposer for libc's ``syscall``. Since this shim is preloaded it
+ * is first in the lookup scope, so a call to ``syscall`` from anywhere inside
+ * it binds back to that interposer: unbounded recursion in every monitored
+ * process. The non-amd64 arm therefore issues the syscall instruction directly,
+ * exactly as nim-stackable-hooks does for x86_64.
+ *
+ * aarch64 Linux ABI: number in x8, args in x0-x5, ``svc #0``, result in x0
+ * under the kernel ``-errno`` convention -- which is already the convention the
+ * callers below test against, so there is nothing to re-encode. */
 static long ct_raw_syscall6(long nr, long a1, long a2, long a3, long a4,
                             long a5, long a6) {
 #if defined(__x86_64__)
   return stackable_linux_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
+#elif defined(__aarch64__)
+  register long x8 __asm__("x8") = nr;
+  register long x0 __asm__("x0") = a1;
+  register long x1 __asm__("x1") = a2;
+  register long x2 __asm__("x2") = a3;
+  register long x3 __asm__("x3") = a4;
+  register long x4 __asm__("x4") = a5;
+  register long x5 __asm__("x5") = a6;
+  __asm__ volatile("svc #0"
+                   : "+r"(x0)
+                   : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+                   : "memory", "cc");
+  return x0;
 #else
-  int saved_errno = errno;
-  errno = 0;
-  long raw = syscall(nr, a1, a2, a3, a4, a5, a6);
-  if (raw == -1 && errno != 0) {
-    long encoded = -(long)errno;
-    errno = saved_errno;
-    return encoded;
-  }
-  errno = saved_errno;
-  return raw;
+#error "io-mon: no raw syscall primitive for this architecture. Add one here \
+rather than routing through libc syscall(2) -- this shim interposes that \
+symbol, so calling it would recurse forever."
 #endif
 }
 
