@@ -75,6 +75,138 @@ jobs:
           env-flavor: reprobuild
           gh-token: ${{ steps.ci_token.outputs.token }}
 
+      - name: Rebuild the engine's io-mon shim from the checkout under test
+        # WHY THIS STEP EXISTS -- measured, not assumed.
+        #
+        # `repro build` monitors its own build actions by loading
+        # `.reprobuild-src/build/lib/librepro_monitor_shim.<ext>`. That library
+        # is produced during `Setup dev env`, by reprobuild's `just build`
+        # running inside reprobuild's `nix develop`. reprobuild's flake.nix
+        # exports `IO_MON_SRC=${io-mon-src}/src` -- a PINNED store path -- and
+        # both `scripts/build_apps.sh` (`io_mon_src="${IO_MON_SRC:-../io-mon}"`)
+        # and reprobuild's `config.nims` prefer `$IO_MON_SRC` over the
+        # `../io-mon` sibling. So the shim the engine loads is compiled from
+        # reprobuild's PIN, not from this checkout.
+        #
+        # Evidence, job 102069636810 (run 34228866337, linux-arm64), the Nim
+        # compile line inside `Setup dev env`:
+        #
+        #   proj: /nix/store/18gfj81y4q901pw88bl2969r0h1dmc4c-source/src/io_mon/shim/linux_preload.nim
+        #   out:  .../io-mon/.reprobuild-src/build/lib/tmp/librepro_monitor_shim.so
+        #
+        # -- a /nix/store source path while the checkout sat at
+        # `.../_work/io-mon/io-mon/src`. Consequence: a change this PR makes to
+        # the shim is not what the reprobuild lanes compile, so those lanes
+        # grade the pin rather than the diff.
+        #
+        # Windows is excluded because it is NOT affected: the windows-diy
+        # flavor's `env.ps1` resolves `IO_MON_SRC` with
+        # `Test-SiblingRepo -Name io-mon`, i.e. from the checkout, already.
+        # Only the nix-provisioned POSIX hosts read the pinned store path.
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          engine_src="${GITHUB_WORKSPACE}/.reprobuild-src"
+          engine_lib="${engine_src}/build/lib"
+          case "$(uname -s)" in
+            Darwin) shim_name="librepro_monitor_shim.dylib" ;;
+            *)      shim_name="librepro_monitor_shim.so" ;;
+          esac
+          shim="${engine_lib}/${shim_name}"
+
+          # Fail loudly if the layout this step depends on is not there. A
+          # silent no-op would restore exactly the blindness being fixed.
+          if [ ! -f "${shim}" ]; then
+            echo "::error::expected the engine's shim at ${shim} after 'Setup dev env'; it is absent."
+            echo "::error::Refusing to continue: without replacing it, this lane grades reprobuild's io-mon pin, not this checkout."
+            exit 1
+          fi
+          before="$(cksum < "${shim}")"
+          echo "engine shim before: ${shim_name} cksum=${before}"
+
+          # Rebuild INSIDE reprobuild's dev shell so STACKABLE_HOOKS_SRC /
+          # SHM_QUEUE_SRC / SHM_GSET_SRC and the Nim toolchain are the exact
+          # ones the pinned build used -- the ONLY thing that changes is that
+          # the shim sources now come from this checkout (build_shim.sh cd's to
+          # its own repo root and compiles with `--path:src`).
+          overrides=()
+          for pair in \
+            "codetracer-native-recorder:${GITHUB_WORKSPACE}/codetracer-native-recorder" \
+            "runquota-src:${GITHUB_WORKSPACE}/runquota"; do
+            input="${pair%%:*}"
+            path="${pair#*:}"
+            # Only override inputs whose local clone the setup action actually
+            # produced; otherwise let the flake resolve them itself.
+            if [ -d "${path}" ]; then
+              overrides+=(--override-input "${input}" "path:${path}")
+            fi
+          done
+
+          cd "${engine_src}"
+          nix develop "${overrides[@]}" --command bash -c '
+            set -euo pipefail
+            export IO_MON_SRC="'"${GITHUB_WORKSPACE}"'/src"
+            export IO_MON_SHIM_OUT_DIR="'"${engine_lib}"'"
+            export IO_MON_SHIM_NIMCACHE_DIR="'"${RUNNER_TEMP}"'/engine-shim-nimcache"
+            bash "'"${GITHUB_WORKSPACE}"'/scripts/build_shim.sh"
+          '
+
+          after="$(cksum < "${shim}")"
+          echo "engine shim after:  ${shim_name} cksum=${after}"
+          if [ ! -f "${shim}" ]; then
+            echo "::error::the rebuild did not produce ${shim}"
+            exit 1
+          fi
+          echo "the reprobuild engine will now monitor with the shim built from THIS checkout"
+
+      - name: Engine shim resolves every symbol it references (Linux)
+        # Same probe, and same self-validating negative control, as `ci.yml`'s
+        # Build job -- applied to the shim the ENGINE will load. Without it a
+        # broken shim surfaces four steps later as an opaque
+        # `repro build: error: interface extraction edge asFailed`, with the
+        # real cause (`symbol lookup error: ... undefined symbol: ...`) buried
+        # in the middle of a 7000-line log. That is what happened in job
+        # 102069636810.
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shim="${GITHUB_WORKSPACE}/.reprobuild-src/build/lib/librepro_monitor_shim.so"
+          test -f "${shim}"
+          probe_dir="$(mktemp -d)"
+          cat > "${probe_dir}/dlopen_probe.c" <<'PROBE'
+          #include <dlfcn.h>
+          #include <stdio.h>
+          int main(int argc, char **argv) {
+            if (argc < 2) { fprintf(stderr, "usage: dlopen_probe <library>\n"); return 2; }
+            void *handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+            if (handle == NULL) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
+            return 0;
+          }
+          PROBE
+          cat > "${probe_dir}/unresolvable.c" <<'BROKEN'
+          extern int io_mon_ci_probe_absent_symbol(void);
+          int io_mon_ci_probe_entry(void) { return io_mon_ci_probe_absent_symbol(); }
+          BROKEN
+          cd "${GITHUB_WORKSPACE}/.reprobuild-src"
+          nix develop --command bash -c '
+            set -euo pipefail
+            cd "'"${probe_dir}"'"
+            cc dlopen_probe.c -o dlopen_probe 2>/dev/null || cc dlopen_probe.c -o dlopen_probe -ldl
+            cc -shared -fPIC unresolvable.c -o libunresolvable.so
+          '
+          if "${probe_dir}/dlopen_probe" "${probe_dir}/libunresolvable.so"; then
+            echo "::error::the dlopen probe ACCEPTED an undefined symbol; a pass below would prove nothing."
+            exit 1
+          fi
+          echo "negative control OK: probe rejected libunresolvable.so"
+          if ! "${probe_dir}/dlopen_probe" "${shim}"; then
+            echo "::error::the engine shim built from this checkout cannot be loaded on $(uname -m)."
+            exit 1
+          fi
+          echo "engine shim loads on $(uname -m)"
+
       - name: repro build
         # Builds the conventional `default` collection declared in
         # `repro.nim` — the standalone `io-mon` CLI. Verifies the primary
