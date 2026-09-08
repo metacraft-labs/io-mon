@@ -295,7 +295,9 @@ var
   # golden pure-file baseline). Their deletion is part 2b.
   setProducer: shmset.SetProducer
   setProducerAttached = false
-  # M3 part 2a — the per-process-INCARNATION identity appended to every SET element:
+  # M3 part 2a — the per-process-INCARNATION identity appended to a SET element
+  # (DA-1b: to every element EXCEPT a fact-scoped kind's — see
+  # `depIdentityKeepsIncarnation`, and `appendFragmentRecord` for why):
   # the process's real on-disk image path (`/proc/self/exe`, set by the shim via
   # `setDepSetIncarnationImage` at init and re-captured after every exec). This is
   # the REAL exec identity, NOT a synthetic nonce. It exists to keep the pre-exec
@@ -1394,7 +1396,8 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   # with `encodeDepRecordIdentity` (drops `seq`, so exact-duplicate probe storms
   # collapse) into a STACK buffer (no heap — fork/orc-safe), append this
   # incarnation's real image path (`setElemImage`, the per-exec identity that keeps
-  # the pre/post-exec process-starts distinct without any synthetic tag), then
+  # the pre/post-exec process-starts distinct without any synthetic tag) FOR THE
+  # KINDS WHOSE IDENTITY KEEPS ONE (DA-1b, `depIdentityKeepsIncarnation`), then
   # `emit` the opaque bytes with a SINGLE idempotent insert. No batch, no flush:
   # the hook has already run the syscall but returns the result to the process only
   # AFTER this publish, so the dependency is recorded before the observed data is
@@ -1420,12 +1423,29 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
     if setProducer.available:
       var recBuf {.noinit.}: array[SetProducerBufBytes, byte]
       let recLen = encodeDepRecordIdentity(record, recBuf)
-      if recLen >= 0 and recLen + setElemImage.len <= SetProducerBufBytes:
+      # DA-1b — the incarnation suffix is a process-local coordinate, so it is
+      # appended only for the kinds whose identity keeps one. Appending it to a
+      # FACT-scoped kind would defeat that kind's dedup with exactly the
+      # coordinate `depIdentityScope` just ruled incidental: measured on a real
+      # `nim c`, `library-load`'s 33,128 elements decoded to only 25,883 distinct
+      # records, i.e. ~7,200 records were duplicates the suffix alone created,
+      # before any pid was considered. `depIdentityKeepsIncarnation` is the one
+      # place the decision is DERIVED, shared with the encoder, so the two cannot
+      # drift into disagreeing about a kind. The two remaining emit sites do not
+      # consult it and do not need to, because each publishes exactly one kind
+      # and that kind is process-scoped: `rebuildDepSetLossElem` always appends
+      # the suffix and `fs_snoop.emitLauncherLossToSet` never does, and both
+      # publish only `mrEventLoss`, whose element merely has to be distinct for
+      # the merge to downgrade. A kind that ever became fact-scoped AND reached
+      # one of those sites would have to be routed through this predicate too.
+      let imageLen =
+        if depIdentityKeepsIncarnation(record.kind): setElemImage.len else: 0
+      if recLen >= 0 and recLen + imageLen <= SetProducerBufBytes:
         # `decodeDepRecord` reads only the record's own fields (seq reconstructs as
         # 0) and IGNORES these trailing image bytes, so a decoded element is a
         # faithful MonitorRecord for the merge.
         var total = recLen
-        for i in 0 ..< setElemImage.len:
+        for i in 0 ..< imageLen:
           recBuf[total] = byte(setElemImage[i]); inc total
         case setProducer.emit(recBuf.toOpenArray(0, total - 1))
         of emInserted, emExists, emSaturated, emConsumerGone:
