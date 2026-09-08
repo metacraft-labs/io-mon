@@ -42,6 +42,7 @@ Options (each accepts both `--flag value` and `--flag=value`):
 | `--events MODE` | Stream the captured records in MODE. One of `none` (default), `text`, `jsonl`, `binary` / `binary-stream`. |
 | `--format MODE` | Alias for `--events` (same `FsSnoopOutputMode` values). |
 | `--event-stream PATH` | Write the streamed events to PATH instead of stderr. **Required** when MODE is `binary`/`binary-stream` (so the binary stream stays separate from child output). |
+| `--interest TOKENS` | The event categories to capture, as a comma-separated subset of `file,proc,lib,nondet,ipc` (the `REPRO_MONITOR_INTEREST` vocabulary — see [event-interest-filter.md](contributors/event-interest-filter.md)). **Omitting the flag, or passing an empty value, means all categories**, so every existing invocation keeps its current behaviour and a consumer that wants a reduced set must ask for one on each run; forgetting costs capture work, never a missed dependency. An unknown token alongside known ones is ignored (a newer consumer may name a category this build does not have); a value naming *no* known token is refused rather than silently widened to "all". |
 | `--capture-stdio` | Capture the child's merged stdout+stderr instead of inheriting the parent's stdio (mirrors how the reprobuild engine launches monitored actions). |
 | `--capture-stdio-path PATH` | Like `--capture-stdio`, but dump the captured bytes to PATH (implies `--capture-stdio`). |
 | `--` | End of options; everything after is the command + args to run. **Required.** |

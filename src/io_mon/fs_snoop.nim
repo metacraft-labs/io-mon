@@ -786,6 +786,44 @@ proc parseOutputMode(value: string): FsSnoopOutputMode =
   else:
     raise newException(ValueError, "unsupported event mode: " & value)
 
+proc parseInterestFlag(value: string): set[EventCategory] =
+  ## Decode `--interest`'s value — the SAME comma-separated token vocabulary
+  ## `REPRO_MONITOR_INTEREST` uses (`file`, `proc`, `lib`, `nondet`, `ipc`), so
+  ## the CLI and the env channel are one wire format with one codec
+  ## (`interestToTokens` / `parseInterestTokens`; see
+  ## `docs/contributors/event-interest-filter.md` §3).
+  ##
+  ## ABSENT FLAG ⇒ `FullInterest`, and that is a deliberate choice rather than a
+  ## default that fell out. `FsSnoopRequest.interest` zero-initialises to `{}`,
+  ## which `normalizeInterest` already turns into "capture everything", so every
+  ## caller that does not pass the flag keeps EXACTLY the behaviour it has today
+  ## — `io-mon run`, the `run`-less legacy form, and every embedder of
+  ## `runFsSnoopCli`. The cost is that a consumer wanting a reduced set must SAY
+  ## so on every invocation; that is the right way round, because the failure
+  ## mode of forgetting is over-capture (a slower, larger, still-honest
+  ## dependency set) and never under-capture (a missing input under
+  ## `mcComplete`, the cardinal sin). An empty VALUE means the same thing as an
+  ## absent flag, for the same reason.
+  ##
+  ## A value naming at least one known token but also an unknown one is accepted
+  ## and the unknown token ignored — the forward-compatibility rule
+  ## `parseInterestTokens` implements for the env channel, and it matters
+  ## equally here now that a NEWER consumer can hand this flag to an OLDER
+  ## io-mon. A value naming NO known token at all is refused instead: that
+  ## cannot be version skew (skew keeps the tokens it already had and adds one),
+  ## it is an operator typo, and silently widening a typo to `FullInterest`
+  ## would discard the caller's reduction without a word — which is the exact
+  ## class of silent discard this flag exists to end.
+  let trimmed = value.strip()
+  if trimmed.len == 0:
+    return FullInterest
+  result = parseInterestTokens(trimmed)
+  if result == {}:
+    raise newException(ValueError,
+      "--interest names no known event category: " & value &
+      " (expected a comma-separated subset of " &
+      interestToTokens(FullInterest) & ")")
+
 proc requireValue(args: seq[string]; index: var int; flag: string): string =
   if index + 1 >= args.len:
     raise newException(ValueError, flag & " requires a value")
@@ -844,6 +882,16 @@ proc parseRun(args: seq[string]): ParsedFsSnoopCommand =
       result.request.streamMode = parseOutputMode(requireValue(args, i, "--format"))
     of "--event-stream":
       result.request.eventStreamPath = requireValue(args, i, "--event-stream")
+    of "--interest":
+      # The consumer's event-interest categories. Without this the request
+      # carried `{}` -> `FullInterest` and `childEnv` then wrote that over
+      # whatever `REPRO_MONITOR_INTEREST` the caller had put in this process's
+      # environment, because the injection deliberately wins over any inherited
+      # value. So an out-of-process consumer had NO way to ask for a reduced
+      # set: the env channel is the shim's, not the CLI's. See
+      # `parseInterestFlag` for the absent-flag semantics.
+      result.request.interest =
+        parseInterestFlag(requireValue(args, i, "--interest"))
     of "--capture-stdio":
       # Flag form (no value) — turn capture on; subsequent
       # ``--capture-stdio-path=…`` controls where the captured bytes
@@ -858,6 +906,7 @@ proc parseRun(args: seq[string]): ParsedFsSnoopCommand =
       let eventsValue = splitFlagValue(arg, "--events")
       let formatValue = splitFlagValue(arg, "--format")
       let streamValue = splitFlagValue(arg, "--event-stream")
+      let interestValue = splitFlagValue(arg, "--interest")
       let stdioPathValue = splitFlagValue(arg, "--capture-stdio-path")
       if depValue.len > 0:
         result.request.depFilePath = depValue
@@ -868,6 +917,8 @@ proc parseRun(args: seq[string]): ParsedFsSnoopCommand =
         result.request.streamMode = parseOutputMode(formatValue)
       elif streamValue.len > 0:
         result.request.eventStreamPath = streamValue
+      elif interestValue.len > 0:
+        result.request.interest = parseInterestFlag(interestValue)
       elif stdioPathValue.len > 0:
         result.request.captureStdioPath = stdioPathValue
         result.request.captureChildStdio = true
