@@ -2890,6 +2890,16 @@ proc mergeFragments*(fragmentDir, outputPath: string;
   # RESULT rather than the request. `{}` means the caller said nothing, and is
   # left unstamped so a library caller that never passes it keeps exactly the
   # previous behaviour instead of having `FullInterest` asserted on its behalf.
+  # "Unstamped" is a READABLE state rather than an absence the reader has to
+  # guess about: it yields `observedInterestStated = false`, which is what
+  # distinguishes it from a stamp whose categories the reader cannot name (see
+  # `effectiveObservedInterest`).
+  #
+  # GRADED END TO END, not only from hand-built records:
+  # `tests/posix/test_io_mon_cli_interest_stamp.nim` runs the real CLI twice on
+  # one command and compares the two depfiles' stamps, and the portable fold test
+  # pins the unstamped case through this proc. Deleting this block, or the
+  # `!= {}` guard on it, reddens those.
   if observedInterest != {}:
     let interestToken = ";interest=" & interestToTokens(observedInterest)
     for record in records.mitems:

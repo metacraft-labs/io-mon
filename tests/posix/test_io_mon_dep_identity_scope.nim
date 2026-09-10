@@ -48,6 +48,12 @@
 ##       silently blessing the change. That is the "every declared attribution
 ##       has a check" rule applied to a platform capability.
 ##
+##       The non-folding arm's bound is `>= FanOut`, not `>= FanOut div 2`: every
+##       one of the `FanOut` children links the shared object and reads the
+##       marker, so a per-observation transport owes at least one record per
+##       child, and a loader closure can only add to that. A halved bound would
+##       stay green against a backend that folded 12 into 6.
+##
 ##       Note what the non-folding arm is NOT: it is not a correctness failure.
 ##       Nothing goes unobserved on those backends; records repeat rather than
 ##       going missing, completeness is unaffected, and consumers already fold
@@ -393,14 +399,22 @@ suite "io-mon DA-1b dependency-identity scope":
       # The declaration says this backend writes one record per observing
       # process. Prove it rather than assuming it: a backend that quietly began
       # folding would otherwise keep passing while its advertised capability set
-      # told consumers the opposite. Asserted as "materially more than one"
-      # rather than exactly `FanOut`, because the loader closure of a re-exec is
-      # a real source of variation and pinning the count would buy flakiness,
-      # not strength.
-      check loads.len > 1
-      check loads.len >= FanOut div 2
-      check envReads.len > 1
-      check envReads.len >= FanOut div 2
+      # told consumers the opposite.
+      #
+      # THE BOUND IS `>= FanOut`, AND THE LOADER-CLOSURE ARGUMENT IS WHY. Each of
+      # the `FanOut` children `execve`s an image that links `libda1bfact.so`
+      # through DT_NEEDED/LC_LOAD_DYLIB and calls `getenv` on the marker, so on a
+      # transport that writes one record per OBSERVATION every child contributes
+      # at least one record of each kind — that is what "does not fold" MEANS.
+      # A re-exec's loader closure can only ADD records; it cannot remove one.
+      # So the closure variation argues against pinning `== FanOut`, and FOR
+      # `>= FanOut`. It was previously written `>= FanOut div 2` citing that same
+      # variation, which is the one bound the argument does not support: as
+      # written the arm passed against a backend that folded 12 observations down
+      # to 6 — precisely the "quietly started folding while advertising
+      # otherwise" drift it exists to catch.
+      check loads.len >= FanOut
+      check envReads.len >= FanOut
 
     # And the fact-scoped kinds as a class: every one of them must be
     # observer-free, and every process-scoped kind that named a process must

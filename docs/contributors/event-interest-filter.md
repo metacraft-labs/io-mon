@@ -218,6 +218,17 @@ consumer that keeps a category and loses an event is `mcIncomplete` as today.
 - Host filter: a synthetic record set with mixed categories + a disabled category
   yields a depfile without that category and with meta/loss intact and
   `mcComplete` preserved.
+- §5.1, read side: a stamp round-trips through the real envelope; an unknown
+  token beside known ones does not poison it; a stamp naming ONLY unknown
+  categories is `stated` and reads as `{}`, so a full-scope consumer rejects it,
+  and so does a stamp whose VALUE is empty; while an ABSENT stamp still reads as
+  `FullInterest` and is accepted.
+  (`tests/portable/test_io_mon_observation_identity_fold.nim`.)
+- §5.1, write side, LIVE: the real CLI runs twice on one command, once at full
+  interest and once narrowed, and the two depfiles it wrote state the two scopes
+  that were asked for — the only case that grades the stamp end to end. Deleting
+  the stamp write, or the `!= {}` guard on it, reddens it.
+  (`tests/posix/test_io_mon_cli_interest_stamp.nim`.)
 - Linux (gated): a real monitored run with `ecNonDeterminism` disabled produces a
   depfile with zero `mrEnvRead`/`mrTimeRead`/`mrSysctlRead`/`mrNonDeterministic`/
   `mrExternalContent` records, file/proc/lib deps intact, `mcComplete`.
