@@ -186,7 +186,7 @@ proc summarizeRecords*(records: openArray[MonitorRecord]): MonitorSummary =
   result.processCount = uint64(processPids.len)
 
 proc observedInterestFromRecords(records: openArray[MonitorRecord]):
-    set[EventCategory] =
+    tuple[stated: bool, tokens: string, categories: set[EventCategory]] =
   ## DA-1j — read the capture-scope stamp off the backend-profile record.
   ##
   ## The depfile envelope carries ONLY records: `depFileFromOwnedRecords`
@@ -198,19 +198,34 @@ proc observedInterestFromRecords(records: openArray[MonitorRecord]):
   ## `parseInterestTokens` already ignores unknown tokens, so an older reader
   ## skips the stamp and a newer reader tolerates a category it does not know.
   ##
-  ## `{}` means NOT STATED — a depfile written before this existed — and every
-  ## consumer reads that as `FullInterest`, preserving the previous behaviour
-  ## rather than looking like a capture that recorded nothing.
+  ## RETURNS `stated` SEPARATELY FROM THE PARSED SET, and that separation is the
+  ## whole point. "No stamp at all" and "a stamp naming only categories this
+  ## build has never heard of" both parse to `{}`, and they mean opposite things:
+  ## the first is an old file that must read as full scope, the second is a
+  ## NARROWED capture from a newer io-mon that must not. Collapsing them let
+  ## `interest=gpu` be accepted by a full-scope consumer — the same false
+  ## complete this stamp exists to end, pointing forward in time instead of
+  ## backward. `tokens` carries the raw value so the unnamable scope can be
+  ## REPORTED rather than merely detected.
+  ##
+  ## An `interest=` key with an EMPTY value counts as stated. `parseInterestTokens`
+  ## widens an empty string to `FullInterest` for the env channel (an absent
+  ## `REPRO_MONITOR_INTEREST` means "capture everything"), but here the key's
+  ## presence already proves the producer meant to say something, so the empty
+  ## value is an unevaluable statement rather than a claim of full scope.
   for record in records:
     if record.kind == mrBackendProfile:
       for part in record.detail.split(';'):
         let pair = part.split("=", 1)
         if pair.len == 2 and pair[0] == "interest":
-          return parseInterestTokens(pair[1])
-  {}
+          if pair[1].strip().len == 0:
+            return (true, pair[1], {})
+          return (true, pair[1], parseInterestTokens(pair[1]))
+  (false, "", {})
 
 proc depFileFromOwnedRecords*(records: sink seq[MonitorRecord]): MonitorDepFile =
   let summary = summarizeRecords(records)
+  let scope = observedInterestFromRecords(records)
   # The required-set is NOT empty, and that is the whole point. Deriving the
   # profile with `{}` meant no declared capability gap could ever mark itself
   # `required`, so none of them could ever clear `evidenceComplete` — the
@@ -235,7 +250,9 @@ proc depFileFromOwnedRecords*(records: sink seq[MonitorRecord]): MonitorDepFile 
     profile: profile,
     capabilityGaps: profile.gaps,
     summary: summary,
-    observedInterest: observedInterestFromRecords(records))
+    observedInterest: scope.categories,
+    observedInterestStated: scope.stated,
+    observedInterestTokens: scope.tokens)
   result.records = move(records)
 
 proc depFileFromRecords*(records: openArray[MonitorRecord]): MonitorDepFile =

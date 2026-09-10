@@ -116,6 +116,38 @@ before it reaches the depfile, so:
   holds regardless of shim version.
 `mrEventLoss`/meta are never dropped.
 
+## 5.1 The depfile SAYS which categories were requested (DA-1j)
+
+The merge stamps the host's normalized interest onto the backend-profile record
+(`interest=file,proc,lib`), so a capture's scope travels with it. Read it through
+the accessor, **never** through the raw field:
+
+```nim
+let dep = readMonitorDepFile(path)
+if not observedInterestCovers(dep, {ecFileDeps, ecIpc}):
+  discard  # this evidence answers a narrower question than we asked
+```
+
+`observedInterest` on its own is ambiguous and resolving it with
+`normalizeInterest` is the trap this accessor exists to remove. `{}` arises three
+ways and they do not mean the same thing:
+
+| file | `observedInterestStated` | `effectiveObservedInterest` | full-scope consumer |
+|---|---|---|---|
+| no stamp (written before DA-1j, or a caller that stated no scope) | `false` | `FullInterest` | ACCEPT — unchanged from before the field existed |
+| stamp naming categories this build knows | `true` | those categories | ACCEPT iff they cover the requirement |
+| stamp naming **only** categories this build cannot name (`interest=gpu`, from a newer io-mon) | `true` | `{}` | **REJECT** — the file states a scope this build cannot evaluate |
+| stamp whose VALUE is empty (`interest=`) | `true` | `{}` | **REJECT** — same reason, and it needs its own answer: `parseInterestTokens` widens `""` to `FullInterest`, which is right for the env channel (an unset `REPRO_MONITOR_INTEREST` means "capture everything") and a false ACCEPT here |
+
+The last two rows are the ones that matter for a wire format: each is a NARROWED capture,
+and reading it as full scope would republish the false complete this stamp exists
+to end, pointing forward in time. `observedInterestTokens` keeps the raw stamp so
+the unevaluable scope can be named in a diagnostic rather than merely detected.
+
+The stamp is **not** a completeness input and **not** a cache-key component:
+full-scope evidence is strictly stronger than narrowed evidence, so a narrow-scope
+consumer must still be able to accept a full capture.
+
 ## 6. Completeness semantics
 
 > **This rule has a measured exception. Read §7's caveat before relying on it:

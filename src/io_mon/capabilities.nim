@@ -1,4 +1,4 @@
-import std/[strutils]
+import std/[options, strutils]
 
 import io_mon/types
 
@@ -534,11 +534,30 @@ proc capabilityId*(capability: MonitorCapability): string =
   of mcapObservationIdentityFold:
     "observation-identity-fold"
 
-proc capabilityFromId*(value: string): MonitorCapability =
+proc tryCapabilityFromId*(value: string): Option[MonitorCapability] =
+  ## The TOLERANT half of the wire-id lookup: `none` for an id this build does
+  ## not know, rather than an exception.
+  ##
+  ## It exists because the raising form below cannot be used on a decode path.
+  ## A depfile written by a NEWER io-mon advertises capability ids this build has
+  ## never heard of, and every such id used to reach `capabilityFromId` and
+  ## escape `readMonitorDepFile` as an unhandled `ValueError` — measured: a
+  ## reader built before `observation-identity-fold` existed exits rc=1 on a file
+  ## that merely mentions it in `supported=`. Unknown is a normal state of the
+  ## world for a format that grows by appending, so it is answered, not raised.
   for capability in MonitorCapability:
     if capabilityId(capability) == value:
-      return capability
-  raise newException(ValueError, "unknown monitor capability: " & value)
+      return some(capability)
+  none(MonitorCapability)
+
+proc capabilityFromId*(value: string): MonitorCapability =
+  ## The STRICT form, for a caller that has already decided an unknown id is a
+  ## programming error (or that catches the exception itself, as `parseGapDetail`
+  ## does). Decode paths must use `tryCapabilityFromId`.
+  let capability = tryCapabilityFromId(value)
+  if capability.isNone:
+    raise newException(ValueError, "unknown monitor capability: " & value)
+  capability.get
 
 proc backendFamilyFromId*(value: string): MonitorBackendFamily =
   for family in MonitorBackendFamily:
@@ -546,12 +565,36 @@ proc backendFamilyFromId*(value: string): MonitorBackendFamily =
       return family
   mbfUnknown
 
-proc parseCapabilityList(value: string): set[MonitorCapability] =
+proc parseCapabilityList(value: string; unnamable: var seq[string]):
+    set[MonitorCapability] =
+  ## Decode a `supported=` / `required=` list, DEGRADING on an id this build
+  ## cannot name instead of raising through the caller and out of
+  ## `readMonitorDepFile`.
+  ##
+  ## The unknown id is RETAINED, in `unnamable`, and the caller turns it into a
+  ## profile diagnostic. Dropping it silently would be one line shorter and is
+  ## the wrong trade: this project's whole argument is attribution rather than
+  ## suppression, and an id that vanishes without a word leaves a consumer unable
+  ## to tell "the producer declared nothing else" from "the producer declared
+  ## something I am too old to understand". The set is enum-typed, so the id
+  ## cannot be carried IN it; a named diagnostic is the closest honest thing.
+  ##
+  ## Direction of the degrade, which is why it is safe: an unnamable id in
+  ## `supported=` is simply not counted as supported, so this build UNDER-claims
+  ## what the backend can do and never over-claims it. It cannot flip a grade
+  ## either — `profileFromRecords` only clears `evidenceComplete` for a
+  ## capability the CALLER required, and a caller's required set is enum-typed
+  ## and therefore cannot contain an id this build does not have.
   if value.len == 0:
     return {}
   for item in value.split(','):
-    if item.len > 0:
-      result.incl capabilityFromId(item)
+    if item.len == 0:
+      continue
+    let capability = tryCapabilityFromId(item)
+    if capability.isSome:
+      result.incl capability.get
+    elif item notin unnamable:
+      unnamable.add item
 
 proc unsupportedReason(capability: MonitorCapability): string =
   case capability
@@ -1067,6 +1110,11 @@ proc profileFromRecords*(records: openArray[MonitorRecord];
   result = defaultHooksMonitorProfile(required)
   var sawProfile = false
   var gaps: seq[MonitorCapabilityGap] = @[]
+  # Capability ids the PRODUCER declared and this build cannot name. Collected
+  # rather than raised (the reader must survive a newer writer) and rather than
+  # discarded (a declaration nobody can see is a suppressed declaration); they
+  # become profile diagnostics below.
+  var unnamableIds: seq[string] = @[]
   for record in records:
     case record.kind
     of mrBackendProfile:
@@ -1079,9 +1127,11 @@ proc profileFromRecords*(records: openArray[MonitorRecord];
         of "backend":
           result.backendFamily = backendFamilyFromId(pair[1])
         of "supported":
-          result.supportedCapabilities = parseCapabilityList(pair[1])
+          result.supportedCapabilities =
+            parseCapabilityList(pair[1], unnamableIds)
         of "required":
-          result.requiredCapabilities = parseCapabilityList(pair[1])
+          result.requiredCapabilities =
+            parseCapabilityList(pair[1], unnamableIds)
         of "evidenceComplete":
           result.evidenceComplete = pair[1] == "true"
         else:
@@ -1099,6 +1149,19 @@ proc profileFromRecords*(records: openArray[MonitorRecord];
           message: "malformed monitor capability gap record: " & record.detail)
     else:
       discard
+
+  # The unnamable declarations, surfaced. This is the same tolerance a malformed
+  # gap record already gets (the `parseGapDetail` branch above) applied to the
+  # `supported=` / `required=` lists, which were the last place in the decoder
+  # where a newer producer's vocabulary could kill the read outright.
+  for id in unnamableIds:
+    result.diagnostics.add MonitorDiagnostic(
+      level: mdlWarning,
+      message: "monitor capability id declared by the producer that this " &
+        "io-mon build cannot name: " & id & " — this capture was written by a " &
+        "newer io-mon; the id is reported rather than dropped, and is counted " &
+        "as UNSUPPORTED here, which under-claims the backend rather than " &
+        "over-claiming it")
 
   if sawProfile and gaps.len > 0:
     result.gaps = gaps

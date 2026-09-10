@@ -251,8 +251,9 @@ type
     # the OBSERVED-DECLARED-INPUT recording of env-var / sysctl / uname queries
     # (mrEnvRead/mrSysctlRead; the BuildXL observed-environment model). mcapNonDeterminism
     # covers entropy observations (mrNonDeterministic) plus time markers
-    # (mrTimeRead). Appended at the END (the enum
-    # is serialized by capabilityId STRING, so appending is wire-safe).
+    # (mrTimeRead). Appended at the END — see the compatibility note on
+    # `mcapObservationIdentityFold` below, which states BOTH halves of what
+    # appending costs (this comment used to state only the enum half).
     mcapObservedEnv
     mcapNonDeterminism
     # ROUND-3 S1 — content-channel coverage: xattr-family metadata reads
@@ -260,7 +261,9 @@ type
     # PROT_READ mapping → content read / out-of-tree downgrade), FIFO and inherited
     # socket/pipe content (out-of-tree → downgrade), and the sendfile/pread/readv
     # zero-copy / positioned reads (content read on the source). Appended at the END
-    # (the enum is serialized by capabilityId STRING, so appending is wire-safe).
+    # — see the compatibility note on `mcapObservationIdentityFold` below, which
+    # states BOTH halves of what appending costs (this comment used to state only
+    # the enum half).
     mcapExternalContent
     # M-FW-5 — production-sensitive Linux residuals. These are intentionally
     # separate from the positive raw-syscall slices io-mon can already cover:
@@ -274,20 +277,36 @@ type
     # into one record? See `backendFoldsObservationIdentity`, which carries the
     # per-family answer and the argument for it.
     #
-    # APPENDED AT THE END, AND THAT IS ONLY HALF A COMPATIBILITY ARGUMENT.
-    # It is safe for the ENUM — the wire carries the `capabilityId` STRING, so
-    # no ordinal ever shifts meaning, and an older WRITER's file still reads
-    # here. It is NOT safe for an older READER: `capabilityFromId` RAISES on an
-    # id it does not know and `parseCapabilityList` does not catch it, so the
-    # moment a backend ADVERTISES a newly-added id in its `supported=` list,
-    # every io-mon built before that id existed fails to load the depfile at
-    # all. MEASURED, not inferred: a reader built at the commit before this one
-    # dies with `ValueError: unknown monitor capability:
-    # observation-identity-fold` inside `readMonitorDepFile`. (Capability GAP
-    # records are tolerant — `parseGapDetail` is wrapped and degrades to a
-    # diagnostic — so it is specifically the `supported=` list that breaks.)
-    # The same caveat applies to the two "appending is wire-safe" notes above,
-    # which state only the enum half.
+    # APPENDED AT THE END, AND "APPENDING IS WIRE-SAFE" WAS ONLY HALF TRUE.
+    # It was always safe for the ENUM — the wire carries the `capabilityId`
+    # STRING, so no ordinal ever shifts meaning, and an older WRITER's file
+    # still reads here. It was NOT safe for an older READER: `capabilityFromId`
+    # RAISED on an id it did not know and `parseCapabilityList` did not catch
+    # it, so the moment a backend ADVERTISED a newly-added id in its
+    # `supported=` list, every io-mon built before that id existed failed to
+    # load the depfile at all. MEASURED, not inferred: a reader built at commit
+    # `715266b` dies with `ValueError: unknown monitor capability:
+    # observation-identity-fold` inside `readMonitorDepFile`. This is a
+    # PRE-EXISTING mechanism, not something this capability introduced —
+    # `mcapPathIdentity` and `mcapExecutableMappingLifecycle` were appended the
+    # same way and carried the same hazard — which is why the two notes above
+    # were corrected as well.
+    #
+    # THE READ SIDE NOW DEGRADES. `parseCapabilityList` resolves ids through
+    # `tryCapabilityFromId` and collects the ones it cannot name into a profile
+    # `mdlWarning` diagnostic: the file loads, the unnamable id is REPORTED
+    # rather than silently dropped, and it counts as unsupported (under-claiming
+    # the backend, never over-claiming it). So from this commit on, appending a
+    # capability really is wire-safe in both directions.
+    #
+    # WHAT THAT CANNOT DO IS FIX A READER THAT IS ALREADY BUILT. Every binary
+    # compiled before this change still raises on an id it does not know, so any
+    # capability appended from here on remains unreadable to those builds. The
+    # tolerance protects readers built from this commit forward and nothing
+    # earlier; there is no retroactive fix, only the end of the growth of the
+    # affected set. (Capability GAP records were always tolerant —
+    # `parseGapDetail` is wrapped and degrades to a diagnostic — so it was
+    # specifically the `supported=`/`required=` lists that broke.)
     #
     # DELIBERATELY NOT IN `InputEvidenceCapabilities`. Its absence is a COST and
     # SIZE shortfall, never a fidelity one: a non-folding backend observed
@@ -396,10 +415,34 @@ type
     ## less must still be able to accept a full capture. Keying on the scope
     ## would make the two disjoint and block exactly that direction.
     ##
-    ## Empty means "not stated" and is read as `FullInterest`, so a depfile
-    ## written before this field degrades to the previous behaviour rather than
-    ## looking like a capture that recorded nothing.
+    ## READ THIS THROUGH `effectiveObservedInterest`, NOT DIRECTLY. `{}` here is
+    ## ambiguous on its own and `normalizeInterest` resolves the ambiguity the
+    ## dangerous way: it cannot tell a file that stated NO scope (an old depfile,
+    ## which must widen to `FullInterest`) from a file that stated a scope
+    ## consisting entirely of categories this build cannot name (a NARROWED
+    ## capture, which must not widen to anything). `observedInterestStated`
+    ## separates them.
     observedInterest*: set[EventCategory]
+    ## Was a scope stated AT ALL? False for every depfile written before the
+    ## stamp existed, and for a library caller that passed no scope.
+    ##
+    ## This exists because the reader of a wire format meets writers from the
+    ## future. `interest=gpu` — what a later io-mon writes for a capture narrowed
+    ## to a category added after this build — parses to `{}` here, and reading
+    ## `{}` as "not stated" would report a NARROWED capture as full scope and let
+    ## a consumer that needs full evidence accept it. That is precisely the false
+    ## complete this field's sibling was added to end, surviving in the forward
+    ## direction. With `stated = true` and an empty parse the honest answer is
+    ## "this file states a scope I cannot evaluate", and a consumer requiring
+    ## full evidence must REJECT it — see `effectiveObservedInterest`.
+    observedInterestStated*: bool
+    ## The stamp VERBATIM, exactly as the producer wrote it (empty when nothing
+    ## was stated). Kept so the residual is nameable rather than merely
+    ## detectable: a consumer can report "this capture declares `gpu`, which I
+    ## cannot evaluate" instead of "this capture declares something". Same
+    ## attribution-not-suppression rule the unnamable-capability diagnostic
+    ## follows in `profileFromRecords`.
+    observedInterestTokens*: string
     records*: seq[MonitorRecord]
 
   MonitorDepFileReaderOptions* = object
@@ -622,3 +665,42 @@ func parseInterestTokens*(s: string): set[EventCategory] =
     let tok = raw.strip()
     for (cat, known) in interestTokenPairs:
       if tok == known: result.incl(cat)
+
+func statesUnevaluableInterest*(dep: MonitorDepFile): bool =
+  ## The capture STATED a scope, and this build could not name a single category
+  ## in it. The file is not silent about its scope and it is not full scope: it
+  ## is a narrowing written in a vocabulary this build does not have.
+  dep.observedInterestStated and dep.observedInterest == {}
+
+func effectiveObservedInterest*(dep: MonitorDepFile): set[EventCategory] =
+  ## THE ONLY CORRECT WAY TO READ THE SCOPE STAMP. Three inputs, three answers,
+  ## and the middle one is the reason this function exists rather than a call to
+  ## `normalizeInterest(dep.observedInterest)`:
+  ##
+  ##   not stated                  -> `FullInterest`. An old depfile (or a
+  ##                                  library caller that said nothing) keeps
+  ##                                  exactly its previous meaning.
+  ##   stated, nothing recognised  -> `{}`. NOT full scope. No non-empty
+  ##                                  requirement is a subset of `{}`, so a
+  ##                                  consumer needing evidence of anything at
+  ##                                  all rejects the file — which is the honest
+  ##                                  verdict, because the file states a scope
+  ##                                  this build cannot evaluate.
+  ##   stated, some recognised     -> what was recognised. Unknown tokens beside
+  ##                                  known ones drop out, which narrows the read
+  ##                                  scope and therefore errs toward rejection.
+  ##
+  ## Every direction of the degrade points at "reject", never at "accept": a
+  ## scope this build misreads costs a re-capture, whereas the opposite mistake
+  ## publishes a narrowed capture as complete evidence.
+  if dep.observedInterestStated: dep.observedInterest
+  else: FullInterest
+
+func observedInterestCovers*(dep: MonitorDepFile;
+                             required: set[EventCategory]): bool =
+  ## Does this capture's stated scope cover what a consumer needs? The
+  ## consumer-side half of the DA-1j contract, in one place so that no consumer
+  ## has to rediscover the `{}` ambiguity for itself. `required = {}` (a consumer
+  ## that needs no particular category) accepts anything, including an
+  ## unevaluable stamp — it asked for nothing, so nothing can be missing.
+  required <= effectiveObservedInterest(dep)
