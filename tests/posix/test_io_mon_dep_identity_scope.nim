@@ -1,5 +1,4 @@
-## test_io_mon_dep_identity_scope — DA-1b (Dependency-Attribution), the
-## representation half of the campaign: **stop writing the same fact down once
+## test_io_mon_dep_identity_scope — the representation half of the campaign: **stop writing the same fact down once
 ## per process**, without erasing the process attribution the completeness
 ## machinery reads.
 ##
@@ -28,10 +27,33 @@
 ##   t_one_fact_observed_by_many_processes_is_one_element
 ##       The headline, shaped like the measurement: `FanOut` processes across
 ##       TWO DIFFERENT executables all load ONE shared object and all read ONE
-##       environment variable. The depfile must contain exactly ONE
-##       `mrLibraryLoad` for that object and exactly ONE `mrEnvRead` for that
-##       name — while still showing `FanOut + 1` distinct monitored processes,
-##       so it cannot pass by the fan-out having failed to happen.
+##       environment variable — while still showing `FanOut + 1` distinct
+##       monitored processes, so it cannot pass by the fan-out having failed to
+##       happen.
+##
+##       THE ASSERTION IS A CHECKED CLAIM, IN BOTH DIRECTIONS. The fold is not
+##       universal: it is a property of the TRANSPORT, and only the Linux
+##       backend has it (it publishes into a `nim-shm-gset` whose element key IS
+##       the observation identity). macOS and Windows write `.iomon-frag` frames
+##       through a writer that encodes every field verbatim, and there is no
+##       dedup step anywhere on the file/merge path — so one fact observed by N
+##       processes lands as N records there.
+##
+##       `backendFoldsObservationIdentity` states that per family, and this case
+##       grades the DECLARATION against the observed behaviour whichever way it
+##       points: declares folding ⇒ exactly one record; declares not folding ⇒
+##       the repetition must really be present. The second arm is the one that
+##       earns its keep — the day someone brings the fold to a file-transport
+##       backend, this reddens and says the declaration is stale instead of
+##       silently blessing the change. That is the "every declared attribution
+##       has a check" rule applied to a platform capability.
+##
+##       Note what the non-folding arm is NOT: it is not a correctness failure.
+##       Nothing goes unobserved on those backends; records repeat rather than
+##       going missing, completeness is unaffected, and consumers already fold
+##       by path. It is a cost and size shortfall, declared as such — see
+##       `backendFoldsObservationIdentity` for why the capability must never
+##       join `InputEvidenceCapabilities`.
 ##
 ##       Two executables rather than one is deliberate: the element key also
 ##       carries the caller's per-exec incarnation identity (`setElemImage`),
@@ -334,21 +356,51 @@ suite "io-mon DA-1b dependency-identity scope":
     check toSeq(execImages.items).anyIt("da1b_child_a" in it)
     check toSeq(execImages.items).anyIt("da1b_child_b" in it)
 
-    # THE HEADLINE. One shared object, loaded by `FanOut` processes running two
-    # different executables — one element, therefore one record.
+    # THE HEADLINE, AND IT IS A CHECKED CLAIM IN BOTH DIRECTIONS.
+    #
+    # `backendFoldsObservationIdentity` states, per backend family, whether this
+    # capture folds repeated observations of one fact into one record. A
+    # declaration nobody checks rots into a permanent exemption, so this case
+    # grades the declaration against what the monitor ACTUALLY produced — in
+    # whichever direction the declaration points:
+    #
+    #   declares folding      => exactly ONE record for the shared object.
+    #   declares NOT folding  => the repetition must really be there.
+    #
+    # That second arm is the one that matters for the future. The day someone
+    # brings the fold to a file-transport backend, this reddens and says the
+    # declaration is now stale, instead of silently blessing a platform that
+    # quietly started behaving differently from what it advertises.
+    let folds = backendFoldsObservationIdentity(dep.backendFamily)
+    checkpoint("backend " & $dep.backendFamily & " declares fold=" & $folds)
+
     let loads = libraryLoadsNamed(dep, "lib" & FactLibName & ".so")
     checkpoint("library-load records for lib" & FactLibName & ".so: " &
       $loads.len & " (" & loads.mapIt(it.path).deduplicate.join(", ") & ")")
-    check loads.len == 1
-    check loads[0].osPid == 0
-    check loads[0].parentOsPid == 0
-    check loads[0].threadId == 0
-
-    # The same claim for the other high-volume fact-scoped kind.
     let envReads = envReadsNamed(dep, EnvMarkerName)
     checkpoint("env-read records for " & EnvMarkerName & ": " & $envReads.len)
-    check envReads.len == 1
-    check envReads[0].osPid == 0
+
+    if folds:
+      # One shared object, loaded by `FanOut` processes running two different
+      # executables — one element, therefore one record.
+      check loads.len == 1
+      check loads[0].osPid == 0
+      check loads[0].parentOsPid == 0
+      check loads[0].threadId == 0
+      check envReads.len == 1
+      check envReads[0].osPid == 0
+    else:
+      # The declaration says this backend writes one record per observing
+      # process. Prove it rather than assuming it: a backend that quietly began
+      # folding would otherwise keep passing while its advertised capability set
+      # told consumers the opposite. Asserted as "materially more than one"
+      # rather than exactly `FanOut`, because the loader closure of a re-exec is
+      # a real source of variation and pinning the count would buy flakiness,
+      # not strength.
+      check loads.len > 1
+      check loads.len >= FanOut div 2
+      check envReads.len > 1
+      check envReads.len >= FanOut div 2
 
     # And the fact-scoped kinds as a class: every one of them must be
     # observer-free, and every process-scoped kind that named a process must
@@ -365,7 +417,19 @@ suite "io-mon DA-1b dependency-identity scope":
       of disProcessScoped:
         if r.osPid != 0: inc processScopedWithPid
       of disPathScoped: discard
-    check factScopedWithPid == 0
+    checkpoint("fact-scoped records still naming a process: " &
+      $factScopedWithPid)
+    if folds:
+      check factScopedWithPid == 0
+    else:
+      # On a non-folding backend the identity codec is never consulted — the
+      # file writer encodes every field verbatim — so the observer is still
+      # there. That is the same fact as the branch above, seen from the record
+      # side, and asserting it keeps this arm from passing vacuously.
+      check factScopedWithPid > 0
+    # Process attribution survives on EVERY backend. This is the assertion that
+    # would catch a fold widened until it swallowed the evidence the
+    # completeness machinery reads.
     check processScopedWithPid > 0
 
   test "t_completeness_is_unchanged":
@@ -484,9 +548,16 @@ suite "io-mon DA-1b dependency-identity scope":
         $polledCensus.getOrDefault(kindName))
     check toSeq(batchCensus.pairs).sorted == toSeq(polledCensus.pairs).sorted
 
-    # And the dedup itself holds on BOTH paths, so this case cannot go green by
-    # the two paths agreeing on un-deduped evidence.
-    check libraryLoadsNamed(batch.depFile, "lib" & FactLibName & ".so").len == 1
-    check libraryLoadsNamed(polled.depFile, "lib" & FactLibName & ".so").len == 1
+    # And whatever this backend declares, BOTH launch paths must do the same
+    # thing — otherwise the two agree on a census while disagreeing about the
+    # fold, which is the drift this case exists to catch.
+    let batchLoads = libraryLoadsNamed(batch.depFile, "lib" & FactLibName & ".so")
+    let polledLoads = libraryLoadsNamed(polled.depFile, "lib" & FactLibName & ".so")
+    check batchLoads.len == polledLoads.len
+    if backendFoldsObservationIdentity(batch.depFile.backendFamily):
+      check batchLoads.len == 1
+      check polledLoads.len == 1
+    else:
+      check batchLoads.len > 1
 
   removeDir(work)

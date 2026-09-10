@@ -8,7 +8,7 @@
 ## format cluster (types/codec/encode/reader/render) can be consumed without
 ## dragging in any shared-memory machinery.
 
-import std/[algorithm, sets]
+import std/[algorithm, sets, strutils]
 from io_mon/paths import extendedPath
 
 import io_mon/codec
@@ -185,6 +185,30 @@ proc summarizeRecords*(records: openArray[MonitorRecord]): MonitorSummary =
       inc result.observationCount
   result.processCount = uint64(processPids.len)
 
+proc observedInterestFromRecords(records: openArray[MonitorRecord]):
+    set[EventCategory] =
+  ## DA-1j — read the capture-scope stamp off the backend-profile record.
+  ##
+  ## The depfile envelope carries ONLY records: `depFileFromOwnedRecords`
+  ## reconstructs `profile`, `capabilityGaps`, `requiredFeatures`,
+  ## `completeness` and `summary` from them. So the scope rides on a record too,
+  ## as an `interest=` token in the `;`-separated profile detail. That is why
+  ## this needed no envelope version bump and breaks no wire compatibility:
+  ## `profileFromRecords` already ignores unknown keys (`else: discard`), and
+  ## `parseInterestTokens` already ignores unknown tokens, so an older reader
+  ## skips the stamp and a newer reader tolerates a category it does not know.
+  ##
+  ## `{}` means NOT STATED — a depfile written before this existed — and every
+  ## consumer reads that as `FullInterest`, preserving the previous behaviour
+  ## rather than looking like a capture that recorded nothing.
+  for record in records:
+    if record.kind == mrBackendProfile:
+      for part in record.detail.split(';'):
+        let pair = part.split("=", 1)
+        if pair.len == 2 and pair[0] == "interest":
+          return parseInterestTokens(pair[1])
+  {}
+
 proc depFileFromOwnedRecords*(records: sink seq[MonitorRecord]): MonitorDepFile =
   let summary = summarizeRecords(records)
   # The required-set is NOT empty, and that is the whole point. Deriving the
@@ -210,7 +234,8 @@ proc depFileFromOwnedRecords*(records: sink seq[MonitorRecord]): MonitorDepFile 
         mcIncomplete,
     profile: profile,
     capabilityGaps: profile.gaps,
-    summary: summary)
+    summary: summary,
+    observedInterest: observedInterestFromRecords(records))
   result.records = move(records)
 
 proc depFileFromRecords*(records: openArray[MonitorRecord]): MonitorDepFile =

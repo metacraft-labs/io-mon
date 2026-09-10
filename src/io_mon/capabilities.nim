@@ -68,6 +68,15 @@ const
   }
 
   MacosInterposeKnownUnsupportedCapabilities* = {
+    # DA-1b — this backend writes `.iomon-frag` frames, and that writer encodes
+    # every field verbatim with the record's real `seq`; there is no dedup step
+    # anywhere on the file/merge path. One fact observed by N processes lands as
+    # N records. DECLARED so a consumer sizing a capture is not promised a
+    # reduction it will not get -- and declared as a COST shortfall, never a
+    # fidelity one: nothing went unobserved. See
+    # `backendFoldsObservationIdentity` for why this capability must never join
+    # `InputEvidenceCapabilities`.
+    mcapObservationIdentityFold,
     # T3c (adversarial-hardening break #6): the EndpointSecurity backend is now
     # DESIGNED + FEASIBILITY-PROBED + SKELETONED — see
     # reprobuild-specs/MacOS-EndpointSecurity-Backend.md and the integration stub
@@ -112,6 +121,11 @@ const
   }
 
   LinuxPreloadSupportedCapabilities* = {
+    # DA-1b — the Linux backend publishes into a consumer-owned nim-shm-gset
+    # whose element key IS the observation identity, so repeated observations
+    # of one fact collapse to one element. See
+    # `backendFoldsObservationIdentity`, which must agree with this entry.
+    mcapObservationIdentityFold,
     mcapProcess,
     mcapFileRead,
     mcapFileWrite,
@@ -432,6 +446,8 @@ const
   # and for the one residual it does not (a direct walk of the CRT's `_environ`
   # array, which performs no call and is uncovered on POSIX too).
   WindowsInterposeKnownUnsupportedCapabilities* = {
+    # DA-1b — same file-writer transport as macOS, same consequence: no fold.
+    mcapObservationIdentityFold,
     mcapEndpointSecurity,
     mcapHybrid,
     mcapAuthorizationEnforcement,
@@ -515,6 +531,8 @@ proc capabilityId*(capability: MonitorCapability): string =
     "executable-mapping-lifecycle"
   of mcapPathIdentity:
     "path-identity"
+  of mcapObservationIdentityFold:
+    "observation-identity-fold"
 
 proc capabilityFromId*(value: string): MonitorCapability =
   for capability in MonitorCapability:
@@ -774,6 +792,54 @@ proc capabilityGapRecord*(gap: MonitorCapabilityGap): MonitorRecord =
     probeResult: prUnknown,
     path: capabilityId(gap.capability),
     detail: gapDetail(gap))
+
+func backendFoldsObservationIdentity*(family: MonitorBackendFamily): bool =
+  ## Does a capture from this backend FOLD repeated observations of one fact
+  ## into one record?
+  ##
+  ## THE ANSWER IS A PROPERTY OF THE TRANSPORT, NOT OF THE HOOKS. The Linux
+  ## backend publishes each observation into a consumer-owned `nim-shm-gset`
+  ## whose element key IS the observation's identity (`depIdentityScope`), so
+  ## two processes observing one fact insert one element. Every other backend
+  ## writes `.iomon-frag` frames, and that writer encodes every field verbatim
+  ## with the record's real `seq`: nothing collapses, on any axis. There is no
+  ## dedup step anywhere on the file/merge path — so macOS and Windows get
+  ## neither the fact-scoped fold nor the path-scoped one, and a probe storm
+  ## lands one record per event.
+  ##
+  ## ASSERTED AS DATA, per family, and NOT behind `when defined(...)`. On Linux
+  ## `defined(linux) or defined(macosx)` and a bare `true` are the same value,
+  ## so a host-conditional assertion cannot catch a claim that is wrong for a
+  ## platform the host is not. Grading every family's answer from any host is
+  ## what makes the macOS answer reviewable from a Linux box.
+  ##
+  ## THIS IS A COST AND SIZE DEFECT, NOT A CORRECTNESS ONE, AND THE DISTINCTION
+  ## IS LOAD-BEARING. On a non-folding backend **no fact is lost**: the records
+  ## are all present, just repeated. Completeness is unaffected — the monitor
+  ## observed everything it was asked to. Consumers already fold by path
+  ## (reprobuild's `addUnique`), so the repetition costs capture time, transport
+  ## and depfile bytes, and changes no verdict and no cache key.
+  ##
+  ## Which is exactly why the gap this drives is declared `required = false` and
+  ## why `mcapObservationIdentityFold` is deliberately NOT a member of
+  ## `InputEvidenceCapabilities`. Promoting it into that floor set would force
+  ## `mcIncomplete` on every macOS capture, and that grade would be FALSE:
+  ## `mcIncomplete` means *the monitor could not observe everything*, and here
+  ## it observed everything and wrote some of it down more than once. Encoding a
+  ## non-fidelity fact as a fidelity grade is the same mistake the reduced-scope
+  ## mode had to withdraw, and it would corrupt the very signal
+  ## `observedInterest` exists to make trustworthy. **Do not "fix" this by
+  ## moving the capability into the floor set.**
+  case family
+  of mbfLinuxPreloadHooks:
+    true
+  of mbfMacosHooks, mbfMacosEndpointSecurity, mbfMacosHybrid,
+     mbfWindowsInterposeHooks:
+    false
+  of mbfUnknown:
+    # Conservative: claim no fold for a backend we cannot name, so a consumer
+    # sizing a capture is never promised a reduction it will not get.
+    false
 
 proc backendProfileRecord*(profile: MonitorBackendProfile): MonitorRecord =
   var caps: seq[string] = @[]

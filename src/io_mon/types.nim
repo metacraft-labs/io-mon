@@ -270,6 +270,32 @@ type
     mcapAdversarialRawSyscall
     mcapExecutableMappingLifecycle
     mcapPathIdentity
+    # DA-1b follow-up — does the capture FOLD repeated observations of one fact
+    # into one record? See `backendFoldsObservationIdentity`, which carries the
+    # per-family answer and the argument for it.
+    #
+    # APPENDED AT THE END, AND THAT IS ONLY HALF A COMPATIBILITY ARGUMENT.
+    # It is safe for the ENUM — the wire carries the `capabilityId` STRING, so
+    # no ordinal ever shifts meaning, and an older WRITER's file still reads
+    # here. It is NOT safe for an older READER: `capabilityFromId` RAISES on an
+    # id it does not know and `parseCapabilityList` does not catch it, so the
+    # moment a backend ADVERTISES a newly-added id in its `supported=` list,
+    # every io-mon built before that id existed fails to load the depfile at
+    # all. MEASURED, not inferred: a reader built at the commit before this one
+    # dies with `ValueError: unknown monitor capability:
+    # observation-identity-fold` inside `readMonitorDepFile`. (Capability GAP
+    # records are tolerant — `parseGapDetail` is wrapped and degrades to a
+    # diagnostic — so it is specifically the `supported=` list that breaks.)
+    # The same caveat applies to the two "appending is wire-safe" notes above,
+    # which state only the enum half.
+    #
+    # DELIBERATELY NOT IN `InputEvidenceCapabilities`. Its absence is a COST and
+    # SIZE shortfall, never a fidelity one: a non-folding backend observed
+    # everything and merely wrote some of it down once per observing process.
+    # Putting it in the floor set would force `mcIncomplete` on every capture
+    # from such a backend, which would be a false statement about what the
+    # monitor could see.
+    mcapObservationIdentityFold
 
   MonitorDiagnosticLevel* = enum
     mdlInfo
@@ -342,6 +368,38 @@ type
     profile*: MonitorBackendProfile
     capabilityGaps*: seq[MonitorCapabilityGap]
     summary*: MonitorSummary
+    ## DA-1j — WHAT THIS CAPTURE WAS ASKED TO RECORD.
+    ##
+    ## `completeness` says whether the monitor could observe everything it
+    ## tried to. It does NOT say what it was asked to try, and until this field
+    ## existed nothing did — while `--interest` already shipped and already
+    ## narrowed. Measured, on one command with a single out-of-tree peer:
+    ## `io-mon run` grades `mcIncomplete` with 1 loss over 32 records, and
+    ## `io-mon run --interest file,proc,lib` grades **`mcComplete`** with 0
+    ## losses over 23 records. Gating `ecIpc` means the `mrIpcConnect` records
+    ## never exist, so `mergeFragments` never derives the synthetic loss from
+    ## them — and the depfile then reports `mcComplete` and says nothing about
+    ## having been narrowed. That is the false complete this project calls "one
+    ## flag away at all times", reachable today with a shipped flag.
+    ##
+    ## A consumer compares this against its own requirement and recomputes
+    ## locally when the record answers a narrower question than it needs. That
+    ## is the shape `evaluateMonitorEvidence` already uses on the capability
+    ## axis — the depfile states what it has, the consumer supplies its own bar
+    ## — applied to the interest axis.
+    ##
+    ## NOT a completeness input and NOT a cache-key component. A narrowed
+    ## capture is an honest answer to a narrower question, not a monitor
+    ## failure, so it must not move the grade (see `MonitorCompleteness`). And
+    ## trust here is a PARTIAL ORDER, not a partition: full-scope evidence is
+    ## strictly stronger than narrowed evidence, so a consumer that asked for
+    ## less must still be able to accept a full capture. Keying on the scope
+    ## would make the two disjoint and block exactly that direction.
+    ##
+    ## Empty means "not stated" and is read as `FullInterest`, so a depfile
+    ## written before this field degrades to the previous behaviour rather than
+    ## looking like a capture that recorded nothing.
+    observedInterest*: set[EventCategory]
     records*: seq[MonitorRecord]
 
   MonitorDepFileReaderOptions* = object

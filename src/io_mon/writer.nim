@@ -2612,7 +2612,8 @@ proc dropStaleRunRecords(records: seq[MonitorRecord];
 proc mergeFragments*(fragmentDir, outputPath: string;
     breakawayReportDir = ""; expectedRootPid: uint64 = 0;
     currentRunId = "";
-    setRecords: openArray[MonitorRecord] = @[]): MonitorDepFile =
+    setRecords: openArray[MonitorRecord] = @[];
+    observedInterest: set[EventCategory] = {}): MonitorDepFile =
   ## io-mon-Lossless-Event-Capture M3 — `setRecords` are the DISTINCT records the
   ## consumer decoded from the edge's shared-memory SET (nim-shm-gset) snapshot
   ## (the sole Linux dependency transport; see fs_snoop). They are folded into the
@@ -2878,6 +2879,22 @@ proc mergeFragments*(fragmentDir, outputPath: string;
     when defined(linux): LinuxPreloadSupportedCapabilities
     elif defined(windows): WindowsInterposeSupportedCapabilities
     else: MacosMonitorShimTaxonomyCapabilities))
+
+  # DA-1j — STAMP WHAT THIS CAPTURE WAS ASKED TO RECORD, before the write, so
+  # the on-disk depfile and the returned value cannot disagree.
+  #
+  # The HOST's normalized interest, never the shim's: the host-side filter is
+  # already the declared source of truth for "the depfile contains only
+  # requested categories" (an older shim that ignores REPRO_MONITOR_INTEREST
+  # still yields a correctly filtered result), so the stamp must describe THE
+  # RESULT rather than the request. `{}` means the caller said nothing, and is
+  # left unstamped so a library caller that never passes it keeps exactly the
+  # previous behaviour instead of having `FullInterest` asserted on its behalf.
+  if observedInterest != {}:
+    let interestToken = ";interest=" & interestToTokens(observedInterest)
+    for record in records.mitems:
+      if record.kind == mrBackendProfile:
+        record.detail.add interestToken
 
   writeCanonicalInPlace(outputPath, records)
   depFileFromOwnedRecords(move(records))

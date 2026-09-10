@@ -1911,7 +1911,8 @@ proc collectMonitorEvidence(h: var MonitorHandle): MonitorDepFile =
         "false mcComplete over a set a detached descendant is still growing")
   when defined(macosx):
     result = mergeFragments(h.fragmentDir, h.request.depFilePath,
-      expectedRootPid = h.rootPid)
+      expectedRootPid = h.rootPid,
+      observedInterest = normalizeInterest(h.request.interest))
   elif defined(linux):
     # io-mon-Lossless-Event-Capture M3 part 2a — SINGLE-THREADED final merge over
     # the SET's DISTINCT elements. The DEP-FLUSH shutdown guarantees every producer
@@ -1951,7 +1952,8 @@ proc collectMonitorEvidence(h: var MonitorHandle): MonitorDepFile =
           " time(s); dependency capture may be incomplete for this edge")
     result = mergeFragments(h.fragmentDir, h.request.depFilePath,
       expectedRootPid = h.rootPid, currentRunId = h.runId,
-      setRecords = depDrained)
+      setRecords = depDrained,
+      observedInterest = normalizeInterest(h.request.interest))
   elif defined(windows):
     var launcherRecords: seq[MonitorRecord] = @[]
     if h.injection.monitoringSkipped:
@@ -1983,7 +1985,8 @@ proc collectMonitorEvidence(h: var MonitorHandle): MonitorDepFile =
     # published as `mcComplete` over an empty record set — a zero-effort false
     # cache hit for the whole action — and is now downgraded to `mcIncomplete`.
     result = mergeFragments(h.fragmentDir, h.request.depFilePath,
-      expectedRootPid = h.rootPid, setRecords = launcherRecords)
+      expectedRootPid = h.rootPid, setRecords = launcherRecords,
+      observedInterest = normalizeInterest(h.request.interest))
 
   # Host-side event-interest filter (belt-and-suspenders — see
   # docs/contributors/event-interest-filter.md §5). The shim is meant to skip
