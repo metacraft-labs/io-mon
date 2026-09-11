@@ -82,15 +82,45 @@ io-mon run --interest file,proc,lib --depfile out.iomon -- <command>
 
 Same vocabulary, same codec (`interestToTokens` / `parseInterestTokens`), so the
 flag and the env variable are one wire format with one implementation. **An
-absent flag, or an empty value, means all categories** — every existing caller
-keeps the behaviour it has, and a consumer that wants a reduction has to ask for
-it on each run. That asymmetry is deliberate: forgetting costs capture work,
+absent flag, or an empty value in either spelling (`--interest ""` and
+`--interest=` alike), means all categories** — every existing caller keeps the
+behaviour it has, and a consumer that wants a reduction has to ask for it on
+each run. The two spellings are one flag: `parseRun` dispatches on the argument's
+PRESENCE (`arg.startsWith("--interest=")`), because a dispatch on the value's
+length cannot tell `--interest=` from an argument that is not `--interest` at
+all, and sending it to the catch-all told the operator the flag does not exist
+when only its value was missing. That asymmetry is deliberate: forgetting costs capture work,
 never a missed dependency. A value that names at least one known token and also
 an unknown one is accepted with the unknown token ignored (§3's forward-compat
 rule, which now also covers a NEWER consumer talking to an OLDER io-mon); a
 value that names **no** known token is refused as an operator typo rather than
 silently widened to "all", because silently widening is the same discard the
 flag exists to end.
+
+**Adding an `EventCategory` whose wire token cannot be read back is a compile
+error.** `interestToken` is an exhaustive `case`, `interestToTokens` and
+`parseInterestTokens` are both derived from it rather than from a table of
+pairs, and a `static:` block asserts over the whole enum that every category has
+a token which is non-empty, carries neither the value's `,` separator nor the
+record-detail's `;`, and decodes back to exactly that category. The table of
+pairs this replaced was policed by nothing: a category added without a row
+compiled, and every `interest=` stamp thereafter silently omitted it.
+
+The harm on this axis is **strictly lesser** than on the evidence axis, and the
+difference is worth being precise about rather than glossing. A missing token can
+only *shrink* what a stamp declares, and `observedInterestCovers` is a subset
+test, so every consequence points at **rejection**: a capture that really did
+observe the new category is read as one that did not, and a consumer needing it
+recaptures for nothing. It cannot produce the opposite mistake, because a
+category this build cannot spell is also one it cannot be asked for. On the
+evidence axis the same omission produces a depfile every consumer refuses, or —
+with a duplicated token — one a full-evidence consumer wrongly **accepts**. That
+asymmetry is the reason this axis was closed second, not a reason to leave it
+open. Graded by the compile-refusal cases in
+`tests/portable/test_io_mon_evidence_scope.nim`, alongside the evidence axis's.
+The change is wire-neutral: the enum's declaration order is the order the array
+had, and the encoding was measured identical over all 32 subsets in both
+directions.
 
 ## 4. Where the work is skipped (two levels)
 

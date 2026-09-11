@@ -47,6 +47,43 @@ environment variable, and the `evidence=` stamp in the depfile.
 `FsSnoopRequest` and a depfile written before this existed both mean "full" with
 no special case anywhere.
 
+**Adding a member to `EvidenceScope` whose wire token cannot be read back is a
+compile error, not a runtime surprise.** `evidenceScopeToken` is an exhaustive
+`case` (so a forgotten member does not compile), `parseEvidenceScopeToken` is
+derived from that one function rather than from a second table (so the two
+directions of the codec cannot drift), and a `static:` block below the decoder
+asserts, over the whole enum, that `esUnrecognized` is the *only* member whose
+token is empty **and that every other member's token survives a round trip
+through the wire**.
+
+The reason is specific: the write side in `mergeFragments` stamps any scope that
+is neither `esFull` nor `esUnrecognized`, so a member the codec cannot spell
+ships a stamp no consumer can evaluate. Four shapes were measured on real
+depfile bytes, and *only the first* is the one an emptiness check catches:
+
+| token arm | compiles? | what reaches the depfile |
+| --- | --- | --- |
+| *(no arm)* | **no** — `case` is exhaustive | — |
+| `""` | **no** — the emptiness assertion | bare `;evidence=`, read as *stated and unevaluable*, refused by every consumer including one asking for exactly that scope, residual **unnameable** |
+| `"writes;only"` | **no** — the wire-safety assertion | the stamp rides inside a `;`-joined record detail, so the decoder splits on `;` first: read as `esUnrecognized` with the residual **misnamed** `writes` |
+| `"full"` (a duplicate) | **no** — the round-trip assertion | decodes to the *first* member holding the token, so the narrowed capture reads back as `esFull` and a full-evidence consumer **accepts** it |
+
+`"writes;only"` is the instructive one: it is non-empty *and* round-trips in
+memory, so it passed both the emptiness assertion and the runtime enum case, and
+the whole suite stayed green while the depfile was unreadable. **Non-empty was
+never the property; the round trip is.**
+
+Making the write-side guard test the token instead of the value does not help
+and was measured to be worse: the stamp is then omitted, the capture reads as
+*not stated*, and a full-evidence consumer **accepts** a narrowed capture. With
+the assertions above the two spellings are provably the same predicate, so
+neither is load-bearing by itself. Graded by the compile-refusal cases in
+`tests/portable/test_io_mon_evidence_scope.nim`, each with two negative controls
+(the unmutated codec compiles; a member *with* a good token compiles).
+
+The interest axis carries the identical construction — see
+[event-interest-filter.md](event-interest-filter.md).
+
 ## 3. The predicate
 
 `recordIsFailedExistenceLookup` is the single definition of what `reads-only`

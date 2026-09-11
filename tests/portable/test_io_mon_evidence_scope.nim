@@ -39,7 +39,7 @@
 ## Assertion helpers are `template`s, never `proc`s: a `check` inside a plain
 ## `proc` prints "Check failed" and the enclosing test still reports `[OK]`.
 
-import std/[options, os, strutils, unittest]
+import std/[options, os, osproc, streams, strutils, unittest]
 
 import io_mon
 
@@ -529,6 +529,30 @@ suite "io-mon evidence scope stamp (DA-1i)":
     check parseEvidenceScopeToken("writes-only") == esUnrecognized
     check parseEvidenceScopeToken("Reads-Only") == esUnrecognized
 
+  test "t_esUnrecognized_is_the_only_scope_without_a_wire_token":
+    # THE INVARIANT THE WRITE SIDE RESTS ON, stated over the WHOLE enum instead
+    # of over the members someone remembered to list. `mergeFragments` guards
+    # with `!= esFull and != esUnrecognized` — it tests the VALUE — while the
+    # hazard its own comment names is the TOKEN's emptiness. Those are the same
+    # statement only while this holds.
+    #
+    # This case is the READER's copy of the rule, not its grader: a runtime loop
+    # cannot see a member that does not exist yet, which is exactly when the
+    # rule gets broken. The grader is the `static:` block in `types.nim`, driven
+    # by the compile-refusal suite at the bottom of this file.
+    var spellable, unspellable: seq[EvidenceScope]
+    for scope in EvidenceScope:
+      if evidenceScopeToken(scope).len == 0: unspellable.add scope
+      else: spellable.add scope
+    check unspellable == @[esUnrecognized]
+    # …and "has a token" has to mean "has a token this build can read back",
+    # not merely "is non-empty", or the two directions of the codec could still
+    # disagree about a member both of them name.
+    check spellable.len > 0        # …so the round trip below is not vacuous.
+    for scope in spellable:
+      checkpoint("scope: " & $scope)
+      check parseEvidenceScopeToken(evidenceScopeToken(scope)) == scope
+
 suite "io-mon evidence scope: the write side at the library boundary (DA-1i)":
 
   let work = getTempDir() / ("io-mon-evidence-merge-" & $getCurrentProcessId())
@@ -603,3 +627,271 @@ suite "io-mon evidence scope: the write side at the library boundary (DA-1i)":
     let onDisk = readMonitorDepFile(work / "both.iomon")
     check onDisk.observedInterest == {ecFileDeps}
     check onDisk.observedEvidenceScope == esReadsOnly
+
+# ---------------------------------------------------------------------------
+# A SCOPE WITH NO WIRE TOKEN — the instrument is the compiler, not this process.
+#
+# `evidenceScopeToken` used to be a plain array of `(scope, token)` pairs while
+# every other consumer of `EvidenceScope` (`recordInEvidenceScope`,
+# `evidenceScopeCovers`) is a compiler-policed exhaustive `case`. MEASURED on
+# that code, end to end and on real bytes: adding an `esWritesOnly` member and
+# doing EXACTLY what the compiler and this suite demanded — an arm in each of
+# those two `case`s plus a row in the relation table above — compiled clean,
+# and `mergeFragments(…, observedEvidenceScope = esWritesOnly)` then wrote a
+# bare `;evidence=` into the depfile. That file reads back `stated = true`,
+# `esUnrecognized`, `token = ""`, so it is REJECTED BY EVERY CONSUMER —
+# including one asking for exactly that scope — and the residual is unnameable,
+# leaving the operator only "caching stopped".
+#
+# NO RUNTIME TEST OVER TODAY'S MEMBERS CAN SEE THAT: every member that exists
+# has a token, and the defect appears only at the moment a member is ADDED. So
+# the subject of these cases is a mutated COPY of the real
+# `src/io_mon/types.nim` and the instrument is the real compiler's exit code —
+# the same reason `test_io_mon_monitor_handle_exclusivity.nim` drives
+# `nim c --compileOnly` instead of `compiles()`.
+#
+# WHY THE GUARD IN `mergeFragments` STILL TESTS THE VALUE. The obvious one-line
+# fix — test the token there instead — was measured on the pre-fix code and is
+# strictly worse: the stamp is then omitted, the capture reads as NOT STATED,
+# `effectiveObservedEvidenceScope` defines not-stated as `esFull`, and a
+# FULL-evidence consumer ACCEPTS a narrowed capture. There was no safe default
+# at the write site in either spelling. What these cases pin instead makes the
+# two spellings PROVABLY EQUIVALENT — empty token ⟺ `esUnrecognized` — so
+# substituting one for the other now reddens nothing (also measured), and the
+# question the write site could not answer is no longer asked there.
+#
+# AND "HAS A TOKEN" IS NOT "HAS A USABLE TOKEN", which is the round after that
+# and the reason the last two cases in the first suite below exist. With only
+# the emptiness assertion in place, `of esWritesOnly: "writes;only"` compiled,
+# satisfied it, round-tripped IN MEMORY (so the runtime enum case above stayed
+# green), left the WHOLE portable suite green — and still produced a depfile
+# read back as `esUnrecognized` with the residual MISnamed `writes`, because
+# the `evidence=` stamp rides inside a `;`-joined record detail. A DUPLICATE
+# token is worse: the narrowed capture reads back as `esFull` and a
+# full-evidence consumer ACCEPTS it. Both measured on real bytes, both now
+# compile errors. The property the `static:` block holds is therefore the ROUND
+# TRIP THROUGH THE WIRE, and a length check was never it.
+# ---------------------------------------------------------------------------
+
+const
+  RepoRoot = currentSourcePath().parentDir().parentDir().parentDir()
+  TypesSource = RepoRoot / "src" / "io_mon" / "types.nim"
+
+  EnumAnchor = "    esUnrecognized    ## READ SIDE ONLY"
+    ## Where the probe's new member goes — BEFORE `esUnrecognized`, so the
+    ## mutation has the realistic shape (a new real scope; the read-side
+    ## sentinel stays last) rather than one appended past the sentinel.
+
+  TokenCaseAnchor = "  of esUnrecognized: \"\"\n"
+    ## `evidenceScopeToken`'s sentinel arm. Distinct from `evidenceScopeCovers`'
+    ## `of esUnrecognized: false`, which is why both can be anchored uniquely.
+
+  ScopeCaseAnchor = "  of esFull, esUnrecognized: true\n"
+    ## `recordInEvidenceScope`'s arm.
+
+  CoversCaseAnchor = "  of esUnrecognized: false\n"
+    ## `evidenceScopeCovers`' arm.
+
+  CategoryEnumAnchor = "    ecIpc            ## mrIpcConnect"
+    ## Where the interest-axis probe's new category goes. `EventCategory` has no
+    ## read-side sentinel, so a new member simply goes last.
+
+  CategoryTokenAnchor = "  of ecIpc: \"ipc\"\n"
+    ## `interestToken`'s last arm.
+
+  ProbeProgram = """
+import io_mon/types
+
+# Touch BOTH directions of BOTH codecs and the partial order, so nothing here
+# can be discarded before the compiler has had to check it.
+echo evidenceScopeToken(esFull)
+echo $parseEvidenceScopeToken("reads-only")
+echo $evidenceScopeCovers(esFull, esReadsOnly)
+echo interestToTokens({ecFileDeps})
+echo $parseInterestTokens("proc")
+"""
+
+proc spliceOnce(text, anchor, insertion: string): string =
+  ## Insert `insertion` immediately BEFORE the sole occurrence of `anchor`.
+  ## Raises when the anchor is missing or repeated: a source-rewriting probe
+  ## that silently failed to mutate measures nothing, and that is the one
+  ## failure mode this shape has which an ordinary test does not.
+  let n = text.count(anchor)
+  if n != 1:
+    raise newException(ValueError,
+      "anchor occurs " & $n & " times, expected exactly 1: " & anchor)
+  let at = text.find(anchor)
+  text[0 ..< at] & insertion & text[at .. ^1]
+
+proc mutatedTypes(tokenArm: string): string =
+  ## The REAL `types.nim` with an `esWritesOnly` member added, arms supplied for
+  ## every OTHER exhaustive `case` over `EvidenceScope` in the file, and
+  ## `tokenArm` (possibly empty) supplied for `evidenceScopeToken`.
+  ##
+  ## Filling those other two cases is what makes the measurement ATTRIBUTABLE: a
+  ## new member reddens them too, so without their arms every probe below would
+  ## fail and none of the failures would be about the token.
+  result = readFile(TypesSource)
+  result = spliceOnce(result, EnumAnchor,
+    "    esWritesOnly      ## PROBE-ONLY, never a member of the shipped enum.\n")
+  result = spliceOnce(result, ScopeCaseAnchor, "  of esWritesOnly: true\n")
+  result = spliceOnce(result, CoversCaseAnchor, "  of esWritesOnly: false\n")
+  if tokenArm.len > 0:
+    result = spliceOnce(result, TokenCaseAnchor, tokenArm)
+
+proc mutatedCategories(tokenArm: string): string =
+  ## The REAL `types.nim` with an `ecProvenance` member added to `EventCategory`
+  ## and `tokenArm` (possibly empty) supplied for `interestToken`.
+  ##
+  ## Shorter than `mutatedTypes` for a reason worth stating: NOTHING ELSE in
+  ## this file switches exhaustively on `EventCategory`, so a new category costs
+  ## exactly one arm. That is also why the axis was unpoliced for two rounds —
+  ## there was no compiler complaint to prompt anyone.
+  result = readFile(TypesSource)
+  result = spliceOnce(result, CategoryEnumAnchor,
+    "    ecProvenance     ## PROBE-ONLY, never a member of the shipped enum.\n")
+  if tokenArm.len > 0:
+    result = spliceOnce(result, CategoryTokenAnchor, tokenArm)
+
+proc compileAgainstTypes(name, typesText: string):
+                        tuple[output: string; code: int] =
+  ## Compile `ProbeProgram` against a COPY of `types.nim` — never against the
+  ## repo's own `src`, so a probe can neither perturb the tree the rest of the
+  ## suite runs from nor be rescued by it. The probe lives OUTSIDE the repo so
+  ## this repo's `config.nims` (which would put the real `src` on the path)
+  ## never applies, and it carries its own `--nimcache` because sibling io-mon
+  ## checkouts otherwise share one under `~/.cache/nim`.
+  let dir = getTempDir() /
+    ("io-mon-evidence-token-probe-" & $getCurrentProcessId() & "-" & name)
+  removeDir(dir)
+  createDir(dir / "io_mon")
+  writeFile(dir / "io_mon" / "types.nim", typesText)
+  let main = dir / "probe.nim"
+  writeFile(main, ProbeProgram)
+  let p = startProcess(getEnv("NIM", "nim"), workingDir = dir, args = @[
+      "c", "--hints:off", "--warnings:off", "--compileOnly",
+      "--nimcache:" & (dir / "cache"), "--path:" & dir, main],
+    options = {poStdErrToStdOut, poUsePath})
+  result = (p.outputStream.readAll(), p.waitForExit())
+  p.close()
+  removeDir(dir)
+
+suite "io-mon evidence scope: a scope with no wire token cannot reach a depfile (DA-1i)":
+
+  test "t_the_unmutated_codec_compiles":
+    # NEGATIVE CONTROL 1. Without it, both refusals below would also "pass"
+    # against a probe that fails to compile for some unrelated reason — the
+    # standard way a compile-refusal test becomes a test that cannot fail.
+    let (output, code) = compileAgainstTypes("control", readFile(TypesSource))
+    checkpoint("control: exit " & $code & "\n" & output)
+    check code == 0
+
+  test "t_a_new_scope_given_a_real_token_compiles":
+    # NEGATIVE CONTROL 2, and the sharper one: ADDING A MEMBER IS NOT ITSELF
+    # REFUSED. What the two cases below refuse is adding one without a token,
+    # so their refusals are attributable to the token and not to the member.
+    let (output, code) = compileAgainstTypes("with-token",
+      mutatedTypes("  of esWritesOnly: \"writes-only\"\n"))
+    checkpoint("with-token: exit " & $code & "\n" & output)
+    check code == 0
+
+  test "t_a_new_scope_with_no_token_arm_does_not_compile":
+    # ARM 1 — the exhaustive `case`. A member simply FORGOTTEN in the codec is a
+    # compile error, where the array of pairs could only answer `""` and let the
+    # capture proceed to a depfile nobody accepts.
+    let (output, code) = compileAgainstTypes("no-arm", mutatedTypes(""))
+    checkpoint("no-arm: exit " & $code & "\n" & output)
+    check code != 0
+    # …and it must fail FOR THE STATED REASON, naming the member.
+    check "not all cases are covered" in output
+    check "esWritesOnly" in output
+
+  test "t_a_new_scope_whose_token_is_empty_does_not_compile":
+    # ARM 2 — the `static:` coupling in `types.nim`, and the reason the
+    # exhaustive `case` alone is NOT enough: its author can satisfy the compiler
+    # with `of esWritesOnly: ""` and land straight back in the original defect
+    # with the whole suite green. This is the exact mutation that shipped the
+    # unacceptable depfile.
+    let (output, code) = compileAgainstTypes("empty-token",
+      mutatedTypes("  of esWritesOnly: \"\"\n"))
+    checkpoint("empty-token: exit " & $code & "\n" & output)
+    check code != 0
+    check "non-empty wire token" in output
+    check "esWritesOnly" in output
+
+  test "t_a_new_scope_whose_token_cannot_survive_the_wire_does_not_compile":
+    # ARM 3, and the one that shows "non-empty" was never the property. MEASURED
+    # on the real bytes with only ARMS 1 and 2 in place: `writes;only` compiled,
+    # satisfied the emptiness assertion, ROUND-TRIPPED IN MEMORY (so the runtime
+    # enum case above stayed green), the whole portable suite stayed green — and
+    # `mergeFragments` wrote a depfile that reads back `esUnrecognized` with the
+    # residual named `writes`, because the `evidence=` stamp rides inside a
+    # `;`-joined record detail and the decoder splits on `;` before `=`. That is
+    # the original defect with a WRONG name attached instead of no name.
+    let (output, code) = compileAgainstTypes("unsafe-token",
+      mutatedTypes("  of esWritesOnly: \"writes;only\"\n"))
+    checkpoint("unsafe-token: exit " & $code & "\n" & output)
+    check code != 0
+    check "is not wire-safe" in output
+    check "esWritesOnly" in output
+
+  test "t_a_new_scope_reusing_an_existing_token_does_not_compile":
+    # ARM 4 — the highest-severity shape, and the only one whose failure
+    # direction is ACCEPT. A duplicate token decodes to the FIRST member holding
+    # it, so a capture taken under the new scope reads back as `esFull` and a
+    # full-evidence consumer accepts a narrowed capture: this milestone's
+    # cardinal defect, reached without a single test going red before this arm.
+    let (output, code) = compileAgainstTypes("duplicate-token",
+      mutatedTypes("  of esWritesOnly: \"full\"\n"))
+    checkpoint("duplicate-token: exit " & $code & "\n" & output)
+    check code != 0
+    check "decodes back to" in output
+    check "esWritesOnly" in output
+
+suite "io-mon interest: a category with no wire token cannot reach a depfile (DA-1j)":
+  # THE SAME CONSTRUCTION ON THE OTHER AXIS. `interestTokenPairs` was a plain
+  # array while `evidenceScopeToken` was being made exhaustive, which left it as
+  # the LAST unpoliced token table of the two — and "now the only one" is how
+  # these persist. The harm is genuinely lesser (a missing token can only shrink
+  # what a stamp declares, and `observedInterestCovers` is a subset test, so
+  # every consequence points at rejection rather than at a false accept), which
+  # is the argument for closing it cheaply rather than for leaving it open.
+
+  test "t_the_unmutated_interest_codec_compiles":
+    # NEGATIVE CONTROL 1 for this axis. Shares `ProbeProgram`, which now touches
+    # both directions of BOTH codecs.
+    let (output, code) = compileAgainstTypes("cat-control", readFile(TypesSource))
+    checkpoint("cat-control: exit " & $code & "\n" & output)
+    check code == 0
+
+  test "t_a_new_category_given_a_real_token_compiles":
+    # NEGATIVE CONTROL 2: adding a category is not itself refused.
+    let (output, code) = compileAgainstTypes("cat-with-token",
+      mutatedCategories("  of ecProvenance: \"provenance\"\n"))
+    checkpoint("cat-with-token: exit " & $code & "\n" & output)
+    check code == 0
+
+  test "t_a_new_category_with_no_token_arm_does_not_compile":
+    let (output, code) = compileAgainstTypes("cat-no-arm", mutatedCategories(""))
+    checkpoint("cat-no-arm: exit " & $code & "\n" & output)
+    check code != 0
+    check "not all cases are covered" in output
+    check "ecProvenance" in output
+
+  test "t_a_new_category_whose_token_is_empty_does_not_compile":
+    let (output, code) = compileAgainstTypes("cat-empty-token",
+      mutatedCategories("  of ecProvenance: \"\"\n"))
+    checkpoint("cat-empty-token: exit " & $code & "\n" & output)
+    check code != 0
+    check "needs a wire token" in output
+    check "ecProvenance" in output
+
+  test "t_a_new_category_whose_token_cannot_survive_the_wire_does_not_compile":
+    # The interest value is COMMA-joined, so this axis has one more separator to
+    # exclude than the evidence axis does.
+    let (output, code) = compileAgainstTypes("cat-unsafe-token",
+      mutatedCategories("  of ecProvenance: \"prov,enance\"\n"))
+    checkpoint("cat-unsafe-token: exit " & $code & "\n" & output)
+    check code != 0
+    check "is not wire-safe" in output
+    check "ecProvenance" in output

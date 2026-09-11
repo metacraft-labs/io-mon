@@ -2925,6 +2925,30 @@ proc mergeFragments*(fragmentDir, outputPath: string;
   # spelling (`evidenceScopeToken` returns ""), so the guard excludes it too
   # rather than writing an empty `evidence=` that would read back as unevaluable.
   #
+  # THE GUARD TESTS THE VALUE WHILE THE HAZARD IS THE TOKEN'S EMPTINESS, and
+  # those are the SAME statement rather than an approximation of one, because
+  # `types.nim` makes them so: `evidenceScopeToken` is an exhaustive `case` and
+  # the `static:` block below `parseEvidenceScopeToken` requires every arm but
+  # `esUnrecognized`'s to be a token that ROUND-TRIPS THROUGH THE WIRE — not
+  # merely a non-empty one. That distinction was MEASURED here: `writes;only`
+  # is non-empty and round-trips in memory, and it still arrived at this line
+  # and wrote a stamp the decoder reads back as `esUnrecognized` named `writes`.
+  # A future member the codec cannot spell is therefore a COMPILE error and can
+  # never arrive here — which is the only reason this guard may go on naming
+  # values.
+  #
+  # BE PRECISE ABOUT THE ALTERNATIVE, because the obvious summary of it is
+  # false in one direction. WITHOUT that coupling, testing the token instead was
+  # MEASURED to be strictly worse: the stamp is silently omitted, the capture
+  # reads as NOT STATED, `effectiveObservedEvidenceScope` defines that as
+  # `esFull`, and a full-evidence consumer then ACCEPTS a narrowed capture —
+  # this milestone's own cardinal defect shape, so there was no safe default
+  # here at all. WITH it the two spellings are provably equivalent (empty token
+  # ⟺ `esUnrecognized`), and substituting one for the other reddens nothing —
+  # also measured. The equivalence is the fix; neither spelling of this line is
+  # load-bearing by itself, and a reader who changes it should change the
+  # `static:` block's mind first.
+  #
   # GRADED END TO END: `tests/posix/test_io_mon_cli_evidence_scope.nim` runs the
   # real CLI twice on one command and compares the two depfiles' stamps against
   # what was asked for on the command line. Deleting this block reddens it.

@@ -930,23 +930,42 @@ func recordInEvidenceScope*(scope: EvidenceScope;
   of esFull, esUnrecognized: true
   of esReadsOnly: not recordIsFailedExistenceLookup(record)
 
-const
-  # Wire tokens for `REPRO_MONITOR_EVIDENCE` (the env channel to the shim) and
-  # for the `evidence=` stamp on the backend-profile record. ONE vocabulary for
-  # both channels and one codec, exactly as `interestTokenPairs` is for the
-  # interest axis. `esUnrecognized` is deliberately absent: it is what a token
-  # NOT in this table parses to, so giving it a token of its own would make it
-  # producible and destroy the distinction it exists to draw.
-  evidenceScopeTokenPairs = [
-    (esFull, "full"), (esReadsOnly, "reads-only")]
-
 func evidenceScopeToken*(scope: EvidenceScope): string =
-  ## Encode a scope as its wire token. `esUnrecognized` has no spelling — it is
-  ## a READING, not a scope — so it encodes as the empty string, and every write
-  ## site guards against handing it here.
-  for (value, token) in evidenceScopeTokenPairs:
-    if value == scope: return token
-  ""
+  ## Encode a scope as its wire token — for `REPRO_MONITOR_EVIDENCE` (the env
+  ## channel to the shim) and for the `evidence=` stamp on the backend-profile
+  ## record. ONE vocabulary for both channels and one codec, exactly as
+  ## `interestToken` is for the interest axis.
+  ##
+  ## AN EXHAUSTIVE `case`, NOT A TABLE OF PAIRS, and the difference is not
+  ## taste. Every other consumer of `EvidenceScope` — `recordInEvidenceScope`,
+  ## `evidenceScopeCovers` — is a `case` the compiler polices; an array is
+  ## policed by nothing. MEASURED on the array, end to end and on real bytes: a
+  ## new member added and given everything the compiler and the suite asked for
+  ## (an arm in each of those two `case`s, a row in the relation test) compiled
+  ## clean, and `mergeFragments` then wrote a bare `;evidence=` for a capture
+  ## taken under it — a depfile that reads back STATED and UNEVALUABLE and is
+  ## refused by EVERY consumer, including one asking for exactly that scope,
+  ## with the residual unnameable. A forgotten token is now a compile error
+  ## here instead of a depfile nobody accepts.
+  ##
+  ## `esUnrecognized` has no spelling — it is a READING, not a scope — so it
+  ## encodes as the empty string, and every write site guards against handing it
+  ## here. It is the ONLY member that may, and the `static:` block below
+  ## `parseEvidenceScopeToken` holds that over the whole enum. That is what lets
+  ## `mergeFragments` keep testing the VALUE while the hazard it guards against
+  ## is the TOKEN's emptiness: after this, those two are the same statement
+  ## rather than two that can drift apart.
+  ##
+  ## NON-EMPTY IS NOT THE PROPERTY, THE ROUND TRIP IS. `writes;only` is
+  ## non-empty AND round-trips in memory, and while only those two things were
+  ## checked it reached the depfile as `esUnrecognized` named `writes` — the
+  ## stamp rides inside a `;`-joined record detail. The block below asserts the
+  ## whole trip, which is why it lives after the decoder rather than here, and
+  ## why that token no longer compiles.
+  case scope
+  of esFull: "full"
+  of esReadsOnly: "reads-only"
+  of esUnrecognized: ""
 
 func parseEvidenceScopeToken*(s: string): EvidenceScope =
   ## Decode a wire token. Empty/absent ⇒ `esFull` — an absent
@@ -958,9 +977,77 @@ func parseEvidenceScopeToken*(s: string): EvidenceScope =
   ## a future narrowing reject instead of silently passing as full.
   let trimmed = s.strip()
   if trimmed.len == 0: return esFull
-  for (value, token) in evidenceScopeTokenPairs:
-    if trimmed == token: return value
+  # DERIVED from `evidenceScopeToken`, never a second table: one direction of a
+  # codec that can be forgotten separately from the other is two tables that
+  # drift, and the drift is silent — a scope that writes a stamp nothing can
+  # read back. `esUnrecognized`'s empty token cannot match here, because
+  # `trimmed` is non-empty by the line above.
+  for scope in EvidenceScope:
+    if evidenceScopeToken(scope) == trimmed: return scope
   esUnrecognized
+
+static:
+  # THE OTHER HALF OF THE CONSTRUCTION, checked at COMPILE TIME over the whole
+  # enum. The `case` in `evidenceScopeToken` forces a new member to be GIVEN an
+  # arm; this forces the arm to be a token that SURVIVES THE WIRE — otherwise
+  # the compiler is satisfied by `of esWritesOnly: ""` and the defect is back
+  # with every test green.
+  #
+  # It sits BELOW `parseEvidenceScopeToken` because the property it holds is a
+  # ROUND TRIP, not a length. Three tokens that satisfy "non-empty" and still
+  # ship a depfile nobody can read were MEASURED on the real bytes:
+  #
+  #   `writes;only`  the `evidence=` stamp rides inside a `;`-joined record
+  #                  detail, so the decoder splits on `;` FIRST: the capture
+  #                  reads back `esUnrecognized` with the residual named
+  #                  `writes` — universally rejected, and MISnamed, which is
+  #                  worse than the empty token this block was written for
+  #                  because the operator is told a scope that does not exist.
+  #                  It passes a length check AND an in-memory round trip, so
+  #                  neither the old assertion nor the runtime enum case below
+  #                  in the test file could see it.
+  #   ` `            the decoder `strip()`s, so the token vanishes on the way
+  #                  back and the capture reads as `esUnrecognized`.
+  #   `full`         a DUPLICATE decodes to the FIRST member holding it, so the
+  #                  narrowed capture reads back as `esFull` and a full-evidence
+  #                  consumer ACCEPTS it — this milestone's cardinal defect.
+  #
+  # `esUnrecognized` is exempt and must stay exempt: it is a READING of someone
+  # else's token, not a scope this build can ask for, and giving it a spelling
+  # would make it producible and destroy the distinction it exists to draw.
+  #
+  # WHY THIS IS ALSO WHAT LETS `mergeFragments` GO ON NAMING VALUES. Its guard
+  # tests `!= esFull and != esUnrecognized` while the hazard it names is the
+  # TOKEN's emptiness. The first assertion below makes those the SAME predicate
+  # over the whole enum (empty token ⟺ `esUnrecognized`), so substituting one
+  # spelling for the other reddens nothing — measured. WITHOUT it they differ on
+  # exactly the tokenless member, and in OPPOSITE directions: the value test
+  # stamps a bare `;evidence=` (rejected by everyone), the token test omits the
+  # stamp so the capture reads as NOT STATED, which
+  # `effectiveObservedEvidenceScope` defines as `esFull` and a full-evidence
+  # consumer ACCEPTS. There is no safe default at the write site in either
+  # spelling; the coupling is the fix, and refusing to compile is the only
+  # answer that neither ships an unreadable depfile nor overstates one.
+  #
+  # Graded by `tests/portable/test_io_mon_evidence_scope.nim`, which mutates a
+  # COPY of this file and reads the real compiler's exit code — the only
+  # instrument that can see a property about a member that does not exist yet.
+  for scope in EvidenceScope:
+    let token = evidenceScopeToken(scope)
+    doAssert (token.len == 0) == (scope == esUnrecognized),
+      "EvidenceScope." & $scope & " needs a non-empty wire token: only " &
+      "esUnrecognized may be unspellable. See evidenceScopeToken."
+    if token.len > 0:
+      doAssert token == token.strip() and ';' notin token,
+        "EvidenceScope." & $scope & "'s wire token `" & token &
+        "` is not wire-safe: the `evidence=` stamp rides inside a `;`-joined " &
+        "record detail and the decoder strips, so a token carrying `;` or " &
+        "outer whitespace cannot be read back. See evidenceScopeToken."
+      doAssert parseEvidenceScopeToken(token) == scope,
+        "EvidenceScope." & $scope & "'s wire token `" & token &
+        "` decodes back to " & $parseEvidenceScopeToken(token) &
+        ": two members share a wire token, or the codec's two directions " &
+        "have drifted. See evidenceScopeToken."
 
 func statesUnevaluableEvidenceScope*(dep: MonitorDepFile): bool =
   ## The capture STATED an evidence scope and this build could not name it. The
@@ -1008,11 +1095,37 @@ func observedEvidenceScopeCovers*(dep: MonitorDepFile;
   ## has to rediscover the not-stated / unrecognised distinction for itself.
   evidenceScopeCovers(effectiveObservedEvidenceScope(dep), required)
 
-const
-  # Wire tokens for `REPRO_MONITOR_INTEREST` (the env channel to the shim).
-  interestTokenPairs = [
-    (ecFileDeps, "file"), (ecProcessTree, "proc"), (ecLibraryLoads, "lib"),
-    (ecNonDeterminism, "nondet"), (ecIpc, "ipc")]
+func interestToken*(category: EventCategory): string =
+  ## Encode one event category as its wire token, for `REPRO_MONITOR_INTEREST`
+  ## (the env channel to the shim) and for the `interest=` stamp on the
+  ## backend-profile record. ONE vocabulary for both channels and one codec.
+  ##
+  ## AN EXHAUSTIVE `case`, NOT A TABLE OF PAIRS, for the reason
+  ## `evidenceScopeToken` is one — and this axis is where the weakness was
+  ## FOUND FIRST and left open longest. An array of `(category, token)` pairs is
+  ## policed by nothing: a category added without a row compiles, and
+  ## `interestToTokens` then silently omits it from every stamp it writes.
+  ##
+  ## The harm is real but strictly LESSER than the evidence axis's, which is why
+  ## it survived two rounds — and naming the difference is the point, because
+  ## "lesser" is not "absent". A missing token can only SHRINK what a stamp
+  ## declares, and `observedInterestCovers` is a subset test, so every
+  ## consequence points at REJECTION: a capture that really did observe the new
+  ## category is read as though it had not, and a consumer needing it recaptures
+  ## for nothing. It cannot produce the opposite mistake, because a category
+  ## this build cannot spell is also one it cannot be asked for. On the evidence
+  ## axis the same omission produces a depfile every consumer refuses, or (with
+  ## a duplicated token) one a full-evidence consumer wrongly ACCEPTS.
+  ##
+  ## Closed here with the identical construction, and the enum's declaration
+  ## order is the token order the array had, so the encoded string is unchanged
+  ## byte for byte.
+  case category
+  of ecFileDeps: "file"
+  of ecProcessTree: "proc"
+  of ecLibraryLoads: "lib"
+  of ecNonDeterminism: "nondet"
+  of ecIpc: "ipc"
 
 func interestToTokens*(interest: set[EventCategory]): string =
   ## Encode an interest set as the comma-separated `REPRO_MONITOR_INTEREST`
@@ -1020,20 +1133,51 @@ func interestToTokens*(interest: set[EventCategory]): string =
   ## reader cannot mistake "all" for "unset").
   let normalized = normalizeInterest(interest)
   var parts: seq[string] = @[]
-  for (cat, tok) in interestTokenPairs:
-    if cat in normalized: parts.add(tok)
+  for cat in EventCategory:
+    if cat in normalized: parts.add(interestToken(cat))
   parts.join(",")
 
 func parseInterestTokens*(s: string): set[EventCategory] =
   ## Decode a `REPRO_MONITOR_INTEREST` value. Empty/absent -> `FullInterest`
   ## (back-compat). Unknown tokens are ignored (forward-compat: an older shim
   ## treats a new category as "not mine"; the host filter is the source of truth).
+  ##
+  ## DERIVED from `interestToken`, never a second table — one direction of a
+  ## codec that can be forgotten separately from the other is two tables that
+  ## drift, and the drift is silent.
   let trimmed = s.strip()
   if trimmed.len == 0: return FullInterest
   for raw in trimmed.split(','):
     let tok = raw.strip()
-    for (cat, known) in interestTokenPairs:
-      if tok == known: result.incl(cat)
+    for cat in EventCategory:
+      if tok == interestToken(cat): result.incl(cat)
+
+static:
+  # The interest axis's copy of the evidence axis's construction, and it needs
+  # no sentinel exemption: EVERY `EventCategory` is a category a consumer can
+  # ask for, so every one of them must be spellable.
+  #
+  # Same three failure shapes, same reasons (see `evidenceScopeToken`'s block),
+  # with one extra separator to exclude: the interest value is COMMA-joined, so
+  # a token carrying a comma decodes as two tokens neither of which is a
+  # category — the exact shape `writes;only` has on the other axis.
+  for category in EventCategory:
+    let token = interestToken(category)
+    doAssert token.len > 0,
+      "EventCategory." & $category & " needs a wire token: without one it is " &
+      "silently absent from every `interest=` stamp this build writes, and a " &
+      "capture that DID observe it reads as one that did not. " &
+      "See interestToken."
+    doAssert token == token.strip() and ',' notin token and ';' notin token,
+      "EventCategory." & $category & "'s wire token `" & token &
+      "` is not wire-safe: the value is comma-joined, the `interest=` stamp " &
+      "rides inside a `;`-joined record detail, and the decoder strips. " &
+      "See interestToken."
+    doAssert parseInterestTokens(token) == {category},
+      "EventCategory." & $category & "'s wire token `" & token &
+      "` decodes back to " & $parseInterestTokens(token) &
+      ": two categories share a wire token, or the codec's two directions " &
+      "have drifted. See interestToken."
 
 func statesUnevaluableInterest*(dep: MonitorDepFile): bool =
   ## The capture STATED a scope, and this build could not name a single category

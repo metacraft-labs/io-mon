@@ -977,13 +977,32 @@ proc parseRun(args: seq[string]): ParsedFsSnoopCommand =
       let streamValue = splitFlagValue(arg, "--event-stream")
       let interestValue = splitFlagValue(arg, "--interest")
       let evidenceValue = splitFlagValue(arg, "--evidence")
-      # PRESENCE, not a non-empty value. `splitFlagValue` cannot tell
-      # `--evidence=` (the flag written with no scope) from an argument that is
-      # not `--evidence` at all, and dispatching on `evidenceValue.len > 0`
-      # sent the empty form to the catch-all — where it was refused as an
-      # "unsupported fs-snoop argument", telling the operator the flag does not
-      # exist when only its value was missing. `parseEvidenceScopeFlag` owns the
-      # empty case and answers in the scope vocabulary.
+      # PRESENCE, not a non-empty value — for BOTH flags whose parser gives the
+      # empty value a MEANING of its own. `splitFlagValue` cannot tell
+      # `--interest=` / `--evidence=` (the flag written with no value) from an
+      # argument that is not that flag at all, so dispatching on
+      # `value.len > 0` sends the empty form to the catch-all, where it is
+      # refused as an "unsupported fs-snoop argument" — telling the operator the
+      # flag does not exist when only its value was missing.
+      #
+      # The arm decides only WHO ANSWERS; the two flags then answer differently,
+      # and that is the point rather than an inconsistency.
+      # `parseInterestFlag("")` widens to `FullInterest` (an empty value means
+      # the same as an absent flag — the documented back-compat rule, and
+      # `--interest` names a SET, of which the empty one is a legal value);
+      # `parseEvidenceScopeFlag("")` refuses in the scope vocabulary (there is
+      # no empty scope). MEASURED at the binary before this: `--interest ""`
+      # exited 0 and stamped full interest while `--interest=` exited 1 with
+      # "unsupported fs-snoop argument: --interest=", so one flag had two
+      # meanings decided by which spelling was typed — and the rule the graded
+      # case is named after held for only one of them.
+      #
+      # The other value-bearing flags here (`--depfile`, `--events`,
+      # `--format`, `--event-stream`, `--capture-stdio-path`) are deliberately
+      # NOT presence-dispatched: an empty path or an empty output mode is not a
+      # value their parsers give a meaning to, so there is nothing for them to
+      # answer and the generic refusal is the end of the matter.
+      let interestGiven = arg.startsWith("--interest=")
       let evidenceGiven = arg.startsWith("--evidence=")
       let stdioPathValue = splitFlagValue(arg, "--capture-stdio-path")
       if depValue.len > 0:
@@ -995,7 +1014,7 @@ proc parseRun(args: seq[string]): ParsedFsSnoopCommand =
         result.request.streamMode = parseOutputMode(formatValue)
       elif streamValue.len > 0:
         result.request.eventStreamPath = streamValue
-      elif interestValue.len > 0:
+      elif interestGiven:
         result.request.interest = parseInterestFlag(interestValue)
       elif evidenceGiven:
         result.request.evidenceScope = parseEvidenceScopeFlag(evidenceValue)
