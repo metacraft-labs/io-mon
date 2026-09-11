@@ -20,7 +20,7 @@ when not defined(windows):
 # the codetracer recorder when co-resident) can register against the
 # same chain at their own priorities without colliding with the shim.
 
-import std/[exitprocs, locks, os, strutils, tables]
+import std/[atomics, exitprocs, locks, os, strutils, tables]
 from io_mon/paths import extendedPath
 
 import io_mon/types
@@ -256,6 +256,10 @@ proc GetEnvironmentStringsWRaw(): LPWSTR
   {.importc: "GetEnvironmentStringsW", stdcall, dynlib: "kernel32".}
 proc FreeEnvironmentStringsW(penv: LPWSTR): BOOL
   {.importc, stdcall, dynlib: "kernel32".}
+proc GetEnvironmentStringsARaw(): LPSTR
+  {.importc: "GetEnvironmentStrings", stdcall, dynlib: "kernel32".}
+proc FreeEnvironmentStringsA(penv: LPSTR): BOOL
+  {.importc, stdcall, dynlib: "kernel32".}
 
 # --- Grandchild injection: pull the shim into every CreateProcess descendant.
 # Without this, descendants of a shim-loaded process spawn naked — their
@@ -270,6 +274,7 @@ proc FreeEnvironmentStringsW(penv: LPWSTR): BOOL
 
 const
   CREATE_SUSPENDED = 0x00000004'u32
+  CREATE_UNICODE_ENVIRONMENT = 0x00000400'u32
   MEM_COMMIT = 0x00001000'u32
   MEM_RESERVE = 0x00002000'u32
   MEM_RELEASE = 0x00008000'u32
@@ -405,6 +410,17 @@ proc ResumeThread(hThread: HANDLE): DWORD
   {.importc, stdcall, dynlib: "kernel32".}
 proc CloseHandle(hObject: HANDLE): BOOL
   {.importc, stdcall, dynlib: "kernel32".}
+proc GetProcessId(hProcess: HANDLE): DWORD
+  {.importc, stdcall, dynlib: "kernel32".}
+# Fiber-local storage is Windows' thread-exit callback. `FlsAlloc` takes a
+# destructor that the OS runs ON THE EXITING THREAD for every thread whose
+# slot value is non-NULL -- the exact contract `pthread_key_create` gives the
+# Linux shim, and the only one that works for threads this shim did not
+# create. See `armThreadExitFlush`.
+proc FlsAlloc(callback: proc(p: pointer) {.stdcall.}): DWORD
+  {.importc, stdcall, dynlib: "kernel32".}
+proc FlsSetValue(dwFlsIndex: DWORD; lpFlsData: pointer): BOOL
+  {.importc, stdcall, dynlib: "kernel32".}
 
 # --- Hook function pointer types (mirror the Win32 API signatures) ---------
 
@@ -476,6 +492,10 @@ type
                             lpStartupInfo: ptr STARTUPINFOA,
                             lpProcessInformation: ptr PROCESS_INFORMATION): BOOL
                             {.stdcall, raises: [].}
+
+  NtTerminateProcessProc = proc(ProcessHandle: HANDLE;
+                                ExitStatus: int32): NTSTATUS
+                                {.stdcall, raises: [].}
 
   # M73 Phase 5 — extended hook surface ----------------------------------
 
@@ -763,6 +783,7 @@ var
   origGetFileAttributesA: GetFileAttributesAProc
   origCreateProcessW: CreateProcessWProc
   origCreateProcessA: CreateProcessAProc
+  origNtTerminateProcess: NtTerminateProcessProc
   # M73 Phase 5 — extended hook surface.
   origDeleteFileW: DeleteFileWProc
   origDeleteFileA: DeleteFileAProc
@@ -1111,9 +1132,60 @@ proc baseRecord(kind: MonitorRecordKind;
     threadId: uint64(GetCurrentThreadId()),
     probeResult: prUnknown)
 
+# ---------------------------------------------------------------------------
+# THREAD-EXIT FLUSH -- the Windows half of DEP-FLUSH-3
+# ---------------------------------------------------------------------------
+#
+# Each recording thread owns a `fragmentSlot` THREADVAR and registers its
+# ADDRESS in a process-global registry, so a process-exit sweep can reach
+# every thread's buffered tail. On Linux a `pthread_key_create` destructor
+# flushes and UNREGISTERS a thread's slot when that thread exits, which is
+# what makes the registry safe to walk: `flushAllRegisteredSlots` says in as
+# many words that "a slot whose owning thread already exited ... is no longer
+# registered".
+#
+# On Windows there was no such destructor, so that sentence was FALSE HERE.
+# An exited thread's entry kept pointing into TLS the OS had already freed,
+# and the first sweep to walk it read a `File` out of released memory and
+# took the process down mid-exit. MEASURED: an injected `grep.exe` whose
+# injector init thread had exited entered the sweep with `batchLen=917` and
+# never came out of it -- no completion, no exception, nothing after that
+# line.
+#
+# `FlsAlloc` is the Windows equivalent and works for foreign threads (the
+# Cygwin main thread, a CRT worker, the injector's remote init thread), which
+# `DllMain(DLL_THREAD_DETACH)` would also do but only for a DLL that owns its
+# entry point. The slot value is arbitrary and non-NULL: it exists purely so
+# the OS calls the destructor for this thread.
+
+var
+  fragmentFlsIndex {.global.}: Atomic[uint32]
+    ## `FlsAlloc` index + 1, so zero means "not allocated". Set once at init.
+  threadExitFlushArmed {.threadvar.}: bool
+
+proc fragmentSlotThreadExit(p: pointer) {.stdcall.} =
+  ## Runs ON THE EXITING THREAD, before its TLS is released.
+  discard p
+  try:
+    threadExitFlushSlot()
+  except CatchableError, IOError, OSError:
+    discard
+
+proc armThreadExitFlush() {.inline, raises: [].} =
+  ## Give THIS thread a thread-exit flush. One `FlsSetValue` per thread, then
+  ## a threadvar test on every later record.
+  if threadExitFlushArmed:
+    return
+  let idx = fragmentFlsIndex.load()
+  if idx == 0:
+    return
+  threadExitFlushArmed = true
+  discard FlsSetValue(idx - 1, cast[pointer](1))
+
 proc emitRecord(record: MonitorRecord) {.raises: [].} =
   if not initialized or fragmentDir.len == 0 or disabled > 0:
     return
+  armThreadExitFlush()
   withShimMuted:
     try:
       appendFragmentRecord(fragmentDir, record)
@@ -1953,6 +2025,37 @@ proc recordProcessStart() =
     except CatchableError:
       discard
 
+proc emitSpawnRecordDurably(record: MonitorRecord) =
+  ## Emit an ``mrProcessSpawn`` record AND force it to disk immediately.
+  ##
+  ## THE RECORD THAT NAMES A SUBTREE MUST OUTLIVE THE PROCESS THAT NAMED IT.
+  ## Fragment frames are batched per (osPid, threadId) and reach the file only
+  ## on a key change, an explicit flush, or the 100 ms age bound. A spawn
+  ## record is the ONLY evidence that a child existed: the merge pairs it
+  ## against the child's ``mrProcessStart`` and, finding none, synthesises the
+  ## "unmonitored subtree/peer" event-loss that grades the run
+  ## unknown-scope-incomplete. Lose the spawn record and the loss it describes
+  ## becomes SILENT -- the merge has nothing to fail to pair, and the run is
+  ## graded on the reads that happened to survive.
+  ##
+  ## That is not hypothetical. An MSYS2/Cygwin ``sh -c "<one command>"`` execs
+  ## within a few milliseconds of startup, and the Cygwin ``exec`` tears the
+  ## calling process down without running our exit proc, so the whole batch
+  ## -- spawn record included -- is lost inside the age bound. Measured on
+  ## Git-for-Windows' ``sh.exe``: 42 records, not one of them the
+  ## ``CreateProcessW`` that produced the ``bash`` that did all the work.
+  ##
+  ## `recordProcessStart` already flushes for the same reason, one record
+  ## earlier in the same causal chain; this is the other half of that pair.
+  ## Same swallow-and-continue posture: a failed flush costs a record, never
+  ## the host process.
+  emitRecord(record)
+  withShimMuted:
+    try:
+      flushFragmentBatch()
+    except CatchableError:
+      discard
+
 proc recordHookInstallLoss(unhooked: int; names: string) =
   ## Report entry points that landed no hook at all, so the run is graded on
   ## what was actually observable rather than on what happened to be emitted.
@@ -2082,6 +2185,14 @@ proc originalCloseHandle(ctx: var hr.HookContext) {.raises: [].} =
   let hObject = cast[HANDLE](ctx.args[0])
   let r = origCloseHandle(hObject)
   ctx.result = uint64(uint32(r))
+
+proc originalNtTerminateProcess(ctx: var hr.HookContext) {.raises: [].} =
+  if origNtTerminateProcess == nil:
+    ctx.result = uint64(uint32(0xC0000001'i32))
+    return
+  let h = cast[HANDLE](ctx.args[0])
+  let status = int32(uint32(ctx.args[1] and 0xFFFFFFFF'u64))
+  ctx.result = uint64(uint32(origNtTerminateProcess(h, status)))
 
 proc originalGetFileAttributesExW(ctx: var hr.HookContext) {.raises: [].} =
   if origGetFileAttributesExW == nil:
@@ -2895,6 +3006,339 @@ proc injectShimIntoChild(hProcess: HANDLE): bool {.raises: [].} =
     discard CloseHandle(initThread)
   true
 
+# ---------------------------------------------------------------------------
+# THE LAST CHANCE TO MAKE RECORDS DURABLE
+# ---------------------------------------------------------------------------
+#
+# Records are batched per thread and reach the fragment file on a key change,
+# an explicit flush, or a 100 ms age bound. Whatever is still in a batch when
+# the process ends is lost, and the merge accounts each unretired read-tail
+# marker as a `kill-before-flush` event-loss -- an honest grade, but an empty
+# one: the reads it describes are gone.
+#
+# The shim registered an `addExitProc` handler for exactly this. MEASURED on
+# this host: IT NEVER RUNS IN AN MSYS2/CYGWIN PROCESS. A probe wired to the
+# first statement of that handler produced no line for `bash` and none for the
+# `grep` it exec'd, while both processes ended normally -- because a Cygwin
+# runtime does not leave through the CRT's `exit`, and the DLL_PROCESS_DETACH
+# that would drive our atexit chain is not delivered on that path. Everything
+# those two processes did on any thread other than the injector's init thread
+# was therefore dropped: for the injected `grep`, that was every file open and
+# every read it performed.
+#
+# `NtTerminateProcess` is where all of those paths meet. `ExitProcess`
+# (`RtlExitUserProcess`), `TerminateProcess`, and a runtime that terminates
+# itself directly all reach it, and the FIRST call `RtlExitUserProcess` makes
+# -- the one with a NULL handle, meaning "stop every OTHER thread" -- arrives
+# while the whole process is still alive and every lock is still owned by a
+# thread that can release it. That is the last instant at which a cross-thread
+# sweep is safe, and it is the instant this hook uses.
+#
+# ONE SHOT, AND ONLY FOR OUR OWN PROCESS. A second sweep would run after those
+# other threads are gone, when the registry lock may be held by a thread that
+# will never release it -- a deadlock inside the exit path, which is strictly
+# worse than the lost batch it would be trying to save. A `TerminateProcess`
+# aimed at a DIFFERENT process says nothing about ours and is passed straight
+# through.
+#
+# WHAT THIS DOES NOT DO. It does not retire another thread's read-tail
+# sentinel -- only the owning thread can, and it is not running. So a batch
+# rescued here still shows up as a kill-before-flush loss, and the run still
+# grades incomplete. That is deliberate: this change puts strictly more
+# evidence on disk and cannot improve a grade, which is the only direction a
+# change to the capture path is allowed to move.
+
+var terminateFlushDone {.global.}: Atomic[bool]
+
+proc snoopNtTerminateProcess(ctx: var hr.HookContext) {.raises: [].} =
+  let target = cast[HANDLE](ctx.args[0])
+  # NULL  == "every other thread of the current process" (RtlExitUserProcess's
+  #          first call, and the one we want)
+  # -1    == GetCurrentProcess()
+  # other == a handle we cannot cheaply attribute; GetProcessId tells us.
+  let isSelf =
+    target == nil or cast[uint](target) == high(uint) or
+    (GetProcessId(target) == GetCurrentProcessId())
+  if isSelf and initialized and not terminateFlushDone.exchange(true):
+    withShimMuted:
+      try:
+        flushAllRegisteredSlots()
+      except CatchableError, IOError, OSError:
+        discard
+  hr.callNext(ctx)
+
+# ---------------------------------------------------------------------------
+# CARRYING THE MONITORING CONFIGURATION INTO AN EXPLICIT CHILD ENVIRONMENT
+# ---------------------------------------------------------------------------
+#
+# THE HOLE THIS CLOSES. The shim reads where to write its records from the
+# child's WINDOWS ENVIRONMENT BLOCK (`REPRO_MONITOR_FRAGMENT_DIR`). A child
+# spawned with `lpEnvironment = NULL` inherits ours and therefore has it. A
+# child spawned with an EXPLICIT block has whatever the spawner put there --
+# and a spawner that builds its own block does not know about us.
+#
+# The failure is silent in the worst way: injection SUCCEEDS (the DLL maps,
+# `repro_runtime_init` runs and returns 0), `fragmentDir` comes back empty,
+# and every record the child produces is dropped on the floor. The spawn hook
+# reports `ioInjected`, the writer never sees an `mrProcessStart` from the
+# child, and the subtree is graded as an unmonitored loss whose stated cause
+# ("un-injectable spawn child") is not what happened.
+#
+# MEASURED, on this host, `bash -c "grep foo <file>"` under the monitor:
+# `grep.exe` was injected and its init ran and returned 0 -- with
+# `fragEnvLen=0`. Cygwin is the spawner that makes this the common case
+# rather than a corner one: it hands a Cygwin child a MINIMAL Windows block
+# on purpose, because the real POSIX environment travels to that child
+# through its own `child_info` shared block rather than through Win32. Every
+# MSYS-to-MSYS `exec` lands here.
+#
+# WHAT IS COPIED. The `REPRO_MONITOR_*` / `IO_MON_*` variables THIS process
+# was configured with, snapshotted once at init from our own block, and only
+# those the caller's block does not already define -- a spawner that sets one
+# of them deliberately keeps its value. Nothing else about the caller's
+# environment is touched: this ADDS entries, it never edits or removes one.
+
+const monitorEnvPrefixes = ["REPRO_MONITOR_", "IO_MON_"]
+
+var
+  monitorEnvSnapshotW {.global.}: seq[uint16] = @[]
+    ## Our own `REPRO_MONITOR_*` / `IO_MON_*` entries, each NUL-terminated,
+    ## with no block terminator -- ready to splice into a caller's block.
+  monitorEnvSnapshotA {.global.}: string = ""
+    ## The same set as the OS itself renders it in an ANSI block. Taken from
+    ## `GetEnvironmentStringsA` rather than converted from the wide form, so
+    ## no code-page decision is made here.
+  monitorEnvSnapshotReady {.global.}: bool = false
+
+proc hasMonitorEnvPrefix(name: string): bool =
+  for prefix in monitorEnvPrefixes:
+    if name.len >= prefix.len:
+      var match = true
+      for i in 0 ..< prefix.len:
+        if name[i] != prefix[i]:
+          match = false
+          break
+      if match:
+        return true
+  false
+
+proc captureMonitorEnvSnapshot() =
+  ## Snapshot the monitoring configuration out of our own environment block.
+  ## Called once from `repro_monitor_shim_init`, i.e. before any hook can
+  ## fire, so the spawn path never has to call the (hooked) environment APIs
+  ## itself.
+  if monitorEnvSnapshotReady:
+    return
+  monitorEnvSnapshotReady = true
+  const MaxBlockCodeUnits = 1 shl 20
+  var blockW: LPWSTR = nil
+  withShimMuted:
+    blockW = GetEnvironmentStringsWRaw()
+  if blockW != nil:
+    let p = cast[ptr UncheckedArray[uint16]](blockW)
+    var i = 0
+    while i < MaxBlockCodeUnits and p[i] != 0'u16:
+      var entryLen = 0
+      while i + entryLen < MaxBlockCodeUnits and p[i + entryLen] != 0'u16:
+        inc entryLen
+      var eq = -1
+      for j in 1 ..< entryLen:
+        if p[i + j] == uint16(ord('=')):
+          eq = j
+          break
+      if eq > 0:
+        var n = newStringOfCap(eq)
+        for j in 0 ..< eq:
+          n.add(chr(int(p[i + j]) and 0xFF))
+        if hasMonitorEnvPrefix(n):
+          for j in 0 ..< entryLen:
+            monitorEnvSnapshotW.add(p[i + j])
+          monitorEnvSnapshotW.add(0'u16)
+      i += entryLen + 1
+    withShimMuted:
+      discard FreeEnvironmentStringsW(blockW)
+  var blockA: LPSTR = nil
+  withShimMuted:
+    blockA = GetEnvironmentStringsARaw()
+  if blockA != nil:
+    let p = cast[ptr UncheckedArray[char]](blockA)
+    var i = 0
+    while i < MaxBlockCodeUnits and p[i] != char(0):
+      var entryLen = 0
+      while i + entryLen < MaxBlockCodeUnits and p[i + entryLen] != char(0):
+        inc entryLen
+      var eq = -1
+      for j in 1 ..< entryLen:
+        if p[i + j] == '=':
+          eq = j
+          break
+      if eq > 0:
+        var n = newStringOfCap(eq)
+        for j in 0 ..< eq:
+          n.add(p[i + j])
+        if hasMonitorEnvPrefix(n):
+          for j in 0 ..< entryLen:
+            monitorEnvSnapshotA.add(p[i + j])
+          monitorEnvSnapshotA.add(char(0))
+      i += entryLen + 1
+    withShimMuted:
+      discard FreeEnvironmentStringsA(blockA)
+
+proc envBlockLenW(src: ptr UncheckedArray[uint16]; limit: int): int =
+  ## Length in code units of a double-NUL-terminated wide block, excluding
+  ## the final terminator. `limit` bounds a corrupted block to a truncation
+  ## rather than a walk off the end of the mapping.
+  result = 0
+  while result < limit and src[result] != 0'u16:
+    var entryLen = 0
+    while result + entryLen < limit and src[result + entryLen] != 0'u16:
+      inc entryLen
+    result += entryLen + 1
+
+proc entryNameDefinedW(blk: ptr UncheckedArray[uint16]; limit: int;
+                       snapshotStart, nameLen: int): bool =
+  ## Is the name of our snapshot entry at `snapshotStart` already defined in
+  ## the caller's wide block? Compared case-insensitively, which is what the
+  ## Windows environment itself is.
+  var i = 0
+  while i < limit and blk[i] != 0'u16:
+    var entryLen = 0
+    while i + entryLen < limit and blk[i + entryLen] != 0'u16:
+      inc entryLen
+    var eq = -1
+    for j in 1 ..< entryLen:
+      if blk[i + j] == uint16(ord('=')):
+        eq = j
+        break
+    if eq == nameLen:
+      var same = true
+      for j in 0 ..< eq:
+        var a = blk[i + j]
+        var b = monitorEnvSnapshotW[snapshotStart + j]
+        if a >= uint16(ord('a')) and a <= uint16(ord('z')): a = a - 32'u16
+        if b >= uint16(ord('a')) and b <= uint16(ord('z')): b = b - 32'u16
+        if a != b:
+          same = false
+          break
+      if same:
+        return true
+    i += entryLen + 1
+  false
+
+proc environmentWithMonitorConfigW(lpEnvironment: LPVOID;
+                                   buf: var seq[uint16]): LPVOID =
+  ## Return a wide block equal to the caller's plus whichever monitoring
+  ## entries it is missing, held in `buf`, or `nil` when nothing needs
+  ## adding. `buf` must outlive the `CreateProcess` call.
+  if lpEnvironment == nil or monitorEnvSnapshotW.len == 0:
+    return nil
+  const MaxBlockCodeUnits = 1 shl 20
+  let src = cast[ptr UncheckedArray[uint16]](lpEnvironment)
+  let srcLen = envBlockLenW(src, MaxBlockCodeUnits)
+  if srcLen >= MaxBlockCodeUnits:
+    return nil
+  var missing: seq[int] = @[]
+  var k = 0
+  while k < monitorEnvSnapshotW.len:
+    var entryLen = 0
+    while k + entryLen < monitorEnvSnapshotW.len and
+        monitorEnvSnapshotW[k + entryLen] != 0'u16:
+      inc entryLen
+    var eq = 0
+    while eq < entryLen and monitorEnvSnapshotW[k + eq] != uint16(ord('=')):
+      inc eq
+    if eq > 0 and eq < entryLen and
+        not entryNameDefinedW(src, srcLen, k, eq):
+      missing.add(k)
+    k += entryLen + 1
+  if missing.len == 0:
+    return nil
+  buf = newSeqOfCap[uint16](srcLen + monitorEnvSnapshotW.len + 2)
+  for i in 0 ..< srcLen:
+    buf.add(src[i])
+  for start in missing:
+    var j = start
+    while j < monitorEnvSnapshotW.len and monitorEnvSnapshotW[j] != 0'u16:
+      buf.add(monitorEnvSnapshotW[j])
+      inc j
+    buf.add(0'u16)
+  buf.add(0'u16)
+  cast[LPVOID](addr buf[0])
+
+proc envBlockLenA(src: ptr UncheckedArray[char]; limit: int): int =
+  result = 0
+  while result < limit and src[result] != char(0):
+    var entryLen = 0
+    while result + entryLen < limit and src[result + entryLen] != char(0):
+      inc entryLen
+    result += entryLen + 1
+
+proc entryNameDefinedA(blk: ptr UncheckedArray[char]; limit: int;
+                       snapshotStart, nameLen: int): bool =
+  var i = 0
+  while i < limit and blk[i] != char(0):
+    var entryLen = 0
+    while i + entryLen < limit and blk[i + entryLen] != char(0):
+      inc entryLen
+    var eq = -1
+    for j in 1 ..< entryLen:
+      if blk[i + j] == '=':
+        eq = j
+        break
+    if eq == nameLen:
+      var same = true
+      for j in 0 ..< eq:
+        var a = blk[i + j]
+        var b = monitorEnvSnapshotA[snapshotStart + j]
+        if a >= 'a' and a <= 'z': a = chr(ord(a) - 32)
+        if b >= 'a' and b <= 'z': b = chr(ord(b) - 32)
+        if a != b:
+          same = false
+          break
+      if same:
+        return true
+    i += entryLen + 1
+  false
+
+proc environmentWithMonitorConfigA(lpEnvironment: LPVOID;
+                                   buf: var string): LPVOID =
+  ## ANSI counterpart of `environmentWithMonitorConfigW`, for a caller that
+  ## passed a block without `CREATE_UNICODE_ENVIRONMENT`.
+  if lpEnvironment == nil or monitorEnvSnapshotA.len == 0:
+    return nil
+  const MaxBlockBytes = 1 shl 20
+  let src = cast[ptr UncheckedArray[char]](lpEnvironment)
+  let srcLen = envBlockLenA(src, MaxBlockBytes)
+  if srcLen >= MaxBlockBytes:
+    return nil
+  var missing: seq[int] = @[]
+  var k = 0
+  while k < monitorEnvSnapshotA.len:
+    var entryLen = 0
+    while k + entryLen < monitorEnvSnapshotA.len and
+        monitorEnvSnapshotA[k + entryLen] != char(0):
+      inc entryLen
+    var eq = 0
+    while eq < entryLen and monitorEnvSnapshotA[k + eq] != '=':
+      inc eq
+    if eq > 0 and eq < entryLen and
+        not entryNameDefinedA(src, srcLen, k, eq):
+      missing.add(k)
+    k += entryLen + 1
+  if missing.len == 0:
+    return nil
+  buf = newStringOfCap(srcLen + monitorEnvSnapshotA.len + 2)
+  for i in 0 ..< srcLen:
+    buf.add(src[i])
+  for start in missing:
+    var j = start
+    while j < monitorEnvSnapshotA.len and monitorEnvSnapshotA[j] != char(0):
+      buf.add(monitorEnvSnapshotA[j])
+      inc j
+    buf.add(char(0))
+  buf.add(char(0))
+  cast[LPVOID](addr buf[0])
+
 proc snoopCreateProcessW(ctx: var hr.HookContext) {.raises: [].} =
   # Grandchild injection (Windows fs-snoop): force CREATE_SUSPENDED into
   # the child's creation flags BEFORE the real CreateProcessW runs, so
@@ -2939,11 +3383,29 @@ proc snoopCreateProcessW(ctx: var hr.HookContext) {.raises: [].} =
   # caller-suspended child drops the count to zero and starts it running
   # before the caller meant it to, which cannot be taken back.
   var shimForcedSuspend = false
+  # Keep-alive for a rewritten environment block. It is handed to the real
+  # `CreateProcessW` as `lpEnvironment`, so it must outlive `callNext` --
+  # hence proc scope, not the `if` below.
+  var childEnvW: seq[uint16] = @[]
+  var childEnvA: string = ""
   if initialized and disabled == 0:
     ensureSelfDllPath()
     if selfDllPathW.len > 0 and not callerAskedForSuspended:
       ctx.args[5] = uint64(callerCreationFlags or CREATE_SUSPENDED)
       shimForcedSuspend = true
+    # A caller that builds its own environment block does not know about our
+    # configuration, and a shim that cannot read `REPRO_MONITOR_FRAGMENT_DIR`
+    # drops every record it makes. See the note above
+    # `captureMonitorEnvSnapshot`.
+    let callerEnv = cast[LPVOID](ctx.args[6])
+    if callerEnv != nil:
+      let newEnv =
+        if (callerCreationFlags and CREATE_UNICODE_ENVIRONMENT) != 0:
+          environmentWithMonitorConfigW(callerEnv, childEnvW)
+        else:
+          environmentWithMonitorConfigA(callerEnv, childEnvA)
+      if newEnv != nil:
+        ctx.args[6] = cast[uint64](newEnv)
   hr.callNext(ctx)
   let savedLastError = GetLastError()
   # Resolve the thread to resume BEFORE any branch that can leave. `disabled`
@@ -3017,7 +3479,7 @@ proc snoopCreateProcessW(ctx: var hr.HookContext) {.raises: [].} =
         if outcome != shProp.ioInjected and
             outcome != shProp.ioAlreadyPresent:
           record.detail.add(" inject=" & $outcome)
-      emitRecord(record)
+      emitSpawnRecordDurably(record)
   except CatchableError:
     discard
   finally:
@@ -3042,11 +3504,23 @@ proc snoopCreateProcessA(ctx: var hr.HookContext) {.raises: [].} =
   # Same resume-debt discipline as `snoopCreateProcessW`; see the commentary
   # there for why the flag is captured here and discharged only in `finally`.
   var shimForcedSuspend = false
+  # Same environment contract as `snoopCreateProcessW`; see the note there.
+  var childEnvW: seq[uint16] = @[]
+  var childEnvA: string = ""
   if initialized and disabled == 0:
     ensureSelfDllPath()
     if selfDllPathW.len > 0 and not callerAskedForSuspendedA:
       ctx.args[5] = uint64(savedFlagsA or CREATE_SUSPENDED)
       shimForcedSuspend = true
+    let callerEnv = cast[LPVOID](ctx.args[6])
+    if callerEnv != nil:
+      let newEnv =
+        if (savedFlagsA and CREATE_UNICODE_ENVIRONMENT) != 0:
+          environmentWithMonitorConfigW(callerEnv, childEnvW)
+        else:
+          environmentWithMonitorConfigA(callerEnv, childEnvA)
+      if newEnv != nil:
+        ctx.args[6] = cast[uint64](newEnv)
   hr.callNext(ctx)
   let savedLastError = GetLastError()
   # Resolved before any branch that can leave, for the reason given in
@@ -3092,7 +3566,7 @@ proc snoopCreateProcessA(ctx: var hr.HookContext) {.raises: [].} =
       record.detail = "CreateProcessA"
       if childForkRuntime.len > 0:
         record.detail.add(" fork-runtime=" & childForkRuntime)
-      emitRecord(record)
+      emitSpawnRecordDurably(record)
       if created and selfDllPathW.len > 0 and childForkRuntime.len == 0:
         discard shProp.injectShimIntoChild(lpProcessInfo[].hProcess,
           selfDllPath(), "repro_runtime_init")
@@ -3705,6 +4179,17 @@ proc trampolineCloseHandle(hObject: HANDLE): BOOL {.stdcall.} =
   var ctx = hr.HookContext(args: @[cast[uint64](hObject)])
   hr.dispatchShimHook(hr.HookCloseHandle, ctx)
   result = BOOL(uint32(ctx.result))
+
+proc trampolineNtTerminateProcess(ProcessHandle: HANDLE;
+                                  ExitStatus: int32): NTSTATUS {.stdcall.} =
+  if origNtTerminateProcess == nil:
+    return NTSTATUS(0xC0000001'i32)
+  var ctx = hr.HookContext(args: @[
+    cast[uint64](ProcessHandle),
+    uint64(uint32(ExitStatus))
+  ])
+  hr.dispatchShimHook(hr.HookNtTerminateProcess, ctx)
+  result = cast[NTSTATUS](uint32(ctx.result and 0xFFFFFFFF'u64))
 
 proc trampolineGetFileAttributesExW(lpFileName: LPCWSTR, fInfoLevelId: DWORD,
                                      lpFileInformation: LPVOID): BOOL
@@ -5160,6 +5645,7 @@ proc registerMonitorSnoopCallbacks*() =
   hr.registerMonitorHook(hr.HookGetFileAttributesA,   snoopGetFileAttributesA)
   hr.registerMonitorHook(hr.HookCreateProcessW,     snoopCreateProcessW)
   hr.registerMonitorHook(hr.HookCreateProcessA,     snoopCreateProcessA)
+  hr.registerMonitorHook(hr.HookNtTerminateProcess, snoopNtTerminateProcess)
   # M73 Phase 5 — extended hook surface.
   hr.registerMonitorHook(hr.HookDeleteFileW,        snoopDeleteFileW)
   hr.registerMonitorHook(hr.HookDeleteFileA,        snoopDeleteFileA)
@@ -5441,6 +5927,14 @@ let hookTable {.global.}: seq[HookSpec] = @[
     origCallback: originalCreateProcessA,
     iatDlls: kernel32FileIatDlls,
     moduleDll: "kernel32.dll"),
+  # Not an observation hook: `snoopNtTerminateProcess` is the last
+  # chance to make this process's buffered records durable.
+  HookSpec(name: hr.HookNtTerminateProcess,
+    trampoline: cast[pointer](trampolineNtTerminateProcess),
+    origStorage: cast[ptr pointer](addr origNtTerminateProcess),
+    origCallback: originalNtTerminateProcess,
+    iatDlls: ntdllNtIatDlls,
+    moduleDll: "ntdll.dll"),
   # M73 Phase 5 — extended Win32 entry points (kernel32.dll).
   HookSpec(name: hr.HookDeleteFileW,
     trampoline: cast[pointer](trampolineDeleteFileW),
@@ -6124,6 +6618,17 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   withShimMuted:
     fragmentDir = readEnvString("REPRO_MONITOR_FRAGMENT_DIR")
     ensureFragmentDir()
+    # Snapshot the monitoring configuration BEFORE any hook is installed, so
+    # the spawn path can hand it to a child whose caller built its own
+    # environment block.
+    captureMonitorEnvSnapshot()
+    # Arm the thread-exit flush for the whole process. Must precede the first
+    # record, because every registry entry made before this exists without a
+    # destructor behind it.
+    if fragmentFlsIndex.load() == 0:
+      let idx = FlsAlloc(fragmentSlotThreadExit)
+      if idx != high(uint32):
+        fragmentFlsIndex.store(idx + 1)
     when defined(ioMonShimSpawnEscapeTest):
       # Only this build reads it at all; in the shipped shim the variable is
       # inert because the code that would honour it does not exist.
@@ -6280,8 +6785,29 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
         # callbacks in LIFO order on ExitProcess / normal-return / CRT
         # `exit`, before the CRT walks Nim's atexit chain — matching the
         # Linux destructor's timing.
+        #
+        # EVERY thread's batch, not just this one's. `closeFragmentSlot`
+        # reaches the caller's `fragmentSlot` THREADVAR and nothing else, so
+        # in any process whose records were made on more than one thread the
+        # other threads' buffered tails were simply abandoned -- which is
+        # most monitored processes, and all of the interesting ones. Measured
+        # on this host: `bash -c "grep foo <file>"` with the grep child
+        # injected produced, from the child, its process-start and its
+        # library loads (both emitted on the injector's init thread, which
+        # flushes explicitly) and NOT ONE of the file opens or reads grep
+        # actually did -- those were made on grep's own main thread, whose
+        # batch died with it.
+        #
+        # `flushAllRegisteredSlots` is the same sweep the Linux shim has run
+        # at shutdown since DEP-FLUSH-1, over the same registry; it ends by
+        # closing the caller's own slot, so it SUBSUMES the call it replaces.
+        # It deliberately does not retire another thread's read-tail sentinel
+        # -- only that thread can -- so a swept batch still shows up as a
+        # kill-before-flush loss. That keeps the change in the safe
+        # direction: strictly more evidence on disk, never a better grade
+        # than before.
         try:
-          closeFragmentSlot()
+          flushAllRegisteredSlots()
         except CatchableError, IOError, OSError:
           discard
         when ctInlineHookAvailable:

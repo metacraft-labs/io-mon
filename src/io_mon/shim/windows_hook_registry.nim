@@ -93,6 +93,12 @@ const
   HookGetFileAttributesA* = "GetFileAttributesA"
   HookCreateProcessW* = "CreateProcessW"
   HookCreateProcessA* = "CreateProcessA"
+  # Not a filesystem entry point. `NtTerminateProcess` is the ONE
+  # chokepoint every process exit passes through -- `ExitProcess`,
+  # `TerminateProcess` and a Cygwin runtime's own teardown alike -- and it is
+  # where the shim gets its last chance to make buffered records durable. See
+  # `windows_interpose.snoopNtTerminateProcess`.
+  HookNtTerminateProcess* = "NtTerminateProcess"
   # M73 Phase 5 — additional Win32 entry points from
   # Monitor-Hook-Shim.md §Windows Hook Surface.
   HookDeleteFileW* = "DeleteFileW"
