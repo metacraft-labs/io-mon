@@ -73,8 +73,15 @@ proc buildC(work, name, source: string; extraArgs: seq[string] = @[]): string =
 proc ensureSnoop(work: string): string =
   result = work / "io-mon"
   if not fileExists(result):
+    # `--nimcache` is NOT optional. Without it this `nim c` lands in the shared
+    # `~/.cache/nim/io_mon_snoop_d`, whose object names are PROJECT-RELATIVE, so
+    # a second io-mon checkout compiling the same CLI collides with the first and
+    # the loser dies with `ld: final link failed: bad value` — a link error that
+    # looks like a code break and is not one. Keyed under `work`, which is
+    # per-run.
     let cli = run("nim", @[
       "c", "--hints:off", "--warnings:off", "--threads:on",
+      "--nimcache:" & (work / "nimcache-snoop"),
       "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
       "--out:" & result, snoopSrc])
     checkpoint(cli.output)
@@ -470,9 +477,22 @@ int main(int argc, char **argv) {
     # The set-only UNBUFFERED path reproduces committed golden depfiles
     # byte-for-byte (normalising only genuine launcher noise via goldenProjection).
     # Three representative workloads: a marker read set, an exec-heavy chain, and a
-    # probe-heavy storm. Each golden is regenerated (self-heal) when absent so the
-    # fixture is produced deterministically, then asserted byte-identical on reruns.
-    createDir(fixturesDir)
+    # probe-heavy storm.
+    #
+    # THE GOLDENS ARE COMMITTED AND ARE NEVER WRITTEN BY THIS TEST. An earlier
+    # revision self-healed a missing fixture by writing the projection it had
+    # just computed and then comparing the two, which on any fresh checkout
+    # generated the golden and compared it against ITSELF — a pass that could
+    # not fail. It was invisible because the committed fixtures were named
+    # `<tag>.rmdf` (the format's name before `2d602cc` renamed RMDF to iomon)
+    # while the comparison read `<tag>.iomon`, so the tracked bytes were never
+    # opened and the generated ones were never tracked. A golden that the test
+    # can produce is not a golden, so the regeneration is gone: an absent
+    # fixture is a FAILURE naming the file, never a silent re-baseline.
+    #
+    # Regenerating deliberately is still possible and is deliberately manual —
+    # `io-mon run --depfile` the workload and project it — so that a changed
+    # projection has to be looked at by a person.
     let snoopBin = ensureSnoop(work)
     let shimLib = ensureShim()
 
@@ -488,10 +508,22 @@ int main(int argc, char **argv) {
     proc assertGolden(tag: string; dep: MonitorDepFile) =
       let projected = goldenProjection(dep, work)
       let fixture = fixturesDir / (tag & ".iomon")
+      # An absent fixture is a RED, not a cue to write one — see the note above.
+      check fileExists(fixture)
       if not fileExists(fixture):
-        writeFile(fixture, cast[string](projected))
-        checkpoint("generated golden fixture " & fixture)
+        checkpoint("missing committed golden fixture " & fixture)
+        return
       let golden = toBytes(readFile(fixture))
+      # Report the shape of the disagreement, not just that there was one: a
+      # length change and a single flipped byte want different investigations.
+      if projected != golden:
+        checkpoint(tag & ": projection " & $projected.len &
+          " bytes vs committed golden " & $golden.len & " bytes")
+        for i in 0 ..< min(projected.len, golden.len):
+          if projected[i] != golden[i]:
+            checkpoint(tag & ": first differing byte at offset " & $i &
+              " (got " & $projected[i] & ", golden " & $golden[i] & ")")
+            break
       check projected == golden
 
     # -- marker workload (distinct reads) --
