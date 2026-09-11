@@ -1193,6 +1193,43 @@ proc flushAllRegisteredSlots*() =
           flushFile(slot.file)
           discard fragmentWriteCount.fetchAdd(1, moRelaxed)
           discard fragmentFlushCount.fetchAdd(1, moRelaxed)
+          # ROUND-2 R5, cross-thread arm — RETIRE THE SWEPT THREAD'S
+          # READ-TAIL SENTINEL.
+          #
+          # The sweep just made that thread's buffered reads durable. Its
+          # `read-tail-pending` marker asserts the opposite ("this thread
+          # has non-durable captured-dependency bytes"), and nothing else
+          # will ever contradict it: `clearReadingSentinel` writes through
+          # `writeReadTailMarker`, which only ever addresses the CALLING
+          # thread's `fragmentSlot` threadvar. So without this, every batch
+          # a sweep rescued was ALSO reported as a kill-before-flush loss —
+          # the run paid for the rescue with a downgrade, and a monitored
+          # shell that reads on more than one thread could not reach
+          # `mcComplete` at all.
+          #
+          # `committedFrame` is precisely the tool for it: a frame
+          # pre-encoded for THIS slot's own (osPid, threadId) at open time,
+          # exactly so a non-owning context can write it verbatim with no
+          # allocation and no threadvar access. `mergeFragments` nets
+          # pending against committed per (osPid, threadId), so one frame
+          # retires one pending.
+          #
+          # THE ORDER AND THE CONDITIONS ARE THE SOUNDNESS ARGUMENT, not
+          # housekeeping. The marker claims durability, so it is written
+          # ONLY after this thread's `writeBuffer` returned the full length
+          # AND `flushFile` returned — i.e. only where the claim is already
+          # true. A short write, a raise, or a `committedFrameLen` of 0 (an
+          # over-long run token the pre-encode refused) all leave the
+          # pending UNMATCHED and the run honestly `mcIncomplete`. Nothing
+          # here can turn an un-flushed batch into a clean grade; it can
+          # only stop a FLUSHED batch from being reported as un-flushed.
+          if slot.readingSentinelActive and slot.committedFrameLen > 0:
+            let markerLen = int(slot.committedFrameLen)
+            let markerWritten = slot.file.writeBuffer(
+              addr slot.committedFrame[0], markerLen)
+            if markerWritten == markerLen:
+              flushFile(slot.file)
+              slot.readingSentinelActive = false
         slot.batchLen = 0
         slot.batchOpenedAtNs = 0
         slot.batchProbeCountdown = 0

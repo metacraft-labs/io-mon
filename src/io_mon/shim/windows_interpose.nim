@@ -6984,11 +6984,12 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
         # `flushAllRegisteredSlots` is the same sweep the Linux shim has run
         # at shutdown since DEP-FLUSH-1, over the same registry; it ends by
         # closing the caller's own slot, so it SUBSUMES the call it replaces.
-        # It deliberately does not retire another thread's read-tail sentinel
-        # -- only that thread can -- so a swept batch still shows up as a
-        # kill-before-flush loss. That keeps the change in the safe
-        # direction: strictly more evidence on disk, never a better grade
-        # than before.
+        # It now also retires the swept thread's read-tail sentinel, but ONLY
+        # where the sweep's own write proves the batch became durable -- see
+        # the soundness note in `flushAllRegisteredSlots`. Before that, a
+        # rescued batch was still reported as a kill-before-flush loss, so a
+        # shell that reads on more than one thread could not reach
+        # `mcComplete` no matter how complete its evidence was.
         try:
           flushAllRegisteredSlots()
         except CatchableError, IOError, OSError:
