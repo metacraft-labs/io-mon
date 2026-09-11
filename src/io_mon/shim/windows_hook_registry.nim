@@ -114,6 +114,15 @@ const
   HookSetCurrentDirectoryA* = "SetCurrentDirectoryA"
   # NT Native API backstop — lives in ntdll.dll, not kernel32.
   HookNtCreateFile* = "NtCreateFile"
+  # NtReadFile — the read that MSYS2/Cygwin actually performs. The Cygwin
+  # runtime imports BOTH kernel32!ReadFile and ntdll!NtReadFile and uses the
+  # NT export for ordinary disk files, so without this hook an MSYS child is
+  # observed opening a file and never reading it: every `bash <script>`
+  # action captured zero `file-read` records, which is precisely what an
+  # action cache keys on. See `snoopNtReadFile` for the double-count rule
+  # that keeps a NATIVE child (whose kernel32!ReadFile lowers to this very
+  # function) from being counted through both layers.
+  HookNtReadFile* = "NtReadFile"
   # libuv on Windows routes fs.statSync through NtQueryAttributesFile /
   # NtQueryFullAttributesFile (no handle is opened), and fs.readdirSync
   # through NtQueryDirectoryFile. None of these cross the kernel32 layer
@@ -213,7 +222,7 @@ const
   HookMsvcrtGetenvS* = "msvcrt!getenv_s"
   HookMsvcrtWGetenvS* = "msvcrt!_wgetenv_s"
 
-const MonitorShimHookNames*: array[64, string] = [
+const MonitorShimHookNames*: array[65, string] = [
   HookCreateFileW, HookCreateFileA, HookReadFile, HookWriteFile,
   HookCloseHandle,
   HookGetFileAttributesExW, HookGetFileAttributesExA,
@@ -225,7 +234,7 @@ const MonitorShimHookNames*: array[64, string] = [
   HookMoveFileExW, HookMoveFileExA,
   HookGetFileInformationByHandleEx,
   HookSetCurrentDirectoryW, HookSetCurrentDirectoryA,
-  HookNtCreateFile,
+  HookNtCreateFile, HookNtReadFile,
   HookNtQueryAttributesFile, HookNtQueryFullAttributesFile,
   HookNtQueryDirectoryFile, HookNtQueryInformationByName,
   HookNtQueryDirectoryFileEx,

@@ -572,6 +572,30 @@ type
                           EaLength: DWORD): NTSTATUS
                           {.stdcall, raises: [].}
 
+  # NtReadFile lives in ntdll. Signature (per MSDN / phnt headers):
+  #   NTSTATUS NtReadFile(
+  #     HANDLE           FileHandle,
+  #     HANDLE           Event,
+  #     PIO_APC_ROUTINE  ApcRoutine,
+  #     PVOID            ApcContext,
+  #     PIO_STATUS_BLOCK IoStatusBlock,
+  #     PVOID            Buffer,
+  #     ULONG            Length,
+  #     PLARGE_INTEGER   ByteOffset,
+  #     PULONG           Key);
+  # The byte count lands in ``IoStatusBlock.Information``, the second
+  # pointer-sized field of the 16-byte IO_STATUS_BLOCK on x64.
+  NtReadFileProc = proc(FileHandle: HANDLE,
+                        Event: HANDLE,
+                        ApcRoutine: pointer,
+                        ApcContext: pointer,
+                        IoStatusBlock: pointer,
+                        Buffer: pointer,
+                        Length: DWORD,
+                        ByteOffset: ptr LARGE_INTEGER,
+                        Key: ptr DWORD): NTSTATUS
+                        {.stdcall, raises: [].}
+
   # NtQueryAttributesFile / NtQueryFullAttributesFile catch libuv's
   # uv_fs_stat fast-path (Node.js 20+). Path lives in OBJECT_ATTRIBUTES.
   NtQueryAttributesFileProc = proc(ObjectAttributes: pointer;
@@ -797,6 +821,7 @@ var
   origSetCurrentDirectoryW: SetCurrentDirectoryWProc
   origSetCurrentDirectoryA: SetCurrentDirectoryAProc
   origNtCreateFile: NtCreateFileProc
+  origNtReadFile: NtReadFileProc
   origNtQueryAttributesFile: NtQueryAttributesFileProc
   origNtQueryFullAttributesFile: NtQueryAttributesFileProc
   origNtQueryDirectoryFile: NtQueryDirectoryFileProc
@@ -2403,6 +2428,23 @@ proc originalNtCreateFile(ctx: var hr.HookContext) {.raises: [].} =
   # let the trampoline reinterpret on the way out.
   ctx.result = uint64(uint32(r))
 
+proc originalNtReadFile(ctx: var hr.HookContext) {.raises: [].} =
+  if origNtReadFile == nil:
+    ctx.result = uint64(uint32(0xC0000001'u32))  # STATUS_UNSUCCESSFUL
+    return
+  let FileHandle    = cast[HANDLE](ctx.args[0])
+  let Event         = cast[HANDLE](ctx.args[1])
+  let ApcRoutine    = cast[pointer](ctx.args[2])
+  let ApcContext    = cast[pointer](ctx.args[3])
+  let IoStatusBlock = cast[pointer](ctx.args[4])
+  let Buffer        = cast[pointer](ctx.args[5])
+  let Length        = DWORD(ctx.args[6])
+  let ByteOffset    = cast[ptr LARGE_INTEGER](ctx.args[7])
+  let Key           = cast[ptr DWORD](ctx.args[8])
+  let r = origNtReadFile(FileHandle, Event, ApcRoutine, ApcContext,
+                          IoStatusBlock, Buffer, Length, ByteOffset, Key)
+  ctx.result = uint64(uint32(r))
+
 proc originalNtQueryAttributesFile(ctx: var hr.HookContext) {.raises: [].} =
   if origNtQueryAttributesFile == nil:
     ctx.result = uint64(uint32(0xC0000001'u32))
@@ -2670,8 +2712,70 @@ proc snoopCreateFileA(ctx: var hr.HookContext) {.raises: [].} =
     discard
   SetLastError(savedLastError)
 
+# --- The read observation, and the one place it is built ------------------
+#
+# TWO entry points reach the same kernel read: kernel32!ReadFile and
+# ntdll!NtReadFile, the former LOWERING TO the latter. Both are hooked,
+# because neither alone is sufficient:
+#
+#   * A native Win32 program calls ReadFile. Hooking only NtReadFile would
+#     still see it (the lowering), but would lose the kernel32-layer
+#     `lpNumberOfBytesRead` semantics the existing capture is specified on.
+#   * An MSYS2/Cygwin program calls NtReadFile DIRECTLY for ordinary disk
+#     files -- `msys-2.0.dll` imports both, and the NT export is the one it
+#     uses. Hooking only ReadFile therefore produced, for every `bash
+#     <script>` action, opens and path-probes and NOT ONE `file-read`.
+#
+# Hooking both without further care would count a NATIVE read TWICE, once
+# per layer. `win32ReadDepth` is that care: `snoopReadFile` raises it across
+# its own `callNext`, so the NtReadFile snoop nested inside the real
+# kernel32!ReadFile stays silent and the kernel32 record is the only one. A
+# direct NtReadFile caller enters at depth zero and is recorded normally.
+# It is a THREADVAR, like `disabled`: the depth is a property of the call
+# stack that is mid-lowering, not of the process, and a concurrent reader on
+# another thread must not be muted by it.
+var win32ReadDepth {.threadvar.}: int
+
+proc emitReadObservation(hFile: HANDLE; callOk: bool; bytesRead: int64;
+                          detail: string) {.raises: [].} =
+  ## The single body behind both read hooks, so the two layers cannot drift
+  ## into recording different things about the same read.
+  let path = pathForHandle(hFile)
+  # M5 — external content: a read from a handle the shim never saw opened is
+  # the Windows shape of the inherited-pipe channel (`chan=opaque`). The
+  # bytes are a real INPUT and there is no file path anywhere in the capture
+  # to fingerprint, so the merge has to decide provenance -- and it can,
+  # because a Windows pipe object carries a name both ends agree on.
+  #
+  # The classification runs ONLY for an unknown handle and the fact that it
+  # ran is recorded in `channelClassified` (NOT in `handlePaths`, which holds
+  # paths and is left empty for exactly these handles), so the
+  # GetFileType/FileNameInfo pair costs one call per handle rather than one
+  # per read. The read hooks are the hottest in the table; an unconditional
+  # probe here would undo S4's batching win on its own.
+  if callOk and path.len == 0 and not markHandleChannelClassified(hFile):
+    if GetFileType(hFile) == FILE_TYPE_PIPE:
+      var producer = 0'u64
+      let identity = pipePairIdentity(hFile, producer)
+      # An identity the kernel would not supply (the far end has already
+      # gone, or the handle is a socket rather than a pipe) yields an EMPTY
+      # key, which the merge deliberately never downgrades on: a possible
+      # missed dependency is the safe direction, a false re-run of every
+      # normal build is not.
+      emitExternalContent("opaque", "read", identity, producer, 0'i64)
+  var record = baseRecord(mrFileRead, moFileRead)
+  record.path = path
+  record.result = bytesRead
+  record.detail = detail
+  emitRecord(record)
+
 proc snoopReadFile(ctx: var hr.HookContext) {.raises: [].} =
+  # The depth is raised across `callNext` ONLY. Everything below it is our
+  # own bookkeeping, which performs no read, and leaving the depth raised
+  # there would mute a genuine nested read the classification itself made.
+  inc win32ReadDepth
   hr.callNext(ctx)
+  dec win32ReadDepth
   # ReadFile preservation is load-bearing. Without it, cargo's
   # std::process::Command::spawn panics with
   # `Os { code: 183, kind: AlreadyExists }` on the rust-binary-with-build-rs
@@ -2684,37 +2788,10 @@ proc snoopReadFile(ctx: var hr.HookContext) {.raises: [].} =
     let hFile = cast[HANDLE](ctx.args[0])
     let lpBytesRead = cast[ptr DWORD](ctx.args[3])
     let callOk = callResultBool(ctx.result) != 0
-    let path = pathForHandle(hFile)
-    # M5 — external content: a read from a handle the shim never saw opened is
-    # the Windows shape of the inherited-pipe channel (`chan=opaque`). The
-    # bytes are a real INPUT and there is no file path anywhere in the capture
-    # to fingerprint, so the merge has to decide provenance -- and it can,
-    # because a Windows pipe object carries a name both ends agree on.
-    #
-    # The classification runs ONLY for an unknown handle and the fact that it
-    # ran is recorded in `channelClassified` (NOT in `handlePaths`, which holds
-    # paths and is left empty for exactly these handles), so the
-    # GetFileType/FileNameInfo pair costs one call per handle rather than one
-    # per read. ReadFile is the hottest hook in the table; an unconditional
-    # probe here would undo S4's batching win on its own.
-    if callOk and path.len == 0 and not markHandleChannelClassified(hFile):
-      if GetFileType(hFile) == FILE_TYPE_PIPE:
-        var producer = 0'u64
-        let identity = pipePairIdentity(hFile, producer)
-        # An identity the kernel would not supply (the far end has already
-        # gone, or the handle is a socket rather than a pipe) yields an EMPTY
-        # key, which the merge deliberately never downgrades on: a possible
-        # missed dependency is the safe direction, a false re-run of every
-        # normal build is not.
-        emitExternalContent("opaque", "read", identity, producer, 0'i64)
-    var record = baseRecord(mrFileRead, moFileRead)
-    record.path = path
-    if callOk and lpBytesRead != nil:
-      record.result = int64(lpBytesRead[])
-    else:
-      record.result = -1
-    record.detail = "ReadFile"
-    emitRecord(record)
+    let bytesRead =
+      if callOk and lpBytesRead != nil: int64(lpBytesRead[])
+      else: -1'i64
+    emitReadObservation(hFile, callOk, bytesRead, "ReadFile")
   except CatchableError:
     discard
   SetLastError(savedLastError)
@@ -3944,6 +4021,50 @@ proc snoopNtCreateFile(ctx: var hr.HookContext) {.raises: [].} =
     discard
   SetLastError(savedLastError)
 
+proc snoopNtReadFile(ctx: var hr.HookContext) {.raises: [].} =
+  ## The NT-layer read. See `emitReadObservation` for why BOTH read layers
+  ## are hooked and how `win32ReadDepth` keeps a native read from being
+  ## counted twice.
+  hr.callNext(ctx)
+  let savedLastError = GetLastError()
+  if disabled > 0 or not initialized:
+    SetLastError(savedLastError)
+    return
+  # We are nested inside the real kernel32!ReadFile, whose own snoop has
+  # already claimed this read. Recording here as well would double every
+  # native read in the capture -- and a doubled read set is not a harmless
+  # cosmetic: it is the evidence an action cache decides on.
+  if win32ReadDepth > 0:
+    SetLastError(savedLastError)
+    return
+  try:
+    let hFile = cast[HANDLE](ctx.args[0])
+    let iosb = cast[pointer](ctx.args[4])
+    let nt = cast[NTSTATUS](uint32(ctx.result and 0xFFFFFFFF'u64))
+    # STATUS_PENDING (0x103) is NT_SUCCESS but the IO_STATUS_BLOCK is NOT
+    # yet written -- the I/O completes on the caller's event/APC after we
+    # return. Reading `Information` here would race the kernel's own store
+    # and report a byte count out of uninitialised caller memory, so the
+    # pending case records the read with an UNKNOWN length rather than a
+    # fabricated one. The dependency is what matters; the byte count is
+    # detail.
+    const StatusPending = NTSTATUS(0x00000103'i32)
+    let completedSync = nt >= 0 and nt != StatusPending
+    # IO_STATUS_BLOCK is { union { NTSTATUS Status; PVOID Pointer; };
+    # ULONG_PTR Information; } -- `Information` is the SECOND pointer-sized
+    # field, so both the offset and the width follow `sizeof(pointer)`.
+    # Nim's `uint` is pointer-sized, which keeps this correct for the
+    # 32-bit (WOW64) shim too: hard-coding `uint64` there would read four
+    # bytes past the caller's struct and report a fabricated count.
+    let bytesRead =
+      if completedSync and iosb != nil:
+        int64(cast[ptr uint](cast[uint](iosb) + uint(sizeof(pointer)))[])
+      else: -1'i64
+    emitReadObservation(hFile, completedSync, bytesRead, "NtReadFile")
+  except CatchableError:
+    discard
+  SetLastError(savedLastError)
+
 proc snoopNtQueryAttributesFileImpl(ctx: var hr.HookContext;
                                      detail: string) {.raises: [].} =
   hr.callNext(ctx)
@@ -4467,6 +4588,32 @@ proc trampolineNtCreateFile(FileHandle: ptr HANDLE,
   # NTSTATUS reinterpret: ctx.result holds the uint32-packed status.
   # Same-size cast avoids `chckRange64` (per the
   # nim_cast_narrowing_rangecheck memo).
+  result = cast[NTSTATUS](uint32(ctx.result and 0xFFFFFFFF'u64))
+
+proc trampolineNtReadFile(FileHandle: HANDLE,
+                           Event: HANDLE,
+                           ApcRoutine: pointer,
+                           ApcContext: pointer,
+                           IoStatusBlock: pointer,
+                           Buffer: pointer,
+                           Length: DWORD,
+                           ByteOffset: ptr LARGE_INTEGER,
+                           Key: ptr DWORD): NTSTATUS {.stdcall.} =
+  if origNtReadFile == nil:
+    return NTSTATUS(0xC0000001'i32)  # STATUS_UNSUCCESSFUL
+  var ctx = hr.HookContext(args: @[
+    cast[uint64](FileHandle),
+    cast[uint64](Event),
+    cast[uint64](ApcRoutine),
+    cast[uint64](ApcContext),
+    cast[uint64](IoStatusBlock),
+    cast[uint64](Buffer),
+    uint64(Length),
+    cast[uint64](ByteOffset),
+    cast[uint64](Key)
+  ])
+  hr.dispatchShimHook(hr.HookNtReadFile, ctx)
+  # Same-size NTSTATUS reinterpret as trampolineNtCreateFile.
   result = cast[NTSTATUS](uint32(ctx.result and 0xFFFFFFFF'u64))
 
 proc trampolineNtQueryAttributesFile(ObjectAttributes: pointer;
@@ -5690,6 +5837,7 @@ proc registerMonitorSnoopCallbacks*() =
   hr.registerMonitorHook(hr.HookSetCurrentDirectoryA,
                          snoopSetCurrentDirectoryA)
   hr.registerMonitorHook(hr.HookNtCreateFile,       snoopNtCreateFile)
+  hr.registerMonitorHook(hr.HookNtReadFile,         snoopNtReadFile)
   hr.registerMonitorHook(hr.HookNtQueryAttributesFile,
                          snoopNtQueryAttributesFile)
   hr.registerMonitorHook(hr.HookNtQueryFullAttributesFile,
@@ -6035,6 +6183,13 @@ let hookTable {.global.}: seq[HookSpec] = @[
     trampoline: cast[pointer](trampolineNtCreateFile),
     origStorage: cast[ptr pointer](addr origNtCreateFile),
     origCallback: originalNtCreateFile,
+    iatDlls: ntdllNtIatDlls,
+    moduleDll: "ntdll.dll"),
+  # NT read backstop — the read an MSYS2/Cygwin child actually performs.
+  HookSpec(name: hr.HookNtReadFile,
+    trampoline: cast[pointer](trampolineNtReadFile),
+    origStorage: cast[ptr pointer](addr origNtReadFile),
+    origCallback: originalNtReadFile,
     iatDlls: ntdllNtIatDlls,
     moduleDll: "ntdll.dll"),
   # NT stat-class hooks (libuv fast-path for fs.statSync).
