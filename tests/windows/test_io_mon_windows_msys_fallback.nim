@@ -73,7 +73,7 @@ proc runNativeMsysChild(): int =
   result = waitForExit(child)
   close(child)
 
-proc runNestedFallbackProbe(): int =
+proc runNestedInstrumentedProbe(): int =
   let shell = findExe("sh")
   if shell.len == 0 or windowsForkRuntimeForExecutable(shell).len == 0:
     return 77
@@ -97,21 +97,52 @@ proc runNestedFallbackProbe(): int =
     if fileExists(stdioPath):
       stderr.writeLine(readFile(stdioPath))
     return 2
-  if monitored.completeness != mcIncomplete:
-    return 3
+
+  # The child really is a fork-runtime image -- otherwise this probe proves
+  # nothing about MSYS at all, it just spawned some native exe.
+  var forkRuntimeChildren: seq[uint64] = @[]
   for record in monitored.records:
-    if record.kind == mrProcessSpawn and
+    if record.kind == mrProcessSpawn and record.childOsPid != 0 and
         "fork-runtime=" & windowsForkRuntimeForExecutable(shell) in
           record.detail:
-      return 0
-  4
+      forkRuntimeChildren.add record.childOsPid
+  if forkRuntimeChildren.len == 0:
+    return 4
+
+  # THE CLAIM THAT CHANGED. This case used to require `mcIncomplete` and a
+  # spawn record naming the runtime: an MSYS child was refused injection
+  # outright (the shim's own `childForkRuntime.len == 0` guard), so the only
+  # honest grade was "subtree lost". With the entry-point park the child is
+  # attachable, and refusing it would now be throwing away evidence we can
+  # have. So the property is inverted, and DELIBERATELY strengthened from
+  # the grade to the thing that earns it: the fork-runtime child must have
+  # reported its OWN `process-start`.
+  #
+  # That ordering matters. Asserting only `mcComplete` would be satisfied by
+  # a merge that had simply stopped noticing the missing child -- the one
+  # regression that must never ship. Asserting the child's own record first
+  # means the grade below is checked over evidence we have already confirmed
+  # is there.
+  var startedPids: seq[uint64] = @[]
+  for record in monitored.records:
+    if record.kind == mrProcessStart and record.osPid != 0:
+      startedPids.add record.osPid
+  var instrumented = false
+  for pid in forkRuntimeChildren:
+    if pid in startedPids:
+      instrumented = true
+  if not instrumented:
+    return 5
+  if monitored.completeness != mcComplete:
+    return 6
+  0
 
 if paramCount() == 1:
   case paramStr(1)
   of DirectProbeArg:
     quit(runDirectFallbackProbe())
   of NestedProbeArg:
-    quit(runNestedFallbackProbe())
+    quit(runNestedInstrumentedProbe())
   of NativeSpawnerArg:
     quit(runNativeMsysChild())
   else:
@@ -139,7 +170,7 @@ suite "Windows MSYS/Cygwin monitor fallback":
     else:
       check runProbeWithTimeout(DirectProbeArg) == 0
 
-  test "native parent leaves an MSYS child uninstrumented and completes":
+  test "native parent gets its MSYS child instrumented, and completes":
     let shell = findExe("sh")
     if shell.len == 0 or windowsForkRuntimeForExecutable(shell).len == 0:
       checkpoint("MSYS2/Cygwin shell is not installed; integration probe skipped")

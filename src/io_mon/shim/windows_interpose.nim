@@ -3469,13 +3469,36 @@ proc snoopCreateProcessW(ctx: var hr.HookContext) {.raises: [].} =
       # cap was saturated" and "LoadLibraryW timed out" are a bug, a tuning
       # knob and a hung child respectively. Record which one it was.
       #
-      # A pre-main remote thread deadlocks MSYS2/Cygwin fork runtimes, so
-      # those are left uninjected; the unmatched spawn record makes the
-      # skipped subtree incomplete. They are still resumed -- skipping the
-      # injection does not transfer the suspension to anyone else.
-      if created and selfDllPathW.len > 0 and childForkRuntime.len == 0:
+      # A pre-main remote thread deadlocks MSYS2/Cygwin fork runtimes. That
+      # used to be handled HERE, by refusing to inject any child that has a
+      # fork runtime next to its image -- which left every MSYS/Cygwin child
+      # uninstrumented, `grep.exe` under `bash -c` included, and made the
+      # whole subtree an unknown-scope loss.
+      #
+      # It is handled INSIDE `injectShimIntoChild` now. That proc parks the
+      # child's main thread at its image entry point so the loader
+      # initialises on the thread the OS would have used, then borrows that
+      # same thread to map the shim; a child it cannot park AND that carries
+      # a fork runtime is still refused, with `ioSkippedForkRuntime`. So the
+      # blanket guard here was a filesystem heuristic standing in for a
+      # thread-scheduling problem, and it answered "skip" for children that
+      # are perfectly attachable. `childForkRuntime` is still computed, but
+      # only to annotate the record.
+      #
+      # THE PARK IS ONLY SOUND WHEN WE OWN THE SUSPENSION. It runs the
+      # child's loader, and a caller who asked for CREATE_SUSPENDED
+      # themselves is entitled to a child that has executed nothing --
+      # Cygwin's fork() copies the parent's address space into exactly such
+      # a child. `shimForcedSuspend` is true only when the suspension is
+      # ours, so it is exactly the condition under which the main thread may
+      # be handed over; otherwise we pass nil and `injectShimIntoChild`
+      # pins itself to the legacy technique, which is byte-for-byte what
+      # this call did before.
+      if created and selfDllPathW.len > 0:
         let outcome = shProp.injectShimIntoChild(lpProcessInfo[].hProcess,
-          selfDllPath(), "repro_runtime_init")
+          selfDllPath(), "repro_runtime_init",
+          hThread = (if shimForcedSuspend: lpProcessInfo[].hThread
+                     else: nil))
         if outcome != shProp.ioInjected and
             outcome != shProp.ioAlreadyPresent:
           record.detail.add(" inject=" & $outcome)
@@ -3567,9 +3590,14 @@ proc snoopCreateProcessA(ctx: var hr.HookContext) {.raises: [].} =
       if childForkRuntime.len > 0:
         record.detail.add(" fork-runtime=" & childForkRuntime)
       emitSpawnRecordDurably(record)
-      if created and selfDllPathW.len > 0 and childForkRuntime.len == 0:
+      # Same contract as `snoopCreateProcessW` -- see the long note there for
+      # why the fork-runtime guard is gone and why the main thread may only
+      # be handed over when `shimForcedSuspend` says the suspension is ours.
+      if created and selfDllPathW.len > 0:
         discard shProp.injectShimIntoChild(lpProcessInfo[].hProcess,
-          selfDllPath(), "repro_runtime_init")
+          selfDllPath(), "repro_runtime_init",
+          hThread = (if shimForcedSuspend: lpProcessInfo[].hThread
+                     else: nil))
   except CatchableError:
     discard
   finally:
