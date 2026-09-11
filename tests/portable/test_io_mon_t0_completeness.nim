@@ -19,6 +19,12 @@ proc spawn(parent, child: uint64): MonitorRecord =
 proc execRec(pid: uint64): MonitorRecord =
   MonitorRecord(kind: mrProcessExec, observationKind: moExecute, osPid: pid)
 
+proc execAt(pid: uint64; image: string): MonitorRecord =
+  ## An exec whose target image the backend resolved — the shape every real
+  ## `mrProcessExec` has, and the input the image note is derived from.
+  MonitorRecord(kind: mrProcessExec, observationKind: moExecute, osPid: pid,
+    path: image)
+
 proc ipc(pid, peer: uint64; dest = "/tmp/d.sock"): MonitorRecord =
   ## An mrIpcConnect from `pid` to a peer whose pid is `peer` (0 ⇒ unknown peer,
   ## e.g. an INET socket where LOCAL_PEERPID is unobtainable).
@@ -81,6 +87,41 @@ suite "io-mon T0 earned-completeness (unmonitoredSubtreeLossCount)":
     # `_posixsubprocess.fork_exec`) bypasses our LD_PRELOAD fork hook.
     let records = @[spawn(0, 100), start(100), execRec(100)]
     check unmonitoredSubtreeLossCount(records) == 1
+
+  test "the exec loss names the image that swallowed the subtree":
+    # The pid in the detail is dead by the time anyone reads the depfile; the
+    # IMAGE is what a consumer can act on. Without it, learning that a macOS
+    # dev-env activation was uncacheable because `/usr/bin/cc` is SIP-protected
+    # meant reading a 57k-record depfile and cross-referencing pids by hand —
+    # so reprobuild's diagnostic could only say "unknown-scope loss" and stop.
+    let records = @[
+      spawn(0, 100), start(100), execAt(100, "/usr/bin/cc")]
+    let details = unmonitoredSubtreeLossDetails(records)
+    check details.len == 1
+    check "exec without post-exec process-start" in details[0]
+    check "pid=100" in details[0]
+    check "image=/usr/bin/cc" in details[0]
+
+  test "the last successful image wins when a pid execs more than once":
+    # A PATH search execs each candidate in turn; only the final, successful
+    # image is the one that went un-injected, so that is the one named.
+    let records = @[
+      spawn(0, 100), start(100),
+      execAt(100, "/nix/store/does-not-matter/bin/arch"),
+      execAt(100, "/usr/bin/arch")]
+    let details = unmonitoredSubtreeLossDetails(records)
+    check details.len == 1
+    check "image=/usr/bin/arch" in details[0]
+
+  test "an exec loss with no recorded image still reports, without an image note":
+    # Older depfiles (and any record whose path the backend could not resolve)
+    # carry no path. The loss must still be reported — dropping it would turn a
+    # correctness downgrade into silence — just without the note.
+    let records = @[spawn(0, 100), start(100), execRec(100)]
+    let details = unmonitoredSubtreeLossDetails(records)
+    check details.len == 1
+    check "exec without post-exec process-start" in details[0]
+    check "image=" notin details[0]
 
   test "a SETEXEC into an injectable image (post-exec start) yields NO loss":
     let records = @[spawn(0, 100), start(100), execRec(100), start(100)]
