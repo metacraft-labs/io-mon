@@ -32,10 +32,34 @@ proc runDirectFallbackProbe(): int =
     return 2
   if monitored.completeness != mcIncomplete:
     return 3
+  # THE PROPERTY IS THE EXPLICIT LOSS, NOT THE SENTENCE THAT EXPLAINS IT.
+  # There are now two ways an MSYS2/Cygwin root reaches "incomplete", and
+  # both have to be accepted here or this case would pin an implementation
+  # detail of the injector rather than the contract a consumer reads.
+  #
+  #   * REFUSED. Where the entry-point park is unavailable (ARM64, a 32-bit
+  #     child), the injector still declines a fork-runtime image outright
+  #     and names the runtime in the loss.
+  #   * INJECTED AND SILENT. Where the park works, the root IS injected --
+  #     that is the whole point of the park -- and this probe deliberately
+  #     points `REPRO_MONITOR_SHIM_LIB` at `kernel32.dll`, a library with no
+  #     `repro_runtime_init`, so the child comes up with nothing hooked and
+  #     emits no records. The merge then finds the root pid the launcher
+  #     said to expect and no `process-start` for it, and reports the same
+  #     unmonitored-subtree loss. (That pairing is io-mon's own
+  #     "an injected child that reports nothing is not an uninjected
+  #     child"; without it this arm would grade COMPLETE over a subtree
+  #     nothing watched, which is the one outcome that must never happen.)
+  #
+  # What is NOT relaxed: there must still be an `mrEventLoss` that says
+  # `unmonitored subtree/peer`, and `completeness` above must still be
+  # `mcIncomplete`. A run that simply stopped reporting the loss fails here
+  # exactly as it did before.
   for record in monitored.records:
     if record.kind == mrEventLoss and
         record.detail.startsWith("unmonitored subtree/peer") and
-        windowsForkRuntimeForExecutable(shell) in record.detail:
+        (windowsForkRuntimeForExecutable(shell) in record.detail or
+         "missing process-start" in record.detail):
       return 0
   4
 
