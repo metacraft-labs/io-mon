@@ -2613,7 +2613,8 @@ proc mergeFragments*(fragmentDir, outputPath: string;
     breakawayReportDir = ""; expectedRootPid: uint64 = 0;
     currentRunId = "";
     setRecords: openArray[MonitorRecord] = @[];
-    observedInterest: set[EventCategory] = {}): MonitorDepFile =
+    observedInterest: set[EventCategory] = {};
+    observedEvidenceScope: EvidenceScope = esFull): MonitorDepFile =
   ## io-mon-Lossless-Event-Capture M3 — `setRecords` are the DISTINCT records the
   ## consumer decoded from the edge's shared-memory SET (nim-shm-gset) snapshot
   ## (the sole Linux dependency transport; see fs_snoop). They are folded into the
@@ -2905,6 +2906,33 @@ proc mergeFragments*(fragmentDir, outputPath: string;
     for record in records.mitems:
       if record.kind == mrBackendProfile:
         record.detail.add interestToken
+
+  # DA-1i — STAMP HOW MUCH OF WHAT WAS OBSERVED THIS CAPTURE WROTE DOWN, in the
+  # same place and before the same write, so the on-disk depfile and the
+  # returned value cannot disagree about it either.
+  #
+  # THE HOST'S SCOPE, never the shim's, for the reason the interest stamp gives
+  # one line up: the host-side filter in `fs_snoop` is the declared source of
+  # truth for what the depfile contains — an older shim that ignores
+  # REPRO_MONITOR_EVIDENCE still yields a correctly filtered result — so the
+  # stamp must describe THE RESULT rather than the request.
+  #
+  # ONLY A NARROWING IS STATED. `esFull` is left unstamped because "not stated"
+  # has always meant exactly `esFull` (see `effectiveObservedEvidenceScope`), so
+  # stamping it would say nothing new while changing the profile-detail bytes of
+  # every capture that exists — and the depfile is byte-reproducible on purpose.
+  # `esUnrecognized` is not a scope this build can be asked for and has no
+  # spelling (`evidenceScopeToken` returns ""), so the guard excludes it too
+  # rather than writing an empty `evidence=` that would read back as unevaluable.
+  #
+  # GRADED END TO END: `tests/posix/test_io_mon_cli_evidence_scope.nim` runs the
+  # real CLI twice on one command and compares the two depfiles' stamps against
+  # what was asked for on the command line. Deleting this block reddens it.
+  if observedEvidenceScope != esFull and observedEvidenceScope != esUnrecognized:
+    let evidenceToken = ";evidence=" & evidenceScopeToken(observedEvidenceScope)
+    for record in records.mitems:
+      if record.kind == mrBackendProfile:
+        record.detail.add evidenceToken
 
   writeCanonicalInPlace(outputPath, records)
   depFileFromOwnedRecords(move(records))

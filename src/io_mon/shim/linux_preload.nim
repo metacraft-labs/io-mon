@@ -79,6 +79,12 @@ var
   # is never told an interest captures everything (back-compat). See
   # docs/contributors/event-interest-filter.md.
   gInterest: set[EventCategory] = FullInterest
+  # DA-1i — the consumer's evidence scope (REPRO_MONITOR_EVIDENCE). Same
+  # discipline as `gInterest`: set ONCE at init and only read thereafter, so the
+  # concurrent reads in `emitRecord` need no lock. `esFull` until init runs and
+  # if the var is absent, so a shim that is never told a scope writes everything
+  # down (back-compat).
+  gEvidenceScope: EvidenceScope = esFull
   # DEP-SHM-2 — the shared-memory dependency-queue segment path (the value of
   # REPRO_MONITOR_DEP_SHM). Empty when the engine did not create a ring, in
   # which case every record takes the file path unchanged. Remembered so the
@@ -932,6 +938,26 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
   # (LF-1: that would risk a false `mcComplete`).
   if not recordWanted(gInterest, record.kind):
     return
+  # DA-1i — evidence-scope gate, RIGHT HERE and not at the host, because the
+  # whole point of `--evidence=reads-only` is to MEASURE what the records cost:
+  # a mode that publishes the record and filters it later saves nothing and
+  # measures nothing. So the expensive part — the gset insert + dedup, or the
+  # fragment write — is what this skips.
+  #
+  # A DIFFERENT PREDICATE FROM THE ONE ABOVE, deliberately. `recordWanted` gates
+  # on the record's KIND; this gates on its RESULT, and no refinement of
+  # `EventCategory` can do it because success is not a kind (measured: gating a
+  # probes category yields 41,736 records where `reads-only` means 23,049,
+  # discarding 2,066 successful probes and keeping 20,753 failed opens).
+  #
+  # `recordIsFailedExistenceLookup` answers false for every META kind BY
+  # CONSTRUCTION — it asks `categoryOf`, the one definition of what META is — so
+  # exactly as with `recordWanted` above, a narrowed capture can never drop an
+  # `mrEventLoss` and manufacture a false `mcComplete` (LF-1). That is asserted
+  # exhaustively over `MonitorRecordKind` in
+  # `tests/portable/test_io_mon_evidence_scope.nim`, not left to this comment.
+  if not recordInEvidenceScope(gEvidenceScope, record):
+    return
   # M9.R.62.2 — refresh the diagnostic context on every emit so an
   # unmatched pending marker carries the LAST-observed record kind
   # instead of the stale "phase=init" from the constructor. A process
@@ -1446,6 +1472,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     fragmentDir = getEnv("REPRO_MONITOR_FRAGMENT_DIR")
     runId = getEnv("REPRO_MONITOR_SESSION")
     gInterest = parseInterestTokens(getEnv("REPRO_MONITOR_INTEREST"))
+    gEvidenceScope = parseEvidenceScopeToken(getEnv("REPRO_MONITOR_EVIDENCE"))
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))
     # DEP-SHM-2 — attach the process to the edge's shared-memory dependency

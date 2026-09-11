@@ -824,6 +824,63 @@ proc parseInterestFlag(value: string): set[EventCategory] =
       " (expected a comma-separated subset of " &
       interestToTokens(FullInterest) & ")")
 
+proc parseEvidenceScopeFlag(value: string): EvidenceScope =
+  ## Decode `--evidence`'s value — the SAME token vocabulary
+  ## `REPRO_MONITOR_EVIDENCE` and the depfile's `evidence=` stamp use
+  ## (`full`, `reads-only`), so the CLI, the env channel and the wire format are
+  ## one vocabulary with one codec (`evidenceScopeToken` /
+  ## `parseEvidenceScopeToken`).
+  ##
+  ## ABSENT FLAG ⇒ `esFull`, and like `--interest` that is a deliberate choice
+  ## rather than a default that fell out. `FsSnoopRequest.evidenceScope`
+  ## zero-initialises to `esFull`, so every caller that does not pass the flag
+  ## keeps EXACTLY today's behaviour. The failure mode of forgetting the flag is
+  ## over-capture — slower, larger, still honest — and never under-capture.
+  ##
+  ## AN UNKNOWN VALUE IS REFUSED, unlike `--interest`'s tolerance of an unknown
+  ## token BESIDE known ones. There is no "beside" here: the flag names exactly
+  ## one scope, so an unrecognised value is either an operator typo or a scope
+  ## this build genuinely cannot implement, and in both cases silently widening
+  ## it to `esFull` would discard the caller's reduction without a word. This is
+  ## also what keeps `esUnrecognized` unreachable from the request side, which
+  ## the gate and the stamp both rely on.
+  ##
+  ## AN EMPTY VALUE IS REFUSED TOO, AND IN THE SCOPE VOCABULARY. `--evidence=`
+  ## and `--evidence ""` are not the absent flag: the operator WROTE the flag and
+  ## named no scope, so the honest diagnostic is the one this flag owns rather
+  ## than the parser's generic "unsupported fs-snoop argument", which told them
+  ## the flag does not exist when in fact only the value was missing. BOTH
+  ## spellings, because the two forms of every other flag here mean the same
+  ## thing and a diagnostic that depended on which one was typed would be its own
+  ## defect.
+  ##
+  ## DELIBERATELY UNLIKE `parseInterestFlag` DIRECTLY ABOVE, which widens an
+  ## empty value to `FullInterest`. That is right there and wrong here for a
+  ## reason about the TYPES, not about taste: `--interest` names a SET, the empty
+  ## set is a legal value of that type, and `normalizeInterest` has always read
+  ## it as "unset". `--evidence` names exactly ONE scope; there is no empty
+  ## scope, so an empty value is not a value at all.
+  ##
+  ## Also deliberately the OPPOSITE of `parseEvidenceScopeToken("")`: on the ENV
+  ## channel an empty `REPRO_MONITOR_EVIDENCE` means "nothing was said, write
+  ## everything down", while on a command line the flag's PRESENCE already proves
+  ## the operator meant to say something. Same overload, and each of the three
+  ## channels resolves it as its own evidence demands — the depfile channel the
+  ## third way again (`;evidence=` reads back as `esUnrecognized`, never as full
+  ## scope).
+  let trimmed = value.strip()
+  if trimmed.len == 0:
+    raise newException(ValueError,
+      "--evidence names no evidence scope: the value is empty" &
+      " (expected one of " & evidenceScopeToken(esFull) & ", " &
+      evidenceScopeToken(esReadsOnly) & ")")
+  result = parseEvidenceScopeToken(trimmed)
+  if result == esUnrecognized:
+    raise newException(ValueError,
+      "--evidence names no known evidence scope: " & value &
+      " (expected one of " & evidenceScopeToken(esFull) & ", " &
+      evidenceScopeToken(esReadsOnly) & ")")
+
 proc requireValue(args: seq[string]; index: var int; flag: string): string =
   if index + 1 >= args.len:
     raise newException(ValueError, flag & " requires a value")
@@ -892,6 +949,18 @@ proc parseRun(args: seq[string]): ParsedFsSnoopCommand =
       # `parseInterestFlag` for the absent-flag semantics.
       result.request.interest =
         parseInterestFlag(requireValue(args, i, "--interest"))
+    of "--evidence":
+      # DA-1i — how much of what the monitor observes gets written down.
+      # `--evidence=reads-only` records only lookups that FOUND something.
+      # HAZARD, named here because an operator choosing this flag is accepting a
+      # specific one: a file ADDED that shadows one earlier in a search path
+      # will NOT invalidate the action, so `repro build` can report "up to date"
+      # while the previous artefacts were compiled against the shadowed file.
+      # Modified and deleted inputs are still detected. This is ninja's own
+      # stale-build failure mode, reproduced deliberately so the two evidence
+      # models can be compared like for like.
+      result.request.evidenceScope =
+        parseEvidenceScopeFlag(requireValue(args, i, "--evidence"))
     of "--capture-stdio":
       # Flag form (no value) — turn capture on; subsequent
       # ``--capture-stdio-path=…`` controls where the captured bytes
@@ -907,6 +976,15 @@ proc parseRun(args: seq[string]): ParsedFsSnoopCommand =
       let formatValue = splitFlagValue(arg, "--format")
       let streamValue = splitFlagValue(arg, "--event-stream")
       let interestValue = splitFlagValue(arg, "--interest")
+      let evidenceValue = splitFlagValue(arg, "--evidence")
+      # PRESENCE, not a non-empty value. `splitFlagValue` cannot tell
+      # `--evidence=` (the flag written with no scope) from an argument that is
+      # not `--evidence` at all, and dispatching on `evidenceValue.len > 0`
+      # sent the empty form to the catch-all — where it was refused as an
+      # "unsupported fs-snoop argument", telling the operator the flag does not
+      # exist when only its value was missing. `parseEvidenceScopeFlag` owns the
+      # empty case and answers in the scope vocabulary.
+      let evidenceGiven = arg.startsWith("--evidence=")
       let stdioPathValue = splitFlagValue(arg, "--capture-stdio-path")
       if depValue.len > 0:
         result.request.depFilePath = depValue
@@ -919,6 +997,8 @@ proc parseRun(args: seq[string]): ParsedFsSnoopCommand =
         result.request.eventStreamPath = streamValue
       elif interestValue.len > 0:
         result.request.interest = parseInterestFlag(interestValue)
+      elif evidenceGiven:
+        result.request.evidenceScope = parseEvidenceScopeFlag(evidenceValue)
       elif stdioPathValue.len > 0:
         result.request.captureStdioPath = stdioPathValue
         result.request.captureChildStdio = true
@@ -1110,6 +1190,16 @@ proc childEnv(request: FsSnoopRequest;
   # shim distinguishes "capture all" from "unset". See
   # docs/contributors/event-interest-filter.md.
   result["REPRO_MONITOR_INTEREST"] = interestToTokens(request.interest)
+  # DA-1i — the evidence scope, on the same io-mon injection channel and for the
+  # same reason: it is the SHIM's to read at init, not the caller's to set in
+  # this process's environment, so the injection deliberately wins over any
+  # inherited value. Always written (never empty, even for `esFull`) so the shim
+  # can tell "record everything" from "unset" without the two colliding — the
+  # same property `interestToTokens` gives the interest channel. A shim that
+  # predates this variable simply ignores it and records everything; the
+  # host-side filter below then produces the correctly narrowed result anyway,
+  # which is why the stamp describes the host's scope and not the shim's.
+  result["REPRO_MONITOR_EVIDENCE"] = evidenceScopeToken(request.evidenceScope)
 
 proc injectionValue(shimLib, existing: string): string =
   ## Prepend the shim to whatever the child's preload list would otherwise be.
@@ -1912,7 +2002,8 @@ proc collectMonitorEvidence(h: var MonitorHandle): MonitorDepFile =
   when defined(macosx):
     result = mergeFragments(h.fragmentDir, h.request.depFilePath,
       expectedRootPid = h.rootPid,
-      observedInterest = normalizeInterest(h.request.interest))
+      observedInterest = normalizeInterest(h.request.interest),
+      observedEvidenceScope = h.request.evidenceScope)
   elif defined(linux):
     # io-mon-Lossless-Event-Capture M3 part 2a — SINGLE-THREADED final merge over
     # the SET's DISTINCT elements. The DEP-FLUSH shutdown guarantees every producer
@@ -1953,7 +2044,8 @@ proc collectMonitorEvidence(h: var MonitorHandle): MonitorDepFile =
     result = mergeFragments(h.fragmentDir, h.request.depFilePath,
       expectedRootPid = h.rootPid, currentRunId = h.runId,
       setRecords = depDrained,
-      observedInterest = normalizeInterest(h.request.interest))
+      observedInterest = normalizeInterest(h.request.interest),
+      observedEvidenceScope = h.request.evidenceScope)
   elif defined(windows):
     var launcherRecords: seq[MonitorRecord] = @[]
     if h.injection.monitoringSkipped:
@@ -1986,7 +2078,8 @@ proc collectMonitorEvidence(h: var MonitorHandle): MonitorDepFile =
     # cache hit for the whole action — and is now downgraded to `mcIncomplete`.
     result = mergeFragments(h.fragmentDir, h.request.depFilePath,
       expectedRootPid = h.rootPid, setRecords = launcherRecords,
-      observedInterest = normalizeInterest(h.request.interest))
+      observedInterest = normalizeInterest(h.request.interest),
+      observedEvidenceScope = h.request.evidenceScope)
 
   # Host-side event-interest filter (belt-and-suspenders — see
   # docs/contributors/event-interest-filter.md §5). The shim is meant to skip
@@ -1998,12 +2091,35 @@ proc collectMonitorEvidence(h: var MonitorHandle): MonitorDepFile =
   # unaffected — disabling a category is a consumer choice, not data loss. Only
   # when the interest is reduced AND something was actually dropped do we
   # re-summarize and re-write the on-disk depfile to match the in-memory result.
-  if normalizeInterest(h.request.interest) != FullInterest:
+  #
+  # DA-1i — THE SAME ARGUMENT ON THE OTHER AXIS, and the reason both filters are
+  # one pass. The shim also skips FAILED EXISTENCE LOOKUPS under
+  # `--evidence=reads-only`, so with a current shim nothing is dropped here
+  # either; but the host is equally the source of truth for what the depfile
+  # contains, and an older shim that ignores REPRO_MONITOR_EVIDENCE must still
+  # yield a correctly narrowed result. The two predicates are COMPOSED, never
+  # conflated: `recordWanted` gates on the record's KIND, `recordInEvidenceScope`
+  # on its RESULT, and no category gate can express the second (success is not a
+  # kind — DA-1j measured a category split reaching 41,736 records where
+  # `reads-only` means 23,049).
+  #
+  # `completeness` IS DELIBERATELY NOT RECOMPUTED. Both predicates keep every
+  # META/loss record by construction, so `summarizeRecords` returns the same
+  # `eventLossCount` over the kept set and nothing here could move the grade even
+  # if it were recomputed — but the stronger statement is the intended one: a
+  # narrowing is the operator asking a narrower question, not the monitor failing
+  # to observe something, and only the latter is what `mcIncomplete` means.
+  let evidenceScope = h.request.evidenceScope
+  if normalizeInterest(h.request.interest) != FullInterest or
+     evidenceScope != esFull:
     var kept: seq[MonitorRecord] = @[]
     var dropped = false
     for rec in result.records:
-      if recordWanted(h.request.interest, rec.kind): kept.add rec
-      else: dropped = true
+      if recordWanted(h.request.interest, rec.kind) and
+         recordInEvidenceScope(evidenceScope, rec):
+        kept.add rec
+      else:
+        dropped = true
     if dropped:
       result.records = kept
       result.summary = summarizeRecords(kept)

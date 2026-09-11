@@ -202,6 +202,63 @@ type
                      ## mrExternalContent
     ecIpc            ## mrIpcConnect
 
+  EvidenceScope* = enum
+    ## DA-1i — HOW MUCH OF WHAT THE MONITOR OBSERVES IS WRITTEN DOWN.
+    ##
+    ## A DIFFERENT AXIS FROM `EventCategory`, and the difference is structural
+    ## rather than a matter of degree. `EventCategory` gates on the KIND of an
+    ## observation; this gates on its RESULT. Measured on one `nim c`:
+    ##
+    ##   total records                                        66,996
+    ##   drop every FAILED lookup — what `esReadsOnly` means   23,049
+    ##   gate a probes *category* instead                      41,736
+    ##
+    ## The category gate discards 2,066 SUCCESSFUL probes it should keep and
+    ## leaves 20,753 FAILED `mrFileOpen`s it should drop, because **success is
+    ## not a kind**. So no split of `EventCategory` can express this and the two
+    ## axes are composed, never conflated: a record is written iff its category
+    ## is wanted AND its result is in scope.
+    ##
+    ## NOT a completeness input. Narrowing the scope is the operator answering a
+    ## narrower question honestly, not the monitor failing to observe something,
+    ## and `mcIncomplete` means the latter. Conflating them corrupts exactly the
+    ## signal DA-2/DA-4 exist to make trustworthy — see `MonitorCompleteness`.
+    ##
+    ## NOT a cache-key component either. Trust here is a PARTIAL ORDER, not a
+    ## partition: full evidence is strictly STRONGER than reads-only evidence, so
+    ## a reads-only consumer must accept a full capture while a strict consumer
+    ## rejects a narrowed one. Keying on the scope would make the two disjoint
+    ## and block the useful direction — the careful teammate publishes and the
+    ## fast teammate cannot consume.
+    esFull = 0        ## Every observation, including lookups that found nothing.
+                      ## The DEFAULT and the ZERO VALUE, so a zero-initialised
+                      ## request and a depfile written before this existed both
+                      ## mean "full" with no special case anywhere.
+    esReadsOnly       ## Drop FAILED EXISTENCE lookups — see
+                      ## `recordIsFailedExistenceLookup` for the exact predicate
+                      ## and for what it deliberately does not touch. Reproduces
+                      ## the evidence model of a compiler-emitted depfile
+                      ## (`gcc -MD` lists headers opened, never headers searched
+                      ## for), and with it ninja's precise one-directional
+                      ## unsoundness: a file ADDED that shadows one earlier in a
+                      ## search path does not invalidate. Modified and deleted
+                      ## inputs are still caught. One more shape is invisible for
+                      ## the SAME reason, and the fields are why: a lookup that
+                      ## failed for a reason OTHER than absence (`EACCES`,
+                      ## `EISDIR`, `ELOOP`) is dropped too, because no errno
+                      ## reaches `MonitorRecord` — so a file that exists but
+                      ## could not be opened, later becoming openable, does not
+                      ## invalidate either. Row 4 of the hazard table; see
+                      ## `recordIsFailedExistenceLookup`.
+    esUnrecognized    ## READ SIDE ONLY, and never producible by parsing a token
+                      ## this build knows: the depfile states a scope written in
+                      ## a vocabulary this build does not have (`evidence=
+                      ## writes-only` from a future io-mon). It is NOT full
+                      ## scope, and it is not any scope this build can evaluate,
+                      ## so it covers NOTHING and every consumer rejects it. The
+                      ## CLI cannot produce it (`parseEvidenceScopeFlag` refuses
+                      ## an unknown value) and the gate never sees it.
+
   ProbeResult* = enum
     prUnknown = 0
     prAbsent = 1
@@ -443,6 +500,36 @@ type
     ## attribution-not-suppression rule the unnamable-capability diagnostic
     ## follows in `profileFromRecords`.
     observedInterestTokens*: string
+    ## DA-1i — HOW MUCH OF WHAT WAS OBSERVED THIS CAPTURE WROTE DOWN.
+    ##
+    ## `observedInterest` above says which KINDS the capture was asked for; this
+    ## says which RESULTS it was asked to keep. Two axes, because a category gate
+    ## provably cannot express `reads-only` (see `EvidenceScope`), and the file
+    ## has to state both or a consumer cannot tell a capture that omitted every
+    ## failed lookup from one that omitted nothing.
+    ##
+    ## Same three-field shape as `observedInterest`, and for the same reason it
+    ## has three fields rather than one: a future io-mon writing
+    ## `evidence=writes-only` must NOT read as `esFull` here. Absent ⇒ full scope
+    ## (an old depfile keeps its meaning); present-but-unrecognised ⇒ REJECT,
+    ## with the token retained so the residual is nameable.
+    ##
+    ## READ THIS THROUGH `effectiveObservedEvidenceScope` /
+    ## `observedEvidenceScopeCovers`, NOT DIRECTLY.
+    ##
+    ## NOT a completeness input and NOT a cache-key component — see
+    ## `EvidenceScope` for both arguments.
+    observedEvidenceScope*: EvidenceScope
+    ## Was an evidence scope stated AT ALL? False for every depfile written
+    ## before the stamp existed, and for a capture at `esFull` — which is the
+    ## same claim, since `esFull` is what an unstamped file has always meant. So
+    ## a full capture's bytes are unchanged by this field's existence.
+    observedEvidenceScopeStated*: bool
+    ## The stamp VERBATIM, exactly as the producer wrote it (empty when nothing
+    ## was stated). Kept so a consumer can report "this capture declares
+    ## `writes-only`, which I cannot evaluate" instead of "this capture declares
+    ## something" — attribution, not mere detection.
+    observedEvidenceScopeToken*: string
     records*: seq[MonitorRecord]
 
   MonitorDepFileReaderOptions* = object
@@ -560,6 +647,13 @@ type
     # captures everything (the safe, back-compatible default) rather than
     # silently disabling all observation. META/loss records are never gated.
     interest*: set[EventCategory]
+    # DA-1i — how much of what is observed this capture writes down. `esFull`
+    # (the zero value) records everything, which is what every caller got before
+    # this field existed. `esReadsOnly` drops FAILED existence lookups: io-mon
+    # still observes them, the shim skips publishing them and the host filter
+    # drops any an older shim published anyway. Not a completeness input and not
+    # a cache-key component — see `EvidenceScope`.
+    evidenceScope*: EvidenceScope
 
 const
   IomonVersion* = 1'u16
@@ -638,6 +732,281 @@ func recordWanted*(interest: set[EventCategory]; kind: MonitorRecordKind): bool 
   let c = categoryOf(kind)
   if c.isNone: true
   else: c.get in normalizeInterest(interest)
+
+# ---------------------------------------------------------------------------
+# Evidence scope — DA-1i. A predicate on the RESULT of a lookup, composed with
+# (never folded into) the event-interest predicate on its KIND.
+# ---------------------------------------------------------------------------
+
+func recordIsFailedExistenceLookup*(record: MonitorRecord): bool =
+  ## Did this record observe an EXISTENCE LOOKUP THAT DID NOT SUCCEED? The whole
+  ## of what `esReadsOnly` drops, in one place, so the shim gate and the host
+  ## filter cannot disagree about what "reads only" means.
+  ##
+  ## The question is deliberately weaker than "did the path turn out to be
+  ## absent?", because that is a question these fields cannot answer — see
+  ## "LOOKUPS THAT DID NOT SUCCEED" below, which is the whole of the difference
+  ## and the reason the hazard table has a fourth row.
+  ##
+  ## META AND LOSS KINDS CANNOT BE DROPPED, and the protection is STRUCTURAL in
+  ## two independent ways rather than a matter of remembering them:
+  ##
+  ##   * The `case` below is EXHAUSTIVE — no `else` — exactly as `categoryOf` is,
+  ##     so a `MonitorRecordKind` added later is a COMPILE ERROR here until
+  ##     someone classifies it. It cannot inherit an answer by default.
+  ##   * The guard on the first line asks `categoryOf`, the one definition of
+  ##     what META is, so the two cannot drift apart even if the META arm below
+  ##     were mis-edited. It is deliberately REDUNDANT with that arm (deleting it
+  ##     changes no behaviour today); it is defence in depth and a statement of
+  ##     where the definition lives, not the sole protection.
+  ##
+  ## Why this matters more than it looks: a narrowing that could drop an
+  ## `mrEventLoss` would manufacture a false `mcComplete` out of a capture that
+  ## lost data (LF-1), which is the cardinal sin this project is organised
+  ## around. `recordWanted` holds the same line for the same reason, and
+  ## `tests/portable/test_io_mon_evidence_scope.nim` asserts it EXHAUSTIVELY over
+  ## `MonitorRecordKind` — offering every kind the exact record shape that makes
+  ## the three lookup kinds droppable — rather than trusting either comment.
+  ##
+  ## LOOKUPS THAT DID NOT SUCCEED — NOT PROVEN ABSENCES. Read this before
+  ## widening any arm, and before restoring the stronger sentence that used to
+  ## stand here ("a failure is an error, not an absence"). THE RECORD SHAPE
+  ## CANNOT DRAW THAT LINE:
+  ##
+  ##   * `result` is the raw call return, and `open`/`openat` answer **-1 for
+  ##     every failure** whatever the reason;
+  ##   * `probeFromResult` stamps **`prAbsent` on every non-zero `stat`
+  ##     return**, again whatever the reason;
+  ##   * **no errno reaches `MonitorRecord`.** There is no field for it and no
+  ##     shim carries one.
+  ##
+  ## So `result < 0` and `prAbsent` mean "the call FAILED", never "the path is
+  ## ABSENT", and four measured shapes where the path EXISTS are dropped here:
+  ## `EACCES` (a mode-000 `open`), `EISDIR`, `EACCES` on a `stat` through a
+  ## no-exec directory, and `ELOOP`. On a real `nim c`, 5 of 2,104 dropped
+  ## records name an existing path (all `/dev/tty`, `ENXIO`).
+  ##
+  ## THAT IS THE NARROWING, STATED RATHER THAN PAPERED OVER. `esReadsOnly` keeps
+  ## the lookups that FOUND SOMETHING USABLE — the evidence a compiler-emitted
+  ## depfile carries — and an errored lookup found nothing usable. The
+  ## consequence is a staleness blind spot, and it is written down as such: ROW 4
+  ## of the normative hazard table (`docs/usage.md`,
+  ## `docs/contributors/evidence-scope.md`, and reprobuild's `CLI/build.md`) says
+  ## that a file which exists but could not be OPENED, later becoming openable (a
+  ## `chmod`, a directory replaced by a file), is invisible under `reads-only` —
+  ## for the same reason row 3's added file is: **it is not recorded at all**, so
+  ## row 1 ("a recorded file is modified ⇒ detected") never reaches it.
+  ##
+  ## THE ALTERNATIVE, NAMED SO THIS IS A CHOICE AND NOT AN OVERSIGHT: carry the
+  ## distinguishing fact — errno, or at minimum an ENOENT/ENOTDIR-vs-everything-
+  ## else bit — and drop only proven absences. THE WIRE WOULD NOT OBJECT:
+  ## `MonitorRecord.detail` is a free string every backend already writes, and
+  ## the `.iomon` envelope carries only RECORDS (`depFileFromOwnedRecords`
+  ## reconstructs `profile`, `capabilityGaps`, `requiredFeatures`, `completeness`
+  ## and `summary` from them), so no version bump and no format break would be
+  ## needed. Two costs are why it was not done here, and both are larger than the
+  ## 0.24% they buy:
+  ##     THREE BACKENDS — AND THE COST IS NOT WHERE THIS BULLET USED TO PUT IT.
+  ##     It said macOS sites "would each have to capture errno before any
+  ##     intervening libc call clobbers it". THE CAPTURE IS ALREADY THERE, on
+  ##     every backend, at exactly the required position, put there for an
+  ##     unrelated reason (preserving the tracee's errno across the hook):
+  ##     `linux_preload` takes `c_get_errno()`, `macos_interpose` `getErrno()`
+  ##     and `windows_interpose` `GetLastError()` on the line AFTER the real
+  ##     call and BEFORE anything that could clobber it. One Windows probe
+  ##     site's comment already reads "ERROR_FILE_NOT_FOUND on absent path".
+  ##     Do not restore that claim. What WOULD have to be built is two other
+  ##     things, and they are the honest cost:
+  ##       - PLUMBING, not capture. The saved value is a LOCAL IN THE HOOK,
+  ##         while the record is built one or two frames down in helpers
+  ##         (`recordOpen`, `recordPathProbe`, `probeFromResult`,
+  ##         `recordFailedOpenCanonical`, `recordCanonicalPathProbe`, …) that
+  ##         receive the CALL RESULT and not the errno. Counted over the procs
+  ##         that build a droppable record without the saved value in scope:
+  ##         **~16 on macOS, ~5 on Linux, ~4 on Windows**. Every one is a
+  ##         signature change on a hot path.
+  ##       - THREE ERROR VOCABULARIES, and Windows has two of its own: a
+  ##         negative NTSTATUS on the `Nt*` arms and a positive Win32 code on
+  ##         the `GetLastError` arms. "Which values mean absent" therefore has
+  ##         to be answered three-and-a-half times, in three files.
+  ##     Until it is, this predicate's fail-toward-keeping rule makes
+  ##     `reads-only` stop reducing ANYTHING on the backends that have not been
+  ##     classified — a far bigger behaviour change than the blind spot it
+  ##     closes. THAT consequence is the load-bearing half of this bullet.
+  ##   * AND THERE IS NO SPARE FIELD THAT IS ALSO FREE. Stated carefully,
+  ##     because the obvious objection to the previous wording is correct:
+  ##     "carrying errno grows the `full` arm" is true of ONE carrier and false
+  ##     of the other, and `full` is the BASELINE DA-1i exists to measure the
+  ##     per-record cost against, so which carrier is meant decides the
+  ##     argument. MEASURED on the real encoder, over a real failed-open record:
+  ##       - `detail` — the free string the paragraph above says the wire would
+  ##         not object to — costs **+7 bytes on a 126-byte record** for an
+  ##         `errno=2` suffix, i.e. **+5.2%** on this fixture's `full` arm. Real,
+  ##         and it moves the measurement.
+  ##       - `result` would cost **NOTHING**: it is a FIXED-WIDTH `int64`
+  ##         (`writeI64Le` → `writeU64Le`), so -1, -2 and -13 all encode in the
+  ##         same 126 bytes, and `result < 0` would still select every failure.
+  ##         But it is NOT AVAILABLE, and that is the real objection rather than
+  ##         a cost one: `result` is defined as the RAW CALL RETURN, and Windows
+  ##         already spends its sign on NTSTATUS, so a `-errno` and a genuine
+  ##         negative status could not be told apart in the one field.
+  ##     So the cheap carrier is the one the wire cannot spare, and the carrier
+  ##     the wire can spare is the one that moves the measurement.
+  ##
+  ## FAILS TOWARD KEEPING. Every arm answers `true` only where the record PROVES
+  ## the lookup DID NOT SUCCEED, and anything unproven is kept:
+  ##   * `mrPathProbe` — `prAbsent` is the classification both POSIX shims and
+  ##     the Windows `probeFromBool` sites already write. Some Windows probe
+  ##     sites (the `NtCreateFile`/`NtQueryAttributesFile` arms) leave
+  ##     `probeResult` at `prUnknown` and carry a negative NTSTATUS instead, so
+  ##     that pairing counts too.
+  ##   * `mrFileOpen` — a negative result. `open`/`openat` return -1, Windows
+  ##     `CreateFileW` records `INVALID_HANDLE_VALUE` (-1) and the NT arm a
+  ##     negative NTSTATUS. A FAILED `fopen` records the NULL `FILE*` as 0 and
+  ##     is therefore KEPT — deliberately, because 0 is also a legal fd, and
+  ##     dropping a successful `open` that happened to get fd 0 would remove a
+  ##     real input. Over-keeping costs records; under-keeping costs
+  ##     correctness.
+  ##   * `mrDirectoryEnumerate` — a negative result. Every current backend emits
+  ##     this only for an enumeration that succeeded (`result = 1`), so this arm
+  ##     is a guard against a future backend that records failures, not a live
+  ##     reducer.
+  ##
+  ## A READ IS NEVER DROPPED, AND NOT FOR THE REASON THIS COMMENT USED TO GIVE.
+  ## It said a failed `mrFileRead` is "an error the consumer must still see",
+  ## presented as a live case this arm protects. THAT CASE IS NOT LIVE ON LINUX.
+  ## Counted: `linux_preload.nim` builds an `mrFileRead` at SIX sites, and not
+  ## one of them can emit a negative result —
+  ##   * four guard on the byte count: `recordFdRead`, `repro_hook_fread` and
+  ##     the `sendfile` arm on `> 0`, `recordRawSplice` on `> 0`, and
+  ##     `recordRawRead` returning early on a negative result;
+  ##   * two hard-code `result = 0`: `recordPathRead` and the inherited-fd
+  ##     reclassification in `classifyEmptyFdRead`.
+  ## WHAT IS LIVE, AND IS KEPT: SHORT reads (`0 < n < requested`) and zero-length
+  ## reads at EOF, emitted with their real byte count, plus those two synthetic
+  ## `result = 0` reads. None of them is an existence lookup, so none is
+  ## droppable. The arm is therefore a GUARD exactly as
+  ## `mrDirectoryEnumerate`'s is — against a future backend that does record
+  ## failed reads, and against anyone widening `mrFileOpen`'s `result < 0` test
+  ## to everything that touches a file — and not a live reducer.
+  if categoryOf(record.kind).isNone:
+    return false
+  case record.kind
+  of mrPathProbe:
+    record.probeResult == prAbsent or
+      (record.probeResult == prUnknown and record.result < 0)
+  of mrFileOpen, mrDirectoryEnumerate:
+    record.result < 0
+  of mrFileRead, mrFileWrite, mrPathMutation:
+    # File-touching, and NOT existence lookups: the path was already in hand, so
+    # whatever these report is not the answer to "is there something here?". A
+    # guard, not a live reducer — see "A READ IS NEVER DROPPED" above.
+    false
+  of mrProcessStart, mrProcessExec, mrProcessSpawn, mrLibraryLoad,
+     mrNonDeterministic, mrTimeRead, mrEnvRead, mrSysctlRead,
+     mrExternalContent, mrIpcConnect:
+    # Not lookups at all. `mrIpcConnect` and `mrExternalContent` are also
+    # COMPLETENESS-BEARING (`mergeFragments` derives a synthetic `mrEventLoss`
+    # from them), so dropping either would move the grade — which this axis must
+    # never do.
+    false
+  of mrEventLoss, mrBackendProfile, mrCapabilityGap:
+    # THE LF-1 ARM. META kinds carry the loss markers and the provenance a
+    # completeness verdict is derived from. `false` here is not a default: it is
+    # the statement that no narrowing may ever suppress them.
+    false
+
+func recordInEvidenceScope*(scope: EvidenceScope;
+                            record: MonitorRecord): bool =
+  ## Should this record be written down under `scope`? The RESULT-side half of
+  ## the gate, to be composed with `recordWanted`'s KIND-side half.
+  ##
+  ## `esUnrecognized` records EVERYTHING. It can only arrive from reading a
+  ## depfile a newer io-mon wrote, never from this build's CLI or from
+  ## `FsSnoopRequest`, and if it somehow reached a gate the safe direction is to
+  ## capture more rather than less — an over-full capture is slower and still
+  ## honest; an under-full one is the cardinal sin.
+  case scope
+  of esFull, esUnrecognized: true
+  of esReadsOnly: not recordIsFailedExistenceLookup(record)
+
+const
+  # Wire tokens for `REPRO_MONITOR_EVIDENCE` (the env channel to the shim) and
+  # for the `evidence=` stamp on the backend-profile record. ONE vocabulary for
+  # both channels and one codec, exactly as `interestTokenPairs` is for the
+  # interest axis. `esUnrecognized` is deliberately absent: it is what a token
+  # NOT in this table parses to, so giving it a token of its own would make it
+  # producible and destroy the distinction it exists to draw.
+  evidenceScopeTokenPairs = [
+    (esFull, "full"), (esReadsOnly, "reads-only")]
+
+func evidenceScopeToken*(scope: EvidenceScope): string =
+  ## Encode a scope as its wire token. `esUnrecognized` has no spelling — it is
+  ## a READING, not a scope — so it encodes as the empty string, and every write
+  ## site guards against handing it here.
+  for (value, token) in evidenceScopeTokenPairs:
+    if value == scope: return token
+  ""
+
+func parseEvidenceScopeToken*(s: string): EvidenceScope =
+  ## Decode a wire token. Empty/absent ⇒ `esFull` — an absent
+  ## `REPRO_MONITOR_EVIDENCE` means "write everything down", which is what every
+  ## shim did before this existed. An unknown token ⇒ `esUnrecognized` rather
+  ## than `esFull`: on the ENV channel that is a shim being told about a scope a
+  ## newer host knows and it captures everything (the host filter is the source
+  ## of truth for the result); on the FILE channel it is the reading that makes
+  ## a future narrowing reject instead of silently passing as full.
+  let trimmed = s.strip()
+  if trimmed.len == 0: return esFull
+  for (value, token) in evidenceScopeTokenPairs:
+    if trimmed == token: return value
+  esUnrecognized
+
+func statesUnevaluableEvidenceScope*(dep: MonitorDepFile): bool =
+  ## The capture STATED an evidence scope and this build could not name it. The
+  ## file is not silent about its scope and it is not full scope: it is a
+  ## narrowing written in a vocabulary this build does not have. The
+  ## `interest=gpu` residual DA-1j closed, on the evidence axis.
+  dep.observedEvidenceScopeStated and
+    dep.observedEvidenceScope == esUnrecognized
+
+func effectiveObservedEvidenceScope*(dep: MonitorDepFile): EvidenceScope =
+  ## THE ONLY CORRECT WAY TO READ THE EVIDENCE STAMP. Three inputs, three
+  ## answers, and the middle one is why this exists rather than a bare field
+  ## read:
+  ##
+  ##   not stated                 -> `esFull`. An old depfile, or a capture that
+  ##                                 narrowed nothing, keeps exactly its
+  ##                                 previous meaning.
+  ##   stated, recognised         -> what was stated.
+  ##   stated, NOT recognised     -> `esUnrecognized`. NOT full scope. It covers
+  ##                                 nothing, so every consumer rejects — the
+  ##                                 honest verdict for a file whose scope this
+  ##                                 build cannot evaluate.
+  ##
+  ## Every direction of the degrade points at "reject", never at "accept": a
+  ## scope this build misreads costs a re-capture, whereas the opposite mistake
+  ## publishes a narrowed capture as full evidence.
+  if dep.observedEvidenceScopeStated: dep.observedEvidenceScope
+  else: esFull
+
+func evidenceScopeCovers*(have, required: EvidenceScope): bool =
+  ## Is `have` at least as strong as `required`? THE PARTIAL ORDER, in one
+  ## place. `esFull` is strictly stronger than `esReadsOnly`, so a reads-only
+  ## consumer accepts a full capture and a full-evidence consumer does not
+  ## accept a reads-only one. `esUnrecognized` covers NOTHING, including itself:
+  ## two builds that both fail to name a scope have not thereby agreed on it.
+  case have
+  of esFull: required in {esFull, esReadsOnly}
+  of esReadsOnly: required == esReadsOnly
+  of esUnrecognized: false
+
+func observedEvidenceScopeCovers*(dep: MonitorDepFile;
+                                  required: EvidenceScope): bool =
+  ## Does this capture's stated evidence scope meet what a consumer needs? The
+  ## consumer-side half of the DA-1i contract, in one place so that no consumer
+  ## has to rediscover the not-stated / unrecognised distinction for itself.
+  evidenceScopeCovers(effectiveObservedEvidenceScope(dep), required)
 
 const
   # Wire tokens for `REPRO_MONITOR_INTEREST` (the env channel to the shim).

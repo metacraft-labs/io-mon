@@ -148,6 +148,19 @@ The stamp is **not** a completeness input and **not** a cache-key component:
 full-scope evidence is strictly stronger than narrowed evidence, so a narrow-scope
 consumer must still be able to accept a full capture.
 
+## 5.2 A DIFFERENT axis: evidence scope (DA-1i)
+
+`--evidence=reads-only` narrows a capture too, and it is **not** expressible
+here. It drops the lookups that found NOTHING, which is a predicate on a
+record's RESULT; every category in §1 gates on its KIND, and success is not a
+kind. Measured on one `nim c`: dropping every failed lookup leaves 23,049
+records, while gating a probes *category* leaves 41,736 — discarding 2,066
+successful probes and keeping 20,753 failed opens.
+
+The two axes are **composed, never conflated**, and each is stamped separately
+so a consumer can evaluate one without the other. See
+[evidence-scope.md](evidence-scope.md).
+
 ## 6. Completeness semantics
 
 > **This rule has a measured exception. Read §7's caveat before relying on it:
