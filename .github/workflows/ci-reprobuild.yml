@@ -70,7 +70,7 @@ jobs:
         # revisions before materialising the env. Those two are io-mon's
         # `uses:` library producers in repro.nim; reprobuild builds each
         # from source and threads their `src/` roots onto io-mon's compile.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: reprobuild
           gh-token: ${{ steps.ci_token.outputs.token }}
