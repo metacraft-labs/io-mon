@@ -295,7 +295,9 @@ var
   # golden pure-file baseline). Their deletion is part 2b.
   setProducer: shmset.SetProducer
   setProducerAttached = false
-  # M3 part 2a — the per-process-INCARNATION identity appended to every SET element:
+  # M3 part 2a — the per-process-INCARNATION identity appended to a SET element
+  # (DA-1b: to every element EXCEPT a fact-scoped kind's — see
+  # `depIdentityKeepsIncarnation`, and `appendFragmentRecord` for why):
   # the process's real on-disk image path (`/proc/self/exe`, set by the shim via
   # `setDepSetIncarnationImage` at init and re-captured after every exec). This is
   # the REAL exec identity, NOT a synthetic nonce. It exists to keep the pre-exec
@@ -1394,7 +1396,8 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   # with `encodeDepRecordIdentity` (drops `seq`, so exact-duplicate probe storms
   # collapse) into a STACK buffer (no heap — fork/orc-safe), append this
   # incarnation's real image path (`setElemImage`, the per-exec identity that keeps
-  # the pre/post-exec process-starts distinct without any synthetic tag), then
+  # the pre/post-exec process-starts distinct without any synthetic tag) FOR THE
+  # KINDS WHOSE IDENTITY KEEPS ONE (DA-1b, `depIdentityKeepsIncarnation`), then
   # `emit` the opaque bytes with a SINGLE idempotent insert. No batch, no flush:
   # the hook has already run the syscall but returns the result to the process only
   # AFTER this publish, so the dependency is recorded before the observed data is
@@ -1420,12 +1423,29 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
     if setProducer.available:
       var recBuf {.noinit.}: array[SetProducerBufBytes, byte]
       let recLen = encodeDepRecordIdentity(record, recBuf)
-      if recLen >= 0 and recLen + setElemImage.len <= SetProducerBufBytes:
+      # DA-1b — the incarnation suffix is a process-local coordinate, so it is
+      # appended only for the kinds whose identity keeps one. Appending it to a
+      # FACT-scoped kind would defeat that kind's dedup with exactly the
+      # coordinate `depIdentityScope` just ruled incidental: measured on a real
+      # `nim c`, `library-load`'s 33,128 elements decoded to only 25,883 distinct
+      # records, i.e. ~7,200 records were duplicates the suffix alone created,
+      # before any pid was considered. `depIdentityKeepsIncarnation` is the one
+      # place the decision is DERIVED, shared with the encoder, so the two cannot
+      # drift into disagreeing about a kind. The two remaining emit sites do not
+      # consult it and do not need to, because each publishes exactly one kind
+      # and that kind is process-scoped: `rebuildDepSetLossElem` always appends
+      # the suffix and `fs_snoop.emitLauncherLossToSet` never does, and both
+      # publish only `mrEventLoss`, whose element merely has to be distinct for
+      # the merge to downgrade. A kind that ever became fact-scoped AND reached
+      # one of those sites would have to be routed through this predicate too.
+      let imageLen =
+        if depIdentityKeepsIncarnation(record.kind): setElemImage.len else: 0
+      if recLen >= 0 and recLen + imageLen <= SetProducerBufBytes:
         # `decodeDepRecord` reads only the record's own fields (seq reconstructs as
         # 0) and IGNORES these trailing image bytes, so a decoded element is a
         # faithful MonitorRecord for the merge.
         var total = recLen
-        for i in 0 ..< setElemImage.len:
+        for i in 0 ..< imageLen:
           recBuf[total] = byte(setElemImage[i]); inc total
         case setProducer.emit(recBuf.toOpenArray(0, total - 1))
         of emInserted, emExists, emSaturated, emConsumerGone:
@@ -2592,7 +2612,9 @@ proc dropStaleRunRecords(records: seq[MonitorRecord];
 proc mergeFragments*(fragmentDir, outputPath: string;
     breakawayReportDir = ""; expectedRootPid: uint64 = 0;
     currentRunId = "";
-    setRecords: openArray[MonitorRecord] = @[]): MonitorDepFile =
+    setRecords: openArray[MonitorRecord] = @[];
+    observedInterest: set[EventCategory] = {};
+    observedEvidenceScope: EvidenceScope = esFull): MonitorDepFile =
   ## io-mon-Lossless-Event-Capture M3 — `setRecords` are the DISTINCT records the
   ## consumer decoded from the edge's shared-memory SET (nim-shm-gset) snapshot
   ## (the sole Linux dependency transport; see fs_snoop). They are folded into the
@@ -2858,6 +2880,83 @@ proc mergeFragments*(fragmentDir, outputPath: string;
     when defined(linux): LinuxPreloadSupportedCapabilities
     elif defined(windows): WindowsInterposeSupportedCapabilities
     else: MacosMonitorShimTaxonomyCapabilities))
+
+  # DA-1j — STAMP WHAT THIS CAPTURE WAS ASKED TO RECORD, before the write, so
+  # the on-disk depfile and the returned value cannot disagree.
+  #
+  # The HOST's normalized interest, never the shim's: the host-side filter is
+  # already the declared source of truth for "the depfile contains only
+  # requested categories" (an older shim that ignores REPRO_MONITOR_INTEREST
+  # still yields a correctly filtered result), so the stamp must describe THE
+  # RESULT rather than the request. `{}` means the caller said nothing, and is
+  # left unstamped so a library caller that never passes it keeps exactly the
+  # previous behaviour instead of having `FullInterest` asserted on its behalf.
+  # "Unstamped" is a READABLE state rather than an absence the reader has to
+  # guess about: it yields `observedInterestStated = false`, which is what
+  # distinguishes it from a stamp whose categories the reader cannot name (see
+  # `effectiveObservedInterest`).
+  #
+  # GRADED END TO END, not only from hand-built records:
+  # `tests/posix/test_io_mon_cli_interest_stamp.nim` runs the real CLI twice on
+  # one command and compares the two depfiles' stamps, and the portable fold test
+  # pins the unstamped case through this proc. Deleting this block, or the
+  # `!= {}` guard on it, reddens those.
+  if observedInterest != {}:
+    let interestToken = ";interest=" & interestToTokens(observedInterest)
+    for record in records.mitems:
+      if record.kind == mrBackendProfile:
+        record.detail.add interestToken
+
+  # DA-1i — STAMP HOW MUCH OF WHAT WAS OBSERVED THIS CAPTURE WROTE DOWN, in the
+  # same place and before the same write, so the on-disk depfile and the
+  # returned value cannot disagree about it either.
+  #
+  # THE HOST'S SCOPE, never the shim's, for the reason the interest stamp gives
+  # one line up: the host-side filter in `fs_snoop` is the declared source of
+  # truth for what the depfile contains — an older shim that ignores
+  # REPRO_MONITOR_EVIDENCE still yields a correctly filtered result — so the
+  # stamp must describe THE RESULT rather than the request.
+  #
+  # ONLY A NARROWING IS STATED. `esFull` is left unstamped because "not stated"
+  # has always meant exactly `esFull` (see `effectiveObservedEvidenceScope`), so
+  # stamping it would say nothing new while changing the profile-detail bytes of
+  # every capture that exists — and the depfile is byte-reproducible on purpose.
+  # `esUnrecognized` is not a scope this build can be asked for and has no
+  # spelling (`evidenceScopeToken` returns ""), so the guard excludes it too
+  # rather than writing an empty `evidence=` that would read back as unevaluable.
+  #
+  # THE GUARD TESTS THE VALUE WHILE THE HAZARD IS THE TOKEN'S EMPTINESS, and
+  # those are the SAME statement rather than an approximation of one, because
+  # `types.nim` makes them so: `evidenceScopeToken` is an exhaustive `case` and
+  # the `static:` block below `parseEvidenceScopeToken` requires every arm but
+  # `esUnrecognized`'s to be a token that ROUND-TRIPS THROUGH THE WIRE — not
+  # merely a non-empty one. That distinction was MEASURED here: `writes;only`
+  # is non-empty and round-trips in memory, and it still arrived at this line
+  # and wrote a stamp the decoder reads back as `esUnrecognized` named `writes`.
+  # A future member the codec cannot spell is therefore a COMPILE error and can
+  # never arrive here — which is the only reason this guard may go on naming
+  # values.
+  #
+  # BE PRECISE ABOUT THE ALTERNATIVE, because the obvious summary of it is
+  # false in one direction. WITHOUT that coupling, testing the token instead was
+  # MEASURED to be strictly worse: the stamp is silently omitted, the capture
+  # reads as NOT STATED, `effectiveObservedEvidenceScope` defines that as
+  # `esFull`, and a full-evidence consumer then ACCEPTS a narrowed capture —
+  # this milestone's own cardinal defect shape, so there was no safe default
+  # here at all. WITH it the two spellings are provably equivalent (empty token
+  # ⟺ `esUnrecognized`), and substituting one for the other reddens nothing —
+  # also measured. The equivalence is the fix; neither spelling of this line is
+  # load-bearing by itself, and a reader who changes it should change the
+  # `static:` block's mind first.
+  #
+  # GRADED END TO END: `tests/posix/test_io_mon_cli_evidence_scope.nim` runs the
+  # real CLI twice on one command and compares the two depfiles' stamps against
+  # what was asked for on the command line. Deleting this block reddens it.
+  if observedEvidenceScope != esFull and observedEvidenceScope != esUnrecognized:
+    let evidenceToken = ";evidence=" & evidenceScopeToken(observedEvidenceScope)
+    for record in records.mitems:
+      if record.kind == mrBackendProfile:
+        record.detail.add evidenceToken
 
   writeCanonicalInPlace(outputPath, records)
   depFileFromOwnedRecords(move(records))

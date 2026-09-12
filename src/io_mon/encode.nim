@@ -8,7 +8,7 @@
 ## format cluster (types/codec/encode/reader/render) can be consumed without
 ## dragging in any shared-memory machinery.
 
-import std/[algorithm, sets]
+import std/[algorithm, sets, strutils]
 from io_mon/paths import extendedPath
 
 import io_mon/codec
@@ -185,8 +185,89 @@ proc summarizeRecords*(records: openArray[MonitorRecord]): MonitorSummary =
       inc result.observationCount
   result.processCount = uint64(processPids.len)
 
+proc observedInterestFromRecords(records: openArray[MonitorRecord]):
+    tuple[stated: bool, tokens: string, categories: set[EventCategory]] =
+  ## DA-1j — read the capture-scope stamp off the backend-profile record.
+  ##
+  ## The depfile envelope carries ONLY records: `depFileFromOwnedRecords`
+  ## reconstructs `profile`, `capabilityGaps`, `requiredFeatures`,
+  ## `completeness` and `summary` from them. So the scope rides on a record too,
+  ## as an `interest=` token in the `;`-separated profile detail. That is why
+  ## this needed no envelope version bump and breaks no wire compatibility:
+  ## `profileFromRecords` already ignores unknown keys (`else: discard`), and
+  ## `parseInterestTokens` already ignores unknown tokens, so an older reader
+  ## skips the stamp and a newer reader tolerates a category it does not know.
+  ##
+  ## RETURNS `stated` SEPARATELY FROM THE PARSED SET, and that separation is the
+  ## whole point. "No stamp at all" and "a stamp naming only categories this
+  ## build has never heard of" both parse to `{}`, and they mean opposite things:
+  ## the first is an old file that must read as full scope, the second is a
+  ## NARROWED capture from a newer io-mon that must not. Collapsing them let
+  ## `interest=gpu` be accepted by a full-scope consumer — the same false
+  ## complete this stamp exists to end, pointing forward in time instead of
+  ## backward. `tokens` carries the raw value so the unnamable scope can be
+  ## REPORTED rather than merely detected.
+  ##
+  ## An `interest=` key with an EMPTY value counts as stated. `parseInterestTokens`
+  ## widens an empty string to `FullInterest` for the env channel (an absent
+  ## `REPRO_MONITOR_INTEREST` means "capture everything"), but here the key's
+  ## presence already proves the producer meant to say something, so the empty
+  ## value is an unevaluable statement rather than a claim of full scope.
+  for record in records:
+    if record.kind == mrBackendProfile:
+      for part in record.detail.split(';'):
+        let pair = part.split("=", 1)
+        if pair.len == 2 and pair[0] == "interest":
+          if pair[1].strip().len == 0:
+            return (true, pair[1], {})
+          return (true, pair[1], parseInterestTokens(pair[1]))
+  (false, "", {})
+
+proc observedEvidenceScopeFromRecords(records: openArray[MonitorRecord]):
+    tuple[stated: bool, token: string, scope: EvidenceScope] =
+  ## DA-1i — read the evidence-scope stamp off the backend-profile record.
+  ##
+  ## Rides on a RECORD for the same reason DA-1j's does, and this is the reason
+  ## neither needed an envelope version bump: THE `.iomon` ENVELOPE CARRIES ONLY
+  ## RECORDS. `depFileFromOwnedRecords` reconstructs `profile`,
+  ## `capabilityGaps`, `requiredFeatures`, `completeness` and `summary` from
+  ## them, so a new depfile field is added by putting it on a record, never by
+  ## growing the header. `profileFromRecords` discards keys it does not know
+  ## (`else: discard`), so an older reader skips this stamp entirely.
+  ##
+  ## RETURNS `stated` SEPARATELY FROM THE PARSED VALUE, which is the whole point
+  ## and the finding DA-1j paid for. "No stamp at all" and "a stamp naming a
+  ## scope this build has never heard of" are opposite facts: the first is an
+  ## old file, or a full capture, that must read as `esFull`; the second is a
+  ## NARROWED capture from a newer io-mon that must not. A single field cannot
+  ## hold both, and collapsing them is a live false-accept — `evidence=
+  ## writes-only` read as full scope and accepted by a full-evidence consumer.
+  ## `token` carries the raw value so the residual is NAMEABLE: a consumer can
+  ## say "declares `writes-only`, which I cannot evaluate".
+  ##
+  ## An `evidence=` key with an EMPTY value counts as STATED and unevaluable.
+  ## `parseEvidenceScopeToken` widens an empty string to `esFull` for the env
+  ## channel (an absent `REPRO_MONITOR_EVIDENCE` means "write everything down"),
+  ## but here the key's PRESENCE already proves the producer meant to say
+  ## something, so an empty value is a statement this build cannot evaluate
+  ## rather than a claim of full scope. DA-1j shipped this branch's twin
+  ## undefended and a deletion of it left the whole suite green while
+  ## `interest=` read as full scope; `test_io_mon_evidence_scope.nim` grades
+  ## this one.
+  for record in records:
+    if record.kind == mrBackendProfile:
+      for part in record.detail.split(';'):
+        let pair = part.split("=", 1)
+        if pair.len == 2 and pair[0] == "evidence":
+          if pair[1].strip().len == 0:
+            return (true, pair[1], esUnrecognized)
+          return (true, pair[1], parseEvidenceScopeToken(pair[1]))
+  (false, "", esFull)
+
 proc depFileFromOwnedRecords*(records: sink seq[MonitorRecord]): MonitorDepFile =
   let summary = summarizeRecords(records)
+  let scope = observedInterestFromRecords(records)
+  let evidence = observedEvidenceScopeFromRecords(records)
   # The required-set is NOT empty, and that is the whole point. Deriving the
   # profile with `{}` meant no declared capability gap could ever mark itself
   # `required`, so none of them could ever clear `evidenceComplete` — the
@@ -210,7 +291,16 @@ proc depFileFromOwnedRecords*(records: sink seq[MonitorRecord]): MonitorDepFile 
         mcIncomplete,
     profile: profile,
     capabilityGaps: profile.gaps,
-    summary: summary)
+    summary: summary,
+    observedInterest: scope.categories,
+    observedInterestStated: scope.stated,
+    observedInterestTokens: scope.tokens,
+    # DA-1i — the evidence scope is read here and NOWHERE feeds `completeness`
+    # above. A narrowed capture is an honest answer to a narrower question, not
+    # a monitor failure, and `mcIncomplete` means the latter.
+    observedEvidenceScope: evidence.scope,
+    observedEvidenceScopeStated: evidence.stated,
+    observedEvidenceScopeToken: evidence.token)
   result.records = move(records)
 
 proc depFileFromRecords*(records: openArray[MonitorRecord]): MonitorDepFile =

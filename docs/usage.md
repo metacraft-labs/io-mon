@@ -42,7 +42,8 @@ Options (each accepts both `--flag value` and `--flag=value`):
 | `--events MODE` | Stream the captured records in MODE. One of `none` (default), `text`, `jsonl`, `binary` / `binary-stream`. |
 | `--format MODE` | Alias for `--events` (same `FsSnoopOutputMode` values). |
 | `--event-stream PATH` | Write the streamed events to PATH instead of stderr. **Required** when MODE is `binary`/`binary-stream` (so the binary stream stays separate from child output). |
-| `--interest TOKENS` | The event categories to capture, as a comma-separated subset of `file,proc,lib,nondet,ipc` (the `REPRO_MONITOR_INTEREST` vocabulary — see [event-interest-filter.md](contributors/event-interest-filter.md)). **Omitting the flag, or passing an empty value, means all categories**, so every existing invocation keeps its current behaviour and a consumer that wants a reduced set must ask for one on each run; forgetting costs capture work, never a missed dependency. An unknown token alongside known ones is ignored (a newer consumer may name a category this build does not have); a value naming *no* known token is refused rather than silently widened to "all". |
+| `--interest TOKENS` | The event categories to capture, as a comma-separated subset of `file,proc,lib,nondet,ipc` (the `REPRO_MONITOR_INTEREST` vocabulary — see [event-interest-filter.md](contributors/event-interest-filter.md)). **Omitting the flag, or passing an empty value in either spelling (`--interest ""` and `--interest=` alike), means all categories**, so every existing invocation keeps its current behaviour and a consumer that wants a reduced set must ask for one on each run; forgetting costs capture work, never a missed dependency. An unknown token alongside known ones is ignored (a newer consumer may name a category this build does not have); a value naming *no* known token is refused rather than silently widened to "all". |
+| `--evidence SCOPE` | How much of what the monitor observes is **written down**. One of `full` (default) or `reads-only`. See [Evidence scope](#evidence-scope--how-much-of-what-is-observed-is-recorded) below (and [evidence-scope.md](contributors/evidence-scope.md)) — **`reads-only` carries a named hazard**. An unknown value is refused rather than widened to `full`. |
 | `--capture-stdio` | Capture the child's merged stdout+stderr instead of inheriting the parent's stdio (mirrors how the reprobuild engine launches monitored actions). |
 | `--capture-stdio-path PATH` | Like `--capture-stdio`, but dump the captured bytes to PATH (implies `--capture-stdio`). |
 | `--` | End of options; everything after is the command + args to run. **Required.** |
@@ -56,6 +57,109 @@ Example — capture what a compile reads/writes:
 io-mon run --depfile build.iomon -- cc -c hello.c -o hello.o
 io-mon inspect build.iomon
 ```
+
+#### Evidence scope — how much of what is observed is recorded
+
+```sh
+io-mon run --evidence=full        # the default
+io-mon run --evidence=reads-only
+```
+
+`--evidence` selects **how much of what the monitor observes is written down**.
+It does not change what the monitor observes: the same events are detected
+either way, and a monitoring *failure* still downgrades the capture to
+`mcIncomplete` exactly as it does today.
+
+`full` records every observation, including **failed lookups** — searches for
+paths that do not exist.
+
+`reads-only` records only lookups that **found something**. Measured on one
+`nim c` in this repo, with 81 `--path` entries on the command line: **8,663
+records down to 2,548 (−70.6%)**, and the 6,115 records removed are failed
+existence lookups and nothing else — the set of lookups that found something is
+identical in both captures. A build performs far more searching than reading,
+and most of what it searches for is absent.
+
+It exists so io-mon's dependency evidence can be compared like for like with
+tools that consume compiler-emitted depfiles (ninja via `gcc -MD`), which list
+headers actually opened and never headers searched for.
+
+Omitting `--evidence` means `full`. Writing it and naming nothing this build can
+evaluate — an unknown scope (`--evidence=writes-only`) or no scope at all
+(`--evidence=`) — is refused, naming what was rejected and the valid set, rather
+than being widened back to `full`: silently widening would discard the reduction
+you asked for without a word.
+
+##### The hazard, exactly
+
+The risk is **one-directional**. It affects the question *"is this build up to
+date?"*, and only for changes of one shape — something that did not exist, or
+could not be reached, becoming available:
+
+| change to your tree | detected under `reads-only`? |
+|---|---|
+| a file the build read is **modified** | ✓ yes |
+| a file the build read is **deleted** | ✓ yes |
+| a file is **added** that shadows one earlier in a search path | ✗ **no** |
+| a file that **exists but could not be opened** becomes openable (a `chmod`, a directory replaced by a file) | ✗ **no** |
+
+Rows 3 and 4 are one rule with two faces: **`reads-only` records only lookups
+that succeeded, so any later change that makes an unsuccessful lookup succeed is
+invisible.** Row 1 does not cover row 4, however much it looks as though it
+should — the file is **not recorded at all**, so "a file the build read" never
+names it.
+
+Row 4 exists because the record cannot tell *why* a lookup failed: `open`
+returns `-1` for `ENOENT` and for `EACCES` alike, a failed `stat` is classified
+as "absent" whatever the reason, and no errno is carried in the depfile. So
+`EACCES`, `EISDIR` and `ELOOP` lookups are dropped alongside genuine absences.
+Measured on a real `nim c`: 5 of 2,104 dropped records name a path that exists
+(all `/dev/tty`).
+
+Worked example: compiling a module, the compiler looks for
+`libs/repro_core/src/repro_core/types.nim`, does not find it, and resolves
+`types` from elsewhere. Under `full` that failed lookup is recorded, so creating
+that file later invalidates the action. Under `reads-only` it is not recorded,
+the key is unchanged, and the build reports "up to date" while compiling against
+the old module. This is the same staleness ninja exhibits when you add a header
+earlier in the include path.
+
+Recovery is a capture at `--evidence=full` (or a clean build); nothing is
+corrupted.
+
+##### What it does **not** affect
+
+- **What was built.** The output bytes are a function of the inputs actually
+  used, so a narrower *record* of those inputs does not change the artefact.
+- **Completeness grading.** `reads-only` is a deliberate choice, not a
+  monitoring failure, so it does not report `mcIncomplete`; a real monitoring
+  failure still does. An `mrEventLoss` can never be dropped by the narrowing.
+
+##### How a consumer is protected
+
+Every depfile records the scope it was captured under. Read it through the
+accessors, never off the field:
+
+```nim
+let dep = readMonitorDepFile(path)
+if not observedEvidenceScopeCovers(dep, esFull):
+  if statesUnevaluableEvidenceScope(dep):
+    echo "capture declares evidence scope '",
+      dep.observedEvidenceScopeToken, "', which this build cannot evaluate"
+  # …recompute locally rather than trust it.
+```
+
+- **Absent** stamp ⇒ `esFull`. Every depfile written before this existed
+  recorded everything, so it keeps its meaning.
+- **Present and recognised** ⇒ that scope.
+- **Present but unrecognised** (a scope a newer io-mon added) ⇒ covers nothing;
+  every consumer rejects, and `observedEvidenceScopeToken` names what it
+  declared so the residual can be reported rather than merely detected.
+
+The check is one-way on purpose: full evidence is strictly stronger, so it is
+always acceptable to a `reads-only` consumer. The scope is **not** part of any
+action-cache key — keying on it would stop a careful teammate's full-evidence
+result from being usable by anyone who opted into the reduced scope.
 
 ### `io-mon inspect` — render an existing depfile
 

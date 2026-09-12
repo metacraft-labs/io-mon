@@ -114,8 +114,28 @@ suite "io-mon CLI event-interest flag":
       BuildEdgeTokens
 
   test "an explicitly empty value means the same as an absent flag":
-    check childInterest(@["run", "--interest", "", "--", "true"]) == AllTokens
-    check childInterest(@["run", "--interest", "   ", "--", "true"]) == AllTokens
+    # BOTH SPELLINGS, because the sentence this case is named after is about the
+    # FLAG and not about one of its two forms — and every other value-bearing
+    # flag here means the same thing whichever way it is written.
+    #
+    # It used to assert the space form only, and for the `=` form the sentence
+    # was FALSE. MEASURED at the binary: `io-mon run --interest "" …` exited 0
+    # and stamped `interest=file,proc,lib,nondet,ipc`, while
+    # `io-mon run --interest= …` exited 1 with "unsupported fs-snoop argument:
+    # --interest=" and wrote no depfile at all — the parser denying the flag
+    # exists, because `parseRun`'s catch-all dispatched on
+    # `interestValue.len > 0`, which cannot tell "this flag with an empty value"
+    # from "not this flag". Restoring that dispatch reddens this case.
+    for argv in [@["run", "--interest", "", "--", "true"],
+                 @["run", "--interest", "   ", "--", "true"],
+                 @["run", "--interest=", "--", "true"],
+                 @["run", "--interest=   ", "--", "true"],
+                 # …and on the `run`-less legacy form too, which reaches the
+                 # same parser by a different door.
+                 @["--interest=", "--", "true"]]:
+      checkpoint("argv: " & $argv)
+      check childInterest(argv) == AllTokens
+      check parsedInterest(argv) == FullInterest
 
   test "an unknown token beside a known one is ignored (forward-compat)":
     # A newer consumer naming a category this build does not have must not fail

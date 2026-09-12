@@ -1,0 +1,12 @@
+{
+  "_comment": [
+    "tests/fixtures/dep_set_golden/ holds BINARY canonical-iomon golden depfiles.",
+    "editorconfig-checker reads them as text and reports a missing final newline",
+    "and a guessed 8-bit encoding. They were never actually lint-clean: pre-commit",
+    "only inspects STAGED files, so the fixtures simply had not been re-staged",
+    "since the hook landed, and renaming them is what first put them through it.",
+    "Excluded here rather than reshaped, because their whole purpose is to be the",
+    "exact bytes the monitor writes."
+  ],
+  "Exclude": ["^tests/fixtures/dep_set_golden/"]
+}
