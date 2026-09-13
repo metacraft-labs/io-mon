@@ -329,9 +329,10 @@ var
   fragmentByteCap: int64 = FragmentMaxBytesDefault
   fragmentByteCapResolved = false
 
-# A generous stack buffer for `encodeDepRecordIdentity` + the incarnation-image
-# suffix on the insert hot path — no heap. A record whose encoding exceeds it (a
-# pathological path+detail) is surfaced as a loss element (LF-2), never a file spill.
+# A generous stack buffer for one `encodeDepSetElement` (identity encoding plus
+# the incarnation-image suffix) on the insert hot path — no heap. A record whose
+# key exceeds it (a pathological path+detail) is surfaced as a loss element
+# (LF-2), never a file spill.
 const SetProducerBufBytes = 16384
 
 proc resolveFragmentByteCap() =
@@ -368,28 +369,118 @@ proc fragmentSlotIsOverCap*(): bool =
   ## reads false in the same state.
   fragmentSlot.overCap
 
-proc rebuildDepSetLossElem() =
+type
+  DepSetElemFit* = enum
+    ## DA-1d — what an element-key call site does when the key does not fit the
+    ## buffer it supplied. This is an OVERFLOW policy and nothing else; it says
+    ## nothing about what belongs in the key.
+    dseRequireFit      ## the whole key must fit or the record is unframable
+                       ## (-1): a truncated key for a REAL record could collide
+                       ## with another record's, so the caller publishes a loss
+                       ## marker instead.
+    dseTruncateSuffix  ## fold in as much of the incarnation suffix as fits.
+                       ## Only sound where the element merely has to be
+                       ## DISTINCT, not faithful — i.e. the loss marker.
+
+proc encodeDepSetElement*(record: MonitorRecord; buf: var openArray[byte];
+                          fit = dseRequireFit): int =
+  ## DA-1d — **THE** composer of a dep-set element key. Returns the number of
+  ## bytes written to `buf`, or -1 if the key does not fit (`dseRequireFit`) or
+  ## the record itself cannot be framed.
+  ##
+  ## WHY THIS PROC EXISTS. Three sites used to encode "what goes in an element
+  ## key", and only one of them consulted the predicate that decides it:
+  ##
+  ##   | site                             | incarnation suffix | consulted it |
+  ##   | `appendFragmentRecord` (below)   | per predicate      | yes          |
+  ##   | `rebuildDepSetLossElem` (below)  | ALWAYS appended    | no           |
+  ##   | `fs_snoop.emitLauncherLossToSet` | NEVER appended     | no           |
+  ##
+  ## That was harmless only because the latter two publish `mrEventLoss` alone,
+  ## which is process-scoped either way — an accident of one kind's
+  ## classification, not a property anyone had arranged. DA-1b's landing comment
+  ## first claimed `depIdentityScope` was "the one place the decision lives",
+  ## review found that false, and the comment was corrected to describe the
+  ## duplication. DA-1d makes the original claim TRUE instead: all three sites
+  ## now call this proc, so the answer to "does this kind's key carry the
+  ## observer's incarnation?" is derived from `depIdentityKeepsIncarnation`
+  ## exactly once, and a kind that changes class moves all three together.
+  ##
+  ## THE INCARNATION IS NOT A PARAMETER, deliberately. `setElemImage` is read
+  ## from here rather than passed in, so a caller cannot supply the wrong one,
+  ## and "which incarnation" is not a question a call site is allowed to answer.
+  ## In the SHIM it is `<realpath(/proc/self/exe)>\x1f<execGen>`, set by
+  ## `setDepSetIncarnationImage` at init and after every exec. In the HOST
+  ## process (`fs_snoop`'s launcher-side loss marker) it is EMPTY, because the
+  ## host loads no shim and nothing sets it there — so the host's key is the
+  ## bare identity, which is byte-for-byte what that site produced before DA-1d.
+  ##
+  ## NO HEAP: the caller supplies a stack buffer, keeping this fork/orc-safe on
+  ## the shim's publish-before-return hot path.
+  let n = encodeDepRecordIdentity(record, buf)
+  if n < 0:
+    return -1
+  if not depIdentityKeepsIncarnation(record.kind):
+    # DA-1b — a fact-scoped kind drops the incarnation for the same reason it
+    # drops the pid: appending it would defeat the dedup with the very
+    # coordinate `depIdentityScope` just ruled incidental.
+    return n
+  var total = n
+  case fit
+  of dseRequireFit:
+    if n + setElemImage.len > buf.len:
+      return -1
+    for i in 0 ..< setElemImage.len:
+      buf[total] = byte(setElemImage[i]); inc total
+  of dseTruncateSuffix:
+    var i = 0
+    while i < setElemImage.len and total < buf.len:
+      buf[total] = byte(setElemImage[i]); inc total; inc i
+  total
+
+proc rebuildDepSetLossElem*() =
   ## M3 part 2a (LF-2) — pre-encode the event-loss SET element ONCE per attach so
   ## the hot oversize/hard-fail path allocates nothing. The element is a compact
-  ## `mrEventLoss` identity record plus the incarnation-image suffix; when a real
-  ## record cannot be framed for the set, the producer inserts this so the
-  ## consumer's merge downgrades the edge to `mcIncomplete` (never a silent drop).
+  ## `mrEventLoss` identity record plus whatever of the incarnation-image suffix
+  ## the predicate calls for; when a real record cannot be framed for the set,
+  ## the producer inserts this so the consumer's merge downgrades the edge to
+  ## `mcIncomplete` (never a silent drop).
+  ##
+  ## DA-1d — the suffix is no longer appended unconditionally here. Composition
+  ## goes through `encodeDepSetElement`, so this site derives the answer from
+  ## `depIdentityKeepsIncarnation` like every other. It is byte-identical today
+  ## (`mrEventLoss` is process-scoped, so the predicate says "keep"), and it
+  ## stays correct if that ever stops being true.
+  ##
+  ## Exported for `tests/portable/test_io_mon_dep_set_element_key`, which grades
+  ## this site against the shared composer: dropping the incarnation here used to
+  ## redden nothing at all (DA-1b reported it INERT).
   let lossRec = MonitorRecord(kind: mrEventLoss, observationKind: moEventLoss,
     detail: "dep-set-capture-loss")
   var buf {.noinit.}: array[DepFixedHeaderLen + 64, byte]
-  let n = encodeDepRecordIdentity(lossRec, buf)
+  # `dseTruncateSuffix`: the loss marker's exactness does not matter (ANY
+  # distinct mrEventLoss element forces mcIncomplete), so a suffix clipped to
+  # the small pre-encoded buffer is harmless — unlike a real record's.
+  let total = encodeDepSetElement(lossRec, buf, dseTruncateSuffix)
   setLossElemLen = 0
-  if n < 0: return
-  # Fold in only as much of the incarnation image as still fits the loss buffer;
-  # the loss marker's exactness does not matter (any distinct mrEventLoss element
-  # forces mcIncomplete), so a truncated suffix is harmless.
-  var total = n
-  var i = 0
-  while i < setElemImage.len and total < setLossElem.len:
-    buf[total] = byte(setElemImage[i]); inc total; inc i
+  if total < 0: return
   for k in 0 ..< total:
     setLossElem[k] = buf[k]
   setLossElemLen = total
+
+proc depSetLossElement*(): seq[byte] =
+  ## Test/introspection — a copy of the currently pre-encoded event-loss SET
+  ## element (empty when none is built). Exists so the loss-element key can be
+  ## graded against `encodeDepSetElement`; not used on any production path.
+  result = newSeq[byte](setLossElemLen)
+  for i in 0 ..< setLossElemLen:
+    result[i] = setLossElem[i]
+
+proc depSetIncarnationImage*(): string =
+  ## Test/introspection — this process's current incarnation identity, i.e. the
+  ## suffix `encodeDepSetElement` appends for a kind that keeps one. Empty in any
+  ## process that never loaded the shim (every HOST process).
+  setElemImage
 
 proc setDepSetIncarnationImage*(image: string) =
   ## M3 part 2a — record THIS incarnation's real on-disk image path
@@ -1422,31 +1513,27 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   if setProducerAttached:
     if setProducer.available:
       var recBuf {.noinit.}: array[SetProducerBufBytes, byte]
-      let recLen = encodeDepRecordIdentity(record, recBuf)
-      # DA-1b — the incarnation suffix is a process-local coordinate, so it is
-      # appended only for the kinds whose identity keeps one. Appending it to a
-      # FACT-scoped kind would defeat that kind's dedup with exactly the
+      # DA-1b/DA-1d — the incarnation suffix is a process-local coordinate, so it
+      # is appended only for the kinds whose identity keeps one. Appending it to
+      # a FACT-scoped kind would defeat that kind's dedup with exactly the
       # coordinate `depIdentityScope` just ruled incidental: measured on a real
       # `nim c`, `library-load`'s 33,128 elements decoded to only 25,883 distinct
       # records, i.e. ~7,200 records were duplicates the suffix alone created,
-      # before any pid was considered. `depIdentityKeepsIncarnation` is the one
-      # place the decision is DERIVED, shared with the encoder, so the two cannot
-      # drift into disagreeing about a kind. The two remaining emit sites do not
-      # consult it and do not need to, because each publishes exactly one kind
-      # and that kind is process-scoped: `rebuildDepSetLossElem` always appends
-      # the suffix and `fs_snoop.emitLauncherLossToSet` never does, and both
-      # publish only `mrEventLoss`, whose element merely has to be distinct for
-      # the merge to downgrade. A kind that ever became fact-scoped AND reached
-      # one of those sites would have to be routed through this predicate too.
-      let imageLen =
-        if depIdentityKeepsIncarnation(record.kind): setElemImage.len else: 0
-      if recLen >= 0 and recLen + imageLen <= SetProducerBufBytes:
-        # `decodeDepRecord` reads only the record's own fields (seq reconstructs as
-        # 0) and IGNORES these trailing image bytes, so a decoded element is a
-        # faithful MonitorRecord for the merge.
-        var total = recLen
-        for i in 0 ..< imageLen:
-          recBuf[total] = byte(setElemImage[i]); inc total
+      # before any pid was considered.
+      #
+      # DA-1d: that decision is no longer made HERE. `encodeDepSetElement` is the
+      # single composer of an element key — this site, `rebuildDepSetLossElem`
+      # and `fs_snoop.emitLauncherLossToSet` all go through it — so
+      # `depIdentityKeepsIncarnation` is consulted in exactly one place and no
+      # site can hard-code an answer that silently disagrees with the others.
+      # `dseRequireFit`: a REAL record's key must be whole or it is unframable,
+      # because a clipped key can collide with a different record's.
+      #
+      # `decodeDepRecord` reads only the record's own fields (seq reconstructs as
+      # 0) and IGNORES the trailing image bytes, so a decoded element is a
+      # faithful MonitorRecord for the merge.
+      let total = encodeDepSetElement(record, recBuf, dseRequireFit)
+      if total >= 0:
         case setProducer.emit(recBuf.toOpenArray(0, total - 1))
         of emInserted, emExists, emSaturated, emConsumerGone:
           return

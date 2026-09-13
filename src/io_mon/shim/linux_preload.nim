@@ -2119,19 +2119,46 @@ proc recordFopen(path, mode: cstring; stream: pointer) {.raises: [].} =
   ## Both sides are now emitted when the mode grants both, because `"w+"`,
   ## `"a+"` and `"r+"` genuinely ARE both, and the set transport dedups them
   ## under distinct element keys.
+  ##
+  ## DA-1d — WHY `result` IS NO LONGER THE `FILE*`.
+  ##
+  ## These three records used to store `cast[int64](stream)`: the raw stdio
+  ## handle, a per-process HEAP ADDRESS, in a field that is part of the
+  ## dependency identity. Two consequences, one latent and one live:
+  ##
+  ##   * Latent. `mrFileOpen` is path-scoped, so the set encoder reduces its
+  ##     `result` to success/failure and the address never reached the key —
+  ##     laundered by luck, in an arm written for descriptor numbers. Path-scope
+  ##     `mrFileWrite` (a plausible future milestone) with no such arm and the
+  ##     address becomes the key outright.
+  ##   * LIVE. `mrFileWrite` is process-scoped TODAY, so nothing normalised it
+  ##     and the address travelled all the way into the depfile: every stdio
+  ##     write record carried an ASLR-dependent value, so a depfile was not
+  ##     reproducible across runs, and two `fopen(p, "w")` calls in one process
+  ##     published two elements for one fact.
+  ##
+  ## A `FILE*` is not an observation. `updateStreamPath` already owns the
+  ## stream→path mapping that the later `fwrite`/`fclose` hooks need, so nothing
+  ## reads this field for a stdio record. It is now a plain success code.
+  ##
+  ## Deliberately 0 and NOT `if stream == nil: -1 else: 0`: a failed `fopen`
+  ## already encoded as 0 (`cast[int64](nil)`), and `result < 0` is what
+  ## `types.nim`'s reads-only evidence gate reads as "absent". Making failure
+  ## visible here would move that gate, which is DA-1i's axis and not this
+  ## milestone's call — recorded as a finding instead of changed in passing.
   let resolved = pathForAt(LinuxAtFdcwd, path)
   if stream != nil:
     updateStreamPath(stream, cstring(resolved))
   let detail = if mode != nil: "stdio:" & $mode else: ""
   if modeLooksReadable(mode):
     var record = baseRecord(mrFileOpen, moFileOpen)
-    record.result = cast[int64](stream)
+    record.result = 0
     record.path = resolved
     record.detail = detail
     emitRecord(record)
   if modeLooksWritable(mode):
     var record = baseRecord(mrFileWrite, moFileWrite)
-    record.result = cast[int64](stream)
+    record.result = 0
     record.path = resolved
     record.detail = detail
     emitRecord(record)
@@ -2139,7 +2166,7 @@ proc recordFopen(path, mode: cstring; stream: pointer) {.raises: [].} =
     # An unparseable / exotic mode string: record the open itself so the path is
     # never lost, and leave the access side unclaimed rather than guessed.
     var record = baseRecord(mrFileOpen, moFileOpen)
-    record.result = cast[int64](stream)
+    record.result = 0
     record.path = resolved
     record.detail = detail
     emitRecord(record)

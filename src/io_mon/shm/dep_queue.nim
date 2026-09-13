@@ -156,12 +156,14 @@ func depIdentityScope*(kind: MonitorRecordKind): DepIdentityScope =
   ##   wrote this path" is a real fact about a build and it is exactly what
   ##   collapsing the observer would erase. Measured cost of keeping it: zero —
   ##   all 2,413 writes in that `nim c` are to distinct paths, so there is no
-  ##   repetition here to recover. NOTE FOR ANYONE WHO REVISITS THIS: a stdio
-  ##   write record carries the raw `FILE*` in `result` (`recordFopen`), and the
-  ##   `dropObserver` normalization below has no `mrFileWrite` arm — so moving
-  ##   this kind across the line without also normalizing `result` would fold
-  ##   the pid out and leave a per-process heap address in its place, deduping
-  ##   nothing while looking as if it had.
+  ##   repetition here to recover. DA-1d CLEARED THE TRAP THAT USED TO SIT HERE:
+  ##   a stdio write record carried the raw `FILE*` in `result` (`recordFopen`)
+  ##   and the normalization below had no `mrFileWrite` arm, so moving this kind
+  ##   across the line would have folded the pid out and left a per-process heap
+  ##   address in its place — deduping nothing while looking as if it had. Both
+  ##   halves are closed: `recordFopen` stores a success code, and
+  ##   `identityNormalizedOutcome` states this kind's answer whether or not it is
+  ##   reached today.
   ## `mrPathMutation` — the same argument as `mrFileWrite`: mkdir/rmdir/unlink
   ##   are output-side effects on a shared tree, and who performed one is part
   ##   of what happened.
@@ -247,9 +249,15 @@ func depIdentityScope*(kind: MonitorRecordKind): DepIdentityScope =
     disProcessScoped
 
 func depIdentityKeepsIncarnation*(kind: MonitorRecordKind): bool =
-  ## DA-1b — should the caller append its per-exec incarnation identity
+  ## DA-1b — should a publisher append its per-exec incarnation identity
   ## (`setElemImage`: `/proc/self/exe` plus the exec generation) to this kind's
   ## element key?
+  ##
+  ## DA-1d — there is exactly ONE consumer of this answer:
+  ## `writer.encodeDepSetElement`, which composes every element key every
+  ## publisher publishes. Before DA-1d two further sites answered the question
+  ## themselves, in opposite directions, and both happened to be right; this is
+  ## now the single decision it was already documented to be.
   ##
   ## The incarnation is a process-local coordinate exactly like the pid, so the
   ## answer follows the same decision: a FACT-scoped kind drops it, everything
@@ -269,6 +277,88 @@ func depIdentityKeepsIncarnation*(kind: MonitorRecordKind): bool =
   ## and this milestone has no evidence against it (measured: file-opens dedup
   ## at 1.0x, so there is nothing there to win by revisiting it).
   depIdentityScope(kind) != disFactScoped
+
+func identityNormalizedOutcome*(kind: MonitorRecordKind; rawResult: int64;
+                                rawFlags: uint32):
+                                tuple[outcome: int64; flags: uint32] =
+  ## DA-1d — WHAT DOES AN OBSERVER-LESS ELEMENT KEY CARRY IN `result`/`flags`?
+  ##
+  ## Consulted by `encodeDepRecordWithSeq` for — and ONLY for — a kind whose
+  ## `depIdentityScope` dropped the observing process (`disPathScoped` /
+  ## `disFactScoped`). Once the pid is out of the key, any OTHER process-local
+  ## coordinate still in it defeats the dedup just as thoroughly, and `result`
+  ## and `flags` are where they hide: a file descriptor, a byte count, a
+  ## `FILE*`.
+  ##
+  ## This used to be a partial `case` with an `else: discard`, which is the
+  ## wrong shape for a per-kind decision — a kind moved across the scope line
+  ## picked up "no normalisation" silently. It is now EXHAUSTIVE over
+  ## `MonitorRecordKind`, deliberately and for the same reason `depIdentityScope`
+  ## is: a kind added or moved later does not compile until somebody states what
+  ## its key carries. Two arms are GUARDS rather than live reducers, and both say
+  ## so — the same distinction `types.nim`'s reads-only gate already draws.
+  ##
+  ## ── FOLDED OUT ENTIRELY: a byte count and a descriptor ──────────────────
+  ##
+  ## `mrFileRead` — LIVE. `result` is the byte count and `flags` is the fd, and
+  ##   neither alters the content dependency. A short read and a full read of
+  ##   the same path are the same fact about the path.
+  ## `mrFileWrite` — A GUARD, and the one this milestone exists to place. The
+  ##   kind is `disProcessScoped` today, so this arm is NOT REACHED; it is stated
+  ##   now, while it is free, because `result` for a write is heterogeneous in a
+  ##   way no other kind's is. Three producers fill it: the raw/libc write hooks
+  ##   store the byte count with the fd in `flags`, `recordPathWrite` stores 0,
+  ##   and `recordFopen` stored the raw `FILE*` — a per-process heap address —
+  ##   until DA-1d made it store 0. Path-scope this kind without this arm and the
+  ##   element key becomes (path, fd, byte-count): it would dedup NOTHING while
+  ##   looking as if it had. With the arm the move is safe by construction.
+  ##
+  ## ── REDUCED TO SUCCESS-OR-FAILURE: existence is the fact, the fd is not ──
+  ##
+  ## `mrFileOpen` — LIVE. A successful `open` returns a descriptor number that is
+  ##   process-local and meaningless to a consumer; what the key needs is whether
+  ##   the path opened. `flags` stays: the O_* access mode IS part of the
+  ##   dependency. Note this arm is also what launders `recordFopen`'s `FILE*`
+  ##   today, which is why the same laundering had to be stated for the write
+  ##   side above rather than left to luck.
+  ## `mrPathProbe` — A GUARD. Reported INERT by DA-1b's mutation pass and it is:
+  ##   on Linux a probe's `result` is already only 0 or −1 (`probeFromResult`),
+  ##   so the mapping is the identity and deleting the arm changes no byte any
+  ##   Linux capture produces. It is kept, and kept HERE rather than in a
+  ##   comment, because the claim "0 or −1" is a property of ONE backend: the
+  ##   macOS and Windows arms build their own `mrPathProbe`s, and the kind is
+  ##   path-scoped for all of them the moment either grows a set producer. The
+  ##   decision table in `test_io_mon_dep_set_element_key` grades it, so it is no
+  ##   longer an untested no-op — it is a stated decision with a test.
+  ##
+  ## ── VERBATIM: nothing process-local to fold ─────────────────────────────
+  ##
+  ## `mrDirectoryEnumerate` — path-scoped, and its `result` is the constant 1 on
+  ##   every current backend (a listing that succeeded), not a descriptor. Folding
+  ##   it would change no key today and would throw away a real success/failure
+  ##   distinction if a backend ever recorded one.
+  ## `mrLibraryLoad`, `mrEnvRead`, `mrSysctlRead`, `mrTimeRead` — the four
+  ##   fact-scoped kinds. Their `result`/`flags` are part of what the fact IS
+  ##   (see `depIdentityScope`), never a handle.
+  ## Every remaining kind is `disProcessScoped`, so this function is not reached
+  ##   for it and the verbatim answer is the one that keeps the key unchanged if
+  ##   it ever is.
+  ##
+  ## BYTE-STABILITY OF DA-1d ITSELF: the only kind whose answer here differs from
+  ## the partial `case` this replaces is `mrFileWrite`, and
+  ## `depIdentityScope(mrFileWrite) == disProcessScoped`, so no call site can
+  ## reach the changed arm. That is asserted, not asserted-in-a-comment — see
+  ## `t_the_only_kind_whose_normalisation_changed_is_unreachable`.
+  case kind
+  of mrFileRead, mrFileWrite:
+    (0'i64, 0'u32)
+  of mrFileOpen, mrPathProbe:
+    ((if rawResult < 0: -1'i64 else: 0'i64), rawFlags)
+  of mrDirectoryEnumerate, mrLibraryLoad, mrEnvRead, mrSysctlRead, mrTimeRead,
+     mrProcessStart, mrProcessExec, mrProcessSpawn, mrEventLoss,
+     mrBackendProfile, mrCapabilityGap, mrIpcConnect, mrNonDeterministic,
+     mrExternalContent, mrPathMutation:
+    (rawResult, rawFlags)
 
 proc encodeDepRecordWithSeq(record: MonitorRecord; buf: var openArray[byte];
                             seqValue: uint64;
@@ -291,17 +381,12 @@ proc encodeDepRecordWithSeq(record: MonitorRecord; buf: var openArray[byte];
   var encodedResult = record.result
   var encodedFlags = record.flags
   if dropObserver:
-    case record.kind
-    of mrFileRead:
-      # Byte count and descriptor number do not alter the content dependency.
-      encodedResult = 0
-      encodedFlags = 0
-    of mrFileOpen, mrPathProbe:
-      # Preserve success versus failure; successful descriptor numbers are
-      # process-local. Open flags and ProbeResult remain part of the key.
-      encodedResult = if record.result < 0: -1 else: 0
-    else:
-      discard
+    # DA-1d — the per-kind answer lives in ONE exhaustive table, not in a partial
+    # `case` with an `else` that quietly answers for kinds nobody classified.
+    let normalized =
+      identityNormalizedOutcome(record.kind, record.result, record.flags)
+    encodedResult = normalized.outcome
+    encodedFlags = normalized.flags
   putU16(buf, pos, uint16(ord(record.kind)))
   putU16(buf, pos, uint16(ord(record.observationKind)))
   putU64(buf, pos, seqValue)
@@ -354,18 +439,21 @@ proc encodeDepRecordIdentity*(record: MonitorRecord; buf: var openArray[byte]): 
   ##   start/exec/spawn/IPC accounting and are never normalized on those records.
   ##
   ##   PATH-SCOPED IDENTITY (`disPathScoped`: `mrFileOpen`, `mrFileRead`,
-  ##   `mrPathProbe`, `mrDirectoryEnumerate`): process and thread ids are zeroed.
-  ##   File-read byte count/fd are zeroed. Open/probe result is reduced to
-  ##   success/failure, while open flags, observation kind, `probeResult`, path, and
-  ##   detail remain in the key. The caller's appended exec-image/generation suffix
-  ##   also remains, so observations from distinct executable incarnations do not
+  ##   `mrPathProbe`, `mrDirectoryEnumerate`): process and thread ids are zeroed,
+  ##   and `result`/`flags` are reduced per `identityNormalizedOutcome` (DA-1d,
+  ##   exhaustive over the enum): file-read byte count/fd zeroed, open/probe
+  ##   result reduced to success/failure, while open flags, observation kind,
+  ##   `probeResult`, path and detail remain in the key. The exec-image/generation
+  ##   suffix that `writer.encodeDepSetElement` appends also remains, so
+  ##   observations from distinct executable incarnations do not
   ##   collapse. This folds compiler include-search storms across thousands of
   ##   same-image workers without losing a distinct path, access mode, existence
   ##   outcome, probe outcome, or run scope.
   ##
   ##   FACT-SCOPED IDENTITY (DA-1b — `disFactScoped`: `mrLibraryLoad`, `mrEnvRead`,
-  ##   `mrSysctlRead`, `mrTimeRead`): process and thread ids are zeroed AND the
-  ##   caller drops the incarnation suffix (`depIdentityKeepsIncarnation`), because
+  ##   `mrSysctlRead`, `mrTimeRead`): process and thread ids are zeroed AND
+  ##   `writer.encodeDepSetElement` drops the incarnation suffix
+  ##   (`depIdentityKeepsIncarnation` — DA-1d made that the ONE site), because
   ##   for these kinds the observation is the whole fact and neither coordinate is
   ##   evidence any consumer reads. Everything the fact IS — observation kind, path,
   ##   detail (including the run scope), result, flags — stays in the key. See
@@ -376,8 +464,8 @@ proc encodeDepRecordIdentity*(record: MonitorRecord; buf: var openArray[byte]): 
   ##   distinguishes exact-duplicate storm EVENTS from each other; it is renumbered
   ##   densely in the canonical depfile so its value never reaches the output, so
   ##   dropping it is what ENABLES source-dedup). The part-1 8-byte incarnation
-  ##   nonce is also gone (replaced by the real exec-incarnation identity the caller
-  ##   appends — see `appendFragmentRecord`).
+  ##   nonce is also gone (replaced by the real exec-incarnation identity that
+  ##   `writer.encodeDepSetElement` appends — DA-1d's single element-key site).
   ##
   ## `decodeDepRecord` reconstructs a `MonitorRecord` with `seq = 0` from this key
   ## (plus ignores any trailing incarnation-identity bytes the caller appends), so
