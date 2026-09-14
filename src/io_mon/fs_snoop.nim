@@ -382,8 +382,19 @@ when defined(linux):
     if not prod.available:
       prod.detach()
       return false
+    #
+    # DA-1d — the element key is composed by `writer.encodeDepSetElement`, the
+    # ONE site that decides what a key carries, rather than by calling the
+    # identity encoder directly and hard-coding "no incarnation suffix" here.
+    # The bytes are unchanged: this runs in the HOST process, which loads no
+    # shim, so `setDepSetIncarnationImage` was never called and the incarnation
+    # is empty — the difference is that the emptiness is now a fact ABOUT THIS
+    # PROCESS that the shared rule reads, instead of an answer this site
+    # asserted on its own. `mrEventLoss` keeps an incarnation, so before DA-1d
+    # this site and `rebuildDepSetLossElem` gave OPPOSITE answers to the same
+    # question for the same kind.
     var buf {.noinit.}: array[512, byte]
-    let n = encodeDepRecordIdentity(rec, buf)
+    let n = encodeDepSetElement(rec, buf)
     result = false
     if n >= 0:
       case prod.emit(buf.toOpenArray(0, n - 1))

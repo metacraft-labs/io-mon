@@ -5,9 +5,36 @@
 ## mcComplete"): an un-injected spawn child, or an exec/SETEXEC into an
 ## un-injectable image, each yields one event-loss so `mergeFragments` downgrades
 ## completeness to `mcIncomplete` — while a fully-monitored tree stays clean.
+##
+## ── DA-1d: TEETH, NOT A RENAME ────────────────────────────────────────────
+##
+## DA-1b reported this file as naming an invariant it does not protect. Its M6b
+## mutation — `depIdentityKeepsIncarnation ≡ false`, dropping the per-exec
+## incarnation from every element key — breaks `startCount == 1 + execCount` for
+## every real process, because a pid's pre-exec and post-exec `mrProcessStart`
+## are BYTE-IDENTICAL after decode and the incarnation suffix is the only thing
+## keeping them two elements. This file stayed GREEN under it, because every
+## suite above hands `unmonitoredSubtreeLossCount` a `seq[MonitorRecord]` that
+## was never published through an element key. The algorithm was covered; the
+## thing that feeds it was not.
+##
+## The name was the honest one, so the file was given the teeth rather than
+## renamed: the final suite publishes synthetic records through the REAL producer
+## composition (`writer.encodeDepSetElement`, DA-1d's single element-key site),
+## unions the element bytes the only way a G-Set can (an idempotent claim on the
+## whole element), sorts by raw bytes as the consumer does, decodes with the REAL
+## `decodeDepRecord`, and only THEN runs the T0 algorithm. Under M6b the two
+## process-starts of one pid arrive as one record and the suite goes red.
+##
+## What this is NOT: the real container. The union here is a `HashSet` of element
+## bytes, which is the G-Set's algebra but not `nim-shm-gset` itself — the real
+## shared-memory container is exercised by `tests/linux/test_io_mon_dep_set` and
+## the live shim tests, which cannot run in the portable tier. What is real here
+## is the composition, the codec and the algorithm, i.e. everything M6b touches.
 
-import std/[os, sets, strutils, unittest]
+import std/[algorithm, os, sets, strutils, unittest]
 import io_mon
+import io_mon/shm/dep_queue
 
 proc start(pid: uint64): MonitorRecord =
   MonitorRecord(kind: mrProcessStart, observationKind: moProcessStart, osPid: pid)
@@ -927,3 +954,159 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
         sawLast = true
     check sawLast
     removeDir(work)
+
+# ---------------------------------------------------------------------------
+# DA-1d — the element key, exercised.
+#
+# Everything above reasons over records that were never published. The producer
+# does not publish records: it publishes ELEMENT KEYS, and two records with the
+# same key become one. That step is where `startCount == 1 + execCount` can be
+# destroyed without any of the suites above noticing, so it is reproduced here
+# exactly as the Linux producer/consumer pair performs it.
+# ---------------------------------------------------------------------------
+
+const DepSetElemBufBytes = 16384
+  ## `writer.SetProducerBufBytes` — the shim's publish-before-return buffer.
+
+proc byteCmp(a, b: seq[byte]): int =
+  let n = min(a.len, b.len)
+  for i in 0 ..< n:
+    if a[i] != b[i]:
+      return cmp(a[i], b[i])
+  cmp(a.len, b.len)
+
+proc throughTheDepSet(published: openArray[
+    tuple[rec: MonitorRecord; image: string]]): seq[MonitorRecord] =
+  ## Publish → union → snapshot → decode, the way the Linux arm really does it.
+  ##
+  ##   * publish: `writer.encodeDepSetElement`, DA-1d's single element-key site,
+  ##     with the publishing incarnation installed the way the shim installs it
+  ##     at init and after every exec;
+  ##   * union: an idempotent claim keyed on the WHOLE element — the only
+  ##     operation `nim-shm-gset` performs, so a repeat insert is a no-op;
+  ##   * snapshot: sorted by raw element bytes, which is how `fs_snoop` restores
+  ##     ordering determinism after `seq` is forced to 0;
+  ##   * decode: the real `decodeDepRecord`, which ignores the trailing
+  ##     incarnation bytes.
+  var elems: seq[seq[byte]]
+  var claimed = initHashSet[seq[byte]]()
+  for entry in published:
+    setDepSetIncarnationImage(entry.image)
+    var buf {.noinit.}: array[DepSetElemBufBytes, byte]
+    let n = encodeDepSetElement(entry.rec, buf)
+    doAssert n > 0, "record could not be framed as an element"
+    var elem = newSeq[byte](n)
+    for i in 0 ..< n:
+      elem[i] = buf[i]
+    if not claimed.containsOrIncl(elem):
+      elems.add elem
+  setDepSetIncarnationImage("")
+  elems.sort(byteCmp)
+  for elem in elems:
+    var ok = false
+    let rec = decodeDepRecord(elem, ok)
+    doAssert ok, "consumer could not decode an element it was handed"
+    result.add rec
+
+proc countKind(records: openArray[MonitorRecord];
+               kind: MonitorRecordKind; pid: uint64): int =
+  for r in records:
+    if r.kind == kind and r.osPid == pid:
+      inc result
+
+const
+  imageA = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bash-5.2/bin/bash\x1f0"
+  imageB = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-gcc-13.2.0/bin/gcc\x1f1"
+
+suite "io-mon T0 completeness THROUGH the dep-set element key (DA-1d)":
+
+  test "startCount == 1 + execCount survives the element key (M6b's target)":
+    # pid 100 starts under image A, execs into image B, and the new incarnation
+    # emits its own process-start. The two starts are byte-identical records —
+    # same pid/ppid/tid, empty path, same detail — so the ONLY thing that can
+    # keep them two elements is the per-exec incarnation suffix.
+    let published = @[
+      (spawn(0, 100), imageA),
+      (start(100), imageA),
+      (execRec(100), imageA),
+      (start(100), imageB)]
+    let decoded = throughTheDepSet(published)
+
+    let starts = countKind(decoded, mrProcessStart, 100)
+    let execs = countKind(decoded, mrProcessExec, 100)
+    echo "DA-1d/T0: published 4 records -> ", decoded.len,
+      " elements; pid 100 starts=", starts, " execs=", execs
+    check starts == 1 + execs        # the named invariant, on published data
+    check decoded.len == 4
+    check unmonitoredSubtreeLossCount(decoded) == 0
+
+  test "an exec whose new image was NOT injectable still downgrades":
+    # The positive control for the case above: with no post-exec start there is
+    # nothing for the incarnation suffix to keep apart, and T0 must still fire.
+    # Without this, "two starts survived" and "the algorithm cannot see an exec"
+    # would be indistinguishable.
+    let published = @[
+      (spawn(0, 100), imageA),
+      (start(100), imageA),
+      (execRec(100), imageA)]
+    let decoded = throughTheDepSet(published)
+    check decoded.len == 3
+    check unmonitoredSubtreeLossCount(decoded) == 1
+
+  test "two DIFFERENT pids' process-starts are never folded together":
+    # `mrProcessStart` is process-scoped: the pid is the evidence, and folding it
+    # would delete the process census T0 reads. Same incarnation on purpose, so
+    # only the pid can keep these apart.
+    let published = @[
+      (spawn(0, 100), imageA),
+      (start(100), imageA),
+      (spawn(100, 200), imageA),
+      (start(200), imageA)]
+    let decoded = throughTheDepSet(published)
+    check decoded.len == 4
+    check unmonitoredSubtreeLossCount(decoded) == 0
+
+  test "a fact-scoped observation folds across processes AND incarnations":
+    # The other side of the same predicate (DA-1b's M6). A DSO's identity is its
+    # path and contents; keeping either the pid or the incarnation in the key
+    # would split one fact into one element per observer — measured on a real
+    # `nim c` as ~7,200 duplicate library-load records created by the suffix
+    # alone, before any pid was considered.
+    proc dso(pid: uint64): MonitorRecord =
+      MonitorRecord(kind: mrLibraryLoad, observationKind: moFileRead,
+        osPid: pid, parentOsPid: 1, threadId: pid, path: "/lib/libc.so.6",
+        detail: "dyld-add-image run=abc")
+    let published = @[
+      (dso(100), imageA), (dso(200), imageB), (dso(300), imageA),
+      (dso(100), imageB)]
+    let decoded = throughTheDepSet(published)
+    echo "DA-1d/T0: 4 library-loads over 3 pids x 2 incarnations -> ",
+      decoded.len, " element(s)"
+    check decoded.len == 1
+    check decoded[0].osPid == 0
+    check decoded[0].path == "/lib/libc.so.6"
+
+  test "a probe storm collapses without losing a distinct path":
+    # The cardinal-sin control for the path-scoped class: repetition collapses,
+    # distinct facts do not.
+    proc probe(pid: uint64; path: string; present: bool): MonitorRecord =
+      MonitorRecord(kind: mrPathProbe, observationKind: moPathProbe,
+        osPid: pid, threadId: pid, path: path,
+        result: if present: 0 else: -1,
+        probeResult: if present: prExistingFile else: prAbsent)
+    var published: seq[tuple[rec: MonitorRecord; image: string]]
+    for i in 0 ..< 500:
+      for pid in [100'u64, 200'u64, 300'u64]:
+        published.add (probe(pid, "/usr/include/stdio.h", true), imageA)
+        published.add (probe(pid, "/usr/include/absent.h", false), imageA)
+    published.add (probe(400'u64, "/usr/include/stdio.h", true), imageB)
+    let decoded = throughTheDepSet(published)
+    echo "DA-1d/T0: 3001 probes -> ", decoded.len, " elements"
+    # 2 facts under incarnation A, plus the same present-file fact seen from a
+    # DIFFERENT incarnation, which path-scoping deliberately does NOT fold.
+    check decoded.len == 3
+    var paths = initHashSet[string]()
+    for r in decoded:
+      paths.incl r.path
+      check r.osPid == 0
+    check paths.len == 2
