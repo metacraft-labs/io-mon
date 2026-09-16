@@ -3924,13 +3924,13 @@
         "lastModified": 1787335553,
         "narHash": "sha256-ROxqx36o96BzdWGlDaZfugY0CQnytCMGwesn3bz96Ig=",
         "owner": "metacraft-labs",
-        "repo": "nixos-modules",
+        "repo": "devops-modules",
         "rev": "e357e1121227e2933b8650d1a0b1d7073878da0b",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
-        "repo": "nixos-modules",
+        "repo": "devops-modules",
         "type": "github"
       }
     },
