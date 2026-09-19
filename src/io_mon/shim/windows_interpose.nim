@@ -1,6 +1,17 @@
 when not defined(windows):
   {.error: "repro_monitor_shim/windows_interpose is Windows-only".}
 
+# The shim is loaded into processes whose threads it does not own, and Nim's
+# default allocator owns one heap per thread: a cell freed on a thread other
+# than its allocator's is handed back through a pointer into the OWNING
+# thread's TLS, which the loader discards when that thread exits. Measured as
+# a 0xC0000005 in `addToSharedFreeList` on .NET's finalizer thread -- see
+# scripts/build_shim.sh. Only the library build is held to this: a test that
+# imports the module into a console binary runs on threads Nim created.
+when appType == "lib" and not defined(useMalloc):
+  {.error: "the io-mon shim must be built with -d:useMalloc; " &
+    "scripts/build_shim.sh sets it, and says why".}
+
 # Windows: Reprobuild monitor shim DLL — feature-parity counterpart to
 # macos_interpose.nim. On macOS the shim is injected via
 # DYLD_INSERT_LIBRARIES and uses ct_interpose's function interposition.

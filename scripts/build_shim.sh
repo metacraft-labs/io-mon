@@ -70,6 +70,38 @@ case "${IO_MON_BUILD_MODE:-debug}" in
     ;;
 esac
 
+# The shim runs on threads it does not own, so it must not own a heap per
+# thread.
+#
+# Nim's default allocator keeps one MemRegion PER THREAD, in that thread's
+# TLS, and frees a cell by handing it back to the region that allocated it --
+# through a pointer into that region (`addToSharedFreeList`). Inside an
+# injected library the threads are the HOST's: they start and exit on the
+# host's schedule, and when one exits the loader frees its TLS block, region
+# included. Every cell that thread allocated into shim-global state now names
+# a region that no longer exists, and the first foreign thread to free one of
+# them faults.
+#
+# MEASURED, in powershell.exe hosting a 300-child `nim c`: .NET Framework
+# finalizes every remaining SafeHandle on ITS finalizer thread at shutdown,
+# including pipe and process handles opened by threadpool threads that
+# retired long before. Each `CloseHandle` reached `forgetHandlePath`, which
+# freed a path string allocated by one of those dead threads; WER recorded
+# the 0xC0000005 inside `addToSharedFreeList__system` in this DLL, every
+# time. Under the same monitor the identical compile launched from bash (no
+# .NET, no thread churn) never faulted -- which is why it presented as an
+# intermittent "compiler crash" for days rather than as what it is.
+#
+# `-d:useMalloc` replaces the per-thread regions with the process's C heap:
+# one heap, owned by the process, alive until the process is. It applies to
+# every platform's shim, not just Windows, because the hazard is the
+# allocator's design and only the trigger is Windows-specific: a Linux or
+# macOS host that frees another thread's cell after that thread exits is
+# exposed the same way, and nothing today proves no host does. Each shim
+# entry module refuses to compile as a library without the define, so a
+# build path that bypasses this script cannot quietly reintroduce it.
+nim_shim_alloc_flags=("-d:useMalloc")
+
 # Platform/arch detection must not depend on an external ``uname``.
 #
 # This script is invoked by reprobuild's scripts/build_apps.sh, which runs both
@@ -137,6 +169,7 @@ case "${io_mon_host_platform_name}" in
     fi
     nim c \
       ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
+      ${nim_shim_alloc_flags[@]+"${nim_shim_alloc_flags[@]}"} \
       ${macos_shim_arch_flags[@]+"${macos_shim_arch_flags[@]}"} \
       --app:lib \
       --threads:on \
@@ -157,6 +190,7 @@ case "${io_mon_host_platform_name}" in
     fi
     nim c \
       ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
+      ${nim_shim_alloc_flags[@]+"${nim_shim_alloc_flags[@]}"} \
       ${linux_shim_link_flags[@]+"${linux_shim_link_flags[@]}"} \
       --app:lib \
       --threads:on \
@@ -180,6 +214,7 @@ case "${io_mon_host_platform_name}" in
     # which the system resolves unconditionally.
     nim c \
       ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
+      ${nim_shim_alloc_flags[@]+"${nim_shim_alloc_flags[@]}"} \
       --app:lib \
       --threads:on \
       --mm:orc \
@@ -251,6 +286,7 @@ case "${io_mon_host_platform_name}" in
       PATH="${i686_bin}:${PATH}" \
       nim c \
         ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
+        ${nim_shim_alloc_flags[@]+"${nim_shim_alloc_flags[@]}"} \
         --app:lib \
         --threads:on \
         --mm:orc \
