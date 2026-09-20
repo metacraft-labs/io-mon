@@ -17,7 +17,7 @@ on:
 jobs:
   lint:
     name: Lint
-    runs-on: eph-linux-x64
+    runs-on: [self-hosted, linux, x64]
     steps:
       - name: Generate CI token
         id: app-token
@@ -58,7 +58,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runs-on: [eph-linux-x64, eph-macos-arm64]
+        # `slug` names the artifact (a plain platform string); `runs-on` carries
+        # the capability-label ARRAY. They are decoupled because an artifact name
+        # cannot be a bracketed label list — see the release.yml / ci-reprobuild.yml
+        # platform-key convention (RC4).
+        include:
+          - slug: linux-x64
+            runs-on: [self-hosted, linux, x64]
+          - slug: macos-arm64
+            runs-on: [self-hosted, macos, arm64]
     steps:
       - name: Generate CI token
         id: app-token
@@ -86,7 +94,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs-${{ matrix.runs-on }}
+          name: build-logs-${{ matrix.slug }}
           path: build.log
           retention-days: 30
 
@@ -96,13 +104,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # `slug` names the artifact; `runs-on` carries the capability-label array
+        # (decoupled — an artifact name cannot be a bracketed label list).
         include:
           - env: nix
-            runs-on: eph-linux-x64
+            slug: linux-x64
+            runs-on: [self-hosted, linux, x64]
           - env: nix
-            runs-on: eph-macos-arm64
+            slug: macos-arm64
+            runs-on: [self-hosted, macos, arm64]
           - env: reprobuild
-            runs-on: eph-linux-x64
+            slug: linux-x64
+            runs-on: [self-hosted, linux, x64]
     steps:
       - name: Generate CI token
         id: app-token
@@ -135,6 +148,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs-${{ matrix.env }}-${{ matrix.runs-on }}
+          name: test-logs-${{ matrix.env }}-${{ matrix.slug }}
           path: test.log
           retention-days: 30
