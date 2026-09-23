@@ -1399,7 +1399,9 @@ proc precomputeSigSafeCommittedFrame(slot: var FragmentSlot) =
     putByte(byte((v shr 56) and 0xFF'u64))
   # Frame length prefix.
   putU32Le(uint32(payloadLen))
-  # Record header — MUST match encodeRecordPayload / appendFragmentRecord.
+  # Record header — MUST match `encode.storeRecordFixedHeader`'s `Off*` layout
+  # (DA-1c moved the field order out of `encodeRecordPayload`'s statement order
+  # and into named offsets; the bytes are unchanged) / appendFragmentRecord.
   putU16Le(uint16(ord(mrEventLoss)))
   putU16Le(uint16(ord(moEventLoss)))
   putU64Le(0'u64)                          # seq
@@ -1681,7 +1683,9 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
 
   # Frame length prefix.
   putU32Le(uint32(payloadLen))
-  # Record header — order MUST match encodeRecordPayload exactly.
+  # Record header — order MUST match `encode.storeRecordFixedHeader`'s `Off*`
+  # layout exactly (DA-1c moved the field order out of `encodeRecordPayload`'s
+  # statement order and into named offsets; the bytes are unchanged).
   putU16Le(uint16(ord(record.kind)))
   putU16Le(uint16(ord(record.observationKind)))
   putU64Le(record.seq)
