@@ -136,17 +136,58 @@ proc loadU64Le*(bytes: openArray[byte]; off: int): uint64 {.inline.} =
       result = result or (uint64(bytes[off + i]) shl (8 * i))
 
 proc writeString*(outp: var seq[byte]; value: string) =
+  ## DA-1c FOLLOW-ON — the string BODY is a bulk copy, not a byte loop.
+  ##
+  ## The `u32` length prefix stays on the cursor codec: it is four bytes and its
+  ## byte order is the wire's, not the host's. Only the BODY changes, and a
+  ## string body is a byte sequence — a Nim `char` is one byte and
+  ## `byte(ord(ch))` is that same byte — so the loop and the copy write the same
+  ## bytes in the same order on EVERY host. No endianness is involved and the
+  ## wire format is unchanged.
+  ##
+  ## The loop it replaces paid a length bump, a capacity test and a store for
+  ## every byte of every `path` and `detail` in the file, and those two strings
+  ## are the majority of a real capture's bytes.
   outp.writeU32Le(uint32(value.len))
-  for ch in value:
-    outp.add(byte(ord(ch)))
+  if value.len > 0:
+    let base = outp.len
+    outp.setLen(base + value.len)
+    copyMem(addr outp[base], unsafeAddr value[0], value.len)
 
 proc readString*(bytes: openArray[byte]; pos: var int): string =
+  ## DA-1c FOLLOW-ON — the decode-side twin of `writeString` above.
+  ##
+  ## THE BOUNDS CHECK BELOW IS LATERALLY LOAD-BEARING and is deliberately
+  ## unchanged. It is the ONLY thing standing between this `copyMem` and an
+  ## out-of-bounds read: `length` comes from the FILE, so a hostile or corrupt
+  ## `u32` length prefix names any size it likes. The per-byte loop this
+  ## replaces would also have run off the end — the check is not new — but a
+  ## `copyMem` turns a bounded misread into one unbounded one, so the check has
+  ## to be graded rather than assumed. It is, by
+  ## `tests/portable/test_io_mon_wire_negative_oracle.nim`, whose
+  ## `pathlen_*` / `detaillen_*` cases present exactly the prefixes no legal
+  ## record can produce (a non-zero byte 2 or 3, and 0xFFFFFFFF) and pin the
+  ## verdict — `eeMalformed` -> `mrTruncated` — that the check must produce.
+  ##
+  ## GRADED AT ITS BOUNDARY, not merely at its presence, and the distinction
+  ## cost a case to learn. Most over-long prefixes are refused twice over: the
+  ## over-long `path` is consumed, and then the `detail` prefix that no longer
+  ## fits raises anyway, so a bound with one byte of slack reaches the same
+  ## `mrTruncated` and hides. `detaillen_one_byte_past_the_payload` is the frame
+  ## that does not let it: the over-long string is the LAST thing in the
+  ## payload, so a slack bound falls out at `pos != payload.len` with
+  ## `mrSemanticValidationFailed` instead. Without that case the whole suite
+  ## stayed green with the bound off by one and only ASAN saw the read.
+  ##
+  ## `pos + length > bytes.len` is kept verbatim rather than rephrased: any
+  ## rewrite of it is a change to which files io-mon accepts, which is not what
+  ## this change is.
   let length = int(readU32Le(bytes, pos))
   if pos + length > bytes.len:
     raiseEnvelopeError(eeMalformed, "truncated string")
   result = newString(length)
-  for i in 0 ..< length:
-    result[i] = char(bytes[pos + i])
+  if length > 0:
+    copyMem(addr result[0], unsafeAddr bytes[pos], length)
   pos += length
 
 proc toBytes*(text: string): seq[byte] =
@@ -167,9 +208,13 @@ proc toBytes*(text: string): seq[byte] =
     copyMem(addr result[0], unsafeAddr text[0], text.len)
 
 proc fromBytes*(bytes: openArray[byte]): string =
+  ## DA-1c FOLLOW-ON — `toBytes`' inverse, bulk for the same reason and with the
+  ## same byte-identity argument: `char(b)` is the byte `b`, so the copy and the
+  ## loop produce the same string. The reader calls this on the whole depfile in
+  ## several places, and the writer on every record's `path`/`detail`.
   result = newString(bytes.len)
-  for i, b in bytes:
-    result[i] = char(b)
+  if bytes.len > 0:
+    copyMem(addr result[0], unsafeAddr bytes[0], bytes.len)
 
 proc hexBytes*(bytes: openArray[byte]): string =
   result = newStringOfCap(bytes.len * 2)
