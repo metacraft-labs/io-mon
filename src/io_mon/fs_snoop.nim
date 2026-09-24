@@ -585,6 +585,89 @@ when defined(macosx):
       return candidate
     ""
 
+  const appleToolchainDropIns = [
+    # Apple's own toolchain, reached at the path Apple already installs it at.
+    # Each of these also exists under /usr/bin as a tiny `xcode_select` SHIM
+    # (`/usr/bin/cc` is 118 KB and signed `com.apple.dt.xcode_select.tool-shim-public`);
+    # the shim is SIP-protected, so exec'ing it strips DYLD_INSERT_LIBRARIES
+    # and the real compiler it then exec's never sees the shim library either.
+    # The compiler ITSELF lives under the active developer directory, outside
+    # every SIP prefix, and is signed with `flags=0x0(none)` — no hardened
+    # runtime, no library validation — so it takes the injection normally.
+    #
+    # Measured: `bash -c '/usr/bin/cc --version'` under the monitor reports one
+    # unknown-scope loss; with `usr/bin/cc` dropped in as a symlink to
+    # `xcrun -f clang` it reports none. On a dev-env activation that one loss
+    # was the difference between a provider compile that publishes to the
+    # action cache and one that recompiles on every new shell (20.5 s).
+    "cc", "clang", "c++", "clang++", "cpp",
+    "ld", "as", "ar", "nm", "strip", "lipo", "libtool",
+  ]
+
+  proc resolveAppleToolchainTool*(name: string): string =
+    ## Exported for the test that asserts the resolved path is outside every
+    ## SIP prefix — the one property the whole mechanism rests on, and one that
+    ## cannot be observed from the outside without re-running `xcrun`.
+    ##
+    ## Absolute path of ``name`` inside the ACTIVE developer directory, via
+    ## ``xcrun -f``. That is the only correct resolver: the toolchain path
+    ## depends on `xcode-select -p` (Xcode.app vs CommandLineTools) and on the
+    ## selected toolchain, and hardcoding either spelling breaks on the other.
+    ##
+    ## ``xcrun`` itself is SIP-protected, which does not matter: this runs in
+    ## the monitor host at populate time, not inside a monitored action — the
+    ## same reasoning that lets ``findNonSipAlternative`` above consult the
+    ## developer's own PATH.
+    var resolved = ""
+    try:
+      let probe = execCmdEx("/usr/bin/xcrun -f " & quoteShell(name) &
+        " 2>/dev/null")
+      if probe.exitCode != 0:
+        return ""
+      resolved = probe.output.strip()
+    except CatchableError, Defect:
+      return ""
+    if resolved.len == 0 or not fileExists(extendedPath(resolved)):
+      return ""
+    # A resolver that answered with a SIP path would defeat the whole point,
+    # so the guard is explicit rather than assumed from the directory layout.
+    if ct_propagation.isSipProtected(resolved):
+      return ""
+    resolved
+
+  proc populateAppleToolchainDropIns*(sandboxDir: string) =
+    ## Symlink each Apple toolchain tool into the sandbox at its /usr/bin
+    ## spelling, so ``rewriteSipPath("/usr/bin/cc", dir)`` resolves.
+    ##
+    ## These are SYMLINKS TO APPLE'S OWN BINARY, which is what makes this
+    ## sound where a substitution would not be: the monitored action runs the
+    ## same compiler, linker and assembler it would have run through the shim,
+    ## with the same SDK resolution and the same defaults. Nothing about the
+    ## build changes; only whether we can see it. Substituting a DIFFERENT
+    ## compiler (a nixpkgs clang, say) would change what gets built, and is
+    ## deliberately not what happens here.
+    ##
+    ## Absent toolchain, absent entry: a host with no developer directory
+    ## simply gets no drop-in, exactly as for any other unresolvable tool.
+    if sandboxDir.len == 0:
+      return
+    let destDir = sandboxDir / "usr" / "bin"
+    try:
+      createDir(extendedPath(destDir))
+    except OSError, IOError:
+      return
+    for name in appleToolchainDropIns:
+      let destPath = destDir / name
+      if fileExists(destPath) or symlinkExists(destPath):
+        continue
+      let resolved = resolveAppleToolchainTool(name)
+      if resolved.len == 0:
+        continue
+      try:
+        createSymlink(resolved, destPath)
+      except OSError, IOError:
+        discard
+
   proc populateReproSandboxTools(sandboxDir: string) =
     ## Drop in a non-SIP instance of every entry in ``reproSandboxBinaries``
     ## under ``sandboxDir``, mirroring the original SIP layout so
@@ -639,6 +722,10 @@ when defined(macosx):
           discard ct_propagation.prepareSandboxCopy(src, sandboxDir)
         except OSError, IOError:
           discard
+
+    # The toolchain is resolved through the developer directory rather than
+    # PATH, so it is a separate pass over a separate name list.
+    populateAppleToolchainDropIns(sandboxDir)
 
   proc resolveExecutableInPath(name: string): string =
     ## Resolve ``name`` against PATH the way ``posix_spawnp`` would so we
