@@ -8,5 +8,14 @@
     "Excluded here rather than reshaped, because their whole purpose is to be the",
     "exact bytes the monitor writes."
   ],
-  "Exclude": ["^tests/fixtures/dep_set_golden/"]
+  "_comment2": [
+    "tests/fixtures/wire_informative/informative.iomon is the same kind of",
+    "artefact for the same reason: a BINARY canonical-iomon capture whose whole",
+    "purpose is to be the exact bytes the encoder writes, so it can neither gain",
+    "a final newline nor be re-encoded as UTF-8."
+  ],
+  "Exclude": [
+    "^tests/fixtures/dep_set_golden/",
+    "^tests/fixtures/wire_informative/"
+  ]
 }
