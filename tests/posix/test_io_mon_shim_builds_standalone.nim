@@ -72,6 +72,13 @@ suite "io-mon shim standalone relocation":
     var args = @[
       "c",
       "--app:lib",
+      # `scripts/build_shim.sh` passes this, and `linux_preload.nim` refuses to
+      # compile as a library without it: the shim runs inside a process whose
+      # allocator it does not own, so Nim's per-thread regions are replaced by
+      # the C heap. This test exists to prove the shim builds standalone, so it
+      # has to build it the way the real build does — otherwise it proves that
+      # some *other* configuration builds, which is not the claim.
+      "-d:useMalloc",
       "--threads:on",
       "--hints:off",
       "--path:" & (repoRoot / "src"),
