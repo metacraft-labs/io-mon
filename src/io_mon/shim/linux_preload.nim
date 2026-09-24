@@ -702,6 +702,8 @@ void repro_linux_atfork_child_c(void) {
 proc c_getpid(): cint {.importc: "getpid", header: "<unistd.h>".}
 proc c_getppid(): cint {.importc: "getppid", header: "<unistd.h>".}
 proc c_gettid(): clong {.importc: "repro_linux_gettid", raises: [].}
+proc c_fileno(stream: pointer): cint
+  {.importc: "fileno", header: "<stdio.h>", raises: [].}
 proc c_get_errno(): cint {.importc: "repro_linux_get_errno", raises: [].}
 proc c_set_errno(value: cint) {.importc: "repro_linux_set_errno", raises: [].}
 proc c_errno_is_connect_in_progress(value: cint): cint
@@ -2220,9 +2222,18 @@ proc repro_hook_fclose*(ctx: var FcloseContext) {.raises: [].} =
   if shouldBypass():
     callNext(ctx)
     return
+  # `fclose` closes the stream's descriptor inside libc, where the `close` hook
+  # never sees it. The descriptor's fd -> path entry must be dropped here, or the
+  # next open that reuses the number inherits the OLD path and its raw
+  # `write(2)`s are recorded against a file the process never wrote (the
+  # libstdc++ ifstream-then-ofstream pattern). `fileno` must be read before the
+  # stream is released.
+  let fd = if ctx.stream == nil: -1.cint else: c_fileno(ctx.stream)
   callNext(ctx)
   let savedErrno = c_get_errno()
   removeStreamPath(ctx.stream)
+  if fd >= 0:
+    removeFdPath(fd)
   c_set_errno(savedErrno)
 
 proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32) {.raises: [].} =
