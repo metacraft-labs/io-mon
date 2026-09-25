@@ -182,7 +182,15 @@ case "${io_mon_host_platform_name}" in
       src/io_mon/shim/macos_interpose.nim
     ;;
   linux)
-    linux_shim_link_flags=()
+    # Put --as-needed BEFORE Nim's automatic -lm/-lrt/-ldl/-pthread flags.
+    # Otherwise unused companion libraries from the build host's glibc can
+    # be loaded into an older monitored process and fail its libc ABI checks.
+    # These variables are expanded by Nim when rendering its linker command.
+    # shellcheck disable=SC2016
+    linux_shim_link_flags=(
+      '--gcc.linkTmpl:-Wl,--as-needed $buildgui $builddll -o $exefile $objfiles $options'
+      '--clang.linkTmpl:-Wl,--as-needed $buildgui $builddll -o $exefile $objfiles $options'
+    )
     if getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
       linux_shim_link_flags+=(
         "-d:ioMonGlibcPrivateHeap"

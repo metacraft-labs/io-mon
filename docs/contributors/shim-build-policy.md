@@ -38,6 +38,13 @@ rustc's allocator from its clock hook. The wrappers do not interpose malloc
 for the host or change its allocation policy. Other platforms retain their
 existing allocation path.
 
+Linux builds also enable linker `--as-needed` before Nim's automatic system
+library arguments. The shim must not carry unused libc companion libraries:
+a Nix RUNPATH can otherwise load a newer libm/librt/libdl/libpthread beside an
+older executable's libc and fail before the program starts. This preserves
+compatibility only down to the shim's actual imported glibc symbol floor; it
+does not promise arbitrary old-glibc or cross-libc injection compatibility.
+
 This depends on an ownership boundary: only shim-owned pointers may reach the
 wrapped frees. The current callers are Nim's `useMalloc` runtime, the Linux POD
 tables, raw-syscall snapshots, and exec-environment construction. Each frees its
