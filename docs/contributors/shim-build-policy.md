@@ -29,6 +29,21 @@ The shim is built (see `scripts/build_shim.sh` and
   thread; more C-like than `orc`. The shim's data has no reference cycles.
 - `--threads:on` — required: the shim records from every host thread.
 
+On Linux/glibc, `-d:useMalloc` is paired with `ioMonGlibcPrivateHeap`. The
+shim's own malloc/calloc/realloc/free references are linked through private,
+hidden wrappers to glibc's allocator entry points. They do not resolve to an
+executable's replacement allocator. This retains process-lifetime ownership
+(including frees after the allocating host thread exits) without entering
+rustc's allocator from its clock hook. The wrappers do not interpose malloc
+for the host or change its allocation policy. Other platforms retain their
+existing allocation path.
+
+This depends on an ownership boundary: only shim-owned pointers may reach the
+wrapped frees. The current callers are Nim's `useMalloc` runtime, the Linux POD
+tables, raw-syscall snapshots, and exec-environment construction. Each frees its
+own allocations. A future foreign API returning an allocated pointer must use
+that API's matching deallocator; it must not pass the pointer to the shim heap.
+
 We deliberately **keep `--exceptions:goto`** (the default) rather than
 `--exceptions:quirky`, even though `goto` injects the `nimInErrorMode` threadvar
 access at proc entry. The writer/codec genuinely use exceptions (`EnvelopeError`,
@@ -54,10 +69,19 @@ its own lock and corrupts the heap. This is not fixable by compiler settings —
 even an application `{.threadvar.}` on that path is unsafe (see the stackable-hooks
 doc for the measurements).
 
-**Audit (current):** `mmap` is the **only** hooked function libmalloc calls
-internally — `munmap`, `mprotect`, `madvise`, `mremap`, `vm_allocate`, `brk`/`sbrk`
-are not hooked. The dyld add-image callback runs in dyld's post-map context (not
-malloc-reentrant) and is safe in practice.
+**Audit scope:** the macOS libmalloc analysis below does not cover replacement
+allocators on Linux. In particular, rustc calls `clock_gettime` while holding
+its allocator lock during thread-destructor registration. A normal Nim clock
+hook built with unqualified `useMalloc` re-enters that lock and deadlocks.
+Linux/glibc therefore isolates shim allocations from the replacement allocator
+as described above. This is not a claim that arbitrary allocator or signal
+contexts are safe: paths called under glibc's own allocator lock still require
+the allocation-free treatment below. The dyld add-image callback runs in dyld's
+post-map context (not malloc-reentrant).
+
+`tests/linux/test_io_mon_allocator_clock_reentrancy.nim` exercises first access
+on foreign threads under a real allocator mutex, plus actual rustc target
+enumeration, with checked timeouts and time-evidence assertions.
 
 **How `mmap` obeys the rule:** `repro_wrap_mmap` decides from the mmap **flags
 alone**, in pure C, whether a mapping could ever be recorded. Only a `MAP_SHARED`

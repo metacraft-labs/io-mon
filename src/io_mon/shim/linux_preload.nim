@@ -12,6 +12,10 @@ when appType == "lib" and not defined(useMalloc):
   {.error: "the io-mon shim must be built with -d:useMalloc; " &
     "scripts/build_shim.sh sets it, and says why".}
 
+when defined(ioMonGlibcPrivateHeap):
+  {.compile: "linux_private_heap.c".}
+  {.passL: "-Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free".}
+
 import std/[locks, os, strutils]
 from io_mon/paths import extendedPath
 

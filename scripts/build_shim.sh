@@ -185,6 +185,7 @@ case "${io_mon_host_platform_name}" in
     linux_shim_link_flags=()
     if getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
       linux_shim_link_flags+=(
+        "-d:ioMonGlibcPrivateHeap"
         "--passL:-Wl,--version-script=${here}/src/io_mon/hooks/linux_preload_versions.map"
       )
     fi
