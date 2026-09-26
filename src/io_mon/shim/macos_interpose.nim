@@ -1406,7 +1406,11 @@ proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
     return 0
   withShimMuted:
     fragmentDir = getEnv("REPRO_MONITOR_FRAGMENT_DIR")
-    gInterest = parseInterestTokens(getEnv("REPRO_MONITOR_INTEREST"))
+    # `shimInterestFromEnv`, not `parseInterestTokens`: a value naming nothing
+    # this build knows is read as "capture everything" rather than "capture
+    # nothing". The shim has no way to refuse, and only one of the two readings
+    # can be wrong in a direction the host filter cannot undo.
+    gInterest = shimInterestFromEnv(getEnv("REPRO_MONITOR_INTEREST"))
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))
     # ROUND-2 R8 — capture the invocation run id for report authentication.

@@ -13,8 +13,8 @@ or the host-side filter at the end of `collectMonitorEvidence`.
 ## 1. Why it cannot be an `EventCategory`
 
 `--evidence=reads-only` means "record only the lookups that FOUND something".
-The obvious implementation — split `ecFileDeps` and gate a *probes* category —
-does not deliver it, and the gap was measured on one `nim c`:
+The obvious implementation — split the file categories and gate a *probes*
+category — does not deliver it, and the gap was measured on one `nim c`:
 
 | | records |
 |---|---|
@@ -24,6 +24,14 @@ does not deliver it, and the gap was measured on one `nim c`:
 
 The category gate discards **2,066 successful probes** it should keep and leaves
 **20,753 failed `mrFileOpen`s** it should drop.
+
+DA-5 has since split the file categories three ways by consumer, and
+`ecPathProbes` is exactly the probes category the table above prices. That
+changes nothing here: the two axes **compose** (a record is written iff its
+category is wanted AND its result is in scope) and neither substitutes for the
+other. A consumer that wants ninja-comparable evidence still asks for
+`--evidence=reads-only`; gating `ecPathProbes` is a different reduction with a
+different number and a different meaning.
 
 > **`reads-only` is a predicate on the RESULT of a lookup. `EventCategory` gates
 > on its KIND, and success is not a kind.**
@@ -206,6 +214,23 @@ under-keeping costs correctness.
 Because the host is the source of truth for the RESULT, the **stamp describes the
 host's scope**, never the shim's.
 
+**And that guarantee covers over-capture only.** The host filter's only operation
+is to remove records, so a shim that records MORE than the scope asks for is
+repaired and a shim that records LESS is not — see
+[event-interest-filter.md](event-interest-filter.md) §5, where the interest axis
+reached the second case and cost every file record in a capture graded
+`mcComplete`.
+
+This channel has the same shape and **not** the same exposure, for one reason
+worth writing down rather than relying on: a shim that predates
+`REPRO_MONITOR_EVIDENCE` ignores it and over-captures, and **no `EvidenceScope`
+token has ever been renamed** — `full` and `reads-only` are the spellings they
+shipped with. The interest axis's defect was reachable only because six of its
+eight tokens changed spelling while older shims were still honouring the old
+ones. If a scope token is ever renamed or retired, this channel needs the same
+treatment the interest channel got (`interestToShimTokens`): the new value must
+also name whatever an older shim needs in order not to record less than asked.
+
 ## 5. The depfile SAYS which scope it was captured under (DA-1i)
 
 The merge stamps `evidence=reads-only` onto the backend-profile record. It rides
@@ -253,9 +278,13 @@ campaign exists to make trustworthy.
 
 Nor could it move the grade even if it were recomputed: no completeness-bearing
 record is an existence lookup, and META/loss kinds are undroppable by
-construction (§3). So the grade is **invariant** under the narrowing — unlike the
-interest axis, where gating `ecIpc` removes the records a synthetic loss is
-derived from.
+construction (§3). So the grade is **invariant** under the narrowing.
+
+That used to be a contrast with the interest axis, where gating `ecIpc` removed
+the records a synthetic loss is derived from. DA-5 removed the contrast rather
+than leaving it as a caveat: `mrIpcConnect` and `mrExternalContent` are now
+ungate-able, `categoryOf` answers `none` for them alongside the META kinds, and
+**both** axes are now grade-invariant for the same structural reason.
 
 ## 7. Not a cache-key component
 
