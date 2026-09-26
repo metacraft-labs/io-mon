@@ -1488,7 +1488,11 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   withShimMuted:
     fragmentDir = getEnv("REPRO_MONITOR_FRAGMENT_DIR")
     runId = getEnv("REPRO_MONITOR_SESSION")
-    gInterest = parseInterestTokens(getEnv("REPRO_MONITOR_INTEREST"))
+    # `shimInterestFromEnv`, not `parseInterestTokens`: a value naming nothing
+    # this build knows is read as "capture everything" rather than "capture
+    # nothing". The shim has no way to refuse, and only one of the two readings
+    # can be wrong in a direction the host filter cannot undo.
+    gInterest = shimInterestFromEnv(getEnv("REPRO_MONITOR_INTEREST"))
     gEvidenceScope = parseEvidenceScopeToken(getEnv("REPRO_MONITOR_EVIDENCE"))
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))

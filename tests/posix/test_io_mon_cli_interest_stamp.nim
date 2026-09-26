@@ -43,14 +43,26 @@ const
   hooksSrc = repoRoot.parentDir() / "nim-stackable-hooks" / "src"
   snoopSrc = repoRoot / "cmd" / "io_mon_snoop.nim"
   fixtureC = repoRoot / "tests" / "fixtures" / "fs_snoop_tool" / "fs_snoop_tool.c"
-  NarrowTokens = "file"
-    ## The narrowing under test. `ecFileDeps` alone is deliberate: every other
+  NarrowTokens = "file-reads,path-probes,file-writes"
+    ## The narrowing under test — DA-5's spelling of what used to be `file`. The
+    ## three file categories and nothing else is deliberate: every other
     ## category is then gated, and one of them — `ecProcessTree` — is guaranteed
     ## to be present in ANY successful capture on ANY backend (the monitored root
     ## itself emits `mrProcessStart`). So the record-side half of this case
     ## cannot pass by the narrowing having had nothing to remove, without relying
     ## on which optional hooks a given platform advertises.
-  NarrowInterest = {ecFileDeps}
+    ##
+    ## It also keeps the narrowing SAFE in the sense DA-5 added: the two
+    ## completeness-bearing kinds (`mrIpcConnect`, `mrExternalContent`) are no
+    ## longer gate-able at all, so this reduction can no longer flip an
+    ## `mcIncomplete` capture to `mcComplete`. The grade is still reported
+    ## rather than asserted (see the end of the case) because the two arms
+    ## legitimately differ for other reasons.
+  NarrowInterest = {ecFileReads, ecPathProbes, ecFileWrites}
+  LegacyNarrowTokens = "file"
+    ## The pre-DA-5 spelling of exactly that set, still accepted on the command
+    ## line. The live arm below proves an old command line reaches the same
+    ## capture — and that the depfile records it in TODAY's vocabulary.
 
 proc run(cmd: string; args: seq[string]; env: StringTableRef = nil):
     tuple[output: string; code: int] =
@@ -197,5 +209,86 @@ suite "io-mon CLI capture-scope stamp (DA-1j, live)":
     # are evidence in the log and the SCOPE is what is asserted.
     checkpoint("completeness: full=" & $full.completeness &
       " narrow=" & $narrow.completeness)
+
+  test "t_a_pre_DA5_command_line_captures_the_same_thing_and_stamps_the_new_names":
+    # DA-5, LIVE. The alias is a read-side vocabulary, and the only way to know
+    # it survives the whole chain — argv -> `parseInterestFlag` ->
+    # `FsSnoopRequest.interest` -> `REPRO_MONITOR_INTEREST` -> the shim's gate ->
+    # `mergeFragments`' stamp -> the bytes on disk — is to run the real binary
+    # with the old spelling and read the file it wrote.
+    #
+    # TWO CLAIMS, and the second is the one an in-memory test cannot make: the
+    # depfile must state the CURRENT tokens, not the ones the operator typed.
+    # A stamp echoing `file` would be a claim in a vocabulary that no longer
+    # describes what was captured, and a reader resolving it through the alias
+    # would get the right set by accident rather than by record.
+    let legacy = capture("legacy", @["--interest", LegacyNarrowTokens])
+    check legacy.observedInterestStated
+    check legacy.observedInterest == NarrowInterest
+    check legacy.observedInterestTokens == NarrowTokens
+    check legacy.observedInterestTokens != LegacyNarrowTokens
+    # …and the capture is a real one, narrowed exactly as the new spelling is.
+    check legacy.records.anyIt(it.path.len > 0 and
+      (it.observationKind == moFileOpen or it.observationKind == moFileRead))
+    check categoryCount(legacy, ecProcessTree) == 0
+    for category in EventCategory:
+      if category notin NarrowInterest:
+        check categoryCount(legacy, category) == 0
+
+  test "t_a_narrowed_capture_can_no_longer_gate_away_a_completeness_bearing_kind":
+    # THE DEFECT DA-5 CLOSED, graded on a real capture rather than on the
+    # predicate. Before the split, `--interest file,proc,lib` gated `ecIpc` and
+    # `ecNonDeterminism`, which deleted the `mrIpcConnect` / `mrExternalContent`
+    # records BEFORE `mergeFragments` could derive a synthetic `mrEventLoss`
+    # from them — measured on Linux with one out-of-tree `socat` peer as
+    # `mcIncomplete`/1 loss going to `mcComplete`/0 losses.
+    #
+    # Those kinds are now ungate-able, so the narrowest interest a caller can
+    # express still carries them. Asserted as the host filter's behaviour over a
+    # REAL narrowed depfile: the filter drops every category not asked for, and
+    # these kinds have no category to be not-asked-for.
+    let narrow = capture("nogate", @["--interest", NarrowTokens])
+    checkpoint("narrow records=" & $narrow.records.len)
+    for r in narrow.records:
+      if r.kind in {mrIpcConnect, mrExternalContent, mrEventLoss,
+                    mrBackendProfile, mrCapabilityGap}:
+        check categoryOf(r.kind).isNone
+    # The structural statement, independent of whether this host's command
+    # happened to produce such a record: nothing the filter can drop is
+    # completeness-bearing.
+    for kind in [mrIpcConnect, mrExternalContent, mrEventLoss]:
+      check categoryOf(kind).isNone
+      check recordWanted(NarrowInterest, kind)
+    # The backend-profile record survived the narrowing — it is META, and the
+    # stamp rides on it, so its survival is load-bearing for the case above.
+    check narrow.records.anyIt(it.kind == mrBackendProfile)
+
+
+  test "t_the_env_channels_back_compat_padding_never_reaches_the_bytes":
+    # The env value the host hands the child carries the pre-DA-5 spellings
+    # behind a `legacy-padding` fence, so a shim built before the split does not
+    # gate away every file record. The DEPFILE must carry none of that: a stamp
+    # is a claim a consumer compares against its requirement, and a legacy
+    # spelling in it would let an old consumer read a narrowed capture as wider
+    # than it is.
+    #
+    # Live, on the bytes, because the two encoders are one line apart in
+    # `childEnv` and swapping them is exactly the edit this refuses.
+    for tag, flag in {"padfull": newSeq[string](),
+                      "padnarrow": @["--interest", NarrowTokens]}.items:
+      let dep = capture(tag, flag)
+      checkpoint(tag & " stamp: " & dep.observedInterestTokens)
+      check dep.observedInterestStated
+      check LegacyPaddingToken notin dep.observedInterestTokens
+      for legacy in LegacyEventCategory:
+        let tok = legacyInterestToken(legacy)
+        # `proc` and `lib` are CURRENT tokens as well; only the three
+        # legacy-only spellings must be absent.
+        if tok notin dep.observedInterestTokens.split(',') or
+           tok in ["proc", "lib"]:
+          continue
+        check false                       # a legacy-only spelling in the stamp
+      check dep.observedInterest == parseInterestTokens(dep.observedInterestTokens)
+
 
   removeDir(work)

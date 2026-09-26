@@ -189,18 +189,151 @@ type
   EventCategory* = enum
     ## The classes of observation a consumer can opt in / out of. See
     ## docs/contributors/event-interest-filter.md. Gating a category makes io-mon
-    ## skip the work (record construction + gset publish, and where cheap the hook
-    ## install itself) for the `MonitorRecordKind`s in it. The META kinds
-    ## (`mrEventLoss`/`mrBackendProfile`/`mrCapabilityGap`) belong to NO category
-    ## and are never gated — a suppressed loss marker would risk a false
-    ## `mcComplete` (LF-1).
-    ecFileDeps       ## mrFileOpen, mrFileRead, mrFileWrite, mrPathProbe,
-                     ## mrDirectoryEnumerate, mrPathMutation
-    ecProcessTree    ## mrProcessStart, mrProcessExec, mrProcessSpawn
-    ecLibraryLoads   ## mrLibraryLoad
-    ecNonDeterminism ## mrNonDeterministic, mrTimeRead, mrEnvRead, mrSysctlRead,
-                     ## mrExternalContent
-    ecIpc            ## mrIpcConnect
+    ## skip record construction and the gset publish for the
+    ## `MonitorRecordKind`s in it — at the shims' one `emitRecord` funnel, and at
+    ## the host filter. It does NOT skip installing the hook: `gInterest` has
+    ## exactly one reader per shim and it is that funnel (swept, not assumed),
+    ## so every interposition is still put in place whatever the interest is.
+    ##
+    ## DA-5 — ONE CATEGORY PER CONSUMER, NOT PER SYNTACTIC FAMILY. The five
+    ## categories this replaced grouped record kinds that LOOK alike, and the
+    ## result was a switch no consumer could use: `ecNonDeterminism` alone
+    ## carried `mrEnvRead` (which reaches an action's CACHE KEY),
+    ## `mrNonDeterministic` (which gates cache PUBLICATION), `mrTimeRead` /
+    ## `mrSysctlRead` (which nothing reads at all) and `mrExternalContent`
+    ## (completeness-bearing). Four consumers behind one bit means no non-empty
+    ## proper subset of the old categories was safe to ask for, which is why
+    ## reprobuild's engine had to request every category unconditionally and why
+    ## its `captureNonDeterminism` / `captureIpc` policy fields were marked
+    ## INERT. A category is now the unit a single consumer reads, so a narrowing
+    ## can be argued one consumer at a time.
+    ##
+    ## TWO CLASSES OF KIND BELONG TO NO CATEGORY AND ARE THEREFORE NEVER GATED —
+    ## `categoryOf` answers `none` for both, and `recordWanted` keeps whatever
+    ## `categoryOf` cannot place:
+    ##
+    ##   * META — `mrEventLoss` / `mrBackendProfile` / `mrCapabilityGap`. A
+    ##     suppressed loss marker would manufacture a false `mcComplete` (LF-1).
+    ##   * COMPLETENESS-BEARING — `mrIpcConnect` and `mrExternalContent`.
+    ##     `mergeFragments` DERIVES a synthetic `mrEventLoss` from them
+    ##     (`unmonitoredSubtreeLossDetails`, `externalContentLossCount`), and the
+    ##     shim's gate runs at `emitRecord`, BEFORE that merge. Gating them
+    ##     therefore does not hide a record the consumer declined to see: it
+    ##     deletes the input a loss marker would have been derived from and turns
+    ##     an `mcIncomplete` edge into an `mcComplete` one. Measured on Linux
+    ##     with one out-of-tree `socat` peer, BEFORE DA-5: `io-mon run` graded
+    ##     `mcIncomplete` (1 loss, 32 records) while `--interest file,proc,lib`
+    ##     graded **`mcComplete`** (0 losses, 23 records). Re-measured on the
+    ##     same shape AFTER DA-5 (2026-09-25, this build's shim and CLI, one
+    ##     `socat UNIX-LISTEN` peer started outside the monitored tree):
+    ##
+    ##       io-mon run                       mcIncomplete  1 loss  31 records
+    ##       --interest file-reads,path-probes,file-writes,proc,lib
+    ##                                        mcIncomplete  1 loss  26 records
+    ##       --interest file,proc,lib (alias) mcIncomplete  1 loss  26 records
+    ##
+    ##     The narrowed arms keep the `mrIpcConnect` record AND the derived
+    ##     `mrEventLoss`; what they drop is `mrEnvRead` / `mrSysctlRead` /
+    ##     `mrTimeRead`. No finer category would have fixed this — the harm comes
+    ##     from the records not existing at merge time, not from how many other
+    ##     kinds shared their bucket — so the fix is that the kinds cannot be
+    ##     gated at all, which is what `none` here means. The retired `ecIpc` is
+    ##     consequently NOT replaced by a new category; see
+    ##     `LegacyEventCategory` for how its wire token still reads.
+    ##
+    ## The rows below name the consumer each category exists for. Adding a
+    ## category without one is the defect this milestone removed.
+    ecFileReads      ## mrFileOpen, mrFileRead.
+                     ## CONSUMER: the INPUT CONTENT set — reprobuild's
+                     ## `PathSetEvidence.monitorReads`, which is what the
+                     ## staleness detector re-hashes and what the strong
+                     ## fingerprint is taken over.
+    ecPathProbes     ## mrPathProbe, mrDirectoryEnumerate.
+                     ## CONSUMER: the EXISTENCE / MEMBERSHIP set —
+                     ## `monitorProbes` and `monitorDirectoryEnumerations`. A
+                     ## different question from `ecFileReads`: these paths are
+                     ## depended on for whether they exist and what a directory
+                     ## contains, not for their bytes, and an enumeration is
+                     ## invalidated by a path being ADDED.
+                     ##
+                     ## NOT `--evidence=reads-only`, and the distinction is
+                     ## structural rather than a matter of degree. That flag
+                     ## drops FAILED lookups — a predicate on a record's RESULT.
+                     ## Measured on one `nim c`: 66,996 records total, 23,049
+                     ## after dropping every failed lookup, 41,736 after gating
+                     ## a probe CATEGORY — the category gate discards 2,066
+                     ## SUCCESSFUL probes it should keep and leaves 20,753
+                     ## FAILED `mrFileOpen`s it should drop, because success is
+                     ## not a kind. The two axes COMPOSE (a record is written
+                     ## iff its category is wanted AND its result is in scope);
+                     ## neither substitutes for the other. See `EvidenceScope`.
+    ecFileWrites     ## mrFileWrite, mrPathMutation.
+                     ## CONSUMER: the OUTPUT set — `monitorWrites` and
+                     ## output-tree state tracking. An output-side fact, read by
+                     ## the declared-output check, not by anything that decides
+                     ## whether the action is stale.
+    ecProcessTree    ## mrProcessStart, mrProcessExec, mrProcessSpawn.
+                     ## CONSUMER: process-tree attribution — pid→image
+                     ## resolution, subtree/breakaway analysis, and the executed
+                     ## binary as a content dependency.
+    ecLibraryLoads   ## mrLibraryLoad.
+                     ## CONSUMER: the loaded-object closure of the tool.
+    ecEnvReads       ## mrEnvRead.
+                     ## CONSUMER: the ACTION CACHE KEY —
+                     ## `PathSetEvidence.monitorEnvReads`, folded into the strong
+                     ## fingerprint through `cacheEnvInputs`. Dropping this
+                     ## category makes an action that reads `SOURCE_DATE_EPOCH`
+                     ## key identically for every value of it.
+    ecEntropy        ## mrNonDeterministic.
+                     ## CONSUMER: the CACHE-PUBLISH GATE —
+                     ## `entropyObservations`, read by
+                     ## `applyEntropyBlessingPolicy`. Dropping this category
+                     ## leaves `entropyObservability` at `entObserved` (the
+                     ## backend-profile record is META and is never gated) with
+                     ## zero observations, which is verbatim the "observable,
+                     ## and nothing observed" false clean that policy exists to
+                     ## refuse.
+    ecAmbientReads   ## mrTimeRead, mrSysctlRead.
+                     ## CONSUMER: NONE TODAY. Both kinds reach reprobuild's
+                     ## record fold and land on its `else: discard` arm; they
+                     ## are record-only diagnostics. This is the one category a
+                     ## reprobuild edge can drop today without losing anything a
+                     ## consumer reads — i.e. the safe subset DA-5 exists to
+                     ## make expressible. Stated as an absence that is true
+                     ## NOW: a consumer that starts reading clock or sysctl
+                     ## observations must stop dropping it, and the place to say
+                     ## so is here.
+
+  LegacyEventCategory* = enum
+    ## READ SIDE ONLY — the pre-DA-5 `EventCategory`, kept so the tokens already
+    ## written into `.iomon` depfiles (and into any command line or
+    ## `REPRO_MONITOR_INTEREST` value that predates the split) still decode.
+    ##
+    ## OLD TOKENS REMAIN ACCEPTED, AS ALIASES. The alternative — retiring them —
+    ## was rejected on a measurement of which way each mistake points. An old
+    ## capture stamped `interest=file,proc,lib,nondet,ipc` observed EVERYTHING,
+    ## and a build that could not read those tokens would grade it as stating a
+    ## scope it cannot evaluate and re-run work that was already done correctly.
+    ## An alias costs nothing and prevents that, PROVIDED the expansion cannot
+    ## over-claim — which is why `legacyInterestExpansion` is derived from
+    ## `categoryOf` rather than written down. See it for the false-accept this
+    ## construction is what rules out.
+    ##
+    ## This is a READ vocabulary only: `interestToTokens` never emits these
+    ## spellings, so nothing this build writes has to be re-read through them.
+    lecFileDeps       ## `file`   -> mrFileOpen, mrFileRead, mrFileWrite,
+                      ##             mrPathProbe, mrDirectoryEnumerate,
+                      ##             mrPathMutation
+    lecProcessTree    ## `proc`   -> mrProcessStart, mrProcessExec,
+                      ##             mrProcessSpawn (unsplit; the token is
+                      ##             still canonical)
+    lecLibraryLoads   ## `lib`    -> mrLibraryLoad (unsplit; still canonical)
+    lecNonDeterminism ## `nondet` -> mrNonDeterministic, mrTimeRead, mrEnvRead,
+                      ##             mrSysctlRead, mrExternalContent
+    lecIpc            ## `ipc`    -> mrIpcConnect, which DA-5 made ungate-able.
+                      ##             The token still parses; it expands to no
+                      ##             category, because there is no longer one to
+                      ##             expand to.
 
   EvidenceScope* = enum
     ## DA-1i — HOW MUCH OF WHAT THE MONITOR OBSERVES IS WRITTEN DOWN.
@@ -450,13 +583,21 @@ type
     ## tried to. It does NOT say what it was asked to try, and until this field
     ## existed nothing did — while `--interest` already shipped and already
     ## narrowed. Measured, on one command with a single out-of-tree peer:
-    ## `io-mon run` grades `mcIncomplete` with 1 loss over 32 records, and
-    ## `io-mon run --interest file,proc,lib` grades **`mcComplete`** with 0
-    ## losses over 23 records. Gating `ecIpc` means the `mrIpcConnect` records
-    ## never exist, so `mergeFragments` never derives the synthetic loss from
-    ## them — and the depfile then reports `mcComplete` and says nothing about
-    ## having been narrowed. That is the false complete this project calls "one
-    ## flag away at all times", reachable today with a shipped flag.
+    ## `io-mon run` graded `mcIncomplete` with 1 loss over 32 records, and
+    ## `io-mon run --interest file,proc,lib` graded **`mcComplete`** with 0
+    ## losses over 23 records. Gating `ecIpc` meant the `mrIpcConnect` records
+    ## never existed, so `mergeFragments` never derived the synthetic loss from
+    ## them — and the depfile then reported `mcComplete` and said nothing about
+    ## having been narrowed. That was the false complete this project calls "one
+    ## flag away at all times", reachable with a shipped flag.
+    ##
+    ## DA-5 CLOSED THAT PARTICULAR DOOR AND THIS FIELD IS STILL NEEDED. The
+    ## measurement above is past tense because `mrIpcConnect` and
+    ## `mrExternalContent` are no longer gate-able at all (see `categoryOf`), so
+    ## no interest set can reproduce it. What a narrowing can still do is answer
+    ## a question narrower than a consumer's — a capture with `ecEnvReads` gated
+    ## observed no environment read, and an action keyed on observed env reads
+    ## must not consume it. The field is what lets that consumer say no.
     ##
     ## A consumer compares this against its own requirement and recomputes
     ## locally when the record answers a narrower question than it needs. That
@@ -700,23 +841,48 @@ const FullInterest* = {EventCategory.low .. EventCategory.high}
   ## normalised to. A generic consumer captures everything unless it opts out.
 
 func categoryOf*(kind: MonitorRecordKind): Option[EventCategory] =
-  ## The gate-able category a record kind belongs to, or `none` for META kinds
-  ## (`mrEventLoss`/`mrBackendProfile`/`mrCapabilityGap`) that are NEVER gated.
+  ## The gate-able category a record kind belongs to, or `none` for a kind NO
+  ## interest set may suppress. THE ONE DEFINITION OF BOTH FACTS — every gate in
+  ## this project asks it, so "which consumer wants this record" and "may this
+  ## record be dropped at all" cannot drift apart into two tables.
+  ##
+  ## `none` covers two classes, and the arms below keep them SEPARATE so the
+  ## reason is legible at the point of decision rather than only in a comment:
+  ## the META kinds (LF-1) and the COMPLETENESS-BEARING kinds (`mrIpcConnect`,
+  ## `mrExternalContent`, from which `mergeFragments` derives a synthetic
+  ## `mrEventLoss` after the shim's gate has already run). See `EventCategory`
+  ## for the measurement that retired `ecIpc` rather than renaming it.
+  ##
   ## Exhaustive over `MonitorRecordKind`, so a new kind must state its category
-  ## (or be declared META) here rather than silently defaulting.
+  ## — or state that it is ungate-able — here rather than silently defaulting.
   case kind
-  of mrFileOpen, mrFileRead, mrFileWrite, mrPathProbe, mrDirectoryEnumerate,
-     mrPathMutation:
-    some(ecFileDeps)
+  of mrFileOpen, mrFileRead:
+    some(ecFileReads)
+  of mrPathProbe, mrDirectoryEnumerate:
+    some(ecPathProbes)
+  of mrFileWrite, mrPathMutation:
+    some(ecFileWrites)
   of mrProcessStart, mrProcessExec, mrProcessSpawn:
     some(ecProcessTree)
   of mrLibraryLoad:
     some(ecLibraryLoads)
-  of mrNonDeterministic, mrTimeRead, mrEnvRead, mrSysctlRead, mrExternalContent:
-    some(ecNonDeterminism)
-  of mrIpcConnect:
-    some(ecIpc)
+  of mrEnvRead:
+    some(ecEnvReads)
+  of mrNonDeterministic:
+    some(ecEntropy)
+  of mrTimeRead, mrSysctlRead:
+    some(ecAmbientReads)
+  of mrIpcConnect, mrExternalContent:
+    # UNGATE-ABLE, not uncategorised. `mergeFragments` turns each out-of-tree
+    # IPC peer and each unpaired external-content channel into a synthetic
+    # `mrEventLoss`; the shim's interest gate runs at `emitRecord`, BEFORE that
+    # merge, so any category holding these kinds is a switch that converts an
+    # `mcIncomplete` edge into an `mcComplete` one. There is no granularity at
+    # which that is safe, so there is no category.
+    none(EventCategory)
   of mrEventLoss, mrBackendProfile, mrCapabilityGap:
+    # THE LF-1 ARM. META kinds carry the loss markers and the provenance a
+    # completeness verdict is derived from.
     none(EventCategory)
 
 func normalizeInterest*(interest: set[EventCategory]): set[EventCategory] =
@@ -748,17 +914,21 @@ func recordIsFailedExistenceLookup*(record: MonitorRecord): bool =
   ## "LOOKUPS THAT DID NOT SUCCEED" below, which is the whole of the difference
   ## and the reason the hazard table has a fourth row.
   ##
-  ## META AND LOSS KINDS CANNOT BE DROPPED, and the protection is STRUCTURAL in
+  ## UNGATE-ABLE KINDS CANNOT BE DROPPED, and the protection is STRUCTURAL in
   ## two independent ways rather than a matter of remembering them:
   ##
   ##   * The `case` below is EXHAUSTIVE — no `else` — exactly as `categoryOf` is,
   ##     so a `MonitorRecordKind` added later is a COMPILE ERROR here until
   ##     someone classifies it. It cannot inherit an answer by default.
   ##   * The guard on the first line asks `categoryOf`, the one definition of
-  ##     what META is, so the two cannot drift apart even if the META arm below
-  ##     were mis-edited. It is deliberately REDUNDANT with that arm (deleting it
-  ##     changes no behaviour today); it is defence in depth and a statement of
-  ##     where the definition lives, not the sole protection.
+  ##     which kinds no narrowing may suppress, so the two cannot drift apart
+  ##     even if the arms below were mis-edited. Since DA-5 that guard covers the
+  ##     completeness-bearing kinds (`mrIpcConnect`, `mrExternalContent`) as well
+  ##     as META, so this axis inherits their protection from the same
+  ##     definition the interest axis uses. It is deliberately REDUNDANT with the
+  ##     arms below (deleting it changes no behaviour today); it is defence in
+  ##     depth and a statement of where the definition lives, not the sole
+  ##     protection.
   ##
   ## Why this matters more than it looks: a narrowing that could drop an
   ## `mrEventLoss` would manufacture a false `mcComplete` out of a capture that
@@ -1117,24 +1287,194 @@ func interestToken*(category: EventCategory): string =
   ## axis the same omission produces a depfile every consumer refuses, or (with
   ## a duplicated token) one a full-evidence consumer wrongly ACCEPTS.
   ##
-  ## Closed here with the identical construction, and the enum's declaration
-  ## order is the token order the array had, so the encoded string is unchanged
-  ## byte for byte.
+  ## Closed with the identical construction, and DA-5's split kept it: a token
+  ## per category, derived in both directions from this one `case`.
+  ##
+  ## TWO TOKENS ARE UNCHANGED FROM BEFORE DA-5 AND THAT IS DELIBERATE.
+  ## `ecProcessTree` and `ecLibraryLoads` did not split — their membership is
+  ## the same set of record kinds it always was — so reusing `proc` and `lib`
+  ## states an EXACT equivalence rather than reusing a name loosely. The split
+  ## categories all take NEW tokens, because a capture stamped `file` covered
+  ## reads, probes and writes together and a build that read it as any one of
+  ## them would be widening a narrowed stamp. The old spellings still READ, as
+  ## aliases; see `LegacyEventCategory`.
   case category
-  of ecFileDeps: "file"
+  of ecFileReads: "file-reads"
+  of ecPathProbes: "path-probes"
+  of ecFileWrites: "file-writes"
   of ecProcessTree: "proc"
   of ecLibraryLoads: "lib"
-  of ecNonDeterminism: "nondet"
-  of ecIpc: "ipc"
+  of ecEnvReads: "env"
+  of ecEntropy: "entropy"
+  of ecAmbientReads: "ambient"
+
+func legacyInterestToken*(legacy: LegacyEventCategory): string =
+  ## The wire token the pre-DA-5 vocabulary used for `legacy`. An exhaustive
+  ## `case` for the same reason `interestToken` is one.
+  case legacy
+  of lecFileDeps: "file"
+  of lecProcessTree: "proc"
+  of lecLibraryLoads: "lib"
+  of lecNonDeterminism: "nondet"
+  of lecIpc: "ipc"
+
+func legacyMemberKinds*(legacy: LegacyEventCategory): set[MonitorRecordKind] =
+  ## The record kinds `legacy` gated before DA-5 — a HISTORICAL FACT about bytes
+  ## already on disk, which is why it is written out by hand and why it must
+  ## never be "updated" to match a later `categoryOf`. It is frozen; the
+  ## expansion derived from it is not.
+  case legacy
+  of lecFileDeps:
+    {mrFileOpen, mrFileRead, mrFileWrite, mrPathProbe, mrDirectoryEnumerate,
+     mrPathMutation}
+  of lecProcessTree:
+    {mrProcessStart, mrProcessExec, mrProcessSpawn}
+  of lecLibraryLoads:
+    {mrLibraryLoad}
+  of lecNonDeterminism:
+    {mrNonDeterministic, mrTimeRead, mrEnvRead, mrSysctlRead, mrExternalContent}
+  of lecIpc:
+    {mrIpcConnect}
+
+func legacyInterestExpansion*(legacy: LegacyEventCategory): set[EventCategory] =
+  ## What a pre-DA-5 token means in today's vocabulary — DERIVED from
+  ## `categoryOf` over `legacyMemberKinds`, never written out.
+  ##
+  ## THE DERIVATION IS THE SAFETY PROPERTY, not a convenience. A hand-written
+  ## alias table is the one construction on this axis that can produce a FALSE
+  ## ACCEPT: give `file` an expansion containing `ecEnvReads` and every old
+  ## `--interest file,proc,lib` capture — which observed no environment read at
+  ## all — reads back as though it had, and a consumer keying on observed env
+  ## reads accepts it. Computing the expansion from where the kinds ACTUALLY
+  ## went makes that unwritable: the answer is exactly the set of categories the
+  ## old capture really did record, and a kind that became ungate-able
+  ## (`mrIpcConnect`, `mrExternalContent`) contributes nothing because
+  ## `categoryOf` gives it nothing to contribute.
+  ##
+  ## `lecIpc` therefore expands to `{}`, and that is the correct reading rather
+  ## than a gap: `interest=ipc` on its own named a scope in which the only
+  ## kinds observed are ones this build never narrows away, so it declares no
+  ## gate-able category and a consumer needing one rejects it.
+  for kind in legacyMemberKinds(legacy):
+    let c = categoryOf(kind)
+    if c.isSome: result.incl(c.get)
+
+const LegacyPaddingToken* = "legacy-padding"
+  ## The one token in this vocabulary that names no category. It marks where the
+  ## canonical part of a `REPRO_MONITOR_INTEREST` value ends and the BACK-COMPAT
+  ## PADDING for a pre-DA-5 shim begins (see `interestToShimTokens`).
+  ##
+  ## It is not a version number and it is not read by any consumer: it is a
+  ## fence. A reader that knows it takes only the canonical part; a reader that
+  ## does not know it ignores it under the same forward-compat rule that makes
+  ## the padding necessary in the first place — which is the point, because that
+  ## rule is the only behaviour a shim already on disk can be relied on to have.
+  ##
+  ## It never appears in a depfile: `interestToTokens` does not emit it, and the
+  ## `interest=` stamp is written from that proc.
 
 func interestToTokens*(interest: set[EventCategory]): string =
-  ## Encode an interest set as the comma-separated `REPRO_MONITOR_INTEREST`
-  ## value. `FullInterest` encodes to every token (never empty, so an older
-  ## reader cannot mistake "all" for "unset").
+  ## Encode an interest set as the comma-separated value for the DEPFILE STAMP
+  ## (`interest=` on the backend-profile record). `FullInterest` encodes to every
+  ## token (never empty, so an older reader cannot mistake "all" for "unset").
+  ##
+  ## CANONICAL SPELLINGS ONLY, AND THAT IS A SAFETY PROPERTY OF THE READ AXIS
+  ## rather than an omission. A stamp is a CLAIM about what the capture observed,
+  ## and a consumer compares it against what it needs; the failure direction of
+  ## an over-stated claim is ACCEPT. Emitting `file` beside `file-reads` would
+  ## make an old consumer read "reads, probes and writes were all observed" off a
+  ## capture that may have observed only one of the three — so nothing this build
+  ## writes into a depfile is spelled in a vocabulary whose meaning it no longer
+  ## controls. `interestToTokens` therefore never emits an alias, for any set.
+  ##
+  ## The ENV channel to the shim is the mirror image and does NOT share this
+  ## encoder — see `interestToShimTokens` for why the two directions want
+  ## opposite answers.
   let normalized = normalizeInterest(interest)
   var parts: seq[string] = @[]
   for cat in EventCategory:
     if cat in normalized: parts.add(interestToken(cat))
+  parts.join(",")
+
+func interestToShimTokens*(interest: set[EventCategory]): string =
+  ## Encode an interest set for `REPRO_MONITOR_INTEREST` — the env channel the
+  ## SHIM reads at init. A different encoder from `interestToTokens`, because the
+  ## two channels have OPPOSITE safe directions and one encoder cannot serve
+  ## both.
+  ##
+  ## THE FAILURE THIS EXISTS TO PREVENT. The depfile stamp is read by a consumer
+  ## that can only be made to accept too much; the env value is read by a shim
+  ## that can only be made to capture too little. A shim built before DA-5 knows
+  ## eight spellings, of which this build still emits two (`proc`, `lib`). Handed
+  ## a canonical-only value it recognises those two, decides the caller asked for
+  ## process tree and library loads and nothing else, and gates away every file
+  ## read, probe, write, env read and IPC connect — for a caller that asked for
+  ## all of them. Measured on Linux, same command line, NO `--interest` flag,
+  ## only the shim differing: current shim 20 records / `mcIncomplete`; shim
+  ## built at `0c312f2` **14 records / `mcComplete` / no file records at all**,
+  ## over a depfile stating full scope and `evidenceComplete=true`. The host
+  ## filter cannot repair it (`fs_snoop`, after `mergeFragments`): that filter
+  ## only ever REMOVES records, and no filter can restore one the shim never
+  ## emitted.
+  ##
+  ## THE RULE, and it is DERIVED rather than written down. A legacy token is
+  ## emitted beside the canonical ones exactly when the legacy category it names
+  ## contains a record kind this interest WANTS:
+  ##
+  ##     emit legacyInterestToken(L)  iff  legacyMemberKinds(L) ∩ wanted ≠ {}
+  ##
+  ## where `wanted` is `recordWanted` over every kind — so the ungate-able kinds
+  ## (`mrIpcConnect`, `mrExternalContent`) count as wanted always, which is why
+  ## `ipc` and `nondet` are emitted for EVERY interest set. That is deliberate:
+  ## those two kinds are what `mergeFragments` derives its synthetic event-loss
+  ## markers from, so an old shim that gates them away is the exact false
+  ## `mcComplete` the interest axis exists to refuse.
+  ##
+  ## WHY THIS DIRECTION IS THE SAFE ONE, and the proof is two lines. Let `K` be
+  ## the kinds the host wants and `E` the kinds an old shim emits under this
+  ## value. Take any `k ∈ K`. Either the old vocabulary classed `k` as META, in
+  ## which case the old shim never gated it and `k ∈ E`; or `k` lay in some
+  ## legacy category `L`, and then `legacyMemberKinds(L) ∩ K ∋ k` is non-empty,
+  ## so `L`'s token is emitted and `k ∈ E`. Hence **`E ⊇ K` for every interest
+  ## set** — the old shim over-captures, never under-captures, and the host
+  ## filter narrows `E` back to exactly `K`. Over-capture costs work; the filter
+  ## is already there and already tested.
+  ##
+  ## The weaker rule "emit the token when ALL of a legacy category's members are
+  ## requested" is a STRICT SUBSET of this one and is not sufficient. It repairs
+  ## the default (`FullInterest` requests every member of every legacy category,
+  ## so both rules emit everything) and leaves the flagged case broken: under it
+  ## `--interest file-reads` sends `file-reads,ipc`, an old shim recognises only
+  ## `ipc`, and the capture comes back with no file records under a stamp saying
+  ## `interest=file-reads` — the same cardinal sin, one flag away. DA-5's own
+  ## safe subset (`FullInterest - {ecAmbientReads}`) would likewise lose
+  ## `mrEnvRead`, which keys the action cache. Every set this rule covers, the
+  ## ALL rule also covers; the converse fails, so this is the rule.
+  ##
+  ## AND WHY IT DOES NOT COST A CURRENT SHIM ITS NARROWING. The padding would be
+  ## read by a CURRENT shim as a widening too (its alias arm is the same one that
+  ## decodes old depfiles), which would quietly make `--interest` stop skipping
+  ## work. `LegacyPaddingToken` is the fence: it is emitted immediately before
+  ## the padding, `parseInterestTokens` drops the alias arm when it sees it, and
+  ## a shim that predates the fence ignores it exactly as it ignores every other
+  ## token it does not know. So the same bytes mean the precise set to a reader
+  ## that understands them and the safe superset to one that does not.
+  let normalized = normalizeInterest(interest)
+  var parts: seq[string] = @[]
+  for cat in EventCategory:
+    if cat in normalized: parts.add(interestToken(cat))
+  var wanted: set[MonitorRecordKind] = {}
+  for kind in MonitorRecordKind:
+    if recordWanted(normalized, kind): wanted.incl(kind)
+  var padding: seq[string] = @[]
+  for legacy in LegacyEventCategory:
+    let tok = legacyInterestToken(legacy)
+    if tok notin parts and tok notin padding and
+       (legacyMemberKinds(legacy) * wanted) != {}:
+      padding.add(tok)
+  if padding.len > 0:
+    parts.add(LegacyPaddingToken)
+    parts &= padding
   parts.join(",")
 
 func parseInterestTokens*(s: string): set[EventCategory] =
@@ -1145,12 +1485,67 @@ func parseInterestTokens*(s: string): set[EventCategory] =
   ## DERIVED from `interestToken`, never a second table — one direction of a
   ## codec that can be forgotten separately from the other is two tables that
   ## drift, and the drift is silent.
+  ##
+  ## DA-5 — pre-split spellings are accepted too, and for the same
+  ## forward/backward-compatibility reason unknown tokens are ignored. They are
+  ## tried AFTER the canonical vocabulary, and they are `LegacyEventCategory`'s
+  ## DERIVED expansions rather than a second hand-written table; see
+  ## `legacyInterestExpansion`. Where a legacy spelling is also a canonical one
+  ## (`proc`, `lib` — the two categories DA-5 did not split) both arms produce
+  ## the identical set, and the `static:` block below proves it rather than
+  ## leaving it to reading order.
+  ##
+  ## `LegacyPaddingToken` SUPPRESSES THE ALIAS ARM, and only a value this build
+  ## composed can contain it. `interestToShimTokens` writes the canonical
+  ## spellings, then the fence, then the back-compat padding an old shim needs;
+  ## a reader that knows the fence must take the canonical part alone, or the
+  ## padding — whose whole job is to be WIDER — would widen this build's own
+  ## reading of its own value. No historical depfile stamp and no operator
+  ## command line carries the fence, so every value that ever existed decodes
+  ## exactly as it did before.
   let trimmed = s.strip()
   if trimmed.len == 0: return FullInterest
+  var fenced = false
+  for raw in trimmed.split(','):
+    if raw.strip() == LegacyPaddingToken: fenced = true
   for raw in trimmed.split(','):
     let tok = raw.strip()
     for cat in EventCategory:
       if tok == interestToken(cat): result.incl(cat)
+    if not fenced:
+      for legacy in LegacyEventCategory:
+        if tok == legacyInterestToken(legacy):
+          result.incl(legacyInterestExpansion(legacy))
+
+func shimInterestFromEnv*(value: string): set[EventCategory] =
+  ## What a SHIM's gate should be set to for a `REPRO_MONITOR_INTEREST` value.
+  ## The env channel's own reader, deliberately separate from the depfile
+  ## decoder, because it answers a different question: not "what did that
+  ## capture observe" but "what may I decline to observe".
+  ##
+  ## A NON-EMPTY VALUE NAMING NOTHING THIS BUILD KNOWS MEANS CAPTURE
+  ## EVERYTHING. It cannot be a request — nothing in it can be honoured — so the
+  ## only two readings are "capture nothing" and "capture everything", and only
+  ## one of them can be wrong in the direction that matters: capturing too much
+  ## costs work the host filter then discards, capturing too little is a missing
+  ## dependency under a stamp that says it is not missing.
+  ##
+  ## Today this is belt-and-braces: `recordWanted` normalises the empty set, so
+  ## the gate already widens. It is written HERE, at the read, so the property
+  ## belongs to the channel rather than to a normalisation two calls away that a
+  ## future reader of `gInterest` would not inherit — and so the next vocabulary
+  ## change has a second line of defence that costs nothing. It is NOT a
+  ## substitute for `interestToShimTokens`: this arm fires only when the shim
+  ## recognises NOTHING, and the failure that motivated the padding is a shim
+  ## that recognises SOMETHING (`proc` and `lib`) and is confidently wrong.
+  ##
+  ## Note the deliberate asymmetry with `parseInterestFlag`, which REFUSES the
+  ## same input. There, a value naming nothing is an operator typo and widening
+  ## it would discard a reduction the operator asked for and could still fix.
+  ## Here there is no operator and no way to report: the shim is inside a
+  ## monitored process and its only choices are to observe or not.
+  result = parseInterestTokens(value)
+  if result == {}: result = FullInterest
 
 static:
   # The interest axis's copy of the evidence axis's construction, and it needs
@@ -1178,6 +1573,122 @@ static:
       "` decodes back to " & $parseInterestTokens(token) &
       ": two categories share a wire token, or the codec's two directions " &
       "have drifted. See interestToken."
+
+  # DA-5 — THE ALIAS VOCABULARY, held to the same standard and to one more.
+  #
+  # The extra one is the whole reason aliases are safe to have. On this axis a
+  # missing token can only shrink a stamp and therefore points at rejection —
+  # but an alias that expands to a category the old capture never observed
+  # WIDENS one, and a widened stamp is accepted. So the expansion is not
+  # merely asserted non-empty or well-formed; it is asserted EQUAL to the
+  # image of the legacy category's frozen kind list under today's `categoryOf`,
+  # recomputed here so a hand edit to either side reddens the compile.
+  for legacy in LegacyEventCategory:
+    let token = legacyInterestToken(legacy)
+    doAssert token.len > 0,
+      "LegacyEventCategory." & $legacy & " needs the wire token it shipped " &
+      "with: it names bytes already written into depfiles, and without it " &
+      "those files read as stating a scope this build cannot evaluate. " &
+      "See legacyInterestToken."
+    doAssert token == token.strip() and ',' notin token and ';' notin token,
+      "LegacyEventCategory." & $legacy & "'s wire token `" & token &
+      "` is not wire-safe; see interestToken's block for the two separators."
+    doAssert legacyMemberKinds(legacy) != {},
+      "LegacyEventCategory." & $legacy & " claims no record kinds, so its " &
+      "expansion is empty for a reason that is not a fact about the split. " &
+      "See legacyMemberKinds — it is frozen history, not a mirror of " &
+      "categoryOf."
+    var derived: set[EventCategory] = {}
+    for kind in legacyMemberKinds(legacy):
+      let c = categoryOf(kind)
+      if c.isSome: derived.incl(c.get)
+    doAssert legacyInterestExpansion(legacy) == derived,
+      "LegacyEventCategory." & $legacy & "'s expansion " &
+      $legacyInterestExpansion(legacy) & " is not the image of its record " &
+      "kinds under categoryOf (" & $derived & "). An alias that names a " &
+      "category the old capture did not observe WIDENS every stamp carrying " &
+      "it, which is the one mistake this axis can otherwise not make. " &
+      "See legacyInterestExpansion."
+    doAssert parseInterestTokens(token) == derived,
+      "LegacyEventCategory." & $legacy & "'s wire token `" & token &
+      "` decodes to " & $parseInterestTokens(token) & ", not to its " &
+      "expansion " & $derived & ". Where a legacy spelling is ALSO a current " &
+      "one the two arms must agree; where it is not, the alias arm must be " &
+      "reached. See parseInterestTokens."
+
+  # DA-5 FOLLOW-UP — THE TOKEN↔LEGACY-CATEGORY PAIRING ITSELF.
+  #
+  # Everything above grades the EXPANSION and none of it grades the PAIRING, and
+  # the gap is reachable by a one-character edit: SWAP the `file` and `nondet`
+  # spellings in `legacyInterestToken` and every assertion above still holds,
+  # because each is quantified over `legacy` and re-derives both sides from the
+  # same (now swapped) table. The result is a build in which every old
+  # `interest=file,proc,lib` depfile reads as having observed environment reads
+  # and entropy — the FALSE ACCEPT this axis has no other defence against,
+  # caught until now only by hand-written runtime expectations.
+  #
+  # The pairing is frozen history, so it cannot be derived from anything in
+  # today's code. It CAN be pinned to something no edit to this table can move:
+  # the NAMES OF THE RECORD KINDS the legacy category gated. Each shipped token
+  # is a case-insensitive substring of at least one of its own members'
+  # identifiers (`file`/`mrFileOpen`, `proc`/`mrProcessStart`,
+  # `lib`/`mrLibraryLoad`, `nondet`/`mrNonDeterministic`, `ipc`/`mrIpcConnect`),
+  # and — the part that makes it a proof rather than a coincidence — it is the
+  # ONLY shipped token that is. So the witness relation is a bijection, the
+  # pairing is the unique one satisfying it, and any permutation of the five
+  # spellings fails to compile. Renaming a `MonitorRecordKind` out from under a
+  # legacy category fails it too, which is correct: that is the other way this
+  # table can quietly stop describing the bytes it claims to describe.
+  for legacy in LegacyEventCategory:
+    var witnessed: seq[LegacyEventCategory] = @[]
+    for candidate in LegacyEventCategory:
+      let probe = legacyInterestToken(candidate).toLowerAscii
+      var hit = false
+      for kind in legacyMemberKinds(legacy):
+        if probe in ($kind).toLowerAscii: hit = true
+      if hit: witnessed.add(candidate)
+    doAssert witnessed == @[legacy],
+      "LegacyEventCategory." & $legacy & " is paired with the wire token `" &
+      legacyInterestToken(legacy) & "`, but the record kinds it gated name " &
+      $witnessed & " instead. The expansion assertions above cannot see this: " &
+      "they re-derive both sides from this same table, so SWAPPING two " &
+      "spellings satisfies every one of them while making every old depfile " &
+      "carrying either token decode to the other one's categories. " &
+      "See legacyInterestToken."
+
+  # DA-5 FOLLOW-UP — THE ENV CHANNEL'S ENCODER, whose safe direction is the
+  # OPPOSITE of the stamp's. `interestToShimTokens` must round-trip exactly
+  # through this build's own decoder (so the padding never widens a CURRENT
+  # shim's gate) while still naming every legacy category an OLD shim needs in
+  # order not to gate away a kind the host asked for.
+  for bits in 0 ..< (1 shl (ord(EventCategory.high) + 1)):
+    var s: set[EventCategory] = {}
+    for cat in EventCategory:
+      if (bits and (1 shl ord(cat))) != 0: s.incl(cat)
+    let wire = interestToShimTokens(s)
+    doAssert parseInterestTokens(wire) == normalizeInterest(s),
+      "interestToShimTokens(" & $s & ") = `" & wire & "` decodes to " &
+      $parseInterestTokens(wire) & ", not to " & $normalizeInterest(s) &
+      ". The back-compat padding is for shims that predate the split; a " &
+      "current shim must read the value as exactly the set the host asked " &
+      "for, or `--interest` silently stops narrowing. See LegacyPaddingToken."
+    var wanted: set[MonitorRecordKind] = {}
+    for kind in MonitorRecordKind:
+      if recordWanted(normalizeInterest(s), kind): wanted.incl(kind)
+    var emitted: set[MonitorRecordKind] = {}
+    for raw in wire.split(','):
+      for legacy in LegacyEventCategory:
+        if raw == legacyInterestToken(legacy):
+          emitted.incl(legacyMemberKinds(legacy))
+    for kind in MonitorRecordKind:
+      if categoryOf(kind).isNone and kind notin {mrIpcConnect, mrExternalContent}:
+        emitted.incl(kind)          # META: never gated by any vocabulary
+    doAssert (wanted - emitted) == {},
+      "interestToShimTokens(" & $s & ") = `" & wire & "` leaves " &
+      $(wanted - emitted) & " outside every legacy category it names, so a " &
+      "shim built before DA-5 gates those kinds away while the host stamps " &
+      "the depfile as having asked for them. The host filter cannot repair " &
+      "this — it only ever removes records. See interestToShimTokens."
 
 func statesUnevaluableInterest*(dep: MonitorDepFile): bool =
   ## The capture STATED a scope, and this build could not name a single category
