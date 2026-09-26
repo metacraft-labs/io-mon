@@ -151,3 +151,87 @@ jobs:
           name: test-logs-${{ matrix.env }}-${{ matrix.slug }}
           path: test.log
           retention-days: 30
+
+  windows-injection:
+    name: Windows injection tests (x64)
+    # The Windows shim's spawn-hook tests need a real Windows x64 host: they
+    # spawn, park, inject and terminate real processes. The reprobuild lane
+    # fails in its own bootstrap before compiling them, so this job runs them
+    # directly on the persistent Windows runners (nim on the SYSTEM PATH,
+    # WinLibs gcc under the service profile). `dev-env-ready` keeps it off a
+    # drained runner.
+    runs-on: [self-hosted, windows, x64, dev-env-ready]
+    steps:
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      # io-mon resolves its siblings as ../<repo> (config.nims), so check the
+      # repo and its siblings out side by side.
+      - uses: actions/checkout@v4
+        with:
+          path: io-mon
+      - uses: actions/checkout@v4
+        with:
+          repository: metacraft-labs/nim-stackable-hooks
+          # Keep in lockstep with stackable-hooks-src in flake.nix.
+          ref: 72f578249e9d8bbca8e3705c8a41ed5085c05bf9
+          path: nim-stackable-hooks
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: metacraft-labs/nim-shm-queue
+          ref: dev
+          path: nim-shm-queue
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: metacraft-labs/nim-shm-gset
+          # Same revision as .github/sibling-repos.
+          ref: cf0adf2f39647f5b203b2ab694414a3c50e93951
+          path: nim-shm-gset
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Run the Windows injection tests
+        shell: pwsh
+        working-directory: io-mon
+        run: |
+          # The PATH `gcc` on these runners is not the provisioned toolchain
+          # (it reports 2.95 and cannot read the CRT headers). The profile
+          # installs WinLibs GCC per service account; put it first.
+          $gccRoots = @(
+            "$env:LOCALAPPDATA\repo-workspaces\toolchains\gcc",
+            'C:\Windows\ServiceProfiles\NetworkService\AppData\Local\repo-workspaces\toolchains\gcc',
+            'C:\Windows\System32\config\systemprofile\AppData\Local\repo-workspaces\toolchains\gcc'
+          )
+          $gccBin = $null
+          foreach ($r in $gccRoots) {
+            if (Test-Path $r) {
+              $cand = Get-ChildItem $r -Directory | Sort-Object Name -Descending |
+                ForEach-Object { Join-Path $_.FullName 'bin' } |
+                Where-Object { Test-Path (Join-Path $_ 'gcc.exe') } | Select-Object -First 1
+              if ($cand) { $gccBin = $cand; break }
+            }
+          }
+          if (-not $gccBin) { throw "no provisioned WinLibs gcc found under: $($gccRoots -join ', ')" }
+          $env:PATH = "$gccBin;$env:PATH"
+          nim -v
+          gcc --version
+          $tests = @(
+            'tests/windows/test_io_mon_windows_spawn_abandoned_injection',
+            'tests/windows/test_io_mon_windows_spawn_resume',
+            'tests/portable/test_shim_signal_handler_policy'
+          )
+          New-Item -ItemType Directory -Force build/test-bin | Out-Null
+          $failed = @()
+          foreach ($t in $tests) {
+            Write-Host "=== $t"
+            $stem = Split-Path $t -Leaf
+            & nim c -r --hints:off --cc:gcc "--out:build/test-bin/$stem.exe" "$t.nim"
+            if ($LASTEXITCODE -ne 0) { $failed += "$t (exit $LASTEXITCODE)" }
+          }
+          if ($failed.Count -gt 0) { throw "failed: $($failed -join '; ')" }
