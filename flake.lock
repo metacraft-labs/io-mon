@@ -4813,16 +4813,17 @@
     "stackable-hooks-src_2": {
       "flake": false,
       "locked": {
-        "lastModified": 1782916661,
-        "narHash": "sha256-Jr6AjwYJaN6nanpaMCvXmdO6DH767qxarsylTff0uzk=",
+        "lastModified": 1790436736,
+        "narHash": "sha256-X8hF8RFp8Dx50Wc2Y41VJ0KV7FkQgEFAqx6R7W5yhu8=",
         "owner": "metacraft-labs",
         "repo": "nim-stackable-hooks",
-        "rev": "c6cf6ad1ac95201288825970b6ca53f630ea8996",
+        "rev": "72f578249e9d8bbca8e3705c8a41ed5085c05bf9",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
         "repo": "nim-stackable-hooks",
+        "rev": "72f578249e9d8bbca8e3705c8a41ed5085c05bf9",
         "type": "github"
       }
     },
