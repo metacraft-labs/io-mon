@@ -585,6 +585,89 @@ when defined(macosx):
       return candidate
     ""
 
+  const appleToolchainDropIns = [
+    # Apple's own toolchain, reached at the path Apple already installs it at.
+    # Each of these also exists under /usr/bin as a tiny `xcode_select` SHIM
+    # (`/usr/bin/cc` is 118 KB and signed `com.apple.dt.xcode_select.tool-shim-public`);
+    # the shim is SIP-protected, so exec'ing it strips DYLD_INSERT_LIBRARIES
+    # and the real compiler it then exec's never sees the shim library either.
+    # The compiler ITSELF lives under the active developer directory, outside
+    # every SIP prefix, and is signed with `flags=0x0(none)` — no hardened
+    # runtime, no library validation — so it takes the injection normally.
+    #
+    # Measured: `bash -c '/usr/bin/cc --version'` under the monitor reports one
+    # unknown-scope loss; with `usr/bin/cc` dropped in as a symlink to
+    # `xcrun -f clang` it reports none. On a dev-env activation that one loss
+    # was the difference between a provider compile that publishes to the
+    # action cache and one that recompiles on every new shell (20.5 s).
+    "cc", "clang", "c++", "clang++", "cpp",
+    "ld", "as", "ar", "nm", "strip", "lipo", "libtool",
+  ]
+
+  proc resolveAppleToolchainTool*(name: string): string =
+    ## Exported for the test that asserts the resolved path is outside every
+    ## SIP prefix — the one property the whole mechanism rests on, and one that
+    ## cannot be observed from the outside without re-running `xcrun`.
+    ##
+    ## Absolute path of ``name`` inside the ACTIVE developer directory, via
+    ## ``xcrun -f``. That is the only correct resolver: the toolchain path
+    ## depends on `xcode-select -p` (Xcode.app vs CommandLineTools) and on the
+    ## selected toolchain, and hardcoding either spelling breaks on the other.
+    ##
+    ## ``xcrun`` itself is SIP-protected, which does not matter: this runs in
+    ## the monitor host at populate time, not inside a monitored action — the
+    ## same reasoning that lets ``findNonSipAlternative`` above consult the
+    ## developer's own PATH.
+    var resolved = ""
+    try:
+      let probe = execCmdEx("/usr/bin/xcrun -f " & quoteShell(name) &
+        " 2>/dev/null")
+      if probe.exitCode != 0:
+        return ""
+      resolved = probe.output.strip()
+    except CatchableError, Defect:
+      return ""
+    if resolved.len == 0 or not fileExists(extendedPath(resolved)):
+      return ""
+    # A resolver that answered with a SIP path would defeat the whole point,
+    # so the guard is explicit rather than assumed from the directory layout.
+    if ct_propagation.isSipProtected(resolved):
+      return ""
+    resolved
+
+  proc populateAppleToolchainDropIns*(sandboxDir: string) =
+    ## Symlink each Apple toolchain tool into the sandbox at its /usr/bin
+    ## spelling, so ``rewriteSipPath("/usr/bin/cc", dir)`` resolves.
+    ##
+    ## These are SYMLINKS TO APPLE'S OWN BINARY, which is what makes this
+    ## sound where a substitution would not be: the monitored action runs the
+    ## same compiler, linker and assembler it would have run through the shim,
+    ## with the same SDK resolution and the same defaults. Nothing about the
+    ## build changes; only whether we can see it. Substituting a DIFFERENT
+    ## compiler (a nixpkgs clang, say) would change what gets built, and is
+    ## deliberately not what happens here.
+    ##
+    ## Absent toolchain, absent entry: a host with no developer directory
+    ## simply gets no drop-in, exactly as for any other unresolvable tool.
+    if sandboxDir.len == 0:
+      return
+    let destDir = sandboxDir / "usr" / "bin"
+    try:
+      createDir(extendedPath(destDir))
+    except OSError, IOError:
+      return
+    for name in appleToolchainDropIns:
+      let destPath = destDir / name
+      if fileExists(destPath) or symlinkExists(destPath):
+        continue
+      let resolved = resolveAppleToolchainTool(name)
+      if resolved.len == 0:
+        continue
+      try:
+        createSymlink(resolved, destPath)
+      except OSError, IOError:
+        discard
+
   proc populateReproSandboxTools(sandboxDir: string) =
     ## Drop in a non-SIP instance of every entry in ``reproSandboxBinaries``
     ## under ``sandboxDir``, mirroring the original SIP layout so
@@ -639,6 +722,10 @@ when defined(macosx):
           discard ct_propagation.prepareSandboxCopy(src, sandboxDir)
         except OSError, IOError:
           discard
+
+    # The toolchain is resolved through the developer directory rather than
+    # PATH, so it is a separate pass over a separate name list.
+    populateAppleToolchainDropIns(sandboxDir)
 
   proc resolveExecutableInPath(name: string): string =
     ## Resolve ``name`` against PATH the way ``posix_spawnp`` would so we
@@ -799,10 +886,18 @@ proc parseOutputMode(value: string): FsSnoopOutputMode =
 
 proc parseInterestFlag(value: string): set[EventCategory] =
   ## Decode `--interest`'s value — the SAME comma-separated token vocabulary
-  ## `REPRO_MONITOR_INTEREST` uses (`file`, `proc`, `lib`, `nondet`, `ipc`), so
-  ## the CLI and the env channel are one wire format with one codec
-  ## (`interestToTokens` / `parseInterestTokens`; see
+  ## `REPRO_MONITOR_INTEREST` uses (`file-reads`, `path-probes`, `file-writes`,
+  ## `proc`, `lib`, `env`, `entropy`, `ambient`, plus the pre-DA-5 aliases
+  ## `file` / `nondet` / `ipc`), decoded by the one codec both channels share
+  ## (`parseInterestTokens`; see
   ## `docs/contributors/event-interest-filter.md` §3).
+  ##
+  ## One VOCABULARY, two ENCODERS — the env channel additionally carries
+  ## back-compat padding for a pre-DA-5 shim (`interestToShimTokens`), which is
+  ## why `--interest`'s value and the child's `REPRO_MONITOR_INTEREST` are not
+  ## expected to be the same string. The vocabulary quoted to an operator in the
+  ## diagnostics below is `interestToTokens(FullInterest)`, the canonical one:
+  ## the padding is not a set of categories anyone can ask for.
   ##
   ## ABSENT FLAG ⇒ `FullInterest`, and that is a deliberate choice rather than a
   ## default that fell out. `FsSnoopRequest.interest` zero-initialises to `{}`,
@@ -820,16 +915,65 @@ proc parseInterestFlag(value: string): set[EventCategory] =
   ## and the unknown token ignored — the forward-compatibility rule
   ## `parseInterestTokens` implements for the env channel, and it matters
   ## equally here now that a NEWER consumer can hand this flag to an OLDER
-  ## io-mon. A value naming NO known token at all is refused instead: that
-  ## cannot be version skew (skew keeps the tokens it already had and adds one),
-  ## it is an operator typo, and silently widening a typo to `FullInterest`
-  ## would discard the caller's reduction without a word — which is the exact
-  ## class of silent discard this flag exists to end.
+  ## io-mon. A value naming NO known token at all is refused instead: it is
+  ## almost always an operator typo, and silently widening a typo to
+  ## `FullInterest` would discard the caller's reduction without a word — which
+  ## is the exact class of silent discard this flag exists to end.
+  ##
+  ## THAT SENTENCE USED TO READ "that cannot be version skew (skew keeps the
+  ## tokens it already had and adds one)", AND DA-5 RETIRED THE ASSUMPTION. Skew
+  ## kept the tokens it already had until a release RENAMED six of the eight, and
+  ## a value written entirely in a vocabulary this build has dropped is exactly a
+  ## value naming no known token. The aliases are what keep the claim true for
+  ## THIS rename — every pre-DA-5 spelling still parses, so no pre-DA-5 command
+  ## line reaches the refusal — but "no known token ⇒ typo" is now a property the
+  ## alias table maintains, not one the shape of version skew guarantees. Retire
+  ## a spelling without an alias and this refusal starts rejecting correct
+  ## callers. The same assumption on the ENV channel had teeth rather than
+  ## manners: there the reader is a shim, refusal is not available to it, and
+  ## honouring a renamed vocabulary cost every file record. See
+  ## `types.interestToShimTokens`.
+  ##
+  ## DA-5 — A VALUE NAMING ONLY RETIRED CATEGORIES IS REFUSED TOO, and gets its
+  ## own sentence rather than the typo one. `--interest ipc` used to be a legal
+  ## request; today `mrIpcConnect` is ungate-able (see `categoryOf`), so the
+  ## value is recognised, expands to no category, and there is nothing this
+  ## build can be asked to do with it. Widening it to `FullInterest` would
+  ## discard the operator's reduction silently and refusing it as a typo would
+  ## send them looking for a misspelling that is not there, so it is refused
+  ## with the reason.
   let trimmed = value.strip()
   if trimmed.len == 0:
     return FullInterest
+  # The back-compat fence is a wire marker, not a category, and on this flag it
+  # would SUPPRESS the aliases beside it — so `--interest legacy-padding,file`
+  # would quietly mean `{}` rather than the file categories. Refused here rather
+  # than reinterpreted, because an operator who types it has been reading the
+  # env value and deserves to be told what it is.
+  for raw in trimmed.split(','):
+    if raw.strip() == LegacyPaddingToken:
+      raise newException(ValueError,
+        "--interest names `" & LegacyPaddingToken & "`, which is not an event" &
+        " category: it is the internal marker io-mon puts in a child's" &
+        " REPRO_MONITOR_INTEREST to separate the categories from the" &
+        " back-compat spellings an older shim needs. Pass the categories only." &
+        " (known categories: " & interestToTokens(FullInterest) & ")")
   result = parseInterestTokens(trimmed)
   if result == {}:
+    var namedRetired = false
+    for raw in trimmed.split(','):
+      let tok = raw.strip()
+      for legacy in LegacyEventCategory:
+        if tok == legacyInterestToken(legacy) and
+           legacyInterestExpansion(legacy) == {}:
+          namedRetired = true
+    if namedRetired:
+      raise newException(ValueError,
+        "--interest names only categories that no longer exist: " & value &
+        " — the record kinds they gated are now ungate-able (they are what" &
+        " io-mon derives its event-loss markers from), so they are always" &
+        " captured. Drop them from the value, or omit --interest entirely." &
+        " (known categories: " & interestToTokens(FullInterest) & ")")
     raise newException(ValueError,
       "--interest names no known event category: " & value &
       " (expected a comma-separated subset of " &
@@ -1215,11 +1359,20 @@ proc childEnv(request: FsSnoopRequest;
     result[key] = value
   # The event-interest set is an io-mon injection variable (so it WINS over any
   # caller `request.env`, exactly like the other REPRO_MONITOR_* needles) that the
-  # shim reads at init to gate which observation categories it captures. Encoded
-  # via `interestToTokens`, which is never empty even for `FullInterest`, so the
-  # shim distinguishes "capture all" from "unset". See
-  # docs/contributors/event-interest-filter.md.
-  result["REPRO_MONITOR_INTEREST"] = interestToTokens(request.interest)
+  # shim reads at init to gate which observation categories it captures. Never
+  # empty even for `FullInterest`, so the shim distinguishes "capture all" from
+  # "unset". See docs/contributors/event-interest-filter.md.
+  #
+  # ENCODED BY `interestToShimTokens`, NOT BY `interestToTokens`, AND THE TWO
+  # MUST NOT BE MERGED. The depfile stamp is a claim a consumer can be made to
+  # ACCEPT too readily, so it is spelled only in this build's own vocabulary; the
+  # env value is an instruction a shim can be made to obey too NARROWLY, so it
+  # additionally carries the pre-DA-5 spellings for every legacy category holding
+  # a kind this interest wants. A shim built before the split then over-captures
+  # and the filter below narrows it, instead of recognising two of eight tokens
+  # and gating away every file read under a stamp claiming full scope. The two
+  # channels want opposite answers; one encoder cannot give both.
+  result["REPRO_MONITOR_INTEREST"] = interestToShimTokens(request.interest)
   # DA-1i — the evidence scope, on the same io-mon injection channel and for the
   # same reason: it is the SHIM's to read at init, not the caller's to set in
   # this process's environment, so the injection deliberately wins over any
@@ -2116,11 +2269,22 @@ proc collectMonitorEvidence(h: var MonitorHandle): MonitorDepFile =
   # emitting the categories the consumer did not ask for, so with a current shim
   # nothing is dropped here. But the HOST is the source of truth for "the depfile
   # contains only requested categories": an OLDER shim that ignores
-  # REPRO_MONITOR_INTEREST still yields a correctly-filtered result. META/loss
-  # records (`recordWanted` returns true) are never dropped, so completeness is
-  # unaffected — disabling a category is a consumer choice, not data loss. Only
-  # when the interest is reduced AND something was actually dropped do we
-  # re-summarize and re-write the on-disk depfile to match the in-memory result.
+  # REPRO_MONITOR_INTEREST, or honours it and OVER-captures, still yields a
+  # correctly-filtered result. META/loss records (`recordWanted` returns true)
+  # are never dropped, so completeness is unaffected — disabling a category is a
+  # consumer choice, not data loss. Only when the interest is reduced AND
+  # something was actually dropped do we re-summarize and re-write the on-disk
+  # depfile to match the in-memory result.
+  #
+  # THE GUARANTEE IS ONE-DIRECTIONAL, AND THIS LOOP IS WHY: its only operation
+  # is to REMOVE a record. Over-capture is repaired here; UNDER-capture cannot
+  # be, because there is nothing to restore a record the shim never emitted.
+  # "The host is the source of truth" is therefore a statement about what the
+  # depfile CONTAINS and says nothing about what it is MISSING — which is how a
+  # shim honouring REPRO_MONITOR_INTEREST in a pre-DA-5 vocabulary produced a
+  # 14-record capture graded `mcComplete` with no file records in it at all. The
+  # encoder in `childEnv` (`interestToShimTokens`) is what keeps that shim on the
+  # over-capture side; nothing downstream of here could have.
   #
   # DA-1i — THE SAME ARGUMENT ON THE OTHER AXIS, and the reason both filters are
   # one pass. The shim also skips FAILED EXISTENCE LOOKUPS under

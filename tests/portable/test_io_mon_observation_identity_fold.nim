@@ -15,7 +15,7 @@
 ## 2. **A depfile states what it was ASKED to record.** Until `observedInterest`
 ##    existed nothing did, while `--interest` already shipped and already
 ##    narrowed: measured, `--interest file,proc,lib` on a command with an
-##    out-of-tree peer grades `mcComplete` with 0 losses, because gating `ecIpc`
+##    out-of-tree peer graded `mcComplete` with 0 losses, because gating `ecIpc`
 ##    means the `mrIpcConnect` records never exist and no synthetic loss is ever
 ##    derived from them. The depfile then said `mcComplete` and said nothing
 ##    about having been narrowed.
@@ -230,8 +230,9 @@ suite "io-mon depfile capture-scope stamp (DA-1j)":
     check observedInterestCovers(dep, FullInterest)
 
   test "t_a_narrowed_capture_says_so":
-    let dep = depFileFromRecords(@[profileRecordWith(";interest=file,proc,lib")])
-    check dep.observedInterest == {ecFileDeps, ecProcessTree, ecLibraryLoads}
+    let dep = depFileFromRecords(@[profileRecordWith(
+      ";interest=file-reads,proc,lib")])
+    check dep.observedInterest == {ecFileReads, ecProcessTree, ecLibraryLoads}
     check dep.observedInterest != FullInterest
     # The narrowing is VISIBLE, and — the whole point — it did not move the
     # grade. A deliberate narrowing is an honest answer to a narrower question,
@@ -247,14 +248,14 @@ suite "io-mon depfile capture-scope stamp (DA-1j)":
     # Not just the in-memory derive: the token has to survive being encoded into
     # the canonical envelope and decoded back, since that is the only form a
     # consumer ever sees.
-    let records = @[profileRecordWith(";interest=file,ipc")]
+    let records = @[profileRecordWith(";interest=file-reads,env")]
     let path = getTempDir() / ("io-mon-scope-stamp-" &
       $getCurrentProcessId() & ".iomon")
     removeFile(path)
     writeCanonical(path, records)
     let decoded = readMonitorDepFile(path)
     removeFile(path)
-    check decoded.observedInterest == {ecFileDeps, ecIpc}
+    check decoded.observedInterest == {ecFileReads, ecEnvReads}
 
   test "t_an_unknown_token_beside_known_ones_narrows_the_scope_and_is_kept":
     # RENAMED, and the old name is the point. This was
@@ -272,8 +273,8 @@ suite "io-mon depfile capture-scope stamp (DA-1j)":
     # understand survive, the one it does not drops out of the SET but stays in
     # the FILE, and the resulting narrower read errs toward rejection.
     let dep = depFileFromRecords(@[profileRecordWith(
-      ";interest=file,proc,someFutureCategory")])
-    check ecFileDeps in dep.observedInterest
+      ";interest=file-reads,proc,someFutureCategory")])
+    check ecFileReads in dep.observedInterest
     check ecProcessTree in dep.observedInterest
     check dep.observedInterest != {}
     # The unknown token drops out of the SET but not out of the FILE: the raw
@@ -283,7 +284,7 @@ suite "io-mon depfile capture-scope stamp (DA-1j)":
     # And what dropped out narrowed the scope this build reads, so the error is
     # toward rejection: a consumer needing everything says no.
     check not observedInterestCovers(dep, FullInterest)
-    check observedInterestCovers(dep, {ecFileDeps, ecProcessTree})
+    check observedInterestCovers(dep, {ecFileReads, ecProcessTree})
 
   test "t_a_stamp_naming_only_unknown_categories_is_not_read_as_full_scope":
     # THE RESIDUAL DA-1j's own verification named, closed. `interest=gpu` is what
@@ -312,7 +313,7 @@ suite "io-mon depfile capture-scope stamp (DA-1j)":
     check not observedInterestCovers(dep, FullInterest)
     # Nor may it be accepted by a consumer that needs merely ONE category — an
     # unevaluable scope cannot be shown to cover anything at all.
-    check not observedInterestCovers(dep, {ecFileDeps})
+    check not observedInterestCovers(dep, {ecFileReads})
 
     # And the contrast that is the bug, side by side: an ABSENT stamp is
     # accepted, a STATED-but-unnamable one is not, though both parse to `{}`.
@@ -351,7 +352,7 @@ suite "io-mon depfile capture-scope stamp (DA-1j)":
       check effectiveObservedInterest(dep) != FullInterest
       check effectiveObservedInterest(dep) == {}
       check not observedInterestCovers(dep, FullInterest)
-      check not observedInterestCovers(dep, {ecFileDeps})
+      check not observedInterestCovers(dep, {ecFileReads})
 
     # Over REAL BYTES too, because the verdict has to survive the envelope.
     let path = getTempDir() / ("io-mon-scope-empty-value-" &
@@ -408,12 +409,194 @@ suite "io-mon depfile capture-scope stamp (DA-1j)":
     # …and a caller that DOES state a scope gets it written down. Deleting the
     # stamp block entirely reddens here.
     let narrowed = mergeFragments(work, work / "narrowed.iomon",
-      observedInterest = {ecFileDeps, ecProcessTree})
+      observedInterest = {ecFileReads, ecProcessTree})
     check narrowed.observedInterestStated
-    check narrowed.observedInterest == {ecFileDeps, ecProcessTree}
+    check narrowed.observedInterest == {ecFileReads, ecProcessTree}
     check not observedInterestCovers(narrowed, FullInterest)
     let narrowedOnDisk = readMonitorDepFile(work / "narrowed.iomon")
-    check narrowedOnDisk.observedInterest == {ecFileDeps, ecProcessTree}
-    check narrowedOnDisk.observedInterestTokens == "file,proc"
+    check narrowedOnDisk.observedInterest == {ecFileReads, ecProcessTree}
+    check narrowedOnDisk.observedInterestTokens == "file-reads,proc"
 
     removeDir(work)
+
+suite "io-mon depfile capture-scope stamp: both wire directions (DA-5)":
+  # DA-5 SPLIT `EventCategory`, WHICH MAKES THE STAMP'S VOCABULARY CHANGE. That
+  # is a wire event, and a wire event has two directions that fail differently:
+  #
+  #   OLD BYTES -> NEW READER  must keep reading, and must not read WIDER than
+  #                            the old capture actually recorded. Accepting a
+  #                            narrowed old capture as full scope is the false
+  #                            complete this stamp exists to end.
+  #   NEW BYTES -> OLD READER  must not be read as full scope either. It may
+  #                            cost a re-capture; it may not produce an accept.
+  #
+  # Both are graded here over REAL DEPFILE BYTES — written with `writeCanonical`
+  # and read back with `readMonitorDepFile` — because the stamp rides inside a
+  # `;`-joined record detail and an in-memory equality has twice now been green
+  # while the encoded form was wrong (DA-1i's `writes;only`, DA-1j's
+  # `interest=`).
+
+  proc profileRecordWith(extraTokens: string): MonitorRecord =
+    result = backendProfileRecord(linuxPreloadMonitorProfile())
+    result.detail.add extraTokens
+
+  proc roundTrip(stamp: string; name: string):
+      tuple[dep: MonitorDepFile; bytes: string] =
+    ## Write ONE real depfile carrying `stamp`, read it back, and also hand back
+    ## the file's raw bytes so a case can assert what is literally on disk
+    ## rather than what the decoder chose to make of it.
+    let path = getTempDir() / ("io-mon-da5-" & name & "-" &
+      $getCurrentProcessId() & ".iomon")
+    removeFile(path)
+    writeCanonical(path, @[profileRecordWith(stamp)])
+    result = (readMonitorDepFile(path), readFile(path))
+    removeFile(path)
+
+  test "t_every_new_token_round_trips_through_a_real_depfile":
+    # ONE CASE PER CATEGORY, over the real container. The `static:` block in
+    # `types.nim` proves the token survives `parseInterestTokens`; it does not
+    # prove the token survives the `;`-joined detail, the canonical encoder and
+    # the reader — which is exactly the gap `writes;only` walked through with a
+    # green suite.
+    var graded = 0
+    for cat in EventCategory:
+      let tok = interestToken(cat)
+      let (dep, bytes) = roundTrip(";interest=" & tok, "tok-" & $cat)
+      inc graded
+      check dep.observedInterestStated
+      check dep.observedInterestTokens == tok
+      check dep.observedInterest == {cat}
+      # The token is in the FILE, not merely in the decode.
+      check ("interest=" & tok) in bytes
+      # A consumer needing exactly this category accepts; one needing all of
+      # them does not.
+      check observedInterestCovers(dep, {cat})
+      check not observedInterestCovers(dep, FullInterest)
+    check graded == 8
+
+  test "t_an_unrecognised_token_is_stated_kept_verbatim_and_rejected":
+    # THE NEGATIVE CONTROL for the case above, and the DA-1j degrade restated
+    # for DA-5's vocabulary: present-but-unrecognised is NOT full scope. Without
+    # it the loop above would also pass against a reader that answered
+    # `FullInterest` for everything it could not name.
+    let (dep, bytes) = roundTrip(";interest=file-reads-and-more", "unknown")
+    check dep.observedInterestStated
+    check dep.observedInterest == {}
+    check statesUnevaluableInterest(dep)
+    check dep.observedInterestTokens == "file-reads-and-more"
+    check "interest=file-reads-and-more" in bytes
+    check effectiveObservedInterest(dep) != FullInterest
+    check not observedInterestCovers(dep, FullInterest)
+    check not observedInterestCovers(dep, {ecFileReads})
+    # And it is NOT a prefix accident: the token is not silently truncated to
+    # the `file-reads` this build does know.
+    check ecFileReads notin dep.observedInterest
+
+  test "t_old_bytes_new_reader_a_full_old_capture_still_reads_as_full_scope":
+    # THE OLD -> NEW DIRECTION, on the exact string every unnarrowed pre-DA-5
+    # capture carries. This is the whole argument for keeping the old tokens as
+    # aliases: without them this file states a scope this build cannot evaluate
+    # and every consumer rejects evidence that is in fact complete.
+    let (dep, bytes) = roundTrip(";interest=file,proc,lib,nondet,ipc", "old-full")
+    check "interest=file,proc,lib,nondet,ipc" in bytes
+    check dep.observedInterestStated
+    check dep.observedInterestTokens == "file,proc,lib,nondet,ipc"
+    check dep.observedInterest == FullInterest
+    check observedInterestCovers(dep, FullInterest)
+
+  test "t_old_bytes_new_reader_a_narrowed_old_capture_is_not_widened":
+    # THE DIRECTION THAT MATTERS. `interest=file,proc,lib` is what reprobuild's
+    # engine used to ask for. That capture observed no environment read, no
+    # entropy and no clock read, and the alias must not claim otherwise —
+    # widening it would put an action's cache key and its publish gate behind
+    # evidence that was never collected.
+    let (dep, bytes) = roundTrip(";interest=file,proc,lib", "old-narrow")
+    check "interest=file,proc,lib" in bytes
+    check dep.observedInterest == {ecFileReads, ecPathProbes, ecFileWrites,
+                                   ecProcessTree, ecLibraryLoads}
+    check dep.observedInterest != FullInterest
+    check not observedInterestCovers(dep, FullInterest)
+    check not observedInterestCovers(dep, {ecEnvReads})
+    check not observedInterestCovers(dep, {ecEntropy})
+    check not observedInterestCovers(dep, {ecAmbientReads})
+    # What it DID observe is still accepted, so the alias is a gain and not
+    # merely a non-loss.
+    check observedInterestCovers(dep, {ecFileReads, ecPathProbes, ecFileWrites})
+    check observedInterestCovers(dep, {ecProcessTree, ecLibraryLoads})
+
+  test "t_old_bytes_new_reader_an_ipc_only_stamp_declares_no_gateable_category":
+    # `interest=ipc` named a scope whose only kind is now ungate-able. The
+    # honest reading is "this states a scope with no category in it", which is
+    # unevaluable — NOT full scope, and not silently dropped either: the raw
+    # token stays in the file so the residual can be named.
+    let (dep, bytes) = roundTrip(";interest=ipc", "old-ipc")
+    check "interest=ipc" in bytes
+    check dep.observedInterestStated
+    check dep.observedInterest == {}
+    check statesUnevaluableInterest(dep)
+    check dep.observedInterestTokens == "ipc"
+    check not observedInterestCovers(dep, FullInterest)
+    check not observedInterestCovers(dep, {ecFileReads})
+
+  test "t_new_bytes_old_reader_reads_narrower_never_wider":
+    # THE NEW -> OLD DIRECTION, over the bytes this build actually writes and
+    # through the pre-DA-5 token table (`legacyInterestToken`, kept in
+    # `types.nim` for exactly this reason — it is the shipped old vocabulary,
+    # not a reconstruction).
+    #
+    # An old build recognises `proc` and `lib` and nothing else, so a NEW FULL
+    # capture reads to it as `{file? no, proc, lib, nondet? no, ipc? no}` — a
+    # narrowed stamp. Its own `observedInterestCovers` is a subset test, so a
+    # full-scope consumer on that build REJECTS and re-captures. That is the
+    # correct direction: cost, not a wrong answer.
+    let (_, bytes) = roundTrip(";interest=" & interestToTokens(FullInterest),
+      "new-full")
+    check "interest=file-reads,path-probes,file-writes,proc,lib,env,entropy,ambient" in bytes
+
+    proc oldReader(s: string): set[LegacyEventCategory] =
+      for raw in s.strip().split(','):
+        let tok = raw.strip()
+        for legacy in LegacyEventCategory:
+          if tok == legacyInterestToken(legacy): result.incl(legacy)
+
+    const OldFullInterest = {LegacyEventCategory.low .. LegacyEventCategory.high}
+    let seenByOld = oldReader(interestToTokens(FullInterest))
+    check seenByOld == {lecProcessTree, lecLibraryLoads}
+    check not (OldFullInterest <= seenByOld)     # the old full consumer rejects
+    check lecFileDeps notin seenByOld
+    check lecNonDeterminism notin seenByOld
+
+    # And a NEW capture narrowed to a split category is unevaluable to the old
+    # build — `{}` with `stated = true`, which its `statesUnevaluableInterest`
+    # already refuses for every non-empty requirement.
+    let (_, envBytes) = roundTrip(";interest=" & interestToTokens({ecEnvReads}),
+      "new-env")
+    check "interest=env" in envBytes
+    check oldReader("env") == {}
+    check oldReader(interestToTokens({ecAmbientReads})) == {}
+
+  test "t_the_two_directions_disagree_only_in_the_safe_direction":
+    # The pair of readings of ONE capture, stated side by side, because the
+    # asymmetry is the property and it is easy to state backwards. For every
+    # single-category new stamp: this build reads exactly that category; an old
+    # build reads a SUBSET of what that category's kinds used to belong to,
+    # never a superset.
+    proc oldReader(s: string): set[LegacyEventCategory] =
+      for raw in s.strip().split(','):
+        let tok = raw.strip()
+        for legacy in LegacyEventCategory:
+          if tok == legacyInterestToken(legacy): result.incl(legacy)
+
+    for cat in EventCategory:
+      let tok = interestToken(cat)
+      let (dep, _) = roundTrip(";interest=" & tok, "pair-" & $cat)
+      check dep.observedInterest == {cat}
+      # Whatever the old build makes of this token, every legacy category it
+      # names must be one whose FROZEN kind list actually contains a kind of
+      # this category — i.e. it cannot learn about a category that did not
+      # cover those kinds.
+      for legacy in oldReader(tok):
+        var overlaps = false
+        for kind in legacyMemberKinds(legacy):
+          if categoryOf(kind) == some(cat): overlaps = true
+        check overlaps

@@ -36,31 +36,77 @@ proc writeBytes(outp: var File; bytes: seq[byte]) =
   if written != bytes.len:
     raiseEnvelopeError(eeMalformed, "short write to iomon depfile")
 
-proc writeI64Le(outp: var seq[byte]; value: int64) =
-  outp.writeU64Le(cast[uint64](value))
+# --------------------------------------------------------------------------
+# DA-1c — the FIXED frame header, stored/loaded at compile-time offsets.
+#
+# A frame is
+#
+#     u32 payloadLen | <---------------- payload ---------------------------->
+#                    | 60-byte fixed record header | u32 | path | u32 | detail
+#
+# so 4 + 60 + 4 + 4 = 72 bytes of every frame are a FIXED header whose field
+# offsets are known at compile time — 39.1% of the 12.6 MB capture measured for
+# DA-1c, and six of its `u64`s are overwhelmingly zero. It was serialised field
+# by field through the cursor codec, i.e. 72 `seq.add` calls (each a length
+# bump, a capacity test and a store) per record. These offsets let the whole
+# header be stored into one already-sized buffer and loaded back with one
+# machine-word access per field.
+#
+# THE WIRE IS UNCHANGED. The constants below restate the existing layout; they
+# do not choose it. `codec.storeU*Le` / `codec.loadU*Le` carry the endianness
+# argument (see their comment) — nothing here blits a Nim object, so no struct
+# padding or field-ordering decision can leak into the file.
+# --------------------------------------------------------------------------
+const
+  RecordFixedHeaderLen* = 60
+    ## Bytes of a record PAYLOAD preceding the two length-prefixed strings:
+    ## kind(2) obs(2) seq(8) osPid(8) parentOsPid(8) threadId(8) childOsPid(8)
+    ## result(8) flags(4) probeResult(4).
+  FrameFixedHeaderLen* = 4 + RecordFixedHeaderLen
+    ## …plus the frame's own `u32` length prefix.
+  # Field offsets WITHIN the payload.
+  OffKind = 0
+  OffObservationKind = 2
+  OffSeq = 4
+  OffOsPid = 12
+  OffParentOsPid = 20
+  OffThreadId = 28
+  OffChildOsPid = 36
+  OffResult = 44
+  OffFlags = 52
+  OffProbeResult = 56
 
-proc readI64Le(bytes: openArray[byte]; pos: var int): int64 =
-  cast[int64](readU64Le(bytes, pos))
+proc storeRecordFixedHeader(buf: var openArray[byte]; base: int;
+                            record: MonitorRecord) {.inline.} =
+  ## Write the 60-byte fixed record header at `base`. The caller guarantees
+  ## `base + RecordFixedHeaderLen <= buf.len`.
+  storeU16Le(buf, base + OffKind, uint16(ord(record.kind)))
+  storeU16Le(buf, base + OffObservationKind, uint16(ord(record.observationKind)))
+  storeU64Le(buf, base + OffSeq, record.seq)
+  storeU64Le(buf, base + OffOsPid, record.osPid)
+  storeU64Le(buf, base + OffParentOsPid, record.parentOsPid)
+  storeU64Le(buf, base + OffThreadId, record.threadId)
+  storeU64Le(buf, base + OffChildOsPid, record.childOsPid)
+  storeU64Le(buf, base + OffResult, cast[uint64](record.result))
+  storeU32Le(buf, base + OffFlags, record.flags)
+  storeU32Le(buf, base + OffProbeResult, uint32(ord(record.probeResult)))
 
 proc encodeRecordPayload*(record: MonitorRecord): seq[byte] =
-  result = @[]
-  result.writeU16Le(uint16(ord(record.kind)))
-  result.writeU16Le(uint16(ord(record.observationKind)))
-  result.writeU64Le(record.seq)
-  result.writeU64Le(record.osPid)
-  result.writeU64Le(record.parentOsPid)
-  result.writeU64Le(record.threadId)
-  result.writeU64Le(record.childOsPid)
-  result.writeI64Le(record.result)
-  result.writeU32Le(record.flags)
-  result.writeU32Le(uint32(ord(record.probeResult)))
+  result = newSeqOfCap[byte](RecordFixedHeaderLen + 8 +
+    record.path.len + record.detail.len)
+  result.setLen(RecordFixedHeaderLen)
+  storeRecordFixedHeader(result, 0, record)
   result.writeString(record.path)
   result.writeString(record.detail)
 
 proc decodeRecordPayload*(payload: openArray[byte]): MonitorRecord =
-  var pos = 0
-  let kindOrd = readU16Le(payload, pos)
-  let obsOrd = readU16Le(payload, pos)
+  if payload.len < RecordFixedHeaderLen:
+    # Same EnvelopeError kind, and the same "truncated" substring the reader's
+    # `classifyEnvelopeError` maps to `mrTruncated`, as the per-field
+    # `readU*Le` bounds checks this replaces.
+    raiseEnvelopeError(eeMalformed, "truncated iomon record header")
+  let kindOrd = loadU16Le(payload, OffKind)
+  let obsOrd = loadU16Le(payload, OffObservationKind)
   if kindOrd < uint16(ord(low(MonitorRecordKind))) or
       kindOrd > uint16(ord(high(MonitorRecordKind))):
     raiseEnvelopeError(eeUnknownType, "unknown iomon record kind")
@@ -70,27 +116,41 @@ proc decodeRecordPayload*(payload: openArray[byte]): MonitorRecord =
 
   result.kind = MonitorRecordKind(kindOrd.int)
   result.observationKind = MonitorObservationKind(obsOrd.int)
-  result.seq = readU64Le(payload, pos)
-  result.osPid = readU64Le(payload, pos)
-  result.parentOsPid = readU64Le(payload, pos)
-  result.threadId = readU64Le(payload, pos)
-  result.childOsPid = readU64Le(payload, pos)
-  result.result = readI64Le(payload, pos)
-  result.flags = readU32Le(payload, pos)
-  let probeOrd = readU32Le(payload, pos)
+  result.seq = loadU64Le(payload, OffSeq)
+  result.osPid = loadU64Le(payload, OffOsPid)
+  result.parentOsPid = loadU64Le(payload, OffParentOsPid)
+  result.threadId = loadU64Le(payload, OffThreadId)
+  result.childOsPid = loadU64Le(payload, OffChildOsPid)
+  result.result = cast[int64](loadU64Le(payload, OffResult))
+  result.flags = loadU32Le(payload, OffFlags)
+  let probeOrd = loadU32Le(payload, OffProbeResult)
   if probeOrd > uint32(ord(high(ProbeResult))):
     raiseEnvelopeError(eeUnknownType, "unknown iomon probe result")
   result.probeResult = ProbeResult(probeOrd.int)
+  var pos = RecordFixedHeaderLen
   result.path = readString(payload, pos)
   result.detail = readString(payload, pos)
   if pos != payload.len:
     raiseEnvelopeError(eeMalformed, "iomon record has trailing bytes")
 
 proc encodeFrame*(record: MonitorRecord): seq[byte] =
-  let payload = encodeRecordPayload(record)
-  result = @[]
-  result.writeU32Le(uint32(payload.len))
-  result.add(payload)
+  ## DA-1c — one sized allocation, one bulk header store. The frame's `u32`
+  ## length prefix and the 60-byte record header are written at fixed offsets
+  ## instead of appended field by field, and the payload is built in place
+  ## rather than encoded into a second `seq` and copied.
+  ##
+  ## Byte-identical to the previous `writeU32Le(payload.len); add(payload)`:
+  ## the payload's length is fully determined by the fixed header plus the two
+  ## length-prefixed strings, so `payloadLen` below is by construction the
+  ## `encodeRecordPayload(record).len` it replaces.
+  let payloadLen = RecordFixedHeaderLen + 4 + record.path.len +
+    4 + record.detail.len
+  result = newSeqOfCap[byte](4 + payloadLen)
+  result.setLen(FrameFixedHeaderLen)
+  storeU32Le(result, 0, uint32(payloadLen))
+  storeRecordFixedHeader(result, 4, record)
+  result.writeString(record.path)
+  result.writeString(record.detail)
 
 proc decodeFrames*(bytes: openArray[byte]): seq[MonitorRecord] =
   var pos = 0

@@ -3427,6 +3427,38 @@ proc environmentWithMonitorConfigA(lpEnvironment: LPVOID;
   buf.add(char(0))
   cast[LPVOID](addr buf[0])
 
+# The injection config the spawn hooks use. A module-level value rather than
+# a literal at each call site so the behavioural tests (which `include` this
+# module) can shorten the hard deadline and drive the abandoned-injection
+# path for real; nothing in the shipped shim changes it.
+var spawnInjectionConfig = shProp.defaultInjectionConfig()
+
+proc injectSpawnedChild(record: var MonitorRecord;
+                        pi: ptr PROCESS_INFORMATION; hThread: HANDLE):
+    bool {.raises: [].} =
+  ## Inject this shim into a freshly created child and annotate ``record``
+  ## with anything other than a clean injection. Answers TRUE when the
+  ## child had to be TERMINATED (``ioChildTerminated``): the injector
+  ## borrowed the child's main thread and could not hand it back, so the
+  ## caller must fail the spawn and must NOT resume that thread.
+  ##
+  ## Why a slow injection is annotated rather than refused: on an
+  ## I/O-starved host, loading this shim into a healthy child took longer
+  ## than the injector used to wait, and the old recovery resumed the child
+  ## MID-CALL, which crashed it (gcc dying with "SIGSEGV: Illegal storage
+  ## access" right after a spawn record said ``inject=ioInitFailed``).
+  ## nim-stackable-hooks now waits while the child lives, so a slow
+  ## injection is a success and only worth a note -- see its
+  ## ``docs/windows-borrowed-call-deadline.md``.
+  let report = shProp.injectShimIntoChildReport(pi[].hProcess,
+    selfDllPath(), "repro_runtime_init", spawnInjectionConfig, hThread)
+  if report.outcome != shProp.ioInjected and
+      report.outcome != shProp.ioAlreadyPresent:
+    record.detail.add(" inject=" & $report.outcome)
+  if report.waitedMs >= uint64(shProp.SlowInjectionNoticeMs):
+    record.detail.add(" inject-wait-ms=" & $report.waitedMs)
+  report.outcome == shProp.ioChildTerminated
+
 proc snoopCreateProcessW(ctx: var hr.HookContext) {.raises: [].} =
   # Grandchild injection (Windows fs-snoop): force CREATE_SUSPENDED into
   # the child's creation flags BEFORE the real CreateProcessW runs, so
@@ -3495,7 +3527,9 @@ proc snoopCreateProcessW(ctx: var hr.HookContext) {.raises: [].} =
       if newEnv != nil:
         ctx.args[6] = cast[uint64](newEnv)
   hr.callNext(ctx)
-  let savedLastError = GetLastError()
+  # `var`: an injection that had to terminate the child replaces it with the
+  # failed spawn's own error; see `injectSpawnedChild`.
+  var savedLastError = GetLastError()
   # Resolve the thread to resume BEFORE any branch that can leave. `disabled`
   # and `initialized` are read again below and may have flipped underneath us
   # (the exit handler races this hook); the child, however, is already alive
@@ -3582,14 +3616,22 @@ proc snoopCreateProcessW(ctx: var hr.HookContext) {.raises: [].} =
       # be handed over; otherwise we pass nil and `injectShimIntoChild`
       # pins itself to the legacy technique, which is byte-for-byte what
       # this call did before.
+      #
+      # A CHILD THE INJECTOR HAD TO TERMINATE FAILS THE SPAWN. The injector
+      # never resumes a thread it lent out mid-call; when it cannot hand one
+      # back it kills the child instead. Reporting success would then give
+      # the caller handles to a process that died of our injection, with an
+      # exit code that reads like the program's own. So CreateProcessW
+      # returns FALSE with ERROR_TIMEOUT, the handles are closed and zeroed,
+      # and the resume owed in the `finally` is cancelled -- the one case
+      # where the debt is discharged by the child no longer existing.
       if created and selfDllPathW.len > 0:
-        let outcome = shProp.injectShimIntoChild(lpProcessInfo[].hProcess,
-          selfDllPath(), "repro_runtime_init",
-          hThread = (if shimForcedSuspend: lpProcessInfo[].hThread
-                     else: nil))
-        if outcome != shProp.ioInjected and
-            outcome != shProp.ioAlreadyPresent:
-          record.detail.add(" inject=" & $outcome)
+        if injectSpawnedChild(record, lpProcessInfo,
+            (if shimForcedSuspend: lpProcessInfo[].hThread else: nil)):
+          childMainThread = nil
+          savedLastError = shProp.failSpawnForTerminatedChild(lpProcessInfo)
+          ctx.result = 0
+          record.result = 0
       emitSpawnRecordDurably(record)
   except CatchableError:
     discard
@@ -3633,7 +3675,7 @@ proc snoopCreateProcessA(ctx: var hr.HookContext) {.raises: [].} =
       if newEnv != nil:
         ctx.args[6] = cast[uint64](newEnv)
   hr.callNext(ctx)
-  let savedLastError = GetLastError()
+  var savedLastError = GetLastError()
   # Resolved before any branch that can leave, for the reason given in
   # `snoopCreateProcessW`.
   let lpProcessInfo = cast[ptr PROCESS_INFORMATION](ctx.args[9])
@@ -3681,11 +3723,15 @@ proc snoopCreateProcessA(ctx: var hr.HookContext) {.raises: [].} =
       # Same contract as `snoopCreateProcessW` -- see the long note there for
       # why the fork-runtime guard is gone and why the main thread may only
       # be handed over when `shimForcedSuspend` says the suspension is ours.
+      # The spawn record has already been emitted on this arm, so the
+      # annotation is dropped; the failed-spawn handling is not.
       if created and selfDllPathW.len > 0:
-        discard shProp.injectShimIntoChild(lpProcessInfo[].hProcess,
-          selfDllPath(), "repro_runtime_init",
-          hThread = (if shimForcedSuspend: lpProcessInfo[].hThread
-                     else: nil))
+        var lateRecord = record
+        if injectSpawnedChild(lateRecord, lpProcessInfo,
+            (if shimForcedSuspend: lpProcessInfo[].hThread else: nil)):
+          childMainThread = nil
+          savedLastError = shProp.failSpawnForTerminatedChild(lpProcessInfo)
+          ctx.result = 0
   except CatchableError:
     discard
   finally:

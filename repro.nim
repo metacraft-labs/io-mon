@@ -68,6 +68,7 @@
 import std/[algorithm, os, strutils]
 
 import repro_project_dsl
+import repro_dsl_stdlib/foreign_env
 import repro_dsl_stdlib/packages/sh
 # NOTE: ``repro_dsl_stdlib/packages/nim`` is deliberately NOT imported here.
 # The ``package`` macro's ``usesImportCode`` pass auto-imports it ``as
@@ -129,6 +130,9 @@ package io_mon:
     name: "io-mon"
 
   devEnv:
+    when not defined(windows):
+      useFlakeDevShell()
+
     task "bump-version", command = "nim r scripts/bump_version.nim", description = "Bump version number"
 
   build:

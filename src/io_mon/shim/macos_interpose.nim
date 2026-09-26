@@ -1406,7 +1406,11 @@ proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
     return 0
   withShimMuted:
     fragmentDir = getEnv("REPRO_MONITOR_FRAGMENT_DIR")
-    gInterest = parseInterestTokens(getEnv("REPRO_MONITOR_INTEREST"))
+    # `shimInterestFromEnv`, not `parseInterestTokens`: a value naming nothing
+    # this build knows is read as "capture everything" rather than "capture
+    # nothing". The shim has no way to refuse, and only one of the two readings
+    # can be wrong in a direction the host filter cannot undo.
+    gInterest = shimInterestFromEnv(getEnv("REPRO_MONITOR_INTEREST"))
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))
     # ROUND-2 R8 — capture the invocation run id for report authentication.
@@ -4004,7 +4008,18 @@ proc repro_hook_posix_spawn*(pid: ptr PidT; path: cstring;
       attrp, argv, envp, ct_macos_interpose_real_posix_spawn)
   # A POSIX_SPAWN_SETEXEC spawn re-images THIS process and never returns on
   # success — record + flush the exec BEFORE forwarding (break #2).
-  recordSetexecExec(attrp, path)
+  #
+  # Only at the OUTERMOST forward, for the same reason `spawnForward` applies
+  # env-propagation and the SIP rewrite exactly once: `posix_spawnp` reaches
+  # the real implementation through libSystem's internal `posix_spawn`, which
+  # the body patch also intercepts, so one user-level spawn fires both hooks.
+  # Recording in both emitted the identical exec record twice, and a duplicate
+  # is not cosmetic here — T0's coverage check compares exec and start tallies
+  # (`execs >= starts` ⇒ unmonitored subtree), so a fully monitored
+  # `arch -arch arm64 prog` chain came out as execs=3 starts=3 and was reported
+  # as a loss. The subtree was captured; only the arithmetic said otherwise.
+  if inSpawnForward == 0:
+    recordSetexecExec(attrp, path)
   let detail =
     if bodypatchPosixSpawnTramp != nil and inSpawnForward == 0:
       "bodypatch-posix_spawn"
@@ -4023,7 +4038,9 @@ proc repro_hook_posix_spawnp*(pid: ptr PidT; path: cstring;
     # (see `spawnForwardMuted` / `inSpawnForward`).
     return spawnForwardMuted(bodypatchPosixSpawnpTramp, pid, path, fileActions,
       attrp, argv, envp, ct_macos_interpose_real_posix_spawnp)
-  recordSetexecExec(attrp, path)
+  # Outermost only — see the note in `repro_hook_posix_spawn`.
+  if inSpawnForward == 0:
+    recordSetexecExec(attrp, path)
   let detail =
     if bodypatchPosixSpawnpTramp != nil and inSpawnForward == 0:
       "bodypatch-posix_spawnp"

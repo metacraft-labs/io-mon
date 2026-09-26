@@ -45,9 +45,16 @@ import io_mon
 
 const
   MetaKinds = {mrEventLoss, mrBackendProfile, mrCapabilityGap}
-    ## The kinds `categoryOf` answers `none` for. Restated here so the case
-    ## below is an INDEPENDENT statement of what META means rather than a
-    ## tautology over the implementation it is grading.
+    ## The META kinds. Restated here so the case below is an INDEPENDENT
+    ## statement of what META means rather than a tautology over the
+    ## implementation it is grading.
+  UngateableKinds = MetaKinds + {mrIpcConnect, mrExternalContent}
+    ## Every kind `categoryOf` answers `none` for. DA-5 added the two
+    ## COMPLETENESS-BEARING kinds to that answer: `mergeFragments` derives a
+    ## synthetic `mrEventLoss` from them after the shim's gate has run, so a
+    ## narrowing that could suppress either would delete a loss marker one step
+    ## before it existed. This axis inherits their protection from the same
+    ## `categoryOf` guard that protects META.
 
 proc lookupRecord(kind: MonitorRecordKind; obs: MonitorObservationKind;
                   path: string; res: int64;
@@ -201,24 +208,41 @@ suite "io-mon evidence scope predicate (DA-1i)":
     # kinds precisely so a narrowed capture cannot drop an `mrEventLoss` and
     # manufacture a false `mcComplete`; this axis has to hold the same line, and
     # holds it BY CONSTRUCTION — `recordIsFailedExistenceLookup` asks
-    # `categoryOf`, the one definition of what META is, before it looks at
-    # anything else. Asserted rather than relied upon.
+    # `categoryOf`, the one definition of which kinds no narrowing may suppress,
+    # before it looks at anything else. Asserted rather than relied upon.
+    #
+    # DA-5 WIDENED WHAT THAT GUARD COVERS, and the widening is graded here
+    # rather than assumed: `mrIpcConnect` and `mrExternalContent` are now
+    # ungate-able too, because `mergeFragments` DERIVES the synthetic
+    # `mrEventLoss` from them and the gate runs first. Suppressing them is
+    # therefore the same failure as suppressing the marker, one step earlier.
     #
     # EXHAUSTIVE over `MonitorRecordKind`, with ADVERSARIAL field values: every
     # kind is offered the exact shape that makes the three lookup kinds
-    # droppable (`result = -1`, `probeResult = prAbsent`). A META kind that
-    # answered on its fields rather than on its category would fail here.
+    # droppable (`result = -1`, `probeResult = prAbsent`). A kind that answered
+    # on its fields rather than on its category would fail here.
     for kind in MonitorRecordKind:
       let hostile = MonitorRecord(kind: kind, osPid: 1, path: "/nope",
         result: -1, probeResult: prAbsent)
-      if kind in MetaKinds:
+      if kind in UngateableKinds:
         check categoryOf(kind).isNone
         check not recordIsFailedExistenceLookup(hostile)
         check recordInEvidenceScope(esReadsOnly, hostile)
+        # THE OTHER AXIS, same kinds, same line — asserted here so the two
+        # predicates cannot be seen to agree only because nobody checked.
+        # Every interest set there is, including the empty one.
+        for bits in 0'u16 ..< 256'u16:
+          var interest: set[EventCategory] = {}
+          for cat in EventCategory:
+            if (bits and (1'u16 shl uint16(ord(cat)))) != 0: interest.incl(cat)
+          check recordWanted(interest, kind)
       else:
-        # …and the complement is checked too, so "META is never dropped" is not
-        # passing because NOTHING is ever dropped.
+        # …and the complement is checked too, so "ungate-able is never dropped"
+        # is not passing because NOTHING is ever dropped.
         check categoryOf(kind).isSome
+        # There EXISTS an interest set that drops it — which is what gate-able
+        # means, and without this the branch above proves nothing.
+        check not recordWanted(FullInterest - {categoryOf(kind).get}, kind)
 
   test "t_every_record_kind_states_its_own_answer":
     # An anti-vacuity guard on the case above. `MonitorRecordKind` is a wire
@@ -232,7 +256,7 @@ suite "io-mon evidence scope predicate (DA-1i)":
     # And the set really is a proper, non-empty subset — otherwise the equality
     # above would hold for a predicate that is constantly true or false.
     check DroppableWhenFailed.len == 3
-    check MetaKinds * DroppableWhenFailed == {}
+    check UngateableKinds * DroppableWhenFailed == {}
 
   test "t_an_unrecognised_scope_records_everything_rather_than_nothing":
     # `esUnrecognized` cannot reach a gate — it is a READING of a depfile a
@@ -472,12 +496,12 @@ suite "io-mon evidence scope stamp (DA-1i)":
     # able to evaluate each without the other. Conflating them is how a category
     # gate came to be mistaken for a `reads-only` mechanism in the first place.
     let dep = depFileFromRecords(@[
-      profileRecordWith(";interest=file,proc;evidence=reads-only")])
-    check dep.observedInterest == {ecFileDeps, ecProcessTree}
+      profileRecordWith(";interest=file-reads,proc;evidence=reads-only")])
+    check dep.observedInterest == {ecFileReads, ecProcessTree}
     check dep.observedEvidenceScope == esReadsOnly
     check not observedInterestCovers(dep, FullInterest)
     check not observedEvidenceScopeCovers(dep, esFull)
-    check observedInterestCovers(dep, {ecFileDeps})
+    check observedInterestCovers(dep, {ecFileReads})
     check observedEvidenceScopeCovers(dep, esReadsOnly)
 
     # …and narrowing ONE axis leaves the other reading as full, so neither
@@ -618,14 +642,14 @@ suite "io-mon evidence scope: the write side at the library boundary (DA-1i)":
     # on both axes must come back with both readable — an append that clobbered
     # the other's key would make one axis silently read as full.
     let dep = mergeFragments(work, work / "both.iomon",
-      observedInterest = {ecFileDeps},
+      observedInterest = {ecFileReads},
       observedEvidenceScope = esReadsOnly)
     check dep.observedInterestStated
-    check dep.observedInterest == {ecFileDeps}
+    check dep.observedInterest == {ecFileReads}
     check dep.observedEvidenceScopeStated
     check dep.observedEvidenceScope == esReadsOnly
     let onDisk = readMonitorDepFile(work / "both.iomon")
-    check onDisk.observedInterest == {ecFileDeps}
+    check onDisk.observedInterest == {ecFileReads}
     check onDisk.observedEvidenceScope == esReadsOnly
 
 # ---------------------------------------------------------------------------
@@ -692,11 +716,13 @@ const
   CoversCaseAnchor = "  of esUnrecognized: false\n"
     ## `evidenceScopeCovers`' arm.
 
-  CategoryEnumAnchor = "    ecIpc            ## mrIpcConnect"
+  CategoryEnumAnchor = "    ecAmbientReads   ## mrTimeRead, mrSysctlRead."
     ## Where the interest-axis probe's new category goes. `EventCategory` has no
-    ## read-side sentinel, so a new member simply goes last.
+    ## read-side sentinel, so a new member simply goes last. Moved off `ecIpc`
+    ## by DA-5, which retired that category — `mrIpcConnect` is
+    ## completeness-bearing and therefore ungate-able.
 
-  CategoryTokenAnchor = "  of ecIpc: \"ipc\"\n"
+  CategoryTokenAnchor = "  of ecAmbientReads: \"ambient\"\n"
     ## `interestToken`'s last arm.
 
   ProbeProgram = """
@@ -707,7 +733,8 @@ import io_mon/types
 echo evidenceScopeToken(esFull)
 echo $parseEvidenceScopeToken("reads-only")
 echo $evidenceScopeCovers(esFull, esReadsOnly)
-echo interestToTokens({ecFileDeps})
+echo interestToTokens({ecFileReads})
+echo $legacyInterestExpansion(lecFileDeps)
 echo $parseInterestTokens("proc")
 """
 
@@ -752,6 +779,35 @@ proc mutatedCategories(tokenArm: string): string =
     "    ecProvenance     ## PROBE-ONLY, never a member of the shipped enum.\n")
   if tokenArm.len > 0:
     result = spliceOnce(result, CategoryTokenAnchor, tokenArm)
+
+proc swappedLegacyTokens(): string =
+  ## The REAL `types.nim` with the `file` and `nondet` legacy SPELLINGS SWAPPED.
+  ##
+  ## This is the mutation the DA-5 review found the frozen table had no defence
+  ## against, and it is a different shape from every other probe here: it adds
+  ## nothing and removes nothing, so no exhaustive `case` notices, and every
+  ## assertion about the ALIAS EXPANSION is quantified over the legacy category
+  ## and re-derives both sides from this same table — so all of them stay
+  ## satisfied. What it changes is the PAIRING, and the consequence is that every
+  ## depfile ever stamped `interest=file,proc,lib` reads as having observed
+  ## environment reads and entropy while every `interest=nondet` one reads as
+  ## having observed file dependencies. A consumer keyed on observed env reads
+  ## then ACCEPTS a capture that made none — the one mistake this axis has no
+  ## other guard against.
+  const
+    FileArm = "  of lecFileDeps: \"file\"\n"
+    NondetArm = "  of lecNonDeterminism: \"nondet\"\n"
+  result = readFile(TypesSource)
+  let fileCount = result.count(FileArm)
+  let nondetCount = result.count(NondetArm)
+  if fileCount != 1 or nondetCount != 1:
+    raise newException(ValueError,
+      "legacy token arms occur " & $fileCount & " / " & $nondetCount &
+      " times, expected 1 / 1 — the probe would measure nothing")
+  # Through a placeholder, so the second replace cannot re-hit the first's output.
+  result = result.replace(FileArm, "  of lecFileDeps: \"@@swapped@@\"\n")
+  result = result.replace(NondetArm, "  of lecNonDeterminism: \"file\"\n")
+  result = result.replace("\"@@swapped@@\"", "\"nondet\"")
 
 proc compileAgainstTypes(name, typesText: string):
                         tuple[output: string; code: int] =
@@ -895,3 +951,82 @@ suite "io-mon interest: a category with no wire token cannot reach a depfile (DA
     check code != 0
     check "is not wire-safe" in output
     check "ecProvenance" in output
+
+  test "t_a_new_category_reusing_an_existing_token_does_not_compile":
+    # The interest axis's copy of the evidence axis's ARM 4. A duplicate decodes
+    # to the first member holding the token, so one category becomes unsayable
+    # while another silently answers for it.
+    let (output, code) = compileAgainstTypes("cat-duplicate-token",
+      mutatedCategories("  of ecProvenance: \"file-reads\"\n"))
+    checkpoint("cat-duplicate-token: exit " & $code & "\n" & output)
+    check code != 0
+    check "decodes back to" in output
+    check "ecProvenance" in output
+
+  test "t_a_new_category_stealing_a_LEGACY_token_does_not_compile":
+    # DA-5's addition to this construction. A legacy alias (`file`, `nondet`,
+    # `ipc`) is not the token of any CURRENT category, so at first sight a new
+    # category could take one: non-empty, wire-safe, and no current category to
+    # collide with.
+    #
+    # It is nonetheless the alias axis's false-accept shape. Every pre-DA-5
+    # depfile stamped `interest=file` would then read as ALSO declaring the new
+    # category, and a consumer requiring that category would ACCEPT a capture
+    # taken before it existed.
+    #
+    # BOTH HALVES OF THE `static:` BLOCK ARE NEEDED, AND THIS CASE MEASURES
+    # WHICH ONE FIRES FOR WHICH THEFT — a distinction found by running it, not
+    # by reading it:
+    #
+    #   `file`  — the alias expands to three real categories, so the CANONICAL
+    #             round-trip (`parseInterestTokens(token) == {category}`) sees
+    #             four and refuses first. The legacy arm would have refused too.
+    #   `ipc`   — the alias expands to NOTHING, so the canonical round-trip is
+    #             satisfied: `parseInterestTokens("ipc")` really is
+    #             `{ecProvenance}` and nothing else. ONLY the legacy arm catches
+    #             it, by comparing against the expansion derived from the frozen
+    #             kind list. Without that arm this mutation compiles, and every
+    #             old `interest=ipc` stamp starts declaring a category invented
+    #             afterwards.
+    let (fileOut, fileCode) = compileAgainstTypes("cat-steals-file-token",
+      mutatedCategories("  of ecProvenance: \"file\"\n"))
+    checkpoint("cat-steals-file-token: exit " & $fileCode & "\n" & fileOut)
+    check fileCode != 0
+    check "decodes back to" in fileOut
+    check "ecProvenance" in fileOut
+
+    let (ipcOut, ipcCode) = compileAgainstTypes("cat-steals-ipc-token",
+      mutatedCategories("  of ecProvenance: \"ipc\"\n"))
+    checkpoint("cat-steals-ipc-token: exit " & $ipcCode & "\n" & ipcOut)
+    check ipcCode != 0
+    # The LEGACY arm, named: the canonical one is satisfied by this mutation.
+    check "lecIpc" in ipcOut
+    check "decodes to" in ipcOut
+    check "decodes back to" notin ipcOut
+
+  test "t_swapping_two_legacy_spellings_does_not_compile":
+    # THE PAIRING, closed by construction. Everything above grades the alias
+    # EXPANSION; none of it can see a swap of two spellings, because each
+    # assertion re-derives both sides from the swapped table and stays
+    # self-consistent. MEASURED before the fix: this mutation compiled clean on
+    # all four targets and left the `static:` block entirely satisfied, caught
+    # only by hand-written runtime expectations in
+    # `tests/portable/test_io_mon_event_interest.nim`.
+    #
+    # It is closed by pinning each token to the NAMES of the record kinds its
+    # legacy category gated: every shipped token is a case-insensitive substring
+    # of one of its own members' identifiers, and it is the ONLY shipped token
+    # that is — so the witness relation is a bijection and the pairing is the
+    # unique one satisfying it. Any permutation of the five spellings therefore
+    # fails, not just this one.
+    let (output, code) = compileAgainstTypes("legacy-swap", swappedLegacyTokens())
+    checkpoint("legacy-swap: exit " & $code & "\n" & output)
+    check code != 0
+    # …and for the PAIRING reason, naming the category whose token moved. Not the
+    # expansion assertions — those are exactly what this mutation satisfies, so
+    # seeing their message here would mean the case is passing for the wrong
+    # reason and the hole is still open.
+    check "is paired with the wire token" in output
+    check "lecFileDeps" in output
+    check "WIDENS every stamp" notin output
+    check "not the image of its record" notin output

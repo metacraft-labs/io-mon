@@ -1399,7 +1399,9 @@ proc precomputeSigSafeCommittedFrame(slot: var FragmentSlot) =
     putByte(byte((v shr 56) and 0xFF'u64))
   # Frame length prefix.
   putU32Le(uint32(payloadLen))
-  # Record header — MUST match encodeRecordPayload / appendFragmentRecord.
+  # Record header — MUST match `encode.storeRecordFixedHeader`'s `Off*` layout
+  # (DA-1c moved the field order out of `encodeRecordPayload`'s statement order
+  # and into named offsets; the bytes are unchanged) / appendFragmentRecord.
   putU16Le(uint16(ord(mrEventLoss)))
   putU16Le(uint16(ord(moEventLoss)))
   putU64Le(0'u64)                          # seq
@@ -1681,7 +1683,9 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
 
   # Frame length prefix.
   putU32Le(uint32(payloadLen))
-  # Record header — order MUST match encodeRecordPayload exactly.
+  # Record header — order MUST match `encode.storeRecordFixedHeader`'s `Off*`
+  # layout exactly (DA-1c moved the field order out of `encodeRecordPayload`'s
+  # statement order and into named offsets; the bytes are unchanged).
   putU16Le(uint16(ord(record.kind)))
   putU16Le(uint16(ord(record.observationKind)))
   putU64Le(record.seq)
@@ -1969,6 +1973,7 @@ proc unmonitoredSubtreeLossDetails*(records: openArray[MonitorRecord];
   var startCount = initCountTable[uint64]()
   var execCount = initCountTable[uint64]()
   var execFailedCount = initCountTable[uint64]()
+  var lastExecPath = initTable[uint64, string]()
   for r in records:
     case r.kind
     of mrProcessStart:
@@ -1989,6 +1994,16 @@ proc unmonitoredSubtreeLossDetails*(records: openArray[MonitorRecord];
         execFailedCount.inc r.osPid
       else:
         execCount.inc r.osPid
+        # The image the pid last exec'd SUCCESSFULLY. When signal (b) trips
+        # below, this is the binary that swallowed the subtree — the single
+        # most useful fact about the loss, and the one a consumer previously
+        # had to reconstruct by hand from the pid. (Measured cost of not
+        # carrying it: reading a 57k-record depfile and cross-referencing
+        # pids to learn that a dev-env activation was uncacheable because
+        # `/usr/bin/cc` is SIP-protected.) Overwritten on each exec so the
+        # LAST one wins, which is the one the invariant is about.
+        if r.path.len > 0:
+          lastExecPath[r.osPid] = r.path
     else: discard
   result = @[]
   # (a) spawned children with no matching process-start (count each child once).
@@ -2095,8 +2110,13 @@ proc unmonitoredSubtreeLossDetails*(records: openArray[MonitorRecord];
       continue
     let starts = startCount.getOrDefault(pid)
     if effectiveExecs >= starts:
+      # Name the image, not just the pid. The pid is dead by the time anyone
+      # reads this; the path is what the operator can act on (provision a
+      # non-SIP build of it, or accept that this action cannot be cached).
+      let image = lastExecPath.getOrDefault(pid)
+      let imageNote = if image.len > 0: " image=" & image else: ""
       result.add("exec without post-exec process-start pid=" & $pid &
-        " execs=" & $effectiveExecs & " starts=" & $starts)
+        " execs=" & $effectiveExecs & " starts=" & $starts & imageNote)
   # (c) IPC-connect to an out-of-tree / opaque / un-reported peer (break #1).
   # Dedup so a client that connects to the same daemon many times counts once:
   # key on the peer pid when known, else on the destination (an unknown-peer
