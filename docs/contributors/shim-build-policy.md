@@ -15,8 +15,11 @@ concrete choices and the reasoning.
 
 ## Build settings
 
-The shim is built (see `scripts/build_shim.sh` and
-`src/io_mon/shim/macos_interpose.nim.cfg`) with:
+The shim is built (see `scripts/build_shim.sh`,
+`src/io_mon/shim/macos_interpose.nim.cfg` and
+`src/io_mon/shim/windows_interpose.nim.cfg`) with the settings below. On
+Windows only `-d:noSignalHandler` is applied through the `.nim.cfg`. The
+Windows build keeps `--mm:orc`, and its trace settings are unchanged.
 
 - `--stackTrace:off --lineTrace:off` — removes the per-proc `framePtr` **threadvar**
   push. A monitor shim never needs Nim stack traces; error context is carried in the
@@ -25,6 +28,12 @@ The shim is built (see `scripts/build_shim.sh` and
   clobbers the host program's own handlers — e.g. rustc installs a `SIGSEGV`
   handler on a sigaltstack for stack-overflow detection, and the Rust/Go runtimes
   rely on theirs. A monitor observes; it does not handle the host's faults.
+  On Windows the Nim handler takes over an injected child's access
+  violations. The child prints `SIGSEGV: Illegal storage access` and exits 1,
+  which hides the real exception and blames Nim in a program (gcc, cc1) that
+  contains none. That is how an injection defect presented on a Windows CI
+  host in 2026-09. `tests/portable/test_shim_signal_handler_policy.nim` pins
+  the define for both shims.
 - `--mm:arc` — deterministic reference counting, no background cycle-collector
   thread; more C-like than `orc`. The shim's data has no reference cycles.
 - `--threads:on` — required: the shim records from every host thread.
