@@ -29,6 +29,7 @@ import io_mon
 when defined(macosx):
   import std/[osproc, streams, strtabs]
   import macos_backend_toggle
+  import build_test_cli
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
@@ -45,11 +46,7 @@ when defined(macosx):
     shim
 
   proc buildCli(): string =
-    let (output, code) = execCmdEx("cd " & quoteShell(repoRoot) &
-      " && nimble buildSnoop")
-    let cli = repoRoot / "build" / "bin" / "io-mon"
-    doAssert fileExists(cli), "io-mon CLI not produced: " & output
-    cli
+    buildTestCli(repoRoot)
 
   proc ccExe(src, outBin: string) =
     let cc = getEnv("CC", "cc")
