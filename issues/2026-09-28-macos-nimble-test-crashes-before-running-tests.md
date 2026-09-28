@@ -26,7 +26,12 @@ must execute them or report an actionable setup failure.
 [Native macOS Nix test job at 0d636e2](https://github.com/metacraft-labs/io-mon/actions/runs/36378715964/job/108789783089).
 The same immediate Nimble crash was seen locally during release preparation.
 The release changes did not introduce the manifest's version expression;
-`origin/dev` has the same expression. The precise crash cause remains unknown.
+`origin/dev` has the same expression. LLDB reproduced the crash at `c68fb31`: Nimble passes a TLS method from
+macOS `libssl.43.dylib` (LibreSSL) to Nix OpenSSL 3's `SSL_CTX_new_ex`.
+The Nim binding dynamically resolves methods as well as linking OpenSSL.
+The development shell now compiles Nimble with `-d:sslVersion=3`, so both
+paths resolve the same ABI. The unmodified portable test task completes
+with this override; full native suite verification follows.
 
 Refreshed `origin/dev` (`279a17b`) and searched open issues and issue history
 for Nimble crashes before recording. Preserve the full suite when repairing

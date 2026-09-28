@@ -42,6 +42,13 @@
         { pkgs, config, ... }:
         let
           version = builtins.replaceStrings [ "\n" "\r" ] [ "" "" ] (builtins.readFile ./version.txt);
+          # Nimble 0.20.1 dynamically looks up TLS methods as well as linking
+          # OpenSSL. On Darwin its unconstrained lookup finds system LibreSSL,
+          # then passes that library's method to OpenSSL 3 and crashes before
+          # executing a task. Bind both lookups to the Nix OpenSSL ABI.
+          nimble = pkgs.nimble.overrideAttrs (old: {
+            nimFlags = (old.nimFlags or [ ]) ++ [ "-d:sslVersion=3" ];
+          });
         in
         {
           pre-commit.settings.hooks = {
@@ -123,7 +130,7 @@
             packages = [
               pkgs.just
               pkgs.nim2
-              pkgs.nimble
+              nimble
               pkgs.git
               pkgs.nixfmt
               pkgs.nodejs
