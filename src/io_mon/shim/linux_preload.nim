@@ -137,9 +137,10 @@ var
   # `gettid(2)` are un-cached raw syscalls in glibc (since 2.25) / musl, so
   # a recorder-heavy workload (the BEAM VM emitting a record per port write)
   # pays THREE extra syscalls per record. pid/ppid are process-constant and
-  # tid is thread-constant for a thread's whole lifetime; the only event
-  # that invalidates them is `fork`, after which the pthread_atfork CHILD
-  # handler (`repro_linux_atfork_child`) resets the caches. A sentinel of 0
+  # tid is thread-constant for a thread's whole lifetime. After `fork`, the
+  # pthread_atfork CHILD handler (`repro_linux_atfork_child`) resets them.
+  # Exec records sample live identities instead: a vfork child shares these
+  # caches with its parent and does not run the atfork handlers. A sentinel of 0
   # means "unset"; a real pid/tid is always > 0, so 0 unambiguously forces a
   # first fetch. The recorded VALUES are byte-identical to the un-cached path
   # — this is a pure syscall-count reduction, not a semantic change.
@@ -926,14 +927,22 @@ proc sampleKillDiagArgvOnce() {.raises: [].} =
 
 proc baseRecord(kind: MonitorRecordKind;
                 observationKind: MonitorObservationKind): MonitorRecord =
-  MonitorRecord(
+  result = MonitorRecord(
     kind: kind,
     observationKind: observationKind,
     seq: processSeq(),
-    osPid: currentPid(),
-    parentOsPid: currentPpid(),
-    threadId: currentThreadId(),
     probeResult: prUnknown)
+  if kind == mrProcessExec:
+    # vfork shares the suspended parent's TLS and skips pthread_atfork.
+    # Attribute both exec attempts and failures to the actual caller without
+    # overwriting caches the parent will reuse when the child execs or exits.
+    result.osPid = uint64(c_getpid())
+    result.parentOsPid = uint64(c_getppid())
+    result.threadId = uint64(c_gettid())
+  else:
+    result.osPid = currentPid()
+    result.parentOsPid = currentPpid()
+    result.threadId = currentThreadId()
 
 proc stampRunId(record: var MonitorRecord) {.raises: [].} =
   ## Scope Linux records to the launcher's run id so reused fragment directories

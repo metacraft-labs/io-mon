@@ -40,6 +40,11 @@
 ##    point turns this arm red and leaves the inheritance arm green — which is
 ##    precisely the distinction being pinned.
 ##
+## A third test calls real vfork, attempts a failed exec, then execs the reader.
+## It checks the child's live identities and the resumed parent's write identity.
+## This catches a child borrowing cached parent IDs without changing completeness
+## accounting. All probes use real processes, files and compilers; no mocks.
+##
 ## The second arm drops ONLY `LD_PRELOAD` and preserves the rest of the
 ## environment on purpose. Wiping the whole environment would also remove
 ## `REPRO_MONITOR_DEP_SHM`, and the child would then fail to attach the set and
@@ -251,3 +256,67 @@ int main(int argc, char **argv) {
     check not depFileB.records.anyIt(it.kind == mrEventLoss)
     check depFileB.records.anyIt(
       it.kind == mrProcessExec and reader in it.path and it.osPid != 0'u64)
+
+  test "vfork_exec_uses_child_identity_without_changing_parent_cache":
+    let snoopBin = ensureSnoop(work)
+    let shimLib = ensureShim()
+    let reader = buildC(work, "vfork_reader", readerSrc)
+    let launcher = buildC(work, "vfork_launcher", """
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  if (argc != 5) return 10;
+  pid_t child = vfork();
+  if (child < 0) return 11;
+  if (child == 0) {
+    execl(argv[4], argv[4], (char *)0);
+    execl(argv[1], argv[1], argv[2], (char *)0);
+    _exit(12);
+  }
+  int status = 0;
+  while (waitpid(child, &status, 0) < 0) {
+    if (errno != EINTR) return 13;
+  }
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 14;
+  int fd = open(argv[3], O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0 || write(fd, "p", 1) != 1) return 15;
+  close(fd);
+  printf("vfork-parent=%ld vfork-child=%ld\n", (long)getpid(), (long)child);
+  return 0;
+}
+""")
+    let marker = work / "vfork-marker.txt"
+    let parentMarker = work / "vfork-parent.txt"
+    let missing = work / "absent-vfork-program"
+    writeFile(marker, "vfork reader payload\n")
+    require not fileExists(missing)
+    let depfile = work / "vfork.iomon"
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--",
+      launcher, reader, marker, parentMarker, missing], childEnvWith(shimLib))
+    checkpoint(cap.output)
+    require cap.code == 0
+    var parentPid, childPid: uint64
+    for field in cap.output.splitWhitespace():
+      if field.startsWith("vfork-parent="):
+        parentPid = parseBiggestUInt(field.split('=')[1])
+      elif field.startsWith("vfork-child="):
+        childPid = parseBiggestUInt(field.split('=')[1])
+    require parentPid != 0 and childPid != 0 and parentPid != childPid
+    let vforkDep = readMonitorDepFile(depfile)
+    for record in vforkDep.records:
+      if record.kind in {mrProcessExec, mrEventLoss}:
+        checkpoint($record)
+    check vforkDep.completeness == mcComplete
+    check not vforkDep.records.anyIt(it.kind == mrEventLoss)
+    check hasFileRead(vforkDep, marker)
+    let execs = vforkDep.records.filterIt(it.kind == mrProcessExec)
+    require execs.anyIt(it.path == reader)
+    require execs.anyIt(it.path == missing and "execstatus=failed" in it.detail)
+    check execs.allIt(it.osPid == childPid and it.parentOsPid == parentPid and
+      it.threadId == childPid)
+    check vforkDep.records.anyIt(it.kind == mrFileWrite and
+      it.path == parentMarker and it.osPid == parentPid)
