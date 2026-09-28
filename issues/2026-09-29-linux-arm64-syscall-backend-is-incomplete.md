@@ -26,8 +26,11 @@ Source inspection finds two independent architecture assumptions:
   patching depend on that substrate. Initialization records those unavailable
   mechanisms as event loss, making ordinary ARM64 captures incomplete.
 
-The precise records behind each failing case are being collected. Do not
-attribute all 31 failures to one cause or remove the completeness assertions.
+The preserved stdio, relative-write and raw-syscall captures from diagnostic
+`36490110117` all contain both unsupported-architecture loss records. The
+raw-syscall capture omits the expected file. The same three cases pass on
+x86_64 at `4f467a0`. Do not attribute all 31 failures to one cause or remove
+the completeness assertions.
 
 ## Expected
 
@@ -69,3 +72,9 @@ unavailable scan=unsupported-architecture`. A successful child exit does not
 mean that capture is complete. Linux's [generic syscall ABI](https://github.com/torvalds/linux/blob/master/include/uapi/asm-generic/unistd.h)
 assigns ARM64 `getcwd` 17, `openat` 56 and `read` 63; the unconditional
 x86_64 constants in the shim differ.
+
+The release smoke test at `6a0a2f7` checked the child's exit status and the
+presence of input/output paths, but never checked completeness or event loss.
+It therefore accepted the earlier ARM64 archive despite this backend gap.
+The release gate must reject incomplete captures and any event-loss record,
+in addition to retaining its real file and child-exit assertions.

@@ -77,6 +77,8 @@ const decoded = cp.execFileSync(exe, ["inspect", depfile, "--format", "json"], {
   encoding: "utf8",
   timeout: 30000,
 });
-JSON.parse(decoded);
+const evidence = JSON.parse(decoded);
+assert.equal(evidence.completeness, "mcComplete", decoded);
+assert.equal(evidence.summary.eventLossCount, 0, decoded);
 assert(decoded.includes("release-probe-input.txt"), decoded);
 assert(decoded.includes("release-probe-output.txt"), decoded);
