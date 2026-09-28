@@ -62,4 +62,11 @@ The recipe repair isolates these five execution edges using the existing
 generated-depfile policy, suppresses the outer shim seed, and marks them
 non-cacheable. Their compiles and all other tests retain normal monitoring.
 CI repeats the five after the complete suite and checks the real execution
-report to prove they launched and passed again. Windows execution is pending.
+report to prove they launched and passed again.
+
+At `de755e5`, job `109087128933` passes the complete Reprobuild test graph.
+The repeat executes all five again, but the plain spawn-resume probe fails
+with `LoadLibraryW in child returned NULL (err=0)`. The other four programs and
+the remaining three spawn-resume cases pass. The failed edge is explicitly
+`cdNotCacheable`. Keep the repeat gate; diagnose the child loader result
+before changing runtime behavior or attributing this intermittent failure.
