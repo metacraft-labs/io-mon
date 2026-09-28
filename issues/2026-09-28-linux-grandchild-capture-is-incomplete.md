@@ -31,3 +31,18 @@ the suite reaches Linux-specific coverage before this failure.
 
 Synced `origin/dev` and `origin/agents`; searched current issues and issue
 history for propagation, grandchild loss and the failing case before filing.
+
+## Diagnosis and repair plan
+
+Focused run `36441926922` at `cba489f` plus diagnostic logging records root
+PID 5068, child shell 5069 and reader 5070. The child's `/bin/sh` exec is
+attributed to 5068, and the reader exec to 5069. The resulting root exec/start
+counts (1/1) falsely signal a missing post-exec start.
+
+The Linux shim caches PID/PPID/TID and clears them in `pthread_atfork`, but
+`vfork` shares the parent's TLS and does not run those handlers. Sample live
+kernel identities for successful and failed exec records without overwriting
+the suspended parent's caches. Keep the cached file-event path and the
+completeness rules unchanged. Add an explicit real `vfork`/failed-exec/exec
+regression that verifies the child's exec identities and the resumed parent's
+file-write identity, then rerun propagation and the full Linux suite.
