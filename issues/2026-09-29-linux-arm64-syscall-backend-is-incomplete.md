@@ -53,3 +53,19 @@ Downloaded ARM64 evidence: `/tmp/io-mon-4f4-arm-diagnostics/stdio-ipc.log`.
 Refreshed dev `279a17b`; searched current and deleted issues for ARM64 raw
 syscalls and unsupported architectures. The earlier inline-assembly fixture
 issue covers its missing test guard only, not this backend gap.
+
+## Full graph and captured loss evidence
+
+At `0f3a186`, the full Linux ARM64 Reprobuild graph completes all 120 actions
+in job `109147056449`. The mapping-policy execution passes all ten cases;
+23 other execution actions fail. The policy extraction therefore resolves
+the previous stuck action, while exposing the remaining backend/fixture gaps.
+The job artifacts include per-action stdout/stderr and the failure report.
+
+The ARM64 predicate capture from diagnostic `36489454773` contains explicit
+loss records for `linux raw-syscall wrapper patch unavailable
+diagnostic=unsupported-architecture` and `linux inline raw-syscall scanner
+unavailable scan=unsupported-architecture`. A successful child exit does not
+mean that capture is complete. Linux's [generic syscall ABI](https://github.com/torvalds/linux/blob/master/include/uapi/asm-generic/unistd.h)
+assigns ARM64 `getcwd` 17, `openat` 56 and `read` 63; the unconditional
+x86_64 constants in the shim differ.
