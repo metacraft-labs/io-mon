@@ -69,6 +69,7 @@ import std/[algorithm, os, strutils]
 
 import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
+import repro_dsl_stdlib/fs as dslfs
 import repro_dsl_stdlib/packages/sh
 # NOTE: ``repro_dsl_stdlib/packages/nim`` is deliberately NOT imported here.
 # The ``package`` macro's ``usesImportCode`` pass auto-imports it ``as
@@ -220,6 +221,7 @@ package io_mon:
 
     var testBuildActions: seq[BuildActionDef] = @[]
     var testExecuteActions: seq[BuildActionDef] = @[]
+    var isolatedTestActions: seq[BuildActionDef] = @[]
 
     proc emitTestPair(source, binary: string;
                       buildActions, executeActions: var seq[BuildActionDef]) =
@@ -243,11 +245,45 @@ package io_mon:
       appendRegisteredActionToolIdentityRefs(edge.action.id, [backendCompiler])
       buildActions.add(edge.action)
 
+      # These Windows tests install their own hooks or deliberately select
+      # an inert/slow DLL. An outer injected shim changes that premise (the
+      # inert root unexpectedly reports complete evidence) and interferes with
+      # the parked main thread used by the inner injector. All five pass
+      # directly at 303e1ef and fail under Reprobuild's monitor at that SHA.
+      #
+      # Keep their compilation monitored and execute every assertion. The
+      # generated depfile orders the known artifacts but does not discover all
+      # runtime reads, so these execute edges MUST remain non-cacheable.
+      # Monitor-Hook-Shim.md / Failure Semantics permits this disposition.
+      let isolatesMonitor = defined(windows) and source.extractFilename in [
+        "test_io_mon_windows_host_session_scope.nim",
+        "test_io_mon_windows_read_capture.nim",
+        "test_io_mon_windows_root_guard.nim",
+        "test_io_mon_windows_spawn_abandoned_injection.nim",
+        "test_io_mon_windows_spawn_resume_invariant.nim"]
+      var executeAfter: seq[BuildActionDef] = @[]
+      var executePolicy = automaticMonitorPolicy()
+      if isolatesMonitor:
+        let depfile = "build/test-deps/" & stem & ".d"
+        let depfileEdge = dslfs.unmonitorableActionDepfile(
+          output = depfile,
+          inputs = @[binary, cliOutput, shimOutput],
+          reason = "Windows injection test owns its hooks and DLL selection; " &
+            "an outer shim changes the experiment. Execution always reruns.",
+          actionId = "io-mon.test_dependencies." & stem)
+        buildActions.add(depfileEdge)
+        executeAfter.add(depfileEdge)
+        executePolicy = makeDepfilePolicy(depfile, suppressMonitorShimSeed = true)
       let executeEdge = edge.testBinary.run(
         actionId = "io-mon.test_execute." & stem,
         requiredBinaries = @[cliOutput],
         extraInputs = @[shimOutput],
+        after = executeAfter,
+        cacheable = not isolatesMonitor,
+        dependencyPolicy = executePolicy,
         registerImplicitName = false)
+      if isolatesMonitor:
+        isolatedTestActions.add(executeEdge)
       # Tests compile real child programs and shims, including shell fixtures.
       appendRegisteredActionToolIdentityRefs(executeEdge.id,
         ["nim", backendCompiler, "sh", "bash", "mkdir"])
@@ -301,4 +337,6 @@ package io_mon:
         emitTestPair(spec.source, spec.binary, testBuildActions, testExecuteActions)
 
     discard collect("test", testExecuteActions)
+    when defined(windows):
+      discard collect("test-monitor-isolation", isolatedTestActions)
     discard collect("test-builds", testBuildActions)

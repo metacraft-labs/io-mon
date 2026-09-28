@@ -51,3 +51,15 @@ CRLF before recording.
 At `1cabd874115573fce23e7533b1a4b33d515afc1e`, [job 109054198659](https://github.com/metacraft-labs/io-mon/actions/runs/36459498969/job/109054198659) passes 41 of 42 programs directly, including all native injection, root-guard, child-termination and host-session tests. The remaining eight assertions are in the evidence-scope compiler diagnostic reader: `Stream.readAll` stops on the first short Windows pipe read, retaining only `stack trace: (most recent call last)`.
 
 Drain the pipe to EOF and keep every exact rejection assertion and both successful-compilation controls. This direct result does not yet clear the nested Reprobuild execution failures.
+
+At `303e1ef`, direct job `109065572161` passes all 368 assertions in the
+complete 42-program Windows catalog. Reprobuild job `109066010867` at the same
+product SHA fails host-session scope, read capture, root guard, abandoned
+injection and resume invariant. The outer shim supplies hooks even when the
+inner root-guard fixture chooses inert `kernel32.dll`.
+
+The recipe repair isolates these five execution edges using the existing
+generated-depfile policy, suppresses the outer shim seed, and marks them
+non-cacheable. Their compiles and all other tests retain normal monitoring.
+CI repeats the five after the complete suite and checks the real execution
+report to prove they launched and passed again. Windows execution is pending.

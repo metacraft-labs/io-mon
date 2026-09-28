@@ -82,17 +82,17 @@ jobs:
         # revisions before materialising the env. Those two are io-mon's
         # `uses:` library producers in repro.nim; reprobuild builds each
         # from source and threads their `src/` roots onto io-mon's compile.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@74c02a377baa8d55947c496df8a2da85ad11f4a8
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@b4b1ae1e33c7384cb046f35030b19875a19f8a3c
         with:
           env-flavor: reprobuild
           # Exercise the published bootstrap repairs before a new CLI release.
           # Windows ARM64 keeps the existing emulated x64 Reprobuild tools.
           repro-from-source: true
-          repro-build-pin: 4adfd0e7302082989775da840998043582c9a439
+          repro-build-pin: 90dc43218b00f2a1a7de94c174fb849f21b3a377
           gh-token: ${{ steps.ci_token.outputs.token }}
 
       - name: Refresh authentication before repro build
-        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bf8a7f7d9d74967b536c903f8ca12ab78256af8b
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bcd29c631ff01fbd0e577c5f96e5f9d5211fed26
         with:
           app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
@@ -106,7 +106,7 @@ jobs:
         run: dev-exec repro build
 
       - name: Refresh authentication before repro test
-        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bf8a7f7d9d74967b536c903f8ca12ab78256af8b
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bcd29c631ff01fbd0e577c5f96e5f9d5211fed26
         with:
           app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
@@ -117,8 +117,24 @@ jobs:
         # io-mon suites).
         run: dev-exec repro test
 
+      - name: Verify isolated Windows tests execute again
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          dev-exec repro build .#test-monitor-isolation --write-report=build/monitor-isolation-repeat.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $report = Get-Content build/monitor-isolation-repeat.json -Raw | ConvertFrom-Json
+          $runs = @($report.actions | Where-Object { $_.id -like 'io-mon.test_execute.*' })
+          if ($runs.Count -ne 5) { throw "Expected all five isolated test programs" }
+          foreach ($run in $runs) {
+            if (-not $run.launched -or $run.status -ne 'asSucceeded' -or $run.exitCode -ne 0) {
+              throw "Test did not execute successfully again: $($run.id)"
+            }
+            Write-Host "Executed again: $($run.id)"
+          }
+
       - name: Refresh authentication before just build (cross-check)
-        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bf8a7f7d9d74967b536c903f8ca12ab78256af8b
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bcd29c631ff01fbd0e577c5f96e5f9d5211fed26
         with:
           app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
@@ -131,7 +147,7 @@ jobs:
         run: dev-exec just build
 
       - name: Refresh authentication before just test (cross-check)
-        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bf8a7f7d9d74967b536c903f8ca12ab78256af8b
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bcd29c631ff01fbd0e577c5f96e5f9d5211fed26
         with:
           app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
