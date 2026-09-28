@@ -44,14 +44,10 @@ when defined(macosx):
   import io_mon/writer
   import macos_backend_toggle  # applyMacosBackendToggle (A/B → debug toggles)
 
+  from build_test_shim import buildPrivateMacosShim
+
   proc buildShim(): string =
-    let (output, code) = execCmdEx("bash " &
-      quoteShell(repoRoot / "scripts" / "build_shim.sh"))
-    if code != 0:
-      raise newException(IOError, "build_shim.sh failed: " & output)
-    let shim = repoRoot / "build" / "lib" / "librepro_monitor_shim.dylib"
-    doAssert fileExists(shim), "shim not produced at " & shim
-    shim
+    buildPrivateMacosShim(repoRoot)
 
   proc compileThreadedProbe(work: string): tuple[bin, parentOut, childOut: string] =
     ## Compile a probe that writes a tagged file from the main thread and another

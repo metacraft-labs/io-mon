@@ -78,15 +78,10 @@ const
   sipReadTarget = "/etc/services"
 
 when defined(macosx):
+  from build_test_shim import buildPrivateMacosShim
+
   proc buildShim(): string =
-    ## Build the fat (arm64+arm64e) shim and return its path. Fails loudly.
-    let (output, code) = execCmdEx("bash " &
-      quoteShell(repoRoot / "scripts" / "build_shim.sh"))
-    if code != 0:
-      raise newException(IOError, "build_shim.sh failed: " & output)
-    let shim = repoRoot / "build" / "lib" / "librepro_monitor_shim.dylib"
-    doAssert fileExists(shim), "shim not produced at " & shim
-    shim
+    buildPrivateMacosShim(repoRoot)
 
   proc buildSandboxBundle(dest: string): string =
     ## Resolve the NON-SIP drop-in bundle the SIP-child test redirects to.

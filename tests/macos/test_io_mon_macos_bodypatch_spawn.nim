@@ -66,15 +66,10 @@ const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
 
 when defined(macosx):
+  from build_test_shim import buildPrivateMacosShim
+
   proc buildShim(): string =
-    ## Build the fat (arm64+arm64e) shim and return its path. Fails loudly.
-    let (output, code) = execCmdEx("bash " &
-      quoteShell(repoRoot / "scripts" / "build_shim.sh"))
-    if code != 0:
-      raise newException(IOError, "build_shim.sh failed: " & output)
-    let shim = repoRoot / "build" / "lib" / "librepro_monitor_shim.dylib"
-    doAssert fileExists(shim), "shim not produced at " & shim
-    shim
+    buildPrivateMacosShim(repoRoot)
 
   proc cc(args: string) =
     ## Compile a C artifact for this host's primary arm64 slice. Fails loudly.
