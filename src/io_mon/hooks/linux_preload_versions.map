@@ -3,7 +3,12 @@ GLIBC_2.2.5 {
     dlsym;
 };
 
-GLIBC_2.34 {
+GLIBC_2.17 {
   global:
     dlsym;
 } GLIBC_2.2.5;
+
+GLIBC_2.34 {
+  global:
+    dlsym;
+} GLIBC_2.17;

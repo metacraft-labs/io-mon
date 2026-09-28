@@ -2106,13 +2106,22 @@ int ct_linux_library_scan(ct_ll_sink_fn sink, char *reason,
   return ct_ll_snap.count;
 }
 
+#if defined(__aarch64__)
+#define CT_DLSYM_GLIBC_BASE "GLIBC_2.17"
+#else
+#define CT_DLSYM_GLIBC_BASE "GLIBC_2.2.5"
+#endif
+
 void *ct_linux_preload_real_dlsym(void *handle, char *name) {
 #ifdef __GLIBC__
   if (real_dlsym_ptr == NULL)
-    real_dlsym_ptr = (ct_dlsym_real_fn)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
-#endif
+    real_dlsym_ptr = (ct_dlsym_real_fn)dlvsym(RTLD_NEXT, "dlsym", CT_DLSYM_GLIBC_BASE);
+  /* Never retry through ct_resolve on glibc: that calls our interposed
+   * dlsym again. ARM64's baseline is 2.17, not x86_64's 2.2.5. */
+#else
   if (real_dlsym_ptr == NULL)
     real_dlsym_ptr = (ct_dlsym_real_fn)ct_resolve("dlsym");
+#endif
   if (real_dlsym_ptr == NULL) { errno = ENOSYS; return NULL; }
   return real_dlsym_ptr(handle, name);
 }
@@ -2639,13 +2648,13 @@ void *ct_linux_preload_public_dlsym(void *handle, const char *name) {
   return CT_CALL_HOOK(ct_dlsym_hook(handle, (char *)name));
 }
 #ifdef __GLIBC__
-void *ct_linux_preload_public_dlsym_glibc_2_2_5(void *handle, const char *name)
+void *ct_linux_preload_public_dlsym_glibc_base(void *handle, const char *name)
     __attribute__((alias("ct_linux_preload_public_dlsym"),
                    visibility("default")));
 void *ct_linux_preload_public_dlsym_glibc_2_34(void *handle, const char *name)
     __attribute__((alias("ct_linux_preload_public_dlsym"),
                    visibility("default")));
-__asm__(".symver ct_linux_preload_public_dlsym_glibc_2_2_5,dlsym@GLIBC_2.2.5");
+__asm__(".symver ct_linux_preload_public_dlsym_glibc_base,dlsym@" CT_DLSYM_GLIBC_BASE);
 __asm__(".symver ct_linux_preload_public_dlsym_glibc_2_34,dlsym@@GLIBC_2.34");
 #else
 void *dlsym(void *handle, const char *name)
