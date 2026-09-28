@@ -77,3 +77,16 @@ The concurrent diagnostic at `de755e5`, shared-actions `7992b87`, job
 The linker fails with permission denied. Its build must use private output
 and compiler-cache directories. Keep the earlier loader NULL issue open until
 the repaired concurrent run and full Reprobuild repeat establish the result.
+
+At `a24739d`, the private fixture shim passes 20 concurrent rounds of all
+five programs (100 successful executions) in job `109108531426`, using the
+same child-loader diagnostic. No NULL load or shared-DLL linker failure was
+observed. The complete Windows Reprobuild repeat still gates promotion.
+
+The same commit passes the complete local macOS graph (179 actions), all 41
+isolated programs on a second actual execution, and the five repaired session
+fixtures with an explicitly unrelated ambient session. Repro executable
+`4adfd0e7`, provider source `90dc4321`, bootstrap shim `de755e5`; evidence is in
+`/tmp/io-mon-isolated-macos-full-fixed.json`,
+`/tmp/io-mon-macos-isolation-repeat.json` and
+`/tmp/io-mon-explicit-session-control.log`.
