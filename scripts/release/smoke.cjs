@@ -37,8 +37,11 @@ const capture = cp.spawnSync(
     env: { ...process.env, REPRO_MONITOR_SHIM_DEBUG_LOG: shimLog },
   },
 );
+// A loader can reject LD_PRELOAD and still run the child successfully. Preserve
+// its diagnostics even when the child returns the expected exit code.
+if (capture.stderr) console.error(capture.stderr);
+if (fs.existsSync(shimLog)) console.error(fs.readFileSync(shimLog, "utf8"));
 if (capture.status !== 7) {
-  if (fs.existsSync(shimLog)) console.error(fs.readFileSync(shimLog, "utf8"));
   if (fs.existsSync(depfile)) {
     const diagnostic = cp.spawnSync(
       exe,
