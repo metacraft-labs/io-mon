@@ -29,16 +29,12 @@
 
 import std/[unittest]
 
-import io_mon/hooks/linux_preload_runtime
+import io_mon/hooks/linux_mapping_policy
 import stackable_hooks/platform/linux_raw_syscalls
 
-# `linux_preload_runtime`'s embedded C block references
-# `repro_linux_sig_safe_flush` from `shim/linux_preload.nim`. Since this
-# unit test only exercises the pure-Nim predicate, provide an empty stub
-# so the link step succeeds without pulling in the full shim assembly.
-{.emit: """
-void repro_linux_sig_safe_flush(void) { }
-""".}
+# No mocks or link-only stubs: test the production mapping policy directly.
+# The runtime imports this same module; libc interposition stays in its own
+# integration tests so the outer build monitor can observe this test normally.
 
 proc mapping(path: string; writable = false; privateMapping = true;
              readable = true; executable = true;
