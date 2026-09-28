@@ -55,6 +55,11 @@ Tests are organized into directories based on their target compatibility:
 | `tests/linux/`    | Linux only   | Live Linux `LD_PRELOAD` testing.                                                                      |
 | `tests/windows/`  | Windows only | Live Windows hook injection testing.                                                                  |
 
+The inline `exit_group` assembly fixture requires Linux x86_64, matching
+`linuxRawSyscallSupported()` and the INT3 backend. It reports an explicit skip
+on other architectures. Linux ARM64 still runs the portable, POSIX and Linux
+file-capture tests; this skip does not claim an ARM64 raw-syscall backend.
+
 ### Run the full suite (Automatic Selection)
 
 Runs the portable tests plus whatever directories match the host operating system:
