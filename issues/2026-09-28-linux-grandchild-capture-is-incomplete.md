@@ -1,11 +1,11 @@
 # Linux grandchild capture is graded incomplete
 
-|             |                                     |
-| ----------- | ----------------------------------- |
-| Status      | open — loss reason not yet recorded |
-| Observed in | io-mon `cba489f`                    |
-| Recorded    | 2026-09-28                          |
-| Area        | Linux descendant propagation        |
+|             |                                                |
+| ----------- | ---------------------------------------------- |
+| Status      | in progress — vfork identity and guard repairs |
+| Observed in | io-mon `cba489f`                               |
+| Recorded    | 2026-09-28                                     |
+| Area        | Linux descendant propagation                   |
 
 ## Observed
 
@@ -46,3 +46,13 @@ the suspended parent's caches. Keep the cached file-event path and the
 completeness rules unchanged. Add an explicit real `vfork`/failed-exec/exec
 regression that verifies the child's exec identities and the resumed parent's
 file-write identity, then rerun propagation and the full Linux suite.
+
+At `3d65deb`, native run `36443250340` passes both original propagation
+tests and the new child's exec identity checks. The resumed parent's write
+is absent. The C preload wrapper raises a thread-local recursion guard
+around exec, but successful exec cannot lower it. With `vfork`, that guard
+is shared with the suspended parent, so it remains raised when the parent
+resumes. Tag exec guards with their owning PID and pre-dispatch depth;
+restore the saved depth on the parent's next hook. Retain suppression
+during libc PATH lookup and restore the previous guard context when exec
+fails. The existing parent-write assertion must pass without weakening it.

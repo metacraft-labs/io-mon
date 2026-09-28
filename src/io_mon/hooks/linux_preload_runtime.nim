@@ -863,6 +863,7 @@ static volatile unsigned long ct_inline_syscall_last_address_value = 0;
 
 extern void *stackable_linux_preload_resolve_next(const char *name);
 extern int stackable_linux_preload_hooks_allowed(void);
+extern int stackable_linux_preload_current_depth(void);
 extern void stackable_linux_preload_enter_hook(void);
 extern void stackable_linux_preload_exit_hook(void);
 /* The raw-syscall / INT3 substrate below lives in nim-stackable-hooks'
@@ -1093,12 +1094,48 @@ int ct_linux_inline_syscall_overflowed(void) {
   return ct_inline_syscall_overflow_value != 0;
 }
 
-#define CT_BYPASS() (!stackable_linux_preload_hooks_allowed())
+/* vfork shares TLS with its suspended parent. A successful exec never returns
+ * through CT_CALL_HOOK, leaving that parent's guard raised. Remember the
+ * guard depth before an exec dispatch and restore it when the parent resumes.
+ * Keep the guard during libc PATH lookup to suppress duplicate exec records.
+ * Only an outstanding exec bracket needs the live PID check. */
+static __thread pid_t ct_exec_guard_pid = 0;
+static __thread int ct_exec_guard_resume_depth = 0;
+
+static void ct_restore_vfork_exec_guard(void) {
+  if (ct_exec_guard_pid != 0 && ct_exec_guard_pid != getpid()) {
+    while (stackable_linux_preload_current_depth() > ct_exec_guard_resume_depth)
+      stackable_linux_preload_exit_hook();
+    ct_exec_guard_pid = 0;
+    ct_exec_guard_resume_depth = 0;
+  }
+}
+
+static int ct_preload_hooks_allowed(void) {
+  ct_restore_vfork_exec_guard();
+  return stackable_linux_preload_hooks_allowed();
+}
+
+#define CT_BYPASS() (!ct_preload_hooks_allowed())
 #define CT_CALL_HOOK(expr) ({ \
   stackable_linux_preload_enter_hook(); \
   __typeof__(expr) _ct_result = (expr); \
   stackable_linux_preload_exit_hook(); \
   _ct_result; \
+})
+
+#define CT_CALL_EXEC_HOOK(expr) ({ \
+  ct_restore_vfork_exec_guard(); \
+  pid_t _ct_previous_exec_pid = ct_exec_guard_pid; \
+  int _ct_previous_exec_depth = ct_exec_guard_resume_depth; \
+  if (ct_exec_guard_pid == 0) { \
+    ct_exec_guard_pid = getpid(); \
+    ct_exec_guard_resume_depth = stackable_linux_preload_current_depth(); \
+  } \
+  __typeof__(expr) _ct_exec_result = CT_CALL_HOOK(expr); \
+  ct_exec_guard_pid = _ct_previous_exec_pid; \
+  ct_exec_guard_resume_depth = _ct_previous_exec_depth; \
+  _ct_exec_result; \
 })
 
 static int ct_starts_with(const char *value, const char *prefix) {
@@ -2799,7 +2836,7 @@ static int ct_linux_preload_dispatch_execve(const char *path,
                                             char *const envp[]) {
   if (CT_BYPASS() || ct_execve_hook == NULL)
     return ct_linux_preload_real_execve((char *)path, (char **)argv, (char **)envp);
-  return CT_CALL_HOOK(ct_execve_hook((char *)path, (char **)argv, (char **)envp));
+  return CT_CALL_EXEC_HOOK(ct_execve_hook((char *)path, (char **)argv, (char **)envp));
 }
 
 int execve(const char *path, char *const argv[], char *const envp[])
@@ -2907,11 +2944,8 @@ static int ct_linux_preload_dispatch_execvp(const char *file,
    * real_execvp call so those internal execve interposers see
    * CT_BYPASS() and delegate straight to real_execve without
    * re-emitting the hook. */
-  CT_CALL_HOOK(ct_execve_hook((char *)file, (char **)argv, environ));
-  stackable_linux_preload_enter_hook();
-  int rc = ct_linux_preload_real_execvp((char *)file, (char **)argv);
-  stackable_linux_preload_exit_hook();
-  return rc;
+  CT_CALL_EXEC_HOOK(ct_execve_hook((char *)file, (char **)argv, environ));
+  return CT_CALL_EXEC_HOOK(ct_linux_preload_real_execvp((char *)file, (char **)argv));
 }
 
 static int ct_linux_preload_dispatch_execvpe(const char *file,
@@ -2920,14 +2954,11 @@ static int ct_linux_preload_dispatch_execvpe(const char *file,
   if (CT_BYPASS() || ct_execve_hook == NULL)
     return ct_linux_preload_real_execvpe((char *)file, (char **)argv,
                                           (char **)envp);
-  CT_CALL_HOOK(ct_execve_hook((char *)file, (char **)argv,
+  CT_CALL_EXEC_HOOK(ct_execve_hook((char *)file, (char **)argv,
                               (char **)envp));
   /* M9.R.66.2: same PATH-lookup double-count guard as dispatch_execvp. */
-  stackable_linux_preload_enter_hook();
-  int rc = ct_linux_preload_real_execvpe((char *)file, (char **)argv,
-                                          (char **)envp);
-  stackable_linux_preload_exit_hook();
-  return rc;
+  return CT_CALL_EXEC_HOOK(ct_linux_preload_real_execvpe((char *)file, (char **)argv,
+                                          (char **)envp));
 }
 
 static int ct_linux_preload_dispatch_fexecve(int fd,
@@ -2941,14 +2972,11 @@ static int ct_linux_preload_dispatch_fexecve(int fd,
    * (better than skipping the flush entirely).  The child image is
    * determined by the fd, so callers using fexecve accept the same
    * ambiguity. */
-  CT_CALL_HOOK(ct_execve_hook("", (char **)argv, (char **)envp));
+  CT_CALL_EXEC_HOOK(ct_execve_hook("", (char **)argv, (char **)envp));
   /* M9.R.66.2: same double-count guard.  glibc's fexecve is a thin
    * wrapper around execve on /proc/self/fd/<fd>, so the same
    * PATH-lookup double-emission would happen without the bracket. */
-  stackable_linux_preload_enter_hook();
-  int rc = ct_linux_preload_real_fexecve(fd, (char **)argv, (char **)envp);
-  stackable_linux_preload_exit_hook();
-  return rc;
+  return CT_CALL_EXEC_HOOK(ct_linux_preload_real_fexecve(fd, (char **)argv, (char **)envp));
 }
 
 int execvp(const char *file, char *const argv[])
