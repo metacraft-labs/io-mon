@@ -18,13 +18,14 @@
     },
     {
       "id": "linux-aarch64",
-      "runner": ["self-hosted", "linux", "arm64"],
+      "runner": "eph-linux-arm64",
       "assets": [
         "{product}-{version}-linux-aarch64.tar.gz",
         "{product}-{version}-linux-aarch64.json",
         "metacraft-io-mon_{version}-1_arm64.deb",
         "metacraft-io-mon-{version}-1.aarch64.rpm"
-      ]
+      ],
+      "runnerReason": "Temporary route through the live m3 scale set; central Tart pool cannot drive this backend (infra 5878095c, central-garm.nix)."
     },
     {
       "id": "darwin-aarch64",
@@ -41,14 +42,7 @@
         "{product}-{version}-windows-x86_64.zip",
         "{product}-{version}-windows-x86_64.json"
       ]
-    },
-    {
-      "id": "windows-aarch64",
-      "runner": ["self-hosted", "windows", "arm64"],
-      "assets": [
-        "{product}-{version}-windows-aarch64.zip",
-        "{product}-{version}-windows-aarch64.json"
-      ]
     }
-  ]
+  ],
+  "unsignedReleaseVersion": "0.1.0"
 }
