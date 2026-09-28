@@ -39,7 +39,7 @@
 ## Assertion helpers are `template`s, never `proc`s: a `check` inside a plain
 ## `proc` prints "Check failed" and the enclosing test still reports `[OK]`.
 
-import std/[options, os, osproc, streams, strutils, unittest]
+import std/[options, os, osproc, strutils, unittest]
 
 import io_mon
 
@@ -833,7 +833,12 @@ proc compileAgainstTypes(name, typesText: string):
       "c", "--hints:off", "--warnings:off", "--compileOnly",
       "--nimcache:" & (dir / "cache"), "--path:" & dir, main],
     options = {poStdErrToStdOut, poUsePath})
-  result = (p.outputStream.readAll(), p.waitForExit())
+  # Windows pipes can return a short chunk before the compiler has finished.
+  # Stream.readAll stops at that chunk; read lines until the pipe reaches EOF
+  # so the rejection assertion sees the complete compiler diagnostic.
+  for line in p.lines(keepNewLines = true):
+    result.output.add(line)
+  result.code = p.waitForExit()
   p.close()
   removeDir(dir)
 

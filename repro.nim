@@ -89,6 +89,7 @@ package io_mon:
     "nim >=2.0"
     "nimble"
     "sh"
+    "bash >=4"
     # The C-family compiler ``nim c`` shells out to for the C backend. macOS
     # builds (and the shim's arm64/arm64e fat link) use Apple ``clang``; Linux
     # and Windows (``--cc:gcc`` for the shim DLL) use ``gcc``. The user supplies
@@ -136,6 +137,7 @@ package io_mon:
     task "bump-version", command = "nim r scripts/bump_version.nim", description = "Bump version number"
 
   build:
+    const backendCompiler = (when defined(macosx): "clang" else: "gcc")
     const binSuffix = (when defined(windows): ".exe" else: "")
     const shimExt =
       when defined(windows): "dll"
@@ -161,6 +163,10 @@ package io_mon:
         "config.nims",
       ],
       extraOutputs = @[shimOutput])
+    # The script invokes Bash, Nim and its C backend inside the action's
+    # isolated PATH. A package-level uses entry alone does not expose them.
+    appendRegisteredActionToolIdentityRefs(shimBuild.id,
+      ["bash", "nim", backendCompiler])
     discard collect("shim", @[shimBuild])
 
     # ---- Standalone CLI (``io-mon`` / the ``default`` collection) -----------
@@ -217,6 +223,7 @@ package io_mon:
         paths = @["src", "tests/helpers"],
         extraInputs = @["src", "tests/helpers", "io_mon.nimble"],
         actionId = "io-mon.test_build." & stem)
+      appendRegisteredActionToolIdentityRefs(edge.action.id, [backendCompiler])
       buildActions.add(edge.action)
 
       let executeEdge = edge.testBinary.run(
@@ -224,6 +231,9 @@ package io_mon:
         requiredBinaries = @[cliOutput],
         extraInputs = @[shimOutput],
         registerImplicitName = false)
+      # Tests compile real child programs and shims, including shell fixtures.
+      appendRegisteredActionToolIdentityRefs(executeEdge.id,
+        ["nim", backendCompiler, "sh", "bash"])
       executeActions.add(executeEdge)
 
     # Portable tests — always in the graph.

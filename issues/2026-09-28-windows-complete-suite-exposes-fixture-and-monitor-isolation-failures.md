@@ -45,3 +45,9 @@ skip the failing programs. Any runtime repair needs real Windows execution.
 Refreshed `origin/dev` at `279a17b` (already an ancestor of `73e4792`) and
 searched open and deleted issues for Windows fixtures, nested monitoring and
 CRLF before recording.
+
+## Direct Windows comparison
+
+At `1cabd874115573fce23e7533b1a4b33d515afc1e`, [job 109054198659](https://github.com/metacraft-labs/io-mon/actions/runs/36459498969/job/109054198659) passes 41 of 42 programs directly, including all native injection, root-guard, child-termination and host-session tests. The remaining eight assertions are in the evidence-scope compiler diagnostic reader: `Stream.readAll` stops on the first short Windows pipe read, retaining only `stack trace: (most recent call last)`.
+
+Drain the pipe to EOF and keep every exact rejection assertion and both successful-compilation controls. This direct result does not yet clear the nested Reprobuild execution failures.
