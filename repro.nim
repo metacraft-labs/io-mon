@@ -85,10 +85,10 @@ when defined(macosx):
   import ./repro_support/cctools
 
 package io_mon:
-  when defined(windows):
-    # Windows development uses the toolchain prepared by env.ps1. Arbitrary
-    # `repro exec` commands need the same default as direct CI build/test.
-    defaultToolProvisioning(path)
+  # Keep this declaration directly in the package body: the DSL recognizes
+  # it before Nim evaluates platform branches. Windows uses env.ps1's tools;
+  # POSIX development commands realize the declared tools through Nix.
+  defaultToolProvisioning(when defined(windows): path else: nix)
 
   uses:
     # Toolchain floor — mirrors ``io_mon.nimble``'s ``requires "nim >= 2.0.0"``
