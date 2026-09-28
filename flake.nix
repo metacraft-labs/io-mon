@@ -91,9 +91,34 @@
           };
 
           devShells.default = pkgs.mkShell {
-            STACKABLE_HOOKS_SRC = "${inputs.stackable-hooks-src}/src";
-            SHM_QUEUE_SRC = "${inputs.shm-queue-src}/src";
-            SHM_GSET_SRC = "${inputs.shm-gset-src}/src";
+            RELEASE_STACKABLE_HOOKS_SRC = "${inputs.stackable-hooks-src}/src";
+            RELEASE_SHM_QUEUE_SRC = "${inputs.shm-queue-src}/src";
+            RELEASE_SHM_GSET_SRC = "${inputs.shm-gset-src}/src";
+            # Paired workspace editing keeps using siblings. Release scripts
+            # explicitly select the immutable inputs exported above.
+            shellHook = ''
+              if [ -z "''${STACKABLE_HOOKS_SRC:-}" ]; then
+                if [ -d ../nim-stackable-hooks/src ]; then
+                  export STACKABLE_HOOKS_SRC="$(cd ../nim-stackable-hooks/src && pwd)"
+                else
+                  export STACKABLE_HOOKS_SRC="$RELEASE_STACKABLE_HOOKS_SRC"
+                fi
+              fi
+              if [ -z "''${SHM_QUEUE_SRC:-}" ]; then
+                if [ -d ../nim-shm-queue/src ]; then
+                  export SHM_QUEUE_SRC="$(cd ../nim-shm-queue/src && pwd)"
+                else
+                  export SHM_QUEUE_SRC="$RELEASE_SHM_QUEUE_SRC"
+                fi
+              fi
+              if [ -z "''${SHM_GSET_SRC:-}" ]; then
+                if [ -d ../nim-shm-gset/src ]; then
+                  export SHM_GSET_SRC="$(cd ../nim-shm-gset/src && pwd)"
+                else
+                  export SHM_GSET_SRC="$RELEASE_SHM_GSET_SRC"
+                fi
+              fi
+            '';
             inputsFrom = [ config.pre-commit.devShell ];
             packages = [
               pkgs.just
