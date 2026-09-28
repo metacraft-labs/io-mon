@@ -118,7 +118,9 @@ suite "io-mon CLI evidence scope (DA-1i, live)":
     ## the CLI wrote, never the in-process value — a consumer only ever sees the
     ## file.
     let depfile = work / (tag & ".iomon")
-    let outputPath = work / (tag & ".out")
+    # The command's paths must be identical in both captures: a successful
+    # write-open is still a successful lookup and belongs in the compared set.
+    let outputPath = work / "output.txt"
     removeFile(depfile)
     removeFile(outputPath)
     var childEnv = newStringTable(modeCaseSensitive)

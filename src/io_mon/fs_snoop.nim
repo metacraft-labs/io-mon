@@ -22,6 +22,7 @@ import shm_gset/transport as shmset
 
 when defined(linux):
   import std/[algorithm, monotimes, posix]
+  from io_mon/proc_start_time import predatesRoot
 
   const
     LinuxInjectedDescendantGraceMsDefault = 500
@@ -348,7 +349,7 @@ when defined(linux):
       # (3) the start-time prune. `startTicks == 0` is "this stat line did not
       # tell us", and it keeps the pid as a CANDIDATE — an unparseable stat line
       # must never be the reason a live descendant goes unreported.
-      if minStartTicks > 0 and startTicks > 0 and startTicks < minStartTicks:
+      if predatesRoot(startTicks, minStartTicks):
         discard posix.close(envFd)
         continue
 
