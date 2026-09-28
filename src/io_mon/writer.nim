@@ -1161,11 +1161,13 @@ proc flushFragmentBatch*() =
   # the fd, drops further records) once it reaches `fragmentByteCap`.
   accountFragmentBytes(bufLen)
 
-proc closeFragmentSlot*() =
+proc closeFragmentSlot*(retainIdentity = false) =
   ## Force the calling thread's cached fragment-log handle (if any) to
   ## close. Called on shim shutdown / thread exit / test teardown.
   ## M9.R.15f.1 — flush any in-flight batch buffer before closing so
   ## the on-disk fragment includes every appended frame.
+  ## `retainIdentity` releases a macOS worker's resources after an emit while
+  ## retaining its cumulative byte budget for the next emit on that thread.
   if fragmentSlot.isOpen:
     if not fragmentHandleIsCurrent() and not reopenFragmentHandle():
       return
@@ -1176,24 +1178,30 @@ proc closeFragmentSlot*() =
     # Defensive: flush above clears the sentinel on the normal path; ensure no
     # stale sentinel survives a flush that raised / early-returned.
     clearReadingSentinel()
-    try:
-      close(fragmentSlot.file)
-    except IOError, OSError:
-      discard
+    # A flush that reaches the byte cap has already closed this handle.
+    if fragmentSlot.isOpen:
+      try:
+        close(fragmentSlot.file)
+      except IOError, OSError:
+        discard
     fragmentSlot.isOpen = false
-    fragmentSlot.fragmentDirLen = 0
-    fragmentSlot.fragmentDirBuf[0] = '\0'
-    fragmentSlot.osPid = 0
-    fragmentSlot.threadId = 0
+    if not retainIdentity:
+      fragmentSlot.fragmentDirLen = 0
+      fragmentSlot.fragmentDirBuf[0] = '\0'
+      fragmentSlot.osPid = 0
+      fragmentSlot.threadId = 0
     fragmentSlot.batchLen = 0
     fragmentSlot.batchOpenedAtNs = 0
     fragmentSlot.batchProbeCountdown = 0
     fragmentSlot.readingSentinelActive = false
-    # LEAK-GUARD — a normal close clears the cap bookkeeping too.
-    fragmentSlot.fragmentBytes = 0
-    fragmentSlot.overCap = false
-    # DEP-FLUSH-1 — leave the registry; the slot is now closed.
-    unregisterFragmentSlot()
+    # Workers close synchronously while their TLS is alive. Retain their key
+    # and cumulative byte budget so reopening cannot evade the fragment cap.
+    if not retainIdentity:
+      fragmentSlot.fragmentBytes = 0
+      fragmentSlot.overCap = false
+  # A cap-triggered flush also closes the slot. Its TLS must leave the registry
+  # before a worker exits, even when the handle was already closed on entry.
+  unregisterFragmentSlot()
 
 proc discardFragmentSlotAfterFork*() =
   ## Reset the calling thread's fragment slot in a fork CHILD WITHOUT flushing
@@ -1422,6 +1430,8 @@ proc precomputeSigSafeCommittedFrame(slot: var FragmentSlot) =
 
 proc openFragmentSlot(fragmentDir: string; osPid, threadId: uint64;
                       path: string): bool =
+  let sameIdentity = slotFragmentDirEquals(fragmentSlot, fragmentDir) and
+    fragmentSlot.osPid == osPid and fragmentSlot.threadId == threadId
   if not open(fragmentSlot.file, extendedPath(path), fmAppend):
     return false
   if not captureFragmentHandleIdentity():
@@ -1442,11 +1452,12 @@ proc openFragmentSlot(fragmentDir: string; osPid, threadId: uint64;
   fragmentSlot.batchOpenedAtNs = 0
   fragmentSlot.batchProbeCountdown = 0
   fragmentSlot.readingSentinelActive = false
-  # LEAK-GUARD — a fresh fragment starts with a clean byte budget and no
-  # cap-retirement carried over from a previous (osPid, threadId).
+  # Only a different fragment starts a new budget. macOS worker threads close
+  # after every emit and can reopen this same fragment many times.
   resolveFragmentByteCap()
-  fragmentSlot.fragmentBytes = 0
-  fragmentSlot.overCap = false
+  if not sameIdentity:
+    fragmentSlot.fragmentBytes = 0
+    fragmentSlot.overCap = false
   precomputeSigSafeCommittedFrame(fragmentSlot)
   # DEP-FLUSH-1 — join the process-global registry so a shutdown sweep on
   # ANY thread can reach this batch. No-op after the first open per thread.

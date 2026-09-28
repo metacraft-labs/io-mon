@@ -417,11 +417,11 @@ var
   # would lose its buffered tail — and crucially we CANNOT flush it from a
   # pthread-key thread-exit destructor, because macOS tears down a non-Nim
   # thread's Nim runtime TLS before pthread destructors run, so any Nim call from
-  # there faults. We therefore flush a worker thread's batch SYNCHRONOUSLY on
+  # there faults. We therefore flush and close a worker thread's slot SYNCHRONOUSLY on
   # every emit (see emitRecord): the main thread keeps the batching win (the
   # millions of single-threaded configure probes the optimization targeted),
-  # while worker threads trade a little batching for guaranteed capture of their
-  # reads AND writes regardless of when they exit. This closes the threaded-write
+  # while worker threads trade batching for capture of their reads and writes without
+  # retaining descriptors or registry pointers after they exit. This closes the threaded-write
   # capture gap without a teardown-time Nim call.
   mainThreadId: uint64 = 0
   # ROUND-2 R8 — this invocation's RUN ID, read once from REPRO_MONITOR_SESSION at
@@ -489,7 +489,7 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
   withShimMuted:
     appendFragmentRecord(fragmentDir, record)
     # Threaded-write capture fix: if this record was emitted from a WORKER thread
-    # (not the main/constructor thread), flush its per-thread fragment batch
+    # (not the main/constructor thread), flush and close its fragment slot
     # synchronously. The batch is otherwise flushed only on overflow / 100 ms age
     # / process-exit, and the process-exit destructor flushes only the MAIN
     # thread's batch — a worker thread that exits early would lose its buffered
@@ -501,7 +501,9 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
     # targeted); worker-thread I/O is comparatively rare, so per-record flushing
     # there is an acceptable trade for guaranteed capture of its reads AND writes.
     if record.threadId != mainThreadId:
-      flushFragmentBatch()
+      # Flush and release the descriptor AND registry pointer while worker TLS
+      # is valid. A flush alone leaks one handle for every exited worker.
+      closeFragmentSlot(retainIdentity = true)
 
 proc runIdToken(): string {.raises: [].} =
   ## ROUND-2 R8 — the ` run=<id>` detail suffix (empty when no run id). Single
@@ -1421,7 +1423,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
     setFragmentRunToken(runIdToken())
   # Record the constructor thread as the "main" thread. Its fragment batch is
   # flushed by the dyld process-exit destructor; worker threads (which the
-  # destructor cannot reach safely) flush eagerly per record in emitRecord. Init
+  # destructor cannot reach safely) flush and close per record in emitRecord. Init
   # runs in the dyld constructor, single-threaded, so this captures the main
   # thread id before any worker thread can emit.
   mainThreadId = currentThreadId()
@@ -4590,13 +4592,16 @@ void repro_macos_set_interpose_disabled(int value) {
  * its Nim-runtime TLS BEFORE pthread key destructors run, so ANY Nim proc call
  * from such a destructor (even a trivial `raises: []` one) faults (verified
  * empirically on this host: the destructor ran but the Nim flush call never
- * entered its body). We therefore flush the worker thread's batch SYNCHRONOUSLY
+ * entered its body). We therefore flush and close the worker thread's slot SYNCHRONOUSLY
  * inside `emitRecord` — while the thread is still alive and its Nim runtime is
  * intact — for every record whose `threadId` differs from the main/constructor
  * thread. The main thread keeps the full batching win (the single-threaded
  * configure probe storm the M9.R.15f.1 optimization targeted); worker-thread I/O
  * is comparatively rare, so per-record flushing there is an acceptable trade for
- * guaranteed capture. See `mainThreadId` / `emitRecord` in the Nim section.
+ * capture and bounded descriptor ownership. A flush alone leaves the cached
+ * FILE and registry pointer behind after TLS destruction, leaking one handle
+ * per exited worker. Synchronous close retains the fragment byte budget across
+ * reopens. See `mainThreadId` / `emitRecord` in the Nim section.
  */
 
 typedef DIR *(*repro_real_opendir_fn)(const char *);
