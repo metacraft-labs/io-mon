@@ -35,14 +35,6 @@
       ]
     },
     {
-      "id": "darwin-x86_64",
-      "runner": ["self-hosted", "macos", "arm64"],
-      "assets": [
-        "{product}-{version}-darwin-x86_64.tar.gz",
-        "{product}-{version}-darwin-x86_64.json"
-      ]
-    },
-    {
       "id": "windows-x86_64",
       "runner": ["self-hosted", "windows", "x64"],
       "assets": [

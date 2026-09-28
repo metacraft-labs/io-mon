@@ -1,11 +1,11 @@
-# The declared Intel macOS release cannot run an injected child
+# Intel macOS needs a working monitor port before it can be released
 
 Observed at `1b17d71` on 2026-09-28, in release job
 <https://github.com/metacraft-labs/io-mon/actions/runs/36362490802/job/108742379730>.
 The same failure reproduces under Rosetta locally.
 
-The approved [release specification](https://github.com/metacraft-labs/metacraft-specs/blob/1056f9f/infrastructure/gosti-io-mon-runquota-releases.md)
-retains io-mon's existing Intel macOS target and requires an extracted-payload
+The initial [release specification](https://github.com/metacraft-labs/metacraft-specs/blob/1056f9f/infrastructure/gosti-io-mon-runquota-releases.md)
+retained the old workflow's Intel macOS target and required extracted-payload
 file capture. The x86_64 probe exits 7 normally; injecting the x86_64 monitor
 changes this to exit 1 and `out of memory` before it reads the file.
 
@@ -18,3 +18,12 @@ which discards Darwin's separate child-return indicator.
 Implement and test the x86_64 forwarding ABI, including full-width mmap
 returns, errno and child fork behavior. Keep libc fork bookkeeping intact.
 Open and deleted issue history had no earlier record of this defect.
+
+Further local diagnosis at `04dcc68` plus experimental x86_64 forwarding
+changes got the child through startup and preserved its exit 7, but captured
+neither the input nor output file. The pinned stackable-hooks body-patch
+implementation emits ARM64 instructions, and ordinary stdio I/O remains
+invisible to import interposition alone. A forwarding fix is insufficient:
+the Intel port needs a working interception backend and the same real-file
+release smoke test. The current release scope uses the fleet's macOS ARM64
+target; it does not claim Intel support.
