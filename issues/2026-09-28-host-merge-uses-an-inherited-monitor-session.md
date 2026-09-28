@@ -43,3 +43,12 @@ searched current issues plus `git log --all -G
 'ambient.*session|inherited.*session|currentRunId' -- issues/`; no prior issue
 covered this runtime defect. The Windows complete-suite issue records a
 related synthetic-fixture failure, fixed separately at `59dc99c`.
+
+## Repair validation
+
+The candidate based on `5eeb2cd` retains the generated session on the handle
+and passes it to the macOS and Windows merge, matching Linux. The shared
+real-child regression passes both arms on macOS; against the original host
+implementation its control passes and its inherited-session arm loses every
+child record. Windows x64 typechecking passes. Native Windows execution and
+the complete macOS suite remain pending.

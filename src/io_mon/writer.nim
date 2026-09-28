@@ -2831,10 +2831,9 @@ proc mergeFragments*(fragmentDir, outputPath: string;
   # is no longer set in the MERGING process on any platform. (The Windows arm was
   # the last to stop `putEnv`-ing it, once `runWithMonitorShim` gained an `env`
   # parameter.) The fallback now engages only for a caller that exports the
-  # variable itself. `runMonitored`'s Linux arm passes `currentRunId` explicitly;
-  # its macOS and Windows arms do not, which is safe only because each merges a
-  # fragment dir it created moments earlier and deletes on the way out, so no
-  # prior run's records can be in it.
+  # variable itself. Every `runMonitored` arm passes its handle's `currentRunId`
+  # explicitly. A fresh fragment directory alone is insufficient: an inherited
+  # outer session would otherwise filter out this child's valid records.
   #
   # Empty ⇒ no filtering (the CLI's fresh-dir case). This
   # runs BEFORE the corrupt-fragment loss injection below so a real corrupt fragment
@@ -3067,4 +3066,3 @@ proc mergeFragments*(fragmentDir, outputPath: string;
 
   writeCanonicalInPlace(outputPath, records)
   depFileFromOwnedRecords(move(records))
-
