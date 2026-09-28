@@ -14,11 +14,43 @@ const input = path.resolve("release-probe-input.txt");
 const output = path.resolve("release-probe-output.txt");
 const depfile = path.resolve("release-probe.rdep");
 fs.writeFileSync(input, "release-input");
+const control = cp.spawnSync(probe, [input, output + ".control"], {
+  encoding: "utf8",
+  timeout: 30000,
+});
+assert.equal(
+  control.status,
+  7,
+  "unmonitored probe: " + JSON.stringify(control),
+);
+assert.equal(
+  fs.readFileSync(output + ".control", "utf8"),
+  "release-input-captured",
+);
+const shimLog = path.resolve("release-probe-shim.log");
 const capture = cp.spawnSync(
   exe,
   ["run", "--depfile", depfile, "--", probe, input, output],
-  { encoding: "utf8", timeout: 30000 },
+  {
+    encoding: "utf8",
+    timeout: 30000,
+    env: { ...process.env, REPRO_MONITOR_SHIM_DEBUG_LOG: shimLog },
+  },
 );
+if (capture.status !== 7) {
+  if (fs.existsSync(shimLog)) console.error(fs.readFileSync(shimLog, "utf8"));
+  if (fs.existsSync(depfile)) {
+    const diagnostic = cp.spawnSync(
+      exe,
+      ["inspect", depfile, "--format", "json"],
+      {
+        encoding: "utf8",
+        timeout: 30000,
+      },
+    );
+    console.error(diagnostic.stdout, diagnostic.stderr);
+  }
+}
 assert.equal(capture.status, 7, JSON.stringify(capture));
 assert.equal(fs.readFileSync(output, "utf8"), "release-input-captured");
 const decoded = cp.execFileSync(exe, ["inspect", depfile, "--format", "json"], {
