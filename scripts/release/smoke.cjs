@@ -37,7 +37,6 @@ const capture = cp.spawnSync(
     env: {
       ...process.env,
       REPRO_MONITOR_SHIM_DEBUG_LOG: shimLog,
-      ...(target.startsWith("linux-") ? { LD_DEBUG: "libs" } : {}),
     },
   },
 );

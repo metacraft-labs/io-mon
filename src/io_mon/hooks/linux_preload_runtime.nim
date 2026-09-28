@@ -1530,14 +1530,45 @@ int ct_linux_preload_real_close(int fd) {
   return real_close_ptr(fd);
 }
 
+/* Before glibc 2.33 the public stat/lstat entrypoints were header wrappers
+ * around __xstat/__lxstat, not dynamically exported symbols. Newer build
+ * headers no longer define _STAT_VER. Preserve the host libc's struct stat
+ * ABI when forwarding into an older runtime. See glibc 2.31's
+ * sysdeps/unix/sysv/linux/{x86,generic}/bits/stat.h. */
+#if defined(_STAT_VER)
+#define CT_STAT_VER _STAT_VER
+#elif defined(__x86_64__)
+#define CT_STAT_VER 1
+#elif defined(__aarch64__)
+#define CT_STAT_VER 0
+#endif
+
 int ct_linux_preload_real_stat(char *path, void *buf) {
-  CT_REAL("stat", real_stat_ptr, ct_stat_real_fn);
-  return real_stat_ptr(path, (struct stat *)buf);
+  if (real_stat_ptr == NULL)
+    real_stat_ptr = (ct_stat_real_fn)ct_resolve("stat");
+  if (real_stat_ptr != NULL) return real_stat_ptr(path, (struct stat *)buf);
+#ifdef CT_STAT_VER
+  if (real_xstat_ptr == NULL)
+    real_xstat_ptr = (ct_xstat_real_fn)ct_resolve("__xstat");
+  if (real_xstat_ptr != NULL)
+    return real_xstat_ptr(CT_STAT_VER, path, (struct stat *)buf);
+#endif
+  errno = ENOSYS;
+  return -1;
 }
 
 int ct_linux_preload_real_lstat(char *path, void *buf) {
-  CT_REAL("lstat", real_lstat_ptr, ct_stat_real_fn);
-  return real_lstat_ptr(path, (struct stat *)buf);
+  if (real_lstat_ptr == NULL)
+    real_lstat_ptr = (ct_stat_real_fn)ct_resolve("lstat");
+  if (real_lstat_ptr != NULL) return real_lstat_ptr(path, (struct stat *)buf);
+#ifdef CT_STAT_VER
+  if (real_lxstat_ptr == NULL)
+    real_lxstat_ptr = (ct_xstat_real_fn)ct_resolve("__lxstat");
+  if (real_lxstat_ptr != NULL)
+    return real_lxstat_ptr(CT_STAT_VER, path, (struct stat *)buf);
+#endif
+  errno = ENOSYS;
+  return -1;
 }
 
 void *ct_linux_preload_real_opendir(char *path) {
