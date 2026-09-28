@@ -45,6 +45,20 @@ const capture = cp.spawnSync(
 if (capture.stderr) console.error(capture.stderr);
 if (fs.existsSync(shimLog)) console.error(fs.readFileSync(shimLog, "utf8"));
 if (capture.status !== 7) {
+  if (target.startsWith("linux")) {
+    // Repeat only the failing launch with the system loader's own diagnostics.
+    // This preserves errors emitted before the shim can open its debug log.
+    const diagnostic = cp.spawnSync(
+      exe,
+      ["run", "--depfile", depfile + ".loader", "--", probe, input, output],
+      {
+        encoding: "utf8",
+        timeout: 30000,
+        env: { ...process.env, LD_DEBUG: "libs,versions" },
+      },
+    );
+    console.error(diagnostic.stdout, diagnostic.stderr);
+  }
   if (fs.existsSync(depfile)) {
     const diagnostic = cp.spawnSync(
       exe,
