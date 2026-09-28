@@ -70,3 +70,10 @@ with `LoadLibraryW in child returned NULL (err=0)`. The other four programs and
 the remaining three spawn-resume cases pass. The failed edge is explicitly
 `cdNotCacheable`. Keep the repeat gate; diagnose the child loader result
 before changing runtime behavior or attributing this intermittent failure.
+
+The concurrent diagnostic at `de755e5`, shared-actions `7992b87`, job
+`109100142914`, reproduces a shared-artifact race: host-session scope rebuilds
+`build/lib/librepro_monitor_shim.dll` while another fixture has it loaded.
+The linker fails with permission denied. Its build must use private output
+and compiler-cache directories. Keep the earlier loader NULL issue open until
+the repaired concurrent run and full Reprobuild repeat establish the result.

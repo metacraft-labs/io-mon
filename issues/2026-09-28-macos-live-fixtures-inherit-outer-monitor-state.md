@@ -25,3 +25,12 @@ Evidence: `/tmp/io-mon-de755-macos-full-graph.json` and `.log`. Refreshed
 `origin/dev` at `279a17b` (already an ancestor), searched open and deleted
 issues for outer sessions and nested monitoring. The resolved host-session
 issue fixed production host merges; these remaining merges belong to tests.
+
+With a distinct bootstrap dylib and the explicit-session repair, the mmap
+fixture's inner CLI hangs before main (`09514bf` plus five test files).
+`sample` shows libSystem malloc initialization spinning through the interposed
+entropy syscall; `lsof` confirms both distinct dylibs are mapped. Evidence:
+`/tmp/io-mon-macos-r5-child-sample.txt`. The hung diagnostic's four verified
+processes were stopped; no CI release run was cancelled. The release plan now
+specifies isolation of all 35 macOS self-injecting programs and six POSIX
+monitor-launching programs on macOS, with every execution non-cacheable.
