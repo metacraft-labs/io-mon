@@ -255,12 +255,22 @@ package io_mon:
       # generated depfile orders the known artifacts but does not discover all
       # runtime reads, so these execute edges MUST remain non-cacheable.
       # Monitor-Hook-Shim.md / Failure Semantics permits this disposition.
-      let isolatesMonitor = defined(windows) and source.extractFilename in [
+      # macOS fixtures also install their own interposers. A distinct outer
+      # dylib can recurse during dyld initialization, before main is reached.
+      let isolatesMonitor = (defined(macosx) and (
+        source.startsWith("tests/macos/") or source.extractFilename in [
+          "test_io_mon_snoop_cli_capture.nim",
+          "test_io_mon_monitored_compile_depset.nim",
+          "test_io_mon_dep_identity_scope.nim",
+          "test_io_mon_cli_interest_stamp.nim",
+          "test_io_mon_cli_evidence_scope.nim",
+          "test_io_mon_host_session_scope.nim"])) or
+        (defined(windows) and source.extractFilename in [
         "test_io_mon_windows_host_session_scope.nim",
         "test_io_mon_windows_read_capture.nim",
         "test_io_mon_windows_root_guard.nim",
         "test_io_mon_windows_spawn_abandoned_injection.nim",
-        "test_io_mon_windows_spawn_resume_invariant.nim"]
+        "test_io_mon_windows_spawn_resume_invariant.nim"])
       var executeAfter: seq[BuildActionDef] = @[]
       var executePolicy = automaticMonitorPolicy()
       if isolatesMonitor:
@@ -268,7 +278,7 @@ package io_mon:
         let depfileEdge = dslfs.unmonitorableActionDepfile(
           output = depfile,
           inputs = @[binary, cliOutput, shimOutput],
-          reason = "Windows injection test owns its hooks and DLL selection; " &
+          reason = "Injection test owns its hooks and shim selection; " &
             "an outer shim changes the experiment. Execution always reruns.",
           actionId = "io-mon.test_dependencies." & stem)
         buildActions.add(depfileEdge)
@@ -337,6 +347,6 @@ package io_mon:
         emitTestPair(spec.source, spec.binary, testBuildActions, testExecuteActions)
 
     discard collect("test", testExecuteActions)
-    when defined(windows):
+    when defined(windows) or defined(macosx):
       discard collect("test-monitor-isolation", isolatedTestActions)
     discard collect("test-builds", testBuildActions)

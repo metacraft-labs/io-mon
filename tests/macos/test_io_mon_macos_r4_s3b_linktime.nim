@@ -97,7 +97,7 @@ when defined(macosx):
     doAssert code == 0, "probe should exit 0 (" & probe & ", out=" &
       stdoutText & ")"
     let depfile = runWork / "cap.iomon"
-    discard mergeFragments(fragmentDir, depfile, runId = testRunId)
+    discard mergeFragments(fragmentDir, depfile, currentRunId = testRunId)
     doAssert fileExists(depfile)
     readMonitorDepFile(depfile)
 

@@ -6,7 +6,7 @@
 ## unchanged. This isolates merge scoping from recursive shim injection; the
 ## Reprobuild suite separately exercises the enclosing monitor itself.
 
-import std/[os, osproc, strutils, tempfiles, unittest]
+import std/[os, osproc, strtabs, strutils, tempfiles, unittest]
 import io_mon
 
 if paramCount() == 2 and paramStr(1) == "--session-scope-reader":
@@ -52,9 +52,18 @@ proc capture(ambient, shim: string): tuple[exitCode, starts, reads: int;
     else: delEnv(ShimLibOverrideEnv)
 
 suite "host monitor session scope":
-  let built = execCmdEx("bash " & quoteShell(repoRoot / "scripts/build_shim.sh"))
+  # Other tests may have the shipping shim loaded concurrently. Rebuilding
+  # that shared file races their loader (and Windows refuses the write).
+  let shimWork = createTempDir("io-mon-session-shim-", "-build")
+  defer: removeDir(shimWork)
+  var buildEnv = newStringTable(modeCaseSensitive)
+  for key, value in envPairs(): buildEnv[key] = value
+  buildEnv["IO_MON_SHIM_OUT_DIR"] = shimWork / "lib"
+  buildEnv["IO_MON_SHIM_NIMCACHE_DIR"] = shimWork / "nimcache"
+  let built = execCmdEx("bash " & quoteShell(repoRoot / "scripts/build_shim.sh"),
+    env = buildEnv)
   doAssert built.exitCode == 0, built.output
-  let shim = repoRoot / "build/lib" / (
+  let shim = shimWork / "lib" / (
     when defined(windows): "librepro_monitor_shim.dll"
     elif defined(macosx): "librepro_monitor_shim.dylib"
     else: "librepro_monitor_shim.so")

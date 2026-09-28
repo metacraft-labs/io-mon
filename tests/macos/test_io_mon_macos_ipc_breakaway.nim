@@ -143,7 +143,7 @@ suite "io-mon macOS IPC / daemon-over-socket breakaway (T3a, break #1)":
       checkpoint("client A: " & outA)
       quitDaemon(sock, daemon)
 
-      let depA = mergeFragments(fragA, work / "A.iomon", runId = testRunId)
+      let depA = mergeFragments(fragA, work / "A.iomon", currentRunId = testRunId)
       # An mrIpcConnect to the out-of-tree daemon was captured (peer pid known)…
       var sawConnect = false
       for r in depA.records:
@@ -165,7 +165,7 @@ suite "io-mon macOS IPC / daemon-over-socket breakaway (T3a, break #1)":
         createDir(frag)
         discard runUnderShim(shim, clientBin, @[sock, input], frag)
         quitDaemon(sock, daemon)
-        mergeFragments(frag, frag / "out.iomon", runId = testRunId).completeness
+        mergeFragments(frag, frag / "out.iomon", currentRunId = testRunId).completeness
 
       let cA = captureFor(inputA, work / "demoA.sock", work / "demoFragA")
       let cB = captureFor(inputB, work / "demoB.sock", work / "demoFragB")
@@ -184,7 +184,7 @@ suite "io-mon macOS IPC / daemon-over-socket breakaway (T3a, break #1)":
       createDir(frag)
       let outP = runUnderShim(shim, pairBin, @[sock], frag)
       checkpoint("ipc_pair: " & outP)
-      let dep = mergeFragments(frag, work / "pair.iomon", runId = testRunId)
+      let dep = mergeFragments(frag, work / "pair.iomon", currentRunId = testRunId)
       # The intra-tree connect was recorded…
       var sawConnect = false
       for r in dep.records:
@@ -224,10 +224,10 @@ suite "io-mon macOS IPC / daemon-over-socket breakaway (T3a, break #1)":
       daemon.close()
 
       # WITHOUT the report dir the out-of-tree daemon would downgrade…
-      check mergeFragments(frag, work / "tNo.iomon", runId = testRunId).completeness == mcIncomplete
+      check mergeFragments(frag, work / "tNo.iomon", currentRunId = testRunId).completeness == mcIncomplete
       # …but WITH the report folded in, the daemon accounted for its read, so the
       # build stays mcComplete and the served file is a recorded dependency.
-      let dep = mergeFragments(frag, work / "tYes.iomon", reportDir, runId = testRunId)
+      let dep = mergeFragments(frag, work / "tYes.iomon", reportDir, currentRunId = testRunId)
       check dep.completeness == mcComplete
       var sawServed = false
       for r in dep.records:
