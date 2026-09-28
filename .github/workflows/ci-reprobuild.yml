@@ -70,7 +70,7 @@ jobs:
         # revisions before materialising the env. Those two are io-mon's
         # `uses:` library producers in repro.nim; reprobuild builds each
         # from source and threads their `src/` roots onto io-mon's compile.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@6d607047dc8b99753f1b16cf37982506de65b373
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@74c02a377baa8d55947c496df8a2da85ad11f4a8
         with:
           env-flavor: reprobuild
           # Exercise the published bootstrap repairs before a new CLI release.
