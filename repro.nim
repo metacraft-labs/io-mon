@@ -80,6 +80,9 @@ import repro_dsl_stdlib/packages/sh
 # reprobuild's own ``repro.nim``.
 import ct_test_nim_unittest
 
+when defined(macosx):
+  import ./repro_support/cctools
+
 package io_mon:
   uses:
     # Toolchain floor — mirrors ``io_mon.nimble``'s ``requires "nim >= 2.0.0"``
@@ -90,6 +93,16 @@ package io_mon:
     "nimble"
     "sh"
     "bash >=4"
+    "mkdir"
+    when not defined(windows):
+      "dirname"
+      "uname"
+      "rustc"
+    when defined(macosx):
+      "cctools"
+    when defined(linux):
+      "nm"
+      "strace"
     # The C-family compiler ``nim c`` shells out to for the C backend. macOS
     # builds (and the shim's arm64/arm64e fat link) use Apple ``clang``; Linux
     # and Windows (``--cc:gcc`` for the shim DLL) use ``gcc``. The user supplies
@@ -166,7 +179,11 @@ package io_mon:
     # The script invokes Bash, Nim and its C backend inside the action's
     # isolated PATH. A package-level uses entry alone does not expose them.
     appendRegisteredActionToolIdentityRefs(shimBuild.id,
-      ["bash", "nim", backendCompiler])
+      ["bash", "nim", backendCompiler, "mkdir"])
+    when not defined(windows):
+      appendRegisteredActionToolIdentityRefs(shimBuild.id, ["dirname", "uname"])
+    when defined(macosx):
+      appendRegisteredActionToolIdentityRefs(shimBuild.id, ["cctools"])
     discard collect("shim", @[shimBuild])
 
     # ---- Standalone CLI (``io-mon`` / the ``default`` collection) -----------
@@ -233,7 +250,14 @@ package io_mon:
         registerImplicitName = false)
       # Tests compile real child programs and shims, including shell fixtures.
       appendRegisteredActionToolIdentityRefs(executeEdge.id,
-        ["nim", backendCompiler, "sh", "bash"])
+        ["nim", backendCompiler, "sh", "bash", "mkdir"])
+      when not defined(windows):
+        appendRegisteredActionToolIdentityRefs(executeEdge.id,
+          ["dirname", "uname", "rustc"])
+      when defined(macosx):
+        appendRegisteredActionToolIdentityRefs(executeEdge.id, ["cctools"])
+      when defined(linux):
+        appendRegisteredActionToolIdentityRefs(executeEdge.id, ["strace", "nm"])
       executeActions.add(executeEdge)
 
     # Portable tests — always in the graph.
