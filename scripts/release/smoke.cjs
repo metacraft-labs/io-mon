@@ -34,7 +34,11 @@ const capture = cp.spawnSync(
   {
     encoding: "utf8",
     timeout: 30000,
-    env: { ...process.env, REPRO_MONITOR_SHIM_DEBUG_LOG: shimLog },
+    env: {
+      ...process.env,
+      REPRO_MONITOR_SHIM_DEBUG_LOG: shimLog,
+      ...(target.startsWith("linux-") ? { LD_DEBUG: "libs" } : {}),
+    },
   },
 );
 // A loader can reject LD_PRELOAD and still run the child successfully. Preserve

@@ -20,6 +20,13 @@ esac
 cp LICENSE "$release_stage/"
 nim c "${release_nim_flags[@]}" --nimcache:"build/nimcache/probe-$release_target" \
   --out:build/release-probe scripts/release/probe.nim
+if [ "$release_os" = linux ]; then
+  {
+    file build/release-probe "$release_stage/bin/io-mon" "$release_stage/lib/librepro_monitor_shim.so"
+    readelf -l -d build/release-probe
+    readelf -d "$release_stage/lib/librepro_monitor_shim.so"
+  } > test-logs/release-elf.txt
+fi
 RELEASE_SMOKE_PROBE="$(pwd)/build/release-probe"
 export RELEASE_SMOKE_PROBE
 release_finish
