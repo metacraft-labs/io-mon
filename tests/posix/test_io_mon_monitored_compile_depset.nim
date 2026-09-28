@@ -174,30 +174,13 @@ int main(void) { printf("%d\n", TOP_VALUE); return 0; }
     # (d) The nested header specifically — named, so a regression that lost
     # transitive includes cannot hide behind a large declared set.
     check canonical(work / "include" / "deep.h") in captured
-    # (e) The compile's own product is captured on the WRITE side, as an
-    # `mrFileWrite` RECORD KIND — not as free text inside a `detail` string.
-    #
-    # This is the assertion that pins the classification fix. gcc's `as` opens
-    # the object file through stdio with mode `"w+"`. The mode is readable (it
-    # has a `+`), and the old classification was a single either/or
-    # (`if modeLooksReadable: moFileOpen else: moFileWrite`), so the readable
-    # arm won and the file that the action CREATED and TRUNCATED produced no
-    # write-side record at all — the write-ness survived only in
-    # `detail="stdio:w+"`. A consumer that splits inputs from outputs by record
-    # kind (which is the only stable way to do it) classified the gcc-produced
-    # object as an input, or as neither.
-    #
-    # Asserting `mrFileWrite` specifically — rather than "any record mentioning
-    # the path", or a `detail`-substring match — is what makes this falsifiable:
-    # the path was already present in the capture before the fix, so a weaker
-    # predicate passed against the defect.
+    # Every compiler must expose its output as a write. Read access is a
+    # compiler choice: GCC's assembler uses w+, whereas Clang can use a
+    # write-only descriptor. The explicit stdio case below pins both sides
+    # of w+ independently of which compiler built this translation unit.
     let objPath = canonical(work / "monitored.o")
     check dep.records.anyIt(canonical(it.path) == objPath and
       it.kind == mrFileWrite)
-    # And it is still visible on the read side too, because `"w+"` really is
-    # both — the fix must not have replaced one half-truth with the other.
-    check dep.records.anyIt(canonical(it.path) == objPath and
-      it.kind == mrFileOpen)
 
     # (f) The object path also carries a `prAbsent` probe: `as` stats it before
     # creating it. That record is TRUE — the path really was absent when probed
@@ -221,3 +204,32 @@ int main(void) { printf("%d\n", TOP_VALUE); return 0; }
         probes.mapIt($it.probeResult).join(", "))
       check dep.records.anyIt(canonical(it.path) == objPath and
         it.kind == mrFileWrite)
+
+  test "a real stdio update stream is captured as both readable and writable":
+    let source = work / "update.c"
+    let binary = work / "update"
+    let output = work / "update.txt"
+    writeFile(source, """
+#include <stdio.h>
+int main(int argc, char **argv) {
+  if (argc != 2) return 2;
+  FILE *f = fopen(argv[1], "w+");
+  if (!f) return 3;
+  if (fputs("payload", f) < 0 || fflush(f) != 0) return 4;
+  rewind(f);
+  if (fgetc(f) != 'p') return 5;
+  return fclose(f) == 0 ? 0 : 6;
+}
+""")
+    require run(cc, @[source, "-o", binary]).code == 0
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let depfile = work / "update.iomon"
+    require run(snoopBin, @["run", "--depfile", depfile, "--", binary, output],
+      childEnv).code == 0
+    check readFile(output) == "payload"
+    let dep = readMonitorDepFile(depfile)
+    let outputPath = canonical(output)
+    check dep.records.anyIt(canonical(it.path) == outputPath and it.kind == mrFileWrite)
+    check dep.records.anyIt(canonical(it.path) == outputPath and it.kind == mrFileOpen)

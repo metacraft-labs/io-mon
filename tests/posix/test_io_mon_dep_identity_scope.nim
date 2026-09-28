@@ -101,7 +101,7 @@ const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
   FanOut = 12
     ## Enough processes that "one element" is unmistakably not "one process".
-  EnvMarkerName = "IO_MON_DA1B_MARKER"
+  EnvMarkerName = "DA1B_FIXTURE_MARKER"
   IpcLossPrefix = "ipc peer outside monitored tree"
   FactLibName = "da1bfact"
 
@@ -152,7 +152,7 @@ int da1b_fact(void) { return 42; }
 #include <stdlib.h>
 extern int da1b_fact(void);
 int main(void) {
-  const char *marker = getenv("IO_MON_DA1B_MARKER");
+  const char *marker = getenv("DA1B_FIXTURE_MARKER");
   if (marker == 0) return 4;
   return da1b_fact() == 42 ? 0 : 1;
 }
@@ -291,11 +291,12 @@ proc factCensus(dep: MonitorDepFile): CountTable[string] =
     result.inc $r.kind
 
 proc factSet(dep: MonitorDepFile): HashSet[string] =
-  ## The deduped FACTS: every record rendered without its process coordinates
-  ## and without the per-call run token. Two launch paths must produce the same
-  ## set for the same action.
+  ## Facts whose identity is independent of the observing process. Process
+  ## events carry real per-run start times and are counted by factCensus;
+  ## comparing their timestamp bytes across runs would compare different facts.
   result = initHashSet[string]()
   for r in dep.records:
+    if depIdentityScope(r.kind) != disFactScoped: continue
     var detail: seq[string]
     for tok in r.detail.splitWhitespace():
       if tok.startsWith("run="): continue

@@ -39,7 +39,7 @@
 ## the Command Line Tools has nothing to resolve, and a fabricated toolchain
 ## would assert nothing about the property under test.
 
-import std/[os, strutils, tempfiles, unittest]
+import std/[os, osproc, strutils, tempfiles, unittest]
 
 import io_mon/fs_snoop
 import stackable_hooks/propagation as ct_propagation
@@ -62,9 +62,11 @@ else:
         # toolchain under /usr/bin proper, the drop-in would be pointless and
         # this is where we would find out.
         check not ct_propagation.isSipProtected(resolvedClang)
-        # And it is the Apple toolchain, not something that happened to be
-        # called clang: xcrun resolves through the ACTIVE developer dir.
-        check resolvedClang.contains("Developer")
+        # Nix's xcrun resolves its pinned Clang under /nix/store. Verify the
+        # compiler's identity without requiring an Apple installation path.
+        let version = execCmdEx(quoteShell(resolvedClang) & " --version")
+        check version.exitCode == 0
+        check "clang" in version.output.toLowerAscii
 
     test "an unresolvable tool yields an empty string, not a guess":
       # `xcrun -f` fails for a name no toolchain provides. A resolver that
