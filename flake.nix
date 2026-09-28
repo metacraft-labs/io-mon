@@ -14,6 +14,14 @@
       url = "github:metacraft-labs/nim-stackable-hooks/72f578249e9d8bbca8e3705c8a41ed5085c05bf9";
       flake = false;
     };
+    shm-queue-src = {
+      url = "github:metacraft-labs/nim-shm-queue/02f442ac12ce2587d9c053c527041097af38609f";
+      flake = false;
+    };
+    shm-gset-src = {
+      url = "github:metacraft-labs/nim-shm-gset/43a61120ae54b542c3e3038453094cca707a6c05";
+      flake = false;
+    };
   };
 
   outputs =
@@ -59,6 +67,8 @@
             ];
 
             STACKABLE_HOOKS_SRC = "${inputs.stackable-hooks-src}/src";
+            SHM_QUEUE_SRC = "${inputs.shm-queue-src}/src";
+            SHM_GSET_SRC = "${inputs.shm-gset-src}/src";
 
             buildPhase = ''
               runHook preBuild
@@ -81,6 +91,9 @@
           };
 
           devShells.default = pkgs.mkShell {
+            STACKABLE_HOOKS_SRC = "${inputs.stackable-hooks-src}/src";
+            SHM_QUEUE_SRC = "${inputs.shm-queue-src}/src";
+            SHM_GSET_SRC = "${inputs.shm-gset-src}/src";
             inputsFrom = [ config.pre-commit.devShell ];
             packages = [
               pkgs.just
@@ -88,6 +101,7 @@
               pkgs.nimble
               pkgs.git
               pkgs.nixfmt
+              pkgs.nodejs
               # tests/linux/test_io_mon_library_load_closure.nim derives its
               # ground truth from `strace -f -e trace=openat`: the loader
               # closure io-mon claims to observe is compared against the one
@@ -95,7 +109,6 @@
               # comparison cannot run, and CI failed with "Could not find
               # command: 'strace'" while it passed on developer machines that
               # happened to have it on PATH.
-              pkgs.strace
               # The §4.5(h) REAL-BUILD COMPLETENESS ORACLE
               # (`just test-realbuild-oracle`, tests/realbuild/run_oracle.sh) —
               # the cardinal-sin gate: it drives real cmake+ninja and cargo
@@ -122,6 +135,14 @@
               pkgs.ninja
               pkgs.cargo
               pkgs.rustc
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              pkgs.strace
+              pkgs.zig
+              pkgs.patchelf
+              pkgs.binutils
+              pkgs.dpkg
+              pkgs.rpm
             ];
           };
         };

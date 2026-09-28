@@ -4629,6 +4629,8 @@
           "nixos-modules",
           "nixpkgs-unstable"
         ],
+        "shm-gset-src": "shm-gset-src",
+        "shm-queue-src": "shm-queue-src",
         "stackable-hooks-src": "stackable-hooks-src_2"
       }
     },
@@ -4758,6 +4760,40 @@
       "original": {
         "owner": "andreymatin",
         "repo": "scss-reset",
+        "type": "github"
+      }
+    },
+    "shm-gset-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1790426282,
+        "narHash": "sha256-f8QpMpiPJsx5rBCPdMd/sz0OmfDfctgydNyDIi4noic=",
+        "owner": "metacraft-labs",
+        "repo": "nim-shm-gset",
+        "rev": "43a61120ae54b542c3e3038453094cca707a6c05",
+        "type": "github"
+      },
+      "original": {
+        "owner": "metacraft-labs",
+        "repo": "nim-shm-gset",
+        "rev": "43a61120ae54b542c3e3038453094cca707a6c05",
+        "type": "github"
+      }
+    },
+    "shm-queue-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1790426264,
+        "narHash": "sha256-xR/SAr44PknBCOFS+jRapVCP3VGo6/ZY+Hz56DFmyQM=",
+        "owner": "metacraft-labs",
+        "repo": "nim-shm-queue",
+        "rev": "02f442ac12ce2587d9c053c527041097af38609f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "metacraft-labs",
+        "repo": "nim-shm-queue",
+        "rev": "02f442ac12ce2587d9c053c527041097af38609f",
         "type": "github"
       }
     },

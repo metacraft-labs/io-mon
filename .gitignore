@@ -34,3 +34,7 @@ tests/*/test_*
 # file is not staged") -- so this repo's hooks were silently inert and commits
 # needed --no-verify.
 .pre-commit-config.yaml
+
+# Release output and pinned shared tooling checkout.
+/dist/
+/.release-tools/
