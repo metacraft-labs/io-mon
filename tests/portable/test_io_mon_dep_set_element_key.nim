@@ -463,7 +463,7 @@ iterator auditedSources(): (string, string) =
   for base in ["src", "cmd"]:
     for path in walkDirRec(repoRoot / base):
       if not path.endsWith(".nim"): continue
-      yield (path.relativePath(repoRoot), codeOnly(readFile(path)))
+      yield (path.relativePath(repoRoot).replace('\\', '/'), codeOnly(readFile(path)))
 
 suite "DA-1d: nothing composes an element key except the one site":
 

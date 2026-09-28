@@ -160,13 +160,10 @@ jobs:
           retention-days: 30
 
   windows-injection:
-    name: Windows injection tests (x64)
-    # The Windows shim's spawn-hook tests need a real Windows x64 host: they
-    # spawn, park, inject and terminate real processes. The reprobuild lane
-    # fails in its own bootstrap before compiling them, so this job runs them
-    # directly on the persistent Windows runners (nim on the SYSTEM PATH,
-    # WinLibs gcc under the service profile). `dev-env-ready` keeps it off a
-    # drained runner.
+    name: Windows complete suite (x64)
+    # Run the complete portable + Windows catalog directly as well as under
+    # Reprobuild. Native execution isolates product failures from interference
+    # by an outer monitor; both paths keep their assertions and remain gates.
     runs-on: [self-hosted, windows, x64, dev-env-ready]
     steps:
       - name: Generate CI token
@@ -203,7 +200,7 @@ jobs:
           path: nim-shm-gset
           token: ${{ steps.app-token.outputs.token }}
 
-      - name: Run the Windows injection tests
+      - name: Build payload and run every portable and Windows test
         shell: pwsh
         working-directory: io-mon
         run: |
@@ -228,17 +225,27 @@ jobs:
           $env:PATH = "$gccBin;$env:PATH"
           nim -v
           gcc --version
-          $tests = @(
-            'tests/windows/test_io_mon_windows_spawn_abandoned_injection',
-            'tests/windows/test_io_mon_windows_spawn_resume',
-            'tests/portable/test_shim_signal_handler_policy'
-          )
-          New-Item -ItemType Directory -Force build/test-bin | Out-Null
+          New-Item -ItemType Directory -Force build/bin, build/test-bin, test-logs/windows-complete | Out-Null
+          & bash scripts/build_shim.sh
+          if ($LASTEXITCODE -ne 0) { throw "monitor shim build failed" }
+          & nim c --hints:off --cc:gcc "--out:build/bin/io-mon.exe" cmd/io_mon_snoop.nim
+          if ($LASTEXITCODE -ne 0) { throw "standalone CLI build failed" }
+          $tests = Get-ChildItem tests/portable, tests/windows -Filter 'test_*.nim' -File | Sort-Object FullName
+          if ($tests.Count -eq 0) { throw "the complete test catalog is empty" }
           $failed = @()
           foreach ($t in $tests) {
-            Write-Host "=== $t"
-            $stem = Split-Path $t -Leaf
-            & nim c -r --hints:off --cc:gcc "--out:build/test-bin/$stem.exe" "$t.nim"
-            if ($LASTEXITCODE -ne 0) { $failed += "$t (exit $LASTEXITCODE)" }
+            Write-Host "=== $($t.FullName)"
+            $stem = $t.BaseName
+            & nim c -r --hints:off --cc:gcc --path:tests/helpers "--out:build/test-bin/$stem.exe" $t.FullName 2>&1 |
+              Tee-Object "test-logs/windows-complete/$stem.log"
+            if ($LASTEXITCODE -ne 0) { $failed += "$stem (exit $LASTEXITCODE)" }
           }
+          Write-Host "Executed $($tests.Count) test programs; $($failed.Count) failed"
           if ($failed.Count -gt 0) { throw "failed: $($failed -join '; ')" }
+      - name: Preserve complete Windows suite logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-complete-test-logs
+          path: io-mon/test-logs/windows-complete/
+          retention-days: 7
