@@ -56,3 +56,14 @@ resumes. Tag exec guards with their owning PID and pre-dispatch depth;
 restore the saved depth on the parent's next hook. Retain suppression
 during libc PATH lookup and restore the previous guard context when exec
 fails. The existing parent-write assertion must pass without weakening it.
+
+## Validation
+
+At `d6465ca`, native propagation run `36445335981` passes every assertion,
+including the resumed parent's write. Restoring cached exec identities makes
+the original grandchild and explicit `vfork` cases fail. The preceding guard
+at `3d65deb` independently fails the parent-write assertion.
+
+The complete Linux suite passes 428 cases at `d6465ca` in `36445342794`;
+macOS passes 473 cases and Windows injection checks pass in `36444835899`.
+Keep this issue until the verified repair is promoted to `dev`.
