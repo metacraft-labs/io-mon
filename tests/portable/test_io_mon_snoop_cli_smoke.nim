@@ -15,8 +15,10 @@ import io_mon  # writeCanonical, MonitorRecord, observation kinds
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
-  hooksSrc = repoRoot.parentDir() / "nim-stackable-hooks" / "src"
   snoopSrc = repoRoot / "cmd" / "io_mon_snoop.nim"
+
+let hooksSrc = getEnv("STACKABLE_HOOKS_SRC",
+  repoRoot.parentDir() / "nim-stackable-hooks" / "src")
 
 proc run(cmd: string; args: seq[string]):
     tuple[output: string; code: int] =
