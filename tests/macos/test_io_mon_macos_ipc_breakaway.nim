@@ -28,9 +28,10 @@
 ##   3. TRUSTED DAEMON: a cooperating daemon that reports its reads keeps the
 ##      build `mcComplete` AND the daemon-read file appears in the depfile.
 ##
+## No mocks: real daemons, sockets, compiler and shim.
 ## macOS-only; a no-op pass elsewhere.
 
-import std/[os, osproc, streams, strtabs, unittest]
+import std/[os, osproc, streams, strtabs, strutils, unittest]
 
 when defined(macosx):
   import io_mon
@@ -55,15 +56,18 @@ when defined(macosx):
       quoteShell(src) & " -o " & quoteShell(bin))
     doAssert code == 0, "cc failed (" & src & "): " & output
 
-  proc waitForFile(path: string; timeoutMs = 5000): bool =
+  proc waitForFile(path: string; timeoutMs = 5000; expectedPid = 0): bool =
     ## Poll until `path` exists (a daemon writes its ready file after listen()).
+    proc isReady(): bool =
+      fileExists(path) and (expectedPid == 0 or
+        readFile(path).strip() == $expectedPid)
     var waited = 0
     while waited < timeoutMs:
-      if fileExists(path):
+      if isReady():
         return true
       sleep(25)
       waited += 25
-    fileExists(path)
+    isReady()
 
   proc shimEnv(shim, fragmentDir: string): StringTableRef =
     ## Environment that runs a child UNDER the shim with direct DYLD injection and
@@ -111,12 +115,21 @@ suite "io-mon macOS IPC / daemon-over-socket breakaway (T3a, break #1)":
 
     proc startPlainDaemon(sock, ready: string): Process =
       ## Start daemon.c OUTSIDE the shim (the test process carries no DYLD inject).
-      ## daemon.c writes its readiness to the fixed /tmp/adv_proctree/daemon.ready.
-      createDir("/tmp/adv_proctree")
+      ## Readiness belongs to this process's private test directory. A shared
+      ## /tmp marker races other suites and may belong to another runner user.
       removeFile(ready)
-      result = startProcess(daemonBin, args = @[sock],
+      result = startProcess(daemonBin, args = @[sock, ready],
         options = {poStdErrToStdOut})
-      doAssert waitForFile(ready), "daemon did not become ready"
+      if not waitForFile(ready, expectedPid = result.processID):
+        result.terminate()
+        if result.waitForExit(5000) == -1:
+          result.kill()
+          discard result.waitForExit()
+        let output = result.outputStream.readAll()
+        result.close()
+        doAssert false, "daemon did not become ready: " & output
+      doAssert readFile(ready).strip() == $result.processID,
+        "readiness must identify the daemon this test started"
 
     proc quitDaemon(sock: string; daemon: Process) =
       ## Graceful shutdown: a __QUIT__ request is processed only AFTER the daemon
@@ -128,7 +141,7 @@ suite "io-mon macOS IPC / daemon-over-socket breakaway (T3a, break #1)":
       daemon.close()
 
     test "REGRESSION: adv_proctree escape now downgrades to mcIncomplete":
-      let ready = "/tmp/adv_proctree/daemon.ready"
+      let ready = work / "daemon.ready"
       let sock = work / "regress.sock"
       let inputA = work / "inputA.txt"
       writeFile(inputA, "secret-input-A-distinct-bytes\n")
@@ -150,7 +163,7 @@ suite "io-mon macOS IPC / daemon-over-socket breakaway (T3a, break #1)":
       check depA.completeness == mcIncomplete
 
     test "false-cache-hit demo closed: two different daemon inputs both re-run":
-      let ready = "/tmp/adv_proctree/daemon.ready"
+      let ready = work / "daemon.ready"
       let inputA = work / "inA.txt"
       let inputB = work / "inB.txt"
       writeFile(inputA, "AAAA-distinct\n")

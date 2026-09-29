@@ -42,3 +42,11 @@ runtime tool in `scripts/build_shim.sh`; its failure is treated as a non-glibc
 host. Supply pinned glibc's getconf to both the shim action and tests that
 build their own shims. The graph reports 60 successful actions, one failed
 and 59 blocked; these are not new results for the nested-monitor tests.
+
+The direct controls from `36542453553` are not yet a clean comparison of outer
+monitoring. The host compile evidence reads shared-memory source
+`c646982` (`/nix/store/x67xglpx2nnyz6dff8iqd1jp9whp349h-source`, layout 3),
+while the direct control shell prefers sibling `cf0adf2` (layout 1) for the
+private shims it builds. Diagnostic `36549278937` checks matched sources and
+deliberately mismatched sources before attributing empty host captures to a
+monitoring defect. No production capture assertion is relaxed.

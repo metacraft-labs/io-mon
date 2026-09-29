@@ -89,9 +89,9 @@ when defined(linux):
 
 package io_mon:
   # Keep this declaration directly in the package body: the DSL recognizes
-  # it before Nim evaluates platform branches. Windows uses env.ps1's tools;
-  # POSIX development commands realize the declared tools through Nix.
-  defaultToolProvisioning(when defined(windows): path else: nix)
+  # it before Nim evaluates platform branches. Windows realizes declared
+  # release archives; POSIX development commands use Nix.
+  defaultToolProvisioning(when defined(windows): tarball else: nix)
 
   uses:
     # Toolchain floor — mirrors ``io_mon.nimble``'s ``requires "nim >= 2.0.0"``

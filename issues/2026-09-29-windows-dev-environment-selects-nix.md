@@ -38,3 +38,15 @@ as well as its arbitrary dev-environment commands before closing this issue.
 
 The local macOS check did not compile the Windows-only branch and therefore
 did not expose the error. The issue is reopened from history, not duplicated.
+
+## Archive provisioning required at `31b7f72`
+
+Windows job
+[109333051380](https://github.com/metacraft-labs/io-mon/actions/runs/36546120504/job/109333051380)
+passes the complete graph and repeated isolated tests, then `dev-exec just
+build` fails with `Requested command not found: 'just'`. Declaring Just is
+insufficient in PATH mode: this worker does not have it. Both the recipe
+default and direct Windows CI commands now use the declared archive tool
+store, while POSIX retains Nix. Select the source bootstrap that retains its
+Windows lease daemon and the Reprobuild catalog with the Windows sleep tool.
+No cross-check is removed.
