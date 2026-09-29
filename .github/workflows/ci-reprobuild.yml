@@ -172,7 +172,7 @@ jobs:
         if: matrix.os == 'macos' || matrix.os == 'linux'
         shell: bash
         env:
-          EXPECTED_ISOLATED_TESTS: ${{ matrix.os == 'macos' && '42' || '6' }}
+          EXPECTED_ISOLATED_TESTS: ${{ matrix.os == 'macos' && '42' || '7' }}
         run: |
           dev-exec repro build --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }} .#test-monitor-isolation --write-report=build/monitor-isolation-repeat.json
           "$REPROBUILD_BOOTSTRAP_PYTHON" - <<'PYCODE'

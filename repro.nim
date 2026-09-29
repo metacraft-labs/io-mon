@@ -280,7 +280,7 @@ package io_mon:
       # Monitor-Hook-Shim.md / Failure Semantics permits this disposition.
       # macOS fixtures also install their own interposers. A distinct outer
       # dylib can recurse during dyld initialization, before main is reached.
-      # Linux's five nested-monitor programs must also own their transport and
+      # Linux's nested-monitor programs must also own their transport and
       # loader closure: an outer shared-memory session defeats file-transport
       # fixtures and adds a second shim to the loader comparison.
       let isolatesMonitor = (defined(macosx) and (
@@ -294,6 +294,7 @@ package io_mon:
           "test_io_mon_host_session_scope.nim"])) or
         (defined(linux) and source.extractFilename in [
           "test_io_mon_cli_exit_status.nim",
+          "test_io_mon_dep_identity_scope.nim",
           "test_io_mon_host_session_scope.nim",
           "test_io_mon_evidence_scope_older_shim.nim",
           "test_io_mon_evidence_scope_shim_gate.nim",
