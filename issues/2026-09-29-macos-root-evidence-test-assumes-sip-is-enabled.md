@@ -34,3 +34,20 @@ Local verification at `e76aa8c` plus the fixture repair passes all six cases on
 macOS with SIP enabled. Replacing the expected-root PID with the legacy zero
 value makes the new uninjected-child control fail, demonstrating that it
 exercises the missing-evidence guard. Hosted disabled-SIP execution is pending.
+
+## Spawn and system-child fixtures
+
+Hosted job `109383371674` at `a33714c` independently reports SIP disabled and
+passes the repaired root-evidence cases. The next failure is the plain-spawn
+`/bin/cat` case in `test_io_mon_macos_setexec`: capture is complete but the
+fixture assumes an uninjectable child. Its SETEXEC case still reports incomplete,
+so a global SIP flag alone cannot establish the expected result for every launch
+mode. `test_io_mon_macos_sip_system_child` makes the same unconditional assumption.
+
+Use a separate benign constructor dylib, with no io-mon code or hooks, to
+measure injection for each real launch mode. Require its parent marker and
+successful child exit, then derive the system-child expectation from the
+independently observed target marker. Retain every drop-in capture assertion and
+the unconditional uninjected-root negative control. A mismatch between this
+probe and monitored capture is a failure requiring investigation, not a skip.
+Run the three fixtures on protected local macOS and disabled-SIP hosted macOS.
