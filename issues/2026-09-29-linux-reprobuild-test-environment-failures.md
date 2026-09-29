@@ -66,3 +66,10 @@ non-cacheable execution disposition to these five programs, then validate the
 complete graph, a second execution and a monitored negative control using
 identical test binaries and dependency sources. This verification remains
 pending; the source-pair result alone does not prove the disposition.
+
+Full graph diagnostic `36551504711` at `eb4451a` passes 123 of 124 actions.
+The loader-closure program reaches its startup-object reopening case, where
+the `ldd | grep | head` pipeline fails with `grep: command not found`.
+Declare the pinned grep package and attach it to Linux execution actions.
+The diagnostic stops before its repeat and negative-control stages, so these
+remain pending. No capture assertion or fixture binary is changed.

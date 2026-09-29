@@ -50,3 +50,12 @@ default and direct Windows CI commands now use the declared archive tool
 store, while POSIX retains Nix. Select the source bootstrap that retains its
 Windows lease daemon and the Reprobuild catalog with the Windows sleep tool.
 No cross-check is removed.
+
+At `eb4451a`, Windows job `109349391811` completes setup and archive-provisioned
+build, then fails only the host-session test program in the 91-action graph.
+Its private production-shim build calls Bash, which reports `dirname: command
+not found` and `mkdir: command not found`. A Windows cmd built-in does not
+supply those commands to Bash. Declare the pinned `install-file` provider on
+Windows and on the shim/test actions: its PortableGit `usr/bin` supplies the
+GNU utilities, as in Reprobuild's existing runtime-closure packaging graph.
+Keep the real private source build and every session/capture assertion.

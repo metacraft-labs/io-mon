@@ -83,6 +83,8 @@ import ct_test_nim_unittest
 
 when defined(macosx):
   import ./repro_support/cctools
+when defined(windows):
+  import repro_dsl_stdlib/packages/coreutils_install
 when defined(linux):
   import ./repro_support/getconf
   import ./repro_support/strace
@@ -104,6 +106,10 @@ package io_mon:
     "sh"
     "bash >=4"
     "mkdir"
+    when defined(windows):
+      # PortableGit's usr/bin contains the real mkdir/dirname used by Bash.
+      # cmd.exe's built-in mkdir does not satisfy that script dependency.
+      "install-file"
     when not defined(windows):
       "dirname"
       "uname"
@@ -112,6 +118,7 @@ package io_mon:
       "cctools"
     when defined(linux):
       "getconf"
+      "grep"
       "nm"
       "strace"
     # The C-family compiler ``nim c`` shells out to for the C backend. macOS
@@ -191,6 +198,8 @@ package io_mon:
     # isolated PATH. A package-level uses entry alone does not expose them.
     appendRegisteredActionToolIdentityRefs(shimBuild.id,
       ["bash", "nim", backendCompiler, "mkdir"])
+    when defined(windows):
+      appendRegisteredActionToolIdentityRefs(shimBuild.id, ["install-file"])
     when not defined(windows):
       appendRegisteredActionToolIdentityRefs(shimBuild.id, ["dirname", "uname"])
     when defined(macosx):
@@ -318,13 +327,16 @@ package io_mon:
       # Tests compile real child programs and shims, including shell fixtures.
       appendRegisteredActionToolIdentityRefs(executeEdge.id,
         ["nim", backendCompiler, "sh", "bash", "mkdir"])
+      when defined(windows):
+        appendRegisteredActionToolIdentityRefs(executeEdge.id, ["install-file"])
       when not defined(windows):
         appendRegisteredActionToolIdentityRefs(executeEdge.id,
           ["dirname", "uname", "rustc"])
       when defined(macosx):
         appendRegisteredActionToolIdentityRefs(executeEdge.id, ["cctools"])
       when defined(linux):
-        appendRegisteredActionToolIdentityRefs(executeEdge.id, ["strace", "nm", "getconf"])
+        appendRegisteredActionToolIdentityRefs(executeEdge.id,
+          ["strace", "nm", "getconf", "grep"])
       executeActions.add(executeEdge)
 
     # Portable tests — always in the graph.

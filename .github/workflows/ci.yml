@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main, dev, stable, io-mon-fixes]
   pull_request:
@@ -20,9 +22,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  choose-linux:
+    # The shared CI_RUNNER_MODE policy selects free hosted runners for public
+    # repos by default and preserves the org-controlled self-hosted fallback.
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: ubuntu-24.04
+      fallback: '["self-hosted","linux","x64"]'
+
   lint:
+    needs: choose-linux
     name: Lint
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ${{ fromJSON(needs.choose-linux.outputs.runs_on) }}
     steps:
       - name: Generate CI token
         id: app-token
@@ -58,8 +69,9 @@ jobs:
           retention-days: 30
 
   build:
+    needs: choose-linux
     name: Build
-    runs-on: ${{ matrix.runs-on }}
+    runs-on: ${{ matrix.slug == 'linux-x64' && fromJSON(needs.choose-linux.outputs.runs_on) || matrix.runs-on }}
     strategy:
       fail-fast: false
       matrix:
@@ -104,8 +116,9 @@ jobs:
           retention-days: 30
 
   test:
+    needs: choose-linux
     name: Test
-    runs-on: ${{ matrix.runs-on }}
+    runs-on: ${{ matrix.slug == 'linux-x64' && fromJSON(needs.choose-linux.outputs.runs_on) || matrix.runs-on }}
     strategy:
       fail-fast: false
       matrix:
