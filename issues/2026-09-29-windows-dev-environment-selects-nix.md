@@ -59,3 +59,16 @@ supply those commands to Bash. Declare the pinned `install-file` provider on
 Windows and on the shim/test actions: its PortableGit `usr/bin` supplies the
 GNU utilities, as in Reprobuild's existing runtime-closure packaging graph.
 Keep the real private source build and every session/capture assertion.
+
+## Shell lookup at `c88183bf`
+
+[Windows job 109427598548](https://github.com/metacraft-labs/io-mon/actions/runs/36574798134/job/109427598548)
+now reaches the last of 91 actions but the host-session fixture's private shim
+build launches the Windows System32 Bash stub. Its assertion contains the real
+WSL diagnostic: no installed distributions. The declared PortableGit tools are
+present; Windows shell executable lookup gives System32 precedence when the
+command string starts with bare `bash`. Resolve `findExe("bash")` from the
+provisioned PATH, require a result, and quote that full executable path before
+calling `execCmdEx`, matching RunQuota's verified correction. Keep the real
+production build and both capture/session assertions. This extends the existing
+provisioning issue rather than creating a duplicate.
