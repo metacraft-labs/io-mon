@@ -26,3 +26,10 @@ Do not relax capture completeness, golden comparisons, or file assertions.
 
 Refreshed dev `9c1d52b`, merged it into the candidate, and searched current and
 deleted issues for strace, provisioning, fixture outputs and outer shims.
+
+Diagnostic `36539293111` at `179f925` builds the product with Nix provisioning,
+then refuses the test graph because `strace` has no `nixPackage` declaration.
+The selected Reprobuild stdlib has no strace recipe. Declare its pinned Nix
+realization in `repro_support/strace.nim`, following the existing cctools
+declaration. This is a missing consumer tool definition; the diagnostic did not
+compile or execute the tests and supplies no new nested-monitor evidence.

@@ -83,6 +83,8 @@ import ct_test_nim_unittest
 
 when defined(macosx):
   import ./repro_support/cctools
+when defined(linux):
+  import ./repro_support/strace
 
 package io_mon:
   # Keep this declaration directly in the package body: the DSL recognizes
