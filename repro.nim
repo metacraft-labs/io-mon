@@ -97,6 +97,7 @@ package io_mon:
     # bash script) and is the tool every ``shell(...)`` edge invokes.
     "nim >=2.0"
     "nimble"
+    "just"
     "sh"
     "bash >=4"
     "mkdir"

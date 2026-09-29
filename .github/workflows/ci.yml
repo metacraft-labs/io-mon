@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@6d607047dc8b99753f1b16cf37982506de65b373
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
@@ -85,7 +85,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@6d607047dc8b99753f1b16cf37982506de65b373
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
@@ -134,11 +134,11 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@6d607047dc8b99753f1b16cf37982506de65b373
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
         with:
           env-flavor: ${{ matrix.env }}
           repro-from-source: ${{ matrix.env == 'reprobuild' }}
-          repro-build-pin: e8804eb367f979c810cc440b901a9506f23b9ae5
+          repro-build-pin: 90dc43218b00f2a1a7de94c174fb849f21b3a377
           gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: Run tests
@@ -146,7 +146,7 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.env }}" = "reprobuild" ]; then
-            repro test 2>&1 | tee test.log
+            dev-exec repro test --tool-provisioning=nix 2>&1 | tee test.log
           else
             dev-exec just test 2>&1 | tee test.log
           fi
