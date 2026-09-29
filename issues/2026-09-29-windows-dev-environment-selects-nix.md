@@ -91,3 +91,9 @@ The log also records a separate bootstrap source root inside the product
 checkout alongside workspace siblings outside it. A Windows control will
 record their actual revisions before deciding whether source selection needs
 a separate repair; the quoting diagnosis alone does not establish that.
+
+At `9529c44` plus the quoting repair, a local real `just build` completes both
+shim and CLI builds with `STACKABLE_HOOKS_SRC=/tmp/io mon hook sources/src`.
+The old Justfile fails the same path before compilation (`mon: command not
+found`, exit 127). The repository lint passes. A native Windows control is
+still required for backslash paths and the source-bootstrap environment.
