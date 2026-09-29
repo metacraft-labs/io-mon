@@ -5,7 +5,7 @@ name: CI (reprobuild)
 # existing `ci.yml` (`nix`) so regressions in either path still gate
 # merges — see
 # `metacraft-dev-guidelines/policies/ci-workflow-standards.md`
-# (`repro build` / `repro test` run on all five platforms) and
+# (all supported hosts, plus the manual Linux ARM64 port diagnostic) and
 # `metacraft-dev-guidelines/policies/ci-shared-dev-env.md` for the
 # rollout shape.
 #
@@ -16,6 +16,12 @@ name: CI (reprobuild)
 # recipe in `repro.nim` end-to-end on every supported host.
 
 on:
+  workflow_dispatch:
+    inputs:
+      linux-arm64:
+        description: Include the unfinished Linux ARM64 backend diagnostic
+        type: boolean
+        default: false
   push:
     branches: [main, dev, stable]
   pull_request:
@@ -32,22 +38,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Linux ARM64 is an unfinished port, deferred from 0.1.0 by the user.
+        # Manual diagnostics retain the complete build/test job and assertions.
         include:
-          - os: linux
-            arch: x64
-            runner: [self-hosted, linux, x64]
-          - os: linux
-            arch: arm64
-            runner: [self-hosted, linux, arm64]
-          - os: macos
-            arch: arm64
-            runner: [self-hosted, macos, arm64]
-          - os: windows
-            arch: x64
-            runner: [self-hosted, windows, x64]
-          - os: windows
-            arch: arm64
-            runner: [self-hosted, windows, arm64]
+          ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.linux-arm64 &&
+          '[{"os":"linux","arch":"x64","runner":["self-hosted","linux","x64"]},{"os":"macos","arch":"arm64","runner":["self-hosted","macos","arm64"]},{"os":"windows","arch":"x64","runner":["self-hosted","windows","x64"]},{"os":"windows","arch":"arm64","runner":["self-hosted","windows","arm64"]},{"os":"linux","arch":"arm64","runner":["self-hosted","linux","arm64"]}]' ||
+          '[{"os":"linux","arch":"x64","runner":["self-hosted","linux","x64"]},{"os":"macos","arch":"arm64","runner":["self-hosted","macos","arm64"]},{"os":"windows","arch":"x64","runner":["self-hosted","windows","x64"]},{"os":"windows","arch":"arm64","runner":["self-hosted","windows","arm64"]}]') }}
     # Temporary native Linux ARM64 migration for this build/test job; owner: zah.
     # Follow-up: metacraft-specs/issues/2026-09-28-release-linux-arm64-runner-migration.md
     runs-on: ${{ contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner }}

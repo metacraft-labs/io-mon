@@ -37,8 +37,9 @@ the completeness assertions.
 [Architecture: Correctness Contract](../docs/contributors/architecture.md)
 requires uncertainty to remain incomplete. The
 [approved release scope](../../metacraft-specs/infrastructure/gosti-io-mon-runquota-releases.md)
-includes native Linux ARM64 and requires existing product checks before
-publication; only Windows ARM64 was explicitly deferred. A release smoke
+defers Linux ARM64 from io-mon 0.1.0 by the user's 2026-09-29 decision.
+This issue stays open for that future port; all included release targets still
+require their existing product checks before publication. A release smoke
 that finds one read event cannot substitute for the full backend gates.
 
 Repair ARM64 syscall numbers and independently validate raw classification,

@@ -7,7 +7,7 @@ Update both `uses` and `tooling-ref` together when changing shared tooling.
 
 ## Targets and checks
 
-Linux x86_64/aarch64, macOS ARM64, and Windows x86_64 are built and
+Linux x86_64, macOS ARM64, and Windows x86_64 are built and
 executed on matching runners. Linux archives and deb/rpm packages are exercised
 in Debian 11, Ubuntu 24.04 and AlmaLinux 9 containers without the Nix store.
 Every archive is extracted away from the source tree and checked for native
@@ -16,7 +16,7 @@ architecture, runtime dependencies and functional behavior.
 Windows ARM64 is deferred by the 2026-09-28 release decision: its inline hook
 backend will be developed separately on Windows.
 
-The archive includes the CLI and matching monitor shim. The smoke check runs a native child, verifies real input/output file events, and preserves the child exit code. Intel macOS needs a separate monitor port; see `issues/2026-09-28-intel-macos-shim-refuses-mmap.md`.
+The archive includes the CLI and matching monitor shim. The smoke check runs a native child, requires complete capture with zero event loss, verifies real input/output file events, and preserves the child exit code. Intel macOS needs a separate monitor port; see `issues/2026-09-28-intel-macos-shim-refuses-mmap.md`.
 
 Each target emits JSON evidence naming the source commit, pinned dependency
 revisions, smoke result, signing state and artifact hashes. The assembly step
@@ -27,12 +27,12 @@ remains false. Later versions must update the policy explicitly or use OS
 signatures and a verified Sigstore checksum-manifest signature. The shared Linux
 package publisher retains its existing package and repository signatures.
 
-Linux ARM64 temporarily uses the native `ubuntu-24.04-arm` runner for version
-0.1.0 while migration to the self-hosted Tart class is unfinished. The inventory
-names owner `zah` and the [return-to-fleet follow-up](https://github.com/metacraft-labs/metacraft-specs/blob/latest/issues/2026-09-28-release-linux-arm64-runner-migration.md).
-Native execution checks still apply. A later version cannot inherit this
-exception silently; return to `[self-hosted, linux, arm64]` when the fleet
-proof passes.
+Linux ARM64 is deferred from version 0.1.0 by the 2026-09-29 release decision.
+Its syscall backend remains tracked in
+[`issues/2026-09-29-linux-arm64-syscall-backend-is-incomplete.md`](../issues/2026-09-29-linux-arm64-syscall-backend-is-incomplete.md).
+The manual **CI (reprobuild)** dispatch can include the full ARM64 port diagnostic.
+Adding that release target requires complete native capture with zero event loss
+and a passing full native suite.
 
 ## Release sequence
 
@@ -53,7 +53,7 @@ proof passes.
    before publication. A retry refuses any differing existing asset.
 5. Track the dispatched `publish-release` run in
    [metacraft-desktop-packages](https://github.com/metacraft-labs/metacraft-desktop-packages/actions/workflows/publish-release.yaml).
-   Verify both architectures in the live apt and RPM indices and install from
+   Verify x86_64 in the live apt and RPM indices and install from
    those repositories in clean environments. The producer carries no package
    repository keys or bucket credentials.
 6. Download the published archives, verify `SHA256SUMS` (and its Sigstore bundle for signed releases),
