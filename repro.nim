@@ -293,6 +293,7 @@ package io_mon:
           "test_io_mon_cli_evidence_scope.nim",
           "test_io_mon_host_session_scope.nim"])) or
         (defined(linux) and source.extractFilename in [
+          "test_io_mon_shared_producer_growth.nim",
           "test_io_mon_cli_exit_status.nim",
           "test_io_mon_dep_identity_scope.nim",
           "test_io_mon_host_session_scope.nim",
