@@ -17,10 +17,13 @@ on:
 # Environment` with "No workspace lock for io-mon" — the lock existed, just not
 # on the pinned branch. `ci-reprobuild.yml` was never pinned and resolves fine.
 
-# Cancel superseded PR checks while preserving every mainline run.
+# Cancel superseded PR runs only: a new push to a PR makes its previous run
+# moot, and stale runs otherwise hold scarce self-hosted runners. Every other
+# event (mainline push, merge_group, tag, dispatch, schedule) gets a group
+# unique to its run_id, so it is never cancelled and never cancels anything.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   choose-macos:
