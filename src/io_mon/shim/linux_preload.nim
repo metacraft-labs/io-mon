@@ -152,6 +152,7 @@ var
 #define _GNU_SOURCE
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <stddef.h>
 #include <netinet/in.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
@@ -247,6 +248,46 @@ long repro_linux_socket_peer_pid(int fd) {
   if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0)
     return (long)cred.pid;
   return 0;
+}
+
+long repro_linux_socket_peer_uid(int fd) {
+  struct ucred cred;
+  socklen_t len = sizeof(cred);
+  if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0)
+    return (long)cred.uid;
+  return -1;
+}
+
+/* The AF_UNIX address a client dialled, as text: the filesystem path, or
+   "@<name>" for an abstract-namespace address (leading NUL). Returns the
+   length written (excluding the terminator), 0 for an unnamed or non-AF_UNIX
+   address. Never reads past `addrlen`. */
+int repro_linux_sockaddr_un_path(void *addr, unsigned int addrlen,
+                                 char *out, int cap) {
+  if (addr == NULL || out == NULL || cap < 2) return 0;
+  if (addrlen <= sizeof(sa_family_t)) return 0;
+  struct sockaddr_un *un = (struct sockaddr_un *)addr;
+  if (un->sun_family != AF_UNIX) return 0;
+  size_t avail = addrlen - offsetof(struct sockaddr_un, sun_path);
+  if (avail > sizeof(un->sun_path)) avail = sizeof(un->sun_path);
+  int n = 0;
+  size_t i = 0;
+  if (avail > 0 && un->sun_path[0] == '\0') {
+    out[n++] = '@';
+    i = 1;
+    for (; i < avail && n < cap - 1; i++) {
+      char c = un->sun_path[i];
+      out[n++] = (c == '\0') ? '@' : c;
+    }
+  } else {
+    for (; i < avail && n < cap - 1; i++) {
+      char c = un->sun_path[i];
+      if (c == '\0') break;
+      out[n++] = c;
+    }
+  }
+  out[n] = '\0';
+  return n;
 }
 
 int repro_linux_fd_identity_kind(int fd, unsigned long *dev,
@@ -717,6 +758,11 @@ proc c_sockaddr_family(address: pointer; addrLen: uint32): cint
   {.importc: "repro_linux_sockaddr_family", raises: [].}
 proc c_socket_peer_pid(fd: cint): clong
   {.importc: "repro_linux_socket_peer_pid", raises: [].}
+proc c_socket_peer_uid(fd: cint): clong
+  {.importc: "repro_linux_socket_peer_uid", raises: [].}
+proc c_sockaddr_un_path(address: pointer; addrLen: uint32; buf: ptr char;
+                        cap: cint): cint
+  {.importc: "repro_linux_sockaddr_un_path", raises: [].}
 proc c_fd_identity_kind(fd: cint; dev, ino: ptr uint64; kind: ptr cint): cint
   {.importc: "repro_linux_fd_identity_kind", raises: [].}
 proc c_fd_proc_path(fd: cint; buf: pointer; len: csize_t): cint
@@ -2258,6 +2304,8 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32) {.raises: [].
   if family == 0:
     return
   var peerPid: uint64 = 0
+  var peerUid: clong = -1
+  var endpoint = ""
   var familyName = "af_other"
   case family
   of 1: # AF_UNIX
@@ -2265,6 +2313,17 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32) {.raises: [].
     let pid = c_socket_peer_pid(fd)
     if pid > 0:
       peerPid = uint64(pid)
+    peerUid = c_socket_peer_uid(fd)
+    # The address the client DIALLED. On a socket-activated host every peer is
+    # the activator (pid 1), so the pid cannot say which service was reached;
+    # the endpoint can, and it is what a daemon trust declaration names
+    # (reprobuild Dev-Env-Warm-Entry.md §3). Carried in `path`, where the macOS
+    # shim already records its endpoint.
+    var buf: array[256, char]
+    let n = c_sockaddr_un_path(address, addrLen, addr buf[0], cint(buf.len))
+    if n > 0:
+      endpoint = newString(n)
+      copyMem(addr endpoint[0], addr buf[0], n)
   of 2, 10: # AF_INET / AF_INET6
     familyName = "af_inet"
   else:
@@ -2273,8 +2332,10 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32) {.raises: [].
   var record = baseRecord(mrIpcConnect, moIpcConnect)
   record.childOsPid = peerPid
   record.result = int64(fd)
+  record.path = endpoint
   record.detail = "connect " & familyName &
-    (if peerPid == 0: " peer=unknown" else: " peer=" & $peerPid)
+    (if peerPid == 0: " peer=unknown" else: " peer=" & $peerPid) &
+    (if peerUid >= 0: " peeruid=" & $peerUid else: "")
   emitRecord(record)
 
 proc repro_hook_connect*(ctx: var ConnectContext) {.raises: [].} =

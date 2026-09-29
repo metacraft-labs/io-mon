@@ -1,4 +1,5 @@
-import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
+import std/[net, os, osproc, sequtils, streams, strtabs, strutils, unittest]
+from std/posix import getuid
 
 import io_mon
 
@@ -114,6 +115,74 @@ int main(int argc, char **argv) {
     let dep = readMonitorDepFile(depfile)
     check dep.completeness == mcComplete
     check dep.records.anyIt(it.kind == mrFileRead and marker in it.path)
+
+  test "an AF_UNIX connect records the dialled path and the peer uid":
+    # reprobuild Dev-Env-Warm-Entry.md §3. On a socket-activated host the peer
+    # pid of every service is the activator (pid 1), so the pid alone cannot
+    # say which service a client reached. The dialled path can, and the peer
+    # uid is what a root-owned-endpoint trust needs. Both must come from the
+    # real shim hook, not only from hand-built records.
+    let snoopBin = work / "io-mon-connect"
+    let cli = run("nim", @[
+      "c", "--hints:off", "--warnings:off", "--threads:on",
+      "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+      "--out:" & snoopBin, snoopSrc])
+    checkpoint(cli.output)
+    check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let client = buildC(work, "unix_client", """
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) return 2;
+  struct sockaddr_un a;
+  memset(&a, 0, sizeof(a));
+  a.sun_family = AF_UNIX;
+  strncpy(a.sun_path, argv[1], sizeof(a.sun_path) - 1);
+  if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) return 3;
+  close(fd);
+  return 0;
+}
+""")
+    # The listener lives in THIS process, outside the monitored tree. The
+    # kernel completes the connect from the listen backlog, so no accept() is
+    # needed for the client's connect(2) to succeed.
+    let sockPath = work / "peer.sock"
+    if fileExists(sockPath): removeFile(sockPath)
+    let server = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP)
+    server.bindUnix(sockPath)
+    server.listen()
+    defer: server.close()
+
+    let depfile = work / "connect.iomon"
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", client,
+      sockPath], childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    let connects = dep.records.filterIt(it.kind == mrIpcConnect)
+    check connects.len == 1
+    if connects.len == 1:
+      check connects[0].path == sockPath
+      check connects[0].childOsPid == uint64(getCurrentProcessId())
+      check (" peeruid=" & $getuid()) in connects[0].detail
+    # The peer is outside the tree, so the capture is incomplete, and the loss
+    # text names the endpoint and the uid.
+    check dep.completeness != mcComplete
+    let losses = unmonitoredSubtreeLossDetails(dep.records)
+    check losses.anyIt(it.endsWith(" path=" & sockPath) and
+      (" peeruid=" & $getuid() & " ") in it)
 
   test "relative writes follow a process chdir":
     let snoopBin = work / "io-mon"

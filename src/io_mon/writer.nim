@@ -1801,6 +1801,7 @@ const
   StartTimeToken = "start"          ## process-start: this pid's kernel start usec
   ChildStartTimeToken = "childstart" ## spawn: the CHILD pid's kernel start usec
   PeerStartTimeToken = "peerstart"  ## ipc-connect: the PEER pid's kernel start usec
+  PeerUidToken = "peeruid"          ## ipc-connect: the PEER's uid (SO_PEERCRED)
   RunIdToken = "run"                ## process-start / ipc-connect: invocation run id
   NonceToken = "nonce"              ## ipc-connect: per-connection nonce (R8)
   ChanToken = "chan"                ## ROUND-3 S1: external-content channel class
@@ -2148,13 +2149,24 @@ proc unmonitoredSubtreeLossDetails*(records: openArray[MonitorRecord];
           (childIsMonitored(peer, peerStart, startIdents, startPids) or
            peer in trustedPeerPids):
         continue
-      let key = if peer != 0: "pid:" & $peer & "@" & peerStart
-                else: "dest:" & r.path
+      # The ENDPOINT is part of the key whenever it is known. On a
+      # socket-activated host every service's peer is the activator (pid 1),
+      # so a pid-only key collapsed connections to DIFFERENT services into one
+      # loss, and a consumer that forgives one endpoint (a trusted daemon's)
+      # would thereby have forgiven the others. Keyed per endpoint, each one
+      # stays its own loss and is judged on its own.
+      let key =
+        if peer != 0:
+          "pid:" & $peer & "@" & peerStart &
+            (if r.path.len > 0: "|dest:" & r.path else: "")
+        else: "dest:" & r.path
       if key in flaggedPeers:
         continue
       flaggedPeers.incl key
+      let peerUid = trustedDetailToken(r.detail, PeerUidToken)
       result.add("ipc peer outside monitored tree pid=" & $r.osPid &
         " peer=" & $peer & " peerstart=" & peerStart &
+        (if peerUid.len > 0: " peeruid=" & peerUid else: "") &
         " path=" & r.path)
 
 proc unmonitoredSubtreeLossCount*(records: openArray[MonitorRecord];
