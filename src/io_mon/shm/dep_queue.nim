@@ -230,9 +230,17 @@ func depIdentityScope*(kind: MonitorRecordKind): DepIdentityScope =
   ## fact still appears in the depfile; it appears once instead of once per
   ## process. `summary.processCount` is derived from any record with a non-zero
   ## `osPid` and every monitored process emits its own `mrProcessStart`, so the
-  ## process census is unchanged. The macOS and Windows arms travel the
-  ## `.iomon-frag` FILE writer, which encodes every field verbatim and never
-  ## consults this function, so this is a Linux set-transport change only.
+  ## process census is unchanged.
+  ##
+  ## THIS USED TO SAY "a Linux set-transport change only", AND DA-10 MADE THAT
+  ## FALSE. The macOS and Windows arms do still travel the `.iomon-frag` FILE
+  ## writer, which encodes every field verbatim — but `writer.mergeFragments`
+  ## now calls `writer.foldObservationIdentity`, which consults THIS function
+  ## (through `depIdentityKeepsIncarnation`) on every merge, on every platform.
+  ## The fold it applies there is the FACT-scoped half only: the PATH-scoped
+  ## kinds keep the observer's per-exec incarnation in their set key and the
+  ## fragment writer carries no incarnation coordinate, so their half stays a
+  ## set-transport property. See `foldObservationIdentity` for the argument.
   ##
   ## It is also NOT an attribution claim. Nothing here asserts that a path is
   ## immutable, that a root is content-addressed, or that an observation may be

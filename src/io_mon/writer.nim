@@ -1,4 +1,5 @@
-import std/[atomics, locks, monotimes, os, sets, strutils, tables, times]
+import std/[algorithm, atomics, locks, monotimes, os, sets, strutils, tables,
+            times]
 from io_mon/paths import extendedPath
 
 import io_mon/codec
@@ -2716,6 +2717,138 @@ proc dropStaleRunRecords(records: seq[MonitorRecord];
       detail: "duplicate identity token in fragment record for run " &
         currentRunId)
 
+proc foldObservationIdentity*(records: openArray[MonitorRecord]):
+    seq[MonitorRecord] =
+  ## DA-10 — THE IDENTITY FOLD ON THE FILE/MERGE PATH, so a backend that has no
+  ## set producer stops writing one fact down once per observing process.
+  ##
+  ## WHY THIS EXISTS AT ALL. `encodeDepRecordIdentity` is reached only under
+  ## `setProducerAttached`, which only `linux_preload` ever sets, and
+  ## `appendFragmentRecord`'s file writer encodes `osPid` / `parentOsPid` /
+  ## `threadId` / `childOsPid` verbatim with the record's real `seq`. So every
+  ## backend on the `.iomon-frag` transport — macOS, Windows, and Linux with
+  ## `REPRO_MONITOR_DEP_SHM_DISABLE` set — got NO identity dedup whatsoever.
+  ## MEASURED on the DA-1b fan-out fixture (12 children across two images, one
+  ## shared object, one environment variable), io-mon `9c1d52b`: the SET
+  ## transport yields **1** `library-load` + **1** `env-read` record for the
+  ## marked fact, the FILE transport yields **12 + 12**, both with the same 13
+  ## monitored processes. That is the whole defect, and it is a COST defect: no
+  ## fact was missing, each was simply written down twelve times.
+  ##
+  ## WHICH KINDS ARE FOLDED, AND WHY THE LINE IS EXACTLY THERE. The fold keys on
+  ## `encodeDepSetElement` — DA-1b's element key through DA-1d's SINGLE composer,
+  ## unchanged and reused, not a second opinion about what makes two
+  ## observations the same fact. It is
+  ## applied to exactly the kinds for which `depIdentityKeepsIncarnation` is
+  ## FALSE (the `disFactScoped` four: `mrLibraryLoad`, `mrEnvRead`,
+  ## `mrSysctlRead`, `mrTimeRead`), because those are precisely the kinds whose
+  ## COMPLETE set element key is the identity bytes and nothing else. For every
+  ## other kind `writer.encodeDepSetElement` appends the observer's per-exec
+  ## incarnation (`setElemImage`: the real image path plus the exec generation),
+  ## and the fragment writer carries no incarnation coordinate at all — so the
+  ## SET key is not reconstructible here, and folding without it would collapse
+  ## observations the SET transport deliberately keeps apart. That would be a
+  ## NEW dedup decision DA-1b never took, taken silently, on the platform with
+  ## the least coverage. It is not taken here either.
+  ##
+  ## AND IT GOES THROUGH THE COMPOSER, NOT AROUND IT. DA-1d's whole point is
+  ## that `encodeDepSetElement` is the ONE site that answers "does this kind's
+  ## key carry the observer's incarnation?", enforced by measurement in
+  ## `test_io_mon_dep_set_element_key :: `
+  ## `t_encodeDepRecordIdentity_is_called_from_exactly_one_place`. Calling
+  ## `encodeDepRecordIdentity` directly from here compiled, produced the right
+  ## bytes, and REDDENED that audit — correctly, because it would have made this
+  ## a second site that hard-codes "no incarnation" and could then drift from
+  ## the predicate. Going through the composer instead costs nothing (for a kind
+  ## whose `depIdentityKeepsIncarnation` is false it returns at the identity
+  ## bytes, before `setElemImage` is read at all) and upgrades "these are the
+  ## bytes the SET transport would have produced" from an argument into a shared
+  ## code path. `dseRequireFit` for the same reason the shim's hot path uses it:
+  ## a clipped key can collide with a different record's, and a collision here
+  ## is a dropped fact.
+  ##
+  ## WHY IT DOES NOT WEAKEN LF-1. A record is dropped only when another record
+  ## already in the output encodes to the SAME DA-1b identity key, i.e. the same
+  ## kind, observation kind, path, detail (run stamp included), result, flags and
+  ## probe result, with the observer coordinates ruled incidental FOR THAT KIND
+  ## by an argument that is written out per kind in `depIdentityScope` and tested
+  ## in `test_io_mon_dep_set_element_key`. The fold therefore removes repetition,
+  ## never a fact — and it cannot manufacture an `mcComplete`, because it touches
+  ## no kind any completeness signal reads:
+  ##   * `processStartIdentities` / `monitoredStartPids` /
+  ##     `unmonitoredSubtreeLossDetails` key on `mrProcessStart`, `mrProcessExec`,
+  ##     `mrProcessSpawn`, `mrIpcConnect`;
+  ##   * `externalContentLossCount` on `mrExternalContent`;
+  ##   * `breakawayAuthContext` on `mrIpcConnect` / `mrProcessStart`;
+  ##   * the read-tail net and every corrupt/unreadable/subtree downgrade on
+  ##     `mrEventLoss`.
+  ## All of those are `disProcessScoped`, so `depIdentityKeepsIncarnation` is
+  ## true for them and this proc hands them through untouched. `summarizeRecords`
+  ## derives `processCount` from any record with a non-zero `osPid`, and every
+  ## monitored process emits its own `mrProcessStart`, so the process census does
+  ## not move either — asserted, not argued, by the fan-out fixture's
+  ## `startPids.len >= FanOut + 1`.
+  ##
+  ## AND IT NEVER DROPS A RECORD IT COULD NOT ENCODE. A record whose identity key
+  ## does not fit the buffer, or that does not decode back, is passed through in
+  ## its original form rather than discarded: "unframable" must cost bytes, not
+  ## evidence.
+  ##
+  ## DETERMINISM. A folded record has `osPid = threadId = seq = 0`, so several of
+  ## them can tie in `canonicalOrder`, and fragment files are read in `walkDir`
+  ## order — which is not stable across runs. `fs_snoop`'s set arm already solves
+  ## this by sorting the raw distinct elements before decoding; this does the
+  ## same, over the same bytes, so the folded group lands in a total order and
+  ## the depfile stays byte-reproducible. For a fact-scoped kind the raw set
+  ## element IS the identity key (no incarnation suffix is appended), so the two
+  ## arms sort the same group the same way and a Linux SET capture's bytes are
+  ## unchanged by this proc.
+  ##
+  ## IDEMPOTENT, deliberately: a record that already travelled the SET transport
+  ## is already in identity form, re-encodes to the same key, and survives as
+  ## itself. That is what lets this run unconditionally on every merge instead of
+  ## being gated on a platform — the gate would be the thing that rots.
+  var kept = newSeqOfCap[MonitorRecord](records.len)
+  var firstSeen = initTable[string, MonitorRecord]()
+  var keys: seq[string] = @[]
+  var buf: seq[byte] = @[]
+  for r in records:
+    if depIdentityKeepsIncarnation(r.kind):
+      kept.add r
+      continue
+    # `DepFixedHeaderLen` + two varint length prefixes + the two payloads. A
+    # varint for a length that fits in an `int` never exceeds 10 bytes.
+    let need = DepFixedHeaderLen + 20 + r.path.len + r.detail.len
+    if buf.len < need:
+      buf.setLen(need)
+    let n = encodeDepSetElement(r, buf, dseRequireFit)
+    if n < 0:
+      kept.add r                        # unframable: keep it, never drop it.
+      continue
+    var key = newString(n)
+    for i in 0 ..< n:
+      key[i] = char(buf[i])
+    if firstSeen.hasKey(key):
+      continue
+    firstSeen[key] = r
+    keys.add key
+  keys.sort()
+  result = kept
+  for key in keys:
+    var bytes = newSeq[byte](key.len)
+    for i in 0 ..< key.len:
+      bytes[i] = byte(key[i])
+    var ok = false
+    let decoded = decodeDepRecord(bytes, ok)
+    # Decode from the identity bytes rather than editing the original, so a
+    # folded record is byte-for-byte the record the SET transport would have
+    # delivered for the same fact (`seq = 0`, observer coordinates zeroed,
+    # `result`/`flags` through `identityNormalizedOutcome`) instead of a second
+    # implementation of the same normalisation. A key that does not decode is a
+    # codec bug, not a reason to lose the fact: fall back to the record as it
+    # arrived.
+    result.add (if ok: decoded else: firstSeen[key])
+
 proc mergeFragments*(fragmentDir, outputPath: string;
     breakawayReportDir = ""; expectedRootPid: uint64 = 0;
     currentRunId = "";
@@ -2842,6 +2975,22 @@ proc mergeFragments*(fragmentDir, outputPath: string;
   let runScope =
     if currentRunId.len > 0: currentRunId else: getEnv("REPRO_MONITOR_SESSION")
   records = dropStaleRunRecords(records, runScope)
+  # DA-10 — FOLD THE FACT-SCOPED OBSERVATIONS, whichever transport carried them.
+  # The `.iomon-frag` writer has no dedup step at all, so every backend without a
+  # set producer wrote one record per observing process; `foldObservationIdentity`
+  # applies DA-1b's element key to exactly the kinds whose key needs no
+  # incarnation coordinate. See that proc for the per-kind argument, for why no
+  # completeness signal is reachable from the folded kinds, and for why running it
+  # unconditionally leaves a Linux SET capture's bytes unchanged.
+  #
+  # ORDER: AFTER `dropStaleRunRecords`, and that is load-bearing in both
+  # directions. The run guard keys on `r.osPid` to scope an UNSTAMPED record
+  # through its pid's run-stamped process-starts, and the fold zeroes that pid —
+  # so folding first would make an unstamped fact-scoped record unscopeable and
+  # fold a prior run's evidence into this verdict. BEFORE the synthetic
+  # event-loss / breakaway / subtree passes, because none of them reads a
+  # fact-scoped kind and all of them are cheaper over the smaller set.
+  records = foldObservationIdentity(records)
   if corruptFragments > 0:
     # One synthetic event-loss record per corrupt fragment. ``mrEventLoss``
     # makes ``summarizeRecords`` count event loss, forcing ``mcIncomplete``.
@@ -3067,4 +3216,3 @@ proc mergeFragments*(fragmentDir, outputPath: string;
 
   writeCanonicalInPlace(outputPath, records)
   depFileFromOwnedRecords(move(records))
-
