@@ -271,6 +271,8 @@ package io_mon:
       # inert root unexpectedly reports complete evidence) and interferes with
       # the parked main thread used by the inner injector. All five pass
       # directly at 303e1ef and fail under Reprobuild's monitor at that SHA.
+      # The system-child regression also needs an uninjected baseline: its
+      # outer fixture compares native execution with its own monitored run.
       #
       # Keep their compilation monitored and execute every assertion. The
       # generated depfile orders the known artifacts but does not discover all

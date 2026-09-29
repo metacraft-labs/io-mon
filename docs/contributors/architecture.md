@@ -106,6 +106,11 @@ wants a wider bar still calls `evaluateMonitorEvidence` with its own required-se
 ### Windows
 
 - **Hook Injection**: Hooks APIs using `CreateRemoteThread` and `LoadLibraryW` to inject shims into child processes, mirroring macOS environment variables.
+- **Child architecture**: The x86 shim checks `IsWow64Process2` before child
+  propagation. A native ARM64 child cannot use the x86 injector. It is resumed
+  without injection, with an unsupported-machine spawn diagnostic and missing
+  process-start loss evidence. Its capture remains incomplete; this does not
+  provide a native Windows ARM64 backend.
 
 ---
 
