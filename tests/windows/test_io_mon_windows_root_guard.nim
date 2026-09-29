@@ -39,10 +39,11 @@
 ## ROOT-process completeness guard (mergeFragments)".
 
 import std/[os, tempfiles, unittest]
+import ../helpers/windows_fixture_child
 
 import io_mon
 
-proc runUninitialisedShimRoot(inertShim, cmdExe: string): MonitorResult =
+proc runUninitialisedShimRoot(inertShim: string): MonitorResult =
   ## Monitor a native root under a DLL that loads but never initialises, and
   ## return the evidence. Deliberately assertion-free: `check` inside a plain
   ## `proc` prints "Check failed" and still reports `[OK]`, so every assertion
@@ -57,7 +58,7 @@ proc runUninitialisedShimRoot(inertShim, cmdExe: string): MonitorResult =
   putEnv(ShimLibOverrideEnv, inertShim)
   try:
     result = runMonitored(FsSnoopRequest(
-      command: @[cmdExe, "/c", "exit 0"],
+      command: windowsFixtureCommand(),
       depFilePath: work / "evidence.iomon"))
   finally:
     if hadOverride: putEnv(ShimLibOverrideEnv, oldOverride)
@@ -69,11 +70,9 @@ suite "Windows R1 root-guard (an injected root that reports nothing)":
   test "a root whose shim never initialises grades mcIncomplete":
     let systemRoot = getEnv("SystemRoot", r"C:\Windows")
     let inertShim = systemRoot / "System32" / "kernel32.dll"
-    let cmdExe = systemRoot / "System32" / "cmd.exe"
     require fileExists(inertShim)
-    require fileExists(cmdExe)
 
-    let monitored = runUninitialisedShimRoot(inertShim, cmdExe)
+    let monitored = runUninitialisedShimRoot(inertShim)
 
     # The child really ran…
     check monitored.exitCode == 0

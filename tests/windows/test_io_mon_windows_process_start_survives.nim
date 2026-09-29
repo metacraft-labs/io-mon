@@ -27,16 +27,17 @@ when not defined(windows):
   {.error: "windows-only test".}
 
 import std/[os, strutils, tempfiles, unittest]
+import ../helpers/windows_fixture_child
 
 import io_mon
 import io_mon/fs_snoop
 
 proc monitorSimpleCommand(depFilePath: string): MonitorResult =
-  ## Run the most trivial child we can and collect its evidence. `cmd /c exit`
+  ## Run the most trivial child we can and collect its evidence. The fixture child
   ## spawns nothing of its own, so anything reported here comes from the shim
   ## in the root child -- which is the case that was broken.
   var request = FsSnoopRequest(
-    command: @[getEnv("ComSpec", r"C:\Windows\System32\cmd.exe"), "/c", "exit"],
+    command: windowsFixtureCommand(),
     depFilePath: depFilePath,
     passthroughChildStdout: false,
     passthroughChildStderr: false,

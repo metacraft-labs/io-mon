@@ -26,8 +26,8 @@
 ## -------------------------------------
 ## ``selfDllPath()`` is pointed at ``tests/windows/fixtures/slow_load_lib.nim``,
 ## a real DLL whose ``DllMain`` sleeps for ``IO_MON_TEST_SLOW_LOAD_MS``. The
-## child is a real ``cmd.exe /c exit 42``. The park is real, and so are the
-## borrowed ``LoadLibraryW``, the deadline and the termination. The only thing
+## child is this executable in its exit-42 fixture mode. The park is real,
+## as are the borrowed ``LoadLibraryW``, the deadline and the termination. The only thing
 ## the test changes is ``spawnInjectionConfig.parkTimeoutMs``, shortened so
 ## the deadline expires in seconds rather than minutes.
 ##
@@ -51,6 +51,7 @@ when not defined(windows):
   {.error: "windows-only test".}
 
 import std/[os, osproc, unittest]
+import ../helpers/windows_fixture_child
 
 include io_mon/shim/windows_interpose
 
@@ -107,11 +108,6 @@ proc toWide(s: string): seq[uint16] =
     result[i] = uint16(ord(c))
   result[s.len] = 0'u16
 
-proc comSpec(): string =
-  result = getEnv("ComSpec")
-  if result.len == 0:
-    result = getEnv("SystemRoot", r"C:\Windows") / "System32" / "cmd.exe"
-
 proc buildFixtureDll(): string =
   let root = currentSourcePath().parentDir()
   result = getTempDir() / "io-mon-slow-load" / "slow_load_lib.dll"
@@ -154,8 +150,9 @@ suite "windows CreateProcess snoop: an injection that had to kill the child fail
     spawnInjectionConfig.parkTimeoutMs = ShortHardDeadlineMs
     defer: spawnInjectionConfig = savedCfg
 
-    var app = toWide(comSpec())
-    var cmd = toWide("\"" & comSpec() & "\" /c exit " & $ChildExitCode)
+    let childCommand = windowsFixtureCommand(int(ChildExitCode))
+    var app = toWide(childCommand[0])
+    var cmd = toWide(quoteShellCommand(childCommand))
     var si = STARTUPINFOW(cb: DWORD(sizeof(STARTUPINFOW)))
     var pi: PROCESS_INFORMATION
     var ctx = hr.HookContext(args: newSeq[uint64](10))
