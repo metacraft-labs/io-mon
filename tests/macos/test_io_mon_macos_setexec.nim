@@ -86,6 +86,8 @@ when defined(macosx):
     let dep = mergeFragments(fragmentDir, depfile)
     result.completeness = dep.completeness
     for rec in dep.records:
+      if rec.kind == mrEventLoss:
+        checkpoint("capture loss: " & rec.detail)
       if rec.path == markerPath and
           rec.observationKind in {moFileOpen, moFileRead}:
         result.markerRead = true

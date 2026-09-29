@@ -28,7 +28,8 @@ __attribute__((constructor)) static void record_image(void) {
 }
 """)
   let (output, code) = execCmdEx(quoteShell(getEnv("CC", "cc")) &
-    " -dynamiclib " & quoteShell(source) & " -o " & quoteShell(dylib))
+    " -arch arm64 -arch arm64e -dynamiclib " & quoteShell(source) &
+    " -o " & quoteShell(dylib))
   doAssert code == 0, "loader control compilation failed: " & output
   removeFile(evidence)
   var env = newStringTable(modeCaseSensitive)
