@@ -135,3 +135,15 @@ job is still running. Full log: `/tmp/io-mon-e8-arm-failure.log`.
 
 Refreshed `origin/dev` at `9c1d52b` and searched open and deleted injection
 issues before extending this existing record.
+
+Control [36626916265](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36626916265)
+at shared `db2f08a` proves the guard introduced at `a2a7733` misclassifies
+an emulated x64 child: `IsWow64Process2` returns `0000/AA64`, whereas
+`GetProcessInformation(ProcessMachineTypeInfo)` returns `8664`, matching
+both the child and slow DLL PE machine. At `e8df820`, with GCC and each of
+Nim 2.2.8/2.2.10, all three ARM-host repetitions fail with the original guard
+and pass with the explicit machine query. All x64-host repetitions pass
+both ways. Injection with the corrected query reaches `ioChildTerminated`
+at about 1546 ms; the unchanged 1500 ms deadline and exit assertions hold.
+The production repair must also retain the real native-system-child refusal
+test and complete ordinary CI. Evidence: `/tmp/io-mon-spawn-db2-evidence`.
