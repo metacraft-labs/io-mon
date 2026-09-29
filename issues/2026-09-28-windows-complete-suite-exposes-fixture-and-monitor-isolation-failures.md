@@ -90,3 +90,29 @@ fixtures with an explicitly unrelated ambient session. Repro executable
 `/tmp/io-mon-isolated-macos-full-fixed.json`,
 `/tmp/io-mon-macos-isolation-repeat.json` and
 `/tmp/io-mon-explicit-session-control.log`.
+
+## Windows ARM64 host with the x64 test toolchain
+
+At `0a0b592`, Windows ARM64 job `109452792104` compiles and executes the
+complete x64-emulation graph. Five programs fail. Library-load observation,
+process-start and root-guard tests report
+`CreateRemoteThread(LoadLibraryW) failed (err=5)`. The abandoned-injection
+fixture resumes its child, which exits 42 rather than timing out and being
+terminated. Those four programs select the host's `ComSpec` or System32
+`cmd.exe`, although the tests and shim are x64. Verify the actual PE machine
+types on the runner before attributing the cross-architecture injection.
+Use real child executables built with the test toolchain for architecture
+independent fixture assertions; retain the expected image records, process
+start, incomplete root evidence and terminated-child status. Compare the
+original host-shell fixtures and repaired children on the same ARM64 host.
+This is an x64-emulation fixture correction; the native Windows ARM64 backend
+remains deferred.
+
+The fifth failure is separate: both host-session scope assertions pass, then
+removing its private shim directory fails with `Access is denied` on the DLL.
+Retain module/cleanup evidence before choosing a repair; do not discard the
+cleanup error. The complete macOS Reprobuild job at the same `0a0b592` passes.
+
+Refreshed dev `9c1d52b` and searched current and deleted ARM64, ComSpec and
+fixture-isolation issues before extending this record. Full log:
+`/tmp/io-mon-0a0-windows-arm-repro-failure.log`.
