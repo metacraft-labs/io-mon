@@ -22,6 +22,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  choose-macos:
+    # Native macOS jobs retain their full gates while the fleet repair lands.
+    # Owner: zah. Follow-up: metacraft-specs/issues/
+    # 2026-09-28-shared-macos-host-has-no-headroom-for-runquota-measurements.md
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: macos-26
+      fallback: '["self-hosted","macos","arm64"]'
+
   choose-linux:
     # The shared CI_RUNNER_MODE policy selects free hosted runners for public
     # repos by default and preserves the org-controlled self-hosted fallback.
@@ -69,9 +78,9 @@ jobs:
           retention-days: 30
 
   build:
-    needs: choose-linux
+    needs: [choose-linux, choose-macos]
     name: Build
-    runs-on: ${{ matrix.slug == 'linux-x64' && fromJSON(needs.choose-linux.outputs.runs_on) || matrix.runs-on }}
+    runs-on: ${{ matrix.slug == 'macos-arm64' && fromJSON(needs.choose-macos.outputs.runs_on) || matrix.slug == 'linux-x64' && fromJSON(needs.choose-linux.outputs.runs_on) || matrix.runs-on }}
     strategy:
       fail-fast: false
       matrix:
@@ -116,9 +125,9 @@ jobs:
           retention-days: 30
 
   test:
-    needs: choose-linux
+    needs: [choose-linux, choose-macos]
     name: Test
-    runs-on: ${{ matrix.slug == 'linux-x64' && fromJSON(needs.choose-linux.outputs.runs_on) || matrix.runs-on }}
+    runs-on: ${{ matrix.slug == 'macos-arm64' && fromJSON(needs.choose-macos.outputs.runs_on) || matrix.slug == 'linux-x64' && fromJSON(needs.choose-linux.outputs.runs_on) || matrix.runs-on }}
     strategy:
       fail-fast: false
       matrix:
