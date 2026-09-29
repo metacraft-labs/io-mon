@@ -84,6 +84,7 @@ import ct_test_nim_unittest
 when defined(macosx):
   import ./repro_support/cctools
 when defined(linux):
+  import ./repro_support/getconf
   import ./repro_support/strace
 
 package io_mon:
@@ -110,6 +111,7 @@ package io_mon:
     when defined(macosx):
       "cctools"
     when defined(linux):
+      "getconf"
       "nm"
       "strace"
     # The C-family compiler ``nim c`` shells out to for the C backend. macOS
@@ -193,6 +195,8 @@ package io_mon:
       appendRegisteredActionToolIdentityRefs(shimBuild.id, ["dirname", "uname"])
     when defined(macosx):
       appendRegisteredActionToolIdentityRefs(shimBuild.id, ["cctools"])
+    when defined(linux):
+      appendRegisteredActionToolIdentityRefs(shimBuild.id, ["getconf"])
     discard collect("shim", @[shimBuild])
 
     # ---- Standalone CLI (``io-mon`` / the ``default`` collection) -----------
@@ -311,7 +315,7 @@ package io_mon:
       when defined(macosx):
         appendRegisteredActionToolIdentityRefs(executeEdge.id, ["cctools"])
       when defined(linux):
-        appendRegisteredActionToolIdentityRefs(executeEdge.id, ["strace", "nm"])
+        appendRegisteredActionToolIdentityRefs(executeEdge.id, ["strace", "nm", "getconf"])
       executeActions.add(executeEdge)
 
     # Portable tests — always in the graph.

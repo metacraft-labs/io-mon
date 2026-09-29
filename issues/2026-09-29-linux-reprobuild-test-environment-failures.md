@@ -33,3 +33,12 @@ The selected Reprobuild stdlib has no strace recipe. Declare its pinned Nix
 realization in `repro_support/strace.nim`, following the existing cctools
 declaration. This is a missing consumer tool definition; the diagnostic did not
 compile or execute the tests and supplies no new nested-monitor evidence.
+
+Diagnostic `36542453553` at `d6c5ab5` gets past strace provisioning, compiles
+the test programs, then fails the prerequisite shim link: `version node not
+found for symbol dlsym@@GLIBC_2.34`. Its link command lacks the version-script
+flag selected by `getconf GNU_LIBC_VERSION`. That probe is another undeclared
+runtime tool in `scripts/build_shim.sh`; its failure is treated as a non-glibc
+host. Supply pinned glibc's getconf to both the shim action and tests that
+build their own shims. The graph reports 60 successful actions, one failed
+and 59 blocked; these are not new results for the nested-monitor tests.
