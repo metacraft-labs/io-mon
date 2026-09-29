@@ -24,7 +24,7 @@ suite "standalone CLI preserves native exit status bits":
     let repo = currentSourcePath.parentDir.parentDir.parentDir
     var cli = getEnv("IO_MON_EXIT_STATUS_CLI")
     if cli.len == 0:
-      cli = work / ("io-mon" & ExeExt)
+      cli = work / "io-mon".changeFileExt(ExeExt)
       let build = execCmdEx(quoteShellCommand(@[findExe("nim"), "c",
         "--hints:off", "--threads:on", "--nimcache:" & work / "nimcache",
         "--out:" & cli, repo / "cmd" / "io_mon_snoop.nim"]))
