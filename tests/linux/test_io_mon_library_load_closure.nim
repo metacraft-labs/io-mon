@@ -28,6 +28,7 @@
 import std/[algorithm, os, osproc, sequtils, sets, streams, strtabs, strutils, unittest]
 
 import io_mon
+import build_test_shim
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
@@ -85,10 +86,7 @@ suite "io-mon Linux runtime library closure":
   createDir(work)
 
   let cc = getEnv("CC", "cc")
-  let shimBuild = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-  checkpoint(shimBuild.output)
-  require shimBuild.code == 0
-  let shimLib = findShimLibrary()
+  let shimLib = buildPrivateLinuxShim(repoRoot)
 
   let snoopBin = work / "io-mon"
   let cli = run("nim", @[

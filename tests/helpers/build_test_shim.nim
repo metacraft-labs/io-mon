@@ -12,11 +12,11 @@ proc cleanupShim() {.noconv.} =
     try: removeDir(shimWork)
     except OSError: discard
 
-proc buildPrivateMacosShim*(repoRoot: string): string =
+proc buildPrivateShim(repoRoot, libraryName: string): string =
   if shimWork.len == 0:
     shimWork = createTempDir("io-mon-fixture-shim-", "")
     addExitProc(cleanupShim)
-  result = shimWork / "lib" / "librepro_monitor_shim.dylib"
+  result = shimWork / "lib" / libraryName
   if fileExists(result):
     return
   var buildEnv = newStringTable(modeCaseSensitive)
@@ -28,3 +28,9 @@ proc buildPrivateMacosShim*(repoRoot: string): string =
   if built.exitCode != 0:
     raise newException(IOError, "private build_shim.sh failed: " & built.output)
   doAssert fileExists(result), "shim not produced at " & result
+
+proc buildPrivateMacosShim*(repoRoot: string): string =
+  buildPrivateShim(repoRoot, "librepro_monitor_shim.dylib")
+
+proc buildPrivateLinuxShim*(repoRoot: string): string =
+  buildPrivateShim(repoRoot, "librepro_monitor_shim.so")

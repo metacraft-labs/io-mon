@@ -1,6 +1,7 @@
 import std/[os, osproc, streams, strtabs, unittest]
 
 import io_mon
+import build_test_shim
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
@@ -38,10 +39,7 @@ suite "io-mon Linux fragment descriptor reuse":
     checkpoint(cli.output)
     check cli.code == 0
 
-    let shimBuild = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(shimBuild.output)
-    require shimBuild.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let probe = buildC(work, "fragment_fd_reuse_probe", """
 #include <errno.h>

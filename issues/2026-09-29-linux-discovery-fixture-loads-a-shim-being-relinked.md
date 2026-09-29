@@ -35,3 +35,13 @@ shipping shim or weaken capture completeness.
 
 Before recording, fetched dev `9c1d52b`, verified it is an ancestor, and searched
 open and deleted issues for partial libraries, shared builds and concurrency.
+
+A second independent [job 109431799681](https://github.com/metacraft-labs/io-mon/actions/runs/36576003727/job/109431799681)
+at the same `c88183bf` fails `test_io_mon_evidence_scope_shim_gate`: its final
+future-scope arm loads the same partially written shared library and records
+zero of the 400 required failed lookups. Give this fixture and the other two
+unmonitored Linux fixtures that still use the shipping shim (library closure
+and fragment descriptor reuse) private outputs too. The older-shim mutation
+fixture and host-session fixture already own private builds. Ordinary monitored
+fixtures retain the enclosing monitor's explicit immutable shim pin; the
+per-call case deliberately clears that pin, hence its separate layout.

@@ -60,7 +60,12 @@ suite "host monitor session scope":
   for key, value in envPairs(): buildEnv[key] = value
   buildEnv["IO_MON_SHIM_OUT_DIR"] = shimWork / "lib"
   buildEnv["IO_MON_SHIM_NIMCACHE_DIR"] = shimWork / "nimcache"
-  let built = execCmdEx("bash " & quoteShell(repoRoot / "scripts/build_shim.sh"),
+  # Windows command lookup checks System32 before PATH for a bare name and
+  # can launch its WSL stub instead of the provisioned Git Bash executable.
+  let bash = findExe("bash")
+  doAssert bash.len > 0, "the fixture requires the provisioned Bash executable"
+  let built = execCmdEx(quoteShell(bash) & " " &
+    quoteShell(repoRoot / "scripts/build_shim.sh"),
     env = buildEnv)
   doAssert built.exitCode == 0, built.output
   let shim = shimWork / "lib" / (
