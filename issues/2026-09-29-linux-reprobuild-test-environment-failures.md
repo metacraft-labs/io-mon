@@ -73,3 +73,28 @@ the `ldd | grep | head` pipeline fails with `grep: command not found`.
 Declare the pinned grep package and attach it to Linux execution actions.
 The diagnostic stops before its repeat and negative-control stages, so these
 remain pending. No capture assertion or fixture binary is changed.
+
+## Observation-fold fixtures after the upstream merge
+
+At `80a7c4a`, both Linux Reprobuild jobs (`109641951343` with bootstrap
+`90dc4321` and `109642508667` with `c14b1e6`) fail the two new merge-time
+observation cases. Native Nix execution passes at that same commit.
+`test_io_mon_observation_identity_fold` supplies records stamped `run=r1`
+but omits `currentRunId`; the documented ambient-session fallback correctly
+drops all of them. Running its unchanged binary locally with
+`REPRO_MONITOR_SESSION=unrelated-outer-session` reproduces all four missing
+record assertions. Pass the fixture's own run ID, preserving the session guard.
+
+`test_io_mon_dep_identity_scope` now also exercises Linux file transport.
+Under an enclosing monitor its child sees shared-memory transport even when
+disabled, and the file capture contains zero processes. This program already
+uses the non-cacheable isolated execution disposition on macOS; extend that
+disposition to its new Linux transport experiment and verify a second actual
+execution. Compilation and every transport/census assertion remain required.
+
+Refreshed dev `07cc4af` and searched open and deleted session/isolation issues
+before extending this record. The expected session behavior is documented on
+`mergeFragments`; the execution disposition follows the failure semantics
+cited above. Logs: `/tmp/io-mon-80a7-linux-repro-native-failure.log`,
+`/tmp/io-mon-80a7-linux-new-repro-failure.log`, and
+`/tmp/io-mon-fold-old-outer-session.log`.
