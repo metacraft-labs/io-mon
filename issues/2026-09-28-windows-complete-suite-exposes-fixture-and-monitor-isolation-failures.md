@@ -116,3 +116,22 @@ cleanup error. The complete macOS Reprobuild job at the same `0a0b592` passes.
 Refreshed dev `9c1d52b` and searched current and deleted ARM64, ComSpec and
 fixture-isolation issues before extending this record. Full log:
 `/tmp/io-mon-0a0-windows-arm-repro-failure.log`.
+
+At `e8df820`, ordinary ARM-host Reprobuild job `109567862804` in
+[36615640369](https://github.com/metacraft-labs/io-mon/actions/runs/36615640369)
+fails only the abandoned-injection program in its 99-action test graph.
+The real same-architecture child exits 42; the hook reports successful spawn,
+leaves its handles intact and reports error zero. The test never establishes
+that the slow DLL reached its borrowed-call deadline. Earlier focused control
+`36594769445` passed this repaired fixture three times at `af1af0f`.
+
+Retain the existing deadline and child-termination assertions. Compare the DLL
+and child PE machines, the process-architecture query and the injector outcome
+on both Windows hosts. The newer native-ARM refusal guard, an entry-point park
+timeout, and failure to load the fixture are distinct possible paths; the
+current log does not identify which ran. The complete native workflow and
+Linux x64/Windows x64 Reprobuild jobs pass at `e8df820`. Its macOS Reprobuild
+job is still running. Full log: `/tmp/io-mon-e8-arm-failure.log`.
+
+Refreshed `origin/dev` at `9c1d52b` and searched open and deleted injection
+issues before extending this existing record.
