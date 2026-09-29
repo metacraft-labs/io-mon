@@ -47,5 +47,5 @@ int main(int argc,char**argv){
   if(rc){fprintf(stderr,"[pspawn] spawn rc=%d (%s)\n",rc,strerror(rc));return 1;}
   int st; waitpid(pid,&st,0);
   printf("[pspawn] child exited status=%d\n",WEXITSTATUS(st));
-  return 0;
+  return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
 }
