@@ -269,6 +269,9 @@ package io_mon:
       # Monitor-Hook-Shim.md / Failure Semantics permits this disposition.
       # macOS fixtures also install their own interposers. A distinct outer
       # dylib can recurse during dyld initialization, before main is reached.
+      # Linux's five nested-monitor programs must also own their transport and
+      # loader closure: an outer shared-memory session defeats file-transport
+      # fixtures and adds a second shim to the loader comparison.
       let isolatesMonitor = (defined(macosx) and (
         source.startsWith("tests/macos/") or source.extractFilename in [
           "test_io_mon_snoop_cli_capture.nim",
@@ -277,6 +280,12 @@ package io_mon:
           "test_io_mon_cli_interest_stamp.nim",
           "test_io_mon_cli_evidence_scope.nim",
           "test_io_mon_host_session_scope.nim"])) or
+        (defined(linux) and source.extractFilename in [
+          "test_io_mon_host_session_scope.nim",
+          "test_io_mon_evidence_scope_older_shim.nim",
+          "test_io_mon_evidence_scope_shim_gate.nim",
+          "test_io_mon_library_load_closure.nim",
+          "test_io_mon_linux_fragment_fd_reuse.nim"]) or
         (defined(windows) and source.extractFilename in [
         "test_io_mon_windows_host_session_scope.nim",
         "test_io_mon_windows_read_capture.nim",
@@ -359,6 +368,6 @@ package io_mon:
         emitTestPair(spec.source, spec.binary, testBuildActions, testExecuteActions)
 
     discard collect("test", testExecuteActions)
-    when defined(windows) or defined(macosx):
+    when defined(windows) or defined(macosx) or defined(linux):
       discard collect("test-monitor-isolation", isolatedTestActions)
     discard collect("test-builds", testBuildActions)

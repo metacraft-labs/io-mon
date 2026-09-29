@@ -81,7 +81,7 @@ jobs:
         # revisions before materialising the env. Those two are io-mon's
         # `uses:` library producers in repro.nim; reprobuild builds each
         # from source and threads their `src/` roots onto io-mon's compile.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@8743c591ccbd97a32de64550b306b87c4d9158c7
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@923f8ec27bfa4735a68242cd6d0e8bf75e1eebdd
         with:
           env-flavor: reprobuild
           # Exercise the published bootstrap repairs before a new CLI release.
@@ -132,17 +132,20 @@ jobs:
             Write-Host "Executed again: $($run.id)"
           }
 
-      - name: Verify isolated macOS tests execute again
-        if: matrix.os == 'macos'
+      - name: Verify isolated POSIX tests execute again
+        if: matrix.os == 'macos' || matrix.os == 'linux'
         shell: bash
+        env:
+          EXPECTED_ISOLATED_TESTS: ${{ matrix.os == 'macos' && '41' || '5' }}
         run: |
           dev-exec repro build --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }} .#test-monitor-isolation --write-report=build/monitor-isolation-repeat.json
           "$REPROBUILD_BOOTSTRAP_PYTHON" - <<'PYCODE'
-          import json
+          import json, os
           from pathlib import Path
           report = json.loads(Path('build/monitor-isolation-repeat.json').read_text())
           runs = [a for a in report['actions'] if a['id'].startswith('io-mon.test_execute.')]
-          assert len(runs) == 41, f'Expected all 41 isolated programs, got {len(runs)}'
+          expected = int(os.environ['EXPECTED_ISOLATED_TESTS'])
+          assert len(runs) == expected, f'Expected all {expected} isolated programs, got {len(runs)}'
           for run in runs:
               assert run['launched'] and run['status'] == 'asSucceeded' and run['exitCode'] == 0, run['id']
               print('Executed again:', run['id'])

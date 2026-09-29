@@ -50,3 +50,19 @@ while the direct control shell prefers sibling `cf0adf2` (layout 1) for the
 private shims it builds. Diagnostic `36549278937` checks matched sources and
 deliberately mismatched sources before attributing empty host captures to a
 monitoring defect. No production capture assertion is relaxed.
+
+Source-pair diagnostic `36549278937` at `31b7f72` passes both programs with
+matching layout-3 sources. Running those identical binaries with layout-1
+private shims reproduces the empty captures. The previous direct comparison
+therefore cannot establish an outer-monitor cause for those two programs.
+
+Full graph `36546393370` at `31b7f72` plus diagnostic-only record printing
+passes 115 of 120 actions. The remaining five execution failures are host
+session scope, older-shim evidence scope, shim-gate evidence scope, loader
+closure and fragment descriptor reuse. The graph's enclosing shared-memory
+session defeats the explicit file-transport fixtures; the loader truth set
+contains the enclosing shim; host-session children exit 139. Apply the existing
+non-cacheable execution disposition to these five programs, then validate the
+complete graph, a second execution and a monitored negative control using
+identical test binaries and dependency sources. This verification remains
+pending; the source-pair result alone does not prove the disposition.
