@@ -297,6 +297,7 @@ package io_mon:
           "test_io_mon_linux_fragment_fd_reuse.nim"]) or
         (defined(windows) and source.extractFilename in [
         "test_io_mon_windows_host_session_scope.nim",
+        "test_io_mon_windows_native_system_child.nim",
         "test_io_mon_windows_read_capture.nim",
         "test_io_mon_windows_root_guard.nim",
         "test_io_mon_windows_spawn_abandoned_injection.nim",

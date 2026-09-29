@@ -315,6 +315,9 @@ proc EnumProcessModulesEx(hProcess: HANDLE, lphModule: ptr pointer,
   {.importc, stdcall, dynlib: "psapi".}
 proc GetCurrentProcess(): HANDLE
   {.importc, stdcall, dynlib: "kernel32".}
+proc IsWow64Process2(hProcess: HANDLE; processMachine,
+                     nativeMachine: ptr WORD): BOOL
+  {.importc, stdcall, dynlib: "kernel32".}
 
 # ---------------------------------------------------------------------------
 # M5 — Win32 imports for the IPC-connect / external-content / non-determinism
@@ -3450,6 +3453,20 @@ proc injectSpawnedChild(record: var MonitorRecord;
   ## nim-stackable-hooks now waits while the child lives, so a slow
   ## injection is a success and only worth a note -- see its
   ## ``docs/windows-borrowed-call-deadline.md``.
+  # A native ARM64 child is not WOW64, just like a native x64 child. The
+  # injector's older boolean query cannot distinguish them, and its x86
+  # entry-point parking instructions must never be written into ARM code.
+  # Leave unsupported children runnable. The durable spawn record without a
+  # matching process-start makes the merged evidence incomplete.
+  var processMachine, nativeMachine: WORD
+  if IsWow64Process2(pi[].hProcess, addr processMachine,
+      addr nativeMachine) == 0:
+    record.detail.add(" inject=unknown-process-machine")
+    return false
+  let machine = if processMachine == 0: nativeMachine else: processMachine
+  if machine notin [0x8664'u16, 0x014c'u16]:
+    record.detail.add(" inject=unsupported-process-machine:" & toHex(machine))
+    return false
   let report = shProp.injectShimIntoChildReport(pi[].hProcess,
     selfDllPath(), "repro_runtime_init", spawnInjectionConfig, hThread)
   if report.outcome != shProp.ioInjected and
