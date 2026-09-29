@@ -41,3 +41,21 @@ Fetched io-mon dev `9c1d52b` and searched open/deleted exit-status, shutdown
 and termination-flush issues before filing. RunQuota's
 `2026-09-29-windows-ci-bypasses-declared-tool-store.md` records the consumer
 symptom; this record owns the isolated monitor failure.
+
+## Full command status and smaller control
+
+At shared `18d1fde`, control
+[36607212920](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36607212920)
+records bootstrap io-mon `9c1d52b`, hooks `a42306d`, Reprobuild `c14b1e61`
+and RunQuota `8add804`. Python launches each command directly with regular-file
+output and a 180-second bound. Both real programs return zero natively,
+`0x7fffffff` from the direct monitor command and 127 through monitored
+sh/timeout; none times out. All assertions still pass. This is the monitor
+command's full status; the child API result needs a direct-library control.
+
+A real eight-thread file-I/O probe returns zero in all three modes. No dump
+or crash-event artifact was produced. Both failing programs use PDH performance
+counters, unlike the small probe. A standalone real PDH load/query/shutdown
+control will distinguish that path; the distinction alone does not establish
+causation. Hooks `72f5782` (candidate dependency) and `a42306d` have identical
+runtime code; their only difference is deletion of a CI workflow.
