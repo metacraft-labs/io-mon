@@ -160,7 +160,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $report = Get-Content build/monitor-isolation-repeat.json -Raw | ConvertFrom-Json
           $runs = @($report.actions | Where-Object { $_.id -like 'io-mon.test_execute.*' })
-          if ($runs.Count -ne 6) { throw "Expected all six isolated test programs" }
+          if ($runs.Count -ne 7) { throw "Expected all seven isolated test programs" }
           foreach ($run in $runs) {
             if (-not $run.launched -or $run.status -ne 'asSucceeded' -or $run.exitCode -ne 0) {
               throw "Test did not execute successfully again: $($run.id)"

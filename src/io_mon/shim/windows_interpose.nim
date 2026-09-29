@@ -2230,7 +2230,8 @@ proc originalNtTerminateProcess(ctx: var hr.HookContext) {.raises: [].} =
     ctx.result = uint64(uint32(0xC0000001'i32))
     return
   let h = cast[HANDLE](ctx.args[0])
-  let status = int32(uint32(ctx.args[1] and 0xFFFFFFFF'u64))
+  # NTSTATUS is signed at the ABI boundary, but every 32-bit pattern is valid.
+  let status = cast[int32](uint32(ctx.args[1] and 0xFFFFFFFF'u64))
   ctx.result = uint64(uint32(origNtTerminateProcess(h, status)))
 
 proc originalGetFileAttributesExW(ctx: var hr.HookContext) {.raises: [].} =
