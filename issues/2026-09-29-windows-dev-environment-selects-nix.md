@@ -72,3 +72,22 @@ provisioned PATH, require a result, and quote that full executable path before
 calling `execCmdEx`, matching RunQuota's verified correction. Keep the real
 production build and both capture/session assertions. This extends the existing
 provisioning issue rather than creating a duplicate.
+
+## Justfile path quoting at `0a0b592`
+
+[Windows job 109452792092](https://github.com/metacraft-labs/io-mon/actions/runs/36582014627/job/109452792092)
+passes build/test and all five required repeat executions, then its native
+`just build` cross-check fails. The unquoted recipe expands
+`STACKABLE_HOOKS_SRC=D:\a\io-mon\io-mon\nim-stackable-hooks\src` into a Bash
+assignment; Bash consumes the backslashes and the script receives
+`D:aio-monio-monnim-stackable-hookssrc`. The CLI recipe also interpolates its
+source path without quoting. Quote both values as shell arguments, including
+build mode, and retain the caller's selected source path. Verify real builds
+with paths containing spaces and Windows backslashes; keep the complete
+cross-check. Refreshed dev `9c1d52b` and searched current/deleted Justfile and
+source-path issues before extending this record.
+
+The log also records a separate bootstrap source root inside the product
+checkout alongside workspace siblings outside it. A Windows control will
+record their actual revisions before deciding whether source selection needs
+a separate repair; the quoting diagnosis alone does not establish that.
