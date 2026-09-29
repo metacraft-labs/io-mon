@@ -116,6 +116,29 @@ suite "io-mon child-environment layering (DH-1 childEnv)":
     check composed["REPRO_MONITOR_SHIM_LIB"] == "/io-mon/real/shim.so"
     check composed["REPRO_MONITOR_SESSION"] == "run-1"
 
+  test "isolateEnv: nothing from the host, request.env, then injection":
+    # A host entry the caller does not mention must NOT reach an isolated
+    # child, and the injection must still be applied last so a caller cannot
+    # disarm the monitor by isolating.
+    var hostKey = ""
+    for key, value in envPairs():
+      if key.len > 0 and key != "PATH" and not key.startsWith("REPRO_MONITOR_"):
+        hostKey = key
+        break
+    require hostKey.len > 0
+    let request = FsSnoopRequest(isolateEnv: true, env: @[
+      ("PATH", "/declared/bin"),
+      ("REPRO_MONITOR_SHIM_LIB", "/caller/attempt/to/disarm.so")])
+    let composed = childEnv(request, @[
+      ("REPRO_MONITOR_SHIM_LIB", "/io-mon/real/shim.so")])
+    check not composed.hasKey(hostKey)
+    check composed["PATH"] == "/declared/bin"
+    check composed["REPRO_MONITOR_SHIM_LIB"] == "/io-mon/real/shim.so"
+    # Everything else in the table is io-mon's own injection channel
+    # (`REPRO_MONITOR_*`, always written); nothing came from the host.
+    for key, _ in composed.pairs:
+      check key == "PATH" or key.startsWith("REPRO_MONITOR_")
+
   test "a later request.env entry beats an earlier one (last wins)":
     # `docs/usage.md` promises callers that duplicates in `env` resolve
     # last-wins. Unpinned until now, for the same reason as the rule above:

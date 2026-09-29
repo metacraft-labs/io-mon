@@ -771,6 +771,17 @@ type
     # launched. Pass an absolute `command[0]` when that distinction matters.
     # Only the Linux row is verified by execution in this workspace.
     env*: seq[(string, string)]
+    isolateEnv*: bool
+      ## When true the child does NOT inherit the hosting process's
+      ## environment: it starts from `env` alone, and io-mon's own injection
+      ## variables are still layered last, so monitoring cannot be switched
+      ## off. Negative-sense so the zero value keeps the historical behaviour.
+      ##
+      ## For a host that composes the action's whole environment (reprobuild
+      ## Dev-Env-Warm-Entry.md §2): otherwise a variable nobody declared still
+      ## reaches the child, and whatever the child reads from it is an input
+      ## nobody recorded. Executable resolution is unaffected (see `env`
+      ## above), so pass an absolute `command[0]`.
     # IoMon-Decomposed-Host-API DH-1 — PER-CALL working directory for the
     # monitored child. Empty means "inherit the hosting process's cwd"
     # (the historical behaviour). Set per-call rather than by `chdir`-ing
