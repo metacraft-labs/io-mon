@@ -30,3 +30,23 @@ and validate both protected local and disabled-SIP hosted macOS.
 Refreshed `origin/dev` at `9c1d52b`; searched open and deleted SETEXEC/flush
 issues. The SIP-state fixture issue covers incorrect test assumptions; this
 record covers the actual loss detected after that repair.
+
+## Local attribution and regression control
+
+At `c296287` plus the regression test, real SETEXEC and execve both lose
+the absent sandbox-path probe and leave an unmatched pending marker. Ordinary
+spawn preserves that exact probe. The rewrite invokes `fileExists` after
+the initial hook flush. Flush again after rewriting at each non-returning
+forwarder, with a C runtime-ready guard. The test requires the actual absent
+probe, no unflushed batch, and the independent injection outcome. Pass the
+known launched root PID to `mergeFragments` so the existing subtree guard
+checks the real image transition. Previously, the incidental batch loss had
+masked the fixture's missing root anchor.
+
+Local verification of `c296287` plus this repair passes the spawn/exec,
+recorded-once, system-child, body-patch spawn and vfork-exit suites (26 cases
+across the complete control set). The original forwarders fail both the
+SETEXEC and execve probe/flush regression assertions. Interpose-only controls
+also pass their existing coverage boundary; the required sandbox probe is
+observed with the production combined backend. Hosted SIP-disabled verification
+and the complete ordinary CI suite remain required.

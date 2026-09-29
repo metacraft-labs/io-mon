@@ -4476,6 +4476,14 @@ proc installBodypatchHooks(envp: ptr cstring) {.exportc: "repro_monitor_install_
 #include <xpc/xpc.h>
 
 static int repro_monitor_runtime_ready = 0;
+
+/* The launch forwarders call this AFTER environment/path rewriting, which
+ * can emit new sandbox path probes after the exec hook's first flush. Never
+ * enter the Nim writer before its runtime is ready. */
+extern int repro_monitor_shim_flush(void);
+void repro_macos_flush_before_image_replacement(void) {
+  if (repro_monitor_runtime_ready) (void)repro_monitor_shim_flush();
+}
 extern void NimMain(void);
 extern void repro_monitor_install_bodypatch(char **envp);
 extern int repro_monitor_shim_flush(void);

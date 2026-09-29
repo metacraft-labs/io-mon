@@ -17,15 +17,15 @@
 ##   child `process-start` — the merge injects an event-loss so completeness
 ##   downgrades to `mcIncomplete` (a conservative RE-RUN, not a false skip).
 ##
-## All runs use DIRECT DYLD injection with NO fs-snoop sandbox-tools dir (and the
-## test explicitly clears `CT_SANDBOX_TOOLS_DIR`). A separate constructor dylib
+## All runs use DIRECT DYLD injection with no executable sandbox drop-in. An
+## empty sandbox forces a real path probe during rewriting. A constructor dylib
 ## establishes whether this OS permits injection into `/bin/cat` for each mode;
 ## hosted macOS can run with SIP disabled. Missing child evidence must downgrade.
 ## The probe is research/adversarial-2026-06/adv_inject/pspawn.c (+ reader.c).
 ##
 ## macOS-only; a no-op pass elsewhere.
 
-import std/[os, osproc, streams, strtabs, unittest]
+import std/[os, osproc, streams, strtabs, strutils, unittest]
 
 when defined(macosx):
   import io_mon
@@ -50,14 +50,16 @@ when defined(macosx):
     completeness: MonitorCompleteness
     markerRead: bool
     setexecRecord: bool
+    sandboxProbe: bool
+    unflushedBatch: bool
 
   proc runPspawn(shim, pspawn, markerPath: string;
-      setexec: int; envMode, prog: string): Capture =
+      setexec: int; envMode, prog: string; sandboxDir = ""; backend = "both"): Capture =
     ## Run `pspawn <setexec> <envMode> <prog> <markerPath>` under the shim with
     ## direct DYLD injection (no sandbox tools) and report the merged depfile's
     ## completeness, whether the marker read was captured, and whether a SETEXEC
     ## exec record was emitted.
-    let tag = "se" & $setexec & "-" & envMode & "-" & prog.extractFilename()
+    let tag = "se" & $setexec & "-" & envMode & "-" & prog.extractFilename() & "-" & backend
     let runWork = pspawn.parentDir() / ("run-" & tag)
     removeDir(runWork)
     createDir(runWork)
@@ -68,14 +70,17 @@ when defined(macosx):
     for k, v in envPairs(): env[k] = v
     # Exercise the actual system image without a sandbox-tools rewrite.
     env.del("CT_SANDBOX_TOOLS_DIR")
+    if sandboxDir.len > 0:
+      env["CT_SANDBOX_TOOLS_DIR"] = sandboxDir
     env["DYLD_INSERT_LIBRARIES"] = shim
     env["REPRO_MONITOR_SHIM_LIB"] = shim
     env["REPRO_MONITOR_FRAGMENT_DIR"] = fragmentDir
-    applyMacosBackendToggle(env, "both")
+    applyMacosBackendToggle(env, backend)
 
     let p = startProcess(pspawn,
       args = @[$setexec, envMode, prog, markerPath], env = env,
       options = {poStdErrToStdOut})
+    let rootPid = uint64(p.processID)
     let stdoutText = p.outputStream.readAll()
     let code = p.waitForExit()
     p.close()
@@ -83,11 +88,16 @@ when defined(macosx):
     doAssert code == 0, "pspawn should exit 0 (" & tag & ", out=" & stdoutText & ")"
 
     let depfile = runWork / "cap.iomon"
-    let dep = mergeFragments(fragmentDir, depfile)
+    let dep = mergeFragments(fragmentDir, depfile, expectedRootPid = rootPid)
     result.completeness = dep.completeness
     for rec in dep.records:
       if rec.kind == mrEventLoss:
         checkpoint("capture loss: " & rec.detail)
+        if "kill-before-flush" in rec.detail:
+          result.unflushedBatch = true
+      if sandboxDir.len > 0 and rec.path == sandboxDir / "bin/cat" and
+          rec.kind == mrPathProbe and rec.probeResult == prAbsent:
+        result.sandboxProbe = true
       if rec.path == markerPath and
           rec.observationKind in {moFileOpen, moFileRead}:
         result.markerRead = true
@@ -129,17 +139,27 @@ suite "io-mon macOS POSIX_SPAWN_SETEXEC + earned completeness (#2, T0/T1)":
       check cap.markerRead
       check cap.completeness == mcComplete
 
-    for setexec in [1, 0]:
-      test "system cat completeness matches independent injection evidence, SETEXEC=" & $setexec:
-        let images = injectedImages(pspawn,
-          @[$setexec, "inherit", "/bin/cat", markerPath])
-        let injectable = "cat" in images
-        let cap = runPspawn(shim, pspawn, markerPath, setexec, "inherit", "/bin/cat")
-        if setexec == 1:
-          check cap.setexecRecord
-        check cap.markerRead == injectable
-        check cap.completeness == (if injectable: mcComplete else: mcIncomplete)
-
+    # An explicit empty sandbox keeps the real system image while forcing a
+    # genuine absent-file probe during launch rewriting. That observation must
+    # survive even when SIP prevents the child from loading the shim.
+    let emptySandbox = work / "empty-sandbox"
+    createDir(emptySandbox)
+    for backend in ["both", "interpose"]:
+      for setexec in [1, 0, 2]:
+        test "system cat completeness matches independent injection evidence, SETEXEC=" & $setexec & ", backend=" & backend:
+          let images = injectedImages(pspawn,
+            @[$setexec, "inherit", "/bin/cat", markerPath])
+          let injectable = "cat" in images
+          let cap = runPspawn(shim, pspawn, markerPath, setexec, "inherit", "/bin/cat",
+            sandboxDir = emptySandbox, backend = backend)
+          if setexec == 1:
+            check cap.setexecRecord
+          check cap.markerRead == injectable
+          # The shim-internal stat requires body patching; interpose-only
+          # deliberately demonstrates that existing coverage boundary.
+          check cap.sandboxProbe == (backend == "both")
+          check not cap.unflushedBatch
+          check cap.completeness == (if injectable: mcComplete else: mcIncomplete)
     removeDir(work)
   else:
     test "SETEXEC handling is macOS-only (no-op on this platform)":
