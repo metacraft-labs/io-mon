@@ -160,7 +160,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $report = Get-Content build/monitor-isolation-repeat.json -Raw | ConvertFrom-Json
           $runs = @($report.actions | Where-Object { $_.id -like 'io-mon.test_execute.*' })
-          if ($runs.Count -ne 7) { throw "Expected all seven isolated test programs" }
+          if ($runs.Count -ne 8) { throw "Expected all eight isolated test programs" }
           foreach ($run in $runs) {
             if (-not $run.launched -or $run.status -ne 'asSucceeded' -or $run.exitCode -ne 0) {
               throw "Test did not execute successfully again: $($run.id)"
@@ -172,7 +172,7 @@ jobs:
         if: matrix.os == 'macos' || matrix.os == 'linux'
         shell: bash
         env:
-          EXPECTED_ISOLATED_TESTS: ${{ matrix.os == 'macos' && '41' || '5' }}
+          EXPECTED_ISOLATED_TESTS: ${{ matrix.os == 'macos' && '42' || '6' }}
         run: |
           dev-exec repro build --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }} .#test-monitor-isolation --write-report=build/monitor-isolation-repeat.json
           "$REPROBUILD_BOOTSTRAP_PYTHON" - <<'PYCODE'

@@ -285,6 +285,7 @@ package io_mon:
       # fixtures and adds a second shim to the loader comparison.
       let isolatesMonitor = (defined(macosx) and (
         source.startsWith("tests/macos/") or source.extractFilename in [
+          "test_io_mon_cli_exit_status.nim",
           "test_io_mon_snoop_cli_capture.nim",
           "test_io_mon_monitored_compile_depset.nim",
           "test_io_mon_dep_identity_scope.nim",
@@ -292,12 +293,14 @@ package io_mon:
           "test_io_mon_cli_evidence_scope.nim",
           "test_io_mon_host_session_scope.nim"])) or
         (defined(linux) and source.extractFilename in [
+          "test_io_mon_cli_exit_status.nim",
           "test_io_mon_host_session_scope.nim",
           "test_io_mon_evidence_scope_older_shim.nim",
           "test_io_mon_evidence_scope_shim_gate.nim",
           "test_io_mon_library_load_closure.nim",
           "test_io_mon_linux_fragment_fd_reuse.nim"]) or
         (defined(windows) and source.extractFilename in [
+        "test_io_mon_cli_exit_status.nim",
         "test_io_mon_windows_exit_status.nim",
         "test_io_mon_windows_host_session_scope.nim",
         "test_io_mon_windows_native_system_child.nim",
