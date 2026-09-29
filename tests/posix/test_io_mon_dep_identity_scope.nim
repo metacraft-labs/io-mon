@@ -22,7 +22,7 @@
 ## dynamic loader, the sockets are real `AF_UNIX` sockets, and every assertion
 ## reads the canonical depfile io-mon actually wrote.
 ##
-## ── THE THREE CASES ────────────────────────────────────────────────────────
+## ── THE FOUR CASES ─────────────────────────────────────────────────────────
 ##
 ##   t_one_fact_observed_by_many_processes_is_one_element
 ##       The headline, shaped like the measurement: `FanOut` processes across
@@ -31,22 +31,23 @@
 ##       monitored processes, so it cannot pass by the fan-out having failed to
 ##       happen.
 ##
-##       THE ASSERTION IS A CHECKED CLAIM, IN BOTH DIRECTIONS. The fold is not
-##       universal: it is a property of the TRANSPORT, and only the Linux
-##       backend has it (it publishes into a `nim-shm-gset` whose element key IS
-##       the observation identity). macOS and Windows write `.iomon-frag` frames
-##       through a writer that encodes every field verbatim, and there is no
-##       dedup step anywhere on the file/merge path — so one fact observed by N
-##       processes lands as N records there.
+##       THE ASSERTION IS A CHECKED CLAIM, IN BOTH DIRECTIONS.
+##       `backendFoldsObservationIdentity` states per family whether a capture
+##       folds, and this case grades the DECLARATION against the observed
+##       behaviour whichever way it points: declares folding ⇒ exactly one
+##       record; declares not folding ⇒ the repetition must really be present.
 ##
-##       `backendFoldsObservationIdentity` states that per family, and this case
-##       grades the DECLARATION against the observed behaviour whichever way it
-##       points: declares folding ⇒ exactly one record; declares not folding ⇒
-##       the repetition must really be present. The second arm is the one that
-##       earns its keep — the day someone brings the fold to a file-transport
-##       backend, this reddens and says the declaration is stale instead of
-##       silently blessing the change. That is the "every declared attribution
-##       has a check" rule applied to a platform capability.
+##       THE SECOND ARM ALREADY DID ITS JOB, AND THAT IS WHY IT IS NOW
+##       UNREACHABLE FOR EVERY NAMED FAMILY. It was written to redden "the day
+##       someone brings the fold to a file-transport backend"; DA-10 is that
+##       day. The fold used to be a property of the TRANSPORT alone — only the
+##       Linux backend published into a `nim-shm-gset` whose element key IS the
+##       observation identity, while macOS and Windows wrote `.iomon-frag`
+##       frames through a writer that encodes every field verbatim, with no
+##       dedup step anywhere on the file/merge path. It now also lives at merge
+##       time (`writer.foldObservationIdentity`), so the declaration moved with
+##       it and the non-folding arm is left standing for `mbfUnknown` and for
+##       the next backend that arrives without one.
 ##
 ##       The non-folding arm's bound is `>= FanOut`, not `>= FanOut div 2`: every
 ##       one of the `FanOut` children links the shared object and reads the
@@ -66,6 +67,16 @@
 ##       so a fixture with a single image would stay green even if that suffix
 ##       still split the elements. Mutation-checked both ways — see the
 ##       milestone report.
+##
+##   t_the_file_merge_transport_folds_the_same_fact_to_one_record
+##       DA-10's own case, and the reason the macOS answer is gradeable here:
+##       `REPRO_MONITOR_DEP_SHM_DISABLE` puts a LINUX capture on the very
+##       `.iomon-frag` merge path macOS uses. Measured at io-mon `9c1d52b`,
+##       before the merge-time fold existed, the identical fixture yielded 1 + 1
+##       records on the set and **12 + 12** on the file path. Both are 1 + 1
+##       now. The case carries its own anti-vacuity control, because after the
+##       fix the two transports are indistinguishable by count and a knob that
+##       silently stopped working would grade the set path twice.
 ##
 ##   t_completeness_is_unchanged
 ##       Two opposed runs of the SAME pair of programs. In-tree: a monitored
@@ -126,11 +137,34 @@ template buildC(work, name, source: string; extra: seq[string]): string =
   check fileExists(outPath)
   outPath
 
+# The extension the HOST's linker will actually find behind a `-l` flag.
+#
+# DA-1j's round-2 verification recorded this as an open question and DA-10
+# closes it: the fixture used to build `lib<name>.so` and link it with
+# `-l<name>` on every POSIX host, and Apple's `ld64` searches `.tbd`, `.dylib`
+# and `.a` for `-l` — never `.so`. So on macOS the child images could not link
+# at all, and this whole file's headline case had very likely never EXECUTED
+# there. Since macOS is the platform the fold declaration is about, a fixture
+# that cannot build there is the one thing that keeps the owed measurement
+# un-takeable.
+#
+# NOT VERIFIED ON A DARWIN HOST — no macOS machine was available. The Linux arm
+# is measured; the macOS arm is this file's documented intent, and the first
+# darwin run is what confirms it.
+const SharedLibExt = when defined(macosx): ".dylib" else: ".so"
+
 template buildSharedC(work, name, source: string): string =
   let src = work / (name & ".c")
   writeFile(src, source)
-  let outPath = work / ("lib" & name & ".so")
-  let built = run(getEnv("CC", "cc"), @["-fPIC", "-shared", src, "-o", outPath])
+  let outPath = work / ("lib" & name & SharedLibExt)
+  var sharedArgs = @["-fPIC", "-shared", src, "-o", outPath]
+  when defined(macosx):
+    # An absolute install name means the child images record where the dylib
+    # really is and the loader needs no rpath search — one fewer thing that can
+    # differ between the two platforms while the RECORD COUNTS are being
+    # compared.
+    sharedArgs.add "-Wl,-install_name," & outPath
+  let built = run(getEnv("CC", "cc"), sharedArgs)
   checkpoint(name & " shared cc: " & built.output)
   check built.code == 0
   check fileExists(outPath)
@@ -304,6 +338,52 @@ proc factSet(dep: MonitorDepFile): HashSet[string] =
     result.incl $r.kind & "|" & $ord(r.observationKind) & "|" &
       r.path & "|" & detail.join(" ")
 
+proc reportCensus(label: string; dep: MonitorDepFile) =
+  ## DA-10's "cheap first measurement", made obtainable from a GREEN run.
+  ##
+  ## `checkpoint` prints NOTHING unless a case fails, so a passing capture
+  ## yields no numbers — and the measurement DA-10 still owes is a COMPARISON of
+  ## record counts between a macOS host and a Linux one, both of which are
+  ## expected to pass. Opt in with `IO_MON_RECORD_CENSUS=1` and every run prints
+  ## its own census on stdout; leave it unset and test output is unchanged.
+  ##
+  ## Counts, never times: a count is load-insensitive, and this fixture is
+  ## meant to be compared across two machines that will never be equally busy.
+  ##
+  ## THE RECIPE, so the owed measurement is a command rather than an intention.
+  ## From the repository root, on EITHER host — the two `--path` switches come
+  ## from `config.nims`, so the second line is the whole invocation:
+  ##
+  ##   scripts/build_shim.sh
+  ##   IO_MON_RECORD_CENSUS=1 nim c -r tests/posix/test_io_mon_dep_identity_scope.nim
+  ##
+  ## `scripts/build_shim.sh` FIRST and from the repository root, both
+  ## load-bearing: `nim c` on a test never rebuilds the shim, and shim discovery
+  ## falls back to `<cwd>/build/lib`, so a stale shim or another directory
+  ## silently measures something else. Compare the `IOMON-CENSUS` lines between
+  ## the two hosts; `default-transport` and `file-transport` are the same
+  ## capture path on macOS (there is no set producer there), so a macOS run
+  ## prints the same census twice and that is the expected shape, not a bug.
+  if getEnv("IO_MON_RECORD_CENSUS").len == 0:
+    return
+  var perKind = initCountTable[string]()
+  var startPids = initHashSet[uint64]()
+  for r in dep.records:
+    perKind.inc $r.kind
+    if r.kind == mrProcessStart: startPids.incl r.osPid
+  var kinds = toSeq(perKind.pairs)
+  kinds.sort(proc (a, b: (string, int)): int = cmp(a[0], b[0]))
+  echo "IOMON-CENSUS ", label,
+    " backend=", dep.backendFamily,
+    " declaresFold=", backendFoldsObservationIdentity(dep.backendFamily),
+    " completeness=", dep.completeness,
+    " records=", dep.records.len,
+    " processes=", startPids.len,
+    " lib=", libraryLoadsNamed(dep, "lib" & FactLibName & SharedLibExt).len,
+    " env=", envReadsNamed(dep, EnvMarkerName).len
+  for (k, n) in kinds:
+    echo "IOMON-CENSUS ", label, "   ", k, "=", n
+
 proc awaitFile(path: string; timeoutMs = 20000) =
   let deadline = epochTime() + float(timeoutMs) / 1000.0
   while epochTime() < deadline:
@@ -345,6 +425,7 @@ suite "io-mon DA-1b dependency-identity scope":
     let res = runMonitored(req)
     check res.exitCode == 0
     let dep = res.depFile
+    reportCensus("default-transport", dep)
 
     # ANTI-VACUITY FIRST: the fan-out must really have happened, on two
     # distinct images, or "one element" would be trivially true.
@@ -381,8 +462,9 @@ suite "io-mon DA-1b dependency-identity scope":
     let folds = backendFoldsObservationIdentity(dep.backendFamily)
     checkpoint("backend " & $dep.backendFamily & " declares fold=" & $folds)
 
-    let loads = libraryLoadsNamed(dep, "lib" & FactLibName & ".so")
-    checkpoint("library-load records for lib" & FactLibName & ".so: " &
+    let loads = libraryLoadsNamed(dep, "lib" & FactLibName & SharedLibExt)
+    checkpoint("library-load records for lib" & FactLibName & SharedLibExt &
+      ": " &
       $loads.len & " (" & loads.mapIt(it.path).deduplicate.join(", ") & ")")
     let envReads = envReadsNamed(dep, EnvMarkerName)
     checkpoint("env-read records for " & EnvMarkerName & ": " & $envReads.len)
@@ -401,6 +483,11 @@ suite "io-mon DA-1b dependency-identity scope":
       # process. Prove it rather than assuming it: a backend that quietly began
       # folding would otherwise keep passing while its advertised capability set
       # told consumers the opposite.
+      #
+      # DA-10 NOTE: no backend this build can NAME reaches this arm any more —
+      # the merge-time fold made every named family answer `true`. It is kept
+      # for `mbfUnknown` and for the next backend that arrives before its fold
+      # does, and the bound below is kept as written for that backend.
       #
       # THE BOUND IS `>= FanOut`, AND THE LOADER-CLOSURE ARGUMENT IS WHY. Each of
       # the `FanOut` children `execve`s an image that links `libda1bfact.so`
@@ -437,10 +524,10 @@ suite "io-mon DA-1b dependency-identity scope":
     if folds:
       check factScopedWithPid == 0
     else:
-      # On a non-folding backend the identity codec is never consulted — the
-      # file writer encodes every field verbatim — so the observer is still
-      # there. That is the same fact as the branch above, seen from the record
-      # side, and asserting it keeps this arm from passing vacuously.
+      # On a non-folding backend neither the identity codec nor the merge-time
+      # fold is consulted, so the observer is still there. That is the same
+      # fact as the branch above, seen from the record side, and asserting it
+      # keeps this arm from passing vacuously.
       check factScopedWithPid > 0
     # Process attribution survives on EVERY backend. This is the assertion that
     # would catch a fold widened until it swallowed the evidence the
@@ -566,13 +653,113 @@ suite "io-mon DA-1b dependency-identity scope":
     # And whatever this backend declares, BOTH launch paths must do the same
     # thing — otherwise the two agree on a census while disagreeing about the
     # fold, which is the drift this case exists to catch.
-    let batchLoads = libraryLoadsNamed(batch.depFile, "lib" & FactLibName & ".so")
-    let polledLoads = libraryLoadsNamed(polled.depFile, "lib" & FactLibName & ".so")
+    let batchLoads = libraryLoadsNamed(batch.depFile, "lib" & FactLibName & SharedLibExt)
+    let polledLoads = libraryLoadsNamed(polled.depFile, "lib" & FactLibName & SharedLibExt)
     check batchLoads.len == polledLoads.len
     if backendFoldsObservationIdentity(batch.depFile.backendFamily):
       check batchLoads.len == 1
       check polledLoads.len == 1
     else:
       check batchLoads.len > 1
+
+  test "t_the_file_merge_transport_folds_the_same_fact_to_one_record":
+    # DA-10 — THE macOS ARM, EXECUTED FROM LINUX.
+    #
+    # macOS and Windows have no set producer: `attachDepQueueForShim` is called
+    # from exactly one place (`shim/linux_preload.nim`),
+    # `REPRO_MONITOR_DEP_SHM` appears 0x in `macos_interpose.nim`, and macOS's
+    # `collectMonitorEvidence` calls `mergeFragments` with NO `setRecords`. So
+    # every observation on those backends travels the `.iomon-frag` file writer
+    # and arrives at the same merge. `REPRO_MONITOR_DEP_SHM_DISABLE` puts a
+    # LINUX capture on that identical file/merge path, which is what makes the
+    # macOS behaviour gradeable on a host that is not macOS — the same move that
+    # makes `backendFoldsObservationIdentity` assertable as data.
+    #
+    # MEASURED BEFORE THE FIX, on this fixture at io-mon `9c1d52b`: the SET
+    # transport produced 1 library-load + 1 env-read for the marked fact and the
+    # FILE transport produced 12 + 12, both with 13 monitored processes. The
+    # fold now lives in `mergeFragments` (`foldObservationIdentity`), so both
+    # columns are 1 + 1 and the process census is untouched.
+    let childArgs = @["-L", work, "-l" & FactLibName, "-Wl,-rpath," & work]
+    let childA = buildC(work, "da10_child_a", FactChildSrc, childArgs)
+    let childB = buildC(work, "da10_child_b", FactChildSrc, childArgs)
+    let fanOut = buildC(work, "da10_fanout", FanOutSrc, @[])
+
+    # ANTI-VACUITY FIRST, AND IT IS THE WHOLE RISK OF THIS CASE. After the fix
+    # the two transports produce the SAME counts, so no assertion below can tell
+    # them apart — a knob that silently stopped working would leave this case
+    # green while grading the set path twice. Prove the knob switches the
+    # transport by asking the CHILD what it was given: the consumer injects
+    # `REPRO_MONITOR_DEP_SHM` only when it actually hosted a set.
+    when defined(linux):
+      proc childSeesDepShm(disable: bool): int =
+        var probe: FsSnoopRequest
+        probe.command = @["/bin/sh", "-c",
+          "if [ -n \"$REPRO_MONITOR_DEP_SHM\" ]; then exit 3; else exit 4; fi"]
+        probe.depFilePath = work / ("da10-probe-" & $disable & ".iomon")
+        probe.streamMode = fsoNone
+        probe.env = requestEnv()
+        if disable:
+          probe.env.add ("REPRO_MONITOR_DEP_SHM_DISABLE", "1")
+        runMonitored(probe).exitCode
+      let withSet = childSeesDepShm(false)
+      let withoutSet = childSeesDepShm(true)
+      checkpoint("child saw REPRO_MONITOR_DEP_SHM: default=" & $withSet &
+        " disabled=" & $withoutSet & "  (3 = present, 4 = absent)")
+      check withSet == 3        # the set transport really is the default here
+      check withoutSet == 4     # …and the knob really removes it
+
+    var req: FsSnoopRequest
+    req.command = @[fanOut, childA, childB, $FanOut]
+    req.depFilePath = work / "da10-file-transport.iomon"
+    req.streamMode = fsoNone
+    req.env = requestEnv({EnvMarkerName: "da1b",
+                          "REPRO_MONITOR_DEP_SHM_DISABLE": "1"})
+    let res = runMonitored(req)
+    check res.exitCode == 0
+    let dep = res.depFile
+    reportCensus("file-transport", dep)
+
+    # The fan-out really happened, on two images — otherwise "one record" is
+    # trivially true, exactly as in the headline case.
+    var startPids = initHashSet[uint64]()
+    for r in recordsOfKind(dep, mrProcessStart):
+      startPids.incl r.osPid
+    checkpoint("file-transport monitored processes: " & $startPids.len &
+      "  processCount=" & $dep.summary.processCount)
+    check startPids.len >= FanOut + 1
+    check dep.summary.processCount >= uint64(FanOut + 1)
+    var execImages = initHashSet[string]()
+    for r in recordsOfKind(dep, mrProcessExec):
+      if r.path.len > 0: execImages.incl r.path
+    check toSeq(execImages.items).anyIt("da10_child_a" in it)
+    check toSeq(execImages.items).anyIt("da10_child_b" in it)
+
+    let loads = libraryLoadsNamed(dep, "lib" & FactLibName & SharedLibExt)
+    let envReads = envReadsNamed(dep, EnvMarkerName)
+    checkpoint("file transport: library-load=" & $loads.len &
+      " env-read=" & $envReads.len & " (was " & $FanOut & " + " & $FanOut & ")")
+    check loads.len == 1
+    check envReads.len == 1
+    check loads[0].osPid == 0
+    check envReads[0].osPid == 0
+
+    # THE DIRECTION THAT WOULD BE THE CARDINAL SIN. The fold must not have
+    # touched the process attribution the completeness machinery reads, and the
+    # verdict must not have moved.
+    var processScopedWithPid = 0
+    var factScopedWithPid = 0
+    for r in dep.records:
+      case depIdentityScope(r.kind)
+      of disProcessScoped:
+        if r.osPid != 0: inc processScopedWithPid
+      of disFactScoped:
+        if r.osPid != 0 or r.parentOsPid != 0 or r.threadId != 0 or
+            r.childOsPid != 0:
+          inc factScopedWithPid
+      of disPathScoped: discard
+    check processScopedWithPid > 0
+    check factScopedWithPid == 0
+    check dep.completeness == mcComplete
 
   removeDir(work)

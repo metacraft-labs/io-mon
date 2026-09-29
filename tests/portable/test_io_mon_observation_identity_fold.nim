@@ -41,13 +41,14 @@
 ## write side is imported deliberately: DA-1j's stamp is WRITTEN there, and a
 ## milestone graded only on the read side survived deleting the writer entirely.
 
-import std/[options, os, strutils, unittest]
+import std/[algorithm, options, os, strutils, unittest]
 
 import io_mon/types
 import io_mon/capabilities
 import io_mon/encode
 import io_mon/reader
 import io_mon/writer
+import io_mon/shm/dep_queue
 
 suite "io-mon observation-identity fold declaration":
 
@@ -56,13 +57,18 @@ suite "io-mon observation-identity fold declaration":
     # for every family, so the answer for a platform this host is not still
     # gets graded here.
     check backendFoldsObservationIdentity(mbfLinuxPreloadHooks)
-    check not backendFoldsObservationIdentity(mbfMacosHooks)
-    check not backendFoldsObservationIdentity(mbfMacosEndpointSecurity)
-    check not backendFoldsObservationIdentity(mbfMacosHybrid)
-    check not backendFoldsObservationIdentity(mbfWindowsInterposeHooks)
-    # An unnamed backend must default to "no fold": promising a reduction we
-    # have not verified is the direction that misleads a consumer sizing a
-    # capture.
+    # DA-10 — the four file-transport families answered `false` until the fold
+    # moved out of the transport and into `mergeFragments`, which every depfile
+    # from every one of them is written through.
+    check backendFoldsObservationIdentity(mbfMacosHooks)
+    check backendFoldsObservationIdentity(mbfMacosEndpointSecurity)
+    check backendFoldsObservationIdentity(mbfMacosHybrid)
+    check backendFoldsObservationIdentity(mbfWindowsInterposeHooks)
+    # An unnamed backend must still default to "no fold", and DA-10 does not
+    # change that: the fold reaches a capture because THIS build's merge wrote
+    # it, and a capture whose backend this build cannot name is not one it can
+    # claim to have written. Promising a reduction we have not verified is the
+    # direction that misleads a consumer sizing a capture.
     check not backendFoldsObservationIdentity(mbfUnknown)
 
     # Exhaustive: a family added later must be classified rather than silently
@@ -79,13 +85,21 @@ suite "io-mon observation-identity fold declaration":
     # and they are written in different files. Pin them to each other.
     check (mcapObservationIdentityFold in LinuxPreloadSupportedCapabilities) ==
       backendFoldsObservationIdentity(mbfLinuxPreloadHooks)
-    check mcapObservationIdentityFold in
-      MacosInterposeKnownUnsupportedCapabilities
-    check mcapObservationIdentityFold in
-      WindowsInterposeKnownUnsupportedCapabilities
-    check mcapObservationIdentityFold notin MacosInterposeSupportedCapabilities
+    check (mcapObservationIdentityFold in MacosInterposeSupportedCapabilities) ==
+      backendFoldsObservationIdentity(mbfMacosHooks)
+    check (mcapObservationIdentityFold in
+      WindowsInterposeSupportedCapabilities) ==
+      backendFoldsObservationIdentity(mbfWindowsInterposeHooks)
+    # DA-10 — and it is no longer declared a GAP anywhere. A capability that is
+    # both advertised and declared missing is the mismatch this pairing exists
+    # to catch, so assert the removal rather than leaving it implied.
     check mcapObservationIdentityFold notin
-      WindowsInterposeSupportedCapabilities
+      MacosInterposeKnownUnsupportedCapabilities
+    check mcapObservationIdentityFold notin
+      WindowsInterposeKnownUnsupportedCapabilities
+    # The non-interpose macOS taxonomy profile writes through the same merge, so
+    # it must not disagree with its sibling.
+    check mcapObservationIdentityFold in MacosMonitorShimTaxonomyCapabilities
 
   test "t_the_fold_gap_is_a_cost_gap_and_must_never_force_incompleteness":
     # THE ASSERTION THAT STOPS THE "FIX". A non-folding backend saw everything;
@@ -97,16 +111,15 @@ suite "io-mon observation-identity fold declaration":
     # through it, so a declared gap must render with `inputChannel = false`.
     check mcapObservationIdentityFold notin InputChannelCapabilities
 
-    # And a macOS profile really does declare it — the runtime visibility half.
-    # Asserting only the set membership above would pass even if no profile ever
-    # emitted the gap.
+    # DA-10 — the runtime visibility half, INVERTED. A macOS profile used to
+    # declare this as a gap; it now ADVERTISES the capability, and the gap must
+    # be gone from the emitted profile rather than merely from the set literal.
+    # Asserting only the set membership above would pass even if the profile
+    # kept emitting the gap from somewhere else.
     let profile = macosInterposeMonitorProfile()
-    var sawGap = false
+    check mcapObservationIdentityFold in profile.supportedCapabilities
     for gap in profile.gaps:
-      if gap.capability == mcapObservationIdentityFold:
-        sawGap = true
-        check not gap.inputChannel
-    check sawGap
+      check gap.capability != mcapObservationIdentityFold
 
     # …and declaring it did NOT cost a macOS capture its completeness. GRADED
     # THROUGH THE DERIVATION PRODUCTION USES, which is the whole point: asking
@@ -118,16 +131,64 @@ suite "io-mon observation-identity fold declaration":
     # would keep passing while this capability sat in the floor set. Measured.
     # `depFileFromOwnedRecords` derives with `InputEvidenceCapabilities`
     # instead, so that is what this asserts against.
+    #
+    # DA-10 kept this assertion and had to give it a SUBJECT again. A macOS
+    # profile no longer declares the fold gap, so deriving from the real profile
+    # would now assert "the gap that is not there did not cost completeness" —
+    # true of every capability, including one that genuinely should force
+    # `mcIncomplete`. The floor-set rule is about what happens WHEN this
+    # capability is declared missing, so the gap is SYNTHESISED here: it is the
+    # shape any future non-folding backend will emit, and it must still grade
+    # `mcComplete`.
     var macosRecords = @[backendProfileRecord(profile)]
     for gap in profile.gaps:
       macosRecords.add capabilityGapRecord(gap)
+    macosRecords.add capabilityGapRecord(MonitorCapabilityGap(
+      backendFamily: mbfMacosHooks,
+      capability: mcapObservationIdentityFold,
+      required: false,
+      inputChannel: false,
+      reason: "synthetic: a backend with neither a set producer nor the " &
+        "merge-time fold"))
     let macosDep = depFileFromRecords(macosRecords)
+    var sawDerivedFoldGap = false
     var derivedFoldGapRequired = false
     for gap in macosDep.capabilityGaps:
       if gap.capability == mcapObservationIdentityFold:
+        sawDerivedFoldGap = true
         derivedFoldGapRequired = gap.required
+    check sawDerivedFoldGap          # the subject really reached the derive
     check not derivedFoldGapRequired
     check macosDep.completeness == mcComplete
+
+    # DA-10 — THE CONFIGURATION macOS ACTUALLY PRODUCES, and the one place this
+    # change could have turned every macOS capture `mcIncomplete`.
+    # `mergeFragments` calls `defaultHooksMonitorProfile(...)` with
+    # `MacosMonitorShimTaxonomyCapabilities` as the REQUIRED set (not as the
+    # supported one), and `macosInterposeMonitorProfile` clears
+    # `evidenceComplete` for any required capability its supported set lacks.
+    # So adding the fold to that taxonomy without also advertising it in
+    # `MacosInterposeSupportedCapabilities` would have declared a REQUIRED,
+    # unsupported capability on every macOS depfile — an `mdlError` gap and a
+    # false `mcIncomplete`, which is this campaign's cardinal sin arriving
+    # through the fix for a cost defect. Both halves landed; assert the pair
+    # rather than trusting that they were noticed together.
+    let asMergeAsksFor =
+      macosInterposeMonitorProfile(MacosMonitorShimTaxonomyCapabilities)
+    check asMergeAsksFor.evidenceComplete
+    var foldGapInMergeProfile = false
+    var requiredGapsInMergeProfile: seq[string] = @[]
+    for gap in asMergeAsksFor.gaps:
+      if gap.capability == mcapObservationIdentityFold:
+        foldGapInMergeProfile = true
+      if gap.required:
+        requiredGapsInMergeProfile.add capabilityId(gap.capability)
+    checkpoint("required gaps in the merge's macOS profile: " &
+      $requiredGapsInMergeProfile)
+    check not foldGapInMergeProfile
+    check requiredGapsInMergeProfile.len == 0
+    for diag in asMergeAsksFor.diagnostics:
+      check diag.level != mdlError
 
   test "t_the_capability_has_a_stable_wire_id":
     # The enum is serialized by STRING, so appending a case never shifts an
@@ -152,6 +213,150 @@ suite "io-mon observation-identity fold declaration":
       discard capabilityFromId("no-such-capability-id")
     check tryCapabilityFromId("no-such-capability-id").isNone
     check tryCapabilityFromId("observation-identity-fold").isSome
+
+suite "io-mon merge-time observation-identity fold (DA-10)":
+  ## The BEHAVIOUR behind the declaration above, graded from any host.
+  ##
+  ## `foldObservationIdentity` is where the file/merge path acquired the fold
+  ## macOS and Windows never had. It is a pure function over records, so every
+  ## kind's answer is gradeable here — including the answer for a platform this
+  ## host is not, which is the same reason `backendFoldsObservationIdentity` is
+  ## asserted as data rather than behind `when defined(...)`.
+
+  proc observed(kind: MonitorRecordKind; path, detail: string;
+                pid, tid: uint64): MonitorRecord =
+    ## One observation of `path` by process `pid` / thread `tid`. Only the
+    ## observer coordinates vary between the copies a case builds, so anything
+    ## that folds them folded on the observer and nothing else.
+    MonitorRecord(kind: kind, observationKind: moFileRead,
+      seq: pid * 1000 + tid, osPid: pid, parentOsPid: 1, threadId: tid,
+      probeResult: prUnknown, path: path, detail: detail)
+
+  test "t_only_the_kinds_whose_identity_drops_the_incarnation_are_folded":
+    # EXHAUSTIVE OVER THE ENUM, so a kind added later is graded rather than
+    # inheriting a neighbour's answer — the same discipline `depIdentityScope`
+    # itself is written under.
+    var graded = 0
+    for kind in MonitorRecordKind:
+      inc graded
+      let three = @[
+        observed(kind, "/x/thing", "run=r1", 100, 7),
+        observed(kind, "/x/thing", "run=r1", 200, 8),
+        observed(kind, "/x/thing", "run=r1", 300, 9)]
+      let folded = foldObservationIdentity(three)
+      checkpoint($kind & " scope=" & $depIdentityScope(kind) &
+        " keepsIncarnation=" & $depIdentityKeepsIncarnation(kind) &
+        " 3 -> " & $folded.len)
+      if depIdentityKeepsIncarnation(kind):
+        # PATH- and PROCESS-scoped kinds keep their observer here. The path
+        # ones are not an oversight: their SET element key carries the
+        # observer's per-exec incarnation (`setElemImage`), the fragment writer
+        # carries no incarnation coordinate, and folding them without it would
+        # be a dedup decision DA-1b did not take.
+        check folded.len == 3
+        check folded == three            # untouched, not merely uncollapsed
+      else:
+        check folded.len == 1
+        check folded[0].kind == kind
+        check folded[0].path == "/x/thing"
+        check folded[0].detail == "run=r1"
+        # The folded record is the one the SET transport would have delivered:
+        # observer coordinates gone, `seq` renumbered from zero.
+        check folded[0].osPid == 0
+        check folded[0].parentOsPid == 0
+        check folded[0].threadId == 0
+        check folded[0].childOsPid == 0
+        check folded[0].seq == 0
+    check graded ==
+      ord(high(MonitorRecordKind)) - ord(low(MonitorRecordKind)) + 1
+
+  test "t_the_fold_never_collapses_two_different_facts":
+    # THE LF-1 DIRECTION, and the one that would be the cardinal sin in
+    # reverse: dropping a record that was not a duplicate manufactures an
+    # `mcComplete` that is missing an input. Every coordinate the identity key
+    # keeps must keep two observations apart, one axis at a time.
+    for kind in [mrLibraryLoad, mrEnvRead, mrSysctlRead, mrTimeRead]:
+      # different path
+      check foldObservationIdentity(@[
+        observed(kind, "/a", "run=r1", 1, 1),
+        observed(kind, "/b", "run=r1", 2, 2)]).len == 2
+      # different detail — which is where the RUN STAMP lives, so this is also
+      # what stops a prior run's evidence folding into this one's
+      check foldObservationIdentity(@[
+        observed(kind, "/a", "run=r1", 1, 1),
+        observed(kind, "/a", "run=r2", 2, 2)]).len == 2
+      # different observation kind
+      var a = observed(kind, "/a", "run=r1", 1, 1)
+      var b = observed(kind, "/a", "run=r1", 2, 2)
+      b.observationKind = moEnvRead
+      check foldObservationIdentity(@[a, b]).len == 2
+      # different outcome / flags — `identityNormalizedOutcome` answers
+      # VERBATIM for every fact-scoped kind, so both stay in the key
+      b = observed(kind, "/a", "run=r1", 2, 2)
+      b.result = 17
+      check foldObservationIdentity(@[a, b]).len == 2
+      b = observed(kind, "/a", "run=r1", 2, 2)
+      b.flags = 0x40
+      check foldObservationIdentity(@[a, b]).len == 2
+
+  test "t_the_fold_is_deterministic_and_idempotent":
+    # DETERMINISM. Fragments are read in `walkDir` order, which is not stable
+    # across runs, and a folded record has `osPid = threadId = seq = 0` so it
+    # can tie in `canonicalOrder`. The fold sorts its distinct keys, so the
+    # output does not depend on the order the duplicates arrived in.
+    let forward = @[
+      observed(mrEnvRead, "PATH", "run=r1", 1, 1),
+      observed(mrEnvRead, "HOME", "run=r1", 2, 2),
+      observed(mrLibraryLoad, "/lib/libc.so", "run=r1", 3, 3),
+      observed(mrEnvRead, "PATH", "run=r1", 4, 4)]
+    var backward = forward
+    backward.reverse()
+    let a = foldObservationIdentity(forward)
+    let b = foldObservationIdentity(backward)
+    check a.len == 3
+    check a == b
+    # IDEMPOTENT: a record that already travelled the SET transport arrives in
+    # identity form and must survive as itself, which is what lets the fold run
+    # unconditionally on every merge instead of being gated on a platform.
+    check foldObservationIdentity(a) == a
+
+  test "t_the_fold_reaches_the_depfile_through_mergeFragments":
+    # THE WIRING, not only the function. `mergeFragments` is the one funnel
+    # every macOS and Windows depfile is written through, and a fold that is
+    # correct but not called is the shape this milestone found in the first
+    # place.
+    let work = getTempDir() / ("io-mon-da10-merge-" & $getCurrentProcessId())
+    removeDir(work)
+    createDir(work)
+    var duplicates: seq[MonitorRecord] = @[]
+    for pid in 1'u64 .. 12'u64:
+      duplicates.add observed(mrLibraryLoad, "/lib/libfact.so", "run=r1", pid, 1)
+      duplicates.add observed(mrEnvRead, "MARKER", "run=r1", pid, 1)
+      duplicates.add observed(mrFileWrite, "/out/" & $pid, "run=r1", pid, 1)
+    let dep = mergeFragments(work, work / "folded.iomon",
+      setRecords = duplicates)
+    var loads, envs, writes = 0
+    for r in dep.records:
+      case r.kind
+      of mrLibraryLoad: inc loads
+      of mrEnvRead: inc envs
+      of mrFileWrite: inc writes
+      else: discard
+    checkpoint("merged: library-load=" & $loads & " env-read=" & $envs &
+      " file-write=" & $writes)
+    check loads == 1
+    check envs == 1
+    # …and the process-scoped kind is untouched: twelve writes by twelve
+    # processes are twelve facts about the build, not one.
+    check writes == 12
+    # The depfile ON DISK agrees with the returned value — the fold runs before
+    # the write, for the same reason the DA-1i/DA-1j stamps do.
+    let onDisk = readMonitorDepFile(work / "folded.iomon")
+    var diskLoads = 0
+    for r in onDisk.records:
+      if r.kind == mrLibraryLoad: inc diskLoads
+    check diskLoads == 1
+    removeDir(work)
 
 suite "io-mon depfile tolerance of a writer from the future":
 

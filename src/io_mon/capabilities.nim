@@ -64,19 +64,21 @@ const
     # or uses RENAME_SWAP) and is OUTPUT-side only: a missed mutation record is
     # never an INPUT false-complete (the cardinal sin), it only leaves the
     # output-tree view of that rare op uncaptured.
-    mcapPathMutation
+    mcapPathMutation,
+    # DA-10 — MOVED HERE FROM THE UNSUPPORTED SET. This backend writes
+    # `.iomon-frag` frames and has no set producer, and the file writer still
+    # encodes every field verbatim; what changed is that the FOLD no longer lives
+    # in the transport. `writer.foldObservationIdentity` applies DA-1b's element
+    # key (`encodeDepRecordIdentity`) inside `mergeFragments`, which every
+    # depfile this backend produces goes through, so one fact observed by N
+    # processes now lands as one record here too. See
+    # `backendFoldsObservationIdentity` for what the fold does and does NOT cover
+    # on a file transport, and for why this capability must still never join
+    # `InputEvidenceCapabilities`.
+    mcapObservationIdentityFold
   }
 
   MacosInterposeKnownUnsupportedCapabilities* = {
-    # DA-1b — this backend writes `.iomon-frag` frames, and that writer encodes
-    # every field verbatim with the record's real `seq`; there is no dedup step
-    # anywhere on the file/merge path. One fact observed by N processes lands as
-    # N records. DECLARED so a consumer sizing a capture is not promised a
-    # reduction it will not get -- and declared as a COST shortfall, never a
-    # fidelity one: nothing went unobserved. See
-    # `backendFoldsObservationIdentity` for why this capability must never join
-    # `InputEvidenceCapabilities`.
-    mcapObservationIdentityFold,
     # T3c (adversarial-hardening break #6): the EndpointSecurity backend is now
     # DESIGNED + FEASIBILITY-PROBED + SKELETONED — see
     # reprobuild-specs/MacOS-EndpointSecurity-Backend.md and the integration stub
@@ -117,14 +119,21 @@ const
     # ROUND-3 S1 — content-channel coverage (see MacosInterposeSupportedCapabilities).
     mcapExternalContent,
     # ROUND-4 RW2 — output-directory mutation surface (mkdir/rmdir/unlink/unlinkat).
-    mcapPathMutation
+    mcapPathMutation,
+    # DA-10 — see the same entry in `MacosInterposeSupportedCapabilities`: the
+    # fold is applied at merge time, so it reaches this taxonomy's backends too.
+    mcapObservationIdentityFold
   }
 
   LinuxPreloadSupportedCapabilities* = {
     # DA-1b — the Linux backend publishes into a consumer-owned nim-shm-gset
     # whose element key IS the observation identity, so repeated observations
-    # of one fact collapse to one element. See
-    # `backendFoldsObservationIdentity`, which must agree with this entry.
+    # of one fact collapse to one element. DA-10 added the merge-time fold that
+    # gives the file transports the fact-scoped half of the same reduction, so
+    # this entry is no longer what distinguishes Linux; what still does is that
+    # the set ALSO folds the path-scoped kinds, which the file path cannot
+    # reconstruct. See `backendFoldsObservationIdentity`, which must agree with
+    # this entry.
     mcapObservationIdentityFold,
     mcapProcess,
     mcapFileRead,
@@ -407,7 +416,14 @@ const
     # the POSIX `environ` walk, which the macOS and Linux arms do not cover
     # either while advertising this same capability; the claim is "every
     # environment read that goes through a call", on all three platforms.
-    mcapObservedEnv
+    mcapObservedEnv,
+    # DA-10 — MOVED HERE FROM THE UNSUPPORTED SET, for the same reason as the
+    # macOS entry: the fold moved out of the transport and into
+    # `writer.foldObservationIdentity`, which runs inside `mergeFragments` —
+    # the one funnel every Windows depfile is written through. See
+    # `backendFoldsObservationIdentity` for the half of the Linux reduction
+    # this does NOT deliver.
+    mcapObservationIdentityFold
   }
 
   # Capabilities with no Windows record kind behind them today. Reported as
@@ -446,8 +462,6 @@ const
   # and for the one residual it does not (a direct walk of the CRT's `_environ`
   # array, which performs no call and is uncovered on POSIX too).
   WindowsInterposeKnownUnsupportedCapabilities* = {
-    # DA-1b — same file-writer transport as macOS, same consequence: no fold.
-    mcapObservationIdentityFold,
     mcapEndpointSecurity,
     mcapHybrid,
     mcapAuthorizationEnforcement,
@@ -840,15 +854,30 @@ func backendFoldsObservationIdentity*(family: MonitorBackendFamily): bool =
   ## Does a capture from this backend FOLD repeated observations of one fact
   ## into one record?
   ##
-  ## THE ANSWER IS A PROPERTY OF THE TRANSPORT, NOT OF THE HOOKS. The Linux
-  ## backend publishes each observation into a consumer-owned `nim-shm-gset`
-  ## whose element key IS the observation's identity (`depIdentityScope`), so
-  ## two processes observing one fact insert one element. Every other backend
-  ## writes `.iomon-frag` frames, and that writer encodes every field verbatim
-  ## with the record's real `seq`: nothing collapses, on any axis. There is no
-  ## dedup step anywhere on the file/merge path — so macOS and Windows get
-  ## neither the fact-scoped fold nor the path-scoped one, and a probe storm
-  ## lands one record per event.
+  ## IT USED TO BE A PROPERTY OF THE TRANSPORT ALONE, AND DA-10 MOVED IT. The
+  ## Linux backend publishes each observation into a consumer-owned
+  ## `nim-shm-gset` whose element key IS the observation's identity
+  ## (`depIdentityScope`), so two processes observing one fact insert one
+  ## element. Every other backend writes `.iomon-frag` frames, and that writer
+  ## still encodes every field verbatim with the record's real `seq` — but the
+  ## fold is no longer only in the transport. `writer.foldObservationIdentity`
+  ## applies the SAME DA-1b element key inside `mergeFragments`, which every
+  ## depfile from every backend is written through, so a fact observed by N
+  ## processes is now one record on a file transport too.
+  ##
+  ## WHAT THE FILE TRANSPORTS STILL DO NOT GET, stated so this answer is not
+  ## read as more than it is: the merge-time fold covers exactly the kinds whose
+  ## `depIdentityKeepsIncarnation` is FALSE — `mrLibraryLoad`, `mrEnvRead`,
+  ## `mrSysctlRead`, `mrTimeRead`, the four the DA-1b measurement found to be
+  ## 46.3% of a real `nim c`'s depfile. The PATH-scoped kinds
+  ## (`mrFileOpen` / `mrFileRead` / `mrPathProbe` / `mrDirectoryEnumerate`) keep
+  ## the observer's per-exec incarnation in their set key
+  ## (`writer.encodeDepSetElement`'s `setElemImage`), and the fragment writer
+  ## carries no incarnation coordinate — so that half of the Linux reduction is
+  ## NOT reconstructible at merge time and is not attempted. Folding those
+  ## without the incarnation would be a dedup decision DA-1b explicitly did not
+  ## take. The residual is small and was measured: path-scoped kinds dedup at
+  ## 1.0–1.1x, i.e. they carry almost no cross-process repetition to recover.
   ##
   ## ASSERTED AS DATA, per family, and NOT behind `when defined(...)`. On Linux
   ## `defined(linux) or defined(macosx)` and a bare `true` are the same value,
@@ -863,10 +892,13 @@ func backendFoldsObservationIdentity*(family: MonitorBackendFamily): bool =
   ## (reprobuild's `addUnique`), so the repetition costs capture time, transport
   ## and depfile bytes, and changes no verdict and no cache key.
   ##
-  ## Which is exactly why the gap this drives is declared `required = false` and
-  ## why `mcapObservationIdentityFold` is deliberately NOT a member of
-  ## `InputEvidenceCapabilities`. Promoting it into that floor set would force
-  ## `mcIncomplete` on every macOS capture, and that grade would be FALSE:
+  ## Which is exactly why the gap this used to drive was declared
+  ## `required = false` — and why `mcapObservationIdentityFold` is deliberately
+  ## NOT a member of `InputEvidenceCapabilities`, which is the part DA-10 does
+  ## not change: no family declares this gap any more, but a family that
+  ## answered `false` here must still not be forced incomplete by it.
+  ## Promoting it into that floor set would force
+  ## `mcIncomplete` on such a capture, and that grade would be FALSE:
   ## `mcIncomplete` means *the monitor could not observe everything*, and here
   ## it observed everything and wrote some of it down more than once. Encoding a
   ## non-fidelity fact as a fidelity grade is the same mistake the reduced-scope
@@ -878,10 +910,20 @@ func backendFoldsObservationIdentity*(family: MonitorBackendFamily): bool =
     true
   of mbfMacosHooks, mbfMacosEndpointSecurity, mbfMacosHybrid,
      mbfWindowsInterposeHooks:
-    false
+    # DA-10 — was `false`, and the change is deliberate rather than a loosening.
+    # These families all reach the consumer through `mergeFragments`, and that
+    # is where the fold now is. The non-folding arm of
+    # `test_io_mon_dep_identity_scope`'s headline case exists precisely to
+    # redden "the day someone brings the fold to a file-transport backend";
+    # this is that day, and the declaration is being moved rather than the
+    # assertion weakened.
+    true
   of mbfUnknown:
-    # Conservative: claim no fold for a backend we cannot name, so a consumer
-    # sizing a capture is never promised a reduction it will not get.
+    # Conservative, and still false AFTER DA-10. The fold reaches a capture
+    # because `mergeFragments` wrote it; a capture whose backend this build
+    # cannot even name is not one it can claim to have written. Promising a
+    # reduction we have not verified is the direction that misleads a consumer
+    # sizing a capture.
     false
 
 proc backendProfileRecord*(profile: MonitorBackendProfile): MonitorRecord =
