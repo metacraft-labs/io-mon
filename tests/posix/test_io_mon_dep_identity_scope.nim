@@ -107,6 +107,7 @@ import std/[algorithm, os, osproc, sequtils, sets, streams, strtabs, strutils,
 
 import io_mon
 import io_mon/shm/dep_queue
+import build_test_shim
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
@@ -354,13 +355,12 @@ proc reportCensus(label: string; dep: MonitorDepFile) =
   ## From the repository root, on EITHER host — the two `--path` switches come
   ## from `config.nims`, so the second line is the whole invocation:
   ##
-  ##   scripts/build_shim.sh
   ##   IO_MON_RECORD_CENSUS=1 nim c -r tests/posix/test_io_mon_dep_identity_scope.nim
   ##
-  ## `scripts/build_shim.sh` FIRST and from the repository root, both
-  ## load-bearing: `nim c` on a test never rebuilds the shim, and shim discovery
-  ## falls back to `<cwd>/build/lib`, so a stale shim or another directory
-  ## silently measures something else. Compare the `IOMON-CENSUS` lines between
+  ## The fixture builds its own production shim and compiler cache, then pins
+  ## that library in each capture request. Concurrent fixtures may rebuild
+  ## `build/lib` without changing the library this test loads.
+  ## Compare the `IOMON-CENSUS` lines between
   ## the two hosts; `default-transport` and `file-transport` are the same
   ## capture path on macOS (there is no set producer there), so a macOS run
   ## prints the same census twice and that is the expected shape, not a bug.
@@ -398,13 +398,15 @@ suite "io-mon DA-1b dependency-identity scope":
   removeDir(work)
   createDir(work)
 
-  # The shim must be built BEFORE anything runs under it: a cold build/lib
-  # otherwise leaves a monitored process reading a half-written shared object.
-  let shimBuild = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-  checkpoint(shimBuild.output)
-  require shimBuild.code == 0
-  let shimLib = findShimLibrary()
-  require shimLib.len > 0
+  # This transport-owning fixture runs outside the enclosing monitor. Its
+  # shim must also be private: another fixture may relink build/lib while
+  # the file-transport fan-out is loading its library.
+  let shimLib =
+    when defined(macosx): buildPrivateMacosShim(repoRoot)
+    else: buildPrivateLinuxShim(repoRoot)
+  require fileExists(shimLib)
+  # The host resolves its injected library from the parent environment.
+  putEnv("REPRO_MONITOR_SHIM_LIB", shimLib)
 
   proc requestEnv(extra: openArray[(string, string)] = []): seq[(string, string)] =
     result = @[("REPRO_MONITOR_SHIM_LIB", shimLib)]
