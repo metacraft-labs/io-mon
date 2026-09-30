@@ -92,3 +92,31 @@ x64 locally. Workflow/Python/PowerShell validation passes. The runtime result
 is pending. Each variant also runs ordinary exit; every case must retain the
 real file-read record, and an expected original stall must specifically show
 shutdown phase 211 rather than just exceed the diagnostic bound.
+
+## Controlled outcome: proposed deadlock not reproduced
+
+Tooling `f8c2615` initially fails its observer self-control because the compiled
+observer filename differs from its own module filter. `fa29d9f` corrects that
+diagnostic mistake. `1604782` waits for the real worker to finish initialization
+before process exit. Both Windows hosts then complete every original and
+guarded child with exit 17 and the expected file-read record; the original
+late-flush stall is absent, so the comparison correctly fails its premise.
+
+Final control `36782322613` at `ed420ad` retains a named event in the parent
+to prove whether the worker actually acquires the registry lock. On Windows
+x64, both scheduled original and guarded repetitions signal that event and
+still exit 17 with complete marker capture. On the ARM host, neither variant
+signals the event, and both still exit 17; that host does not execute the
+requested early-flush schedule. Ordinary controls also retain capture and
+exit 17. No late-flush phase 211 is observed. Evidence:
+`/tmp/windows-shutdown-lock-ed4-x64` and
+`/tmp/windows-shutdown-lock-ed4-arm`.
+
+This does not validate the guarded callback as a repair. The source mismatch
+remains documented, but this control does not reproduce its proposed unsafe
+order. No production callback change is selected. Focused RunQuota comparison
+`36774529116` at `8817d55` separately shows export completing after 554 seconds
+and merge timing out after six successful assertions, with more than 1000
+recorded child launches. That observation supports investigating execution
+overhead and does not locate an exit deadlock. The shutdown-phase observation
+`36778919434` at `d35cfcc` remains pending.
