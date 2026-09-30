@@ -147,3 +147,13 @@ both ways. Injection with the corrected query reaches `ioChildTerminated`
 at about 1546 ms; the unchanged 1500 ms deadline and exit assertions hold.
 The production repair must also retain the real native-system-child refusal
 test and complete ordinary CI. Evidence: `/tmp/io-mon-spawn-db2-evidence`.
+
+At `3df08c2`, ordinary ARM-host job `109666585235` in `36645229405` passes
+all native-exit and session-scope assertions, then fails deleting the private
+`io-mon.exe` and shim DLL with `Access is denied`. This matches the separate
+RunQuota finished-image investigation, whose real Restart Manager control at
+shared `6cd12df` identifies `XtaCache.exe` retaining images after child exit.
+Give these two fixture trees bounded removal retries; persistent failure must
+still raise. Confirm with unchanged assertions on real ARM and x64 Windows
+hosts. Refreshed dev `9c03325`; searched the existing and deleted cleanup
+records before adding this evidence.

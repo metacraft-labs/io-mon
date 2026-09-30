@@ -45,3 +45,20 @@ and fragment descriptor reuse) private outputs too. The older-shim mutation
 fixture and host-session fixture already own private builds. Ordinary monitored
 fixtures retain the enclosing monitor's explicit immutable shim pin; the
 per-call case deliberately clears that pin, hence its separate layout.
+
+## Remaining fixture ownership failures at `3df08c2`
+
+Native-workflow Reprobuild job `109666724409` in run `36645226098` fails two
+programs. The new shared-producer growth regression loads the shipping shim
+while another fixture relinks it: the loader reports `invalid ELF header`,
+the fork arm retains only eight child paths rather than 16,392 total paths,
+and capture is incomplete. Give its default capture a private production
+shim, while preserving an explicit shim override for the old/new control.
+
+The older-shim fixture recursively copies `.repro`, including transient
+monitor depfiles deleted during the copy. It fails before assertions with
+`No such file or directory`. Copy only its required source/configuration
+inputs; the mutation build does not consume the build engine's working state.
+Keep all mutation, capture and completeness assertions. Refreshed dev
+`9c03325` and searched current and archived fixture issues before extending
+this record.
