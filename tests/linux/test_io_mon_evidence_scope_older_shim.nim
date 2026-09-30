@@ -102,7 +102,7 @@ suite "io-mon evidence-scope filter on the host (DA-1i, older shim)":
     # `.repro` contains live depfiles that disappear while another action ends.
     for name in ["src", "scripts"]:
       copyDir(repoRoot / name, repoCopy / name)
-    for name in ["config.nims", "io_mon.nimble"]:
+    for name in ["config.nims", "io_mon.nimble", "version.txt"]:
       copyFile(repoRoot / name, repoCopy / name)
 
     let preload = repoCopy / "src" / "io_mon" / "shim" / "linux_preload.nim"
