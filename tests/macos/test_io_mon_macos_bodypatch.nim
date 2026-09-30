@@ -40,15 +40,10 @@ when defined(macosx):
   # via stdio (fopen → open$NOCANCEL inside libsystem_c).
   const internalTarget = "/etc/services"
 
+  from build_test_shim import buildPrivateMacosShim
+
   proc buildShim(): string =
-    ## Build the fat (arm64+arm64e) shim and return its path. Fails loudly.
-    let (output, code) = execCmdEx("bash " &
-      quoteShell(repoRoot / "scripts" / "build_shim.sh"))
-    if code != 0:
-      raise newException(IOError, "build_shim.sh failed: " & output)
-    let shim = repoRoot / "build" / "lib" / "librepro_monitor_shim.dylib"
-    doAssert fileExists(shim), "shim not produced at " & shim
-    shim
+    buildPrivateMacosShim(repoRoot)
 
   proc compileProbe(work: string): string =
     ## Compile a tiny C program that fopen()s the internal target. fopen's
@@ -98,7 +93,7 @@ int main(void) {
 
     # Merge the per-thread fragments the child wrote into a single depfile and
     # decode it with the production reader (no string-grepping of raw bytes).
-    let depfile = work / "cap.rdep"
+    let depfile = work / "cap.iomon"
     discard mergeFragments(fragmentDir, depfile)
     if not fileExists(depfile):
       return false

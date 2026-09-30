@@ -41,7 +41,7 @@ The historical design (milestone `io-mon-DEP-SHM`, see
 **bounded, drop-on-full** ring. That was only self-consistent because it was
 paired with a **file fallback**: `dep_queue.tryPushRecord` returns `dpsDropped`
 on a full ring, and the caller was *required* to re-emit the dropped record to a
-per-thread `.rmdf-frag` file (`writer.nim`). Under that two-channel design a ring
+per-thread `.iomon-frag` file (`writer.nim`). Under that two-channel design a ring
 drop was **not** a loss event — the file caught it — so the ring's drop-on-full
 looked "signalled, never silent, never lossy."
 
@@ -74,7 +74,7 @@ gets its own structure, the action cache keeps its ring).
    └───────────────────────────────────────────────┘
         │  single consumer reads/drains
         ▼
-   io-mon run driver / reprobuild engine  →  canonical RMDF depfile + completeness
+   io-mon run driver / reprobuild engine  →  canonical iomon depfile + completeness
 ```
 
 - **Producers** are the shim instances injected into every process/thread of the
@@ -397,7 +397,7 @@ swappable.
 
 ## 4. No fallback file
 
-**The `.rmdf-frag` per-process file spill is removed as a producer path.** Its
+**The `.iomon-frag` per-process file spill is removed as a producer path.** Its
 two historical jobs are both subsumed:
 
 - *Durability across producer death* → provided by consumer-owned ring memory
@@ -422,7 +422,7 @@ treated as a **hard error, not a reason to write a file**:
 A long-lived `repro-full daemon serve --dev` was left as an **orphaned monitored
 descendant**: its monitor's root command had exited, the grace period lapsed, and
 `fs_snoop` removed the fragment directory — but the descendant kept running and
-kept appending to its now-*unlinked* `.rmdf-frag` fd. With no consumer draining
+kept appending to its now-*unlinked* `.iomon-frag` fd. With no consumer draining
 it, that single fragment grew to **~61 GiB** and filled the root tmpfs. This is
 exactly the `dpsUnavailable`/orphan class: a producer on the file fallback with
 no consumer. LF-2 makes it structurally impossible — there is no file to grow.
@@ -489,14 +489,95 @@ library API**, not only a CLI:
   for any well-formed parent: "the set was never set up" is structurally
   impossible. See `io-mon/docs/usage.md` → *The public host API* for the caller
   contract, and `tests/linux/test_io_mon_public_host_api.nim` for the end-to-end
-  proof (public-surface-only: `mcComplete`, inputs captured, no `.rmdf-frag`
+  proof (public-surface-only: `mcComplete`, inputs captured, no `.iomon-frag`
   spill).
 
-  The **streaming** form (`startMonitor* / drain* / finishMonitor*`) is
-  **deferred** — a streaming host would have to keep the mutated process-global
-  injection env (`LD_PRELOAD`, …) live between calls, risking a shim leak into
-  the parent; the batch form confines that mutation to one `defer`-guarded
-  scope and already covers the spawn-and-collect parent-host use case.
+  `FsSnoopRequest` also carries a per-call `env` and `cwd`
+  (IoMon-Decomposed-Host-API DH-1). On **all three** arms the injection
+  variables travel through the spawn and `runMonitored` mutates nothing
+  process-global, so N monitors can run concurrently in one host process without
+  clobbering each other's `LD_PRELOAD` / `REPRO_MONITOR_*`. Windows was the last
+  arm to get there: `stackable_hooks.runWithMonitorShim` now takes an `env`
+  (a non-nil table being the child's *complete* environment, encoded into an
+  explicit `CreateProcessW` environment block), so its four injection variables
+  no longer need a scope-restored `putEnv`. One `childEnv` helper composes the
+  child environment for every arm, so there is a single layering rule (host env,
+  then `request.env`, then io-mon's injection, injection winning) rather than
+  three that can drift.
+
+  The **decomposed** form has landed (DH-2): `startMonitor` → `pollMonitor` →
+  `finishMonitor`, so a caller can own the wait and interleave N monitors in one
+  poll loop — the shape the build engine's scheduler needs. `runMonitored` is
+  now literally `finishMonitor(startMonitor(req))`, so there is still exactly
+  one implementation of the lifecycle.
+
+  Moving ownership of the wait out is precisely what makes an LF-2 orphan
+  reachable again, so the guarantee moved into the TYPE rather than into a rule
+  callers are asked to follow. `MonitorHandle` cannot be copied (`=copy` is
+  `{.error.}`, propagating through `seq`s, arrays and wrapping objects, so "the
+  other copy will finish it" is not an argument that can be made), and dropping
+  one runs `=destroy`, which **reaps the monitored root before releasing the
+  consumer** — on every path out of the owning scope, including an unwinding
+  exception. The ordering that produced §4.1's incident (release the consumer
+  and delete the fragment directory while a producer is still publishing into
+  it) is therefore not reachable by forgetting anything: a dropped handle costs
+  the caller the wait and the evidence, never an orphan. The wait/release
+  ordering has ONE implementation (`endMonitor`), shared by `finishMonitor` and
+  the destructor, so the two cannot drift.
+
+  Pinned by `tests/linux/test_io_mon_decomposed_host_api.nim` (a handle dropped
+  over a demonstrably-live producer, three monitors interleaved in one poll
+  loop, and `runMonitored`'s delegation asserted both at runtime and at source
+  level) and `tests/portable/test_io_mon_monitor_handle_exclusivity.nim` (the
+  real compiler refusing every copy of a handle, with positive controls).
+
+  **The §4.1 descendant guard is unskippable from outside (DH-3).** The
+  detector (`liveInjectedDescendants`) and its grace wait
+  (`waitForLinuxInjectedDescendants`) are private, and stay private: exporting
+  them would hand a host a proc it can forget to call, which reproduces the
+  false-`mcComplete` hazard one level up instead of closing it. Instead the
+  guard is the FIRST act of `collectMonitorEvidence` — the single funnel every
+  `MonitorResult`'s evidence is produced by — and that funnel refuses to merge
+  for a monitor the guard has not marked, so a bypass surfaces as a loud raise
+  rather than a quiet false `mcComplete`. With `startMonitor` the only spawn
+  site and `finishMonitor` the only producer of a `MonitorResult`, "a host that
+  owns its own spawn" is not a configuration the public surface can reach, and a
+  decomposed host grades a detached descendant exactly as `runMonitored` does.
+  Order is load-bearing on Linux and is held by the same proc: the guard
+  publishes its `mrEventLoss` INTO the consumer-owned set, which is snapshotted
+  once, so a settle that ran after the snapshot would publish a marker nothing
+  ever reads. Pinned by
+  `tests/linux/test_io_mon_external_host_descendant_guard.nim` — a real
+  detached descendant held alive across a real grace window, graded by both
+  launch paths, with a quiescing control; the structural claim asserted against
+  the source; and LF-4's `markConsumerGone` pinned by a real producer whose
+  late `emit` must answer `emConsumerGone`.
+
+  A DROPPED handle deliberately does NOT run the guard: it is an evidence step
+  and a dropped handle publishes no edge for a loss marker to downgrade. That
+  asymmetry is asserted, not just documented (the census's `settled` counter).
+
+  **And the two launch paths are now measured against each other (DH-4).** That
+  the guard is unskippable says the decomposed host CANNOT miss it; it does not
+  by itself say the two paths agree about everything else. DH-4 renders every
+  field of both edges — records, completeness, loss markers, backend
+  diagnostics — and compares them byte for byte for the same action, including
+  the detached-descendant case
+  (`tests/linux/test_io_mon_evidence_identical_across_launch_paths.nim`). Only
+  kernel-allocated identifiers that cannot be equal are normalised (pids, the
+  per-call run id, a `localfd:` inode), each through a bijection, and the file
+  perturbs the real evidence to prove the comparison still sees a dropped
+  record, a flipped verdict, a changed path or two processes collapsed into one.
+
+  Three seams make that agreement a property to hold rather than a formality.
+  `waitForMonitorRoot`'s `if h.exited: return` is the ONE code-level place the
+  paths differ, so state added after it runs on the batch path only. The root's
+  exit status now has a SINGLE writer (`recordRootExit`), reached by both paths,
+  so they cannot disagree about it. And the grace window opens when
+  `finishMonitor` runs, which a polled host chooses — a descendant that dies in
+  that interval is graded differently by the two paths with nothing wrong, which
+  is inherent to owning the wait and is documented for callers in
+  `docs/usage.md` rather than papered over.
 
 ---
 

@@ -5,9 +5,36 @@
 ## mcComplete"): an un-injected spawn child, or an exec/SETEXEC into an
 ## un-injectable image, each yields one event-loss so `mergeFragments` downgrades
 ## completeness to `mcIncomplete` — while a fully-monitored tree stays clean.
+##
+## ── DA-1d: TEETH, NOT A RENAME ────────────────────────────────────────────
+##
+## DA-1b reported this file as naming an invariant it does not protect. Its M6b
+## mutation — `depIdentityKeepsIncarnation ≡ false`, dropping the per-exec
+## incarnation from every element key — breaks `startCount == 1 + execCount` for
+## every real process, because a pid's pre-exec and post-exec `mrProcessStart`
+## are BYTE-IDENTICAL after decode and the incarnation suffix is the only thing
+## keeping them two elements. This file stayed GREEN under it, because every
+## suite above hands `unmonitoredSubtreeLossCount` a `seq[MonitorRecord]` that
+## was never published through an element key. The algorithm was covered; the
+## thing that feeds it was not.
+##
+## The name was the honest one, so the file was given the teeth rather than
+## renamed: the final suite publishes synthetic records through the REAL producer
+## composition (`writer.encodeDepSetElement`, DA-1d's single element-key site),
+## unions the element bytes the only way a G-Set can (an idempotent claim on the
+## whole element), sorts by raw bytes as the consumer does, decodes with the REAL
+## `decodeDepRecord`, and only THEN runs the T0 algorithm. Under M6b the two
+## process-starts of one pid arrive as one record and the suite goes red.
+##
+## What this is NOT: the real container. The union here is a `HashSet` of element
+## bytes, which is the G-Set's algebra but not `nim-shm-gset` itself — the real
+## shared-memory container is exercised by `tests/linux/test_io_mon_dep_set` and
+## the live shim tests, which cannot run in the portable tier. What is real here
+## is the composition, the codec and the algorithm, i.e. everything M6b touches.
 
-import std/[os, sets, strutils, unittest]
+import std/[algorithm, os, sets, strutils, unittest]
 import io_mon
+import io_mon/shm/dep_queue
 
 proc start(pid: uint64): MonitorRecord =
   MonitorRecord(kind: mrProcessStart, observationKind: moProcessStart, osPid: pid)
@@ -18,6 +45,12 @@ proc spawn(parent, child: uint64): MonitorRecord =
 
 proc execRec(pid: uint64): MonitorRecord =
   MonitorRecord(kind: mrProcessExec, observationKind: moExecute, osPid: pid)
+
+proc execAt(pid: uint64; image: string): MonitorRecord =
+  ## An exec whose target image the backend resolved — the shape every real
+  ## `mrProcessExec` has, and the input the image note is derived from.
+  MonitorRecord(kind: mrProcessExec, observationKind: moExecute, osPid: pid,
+    path: image)
 
 proc ipc(pid, peer: uint64; dest = "/tmp/d.sock"): MonitorRecord =
   ## An mrIpcConnect from `pid` to a peer whose pid is `peer` (0 ⇒ unknown peer,
@@ -81,6 +114,41 @@ suite "io-mon T0 earned-completeness (unmonitoredSubtreeLossCount)":
     # `_posixsubprocess.fork_exec`) bypasses our LD_PRELOAD fork hook.
     let records = @[spawn(0, 100), start(100), execRec(100)]
     check unmonitoredSubtreeLossCount(records) == 1
+
+  test "the exec loss names the image that swallowed the subtree":
+    # The pid in the detail is dead by the time anyone reads the depfile; the
+    # IMAGE is what a consumer can act on. Without it, learning that a macOS
+    # dev-env activation was uncacheable because `/usr/bin/cc` is SIP-protected
+    # meant reading a 57k-record depfile and cross-referencing pids by hand —
+    # so reprobuild's diagnostic could only say "unknown-scope loss" and stop.
+    let records = @[
+      spawn(0, 100), start(100), execAt(100, "/usr/bin/cc")]
+    let details = unmonitoredSubtreeLossDetails(records)
+    check details.len == 1
+    check "exec without post-exec process-start" in details[0]
+    check "pid=100" in details[0]
+    check "image=/usr/bin/cc" in details[0]
+
+  test "the last successful image wins when a pid execs more than once":
+    # A PATH search execs each candidate in turn; only the final, successful
+    # image is the one that went un-injected, so that is the one named.
+    let records = @[
+      spawn(0, 100), start(100),
+      execAt(100, "/nix/store/does-not-matter/bin/arch"),
+      execAt(100, "/usr/bin/arch")]
+    let details = unmonitoredSubtreeLossDetails(records)
+    check details.len == 1
+    check "image=/usr/bin/arch" in details[0]
+
+  test "an exec loss with no recorded image still reports, without an image note":
+    # Older depfiles (and any record whose path the backend could not resolve)
+    # carry no path. The loss must still be reported — dropping it would turn a
+    # correctness downgrade into silence — just without the note.
+    let records = @[spawn(0, 100), start(100), execRec(100)]
+    let details = unmonitoredSubtreeLossDetails(records)
+    check details.len == 1
+    check "exec without post-exec process-start" in details[0]
+    check "image=" notin details[0]
 
   test "a SETEXEC into an injectable image (post-exec start) yields NO loss":
     let records = @[spawn(0, 100), start(100), execRec(100), start(100)]
@@ -249,7 +317,7 @@ suite "io-mon R1 ROOT-process completeness guard (mergeFragments)":
     removeDir(work); createDir(work)
     let frag = work / "frags"
     createDir(frag)            # empty fragment set — the SIP-root reality
-    let dep = mergeFragments(frag, work / "out.rdep", expectedRootPid = 4321'u64)
+    let dep = mergeFragments(frag, work / "out.iomon", expectedRootPid = 4321'u64)
     check dep.completeness == mcIncomplete
     removeDir(work)
 
@@ -261,7 +329,7 @@ suite "io-mon R1 ROOT-process completeness guard (mergeFragments)":
     let frag = work / "frags"
     createDir(frag)
     appendFragmentRecord(frag, startAt(4321'u64, "9000"))
-    let dep = mergeFragments(frag, work / "out.rdep", expectedRootPid = 4321'u64)
+    let dep = mergeFragments(frag, work / "out.iomon", expectedRootPid = 4321'u64)
     check dep.completeness == mcComplete
     removeDir(work)
 
@@ -271,7 +339,7 @@ suite "io-mon R1 ROOT-process completeness guard (mergeFragments)":
     let frag = work / "frags"
     createDir(frag)
     appendFragmentRecord(frag, start(4321'u64))
-    check mergeFragments(frag, work / "out.rdep").completeness == mcComplete
+    check mergeFragments(frag, work / "out.iomon").completeness == mcComplete
     removeDir(work)
 
 suite "io-mon R7 (pid, start-time) identity (defeat pid-reuse)":
@@ -316,6 +384,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
   # report (3b) and a stale cross-run report (3c). A report is now trusted only if
   # it is run-scoped, bound to an OBSERVED connection, explicitly complete, and
   # accounts for ≥1 read. These platform-independent tests lock the auth in.
+  # Synthetic records belong to this fixture, even under an outer monitor.
   const runId = "session-abc-123"
 
   proc clientFrag(work: string; clientPid, daemonPid: uint64): string =
@@ -339,9 +408,9 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
       "io-mon-breakaway-report v1\nrun " & runId & "\nclient 4242\ndaemon 9999\n" &
         "read " & served & "\ncomplete\n")
     # WITHOUT the report the out-of-tree peer downgrades…
-    check mergeFragments(frag, work / "no.rdep").completeness == mcIncomplete
+    check mergeFragments(frag, work / "no.iomon", currentRunId = runId).completeness == mcIncomplete
     # …WITH the authenticated report it stays complete and the read is folded in.
-    let dep = mergeFragments(frag, work / "yes.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "yes.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcComplete
     var sawServed = false
     for r in dep.records:
@@ -359,7 +428,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     let frag = clientFrag(work, 4242'u64, 9999'u64)
     writeFile(reportDir / "forged.io-mon-report",
       "io-mon-breakaway-report v1\nrun " & runId & "\nclient 4242\ndaemon 9999\n")
-    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcIncomplete
     removeDir(work)
 
@@ -372,7 +441,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "partial.io-mon-report",
       "io-mon-breakaway-report v1\nrun " & runId &
         "\nclient 4242\ndaemon 9999\nread /x/y.h\n")  # no `complete`
-    check mergeFragments(frag, work / "out.rdep", reportDir).completeness ==
+    check mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId).completeness ==
       mcIncomplete
     removeDir(work)
 
@@ -386,7 +455,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "no-header.io-mon-report",
       "run " & runId & "\nclient 4242\ndaemon 9999\n" &
         "read " & decoy & "\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcIncomplete
     for r in dep.records:
       check r.path != decoy
@@ -402,7 +471,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "padded-header.io-mon-report",
       " " & BreakawayReportMagic & "\nrun " & runId &
         "\nclient 4242\ndaemon 9999\nread " & decoy & "\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcIncomplete
     for r in dep.records:
       check r.path != decoy
@@ -418,7 +487,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "stale.io-mon-report",
       "io-mon-breakaway-report v1\nrun OLD-SESSION-999\nclient 4242\ndaemon 9999\n" &
         "read /stale/build/file.h\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcIncomplete
     for r in dep.records:
       check r.path != "/stale/build/file.h"
@@ -437,7 +506,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "duplicate-run.io-mon-report",
       "io-mon-breakaway-report v1\nrun OLD-SESSION-999\nrun " & runId &
         "\nclient 4242\ndaemon 9999\nread " & decoy & "\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcIncomplete
     for r in dep.records:
       check r.path != decoy
@@ -454,7 +523,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
       "io-mon-breakaway-report v1\nrun " & runId &
         "\nclient 4242\ndaemon 9999\nunexpected structural-field\nread " &
         decoy & "\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcIncomplete
     for r in dep.records:
       check r.path != decoy
@@ -470,7 +539,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "wrong.io-mon-report",
       "io-mon-breakaway-report v1\nrun " & runId &
         "\nclient 4242\ndaemon 7777\nread /x.h\ncomplete\n")  # daemon 7777!
-    check mergeFragments(frag, work / "out.rdep", reportDir).completeness ==
+    check mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId).completeness ==
       mcIncomplete
     removeDir(work)
 
@@ -483,7 +552,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "foreign.io-mon-report",
       "io-mon-breakaway-report v1\nrun " & runId &
         "\nclient 1111\ndaemon 9999\nread /other/build/file.h\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcIncomplete
     for r in dep.records:
       check r.path != "/other/build/file.h"
@@ -556,7 +625,7 @@ suite "io-mon R5 kill-before-flush durability (in-fragment marker)":
     doAssert open(f, path, fmAppend)
     doAssert f.writeBuffer(unsafeAddr frame[0], frame.len) == frame.len
     close(f)
-    let dep = mergeFragments(frag, work / "out.rdep")
+    let dep = mergeFragments(frag, work / "out.iomon")
     check dep.completeness == mcIncomplete
     # A kill-before-flush event-loss was injected; no read-tail bookkeeping leaked.
     var sawKill = false
@@ -578,7 +647,7 @@ suite "io-mon R5 kill-before-flush durability (in-fragment marker)":
     appendFragmentRecord(frag, startAt(700'u64, "1000"))
     appendFragmentRecord(frag, readRec(700'u64, "/dep/header.h"))
     flushFragmentBatch()
-    let dep = mergeFragments(frag, work / "out.rdep")
+    let dep = mergeFragments(frag, work / "out.iomon")
     check dep.completeness == mcComplete
     # The pending/committed bookkeeping markers are stripped from the output, and no
     # kill-before-flush was injected (the netting cancelled cleanly).
@@ -600,7 +669,7 @@ suite "io-mon R5 kill-before-flush durability (in-fragment marker)":
     for i in 0 ..< 500:
       appendFragmentRecord(frag, readRec(700'u64, "/dep/h" & $i & ".h"))
       flushFragmentBatch()   # each cycle: pending (on dirty) + committed (on flush)
-    let dep = mergeFragments(frag, work / "out.rdep")
+    let dep = mergeFragments(frag, work / "out.iomon")
     check dep.completeness == mcComplete
     var kills = 0
     for r in dep.records:
@@ -619,6 +688,7 @@ suite "io-mon S3a self-authored breakaway-report forgery (write provenance)":
   # monitored, so the shim DID record the write of its report file. A report whose
   # own file is an in-tree output write is therefore rejected as a forgery. These
   # platform-independent tests drive the exact write-provenance discriminator.
+  # Synthetic records belong to this fixture, even under an outer monitor.
   const runId = "session-s3a-xyz"
 
   proc clientFragWithWrite(work, reportPath: string;
@@ -650,7 +720,7 @@ suite "io-mon S3a self-authored breakaway-report forgery (write provenance)":
     writeFile(reportPath,
       "io-mon-breakaway-report v1\nrun " & runId & "\nclient 4242\ndaemon 9999\n" &
         "read /tmp/DECOY.txt\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcIncomplete
     # The decoy must NOT have been folded as a dependency.
     for r in dep.records:
@@ -682,7 +752,7 @@ suite "io-mon S3a self-authored breakaway-report forgery (write provenance)":
       observationKind: moFileWrite, osPid: 4242'u64,
       path: "/some/other/spelling.io-mon-report",
       detail: "dev=" & dev & " ino=" & ino))
-    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcIncomplete
     removeDir(work)
 
@@ -703,7 +773,7 @@ suite "io-mon S3a self-authored breakaway-report forgery (write provenance)":
     writeFile(reportDir / "report-4242-9999-0.io-mon-report",
       "io-mon-breakaway-report v1\nrun " & runId & "\nclient 4242\ndaemon 9999\n" &
         "read " & served & "\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.rdep", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcComplete
     var sawServed = false
     for r in dep.records:
@@ -713,7 +783,7 @@ suite "io-mon S3a self-authored breakaway-report forgery (write provenance)":
 
 suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
   # ROUND-3 S3c — mergeFragments consumes the kill-sentinels but does NOT delete the
-  # `.rmdf-frag` files, so a library caller that RE-MERGES a reused fragment dir
+  # `.iomon-frag` files, so a library caller that RE-MERGES a reused fragment dir
   # (a warm restart) would fold a PRIOR run's records (merge_attack.nim): a stale
   # run-1 process-start makes a run-2 out-of-tree breakaway peer look in-tree ⇒ a
   # FALSE mcComplete, plus the stale reads pollute the depfile. The guard namespaces
@@ -731,7 +801,7 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
     appendFragmentRecord(frag, startAt(500'u64, "111", "r1"))
     appendFragmentRecord(frag, readRec(500'u64, "/fileA"))
     closeFragmentSlot()
-    check mergeFragments(frag, work / "r1.rdep", currentRunId = "r1").completeness ==
+    check mergeFragments(frag, work / "r1.iomon", currentRunId = "r1").completeness ==
       mcComplete
     # RUN 2 reuses the SAME dir (warm restart). A DIFFERENT client pid 600 connects
     # to an OUT-OF-TREE daemon whose pid is 500 (recycled) — the stale run-1
@@ -739,7 +809,7 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
     appendFragmentRecord(frag, startAt(600'u64, "222", "r2"))
     appendFragmentRecord(frag, ipcPeerAt(600'u64, 500'u64, "", "/tmp/d.sock", "r2"))
     closeFragmentSlot()
-    let dep = mergeFragments(frag, work / "r2.rdep", currentRunId = "r2")
+    let dep = mergeFragments(frag, work / "r2.iomon", currentRunId = "r2")
     # The stale run-1 start for pid 500 is dropped, so peer 500 is out-of-tree…
     check dep.completeness == mcIncomplete
     # …and the stale run-1 read /fileA is NOT folded into run-2's depfile.
@@ -757,7 +827,7 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
     appendFragmentRecord(frag, startAt(700'u64, "1000", "r2"))
     appendFragmentRecord(frag, readRec(700'u64, "/dep/header.h"))
     closeFragmentSlot()
-    let dep = mergeFragments(frag, work / "out.rdep", currentRunId = "r2")
+    let dep = mergeFragments(frag, work / "out.iomon", currentRunId = "r2")
     check dep.completeness == mcComplete
     var sawDep = false
     for r in dep.records:
@@ -778,7 +848,7 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
     closeFragmentSlot()
     appendFragmentRecord(frag, startAt(500'u64, "222", "CURRENT"))
     closeFragmentSlot()
-    let dep = mergeFragments(frag, work / "current.rdep",
+    let dep = mergeFragments(frag, work / "current.iomon",
       currentRunId = "CURRENT")
     check dep.completeness == mcIncomplete
     var sawAmbiguousLoss = false
@@ -814,7 +884,7 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
     currentRead.detail = "run=CURRENT"
     appendFragmentRecord(frag, currentRead)
     closeFragmentSlot()
-    let dep = mergeFragments(frag, work / "current.rdep",
+    let dep = mergeFragments(frag, work / "current.iomon",
       currentRunId = "CURRENT")
     check dep.completeness == mcComplete
     var sawCurrent = false
@@ -847,7 +917,7 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
     currentRead.detail = "run=CURRENT"
     appendFragmentRecord(frag, currentRead)
     closeFragmentSlot()
-    let dep = mergeFragments(frag, work / "current.rdep",
+    let dep = mergeFragments(frag, work / "current.iomon",
       currentRunId = "CURRENT")
     check dep.completeness == mcIncomplete
     var sawCurrent = false
@@ -878,7 +948,7 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
     appendFragmentRecord(frag, ipcPeerAt(503'u64, 900'u64, "",
       "/tmp/d.sock", "CURRENT"))
     closeFragmentSlot()
-    let dep = mergeFragments(frag, work / "current.rdep",
+    let dep = mergeFragments(frag, work / "current.iomon",
       currentRunId = "CURRENT")
     check dep.completeness == mcIncomplete
     var sawDuplicateLoss = false
@@ -899,7 +969,7 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
     appendFragmentRecord(frag, startAt(800'u64, "1000", "r9"))
     appendFragmentRecord(frag, readRec(800'u64, "/dep/x.h"))
     closeFragmentSlot()
-    let dep = mergeFragments(frag, work / "out.rdep")
+    let dep = mergeFragments(frag, work / "out.iomon")
     check dep.completeness == mcComplete
     removeDir(work)
 
@@ -918,7 +988,7 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
         observationKind: moFileRead, osPid: 801'u64,
         path: "/deps/header-" & $i & ".h"))
     closeFragmentSlot()
-    let dep = mergeFragments(frag, work / "current.rdep",
+    let dep = mergeFragments(frag, work / "current.iomon",
       currentRunId = "CURRENT")
     check dep.completeness == mcComplete
     var sawLast = false
@@ -927,3 +997,159 @@ suite "io-mon S3c warm-restart stale-fragment guard (mergeFragments run-id)":
         sawLast = true
     check sawLast
     removeDir(work)
+
+# ---------------------------------------------------------------------------
+# DA-1d — the element key, exercised.
+#
+# Everything above reasons over records that were never published. The producer
+# does not publish records: it publishes ELEMENT KEYS, and two records with the
+# same key become one. That step is where `startCount == 1 + execCount` can be
+# destroyed without any of the suites above noticing, so it is reproduced here
+# exactly as the Linux producer/consumer pair performs it.
+# ---------------------------------------------------------------------------
+
+const DepSetElemBufBytes = 16384
+  ## `writer.SetProducerBufBytes` — the shim's publish-before-return buffer.
+
+proc byteCmp(a, b: seq[byte]): int =
+  let n = min(a.len, b.len)
+  for i in 0 ..< n:
+    if a[i] != b[i]:
+      return cmp(a[i], b[i])
+  cmp(a.len, b.len)
+
+proc throughTheDepSet(published: openArray[
+    tuple[rec: MonitorRecord; image: string]]): seq[MonitorRecord] =
+  ## Publish → union → snapshot → decode, the way the Linux arm really does it.
+  ##
+  ##   * publish: `writer.encodeDepSetElement`, DA-1d's single element-key site,
+  ##     with the publishing incarnation installed the way the shim installs it
+  ##     at init and after every exec;
+  ##   * union: an idempotent claim keyed on the WHOLE element — the only
+  ##     operation `nim-shm-gset` performs, so a repeat insert is a no-op;
+  ##   * snapshot: sorted by raw element bytes, which is how `fs_snoop` restores
+  ##     ordering determinism after `seq` is forced to 0;
+  ##   * decode: the real `decodeDepRecord`, which ignores the trailing
+  ##     incarnation bytes.
+  var elems: seq[seq[byte]]
+  var claimed = initHashSet[seq[byte]]()
+  for entry in published:
+    setDepSetIncarnationImage(entry.image)
+    var buf {.noinit.}: array[DepSetElemBufBytes, byte]
+    let n = encodeDepSetElement(entry.rec, buf)
+    doAssert n > 0, "record could not be framed as an element"
+    var elem = newSeq[byte](n)
+    for i in 0 ..< n:
+      elem[i] = buf[i]
+    if not claimed.containsOrIncl(elem):
+      elems.add elem
+  setDepSetIncarnationImage("")
+  elems.sort(byteCmp)
+  for elem in elems:
+    var ok = false
+    let rec = decodeDepRecord(elem, ok)
+    doAssert ok, "consumer could not decode an element it was handed"
+    result.add rec
+
+proc countKind(records: openArray[MonitorRecord];
+               kind: MonitorRecordKind; pid: uint64): int =
+  for r in records:
+    if r.kind == kind and r.osPid == pid:
+      inc result
+
+const
+  imageA = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bash-5.2/bin/bash\x1f0"
+  imageB = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-gcc-13.2.0/bin/gcc\x1f1"
+
+suite "io-mon T0 completeness THROUGH the dep-set element key (DA-1d)":
+
+  test "startCount == 1 + execCount survives the element key (M6b's target)":
+    # pid 100 starts under image A, execs into image B, and the new incarnation
+    # emits its own process-start. The two starts are byte-identical records —
+    # same pid/ppid/tid, empty path, same detail — so the ONLY thing that can
+    # keep them two elements is the per-exec incarnation suffix.
+    let published = @[
+      (spawn(0, 100), imageA),
+      (start(100), imageA),
+      (execRec(100), imageA),
+      (start(100), imageB)]
+    let decoded = throughTheDepSet(published)
+
+    let starts = countKind(decoded, mrProcessStart, 100)
+    let execs = countKind(decoded, mrProcessExec, 100)
+    echo "DA-1d/T0: published 4 records -> ", decoded.len,
+      " elements; pid 100 starts=", starts, " execs=", execs
+    check starts == 1 + execs        # the named invariant, on published data
+    check decoded.len == 4
+    check unmonitoredSubtreeLossCount(decoded) == 0
+
+  test "an exec whose new image was NOT injectable still downgrades":
+    # The positive control for the case above: with no post-exec start there is
+    # nothing for the incarnation suffix to keep apart, and T0 must still fire.
+    # Without this, "two starts survived" and "the algorithm cannot see an exec"
+    # would be indistinguishable.
+    let published = @[
+      (spawn(0, 100), imageA),
+      (start(100), imageA),
+      (execRec(100), imageA)]
+    let decoded = throughTheDepSet(published)
+    check decoded.len == 3
+    check unmonitoredSubtreeLossCount(decoded) == 1
+
+  test "two DIFFERENT pids' process-starts are never folded together":
+    # `mrProcessStart` is process-scoped: the pid is the evidence, and folding it
+    # would delete the process census T0 reads. Same incarnation on purpose, so
+    # only the pid can keep these apart.
+    let published = @[
+      (spawn(0, 100), imageA),
+      (start(100), imageA),
+      (spawn(100, 200), imageA),
+      (start(200), imageA)]
+    let decoded = throughTheDepSet(published)
+    check decoded.len == 4
+    check unmonitoredSubtreeLossCount(decoded) == 0
+
+  test "a fact-scoped observation folds across processes AND incarnations":
+    # The other side of the same predicate (DA-1b's M6). A DSO's identity is its
+    # path and contents; keeping either the pid or the incarnation in the key
+    # would split one fact into one element per observer — measured on a real
+    # `nim c` as ~7,200 duplicate library-load records created by the suffix
+    # alone, before any pid was considered.
+    proc dso(pid: uint64): MonitorRecord =
+      MonitorRecord(kind: mrLibraryLoad, observationKind: moFileRead,
+        osPid: pid, parentOsPid: 1, threadId: pid, path: "/lib/libc.so.6",
+        detail: "dyld-add-image run=abc")
+    let published = @[
+      (dso(100), imageA), (dso(200), imageB), (dso(300), imageA),
+      (dso(100), imageB)]
+    let decoded = throughTheDepSet(published)
+    echo "DA-1d/T0: 4 library-loads over 3 pids x 2 incarnations -> ",
+      decoded.len, " element(s)"
+    check decoded.len == 1
+    check decoded[0].osPid == 0
+    check decoded[0].path == "/lib/libc.so.6"
+
+  test "a probe storm collapses without losing a distinct path":
+    # The cardinal-sin control for the path-scoped class: repetition collapses,
+    # distinct facts do not.
+    proc probe(pid: uint64; path: string; present: bool): MonitorRecord =
+      MonitorRecord(kind: mrPathProbe, observationKind: moPathProbe,
+        osPid: pid, threadId: pid, path: path,
+        result: if present: 0 else: -1,
+        probeResult: if present: prExistingFile else: prAbsent)
+    var published: seq[tuple[rec: MonitorRecord; image: string]]
+    for i in 0 ..< 500:
+      for pid in [100'u64, 200'u64, 300'u64]:
+        published.add (probe(pid, "/usr/include/stdio.h", true), imageA)
+        published.add (probe(pid, "/usr/include/absent.h", false), imageA)
+    published.add (probe(400'u64, "/usr/include/stdio.h", true), imageB)
+    let decoded = throughTheDepSet(published)
+    echo "DA-1d/T0: 3001 probes -> ", decoded.len, " elements"
+    # 2 facts under incarnation A, plus the same present-file fact seen from a
+    # DIFFERENT incarnation, which path-scoping deliberately does NOT fold.
+    check decoded.len == 3
+    var paths = initHashSet[string]()
+    for r in decoded:
+      paths.incl r.path
+      check r.osPid == 0
+    check paths.len == 2

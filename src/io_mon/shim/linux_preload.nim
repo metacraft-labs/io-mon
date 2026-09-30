@@ -1,6 +1,21 @@
 when not defined(linux):
   {.error: "repro_monitor_shim/linux_preload is Linux-only".}
 
+# The shim is loaded into processes whose threads it does not own, and Nim's
+# default allocator owns one heap per thread: a cell freed on a thread other
+# than its allocator's is handed back through a pointer into the OWNING
+# thread's TLS, which the loader discards when that thread exits. Measured as
+# a 0xC0000005 in `addToSharedFreeList` on .NET's finalizer thread -- see
+# scripts/build_shim.sh. Only the library build is held to this: a test that
+# imports the module into a console binary runs on threads Nim created.
+when appType == "lib" and not defined(useMalloc):
+  {.error: "the io-mon shim must be built with -d:useMalloc; " &
+    "scripts/build_shim.sh sets it, and says why".}
+
+when defined(ioMonGlibcPrivateHeap):
+  {.compile: "linux_private_heap.c".}
+  {.passL: "-Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free".}
+
 import std/[locks, os, strutils]
 from io_mon/paths import extendedPath
 
@@ -27,6 +42,7 @@ const
   LinuxSysSendfile = 40.clong
   LinuxSysGettimeofday = 96.clong
   LinuxSysTime = 201.clong
+  LinuxSysFutex = 202.clong
   LinuxSysClockGettime = 228.clong
   LinuxSysClockGetres = 229.clong
   LinuxSysGettid = 186.clong
@@ -44,6 +60,9 @@ const
   LinuxSysCopyFileRange = 326.clong
   LinuxSysStatx = 332.clong
   LinuxSysOpenat2 = 437.clong
+  LinuxSysLandlockCreateRuleset = 444.clong
+  LinuxSysLandlockAddRule = 445.clong
+  LinuxSysLandlockRestrictSelf = 446.clong
   LinuxEfault = 14.clong
   LinuxRenameExchange = 2'u32
 
@@ -69,6 +88,18 @@ var
   # module; the accessor procs below just forward to it.
   fragmentDir: string
   runId: string
+  # The consumer's event-interest set (REPRO_MONITOR_INTEREST). Set ONCE at init
+  # and only read thereafter, so the concurrent reads in `emitRecord` need no
+  # lock. `FullInterest` until init runs and if the var is absent, so a shim that
+  # is never told an interest captures everything (back-compat). See
+  # docs/contributors/event-interest-filter.md.
+  gInterest: set[EventCategory] = FullInterest
+  # DA-1i — the consumer's evidence scope (REPRO_MONITOR_EVIDENCE). Same
+  # discipline as `gInterest`: set ONCE at init and only read thereafter, so the
+  # concurrent reads in `emitRecord` need no lock. `esFull` until init runs and
+  # if the var is absent, so a shim that is never told a scope writes everything
+  # down (back-compat).
+  gEvidenceScope: EvidenceScope = esFull
   # DEP-SHM-2 — the shared-memory dependency-queue segment path (the value of
   # REPRO_MONITOR_DEP_SHM). Empty when the engine did not create a ring, in
   # which case every record takes the file path unchanged. Remembered so the
@@ -106,9 +137,10 @@ var
   # `gettid(2)` are un-cached raw syscalls in glibc (since 2.25) / musl, so
   # a recorder-heavy workload (the BEAM VM emitting a record per port write)
   # pays THREE extra syscalls per record. pid/ppid are process-constant and
-  # tid is thread-constant for a thread's whole lifetime; the only event
-  # that invalidates them is `fork`, after which the pthread_atfork CHILD
-  # handler (`repro_linux_atfork_child`) resets the caches. A sentinel of 0
+  # tid is thread-constant for a thread's whole lifetime. After `fork`, the
+  # pthread_atfork CHILD handler (`repro_linux_atfork_child`) resets them.
+  # Exec records sample live identities instead: a vfork child shares these
+  # caches with its parent and does not run the atfork handlers. A sentinel of 0
   # means "unset"; a real pid/tid is always > 0, so 0 unambiguously forces a
   # first fetch. The recorded VALUES are byte-identical to the un-cached path
   # — this is a pure syscall-count reduction, not a semantic change.
@@ -128,11 +160,68 @@ var
 #include <errno.h>
 #include <dlfcn.h>
 
+/* nim-stackable-hooks emits ``stackable_linux_raw_syscall6`` (and the rest of
+ * its raw-syscall substrate) only under
+ * ``when defined(linux) and defined(amd64)``. This file is LD_PRELOADed, so an
+ * undefined symbol here is not a dormant reference — the loader binds it
+ * eagerly and the process dies before ``main``. See the matching guard in
+ * ``hooks/linux_preload_runtime.nim``.
+ *
+ * ``repro_raw_syscall6`` is the arch-portable spelling every call site below
+ * uses. On x86_64 it is a direct passthrough, so nothing about the amd64 build
+ * changes. Elsewhere it issues the syscall instruction directly.
+ *
+ * It must NOT fall back to libc ``syscall(2)``. THIS FILE defines
+ * ``long syscall(long number, ...)`` with default visibility a few hundred
+ * lines below — that is the LD_PRELOAD interposer for libc's ``syscall``.
+ * Because the shim is preloaded it sits first in the lookup scope, so a call to
+ * ``syscall`` from inside it binds back to that interposer and recurses until
+ * the stack is gone. Several call sites here are also on the async-signal-safe
+ * flush path, where that would be especially unpleasant.
+ *
+ * aarch64 Linux ABI: number in x8, args in x0-x5, ``svc #0``, result in x0
+ * under the kernel ``-errno`` convention — already the convention every call
+ * site here tests against (``!= 0``, ``< 0``), so nothing is re-encoded.
+ * Issuing the instruction directly is also strictly more async-signal-safe than
+ * any libc route. */
+#if defined(__x86_64__)
 extern long stackable_linux_raw_syscall6(long nr, long a1, long a2, long a3,
                                          long a4, long a5, long a6);
+#endif
+
+static long repro_raw_syscall6(long nr, long a1, long a2, long a3, long a4,
+                               long a5, long a6) {
+#if defined(__x86_64__)
+  return stackable_linux_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
+#elif defined(__aarch64__)
+  register long x8 __asm__("x8") = nr;
+  register long x0 __asm__("x0") = a1;
+  register long x1 __asm__("x1") = a2;
+  register long x2 __asm__("x2") = a3;
+  register long x3 __asm__("x3") = a4;
+  register long x4 __asm__("x4") = a5;
+  register long x5 __asm__("x5") = a6;
+  __asm__ volatile("svc #0"
+                   : "+r"(x0)
+                   : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+                   : "memory", "cc");
+  return x0;
+#else
+#error "io-mon: no raw syscall primitive for this architecture. Add one here \
+rather than routing through libc syscall(2) — this shim interposes that \
+symbol, so calling it would recurse forever."
+#endif
+}
+
+/* Exported so the Nim side can bind one always-present name rather than a
+ * symbol that exists on only one architecture. */
+long repro_linux_raw_syscall6(long nr, long a1, long a2, long a3, long a4,
+                              long a5, long a6) {
+  return repro_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
+}
 
 long repro_linux_gettid(void) {
-  return stackable_linux_raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
+  return repro_raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
 }
 
 int repro_linux_get_errno(void) {
@@ -163,7 +252,7 @@ long repro_linux_socket_peer_pid(int fd) {
 int repro_linux_fd_identity_kind(int fd, unsigned long *dev,
                                  unsigned long *ino, int *kind) {
   struct stat st;
-  if (stackable_linux_raw_syscall6(SYS_fstat, fd, (long)&st, 0, 0, 0, 0) != 0)
+  if (repro_raw_syscall6(SYS_fstat, fd, (long)&st, 0, 0, 0, 0) != 0)
     return 0;
   *dev = (unsigned long)st.st_dev;
   *ino = (unsigned long)st.st_ino;
@@ -211,11 +300,11 @@ int repro_linux_fd_proc_path(int fd, void *raw_buf, unsigned long len) {
      only provide readlinkat; readlink(p,b,n) == readlinkat(AT_FDCWD,p,b,n).
      Keep the x86-64 path byte-identical to avoid any behavioral change there. */
 #ifdef SYS_readlink
-  long n = stackable_linux_raw_syscall6(SYS_readlink, (long)linkpath,
+  long n = repro_raw_syscall6(SYS_readlink, (long)linkpath,
                                         (long)buf, (long)(len - 1),
                                         0, 0, 0);
 #else
-  long n = stackable_linux_raw_syscall6(SYS_readlinkat, (long)AT_FDCWD,
+  long n = repro_raw_syscall6(SYS_readlinkat, (long)AT_FDCWD,
                                         (long)linkpath, (long)buf,
                                         (long)(len - 1), 0, 0);
 #endif
@@ -238,11 +327,11 @@ int repro_linux_self_exe_path(void *raw_buf, unsigned long len) {
   /* aarch64 (and other newer Linux ABIs) lack the legacy readlink syscall;
      readlink(p,b,n) == readlinkat(AT_FDCWD,p,b,n). x86-64 stays byte-identical. */
 #ifdef SYS_readlink
-  long n = stackable_linux_raw_syscall6(SYS_readlink, (long)"/proc/self/exe",
+  long n = repro_raw_syscall6(SYS_readlink, (long)"/proc/self/exe",
                                         (long)buf, (long)(len - 1),
                                         0, 0, 0);
 #else
-  long n = stackable_linux_raw_syscall6(SYS_readlinkat, (long)AT_FDCWD,
+  long n = repro_raw_syscall6(SYS_readlinkat, (long)AT_FDCWD,
                                         (long)"/proc/self/exe", (long)buf,
                                         (long)(len - 1), 0, 0);
 #endif
@@ -285,6 +374,7 @@ extern int repro_monitor_shim_shutdown(void);
 
 extern int repro_linux_sig_safe_slot_is_open(void);
 extern int repro_linux_sig_safe_slot_fd(void);
+extern int repro_linux_sig_safe_slot_identity_matches(void);
 extern void* repro_linux_sig_safe_batch_ptr(void);
 extern long repro_linux_sig_safe_batch_len(void);
 extern void* repro_linux_sig_safe_committed_ptr(void);
@@ -317,6 +407,13 @@ void repro_linux_sig_safe_flush(void) {
   fd = repro_linux_sig_safe_slot_fd();
   if (fd < 0)
     return;
+  /* The tracee may have closed or replaced the cached descriptor through a
+   * raw syscall or dup2. Never write monitor frames into its replacement. */
+  if (!repro_linux_sig_safe_slot_identity_matches()) {
+    repro_linux_sig_safe_mark_slot_closed();
+    errno = (int)saved_errno;
+    return;
+  }
   /* Flush any in-flight batch buffer FIRST so buffered read records land
    * before the committed marker. Partial writes are best-effort at the
    * async-signal-safe level; the tolerant reader (decodeFramesTolerant)
@@ -328,7 +425,7 @@ void repro_linux_sig_safe_flush(void) {
       void *p = repro_linux_sig_safe_batch_ptr();
       long written = 0;
       while (written < len) {
-        long n = stackable_linux_raw_syscall6(SYS_write, fd,
+        long n = repro_raw_syscall6(SYS_write, fd,
                                               (long)((char*)p + written),
                                               len - written, 0, 0, 0);
         if (n <= 0) break;
@@ -345,7 +442,7 @@ void repro_linux_sig_safe_flush(void) {
       void *p = repro_linux_sig_safe_committed_ptr();
       long written = 0;
       while (written < len) {
-        long n = stackable_linux_raw_syscall6(SYS_write, fd,
+        long n = repro_raw_syscall6(SYS_write, fd,
                                               (long)((char*)p + written),
                                               len - written, 0, 0, 0);
         if (n <= 0) break;
@@ -356,8 +453,8 @@ void repro_linux_sig_safe_flush(void) {
   /* fsync so the writes are on-disk before the signal terminates the
    * process (the OS page cache would otherwise survive process death,
    * but a subsequent host crash would drop the tail). Best-effort. */
-  stackable_linux_raw_syscall6(SYS_fsync, fd, 0, 0, 0, 0, 0);
-  stackable_linux_raw_syscall6(SYS_close, fd, 0, 0, 0, 0, 0);
+  repro_raw_syscall6(SYS_fsync, fd, 0, 0, 0, 0, 0);
+  repro_raw_syscall6(SYS_close, fd, 0, 0, 0, 0, 0);
   repro_linux_sig_safe_mark_slot_closed();
   errno = (int)saved_errno;
 }
@@ -488,7 +585,7 @@ long syscall(long number, ...) {
   long a0, a1, a2, a3, a4, a5;
   repro_linux_resolve_libc_syscall();
   /* Pull up to 6 args from varargs — matches glibc's syscall(3) contract
-   * of forwarding at most 6 args to the raw stackable_linux_raw_syscall6
+   * of forwarding at most 6 args to the raw repro_raw_syscall6
    * wrapper. Callers passing fewer args have zero-init trailing regs on
    * every ABI we run on (x86_64 SysV / aarch64 AAPCS). */
   va_start(ap, number);
@@ -510,7 +607,7 @@ long syscall(long number, ...) {
   /* Fall back to the raw wrapper if libc's syscall wasn't dlsym-able
    * (extremely unusual — implies a statically-linked host or a stripped
    * libc). */
-  return stackable_linux_raw_syscall6(number, a0, a1, a2, a3, a4, a5);
+  return repro_raw_syscall6(number, a0, a1, a2, a3, a4, a5);
 }
 
 __attribute__((constructor))
@@ -610,6 +707,8 @@ void repro_linux_atfork_child_c(void) {
 proc c_getpid(): cint {.importc: "getpid", header: "<unistd.h>".}
 proc c_getppid(): cint {.importc: "getppid", header: "<unistd.h>".}
 proc c_gettid(): clong {.importc: "repro_linux_gettid", raises: [].}
+proc c_fileno(stream: pointer): cint
+  {.importc: "fileno", header: "<stdio.h>", raises: [].}
 proc c_get_errno(): cint {.importc: "repro_linux_get_errno", raises: [].}
 proc c_set_errno(value: cint) {.importc: "repro_linux_set_errno", raises: [].}
 proc c_errno_is_connect_in_progress(value: cint): cint
@@ -625,7 +724,13 @@ proc c_fd_proc_path(fd: cint; buf: pointer; len: csize_t): cint
 proc c_self_exe_path(buf: pointer; len: csize_t): cint
   {.importc: "repro_linux_self_exe_path", raises: [].}
 proc c_raw_syscall6(nr, a1, a2, a3, a4, a5, a6: clong): clong
-  {.importc: "stackable_linux_raw_syscall6", cdecl, raises: [].}
+  {.importc: "repro_linux_raw_syscall6", cdecl, raises: [].}
+  ## Bound to the exported portable wrapper, NOT to
+  ## ``stackable_linux_raw_syscall6`` directly and NOT to the ``static``
+  ## ``repro_raw_syscall6``. nim-stackable-hooks emits the former only on amd64,
+  ## and this binding has live call sites that are not behind an arch guard
+  ## (``getcwd`` at minimum) — so binding it directly left an undefined symbol
+  ## in an LD_PRELOADed object on aarch64.
 
 # M9.R.62.2 — bridge procs the C-side signal handler calls to reach into
 # writer.nim's threadvar-resident fragment slot. Every proc is a pure POD
@@ -638,6 +743,20 @@ proc repro_linux_sig_safe_slot_is_open(): cint {.exportc, cdecl, raises: [].} =
 
 proc repro_linux_sig_safe_slot_fd(): cint {.exportc, cdecl, raises: [].} =
   sigSafeSlotFd()
+
+proc repro_linux_sig_safe_slot_identity_matches(): cint
+    {.exportc, cdecl, raises: [].} =
+  let fd = sigSafeSlotFd()
+  if fd < 0:
+    return 0
+  var device, fileId: uint64
+  var kind: cint
+  if c_fd_identity_kind(fd, addr device, addr fileId, addr kind) != 1:
+    return 0
+  if kind == 1 and device == sigSafeSlotDevice() and
+      fileId == sigSafeSlotFileId():
+    return 1
+  0
 
 proc repro_linux_sig_safe_batch_ptr(): pointer {.exportc, cdecl, raises: [].} =
   sigSafeBatchPtr()
@@ -747,6 +866,14 @@ proc armThreadExitFlush() {.raises: [].} =
   ## right after it first opens its fragment slot (see emitRecord).
   repro_linux_arm_thread_exit_flush_c()
 
+proc repro_linux_atfork_prepare() {.cdecl, raises: [].} =
+  # The shared table is atomic; its process-local mapped-shard sequence is
+  # mutable. Fork must copy that view only between complete publications.
+  acquire(recordLock)
+
+proc repro_linux_atfork_parent() {.cdecl, raises: [].} =
+  release(recordLock)
+
 proc repro_linux_atfork_child() {.exportc, cdecl, raises: [].} =
   ## DEP-FLUSH-4 — reset the child's inherited slot + registry so it never
   ## replays the parent's buffered frames or writes through the COW-shared
@@ -754,6 +881,9 @@ proc repro_linux_atfork_child() {.exportc, cdecl, raises: [].} =
   # FUP-K — the child has a fresh pid/ppid/tid; drop the inherited (COW) caches
   # so `baseRecord` re-fetches them for the child's records. Runs inside fork()
   # in the child before fork() returns, so every child record sees fresh values.
+  # prepare acquired this lock on the forking thread. Release the child's
+  # copy before detaching/re-attaching its private producer view.
+  release(recordLock)
   resetIdentityCaches()
   withShimMuted:
     try: discardFragmentSlotAfterFork()
@@ -808,14 +938,22 @@ proc sampleKillDiagArgvOnce() {.raises: [].} =
 
 proc baseRecord(kind: MonitorRecordKind;
                 observationKind: MonitorObservationKind): MonitorRecord =
-  MonitorRecord(
+  result = MonitorRecord(
     kind: kind,
     observationKind: observationKind,
     seq: processSeq(),
-    osPid: currentPid(),
-    parentOsPid: currentPpid(),
-    threadId: currentThreadId(),
     probeResult: prUnknown)
+  if kind == mrProcessExec:
+    # vfork shares the suspended parent's TLS and skips pthread_atfork.
+    # Attribute both exec attempts and failures to the actual caller without
+    # overwriting caches the parent will reuse when the child execs or exits.
+    result.osPid = uint64(c_getpid())
+    result.parentOsPid = uint64(c_getppid())
+    result.threadId = uint64(c_gettid())
+  else:
+    result.osPid = currentPid()
+    result.parentOsPid = currentPpid()
+    result.threadId = currentThreadId()
 
 proc stampRunId(record: var MonitorRecord) {.raises: [].} =
   ## Scope Linux records to the launcher's run id so reused fragment directories
@@ -828,6 +966,34 @@ proc stampRunId(record: var MonitorRecord) {.raises: [].} =
 
 proc emitRecord(record: MonitorRecord) {.raises: [].} =
   if not initialized or fragmentDir.len == 0 or shouldBypass():
+    return
+  # Event-interest gate (docs/contributors/event-interest-filter.md §4.1). Skip
+  # the whole record — construction already happened at the call site, but the
+  # expensive publish (gset insert + dedup, or fragment write) is avoided — for a
+  # category the consumer did not ask for. `recordWanted` returns true for
+  # META/loss kinds, so a suppressed interest can never drop an `mrEventLoss`
+  # (LF-1: that would risk a false `mcComplete`).
+  if not recordWanted(gInterest, record.kind):
+    return
+  # DA-1i — evidence-scope gate, RIGHT HERE and not at the host, because the
+  # whole point of `--evidence=reads-only` is to MEASURE what the records cost:
+  # a mode that publishes the record and filters it later saves nothing and
+  # measures nothing. So the expensive part — the gset insert + dedup, or the
+  # fragment write — is what this skips.
+  #
+  # A DIFFERENT PREDICATE FROM THE ONE ABOVE, deliberately. `recordWanted` gates
+  # on the record's KIND; this gates on its RESULT, and no refinement of
+  # `EventCategory` can do it because success is not a kind (measured: gating a
+  # probes category yields 41,736 records where `reads-only` means 23,049,
+  # discarding 2,066 successful probes and keeping 20,753 failed opens).
+  #
+  # `recordIsFailedExistenceLookup` answers false for every META kind BY
+  # CONSTRUCTION — it asks `categoryOf`, the one definition of what META is — so
+  # exactly as with `recordWanted` above, a narrowed capture can never drop an
+  # `mrEventLoss` and manufacture a false `mcComplete` (LF-1). That is asserted
+  # exhaustively over `MonitorRecordKind` in
+  # `tests/portable/test_io_mon_evidence_scope.nim`, not left to this comment.
+  if not recordInEvidenceScope(gEvidenceScope, record):
     return
   # M9.R.62.2 — refresh the diagnostic context on every emit so an
   # unmatched pending marker carries the LAST-observed record kind
@@ -852,7 +1018,14 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
   withShimMuted:
     var stamped = record
     stampRunId(stamped)
-    appendFragmentRecord(fragmentDir, stamped)
+    # All host threads share one producer. Its local shard mapping sequence
+    # can grow even though the shared-memory inserts themselves are atomic.
+    # Muting precedes the lock so allocation/file hooks cannot reenter it.
+    acquire(recordLock)
+    try:
+      appendFragmentRecord(fragmentDir, stamped)
+    finally:
+      release(recordLock)
     # DEP-FLUSH-3 — arm the pthread-key thread-exit flush once per thread,
     # right after this thread's slot is open (appendFragmentRecord opened /
     # registered it above). libc then fires the value-destructor on this
@@ -883,9 +1056,139 @@ proc emitEventLoss(detail: string; result: int64 = 0) {.raises: [].} =
   record.result = result
   emitRecord(record)
 
+# ---------------------------------------------------------------------------
+# LIBRARY-LOAD OBSERVATION (`mcapLibraryLoad`) — see the long design note above
+# `ct_linux_library_scan` in `linux_preload_runtime.nim` for WHY this asks the
+# loader instead of hooking it, and for the coverage arithmetic it implements.
+#
+# NOTE ON WHERE THE STATE LIVES. The seen-set and the previous `dlpi_adds` are
+# deliberately NOT Nim globals here; they are C-side POD (see that same note).
+# A scan runs on whichever thread called `dlopen`, so long-lived Nim heap state
+# shared between scans would be allocated on one thread and grown or freed on
+# another — the FUP-C allocator-corruption class this file already warns about
+# for the fd/dir/stream tables. Serialising with a lock orders the accesses; it
+# does not make the ORC allocator cross-thread safe. What remains on the Nim
+# side is per-record temporaries, created and released inside a single sink call
+# on one thread, exactly like every other hook.
+#
+# Fork/exec: the C state is inherited across `fork` (correctly — the child has
+# the same mappings and the same history) and reset by the constructor re-running
+# after `exec` (correctly — a new image has a new link map).
+# ---------------------------------------------------------------------------
+var
+  libScanLock: Lock
+  libScanSinkFailed = false   ## plain bool, no heap: safe to touch from any thread
+
+proc libraryLoadRecordablePath(path: string): bool {.raises: [].} =
+  ## Which enumerated objects become `mrLibraryLoad` records.
+  ##
+  ## Excluded, and why each exclusion is not a coverage hole:
+  ##   * the MAIN EXECUTABLE (`dlpi_name == ""`) — already captured as the
+  ##     process image by `mrProcessExec` / `mrProcessStart`; recording it again
+  ##     under a different kind would double-count, not add coverage.
+  ##   * the VDSO (`linux-vdso.so.1`) — kernel-provided, has no on-disk file, so
+  ##     there is nothing for a consumer to fingerprint.
+  ##   * THIS SHIM — the monitor's own footprint. Recording it would make every
+  ##     captured dependency set depend on the monitor binary, so upgrading
+  ##     io-mon would invalidate every cached action for a reason that has
+  ##     nothing to do with the action.
+  ## Everything else — libc, the loader itself, every toolchain library — IS
+  ## recorded. Unlike macOS's shared cache there is no Linux system-library blob
+  ## that could justify a baseline exemption: on a Nix or container image the
+  ## libc under `/nix/store` or `/usr/lib` is a genuine, upgradeable input.
+  if path.len == 0: return false
+  if not path.startsWith("/"): return false
+  if path.endsWith("librepro_monitor_shim.so"): return false
+  true
+
+proc libraryScanSink(name: cstring; address: culong; reason: cstring)
+    {.cdecl, raises: [].} =
+  ## Invoked once per NEWLY-SEEN link-map entry, after `dl_iterate_phdr` has
+  ## returned and the loader lock is released — so allocating and recording here
+  ## is safe, and every allocation is freed on this same thread before returning.
+  try:
+    let path = if name == nil: "" else: $name
+    if libraryLoadRecordablePath(path):
+      var record = baseRecord(mrLibraryLoad, moFileRead)
+      record.path = path
+      record.detail = "library-load dl_iterate_phdr " &
+        (if reason == nil: "" else: $reason)
+      emitRecord(record)
+    elif path.len > 0 and not path.startsWith("/") and
+        not path.startsWith("linux-vdso") and not path.startsWith("linux-gate"):
+      # An object the loader names relatively: it IS a real file dependency but
+      # we cannot state WHICH one, because a relative name is only meaningful
+      # against a working directory that has since moved on. Flagged, not
+      # guessed — a wrong path in a dependency set is worse than a stated gap.
+      libScanSinkFailed = true
+  except CatchableError:
+    libScanSinkFailed = true
+
+proc scanLoadedLibraries(reason: cstring) {.raises: [].} =
+  ## Enumerate the loader's link map, record every newly-seen object as a
+  ## content dependency, and then PROVE that the enumeration covered every load
+  ## the loader performed since the previous scan.
+  ##
+  ## The proof is what makes this honest rather than merely useful. Sampling the
+  ## link map at chosen points leaves one question open — "what about an object
+  ## loaded and unloaded between two samples?" — and an open question about
+  ## input coverage may not be answered with `mcComplete`. Scanning immediately
+  ## before and after interposed loader calls separates ordinary unload/reload
+  ## transitions. The loader counters can then prove a gap only when more loads
+  ## occurred than objects appeared since the preceding link-map snapshot and
+  ## an unload confirms that an object could have vanished between scans.
+  if not initialized or inForkChild:
+    return
+  acquire(libScanLock)
+  defer: release(libScanLock)
+  libScanSinkFailed = false
+  var performed: uint64 = 0
+  var removed: uint64 = 0
+  var newlyActive: cint = 0
+  var newlySeen: cint = 0
+  var countersValid: cint = 0
+  var overflow: cint = 0
+  # NOT muted. The sink records on behalf of the monitored process, and
+  # `emitRecord` is a no-op while the shim is muted. The loader walk itself
+  # cannot re-enter the hooks: `dl_iterate_phdr` performs no file I/O and
+  # resolves no symbols.
+  let count = linuxLibraryScan(cast[pointer](libraryScanSink), reason,
+                               addr performed, addr removed, addr newlyActive,
+                               addr newlySeen, addr countersValid, addr overflow)
+  let why = if reason == nil: "" else: $reason
+  if count < 0:
+    emitEventLoss("library-load scan failed (" & why & ")")
+    return
+
+  # --- coverage proof -----------------------------------------------------
+  if libScanSinkFailed:
+    emitEventLoss("library-load coverage gap: a loaded object could not be " &
+      "recorded or is named only relatively by the loader, so the file behind " &
+      "it cannot be identified (" & why & ")")
+  elif overflow != 0:
+    emitEventLoss("library-load enumeration overflowed its snapshot buffer: " &
+      "the process has more loaded objects than the scan can hold (" &
+      why & ")")
+  elif countersValid == 0:
+    emitEventLoss("library-load coverage is unprovable: this loader does not " &
+      "report dlpi_adds/dlpi_subs, so a library loaded and unloaded between " &
+      "scans would be undetectable (" & why & ")")
+  elif uint64(newlyActive) < performed and removed > 0:
+    emitEventLoss("library-load coverage gap: the loader performed " &
+      $performed & " load(s) since the previous scan but only " &
+      $newlyActive & " object(s) appeared in the link map (" &
+      why & "); " & $removed & " object(s) were unloaded — at least one " &
+      "shared object may have been loaded and unloaded without " &
+      "being observed, so its bytes are an input this capture cannot name")
+
 proc drainInlineRawSyscallEvents() {.raises: [].}
 proc installLinuxVdsoPatches() {.raises: [].}
 proc emitLinuxVdsoPatchFailures(source: string) {.raises: [].}
+# Defined next to the other `record*` helpers, below the vDSO block; forward
+# declared because `classifyRawFileSyscall` (the raw-`syscall()` classifier)
+# sits above it and must emit the same entropy observation the libc-symbol and
+# vDSO entry points do.
+proc recordNonDeterministic(source: string) {.raises: [].}
 proc repro_vdso_clock_gettime*(clockId: cint; tp: pointer): cint
     {.exportc, cdecl, dynlib, raises: [].}
 proc repro_vdso_gettimeofday*(tv, tz: pointer): cint
@@ -976,12 +1279,14 @@ proc observationForOpen(flags: cint): MonitorObservationKind =
 proc updateFdPath(fd: cint; path: cstring) =
   if fd < 0 or path == nil:
     return
+  podFileReadExcl(fd)
   podFdPathSet(fd, path)
 
 proc removeFdPath(fd: cint) =
   podFdPathDel(fd)
   podEmptyFdExcl(fd)
   podInheritedFdExcl(fd)
+  podFileReadExcl(fd)
 
 proc pathForFd(fd: cint): string =
   podFdPathGet(fd)
@@ -1006,15 +1311,101 @@ proc rememberInheritedOpenFds() {.raises: [].} =
 proc localFdKey(dev, ino: uint64): string {.raises: [].} =
   "localfd:" & $dev & ":" & $ino
 
-proc recordExternalContent(chan, role, path: string; fd: cint) {.raises: [].} =
+proc recordExternalContent(chan, role, path: string; fd: cint;
+                           peerPid: uint64 = 0) {.raises: [].} =
+  ## `peerPid` (0 = unknown) names the process on the OTHER end of the channel,
+  ## carried in `childOsPid` exactly as `mrIpcConnect` does. IoMon-Pipeline-Capture
+  ## IM-4: the merge uses it to answer "is the producer inside the monitored tree?"
+  ## directly, instead of inferring it from an in-tree create record.
   var record = baseRecord(mrExternalContent, moExternalContent)
   record.path = path
   record.flags = uint32(fd)
-  record.detail = "chan=" & chan & " role=" & role
+  record.childOsPid = peerPid
+  record.detail = "chan=" & chan & " role=" & role &
+    (if peerPid == 0: "" else: " peer=" & $peerPid)
   emitRecord(record)
+
+proc channelPeerPid(fd: cint; kind: FdKind): uint64 {.raises: [].} =
+  ## IoMon-Pipeline-Capture IM-4 — the pid of the process on the other end of a
+  ## content channel, or 0 when the channel cannot name it.
+  ##
+  ## Only an AF_UNIX socket can: `SO_PEERCRED` returns the KERNEL's record of the
+  ## credentials the peer had when the connection was established (for an accepted
+  ## fd, the connector; for a connector's fd, the listener; for a `socketpair`, its
+  ## creator). It is stamped by the kernel, not by either userspace end, so it
+  ## cannot be forged from inside the monitored tree, and it survives the peer's
+  ## exit. A pipe, a FIFO, an AF_INET socket or any other fd fails the `getsockopt`
+  ## and yields 0.
+  ##
+  ## Fails SAFE in one direction only: an unobtainable peer leaves the consume
+  ## unattributed, which at worst costs a conservative re-run. It can never invent
+  ## an in-tree producer.
+  if kind != fkSocket:
+    return 0
+  let pid = c_socket_peer_pid(fd)
+  if pid > 0: uint64(pid) else: 0
+
+proc recordLocalFdCreate(fd: cint) {.raises: [].} =
+  ## IoMon-Pipeline-Capture IM-3 — record that a monitored (in-tree) process
+  ## CREATED a local IPC fd (`pipe`/`pipe2`/`socketpair`), stamping the kernel
+  ## (dev,ino) identity of the underlying object so the merge can PAIR a later
+  ## inherited `chan=opaque role=read` against it (writer.externalContentLossCount).
+  ##
+  ## This is the cardinal-sin guard for the Linux arm of ROUND-4 IP1, mirroring
+  ## `macos_interpose.recordLocalFdCreate`: an entirely in-tree pipeline —
+  ## `sh -c 'echo hi | cat'`, a compiler driver's driver↔cc1 pipes — is paired and
+  ## stays `mcComplete`, while an fd inherited from an OUT-OF-TREE creator has no
+  ## in-tree create, stays unpaired, and still downgrades.
+  ##
+  ## Direction of failure is deliberately one-way: the `fstat` is a raw syscall and
+  ## a failure is swallowed. A MISSING create can only leave a consume unpaired,
+  ## i.e. a conservative re-run; it can never manufacture a pairing. Conversely an
+  ## EXTRA create only suppresses a downgrade for an object the monitored tree
+  ## demonstrably made itself, which is the whole point.
+  if fd < 0:
+    return
+  var dev, ino: uint64
+  var kind: cint
+  if c_fd_identity_kind(fd, addr dev, addr ino, addr kind) == 0:
+    return
+  recordExternalContent("localfd", "create", localFdKey(dev, ino), fd)
+
+proc recordLocalFdPair(fds: ptr cint) {.raises: [].} =
+  ## Record BOTH ends of a freshly created fd pair. On Linux the two ends of a
+  ## `pipe` share ONE pipefs inode (so the second record dedups in the set), but a
+  ## `socketpair`'s ends have DISTINCT inodes and the consumer may fstat either —
+  ## so both are recorded unconditionally rather than relying on which end is
+  ## which.
+  if fds == nil:
+    return
+  let arr = cast[ptr UncheckedArray[cint]](fds)
+  recordLocalFdCreate(arr[0])
+  recordLocalFdCreate(arr[1])
 
 proc isLinuxDeletedProcFdTarget(path: string): bool {.raises: [].} =
   path.endsWith(" (deleted)")
+
+proc recoverNamedFdRead(fd: cint; kind: FdKind): bool {.raises: [].} =
+  ## Recover regular files and named devices after an inherited fd or an
+  ## untracked dup replaced the descriptor that carried the original path.
+  if kind notin {fkRegular, fkOther}:
+    return false
+  var buf: array[4096, char]
+  if c_fd_proc_path(fd, addr buf[0], csize_t(buf.len)) == 0:
+    return false
+  let resolved = $cast[cstring](addr buf[0])
+  if not resolved.isAbsolute or resolved.startsWith("anon_inode:") or
+      isLinuxDeletedProcFdTarget(resolved):
+    return false
+  updateFdPath(fd, cstring(resolved))
+  var record = baseRecord(mrFileRead, moFileRead)
+  record.path = resolved
+  record.result = 0
+  record.flags = uint32(fd)
+  record.detail = "inherited-fd"
+  discard podFileReadMarkIsNew(fd)
+  emitRecord(record)
+  true
 
 proc classifyEmptyFdRead(fd: cint): bool {.raises: [].} =
   if fd < 0 or emptyFdAlreadyClassified(fd):
@@ -1026,20 +1417,9 @@ proc classifyEmptyFdRead(fd: cint): bool {.raises: [].} =
     markEmptyFdClassified(fd)
     return false
   let kind = FdKind(rawKind)
+  if recoverNamedFdRead(fd, kind):
+    return true
   if kind == fkRegular:
-    var buf: array[4096, char]
-    if c_fd_proc_path(fd, addr buf[0], csize_t(buf.len)) != 0:
-      let resolved = $cast[cstring](addr buf[0])
-      if resolved.len > 0 and not resolved.startsWith("anon_inode:") and
-          not isLinuxDeletedProcFdTarget(resolved):
-        updateFdPath(fd, cstring(resolved))
-        var record = baseRecord(mrFileRead, moFileRead)
-        record.path = resolved
-        record.result = 0
-        record.flags = uint32(fd)
-        record.detail = "inherited-fd"
-        emitRecord(record)
-        return true
     emitEventLoss("linux inherited regular fd read unnamed key=" &
       localFdKey(dev, ino) & " fd=" & $fd)
     markEmptyFdClassified(fd)
@@ -1054,13 +1434,15 @@ proc classifyEmptyFdRead(fd: cint): bool {.raises: [].} =
       # the recorded dependency set is byte-identical.
       markEmptyFdClassified(fd)
       return false
-    recordExternalContent("opaque", "read", localFdKey(dev, ino), fd)
+    recordExternalContent("opaque", "read", localFdKey(dev, ino), fd,
+      channelPeerPid(fd, kind))
     markEmptyFdClassified(fd)
   else:
     if not inheritedFd(fd):
       markEmptyFdClassified(fd)  # FUP-K — see the fifo/socket branch above.
       return false
-    recordExternalContent("opaque", "read", localFdKey(dev, ino), fd)
+    recordExternalContent("opaque", "read", localFdKey(dev, ino), fd,
+      channelPeerPid(fd, kind))
     markEmptyFdClassified(fd)
   false
 
@@ -1123,6 +1505,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   if not locksReady:
     initLock(initLockVar)
     initLock(recordLock)
+    initLock(libScanLock)
     initPodTables()
     locksReady = true
   acquire(initLockVar)
@@ -1132,6 +1515,12 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   withShimMuted:
     fragmentDir = getEnv("REPRO_MONITOR_FRAGMENT_DIR")
     runId = getEnv("REPRO_MONITOR_SESSION")
+    # `shimInterestFromEnv`, not `parseInterestTokens`: a value naming nothing
+    # this build knows is read as "capture everything" rather than "capture
+    # nothing". The shim has no way to refuse, and only one of the two readings
+    # can be wrong in a direction the host filter cannot undo.
+    gInterest = shimInterestFromEnv(getEnv("REPRO_MONITOR_INTEREST"))
+    gEvidenceScope = parseEvidenceScopeToken(getEnv("REPRO_MONITOR_EVIDENCE"))
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))
     # DEP-SHM-2 — attach the process to the edge's shared-memory dependency
@@ -1187,6 +1576,14 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   sampleKillDiagArgvOnce()
   sampleKillDiag("init")
   recordProcessStart()
+  # LIBRARY-LOAD OBSERVATION — the first scan, and the one that does the most
+  # work. `ld.so` maps the ENTIRE initial closure before running any ELF
+  # constructor, so by the time this shim's constructor runs, every DT_NEEDED of
+  # the executable, every other `LD_PRELOAD`, and the loader itself are already
+  # on the link map and are enumerated here. That is why "loaded before the shim
+  # was initialised" is a covered case and not a hole: this design reads loader
+  # STATE, and state includes everything that happened before it looked.
+  scanLoadedLibraries("startup-closure")
   let rawStatus = installRawSyscallWrapperPatch()
   recordRawSyscallCoverage(rawStatus)
   let inlineStatus = installInlineSyscallPatches()
@@ -1209,7 +1606,8 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   # including those spawned through a clone(2) path the hook does not see,
   # resetting the inherited slot + registry so the child never replays the
   # parent's buffered frames. Best-effort; a non-zero return is ignored.
-  discard c_pthread_atfork(nil, nil,
+  discard c_pthread_atfork(cast[pointer](repro_linux_atfork_prepare),
+    cast[pointer](repro_linux_atfork_parent),
     cast[pointer](repro_linux_atfork_child_c))
   let sigInstalled = repro_linux_install_terminating_signal_handlers()
   if killDiagDeepIsOn() and sigInstalled > 0:
@@ -1241,6 +1639,14 @@ proc repro_monitor_shim_shutdown*(): cint {.exportc, dynlib, raises: [].} =
   ## teardown emits no new records (`withShimMuted`).
   sampleKillDiag("shutdown-enter")
   recordInlineSyscallTrapCoverage()
+  # LIBRARY-LOAD OBSERVATION — the closing scan. Its job is less to find new
+  # libraries (the load-time scans do that) than to CLOSE THE ACCOUNT: it is the
+  # last chance to compare the loader's cumulative load counter against what was
+  # enumerated, and so the point at which a load that never reached the
+  # interposed `dlopen` — glibc's internal `__libc_dlopen_mode` for NSS or gconv
+  # modules — is detected and downgrades the capture. Runs BEFORE the mute
+  # below, because `emitRecord` is a no-op while the shim is muted.
+  scanLoadedLibraries("shutdown")
   withShimMuted:
     try: flushAllRegisteredSlots()
     except CatchableError: discard
@@ -1309,7 +1715,7 @@ proc recordFdRead(fd: cint; bytes: clong) {.raises: [].} =
     let path = pathForFd(fd)
     if path.len == 0:
       discard classifyEmptyFdRead(fd)
-    else:
+    elif podFileReadMarkIsNew(fd):
       var record = baseRecord(mrFileRead, moFileRead)
       record.path = path
       record.result = bytes.int64
@@ -1441,6 +1847,8 @@ proc recordRawRead(fd: cint; callResult: clong): bool {.raises: [].} =
   let path = pathForFd(fd)
   if path.len == 0:
     return false
+  if not podFileReadMarkIsNew(fd):
+    return true
   var record = baseRecord(mrFileRead, moFileRead)
   record.path = path
   record.result = callResult.int64
@@ -1479,12 +1887,13 @@ proc recordRawSplice(fdIn, fdOut: cint; callResult: clong): bool
   if fdIn > 2:
     let inPath = pathForFd(fdIn)
     if inPath.len > 0:
-      var record = baseRecord(mrFileRead, moFileRead)
-      record.path = inPath
-      record.result = callResult.int64
-      record.flags = uint32(fdIn)
-      emitRecord(record)
       recorded = true
+      if podFileReadMarkIsNew(fdIn):
+        var record = baseRecord(mrFileRead, moFileRead)
+        record.path = inPath
+        record.result = callResult.int64
+        record.flags = uint32(fdIn)
+        emitRecord(record)
   if fdOut > 2:
     let outPath = pathForFd(fdOut)
     if outPath.len > 0:
@@ -1559,6 +1968,44 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
     # `syscall(SYS_gettid)` per-thread) do not trip `unsupported nr=186`
     # event-loss. Documented by M9.R.65 close-out as the residual
     # `libc raw syscall unsupported nr=186` class on mesonbin-setup.
+    true
+  of LinuxSysGetrandom:
+    # `getrandom(2)` reached through libc's raw `syscall()` rather than
+    # through the `getrandom()` symbol. Nim's own `std/sysrand` does exactly
+    # this (`syscall(SYS_getrandom, …)`), so every Nim binary that touches
+    # `std/tempfiles` — including reprobuild's own monitored helper edges —
+    # tripped `libc raw syscall unsupported nr=318`. Unknown loss details
+    # classify as Level 2 (unknown scope) in the consumer, which sets
+    # `disableCacheHits` and skips the action-cache publish: the edge could
+    # never hit cache on this or any later build.
+    #
+    # This is a CLASSIFICATION gap, not a monitoring gap. The same call is
+    # already observed on both other paths into it — `repro_hook_getrandom`
+    # (the libc symbol) and `repro_vdso_getrandom` (the vDSO entry) — and
+    # both record it as `mrNonDeterministic`. Do the same here so all three
+    # entry points produce identical evidence.
+    #
+    # `mrNonDeterministic` is deliberately NOT a completeness downgrade
+    # (`io_mon/types.nim`, record 16): io-mon OBSERVED the entropy read, so
+    # nothing is missing; whether entropy invalidates a result is a caller
+    # policy decision made on the record, not a loss.
+    if callResult >= 0:
+      recordNonDeterministic("getrandom")
+    true
+  of LinuxSysFutex:
+    # SYS_futex only coordinates threads through caller-owned memory. It does
+    # not access filesystem state or introduce an external input, so treating
+    # it as unknown event loss makes ordinary threaded tools permanently
+    # non-cacheable without protecting any dependency channel.
+    true
+  of LinuxSysLandlockCreateRuleset, LinuxSysLandlockAddRule,
+      LinuxSysLandlockRestrictSelf:
+    # Landlock only narrows the caller's future filesystem access. Creating a
+    # ruleset observes kernel capability state, adding a rule refers to an fd
+    # whose open was already monitored, and restricting the current thread has
+    # no filesystem read of its own. Subsequent allowed filesystem operations
+    # still pass through the regular hooks; denied operations are captured as
+    # probes. XZ uses these raw syscalls to install its optional sandbox.
     true
   of LinuxSysIoUringSetup, LinuxSysIoUringEnter:
     # M9.R.67.2 — Python 3.13's stdlib uses io_uring under the hood for
@@ -1679,17 +2126,99 @@ proc modeLooksReadable(mode: cstring): bool =
     inc i
   result = false
 
+proc modeLooksWritable(mode: cstring): bool =
+  ## True when the stdio mode string grants WRITE access, i.e. the open is an
+  ## OUTPUT-side event.
+  ##
+  ## `"w"`/`"w+"` create+truncate, `"a"`/`"a+"` create+append, and `"r+"` opens
+  ## an existing file for update. `modeLooksReadable` is deliberately NOT the
+  ## complement of this: `"w+"` and `"a+"` and `"r+"` are BOTH, and the two
+  ## questions have to be asked separately or the answer to one silently
+  ## overrides the other (see `recordFopen`).
+  if mode == nil or mode[0] == '\0':
+    return false
+  if mode[0] in {'w', 'a'}:
+    return true
+  var i = 0
+  while mode[i] != '\0':
+    if mode[i] == '+':
+      return true
+    inc i
+  result = false
+
 proc recordFopen(path, mode: cstring; stream: pointer) {.raises: [].} =
+  ## A stdio open is recorded on EVERY access side the mode actually grants.
+  ##
+  ## THE BUG THIS FIXES. The classification used to be a single either/or:
+  ## `if modeLooksReadable(mode): moFileOpen else: moFileWrite`. `"w+"` is
+  ## readable (it has a `+`), so a gcc-produced object file — which `as` opens
+  ## through stdio as `"w+"` — took the `moFileOpen` arm and was recorded ONLY
+  ## as an `mrFileOpen`, with the write-ness surviving nowhere but the free-text
+  ## `detail=stdio:w+` string. So a file that was CREATED and TRUNCATED by the
+  ## action produced no write-side record at all, while `mcapFileCreate` and
+  ## `mcapFileTruncate` were both advertised Linux capabilities.
+  ##
+  ## The consumer consequence is the part that matters: reprobuild splits an
+  ## action's INPUTS from its OUTPUTS by record kind. `mrFileOpen` is on the
+  ## input side (see `oracle.nim:observedPaths`), and there was no `mrFileWrite`
+  ## — so the compile's own product was classified as an input, or as neither,
+  ## depending on how the consumer reads it. Free-text `detail` parsing is not a
+  ## classification API and no consumer should have to do it.
+  ##
+  ## Both sides are now emitted when the mode grants both, because `"w+"`,
+  ## `"a+"` and `"r+"` genuinely ARE both, and the set transport dedups them
+  ## under distinct element keys.
+  ##
+  ## DA-1d — WHY `result` IS NO LONGER THE `FILE*`.
+  ##
+  ## These three records used to store `cast[int64](stream)`: the raw stdio
+  ## handle, a per-process HEAP ADDRESS, in a field that is part of the
+  ## dependency identity. Two consequences, one latent and one live:
+  ##
+  ##   * Latent. `mrFileOpen` is path-scoped, so the set encoder reduces its
+  ##     `result` to success/failure and the address never reached the key —
+  ##     laundered by luck, in an arm written for descriptor numbers. Path-scope
+  ##     `mrFileWrite` (a plausible future milestone) with no such arm and the
+  ##     address becomes the key outright.
+  ##   * LIVE. `mrFileWrite` is process-scoped TODAY, so nothing normalised it
+  ##     and the address travelled all the way into the depfile: every stdio
+  ##     write record carried an ASLR-dependent value, so a depfile was not
+  ##     reproducible across runs, and two `fopen(p, "w")` calls in one process
+  ##     published two elements for one fact.
+  ##
+  ## A `FILE*` is not an observation. `updateStreamPath` already owns the
+  ## stream→path mapping that the later `fwrite`/`fclose` hooks need, so nothing
+  ## reads this field for a stdio record. It is now a plain success code.
+  ##
+  ## Deliberately 0 and NOT `if stream == nil: -1 else: 0`: a failed `fopen`
+  ## already encoded as 0 (`cast[int64](nil)`), and `result < 0` is what
+  ## `types.nim`'s reads-only evidence gate reads as "absent". Making failure
+  ## visible here would move that gate, which is DA-1i's axis and not this
+  ## milestone's call — recorded as a finding instead of changed in passing.
   let resolved = pathForAt(LinuxAtFdcwd, path)
   if stream != nil:
     updateStreamPath(stream, cstring(resolved))
-  var record = baseRecord(mrFileOpen,
-    if modeLooksReadable(mode): moFileOpen else: moFileWrite)
-  record.result = cast[int64](stream)
-  record.path = resolved
-  if mode != nil:
-    record.detail = "stdio:" & $mode
-  emitRecord(record)
+  let detail = if mode != nil: "stdio:" & $mode else: ""
+  if modeLooksReadable(mode):
+    var record = baseRecord(mrFileOpen, moFileOpen)
+    record.result = 0
+    record.path = resolved
+    record.detail = detail
+    emitRecord(record)
+  if modeLooksWritable(mode):
+    var record = baseRecord(mrFileWrite, moFileWrite)
+    record.result = 0
+    record.path = resolved
+    record.detail = detail
+    emitRecord(record)
+  if not modeLooksReadable(mode) and not modeLooksWritable(mode):
+    # An unparseable / exotic mode string: record the open itself so the path is
+    # never lost, and leave the access side unclaimed rather than guessed.
+    var record = baseRecord(mrFileOpen, moFileOpen)
+    record.result = 0
+    record.path = resolved
+    record.detail = detail
+    emitRecord(record)
 
 proc repro_hook_fopen*(ctx: var FopenContext) {.raises: [].} =
   if shouldBypass():
@@ -1729,9 +2258,18 @@ proc repro_hook_fclose*(ctx: var FcloseContext) {.raises: [].} =
   if shouldBypass():
     callNext(ctx)
     return
+  # `fclose` closes the stream's descriptor inside libc, where the `close` hook
+  # never sees it. The descriptor's fd -> path entry must be dropped here, or the
+  # next open that reuses the number inherits the OLD path and its raw
+  # `write(2)`s are recorded against a file the process never wrote (the
+  # libstdc++ ifstream-then-ofstream pattern). `fileno` must be read before the
+  # stream is released.
+  let fd = if ctx.stream == nil: -1.cint else: c_fileno(ctx.stream)
   callNext(ctx)
   let savedErrno = c_get_errno()
   removeStreamPath(ctx.stream)
+  if fd >= 0:
+    removeFdPath(fd)
   c_set_errno(savedErrno)
 
 proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32) {.raises: [].} =
@@ -1767,6 +2305,46 @@ proc repro_hook_connect*(ctx: var ConnectContext) {.raises: [].} =
   let savedErrno = c_get_errno()
   if ctx.result == 0 or c_errno_is_connect_in_progress(savedErrno) != 0:
     recordIpcConnect(ctx.fd, ctx.address, ctx.addrLen)
+  c_set_errno(savedErrno)
+
+proc repro_hook_pipe*(ctx: var PipeContext) {.raises: [].} =
+  ## IM-3 — `pipe(2)`. Both fds are recorded as in-tree local-fd creates so a
+  ## downstream in-tree consumer's inherited opaque read pairs and does not
+  ## downgrade. Reads `ctx.fds` only after the real call reported success.
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0:
+    recordLocalFdPair(ctx.fds)
+  c_set_errno(savedErrno)
+
+proc repro_hook_pipe2*(ctx: var Pipe2Context) {.raises: [].} =
+  ## IM-3 — `pipe2(2)`. Same as `pipe`; `O_CLOEXEC`/`O_NONBLOCK` in `ctx.flags`
+  ## do not change the channel identity, so the flags are not consulted.
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0:
+    recordLocalFdPair(ctx.fds)
+  c_set_errno(savedErrno)
+
+proc repro_hook_socketpair*(ctx: var SocketpairContext) {.raises: [].} =
+  ## IM-3 — `socketpair(2)`. The two ends have DISTINCT inodes, so both must be
+  ## recorded for either end's inherited read to pair.
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  if ctx.result == 0:
+    recordLocalFdPair(ctx.sv)
   c_set_errno(savedErrno)
 
 proc repro_hook_sendfile*(ctx: var SendfileContext) {.raises: [].} =
@@ -1924,9 +2502,19 @@ proc repro_hook_dlopen*(ctx: var DlopenContext) {.raises: [].} =
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
+  # Establish the exact pre-call link map. If an object was unloaded after the
+  # preceding call, a reload now appears as a normal transition instead of an
+  # unidentifiable load/unload window.
+  scanLoadedLibraries("pre-dlopen")
   callNext(ctx)
   let savedErrno = c_get_errno()
   if ctx.result != nil:
+    # LIBRARY-LOAD OBSERVATION — scan HERE, before the wrapper returns to the
+    # caller. The object is mapped and the program has not yet been handed the
+    # handle, so the dependency is published before the program can act on it
+    # (the LF-7 publish-before-return discipline the read hooks follow), and the
+    # object is still present so a later `dlclose` cannot make it unobservable.
+    scanLoadedLibraries("dlopen")
     let status = scanInlineSyscallPatchesForNewMappings()
     recordLateInlineSyscallScanCoverage(status, "dlopen")
     if ctx.path != nil and ($ctx.path == "linux-vdso.so.1" or
@@ -1939,9 +2527,11 @@ proc repro_hook_dlmopen*(ctx: var DlmopenContext) {.raises: [].} =
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
+  scanLoadedLibraries("pre-dlmopen")
   callNext(ctx)
   let savedErrno = c_get_errno()
   if ctx.result != nil:
+    scanLoadedLibraries("dlmopen")
     let status = scanInlineSyscallPatchesForNewMappings()
     recordLateInlineSyscallScanCoverage(status, "dlmopen")
     if ctx.namespaceId != 0:
@@ -2093,10 +2683,23 @@ proc recordTimeRead(source: string) {.raises: [].} =
   recordObservedNonFile(mrTimeRead, moTimeRead, source, "linux time")
 
 proc recordNonDeterministic(source: string) {.raises: [].} =
-  var record = baseRecord(mrNonDeterministic, moNonDeterministic)
-  record.path = source
-  record.detail = "linux non-deterministic source"
-  emitRecord(record)
+  ## Record the program's consumption of ENTROPY as policy evidence, on the same
+  ## terms as every other non-file observation and as the macOS shim
+  ## (`io_mon/types.nim`, record 16): DEDUPED per process per source, `path` =
+  ## the API name, `detail` = the shared `NonDeterministicEntropyDetail`.
+  ##
+  ## This used to build the record by hand and call `emitRecord` directly — the
+  ## ONLY non-file recorder on this shim that skipped `recordObservedNonFile` —
+  ## so a program drawing entropy in a loop or from N threads emitted N records
+  ## for one fact, while the same program on macOS emitted one. Nothing needed
+  ## the extra copies: the evidence is "this process consumed entropy from this
+  ## API", and it is complete after the first observation.
+  ##
+  ## This does NOT downgrade completeness: io-mon SAW the entropy read, so
+  ## nothing is missing; whether entropy invalidates a cached result is a caller
+  ## policy decision made on the record.
+  recordObservedNonFile(mrNonDeterministic, moNonDeterministic, source,
+    NonDeterministicEntropyDetail)
 
 proc ptrArg(value: pointer): clong {.inline, raises: [].} =
   clong(cast[int](value))
@@ -2307,6 +2910,47 @@ proc repro_hook_getrandom*(ctx: var GetrandomContext) {.raises: [].} =
     recordNonDeterministic("getrandom")
   c_set_errno(savedErrno)
 
+proc repro_hook_entropy*(ctx: var EntropyContext) {.raises: [].} =
+  ## ENTROPY-PARITY — getentropy / arc4random / arc4random_buf /
+  ## arc4random_uniform, the glibc >= 2.36 BSD entropy set. These were
+  ## previously INVISIBLE on Linux while macOS recorded all four, so a program
+  ## seeding a PRNG through `arc4random_buf` was flagged as an entropy consumer
+  ## on one platform and not the other.
+  ##
+  ## They do NOT reduce to the existing `getrandom` hook — by two DIFFERENT
+  ## mechanisms, both read out of the shipped glibc 2.42 `libc.so.6`:
+  ##   * `getentropy` issues `getrandom(2)` ITSELF, as an inline `syscall`
+  ##     instruction in its own body (`mov $0x13e,%eax; syscall`). It never
+  ##     calls the public `getrandom` symbol, and an instruction inside libc's
+  ##     own text is not on the `syscall()`-wrapper path either
+  ##     (`repro_hook_raw_syscall`), so the kernel entry happens with no
+  ##     interposed frame anywhere in the chain.
+  ##   * `arc4random` / `arc4random_buf` / `arc4random_uniform` funnel into
+  ##     `__GI___arc4random_buf`, which calls `__getrandom_nocancel` — a LOCAL
+  ##     symbol, absent from libc's DYNAMIC symbol table, so it cannot cross an
+  ##     interposed PLT entry — and only when re-seeding its ChaCha20 stream:
+  ##     2000 `arc4random*` calls made exactly 2 `getrandom` syscalls, so
+  ##     nearly every call reaches the kernel not at all.
+  ## Net effect, measured: a probe calling all four produced ZERO entropy
+  ## records before this hook existed, even though a real `getrandom(2)`
+  ## syscall demonstrably occurred inside it.
+  ##
+  ## `ctx.value`/`ctx.result` are the forwarded genuine results — the hook only
+  ## observes. No caller attribution: LD_PRELOAD interposes the PUBLIC symbol,
+  ## which libc's own internal users bypass, so what arrives here is the
+  ## program's own call (see `io_mon/types.nim`, record 16).
+  if shouldBypass():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  # `getentropy` is the only one of the four that can fail; a failed call
+  # produced no entropy, so it is not evidence that the program consumed any.
+  if ctx.source != lesGetentropy or ctx.result == 0:
+    recordNonDeterministic($ctx.source)
+  c_set_errno(savedErrno)
+
 proc repro_hook_raw_syscall*(number, a1, a2, a3, a4, a5, a6,
                              callResult: clong; inlineTrap: cint)
     {.raises: [].} =
@@ -2512,6 +3156,9 @@ registerFopen64Hook(repro_hook_fopen64)
 registerFreadHook(repro_hook_fread)
 registerFcloseHook(repro_hook_fclose)
 registerConnectHook(repro_hook_connect)
+registerPipeHook(repro_hook_pipe)
+registerPipe2Hook(repro_hook_pipe2)
+registerSocketpairHook(repro_hook_socketpair)
 registerSendfileHook(repro_hook_sendfile)
 registerCopyFileRangeHook(repro_hook_copy_file_range)
 registerSpliceHook(repro_hook_splice)
@@ -2534,6 +3181,7 @@ registerClockGettimeHook(repro_hook_clock_gettime)
 registerGettimeofdayHook(repro_hook_gettimeofday)
 registerTimeHook(repro_hook_time)
 registerGetrandomHook(repro_hook_getrandom)
+registerEntropyHook(repro_hook_entropy)
 registerForkHook(repro_hook_fork)
 registerExecveHook(repro_hook_execve)
 registerPosixSpawnHook(repro_hook_posix_spawn)

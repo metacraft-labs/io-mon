@@ -70,10 +70,96 @@ case "${IO_MON_BUILD_MODE:-debug}" in
     ;;
 esac
 
-case "$(uname -s)" in
-  Darwin)
+# The shim runs on threads it does not own, so it must not own a heap per
+# thread.
+#
+# Nim's default allocator keeps one MemRegion PER THREAD, in that thread's
+# TLS, and frees a cell by handing it back to the region that allocated it --
+# through a pointer into that region (`addToSharedFreeList`). Inside an
+# injected library the threads are the HOST's: they start and exit on the
+# host's schedule, and when one exits the loader frees its TLS block, region
+# included. Every cell that thread allocated into shim-global state now names
+# a region that no longer exists, and the first foreign thread to free one of
+# them faults.
+#
+# MEASURED, in powershell.exe hosting a 300-child `nim c`: .NET Framework
+# finalizes every remaining SafeHandle on ITS finalizer thread at shutdown,
+# including pipe and process handles opened by threadpool threads that
+# retired long before. Each `CloseHandle` reached `forgetHandlePath`, which
+# freed a path string allocated by one of those dead threads; WER recorded
+# the 0xC0000005 inside `addToSharedFreeList__system` in this DLL, every
+# time. Under the same monitor the identical compile launched from bash (no
+# .NET, no thread churn) never faulted -- which is why it presented as an
+# intermittent "compiler crash" for days rather than as what it is.
+#
+# `-d:useMalloc` replaces the per-thread regions with the process's C heap:
+# one heap, owned by the process, alive until the process is. It applies to
+# every platform's shim, not just Windows, because the hazard is the
+# allocator's design and only the trigger is Windows-specific: a Linux or
+# macOS host that frees another thread's cell after that thread exits is
+# exposed the same way, and nothing today proves no host does. Each shim
+# entry module refuses to compile as a library without the define, so a
+# build path that bypasses this script cannot quietly reintroduce it.
+nim_shim_alloc_flags=("-d:useMalloc")
+
+# Platform/arch detection must not depend on an external ``uname``.
+#
+# This script is invoked by reprobuild's scripts/build_apps.sh, which runs both
+# directly and as a MONITORED build action under ``repro build``. In the
+# monitored case on macOS the engine injects this very shim into every child
+# process, and ``$(uname -s)`` has been observed to expand to the EMPTY string
+# there: reprobuild's v0.1.3 release failed with
+#
+#   unsupported platform  for the io-mon shim
+#
+# -- note the doubled space where the platform name belongs -- roughly three
+# minutes after this same script had completed successfully outside the engine
+# in the same job. Depending on a forked binary to learn what OS we are on is
+# the fragile part; ``$OSTYPE`` and ``$HOSTTYPE`` are bash builtins that need
+# no fork, no PATH lookup, and offer nothing for a monitoring shim to
+# interpose.
+#
+# ``uname`` remains the fallback, and an unresolvable platform is a hard error
+# rather than a guess -- the ``*)`` arm below is a real "unsupported OS", so
+# silently landing there because a subprocess returned nothing would report the
+# wrong cause (which is exactly what happened).
+io_mon_host_platform() {
+  case "${OSTYPE:-}" in
+    darwin*) printf 'darwin\n'; return 0 ;;
+    linux*) printf 'linux\n'; return 0 ;;
+    msys*|cygwin*|win32) printf 'windows\n'; return 0 ;;
+  esac
+  case "$(uname -s 2>/dev/null || true)" in
+    Darwin) printf 'darwin\n'; return 0 ;;
+    Linux) printf 'linux\n'; return 0 ;;
+    MINGW*|MSYS*|CYGWIN*|Windows_NT) printf 'windows\n'; return 0 ;;
+  esac
+  return 1
+}
+
+io_mon_host_is_arm64() {
+  case "${HOSTTYPE:-}${MACHTYPE:-}" in
+    *arm64*|*aarch64*) return 0 ;;
+  esac
+  case "$(uname -m 2>/dev/null || true)" in
+    arm64|aarch64) return 0 ;;
+  esac
+  return 1
+}
+
+if ! io_mon_host_platform_name="$(io_mon_host_platform)"; then
+  echo "error: cannot determine the host platform for the io-mon shim." >&2
+  echo "       \$OSTYPE='${OSTYPE:-}'; 'uname -s' gave '$(uname -s 2>/dev/null || true)'." >&2
+  echo "       This is a detection failure, NOT an unsupported OS -- refusing to" >&2
+  echo "       report the wrong cause. If this fired under 'repro build', the" >&2
+  echo "       action environment is not resolving subprocesses." >&2
+  exit 2
+fi
+
+case "${io_mon_host_platform_name}" in
+  darwin)
     macos_shim_arch_flags=()
-    if [ "$(uname -m)" = "arm64" ]; then
+    if [ "${IO_MON_TARGET_CPU:-}" != amd64 ] && io_mon_host_is_arm64; then
       macos_shim_arch_flags+=(
         "--passC:-arch arm64"
         "--passC:-arch arm64e"
@@ -83,6 +169,7 @@ case "$(uname -s)" in
     fi
     nim c \
       ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
+      ${nim_shim_alloc_flags[@]+"${nim_shim_alloc_flags[@]}"} \
       ${macos_shim_arch_flags[@]+"${macos_shim_arch_flags[@]}"} \
       --app:lib \
       --threads:on \
@@ -92,17 +179,28 @@ case "$(uname -s)" in
       --path:"${shm_gset_src}" \
       --nimcache:"${nimcache_dir}/io-mon-shim-dylib" \
       --out:"${out_dir}/librepro_monitor_shim.dylib" \
+      "$@" \
       src/io_mon/shim/macos_interpose.nim
     ;;
-  Linux)
-    linux_shim_link_flags=()
+  linux)
+    # Put --as-needed BEFORE Nim's automatic -lm/-lrt/-ldl/-pthread flags.
+    # Otherwise unused companion libraries from the build host's glibc can
+    # be loaded into an older monitored process and fail its libc ABI checks.
+    # These variables are expanded by Nim when rendering its linker command.
+    # shellcheck disable=SC2016
+    linux_shim_link_flags=(
+      '--gcc.linkTmpl:-Wl,--as-needed $buildgui $builddll -o $exefile $objfiles $options'
+      '--clang.linkTmpl:-Wl,--as-needed $buildgui $builddll -o $exefile $objfiles $options'
+    )
     if getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
       linux_shim_link_flags+=(
+        "-d:ioMonGlibcPrivateHeap"
         "--passL:-Wl,--version-script=${here}/src/io_mon/hooks/linux_preload_versions.map"
       )
     fi
     nim c \
       ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
+      ${nim_shim_alloc_flags[@]+"${nim_shim_alloc_flags[@]}"} \
       ${linux_shim_link_flags[@]+"${linux_shim_link_flags[@]}"} \
       --app:lib \
       --threads:on \
@@ -112,25 +210,152 @@ case "$(uname -s)" in
       --path:"${shm_gset_src}" \
       --nimcache:"${nimcache_dir}/io-mon-shim-so" \
       --out:"${out_dir}/librepro_monitor_shim.so" \
+      "$@" \
       src/io_mon/shim/linux_preload.nim
     ;;
-  MINGW*|MSYS*|CYGWIN*|Windows_NT)
+  windows)
+    # -static-libgcc: the shim is LoadLibraryW'd into arbitrary children by the
+    # engine, so it must resolve with no help from the child's DLL search path.
+    # Linked dynamically it imports libgcc_s_seh-1.dll, which lives in whichever
+    # mingw bin dir built it and is NOT on the PATH the engine composes for a
+    # monitored action -- the child then fails with
+    #   repro internal io monitor: error: LoadLibraryW in child returned NULL
+    # and every monitored action on Windows fails. Static-linking the gcc
+    # runtime leaves only KERNEL32 + the api-ms-win-crt-* UCRT stubs, all of
+    # which the system resolves unconditionally.
     nim c \
       ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
+      ${nim_shim_alloc_flags[@]+"${nim_shim_alloc_flags[@]}"} \
       --app:lib \
       --threads:on \
       --mm:orc \
       --cc:gcc \
+      --passL:"-static-libgcc" \
       --path:src \
       --path:"${stackable_hooks_src}" \
       --path:"${shm_queue_src}" \
       --path:"${shm_gset_src}" \
       --nimcache:"${nimcache_dir}/io-mon-shim-dll" \
       --out:"${out_dir}/librepro_monitor_shim.dll" \
+      "$@" \
       src/io_mon/shim/windows_interpose.nim
+
+    # 32-bit (WOW64) companions.
+    #
+    # A 64-bit shim cannot be injected into a 32-bit child: LoadLibraryW
+    # returns NULL on the machine-type mismatch, the child is left
+    # unmonitored, and the action is graded an unmonitored-subtree loss --
+    # which costs the whole build its cache publication. 32-bit children are
+    # not exotic on Windows: PATH trampolines (scoop shims) and older
+    # toolchain binaries (the ezwinports make.exe) are routinely i386.
+    #
+    # Two artefacts, both found by convention rather than configuration --
+    # see the WOW64 section of nim-stackable-hooks'
+    # src/stackable_hooks/windows_injector.nim:
+    #
+    #   librepro_monitor_shim32.dll         the 32-bit shim
+    #   stackable_hooks_wow64_probe32.exe   reports the 32-bit kernel32
+    #                                       proc addresses the injector
+    #                                       cannot resolve for itself,
+    #                                       via its exit code
+    #
+    # Optional: a host with no i686 toolchain still gets a working 64-bit
+    # shim, and the injector fails with a specific "32-bit shim is missing,
+    # build it with --cpu:i386" message if it ever meets a 32-bit child.
+    # Install one with: pacman -S mingw-w64-i686-gcc
+    i686_gcc="${IO_MON_I686_GCC:-}"
+    if [ -z "${i686_gcc}" ] && command -v i686-w64-mingw32-gcc >/dev/null 2>&1; then
+      i686_gcc="$(command -v i686-w64-mingw32-gcc)"
+    fi
+    if [ -n "${i686_gcc}" ]; then
+      # The i686 gcc.exe links its own libgcc_s_dw2-1.dll +
+      # libwinpthread-1.dll from its bin dir. nim spawns the compiler with
+      # the ambient PATH, so without that directory on it the compiler fails
+      # to START -- exit 1 with no diagnostic, which reads as a compile error
+      # against whichever .c file happened to be first. Scope the addition to
+      # the 32-bit invocations only: on the global PATH it makes the 64-bit
+      # build pick up the i686 compiler and fail on a pointer-size assert.
+      i686_bin="$(dirname "${i686_gcc}")"
+      # A bash PATH is colon-separated, so a Windows-style "D:/..." entry
+      # would split at the drive colon into "D" and "/...". Convert to the
+      # shell's own path form where cygpath is available (MSYS2 / git-bash).
+      if command -v cygpath >/dev/null 2>&1; then
+        i686_bin="$(cygpath -u "${i686_bin}")"
+      fi
+      # --kill-at: 32-bit mingw decorates stdcall exports with the callee's
+      # argument-byte count, so `repro_runtime_init` (a stdcall entry taking
+      # one pointer) is exported as `repro_runtime_init@4`, while the 64-bit
+      # build -- where there is no stdcall to decorate -- exports it plain.
+      # Every lookup asks for the undecorated name: the shim resolves its own
+      # init to compute the RVA it starts in the child, and the spawn hook
+      # passes the literal string to injectShimIntoChild. Both would return
+      # NULL against a decorated export, and neither failure is visible from
+      # outside -- LoadLibraryW succeeds, the DLL sits in the child with no
+      # hooks installed, and the process reports no records at all while the
+      # run still grades mcComplete. Stripping the decoration keeps ONE export
+      # name across both bitnesses, which is what the injector's naming
+      # convention already assumes.
+      PATH="${i686_bin}:${PATH}" \
+      nim c \
+        ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
+        ${nim_shim_alloc_flags[@]+"${nim_shim_alloc_flags[@]}"} \
+        --app:lib \
+        --threads:on \
+        --mm:orc \
+        --cpu:i386 \
+        --cc:gcc \
+        --gcc.exe:"${i686_gcc}" \
+        --gcc.linkerexe:"${i686_gcc}" \
+        --passL:"-static-libgcc" \
+        --passL:"-Wl,--kill-at" \
+        --path:src \
+        --path:"${stackable_hooks_src}" \
+        --path:"${shm_queue_src}" \
+        --path:"${shm_gset_src}" \
+        --nimcache:"${nimcache_dir}/io-mon-shim-dll32" \
+        --out:"${out_dir}/librepro_monitor_shim32.dll" \
+        src/io_mon/shim/windows_interpose.nim
+
+      PATH="${i686_bin}:${PATH}" \
+      nim c \
+        --app:console \
+        --cpu:i386 \
+        --cc:gcc \
+        --gcc.exe:"${i686_gcc}" \
+        --gcc.linkerexe:"${i686_gcc}" \
+        --passL:"-static-libgcc" \
+        --nimcache:"${nimcache_dir}/wow64-probe32" \
+        --out:"${out_dir}/stackable_hooks_wow64_probe32.exe" \
+        "${stackable_hooks_src}/stackable_hooks/tools/wow64_proc_probe.nim"
+
+      echo "built 32-bit WOW64 shim + probe into ${out_dir}"
+
+      # The 64-bit injection helper. Built here, in the 32-bit block, because
+      # its only caller is the 32-bit shim: a WOW64 process cannot inject
+      # into a 64-bit child itself (its VirtualAllocEx / CreateRemoteThread
+      # go through the WOW64 thunk layer, which does not reach a 64-bit
+      # address space), so it delegates the whole operation. Without a
+      # 32-bit shim there is nothing to delegate, hence nothing to build.
+      #
+      # Compiled 64-bit, i.e. with the DEFAULT toolchain and no i686 PATH.
+      nim c \
+        --app:console \
+        --passL:"-static-libgcc" \
+        --nimcache:"${nimcache_dir}/inject-helper64" \
+        --out:"${out_dir}/stackable_hooks_inject64.exe" \
+        "${stackable_hooks_src}/stackable_hooks/tools/inject_helper.nim"
+
+      echo "built 64-bit injection helper into ${out_dir}"
+    else
+      echo "note: no i686 toolchain found (set IO_MON_I686_GCC or install" \
+        "mingw-w64-i686-gcc); 32-bit children will not be injectable" >&2
+    fi
     ;;
   *)
-    echo "unsupported platform $(uname -s) for the io-mon shim" >&2
+    # Reachable only for a platform we genuinely do not support: detection
+    # itself already failed hard above, so this can no longer be reached by a
+    # subprocess returning nothing.
+    echo "unsupported platform ${io_mon_host_platform_name} for the io-mon shim" >&2
     exit 2
     ;;
 esac

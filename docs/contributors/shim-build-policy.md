@@ -15,8 +15,11 @@ concrete choices and the reasoning.
 
 ## Build settings
 
-The shim is built (see `scripts/build_shim.sh` and
-`src/io_mon/shim/macos_interpose.nim.cfg`) with:
+The shim is built (see `scripts/build_shim.sh`,
+`src/io_mon/shim/macos_interpose.nim.cfg` and
+`src/io_mon/shim/windows_interpose.nim.cfg`) with the settings below. On
+Windows only `-d:noSignalHandler` is applied through the `.nim.cfg`. The
+Windows build keeps `--mm:orc`, and its trace settings are unchanged.
 
 - `--stackTrace:off --lineTrace:off` — removes the per-proc `framePtr` **threadvar**
   push. A monitor shim never needs Nim stack traces; error context is carried in the
@@ -25,9 +28,37 @@ The shim is built (see `scripts/build_shim.sh` and
   clobbers the host program's own handlers — e.g. rustc installs a `SIGSEGV`
   handler on a sigaltstack for stack-overflow detection, and the Rust/Go runtimes
   rely on theirs. A monitor observes; it does not handle the host's faults.
+  On Windows the Nim handler takes over an injected child's access
+  violations. The child prints `SIGSEGV: Illegal storage access` and exits 1,
+  which hides the real exception and blames Nim in a program (gcc, cc1) that
+  contains none. That is how an injection defect presented on a Windows CI
+  host in 2026-09. `tests/portable/test_shim_signal_handler_policy.nim` pins
+  the define for both shims.
 - `--mm:arc` — deterministic reference counting, no background cycle-collector
   thread; more C-like than `orc`. The shim's data has no reference cycles.
 - `--threads:on` — required: the shim records from every host thread.
+
+On Linux/glibc, `-d:useMalloc` is paired with `ioMonGlibcPrivateHeap`. The
+shim's own malloc/calloc/realloc/free references are linked through private,
+hidden wrappers to glibc's allocator entry points. They do not resolve to an
+executable's replacement allocator. This retains process-lifetime ownership
+(including frees after the allocating host thread exits) without entering
+rustc's allocator from its clock hook. The wrappers do not interpose malloc
+for the host or change its allocation policy. Other platforms retain their
+existing allocation path.
+
+Linux builds also enable linker `--as-needed` before Nim's automatic system
+library arguments. The shim must not carry unused libc companion libraries:
+a Nix RUNPATH can otherwise load a newer libm/librt/libdl/libpthread beside an
+older executable's libc and fail before the program starts. This preserves
+compatibility only down to the shim's actual imported glibc symbol floor; it
+does not promise arbitrary old-glibc or cross-libc injection compatibility.
+
+This depends on an ownership boundary: only shim-owned pointers may reach the
+wrapped frees. The current callers are Nim's `useMalloc` runtime, the Linux POD
+tables, raw-syscall snapshots, and exec-environment construction. Each frees its
+own allocations. A future foreign API returning an allocated pointer must use
+that API's matching deallocator; it must not pass the pointer to the shim heap.
 
 We deliberately **keep `--exceptions:goto`** (the default) rather than
 `--exceptions:quirky`, even though `goto` injects the `nimInErrorMode` threadvar
@@ -43,6 +74,26 @@ substitute for keeping the hostile path in C.)
 The `IO_MON_DEBUG_*` diagnostic toggles remain compiled in (they are
 `when not defined(release)`), because the settings above do not define `release`.
 
+### Linux shared producer ownership
+
+All host threads publish through one process-local producer view. The shared
+table uses atomic inserts, but the view's list of mapped shards can grow and
+must have one caller at a time. Linux holds `recordLock` around publication,
+after muting recursive capture. The same lock already protects sequence-number
+assignment; neither operation nests the other.
+
+The fork prepare handler waits for that lock. Parent and child release their
+copies before further capture, and the child then replaces its inherited
+producer view. This keeps fork from copying a partially resized mapping list.
+The lock serializes publication within one process; separate processes retain
+the shared table's atomic publication protocol. Capture still finishes before
+the hook returns and reports loss on a failed publication.
+
+`test_io_mon_shared_producer_growth.nim` uses real pthreads, absent filesystem
+paths and fork/exec children to force growth and require complete capture of
+every distinct path. Its outer runner owns the transport, so compilation is
+monitored while test execution is isolated and always reruns.
+
 ## The structural rule (what actually keeps us safe)
 
 > **No code path reachable from inside libmalloc may touch any thread-local
@@ -54,10 +105,19 @@ its own lock and corrupts the heap. This is not fixable by compiler settings —
 even an application `{.threadvar.}` on that path is unsafe (see the stackable-hooks
 doc for the measurements).
 
-**Audit (current):** `mmap` is the **only** hooked function libmalloc calls
-internally — `munmap`, `mprotect`, `madvise`, `mremap`, `vm_allocate`, `brk`/`sbrk`
-are not hooked. The dyld add-image callback runs in dyld's post-map context (not
-malloc-reentrant) and is safe in practice.
+**Audit scope:** the macOS libmalloc analysis below does not cover replacement
+allocators on Linux. In particular, rustc calls `clock_gettime` while holding
+its allocator lock during thread-destructor registration. A normal Nim clock
+hook built with unqualified `useMalloc` re-enters that lock and deadlocks.
+Linux/glibc therefore isolates shim allocations from the replacement allocator
+as described above. This is not a claim that arbitrary allocator or signal
+contexts are safe: paths called under glibc's own allocator lock still require
+the allocation-free treatment below. The dyld add-image callback runs in dyld's
+post-map context (not malloc-reentrant).
+
+`tests/linux/test_io_mon_allocator_clock_reentrancy.nim` exercises first access
+on foreign threads under a real allocator mutex, plus actual rustc target
+enumeration, with checked timeouts and time-evidence assertions.
 
 **How `mmap` obeys the rule:** `repro_wrap_mmap` decides from the mmap **flags
 alone**, in pure C, whether a mapping could ever be recorded. Only a `MAP_SHARED`

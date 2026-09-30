@@ -50,7 +50,7 @@ suite "io-mon standalone build":
     # io_mon/reader — full file round-trip through the public reader.
     let root = createTempDir("io-mon-standalone", "")
     defer: removeDir(root)
-    let depfile = root / "rt.rdep"
+    let depfile = root / "rt.iomon"
     writeCanonical(depfile, @[record])
     let readBack = readMonitorDepFile(depfile)
     check readBack.records.len == 1

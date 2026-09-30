@@ -28,6 +28,10 @@
 ## parent-thread file AND the child-thread file, and the two writes must carry
 ## DIFFERENT thread ids (proving the child-thread record is genuinely captured,
 ## not the parent's). macOS-only; no-op pass elsewhere.
+##
+## A second real pthread probe joins 256 short-lived workers under a 128-file
+## descriptor limit. Every worker's write must survive, and open descriptors
+## must return to their baseline. No process, filesystem or monitor is mocked.
 
 import std/[os, osproc, streams, strtabs, unittest]
 from std/strutils import contains
@@ -37,16 +41,13 @@ const
 
 when defined(macosx):
   import io_mon  # readMonitorDepFile, mergeFragments, MonitorObservationKind
+  import io_mon/writer
   import macos_backend_toggle  # applyMacosBackendToggle (A/B → debug toggles)
 
+  from build_test_shim import buildPrivateMacosShim
+
   proc buildShim(): string =
-    let (output, code) = execCmdEx("bash " &
-      quoteShell(repoRoot / "scripts" / "build_shim.sh"))
-    if code != 0:
-      raise newException(IOError, "build_shim.sh failed: " & output)
-    let shim = repoRoot / "build" / "lib" / "librepro_monitor_shim.dylib"
-    doAssert fileExists(shim), "shim not produced at " & shim
-    shim
+    buildPrivateMacosShim(repoRoot)
 
   proc compileThreadedProbe(work: string): tuple[bin, parentOut, childOut: string] =
     ## Compile a probe that writes a tagged file from the main thread and another
@@ -61,6 +62,7 @@ when defined(macosx):
 #include <unistd.h>
 #include <string.h>
 #include <pthread.h>
+#include <sys/resource.h>
 
 static void write_tagged(const char *path, const char *tag) {
   int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
@@ -78,9 +80,37 @@ static void *child_thread(void *arg) {
   return NULL;
 }
 
+static int open_descriptors(void) {
+  int count = 0;
+  for (int fd = 0; fd < 128; ++fd)
+    if (fcntl(fd, F_GETFD) >= 0) ++count;
+  return count;
+}
+
 int main(int argc, char **argv) {
   if (argc < 3) { fprintf(stderr, "usage: %s <parent-out> <child-out>\n", argv[0]); return 2; }
   write_tagged(argv[1], "parent-thread");  /* main-thread write */
+  if (argc == 4 && strcmp(argv[3], "churn") == 0) {
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0) return 10;
+    limit.rlim_cur = 128;
+    if (setrlimit(RLIMIT_NOFILE, &limit) != 0) return 11;
+    int before = open_descriptors();
+    for (int i = 0; i < 256; ++i) {
+      char path[4096];
+      snprintf(path, sizeof(path), "%s-%d", argv[2], i);
+      g_child_path = path;
+      pthread_t worker;
+      if (pthread_create(&worker, NULL, child_thread, NULL) != 0) return 12;
+      if (pthread_join(worker, NULL) != 0) return 13;
+      int after = open_descriptors();
+      if (after > before + 4) {
+        fprintf(stderr, "worker %d leaked descriptors: before=%d after=%d\n", i, before, after);
+        return 14;
+      }
+    }
+    return 0;
+  }
   g_child_path = argv[2];
   pthread_t t;
   if (pthread_create(&t, NULL, child_thread, NULL) != 0) { perror("pthread_create"); return 4; }
@@ -133,7 +163,7 @@ int main(int argc, char **argv) {
     checkpoint("[" & backend & "] probe exit=" & $code & " stderr=" & stderrOut)
     doAssert code == 0, "probe under shim should exit 0"
 
-    let depfile = work / "cap.rdep"
+    let depfile = work / "cap.iomon"
     discard mergeFragments(fragmentDir, depfile)
     doAssert fileExists(depfile)
     let dep = readMonitorDepFile(depfile)
@@ -166,6 +196,61 @@ suite "io-mon macOS threaded-write capture (non-main-thread writes)":
       check hits.parent.found
       check hits.child.found
       check hits.parent.threadId != hits.child.threadId
+
+    test "short-lived workers release descriptors and preserve every write":
+      let fragments = work / "churn-fragments"
+      createDir(fragments)
+      var env = newStringTable(modeCaseSensitive)
+      for k, v in envPairs(): env[k] = v
+      env["DYLD_INSERT_LIBRARIES"] = shim
+      env["REPRO_MONITOR_FRAGMENT_DIR"] = fragments
+      applyMacosBackendToggle(env, "both")
+      let p = startProcess(probe, args = @[parentOut, childOut, "churn"],
+        env = env, options = {poStdErrToStdOut})
+      let output = p.outputStream.readAll()
+      let code = p.waitForExit()
+      p.close()
+      checkpoint(output)
+      require code == 0
+      let depfile = work / "churn.iomon"
+      discard mergeFragments(fragments, depfile)
+      let dep = readMonitorDepFile(depfile)
+      for i in 0 ..< 256:
+        let target = childOut & "-" & $i
+        var found = false
+        for record in dep.records:
+          if record.path == target and record.observationKind == moFileWrite:
+            found = true
+            break
+        check found
+
+    test "releasing worker handles preserves the cumulative fragment cap":
+      let fragments = work / "capped-worker"
+      createDir(fragments)
+      setFragmentByteCap(4096)
+      defer:
+        closeFragmentSlot()
+        setFragmentByteCap(0)
+      for i in 0 ..< 200:
+        appendFragmentRecord(fragments, MonitorRecord(
+          kind: mrFileWrite, observationKind: moFileWrite,
+          osPid: 123, threadId: 456, seq: uint64(i),
+          path: work / ("capped-output-" & $i)))
+        closeFragmentSlot(retainIdentity = true)
+        check not sigSafeSlotIsOpen()
+        check not fragmentSlotIsRegistered()
+      check fragmentSlotIsOverCap()
+      let fragment = fragmentPath(fragments, 123, 456)
+      # The cap counts payload frames; its loss/commit markers add bytes too.
+      check getFileSize(fragment) < 3 * 4096
+      let cappedSize = getFileSize(fragment)
+      appendFragmentRecord(fragments, MonitorRecord(
+        kind: mrFileWrite, observationKind: moFileWrite,
+        osPid: 123, threadId: 456, seq: 201, path: work / "after-cap"))
+      closeFragmentSlot(retainIdentity = true)
+      check getFileSize(fragment) == cappedSize
+      let dep = mergeFragments(fragments, work / "capped-worker.iomon")
+      check dep.completeness == mcIncomplete
 
     removeDir(work)
   else:

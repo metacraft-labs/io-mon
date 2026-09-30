@@ -295,12 +295,40 @@ proc runFixtureAndGate(name, projectDir: string; buildCmd: seq[string];
   ## class-(a) transport gate, AND the completeness-axis divergence gate
   ## (file-complete / SET-incomplete is the cardinal sin on the completeness
   ## axis — the exact part-2a regression this campaign closes).
-  let setDep = capture(workdir / (name & "-set.rdep"), buildCmd, projectDir).dep
+  let setCapC = capture(workdir / (name & "-set.iomon"), buildCmd, projectDir)
+  # THE BUILD MUST HAVE SUCCEEDED before any closure assertion runs.
+  #
+  # Without this gate a build that FAILED (for a reason having nothing to do
+  # with io-mon) never opens the inputs the closure lists, so the very next
+  # assertion reports "known-closure inputs NOT captured" — i.e. it reports a
+  # CARDINAL-SIN VIOLATION, the most serious verdict this oracle can return,
+  # for a build that simply did not run. That is a false alarm in the one
+  # direction an oracle must never be wrong in: it destroys the signal that
+  # makes a real under-capture credible.
+  #
+  # Observed for real: a stray `/tmp/Cargo.toml` left by an unrelated process
+  # made cargo resolve the wrong workspace root and exit non-zero; the oracle
+  # dutifully announced `[FAIL] 4 known-closure inputs NOT captured`. The exit
+  # code was right there and unexamined.
+  #
+  # `abort` rather than `fail`: with no successful build there is nothing to
+  # assert about, so continuing would only pile more meaningless failures onto
+  # a misleading one.
+  proc requireBuildOk(kind: string; c: Capture) =
+    if c.code != 0:
+      fail name & " (" & kind & "): FIXTURE BUILD FAILED with exit code " &
+        $c.code & " — closure assertions skipped because a build that did " &
+        "not run cannot have opened its inputs (this is an ENVIRONMENT " &
+        "failure, not an io-mon under-capture). Build output:\n" & c.output
+      raise newException(IOError, name & ": fixture build exit code " & $c.code)
+  requireBuildOk("set", setCapC)
+  let setDep = setCapC.dep
   # clean rebuild for the baseline (avoid incremental no-op)
   removeDir(projectDir); createDir(parentDir(projectDir))
   discard copyFixture(name, workdir)
-  let fileCapC = capture(workdir / (name & "-file.rdep"), buildCmd, projectDir,
+  let fileCapC = capture(workdir / (name & "-file.iomon"), buildCmd, projectDir,
                          disableShm = true)
+  requireBuildOk("file-baseline", fileCapC)
   result.setCap = inputReads(setDep)
   result.fileCap = inputReads(fileCapC.dep)
   result.setComplete = setDep.completeness == mcComplete
@@ -430,7 +458,7 @@ proc batteryD_control(workdir: string) =
   if not fileExists(ft): return
   createDir(workdir / "d")
   writeFile(workdir / "d" / "marker.txt", "dependency\n")
-  let cap = capture(workdir / "d-nokill.rdep",
+  let cap = capture(workdir / "d-nokill.iomon",
                     @[ft, workdir / "d" / "marker.txt", "6"], workdir)
   if cap.dep.completeness == mcComplete:
     ok "battery D control (fork tree, no kill): mcComplete — completeness is reportable"
@@ -438,7 +466,7 @@ proc batteryD_control(workdir: string) =
     fail "battery D control: expected mcComplete, got " & $cap.dep.completeness
   # kill a leaf after it published its read (LF-7): io-mon must stay honest —
   # NOT a false loss of the killed child's already-published dependency.
-  let cap2 = capture(workdir / "d-leafkill.rdep",
+  let cap2 = capture(workdir / "d-leafkill.iomon",
                      @[ft, workdir / "d" / "marker.txt", "6", "kill"], workdir)
   let reads = inputReads(cap2.dep)
   let markerRead = anyIt(reads.toSeq, "marker.txt" in it)
@@ -525,7 +553,7 @@ proc batteryD_realBuildKill(workdir: string) =
   # exec-accounting-boundary race can instead yield an honest `mcIncomplete`; that
   # is NOT a false complete, so it degrades to a WARN rather than a hard failure.
   # ==========================================================================
-  let capA = capture(workdir / "killbuild-kill.rdep", @["bash", "-c", script], proj)
+  let capA = capture(workdir / "killbuild-kill.iomon", @["bash", "-c", script], proj)
   ok "battery D kill (run A, direct): depfile produced despite mid-flight SIGKILL " &
     "(build exit " & $capA.code & ")"
   if capA.code != 0:
@@ -555,7 +583,7 @@ proc batteryD_realBuildKill(workdir: string) =
   # kill here may land at a different point than run A and completeness may differ
   # — the ⊇ relation is what's load-bearing, not the completeness value.)
   # ==========================================================================
-  let depPathB = workdir / "killbuild-kill-strace.rdep"
+  let depPathB = workdir / "killbuild-kill-strace.iomon"
   let straceLog = workdir / "killbuild-kill.strace"
   let straceArgs = @["-f", "-e", "trace=openat,open", "-o", straceLog,
     ioMonBin, "run", "--depfile", depPathB, "--", "bash", "-c", script]
@@ -657,7 +685,7 @@ int main(int argc, char **argv) {
   listener.listen()
   let port = int(listener.getLocalAddr()[1])
 
-  let cap = capture(workdir / "ipc-breakaway.rdep",
+  let cap = capture(workdir / "ipc-breakaway.iomon",
                     @[bin, marker, $port], workdir)
   listener.close()
 

@@ -60,11 +60,10 @@ proc selectedTestDirs(): seq[string] =
 
 # Compile + run every `test_*.nim` in the selected directories.
 proc runTestDirs(dirs: seq[string]) =
-  # `--path:../nim-stackable-hooks/src` resolves the `stackable_hooks/...` imports
-  # (the sibling checkout, not a published package); `--path:tests/helpers` makes
-  # the shared test helpers (e.g. `macos_backend_toggle`) importable from any
-  # per-OS directory; `--path:src` comes from config.nims.
-  let flags = "--path:../nim-stackable-hooks/src --path:tests/helpers"
+  # config.nims resolves source dependencies from explicit environment paths
+  # or sibling checkouts. Keep that choice for tests as well as normal builds.
+  # The shared helpers must be importable from every per-OS test directory.
+  let flags = "--path:tests/helpers"
   for dir in dirs:
     if not dirExists(dir): continue
     var files: seq[string]

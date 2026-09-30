@@ -1,4 +1,4 @@
-import std/[options]
+import std/[options, strutils]
 
 type
   MonitorRecordKind* = enum
@@ -15,7 +15,7 @@ type
     mrCapabilityGap = 11
     # T3a (Phase 2 / findings-doc break #1): a `connect(2)` (or connectionless
     # `sendmsg`/`sendto`) to an AF_UNIX / AF_INET(6) peer. APPENDED AT THE END to
-    # preserve RMDF wire-compat (the dgNoRuntimeDependencies lesson — never
+    # preserve iomon wire-compat (the dgNoRuntimeDependencies lesson — never
     # renumber an existing enum case). Carries the destination in `path` and the
     # PEER PID in `childOsPid` (AF_UNIX via LOCAL_PEERPID; 0 when unobtainable).
     mrIpcConnect = 12
@@ -26,7 +26,7 @@ type
     # hooked open, so without this they were recorded NOWHERE — a content-addressed
     # cache fingerprinting only the depfile would then serve a STALE result after
     # an in-place compiler-library upgrade. Captured via the `_dyld` add-image
-    # callback (NOT by hooking open). APPENDED AT THE END to preserve RMDF
+    # callback (NOT by hooking open). APPENDED AT THE END to preserve iomon
     # wire-compat (the dgNoRuntimeDependencies / mrIpcConnect lesson — never
     # renumber an existing case). The path is the dylib's REAL on-disk path; the
     # `observationKind` is deliberately `moFileRead` so the dylib is treated as a
@@ -38,7 +38,7 @@ type
     # build's output may depend on that are NOT file reads, so a depfile-only
     # fingerprint can false-cache-hit when they change. io-mon records evidence
     # only; callers decide whether a given observation invalidates their cache key.
-    # All four APPENDED AT THE END for RMDF wire-compat (never renumber).
+    # All four APPENDED AT THE END for iomon wire-compat (never renumber).
     #
     # 1. mrEnvRead / mrSysctlRead — OBSERVED DECLARED INPUTS (record, do NOT
     #    downgrade). The shim hooks getenv / sysctlbyname / sysctl / uname /
@@ -53,24 +53,58 @@ type
     #    note (MacOS-Monitoring-Adversarial-Hardening.milestones.org §R-D).
     mrEnvRead = 14
     mrSysctlRead = 15
-    # 2. mrNonDeterministic — OBSERVED ENTROPY INPUT, GATED BY CALLER ATTRIBUTION.
-    #    The shim hooks getentropy / arc4random / arc4random_buf /
-    #    arc4random_uniform and emits this record ONLY when the call's CALLER lies
-    #    in the monitored program's OWN main-executable __TEXT range (`path` names
-    #    the source). This does NOT force `mcIncomplete`: io-mon monitored the
-    #    entropy read successfully, and caller policy decides whether that evidence
-    #    invalidates the build/cache result.
-    #    CALLER ATTRIBUTION IS ESSENTIAL (a round-1 cardinal-sin defect): an
-    #    interpose hook is NOT limited to the program's own calls — on every process
-    #    startup /usr/lib/libobjc, /usr/lib/swift, libsystem_malloc/_trace call
-    #    arc4random_buf and libcorecrypto calls getentropy, all CROSS-DYLIB (so they
-    #    cross the interpose stub). Flagging those downgraded EVERY real cc/clang/ld/
-    #    bash run (the cardinal sin); attributing to the program's main-exe __TEXT
-    #    excludes the /usr/lib baseline. A /dev/random or /dev/urandom OPEN is
-    #    DELIBERATELY NOT flagged (mktemp opens /dev/urandom for a random temp name on
-    #    essentially every build). See `nonDeterminismObservationCount`
-    #    (writer.nim) and
-    #    `ct_macos_addr_in_program`.
+    # 2. mrNonDeterministic — OBSERVED ENTROPY INPUT.
+    #
+    #    THE CROSS-PLATFORM OBSERVATION CONTRACT. Every backend either MEETS this
+    #    or DECLARES the gap; macOS and Linux used to disagree on all three
+    #    clauses below, which is what stating the contract here fixes:
+    #      a. COVERAGE — every entropy entry point the PLATFORM'S libc/system
+    #         libraries expose is hooked, not an arbitrary subset:
+    #           macOS: getentropy, arc4random, arc4random_buf, arc4random_uniform,
+    #                  SecRandomCopyBytes, CCRandomGenerateBytes.
+    #           Linux: getrandom (libc symbol + raw syscall + vDSO entry) plus the
+    #                  glibc >= 2.36 BSD set getentropy / arc4random /
+    #                  arc4random_buf / arc4random_uniform.
+    #         `SecRandomCopyBytes`/`CCRandomGenerateBytes` are Apple-only and
+    #         `getrandom` is Linux-only, so the sets differ by what EXISTS, never
+    #         by what the shim bothered to hook. Windows hooks none of them and
+    #         says so: `mcapNonDeterminism` is a DECLARED capability gap there
+    #         (`WindowsInterposeKnownUnsupportedCapabilities`), so a consumer sees
+    #         the absence instead of mistaking it for "no entropy was used".
+    #      b. IDENTITY — `path` is the API NAME ("arc4random_buf"), and `detail`
+    #         is exactly `NonDeterministicEntropyDetail` on every platform, so a
+    #         consumer that matches on the detail string behaves identically
+    #         everywhere.
+    #      c. DEDUP — recorded ONCE PER PROCESS PER SOURCE. A program that draws
+    #         entropy in a loop, or from many threads, yields ONE record per
+    #         source, not one per call: the evidence is "this process consumed
+    #         entropy from this API", and repeating it adds nothing while costing
+    #         the depfile linearly in call volume.
+    #    This does NOT force `mcIncomplete`: io-mon monitored the entropy read
+    #    successfully, and caller policy decides whether that evidence invalidates
+    #    the build/cache result. See `nonDeterminismObservationCount` (writer.nim).
+    #
+    #    CALLER ATTRIBUTION (macOS only, and deliberately so). On macOS the record
+    #    is emitted ONLY when the call's CALLER lies in a NON-SYSTEM image
+    #    (`ct_macos_addr_in_nonsystem`). That gate is essential there (a round-1
+    #    cardinal-sin defect): on every process startup /usr/lib/libobjc,
+    #    /usr/lib/swift and libsystem_malloc/_trace call arc4random_buf and
+    #    libcorecrypto calls getentropy, all CROSS-DYLIB, so they cross the
+    #    interpose stub and flagged EVERY real cc/clang/ld/bash run. Linux needs no
+    #    equivalent gate: LD_PRELOAD interposes the PUBLIC symbol, and glibc's own
+    #    internal users reach entropy by routes that never pass through an
+    #    interposed PLT entry — a LOCAL, non-exported symbol
+    #    (`__getrandom_nocancel`, behind `arc4random*`) or an inline `syscall`
+    #    instruction in libc's own text (`getentropy`) — so what the Linux shim
+    #    sees is already the program's own call. Measured: `bash -c true`, a
+    #    `cc` compile+link, and a plain `printf` program each produce ZERO
+    #    `mrNonDeterministic` records with all four hooks installed, i.e. the
+    #    macOS /usr/lib baseline has no Linux counterpart to exclude. Building
+    #    a return-address→ELF-image classifier there would add a subsystem to
+    #    re-derive an attribution the interposition already gives us.
+    #
+    #    A /dev/random or /dev/urandom OPEN is DELIBERATELY NOT flagged (mktemp
+    #    opens /dev/urandom for a random temp name on essentially every build).
     mrNonDeterministic = 16
     # 3. mrTimeRead — RECORD but do NOT auto-downgrade (high benign false-positive).
     #    The shim hooks clock_gettime / gettimeofday / time / mach_absolute_time and
@@ -92,7 +126,7 @@ type
     # (`externalContentLossCount`) pairs the create/write side against the
     # attach/read side and injects an event-loss ONLY for an unpaired (out-of-tree)
     # consume — the SAME conservative-re-run machinery as the IPC-breakaway /
-    # un-injected-subtree downgrade. APPENDED AT THE END to preserve RMDF
+    # un-injected-subtree downgrade. APPENDED AT THE END to preserve iomon
     # wire-compat (the dgNoRuntimeDependencies / mrIpcConnect / mrLibraryLoad lesson
     # — never renumber an existing case). The channel identity (shm name / FIFO
     # path / "" for an anonymous socket/pipe) is in `path`; `detail` carries a
@@ -109,7 +143,7 @@ type
     # gap marked required=false, so completeness stayed mcComplete despite the
     # unhooked surface (research/adversarial-2026-06-round4/r4_dir/misc_probe.c).
     # The shim now records each successful mutation against the canonical path so
-    # the output-dir state is tracked. APPENDED AT THE END to preserve RMDF
+    # the output-dir state is tracked. APPENDED AT THE END to preserve iomon
     # wire-compat (the dgNoRuntimeDependencies / mrIpcConnect / mrExternalContent
     # lesson — never renumber an existing case). `detail` names the syscall
     # (`mkdir`/`mkdirat`/`rmdir`/`unlink`/`unlinkat`). This is an OUTPUT-side fact,
@@ -152,6 +186,212 @@ type
     # state tracking and is NOT a determinism downgrade.
     moPathMutation = 17
 
+  EventCategory* = enum
+    ## The classes of observation a consumer can opt in / out of. See
+    ## docs/contributors/event-interest-filter.md. Gating a category makes io-mon
+    ## skip record construction and the gset publish for the
+    ## `MonitorRecordKind`s in it — at the shims' one `emitRecord` funnel, and at
+    ## the host filter. It does NOT skip installing the hook: `gInterest` has
+    ## exactly one reader per shim and it is that funnel (swept, not assumed),
+    ## so every interposition is still put in place whatever the interest is.
+    ##
+    ## DA-5 — ONE CATEGORY PER CONSUMER, NOT PER SYNTACTIC FAMILY. The five
+    ## categories this replaced grouped record kinds that LOOK alike, and the
+    ## result was a switch no consumer could use: `ecNonDeterminism` alone
+    ## carried `mrEnvRead` (which reaches an action's CACHE KEY),
+    ## `mrNonDeterministic` (which gates cache PUBLICATION), `mrTimeRead` /
+    ## `mrSysctlRead` (which nothing reads at all) and `mrExternalContent`
+    ## (completeness-bearing). Four consumers behind one bit means no non-empty
+    ## proper subset of the old categories was safe to ask for, which is why
+    ## reprobuild's engine had to request every category unconditionally and why
+    ## its `captureNonDeterminism` / `captureIpc` policy fields were marked
+    ## INERT. A category is now the unit a single consumer reads, so a narrowing
+    ## can be argued one consumer at a time.
+    ##
+    ## TWO CLASSES OF KIND BELONG TO NO CATEGORY AND ARE THEREFORE NEVER GATED —
+    ## `categoryOf` answers `none` for both, and `recordWanted` keeps whatever
+    ## `categoryOf` cannot place:
+    ##
+    ##   * META — `mrEventLoss` / `mrBackendProfile` / `mrCapabilityGap`. A
+    ##     suppressed loss marker would manufacture a false `mcComplete` (LF-1).
+    ##   * COMPLETENESS-BEARING — `mrIpcConnect` and `mrExternalContent`.
+    ##     `mergeFragments` DERIVES a synthetic `mrEventLoss` from them
+    ##     (`unmonitoredSubtreeLossDetails`, `externalContentLossCount`), and the
+    ##     shim's gate runs at `emitRecord`, BEFORE that merge. Gating them
+    ##     therefore does not hide a record the consumer declined to see: it
+    ##     deletes the input a loss marker would have been derived from and turns
+    ##     an `mcIncomplete` edge into an `mcComplete` one. Measured on Linux
+    ##     with one out-of-tree `socat` peer, BEFORE DA-5: `io-mon run` graded
+    ##     `mcIncomplete` (1 loss, 32 records) while `--interest file,proc,lib`
+    ##     graded **`mcComplete`** (0 losses, 23 records). Re-measured on the
+    ##     same shape AFTER DA-5 (2026-09-25, this build's shim and CLI, one
+    ##     `socat UNIX-LISTEN` peer started outside the monitored tree):
+    ##
+    ##       io-mon run                       mcIncomplete  1 loss  31 records
+    ##       --interest file-reads,path-probes,file-writes,proc,lib
+    ##                                        mcIncomplete  1 loss  26 records
+    ##       --interest file,proc,lib (alias) mcIncomplete  1 loss  26 records
+    ##
+    ##     The narrowed arms keep the `mrIpcConnect` record AND the derived
+    ##     `mrEventLoss`; what they drop is `mrEnvRead` / `mrSysctlRead` /
+    ##     `mrTimeRead`. No finer category would have fixed this — the harm comes
+    ##     from the records not existing at merge time, not from how many other
+    ##     kinds shared their bucket — so the fix is that the kinds cannot be
+    ##     gated at all, which is what `none` here means. The retired `ecIpc` is
+    ##     consequently NOT replaced by a new category; see
+    ##     `LegacyEventCategory` for how its wire token still reads.
+    ##
+    ## The rows below name the consumer each category exists for. Adding a
+    ## category without one is the defect this milestone removed.
+    ecFileReads      ## mrFileOpen, mrFileRead.
+                     ## CONSUMER: the INPUT CONTENT set — reprobuild's
+                     ## `PathSetEvidence.monitorReads`, which is what the
+                     ## staleness detector re-hashes and what the strong
+                     ## fingerprint is taken over.
+    ecPathProbes     ## mrPathProbe, mrDirectoryEnumerate.
+                     ## CONSUMER: the EXISTENCE / MEMBERSHIP set —
+                     ## `monitorProbes` and `monitorDirectoryEnumerations`. A
+                     ## different question from `ecFileReads`: these paths are
+                     ## depended on for whether they exist and what a directory
+                     ## contains, not for their bytes, and an enumeration is
+                     ## invalidated by a path being ADDED.
+                     ##
+                     ## NOT `--evidence=reads-only`, and the distinction is
+                     ## structural rather than a matter of degree. That flag
+                     ## drops FAILED lookups — a predicate on a record's RESULT.
+                     ## Measured on one `nim c`: 66,996 records total, 23,049
+                     ## after dropping every failed lookup, 41,736 after gating
+                     ## a probe CATEGORY — the category gate discards 2,066
+                     ## SUCCESSFUL probes it should keep and leaves 20,753
+                     ## FAILED `mrFileOpen`s it should drop, because success is
+                     ## not a kind. The two axes COMPOSE (a record is written
+                     ## iff its category is wanted AND its result is in scope);
+                     ## neither substitutes for the other. See `EvidenceScope`.
+    ecFileWrites     ## mrFileWrite, mrPathMutation.
+                     ## CONSUMER: the OUTPUT set — `monitorWrites` and
+                     ## output-tree state tracking. An output-side fact, read by
+                     ## the declared-output check, not by anything that decides
+                     ## whether the action is stale.
+    ecProcessTree    ## mrProcessStart, mrProcessExec, mrProcessSpawn.
+                     ## CONSUMER: process-tree attribution — pid→image
+                     ## resolution, subtree/breakaway analysis, and the executed
+                     ## binary as a content dependency.
+    ecLibraryLoads   ## mrLibraryLoad.
+                     ## CONSUMER: the loaded-object closure of the tool.
+    ecEnvReads       ## mrEnvRead.
+                     ## CONSUMER: the ACTION CACHE KEY —
+                     ## `PathSetEvidence.monitorEnvReads`, folded into the strong
+                     ## fingerprint through `cacheEnvInputs`. Dropping this
+                     ## category makes an action that reads `SOURCE_DATE_EPOCH`
+                     ## key identically for every value of it.
+    ecEntropy        ## mrNonDeterministic.
+                     ## CONSUMER: the CACHE-PUBLISH GATE —
+                     ## `entropyObservations`, read by
+                     ## `applyEntropyBlessingPolicy`. Dropping this category
+                     ## leaves `entropyObservability` at `entObserved` (the
+                     ## backend-profile record is META and is never gated) with
+                     ## zero observations, which is verbatim the "observable,
+                     ## and nothing observed" false clean that policy exists to
+                     ## refuse.
+    ecAmbientReads   ## mrTimeRead, mrSysctlRead.
+                     ## CONSUMER: NONE TODAY. Both kinds reach reprobuild's
+                     ## record fold and land on its `else: discard` arm; they
+                     ## are record-only diagnostics. This is the one category a
+                     ## reprobuild edge can drop today without losing anything a
+                     ## consumer reads — i.e. the safe subset DA-5 exists to
+                     ## make expressible. Stated as an absence that is true
+                     ## NOW: a consumer that starts reading clock or sysctl
+                     ## observations must stop dropping it, and the place to say
+                     ## so is here.
+
+  LegacyEventCategory* = enum
+    ## READ SIDE ONLY — the pre-DA-5 `EventCategory`, kept so the tokens already
+    ## written into `.iomon` depfiles (and into any command line or
+    ## `REPRO_MONITOR_INTEREST` value that predates the split) still decode.
+    ##
+    ## OLD TOKENS REMAIN ACCEPTED, AS ALIASES. The alternative — retiring them —
+    ## was rejected on a measurement of which way each mistake points. An old
+    ## capture stamped `interest=file,proc,lib,nondet,ipc` observed EVERYTHING,
+    ## and a build that could not read those tokens would grade it as stating a
+    ## scope it cannot evaluate and re-run work that was already done correctly.
+    ## An alias costs nothing and prevents that, PROVIDED the expansion cannot
+    ## over-claim — which is why `legacyInterestExpansion` is derived from
+    ## `categoryOf` rather than written down. See it for the false-accept this
+    ## construction is what rules out.
+    ##
+    ## This is a READ vocabulary only: `interestToTokens` never emits these
+    ## spellings, so nothing this build writes has to be re-read through them.
+    lecFileDeps       ## `file`   -> mrFileOpen, mrFileRead, mrFileWrite,
+                      ##             mrPathProbe, mrDirectoryEnumerate,
+                      ##             mrPathMutation
+    lecProcessTree    ## `proc`   -> mrProcessStart, mrProcessExec,
+                      ##             mrProcessSpawn (unsplit; the token is
+                      ##             still canonical)
+    lecLibraryLoads   ## `lib`    -> mrLibraryLoad (unsplit; still canonical)
+    lecNonDeterminism ## `nondet` -> mrNonDeterministic, mrTimeRead, mrEnvRead,
+                      ##             mrSysctlRead, mrExternalContent
+    lecIpc            ## `ipc`    -> mrIpcConnect, which DA-5 made ungate-able.
+                      ##             The token still parses; it expands to no
+                      ##             category, because there is no longer one to
+                      ##             expand to.
+
+  EvidenceScope* = enum
+    ## DA-1i — HOW MUCH OF WHAT THE MONITOR OBSERVES IS WRITTEN DOWN.
+    ##
+    ## A DIFFERENT AXIS FROM `EventCategory`, and the difference is structural
+    ## rather than a matter of degree. `EventCategory` gates on the KIND of an
+    ## observation; this gates on its RESULT. Measured on one `nim c`:
+    ##
+    ##   total records                                        66,996
+    ##   drop every FAILED lookup — what `esReadsOnly` means   23,049
+    ##   gate a probes *category* instead                      41,736
+    ##
+    ## The category gate discards 2,066 SUCCESSFUL probes it should keep and
+    ## leaves 20,753 FAILED `mrFileOpen`s it should drop, because **success is
+    ## not a kind**. So no split of `EventCategory` can express this and the two
+    ## axes are composed, never conflated: a record is written iff its category
+    ## is wanted AND its result is in scope.
+    ##
+    ## NOT a completeness input. Narrowing the scope is the operator answering a
+    ## narrower question honestly, not the monitor failing to observe something,
+    ## and `mcIncomplete` means the latter. Conflating them corrupts exactly the
+    ## signal DA-2/DA-4 exist to make trustworthy — see `MonitorCompleteness`.
+    ##
+    ## NOT a cache-key component either. Trust here is a PARTIAL ORDER, not a
+    ## partition: full evidence is strictly STRONGER than reads-only evidence, so
+    ## a reads-only consumer must accept a full capture while a strict consumer
+    ## rejects a narrowed one. Keying on the scope would make the two disjoint
+    ## and block the useful direction — the careful teammate publishes and the
+    ## fast teammate cannot consume.
+    esFull = 0        ## Every observation, including lookups that found nothing.
+                      ## The DEFAULT and the ZERO VALUE, so a zero-initialised
+                      ## request and a depfile written before this existed both
+                      ## mean "full" with no special case anywhere.
+    esReadsOnly       ## Drop FAILED EXISTENCE lookups — see
+                      ## `recordIsFailedExistenceLookup` for the exact predicate
+                      ## and for what it deliberately does not touch. Reproduces
+                      ## the evidence model of a compiler-emitted depfile
+                      ## (`gcc -MD` lists headers opened, never headers searched
+                      ## for), and with it ninja's precise one-directional
+                      ## unsoundness: a file ADDED that shadows one earlier in a
+                      ## search path does not invalidate. Modified and deleted
+                      ## inputs are still caught. One more shape is invisible for
+                      ## the SAME reason, and the fields are why: a lookup that
+                      ## failed for a reason OTHER than absence (`EACCES`,
+                      ## `EISDIR`, `ELOOP`) is dropped too, because no errno
+                      ## reaches `MonitorRecord` — so a file that exists but
+                      ## could not be opened, later becoming openable, does not
+                      ## invalidate either. Row 4 of the hazard table; see
+                      ## `recordIsFailedExistenceLookup`.
+    esUnrecognized    ## READ SIDE ONLY, and never producible by parsing a token
+                      ## this build knows: the depfile states a scope written in
+                      ## a vocabulary this build does not have (`evidence=
+                      ## writes-only` from a future io-mon). It is NOT full
+                      ## scope, and it is not any scope this build can evaluate,
+                      ## so it covers NOTHING and every consumer rejects it. The
+                      ## CLI cannot produce it (`parseEvidenceScopeFlag` refuses
+                      ## an unknown value) and the gate never sees it.
+
   ProbeResult* = enum
     prUnknown = 0
     prAbsent = 1
@@ -168,6 +408,9 @@ type
     mbfMacosEndpointSecurity
     mbfMacosHybrid
     mbfLinuxPreloadHooks
+    # Appended before mbfUnknown: the family is serialized by its STRING id
+    # (backendFamilyId), so position is not wire-visible.
+    mbfWindowsInterposeHooks
     mbfUnknown
 
   MonitorCapability* = enum
@@ -198,8 +441,9 @@ type
     # the OBSERVED-DECLARED-INPUT recording of env-var / sysctl / uname queries
     # (mrEnvRead/mrSysctlRead; the BuildXL observed-environment model). mcapNonDeterminism
     # covers entropy observations (mrNonDeterministic) plus time markers
-    # (mrTimeRead). Appended at the END (the enum
-    # is serialized by capabilityId STRING, so appending is wire-safe).
+    # (mrTimeRead). Appended at the END — see the compatibility note on
+    # `mcapObservationIdentityFold` below, which states BOTH halves of what
+    # appending costs (this comment used to state only the enum half).
     mcapObservedEnv
     mcapNonDeterminism
     # ROUND-3 S1 — content-channel coverage: xattr-family metadata reads
@@ -207,7 +451,9 @@ type
     # PROT_READ mapping → content read / out-of-tree downgrade), FIFO and inherited
     # socket/pipe content (out-of-tree → downgrade), and the sendfile/pread/readv
     # zero-copy / positioned reads (content read on the source). Appended at the END
-    # (the enum is serialized by capabilityId STRING, so appending is wire-safe).
+    # — see the compatibility note on `mcapObservationIdentityFold` below, which
+    # states BOTH halves of what appending costs (this comment used to state only
+    # the enum half).
     mcapExternalContent
     # M-FW-5 — production-sensitive Linux residuals. These are intentionally
     # separate from the positive raw-syscall slices io-mon can already cover:
@@ -217,6 +463,48 @@ type
     mcapAdversarialRawSyscall
     mcapExecutableMappingLifecycle
     mcapPathIdentity
+    # DA-1b follow-up — does the capture FOLD repeated observations of one fact
+    # into one record? See `backendFoldsObservationIdentity`, which carries the
+    # per-family answer and the argument for it.
+    #
+    # APPENDED AT THE END, AND "APPENDING IS WIRE-SAFE" WAS ONLY HALF TRUE.
+    # It was always safe for the ENUM — the wire carries the `capabilityId`
+    # STRING, so no ordinal ever shifts meaning, and an older WRITER's file
+    # still reads here. It was NOT safe for an older READER: `capabilityFromId`
+    # RAISED on an id it did not know and `parseCapabilityList` did not catch
+    # it, so the moment a backend ADVERTISED a newly-added id in its
+    # `supported=` list, every io-mon built before that id existed failed to
+    # load the depfile at all. MEASURED, not inferred: a reader built at commit
+    # `715266b` dies with `ValueError: unknown monitor capability:
+    # observation-identity-fold` inside `readMonitorDepFile`. This is a
+    # PRE-EXISTING mechanism, not something this capability introduced —
+    # `mcapPathIdentity` and `mcapExecutableMappingLifecycle` were appended the
+    # same way and carried the same hazard — which is why the two notes above
+    # were corrected as well.
+    #
+    # THE READ SIDE NOW DEGRADES. `parseCapabilityList` resolves ids through
+    # `tryCapabilityFromId` and collects the ones it cannot name into a profile
+    # `mdlWarning` diagnostic: the file loads, the unnamable id is REPORTED
+    # rather than silently dropped, and it counts as unsupported (under-claiming
+    # the backend, never over-claiming it). So from this commit on, appending a
+    # capability really is wire-safe in both directions.
+    #
+    # WHAT THAT CANNOT DO IS FIX A READER THAT IS ALREADY BUILT. Every binary
+    # compiled before this change still raises on an id it does not know, so any
+    # capability appended from here on remains unreadable to those builds. The
+    # tolerance protects readers built from this commit forward and nothing
+    # earlier; there is no retroactive fix, only the end of the growth of the
+    # affected set. (Capability GAP records were always tolerant —
+    # `parseGapDetail` is wrapped and degrades to a diagnostic — so it was
+    # specifically the `supported=`/`required=` lists that broke.)
+    #
+    # DELIBERATELY NOT IN `InputEvidenceCapabilities`. Its absence is a COST and
+    # SIZE shortfall, never a fidelity one: a non-folding backend observed
+    # everything and merely wrote some of it down once per observing process.
+    # Putting it in the floor set would force `mcIncomplete` on every capture
+    # from such a backend, which would be a false statement about what the
+    # monitor could see.
+    mcapObservationIdentityFold
 
   MonitorDiagnosticLevel* = enum
     mdlInfo
@@ -231,6 +519,24 @@ type
     backendFamily*: MonitorBackendFamily
     capability*: MonitorCapability
     required*: bool
+    ## Is the missing capability an INPUT channel -- something bytes or
+    ## decisions can reach the monitored program through -- as opposed to
+    ## output-side bookkeeping, identity fidelity, an alternative backend or a
+    ## threat model?
+    ##
+    ## This exists because the distinction decides what a consumer must DO, and
+    ## it was previously only expressible in the free-text `reason`. A depfile
+    ## consumer weighing whether a capture may be trusted for cache publication
+    ## cannot tell "renames are not classified" (nothing unseen on the way in)
+    ## from "environment reads are not recorded" (a real input observed by
+    ## nothing) by string-matching English prose. `required` does not answer it
+    ## either: `required` says only whether the CALLER asked for the capability.
+    ##
+    ## `true` does NOT imply the capture is unusable -- see
+    ## `InputEvidenceCapabilities` for the subset whose absence forces
+    ## `mcIncomplete`. It means the shortfall is on the input side and a
+    ## consumer that cares about input completeness must weigh it.
+    inputChannel*: bool
     reason*: string
 
   MonitorBackendProfile* = object
@@ -271,6 +577,100 @@ type
     profile*: MonitorBackendProfile
     capabilityGaps*: seq[MonitorCapabilityGap]
     summary*: MonitorSummary
+    ## DA-1j — WHAT THIS CAPTURE WAS ASKED TO RECORD.
+    ##
+    ## `completeness` says whether the monitor could observe everything it
+    ## tried to. It does NOT say what it was asked to try, and until this field
+    ## existed nothing did — while `--interest` already shipped and already
+    ## narrowed. Measured, on one command with a single out-of-tree peer:
+    ## `io-mon run` graded `mcIncomplete` with 1 loss over 32 records, and
+    ## `io-mon run --interest file,proc,lib` graded **`mcComplete`** with 0
+    ## losses over 23 records. Gating `ecIpc` meant the `mrIpcConnect` records
+    ## never existed, so `mergeFragments` never derived the synthetic loss from
+    ## them — and the depfile then reported `mcComplete` and said nothing about
+    ## having been narrowed. That was the false complete this project calls "one
+    ## flag away at all times", reachable with a shipped flag.
+    ##
+    ## DA-5 CLOSED THAT PARTICULAR DOOR AND THIS FIELD IS STILL NEEDED. The
+    ## measurement above is past tense because `mrIpcConnect` and
+    ## `mrExternalContent` are no longer gate-able at all (see `categoryOf`), so
+    ## no interest set can reproduce it. What a narrowing can still do is answer
+    ## a question narrower than a consumer's — a capture with `ecEnvReads` gated
+    ## observed no environment read, and an action keyed on observed env reads
+    ## must not consume it. The field is what lets that consumer say no.
+    ##
+    ## A consumer compares this against its own requirement and recomputes
+    ## locally when the record answers a narrower question than it needs. That
+    ## is the shape `evaluateMonitorEvidence` already uses on the capability
+    ## axis — the depfile states what it has, the consumer supplies its own bar
+    ## — applied to the interest axis.
+    ##
+    ## NOT a completeness input and NOT a cache-key component. A narrowed
+    ## capture is an honest answer to a narrower question, not a monitor
+    ## failure, so it must not move the grade (see `MonitorCompleteness`). And
+    ## trust here is a PARTIAL ORDER, not a partition: full-scope evidence is
+    ## strictly stronger than narrowed evidence, so a consumer that asked for
+    ## less must still be able to accept a full capture. Keying on the scope
+    ## would make the two disjoint and block exactly that direction.
+    ##
+    ## READ THIS THROUGH `effectiveObservedInterest`, NOT DIRECTLY. `{}` here is
+    ## ambiguous on its own and `normalizeInterest` resolves the ambiguity the
+    ## dangerous way: it cannot tell a file that stated NO scope (an old depfile,
+    ## which must widen to `FullInterest`) from a file that stated a scope
+    ## consisting entirely of categories this build cannot name (a NARROWED
+    ## capture, which must not widen to anything). `observedInterestStated`
+    ## separates them.
+    observedInterest*: set[EventCategory]
+    ## Was a scope stated AT ALL? False for every depfile written before the
+    ## stamp existed, and for a library caller that passed no scope.
+    ##
+    ## This exists because the reader of a wire format meets writers from the
+    ## future. `interest=gpu` — what a later io-mon writes for a capture narrowed
+    ## to a category added after this build — parses to `{}` here, and reading
+    ## `{}` as "not stated" would report a NARROWED capture as full scope and let
+    ## a consumer that needs full evidence accept it. That is precisely the false
+    ## complete this field's sibling was added to end, surviving in the forward
+    ## direction. With `stated = true` and an empty parse the honest answer is
+    ## "this file states a scope I cannot evaluate", and a consumer requiring
+    ## full evidence must REJECT it — see `effectiveObservedInterest`.
+    observedInterestStated*: bool
+    ## The stamp VERBATIM, exactly as the producer wrote it (empty when nothing
+    ## was stated). Kept so the residual is nameable rather than merely
+    ## detectable: a consumer can report "this capture declares `gpu`, which I
+    ## cannot evaluate" instead of "this capture declares something". Same
+    ## attribution-not-suppression rule the unnamable-capability diagnostic
+    ## follows in `profileFromRecords`.
+    observedInterestTokens*: string
+    ## DA-1i — HOW MUCH OF WHAT WAS OBSERVED THIS CAPTURE WROTE DOWN.
+    ##
+    ## `observedInterest` above says which KINDS the capture was asked for; this
+    ## says which RESULTS it was asked to keep. Two axes, because a category gate
+    ## provably cannot express `reads-only` (see `EvidenceScope`), and the file
+    ## has to state both or a consumer cannot tell a capture that omitted every
+    ## failed lookup from one that omitted nothing.
+    ##
+    ## Same three-field shape as `observedInterest`, and for the same reason it
+    ## has three fields rather than one: a future io-mon writing
+    ## `evidence=writes-only` must NOT read as `esFull` here. Absent ⇒ full scope
+    ## (an old depfile keeps its meaning); present-but-unrecognised ⇒ REJECT,
+    ## with the token retained so the residual is nameable.
+    ##
+    ## READ THIS THROUGH `effectiveObservedEvidenceScope` /
+    ## `observedEvidenceScopeCovers`, NOT DIRECTLY.
+    ##
+    ## NOT a completeness input and NOT a cache-key component — see
+    ## `EvidenceScope` for both arguments.
+    observedEvidenceScope*: EvidenceScope
+    ## Was an evidence scope stated AT ALL? False for every depfile written
+    ## before the stamp existed, and for a capture at `esFull` — which is the
+    ## same claim, since `esFull` is what an unstamped file has always meant. So
+    ## a full capture's bytes are unchanged by this field's existence.
+    observedEvidenceScopeStated*: bool
+    ## The stamp VERBATIM, exactly as the producer wrote it (empty when nothing
+    ## was stated). Kept so a consumer can report "this capture declares
+    ## `writes-only`, which I cannot evaluate" instead of "this capture declares
+    ## something" — attribution, not mere detection.
+    observedEvidenceScopeToken*: string
     records*: seq[MonitorRecord]
 
   MonitorDepFileReaderOptions* = object
@@ -339,12 +739,77 @@ type
     # means stdio is read+discarded (mimicking the engine when it
     # only cares about completion).
     captureStdioPath*: string
+    # IoMon-Decomposed-Host-API DH-1 — PER-CALL environment for the
+    # monitored child. Entries are layered on top of the parent's own
+    # environment (which the child otherwise inherits unchanged) and are
+    # applied to the SPAWN, never to the hosting process: `runMonitored`
+    # performs no `putEnv`, so two monitors running concurrently in one
+    # process cannot clobber each other's injection variables.
+    #
+    # Later duplicates win over earlier ones. io-mon's OWN injection
+    # variables (`LD_PRELOAD` / `DYLD_INSERT_LIBRARIES`,
+    # `REPRO_MONITOR_*`, `CT_SANDBOX_TOOLS_DIR`) are applied AFTER these,
+    # so a caller can never accidentally switch monitoring off — but the
+    # value a caller supplies IS honoured as the base the injection
+    # extends (a caller-supplied `LD_PRELOAD` is preserved after the
+    # shim, exactly as an inherited one is).
+    #
+    # NOTE: on EVERY arm the executable is still resolved via the HOSTING
+    # process's `PATH`, but by a DIFFERENT route on each, so do not generalise
+    # from one of them:
+    #   * Linux   — `osproc`'s fork path calls `findExe` IN THE FORKED CHILD,
+    #               whose `environ` is still the parent's, then `execve`s the
+    #               resolved absolute path with this `env`. The search predates
+    #               the new environment.
+    #   * macOS   — `osproc` takes the `posix_spawnp(…, env)` path instead, and
+    #               `posix_spawnp` reads `PATH` from the CALLING process's
+    #               environment, never from the `envp` argument.
+    #   * Windows — `CreateProcessW` is called with `lpApplicationName = NULL`,
+    #               whose documented search runs in the calling process and
+    #               never consults `lpEnvironment`.
+    # So a `PATH` entry here changes what the child sees but not which binary is
+    # launched. Pass an absolute `command[0]` when that distinction matters.
+    # Only the Linux row is verified by execution in this workspace.
+    env*: seq[(string, string)]
+    # IoMon-Decomposed-Host-API DH-1 — PER-CALL working directory for the
+    # monitored child. Empty means "inherit the hosting process's cwd"
+    # (the historical behaviour). Set per-call rather than by `chdir`-ing
+    # the host, so concurrent monitors can each resolve their relative
+    # paths against their own action directory.
+    #
+    # `depFilePath`, `eventStreamPath` and `captureStdioPath` are resolved
+    # by the HOST, not the child, so they are unaffected by this field —
+    # pass them absolute if the host's cwd may differ.
+    cwd*: string
+    # The observation categories this consumer wants. io-mon skips the work
+    # (record build + gset publish, and where cheap the hook install) for the
+    # categories NOT in this set. See docs/contributors/event-interest-filter.md.
+    # The empty set is normalised to `FullInterest` on ingest, so an unset field
+    # captures everything (the safe, back-compatible default) rather than
+    # silently disabling all observation. META/loss records are never gated.
+    interest*: set[EventCategory]
+    # DA-1i — how much of what is observed this capture writes down. `esFull`
+    # (the zero value) records everything, which is what every caller got before
+    # this field existed. `esReadsOnly` drops FAILED existence lookups: io-mon
+    # still observes them, the shim skips publishing them and the host filter
+    # drops any an older shim published anyway. Not a completeness input and not
+    # a cache-key component — see `EvidenceScope`.
+    evidenceScope*: EvidenceScope
 
 const
-  RmdfVersion* = 1'u16
-  RmdfMagic* = "RMDF"
-  RmdfTrailerMagic* = "RMDT"
-  ReproMonitorDepfileProducer* = "repro_monitor_depfile_m11"
+  IomonVersion* = 1'u16
+  IomonMagic* = "IOMN"
+  IomonTrailerMagic* = "IOMT"
+  IoMonDepfileProducer* = "iomon_depfile_v1"
+
+  NonDeterministicEntropyDetail* = "non-deterministic entropy source"
+    ## The `detail` text EVERY backend must put on an `mrNonDeterministic`
+    ## record. It lives here — not as a literal in each shim — because the
+    ## shims previously disagreed ("non-deterministic entropy source" on macOS,
+    ## "linux non-deterministic source" on Linux), which made any consumer that
+    ## matched on the detail string behave differently per platform for the same
+    ## observation. One definition means the two cannot drift apart again.
+    ## The record's `path` carries WHICH source (see `mrNonDeterministic`).
 
 proc defaultMonitorDepFileReaderOptions*(): MonitorDepFileReaderOptions =
   MonitorDepFileReaderOptions(
@@ -366,3 +831,900 @@ proc raiseMonitorDepFileReaderError*(kind: MonitorDepFileReaderErrorKind;
   var err = newException(MonitorDepFileReaderError, message)
   err.kind = kind
   raise err
+
+# ---------------------------------------------------------------------------
+# Event-interest categories — docs/contributors/event-interest-filter.md
+# ---------------------------------------------------------------------------
+
+const FullInterest* = {EventCategory.low .. EventCategory.high}
+  ## Every category — io-mon's default, and what an empty request interest is
+  ## normalised to. A generic consumer captures everything unless it opts out.
+
+func categoryOf*(kind: MonitorRecordKind): Option[EventCategory] =
+  ## The gate-able category a record kind belongs to, or `none` for a kind NO
+  ## interest set may suppress. THE ONE DEFINITION OF BOTH FACTS — every gate in
+  ## this project asks it, so "which consumer wants this record" and "may this
+  ## record be dropped at all" cannot drift apart into two tables.
+  ##
+  ## `none` covers two classes, and the arms below keep them SEPARATE so the
+  ## reason is legible at the point of decision rather than only in a comment:
+  ## the META kinds (LF-1) and the COMPLETENESS-BEARING kinds (`mrIpcConnect`,
+  ## `mrExternalContent`, from which `mergeFragments` derives a synthetic
+  ## `mrEventLoss` after the shim's gate has already run). See `EventCategory`
+  ## for the measurement that retired `ecIpc` rather than renaming it.
+  ##
+  ## Exhaustive over `MonitorRecordKind`, so a new kind must state its category
+  ## — or state that it is ungate-able — here rather than silently defaulting.
+  case kind
+  of mrFileOpen, mrFileRead:
+    some(ecFileReads)
+  of mrPathProbe, mrDirectoryEnumerate:
+    some(ecPathProbes)
+  of mrFileWrite, mrPathMutation:
+    some(ecFileWrites)
+  of mrProcessStart, mrProcessExec, mrProcessSpawn:
+    some(ecProcessTree)
+  of mrLibraryLoad:
+    some(ecLibraryLoads)
+  of mrEnvRead:
+    some(ecEnvReads)
+  of mrNonDeterministic:
+    some(ecEntropy)
+  of mrTimeRead, mrSysctlRead:
+    some(ecAmbientReads)
+  of mrIpcConnect, mrExternalContent:
+    # UNGATE-ABLE, not uncategorised. `mergeFragments` turns each out-of-tree
+    # IPC peer and each unpaired external-content channel into a synthetic
+    # `mrEventLoss`; the shim's interest gate runs at `emitRecord`, BEFORE that
+    # merge, so any category holding these kinds is a switch that converts an
+    # `mcIncomplete` edge into an `mcComplete` one. There is no granularity at
+    # which that is safe, so there is no category.
+    none(EventCategory)
+  of mrEventLoss, mrBackendProfile, mrCapabilityGap:
+    # THE LF-1 ARM. META kinds carry the loss markers and the provenance a
+    # completeness verdict is derived from.
+    none(EventCategory)
+
+func normalizeInterest*(interest: set[EventCategory]): set[EventCategory] =
+  ## The empty set means "unset" -> capture everything; any non-empty set is
+  ## honoured as-is. Callers normalise on ingest so a zero-initialised request
+  ## never silently disables all observation.
+  if interest == {}: FullInterest else: interest
+
+func recordWanted*(interest: set[EventCategory]; kind: MonitorRecordKind): bool =
+  ## Should a record of `kind` be captured under `interest`? META kinds (no
+  ## category) are always wanted; a categorised kind is wanted iff its category
+  ## is in the (normalised) set.
+  let c = categoryOf(kind)
+  if c.isNone: true
+  else: c.get in normalizeInterest(interest)
+
+# ---------------------------------------------------------------------------
+# Evidence scope — DA-1i. A predicate on the RESULT of a lookup, composed with
+# (never folded into) the event-interest predicate on its KIND.
+# ---------------------------------------------------------------------------
+
+func recordIsFailedExistenceLookup*(record: MonitorRecord): bool =
+  ## Did this record observe an EXISTENCE LOOKUP THAT DID NOT SUCCEED? The whole
+  ## of what `esReadsOnly` drops, in one place, so the shim gate and the host
+  ## filter cannot disagree about what "reads only" means.
+  ##
+  ## The question is deliberately weaker than "did the path turn out to be
+  ## absent?", because that is a question these fields cannot answer — see
+  ## "LOOKUPS THAT DID NOT SUCCEED" below, which is the whole of the difference
+  ## and the reason the hazard table has a fourth row.
+  ##
+  ## UNGATE-ABLE KINDS CANNOT BE DROPPED, and the protection is STRUCTURAL in
+  ## two independent ways rather than a matter of remembering them:
+  ##
+  ##   * The `case` below is EXHAUSTIVE — no `else` — exactly as `categoryOf` is,
+  ##     so a `MonitorRecordKind` added later is a COMPILE ERROR here until
+  ##     someone classifies it. It cannot inherit an answer by default.
+  ##   * The guard on the first line asks `categoryOf`, the one definition of
+  ##     which kinds no narrowing may suppress, so the two cannot drift apart
+  ##     even if the arms below were mis-edited. Since DA-5 that guard covers the
+  ##     completeness-bearing kinds (`mrIpcConnect`, `mrExternalContent`) as well
+  ##     as META, so this axis inherits their protection from the same
+  ##     definition the interest axis uses. It is deliberately REDUNDANT with the
+  ##     arms below (deleting it changes no behaviour today); it is defence in
+  ##     depth and a statement of where the definition lives, not the sole
+  ##     protection.
+  ##
+  ## Why this matters more than it looks: a narrowing that could drop an
+  ## `mrEventLoss` would manufacture a false `mcComplete` out of a capture that
+  ## lost data (LF-1), which is the cardinal sin this project is organised
+  ## around. `recordWanted` holds the same line for the same reason, and
+  ## `tests/portable/test_io_mon_evidence_scope.nim` asserts it EXHAUSTIVELY over
+  ## `MonitorRecordKind` — offering every kind the exact record shape that makes
+  ## the three lookup kinds droppable — rather than trusting either comment.
+  ##
+  ## LOOKUPS THAT DID NOT SUCCEED — NOT PROVEN ABSENCES. Read this before
+  ## widening any arm, and before restoring the stronger sentence that used to
+  ## stand here ("a failure is an error, not an absence"). THE RECORD SHAPE
+  ## CANNOT DRAW THAT LINE:
+  ##
+  ##   * `result` is the raw call return, and `open`/`openat` answer **-1 for
+  ##     every failure** whatever the reason;
+  ##   * `probeFromResult` stamps **`prAbsent` on every non-zero `stat`
+  ##     return**, again whatever the reason;
+  ##   * **no errno reaches `MonitorRecord`.** There is no field for it and no
+  ##     shim carries one.
+  ##
+  ## So `result < 0` and `prAbsent` mean "the call FAILED", never "the path is
+  ## ABSENT", and four measured shapes where the path EXISTS are dropped here:
+  ## `EACCES` (a mode-000 `open`), `EISDIR`, `EACCES` on a `stat` through a
+  ## no-exec directory, and `ELOOP`. On a real `nim c`, 5 of 2,104 dropped
+  ## records name an existing path (all `/dev/tty`, `ENXIO`).
+  ##
+  ## THAT IS THE NARROWING, STATED RATHER THAN PAPERED OVER. `esReadsOnly` keeps
+  ## the lookups that FOUND SOMETHING USABLE — the evidence a compiler-emitted
+  ## depfile carries — and an errored lookup found nothing usable. The
+  ## consequence is a staleness blind spot, and it is written down as such: ROW 4
+  ## of the normative hazard table (`docs/usage.md`,
+  ## `docs/contributors/evidence-scope.md`, and reprobuild's `CLI/build.md`) says
+  ## that a file which exists but could not be OPENED, later becoming openable (a
+  ## `chmod`, a directory replaced by a file), is invisible under `reads-only` —
+  ## for the same reason row 3's added file is: **it is not recorded at all**, so
+  ## row 1 ("a recorded file is modified ⇒ detected") never reaches it.
+  ##
+  ## THE ALTERNATIVE, NAMED SO THIS IS A CHOICE AND NOT AN OVERSIGHT: carry the
+  ## distinguishing fact — errno, or at minimum an ENOENT/ENOTDIR-vs-everything-
+  ## else bit — and drop only proven absences. THE WIRE WOULD NOT OBJECT:
+  ## `MonitorRecord.detail` is a free string every backend already writes, and
+  ## the `.iomon` envelope carries only RECORDS (`depFileFromOwnedRecords`
+  ## reconstructs `profile`, `capabilityGaps`, `requiredFeatures`, `completeness`
+  ## and `summary` from them), so no version bump and no format break would be
+  ## needed. Two costs are why it was not done here, and both are larger than the
+  ## 0.24% they buy:
+  ##     THREE BACKENDS — AND THE COST IS NOT WHERE THIS BULLET USED TO PUT IT.
+  ##     It said macOS sites "would each have to capture errno before any
+  ##     intervening libc call clobbers it". THE CAPTURE IS ALREADY THERE, on
+  ##     every backend, at exactly the required position, put there for an
+  ##     unrelated reason (preserving the tracee's errno across the hook):
+  ##     `linux_preload` takes `c_get_errno()`, `macos_interpose` `getErrno()`
+  ##     and `windows_interpose` `GetLastError()` on the line AFTER the real
+  ##     call and BEFORE anything that could clobber it. One Windows probe
+  ##     site's comment already reads "ERROR_FILE_NOT_FOUND on absent path".
+  ##     Do not restore that claim. What WOULD have to be built is two other
+  ##     things, and they are the honest cost:
+  ##       - PLUMBING, not capture. The saved value is a LOCAL IN THE HOOK,
+  ##         while the record is built one or two frames down in helpers
+  ##         (`recordOpen`, `recordPathProbe`, `probeFromResult`,
+  ##         `recordFailedOpenCanonical`, `recordCanonicalPathProbe`, …) that
+  ##         receive the CALL RESULT and not the errno. Counted over the procs
+  ##         that build a droppable record without the saved value in scope:
+  ##         **~16 on macOS, ~5 on Linux, ~4 on Windows**. Every one is a
+  ##         signature change on a hot path.
+  ##       - THREE ERROR VOCABULARIES, and Windows has two of its own: a
+  ##         negative NTSTATUS on the `Nt*` arms and a positive Win32 code on
+  ##         the `GetLastError` arms. "Which values mean absent" therefore has
+  ##         to be answered three-and-a-half times, in three files.
+  ##     Until it is, this predicate's fail-toward-keeping rule makes
+  ##     `reads-only` stop reducing ANYTHING on the backends that have not been
+  ##     classified — a far bigger behaviour change than the blind spot it
+  ##     closes. THAT consequence is the load-bearing half of this bullet.
+  ##   * AND THERE IS NO SPARE FIELD THAT IS ALSO FREE. Stated carefully,
+  ##     because the obvious objection to the previous wording is correct:
+  ##     "carrying errno grows the `full` arm" is true of ONE carrier and false
+  ##     of the other, and `full` is the BASELINE DA-1i exists to measure the
+  ##     per-record cost against, so which carrier is meant decides the
+  ##     argument. MEASURED on the real encoder, over a real failed-open record:
+  ##       - `detail` — the free string the paragraph above says the wire would
+  ##         not object to — costs **+7 bytes on a 126-byte record** for an
+  ##         `errno=2` suffix, i.e. **+5.2%** on this fixture's `full` arm. Real,
+  ##         and it moves the measurement.
+  ##       - `result` would cost **NOTHING**: it is a FIXED-WIDTH `int64`
+  ##         (`writeI64Le` → `writeU64Le`), so -1, -2 and -13 all encode in the
+  ##         same 126 bytes, and `result < 0` would still select every failure.
+  ##         But it is NOT AVAILABLE, and that is the real objection rather than
+  ##         a cost one: `result` is defined as the RAW CALL RETURN, and Windows
+  ##         already spends its sign on NTSTATUS, so a `-errno` and a genuine
+  ##         negative status could not be told apart in the one field.
+  ##     So the cheap carrier is the one the wire cannot spare, and the carrier
+  ##     the wire can spare is the one that moves the measurement.
+  ##
+  ## FAILS TOWARD KEEPING. Every arm answers `true` only where the record PROVES
+  ## the lookup DID NOT SUCCEED, and anything unproven is kept:
+  ##   * `mrPathProbe` — `prAbsent` is the classification both POSIX shims and
+  ##     the Windows `probeFromBool` sites already write. Some Windows probe
+  ##     sites (the `NtCreateFile`/`NtQueryAttributesFile` arms) leave
+  ##     `probeResult` at `prUnknown` and carry a negative NTSTATUS instead, so
+  ##     that pairing counts too.
+  ##   * `mrFileOpen` — a negative result. `open`/`openat` return -1, Windows
+  ##     `CreateFileW` records `INVALID_HANDLE_VALUE` (-1) and the NT arm a
+  ##     negative NTSTATUS. A FAILED `fopen` records the NULL `FILE*` as 0 and
+  ##     is therefore KEPT — deliberately, because 0 is also a legal fd, and
+  ##     dropping a successful `open` that happened to get fd 0 would remove a
+  ##     real input. Over-keeping costs records; under-keeping costs
+  ##     correctness.
+  ##   * `mrDirectoryEnumerate` — a negative result. Every current backend emits
+  ##     this only for an enumeration that succeeded (`result = 1`), so this arm
+  ##     is a guard against a future backend that records failures, not a live
+  ##     reducer.
+  ##
+  ## A READ IS NEVER DROPPED, AND NOT FOR THE REASON THIS COMMENT USED TO GIVE.
+  ## It said a failed `mrFileRead` is "an error the consumer must still see",
+  ## presented as a live case this arm protects. THAT CASE IS NOT LIVE ON LINUX.
+  ## Counted: `linux_preload.nim` builds an `mrFileRead` at SIX sites, and not
+  ## one of them can emit a negative result —
+  ##   * four guard on the byte count: `recordFdRead`, `repro_hook_fread` and
+  ##     the `sendfile` arm on `> 0`, `recordRawSplice` on `> 0`, and
+  ##     `recordRawRead` returning early on a negative result;
+  ##   * two hard-code `result = 0`: `recordPathRead` and the inherited-fd
+  ##     reclassification in `classifyEmptyFdRead`.
+  ## WHAT IS LIVE, AND IS KEPT: SHORT reads (`0 < n < requested`) and zero-length
+  ## reads at EOF, emitted with their real byte count, plus those two synthetic
+  ## `result = 0` reads. None of them is an existence lookup, so none is
+  ## droppable. The arm is therefore a GUARD exactly as
+  ## `mrDirectoryEnumerate`'s is — against a future backend that does record
+  ## failed reads, and against anyone widening `mrFileOpen`'s `result < 0` test
+  ## to everything that touches a file — and not a live reducer.
+  if categoryOf(record.kind).isNone:
+    return false
+  case record.kind
+  of mrPathProbe:
+    record.probeResult == prAbsent or
+      (record.probeResult == prUnknown and record.result < 0)
+  of mrFileOpen, mrDirectoryEnumerate:
+    record.result < 0
+  of mrFileRead, mrFileWrite, mrPathMutation:
+    # File-touching, and NOT existence lookups: the path was already in hand, so
+    # whatever these report is not the answer to "is there something here?". A
+    # guard, not a live reducer — see "A READ IS NEVER DROPPED" above.
+    false
+  of mrProcessStart, mrProcessExec, mrProcessSpawn, mrLibraryLoad,
+     mrNonDeterministic, mrTimeRead, mrEnvRead, mrSysctlRead,
+     mrExternalContent, mrIpcConnect:
+    # Not lookups at all. `mrIpcConnect` and `mrExternalContent` are also
+    # COMPLETENESS-BEARING (`mergeFragments` derives a synthetic `mrEventLoss`
+    # from them), so dropping either would move the grade — which this axis must
+    # never do.
+    false
+  of mrEventLoss, mrBackendProfile, mrCapabilityGap:
+    # THE LF-1 ARM. META kinds carry the loss markers and the provenance a
+    # completeness verdict is derived from. `false` here is not a default: it is
+    # the statement that no narrowing may ever suppress them.
+    false
+
+func recordInEvidenceScope*(scope: EvidenceScope;
+                            record: MonitorRecord): bool =
+  ## Should this record be written down under `scope`? The RESULT-side half of
+  ## the gate, to be composed with `recordWanted`'s KIND-side half.
+  ##
+  ## `esUnrecognized` records EVERYTHING. It can only arrive from reading a
+  ## depfile a newer io-mon wrote, never from this build's CLI or from
+  ## `FsSnoopRequest`, and if it somehow reached a gate the safe direction is to
+  ## capture more rather than less — an over-full capture is slower and still
+  ## honest; an under-full one is the cardinal sin.
+  case scope
+  of esFull, esUnrecognized: true
+  of esReadsOnly: not recordIsFailedExistenceLookup(record)
+
+func evidenceScopeToken*(scope: EvidenceScope): string =
+  ## Encode a scope as its wire token — for `REPRO_MONITOR_EVIDENCE` (the env
+  ## channel to the shim) and for the `evidence=` stamp on the backend-profile
+  ## record. ONE vocabulary for both channels and one codec, exactly as
+  ## `interestToken` is for the interest axis.
+  ##
+  ## AN EXHAUSTIVE `case`, NOT A TABLE OF PAIRS, and the difference is not
+  ## taste. Every other consumer of `EvidenceScope` — `recordInEvidenceScope`,
+  ## `evidenceScopeCovers` — is a `case` the compiler polices; an array is
+  ## policed by nothing. MEASURED on the array, end to end and on real bytes: a
+  ## new member added and given everything the compiler and the suite asked for
+  ## (an arm in each of those two `case`s, a row in the relation test) compiled
+  ## clean, and `mergeFragments` then wrote a bare `;evidence=` for a capture
+  ## taken under it — a depfile that reads back STATED and UNEVALUABLE and is
+  ## refused by EVERY consumer, including one asking for exactly that scope,
+  ## with the residual unnameable. A forgotten token is now a compile error
+  ## here instead of a depfile nobody accepts.
+  ##
+  ## `esUnrecognized` has no spelling — it is a READING, not a scope — so it
+  ## encodes as the empty string, and every write site guards against handing it
+  ## here. It is the ONLY member that may, and the `static:` block below
+  ## `parseEvidenceScopeToken` holds that over the whole enum. That is what lets
+  ## `mergeFragments` keep testing the VALUE while the hazard it guards against
+  ## is the TOKEN's emptiness: after this, those two are the same statement
+  ## rather than two that can drift apart.
+  ##
+  ## NON-EMPTY IS NOT THE PROPERTY, THE ROUND TRIP IS. `writes;only` is
+  ## non-empty AND round-trips in memory, and while only those two things were
+  ## checked it reached the depfile as `esUnrecognized` named `writes` — the
+  ## stamp rides inside a `;`-joined record detail. The block below asserts the
+  ## whole trip, which is why it lives after the decoder rather than here, and
+  ## why that token no longer compiles.
+  case scope
+  of esFull: "full"
+  of esReadsOnly: "reads-only"
+  of esUnrecognized: ""
+
+func parseEvidenceScopeToken*(s: string): EvidenceScope =
+  ## Decode a wire token. Empty/absent ⇒ `esFull` — an absent
+  ## `REPRO_MONITOR_EVIDENCE` means "write everything down", which is what every
+  ## shim did before this existed. An unknown token ⇒ `esUnrecognized` rather
+  ## than `esFull`: on the ENV channel that is a shim being told about a scope a
+  ## newer host knows and it captures everything (the host filter is the source
+  ## of truth for the result); on the FILE channel it is the reading that makes
+  ## a future narrowing reject instead of silently passing as full.
+  let trimmed = s.strip()
+  if trimmed.len == 0: return esFull
+  # DERIVED from `evidenceScopeToken`, never a second table: one direction of a
+  # codec that can be forgotten separately from the other is two tables that
+  # drift, and the drift is silent — a scope that writes a stamp nothing can
+  # read back. `esUnrecognized`'s empty token cannot match here, because
+  # `trimmed` is non-empty by the line above.
+  for scope in EvidenceScope:
+    if evidenceScopeToken(scope) == trimmed: return scope
+  esUnrecognized
+
+static:
+  # THE OTHER HALF OF THE CONSTRUCTION, checked at COMPILE TIME over the whole
+  # enum. The `case` in `evidenceScopeToken` forces a new member to be GIVEN an
+  # arm; this forces the arm to be a token that SURVIVES THE WIRE — otherwise
+  # the compiler is satisfied by `of esWritesOnly: ""` and the defect is back
+  # with every test green.
+  #
+  # It sits BELOW `parseEvidenceScopeToken` because the property it holds is a
+  # ROUND TRIP, not a length. Three tokens that satisfy "non-empty" and still
+  # ship a depfile nobody can read were MEASURED on the real bytes:
+  #
+  #   `writes;only`  the `evidence=` stamp rides inside a `;`-joined record
+  #                  detail, so the decoder splits on `;` FIRST: the capture
+  #                  reads back `esUnrecognized` with the residual named
+  #                  `writes` — universally rejected, and MISnamed, which is
+  #                  worse than the empty token this block was written for
+  #                  because the operator is told a scope that does not exist.
+  #                  It passes a length check AND an in-memory round trip, so
+  #                  neither the old assertion nor the runtime enum case below
+  #                  in the test file could see it.
+  #   ` `            the decoder `strip()`s, so the token vanishes on the way
+  #                  back and the capture reads as `esUnrecognized`.
+  #   `full`         a DUPLICATE decodes to the FIRST member holding it, so the
+  #                  narrowed capture reads back as `esFull` and a full-evidence
+  #                  consumer ACCEPTS it — this milestone's cardinal defect.
+  #
+  # `esUnrecognized` is exempt and must stay exempt: it is a READING of someone
+  # else's token, not a scope this build can ask for, and giving it a spelling
+  # would make it producible and destroy the distinction it exists to draw.
+  #
+  # WHY THIS IS ALSO WHAT LETS `mergeFragments` GO ON NAMING VALUES. Its guard
+  # tests `!= esFull and != esUnrecognized` while the hazard it names is the
+  # TOKEN's emptiness. The first assertion below makes those the SAME predicate
+  # over the whole enum (empty token ⟺ `esUnrecognized`), so substituting one
+  # spelling for the other reddens nothing — measured. WITHOUT it they differ on
+  # exactly the tokenless member, and in OPPOSITE directions: the value test
+  # stamps a bare `;evidence=` (rejected by everyone), the token test omits the
+  # stamp so the capture reads as NOT STATED, which
+  # `effectiveObservedEvidenceScope` defines as `esFull` and a full-evidence
+  # consumer ACCEPTS. There is no safe default at the write site in either
+  # spelling; the coupling is the fix, and refusing to compile is the only
+  # answer that neither ships an unreadable depfile nor overstates one.
+  #
+  # Graded by `tests/portable/test_io_mon_evidence_scope.nim`, which mutates a
+  # COPY of this file and reads the real compiler's exit code — the only
+  # instrument that can see a property about a member that does not exist yet.
+  for scope in EvidenceScope:
+    let token = evidenceScopeToken(scope)
+    doAssert (token.len == 0) == (scope == esUnrecognized),
+      "EvidenceScope." & $scope & " needs a non-empty wire token: only " &
+      "esUnrecognized may be unspellable. See evidenceScopeToken."
+    if token.len > 0:
+      doAssert token == token.strip() and ';' notin token,
+        "EvidenceScope." & $scope & "'s wire token `" & token &
+        "` is not wire-safe: the `evidence=` stamp rides inside a `;`-joined " &
+        "record detail and the decoder strips, so a token carrying `;` or " &
+        "outer whitespace cannot be read back. See evidenceScopeToken."
+      doAssert parseEvidenceScopeToken(token) == scope,
+        "EvidenceScope." & $scope & "'s wire token `" & token &
+        "` decodes back to " & $parseEvidenceScopeToken(token) &
+        ": two members share a wire token, or the codec's two directions " &
+        "have drifted. See evidenceScopeToken."
+
+func statesUnevaluableEvidenceScope*(dep: MonitorDepFile): bool =
+  ## The capture STATED an evidence scope and this build could not name it. The
+  ## file is not silent about its scope and it is not full scope: it is a
+  ## narrowing written in a vocabulary this build does not have. The
+  ## `interest=gpu` residual DA-1j closed, on the evidence axis.
+  dep.observedEvidenceScopeStated and
+    dep.observedEvidenceScope == esUnrecognized
+
+func effectiveObservedEvidenceScope*(dep: MonitorDepFile): EvidenceScope =
+  ## THE ONLY CORRECT WAY TO READ THE EVIDENCE STAMP. Three inputs, three
+  ## answers, and the middle one is why this exists rather than a bare field
+  ## read:
+  ##
+  ##   not stated                 -> `esFull`. An old depfile, or a capture that
+  ##                                 narrowed nothing, keeps exactly its
+  ##                                 previous meaning.
+  ##   stated, recognised         -> what was stated.
+  ##   stated, NOT recognised     -> `esUnrecognized`. NOT full scope. It covers
+  ##                                 nothing, so every consumer rejects — the
+  ##                                 honest verdict for a file whose scope this
+  ##                                 build cannot evaluate.
+  ##
+  ## Every direction of the degrade points at "reject", never at "accept": a
+  ## scope this build misreads costs a re-capture, whereas the opposite mistake
+  ## publishes a narrowed capture as full evidence.
+  if dep.observedEvidenceScopeStated: dep.observedEvidenceScope
+  else: esFull
+
+func evidenceScopeCovers*(have, required: EvidenceScope): bool =
+  ## Is `have` at least as strong as `required`? THE PARTIAL ORDER, in one
+  ## place. `esFull` is strictly stronger than `esReadsOnly`, so a reads-only
+  ## consumer accepts a full capture and a full-evidence consumer does not
+  ## accept a reads-only one. `esUnrecognized` covers NOTHING, including itself:
+  ## two builds that both fail to name a scope have not thereby agreed on it.
+  case have
+  of esFull: required in {esFull, esReadsOnly}
+  of esReadsOnly: required == esReadsOnly
+  of esUnrecognized: false
+
+func observedEvidenceScopeCovers*(dep: MonitorDepFile;
+                                  required: EvidenceScope): bool =
+  ## Does this capture's stated evidence scope meet what a consumer needs? The
+  ## consumer-side half of the DA-1i contract, in one place so that no consumer
+  ## has to rediscover the not-stated / unrecognised distinction for itself.
+  evidenceScopeCovers(effectiveObservedEvidenceScope(dep), required)
+
+func interestToken*(category: EventCategory): string =
+  ## Encode one event category as its wire token, for `REPRO_MONITOR_INTEREST`
+  ## (the env channel to the shim) and for the `interest=` stamp on the
+  ## backend-profile record. ONE vocabulary for both channels and one codec.
+  ##
+  ## AN EXHAUSTIVE `case`, NOT A TABLE OF PAIRS, for the reason
+  ## `evidenceScopeToken` is one — and this axis is where the weakness was
+  ## FOUND FIRST and left open longest. An array of `(category, token)` pairs is
+  ## policed by nothing: a category added without a row compiles, and
+  ## `interestToTokens` then silently omits it from every stamp it writes.
+  ##
+  ## The harm is real but strictly LESSER than the evidence axis's, which is why
+  ## it survived two rounds — and naming the difference is the point, because
+  ## "lesser" is not "absent". A missing token can only SHRINK what a stamp
+  ## declares, and `observedInterestCovers` is a subset test, so every
+  ## consequence points at REJECTION: a capture that really did observe the new
+  ## category is read as though it had not, and a consumer needing it recaptures
+  ## for nothing. It cannot produce the opposite mistake, because a category
+  ## this build cannot spell is also one it cannot be asked for. On the evidence
+  ## axis the same omission produces a depfile every consumer refuses, or (with
+  ## a duplicated token) one a full-evidence consumer wrongly ACCEPTS.
+  ##
+  ## Closed with the identical construction, and DA-5's split kept it: a token
+  ## per category, derived in both directions from this one `case`.
+  ##
+  ## TWO TOKENS ARE UNCHANGED FROM BEFORE DA-5 AND THAT IS DELIBERATE.
+  ## `ecProcessTree` and `ecLibraryLoads` did not split — their membership is
+  ## the same set of record kinds it always was — so reusing `proc` and `lib`
+  ## states an EXACT equivalence rather than reusing a name loosely. The split
+  ## categories all take NEW tokens, because a capture stamped `file` covered
+  ## reads, probes and writes together and a build that read it as any one of
+  ## them would be widening a narrowed stamp. The old spellings still READ, as
+  ## aliases; see `LegacyEventCategory`.
+  case category
+  of ecFileReads: "file-reads"
+  of ecPathProbes: "path-probes"
+  of ecFileWrites: "file-writes"
+  of ecProcessTree: "proc"
+  of ecLibraryLoads: "lib"
+  of ecEnvReads: "env"
+  of ecEntropy: "entropy"
+  of ecAmbientReads: "ambient"
+
+func legacyInterestToken*(legacy: LegacyEventCategory): string =
+  ## The wire token the pre-DA-5 vocabulary used for `legacy`. An exhaustive
+  ## `case` for the same reason `interestToken` is one.
+  case legacy
+  of lecFileDeps: "file"
+  of lecProcessTree: "proc"
+  of lecLibraryLoads: "lib"
+  of lecNonDeterminism: "nondet"
+  of lecIpc: "ipc"
+
+func legacyMemberKinds*(legacy: LegacyEventCategory): set[MonitorRecordKind] =
+  ## The record kinds `legacy` gated before DA-5 — a HISTORICAL FACT about bytes
+  ## already on disk, which is why it is written out by hand and why it must
+  ## never be "updated" to match a later `categoryOf`. It is frozen; the
+  ## expansion derived from it is not.
+  case legacy
+  of lecFileDeps:
+    {mrFileOpen, mrFileRead, mrFileWrite, mrPathProbe, mrDirectoryEnumerate,
+     mrPathMutation}
+  of lecProcessTree:
+    {mrProcessStart, mrProcessExec, mrProcessSpawn}
+  of lecLibraryLoads:
+    {mrLibraryLoad}
+  of lecNonDeterminism:
+    {mrNonDeterministic, mrTimeRead, mrEnvRead, mrSysctlRead, mrExternalContent}
+  of lecIpc:
+    {mrIpcConnect}
+
+func legacyInterestExpansion*(legacy: LegacyEventCategory): set[EventCategory] =
+  ## What a pre-DA-5 token means in today's vocabulary — DERIVED from
+  ## `categoryOf` over `legacyMemberKinds`, never written out.
+  ##
+  ## THE DERIVATION IS THE SAFETY PROPERTY, not a convenience. A hand-written
+  ## alias table is the one construction on this axis that can produce a FALSE
+  ## ACCEPT: give `file` an expansion containing `ecEnvReads` and every old
+  ## `--interest file,proc,lib` capture — which observed no environment read at
+  ## all — reads back as though it had, and a consumer keying on observed env
+  ## reads accepts it. Computing the expansion from where the kinds ACTUALLY
+  ## went makes that unwritable: the answer is exactly the set of categories the
+  ## old capture really did record, and a kind that became ungate-able
+  ## (`mrIpcConnect`, `mrExternalContent`) contributes nothing because
+  ## `categoryOf` gives it nothing to contribute.
+  ##
+  ## `lecIpc` therefore expands to `{}`, and that is the correct reading rather
+  ## than a gap: `interest=ipc` on its own named a scope in which the only
+  ## kinds observed are ones this build never narrows away, so it declares no
+  ## gate-able category and a consumer needing one rejects it.
+  for kind in legacyMemberKinds(legacy):
+    let c = categoryOf(kind)
+    if c.isSome: result.incl(c.get)
+
+const LegacyPaddingToken* = "legacy-padding"
+  ## The one token in this vocabulary that names no category. It marks where the
+  ## canonical part of a `REPRO_MONITOR_INTEREST` value ends and the BACK-COMPAT
+  ## PADDING for a pre-DA-5 shim begins (see `interestToShimTokens`).
+  ##
+  ## It is not a version number and it is not read by any consumer: it is a
+  ## fence. A reader that knows it takes only the canonical part; a reader that
+  ## does not know it ignores it under the same forward-compat rule that makes
+  ## the padding necessary in the first place — which is the point, because that
+  ## rule is the only behaviour a shim already on disk can be relied on to have.
+  ##
+  ## It never appears in a depfile: `interestToTokens` does not emit it, and the
+  ## `interest=` stamp is written from that proc.
+
+func interestToTokens*(interest: set[EventCategory]): string =
+  ## Encode an interest set as the comma-separated value for the DEPFILE STAMP
+  ## (`interest=` on the backend-profile record). `FullInterest` encodes to every
+  ## token (never empty, so an older reader cannot mistake "all" for "unset").
+  ##
+  ## CANONICAL SPELLINGS ONLY, AND THAT IS A SAFETY PROPERTY OF THE READ AXIS
+  ## rather than an omission. A stamp is a CLAIM about what the capture observed,
+  ## and a consumer compares it against what it needs; the failure direction of
+  ## an over-stated claim is ACCEPT. Emitting `file` beside `file-reads` would
+  ## make an old consumer read "reads, probes and writes were all observed" off a
+  ## capture that may have observed only one of the three — so nothing this build
+  ## writes into a depfile is spelled in a vocabulary whose meaning it no longer
+  ## controls. `interestToTokens` therefore never emits an alias, for any set.
+  ##
+  ## The ENV channel to the shim is the mirror image and does NOT share this
+  ## encoder — see `interestToShimTokens` for why the two directions want
+  ## opposite answers.
+  let normalized = normalizeInterest(interest)
+  var parts: seq[string] = @[]
+  for cat in EventCategory:
+    if cat in normalized: parts.add(interestToken(cat))
+  parts.join(",")
+
+func interestToShimTokens*(interest: set[EventCategory]): string =
+  ## Encode an interest set for `REPRO_MONITOR_INTEREST` — the env channel the
+  ## SHIM reads at init. A different encoder from `interestToTokens`, because the
+  ## two channels have OPPOSITE safe directions and one encoder cannot serve
+  ## both.
+  ##
+  ## THE FAILURE THIS EXISTS TO PREVENT. The depfile stamp is read by a consumer
+  ## that can only be made to accept too much; the env value is read by a shim
+  ## that can only be made to capture too little. A shim built before DA-5 knows
+  ## eight spellings, of which this build still emits two (`proc`, `lib`). Handed
+  ## a canonical-only value it recognises those two, decides the caller asked for
+  ## process tree and library loads and nothing else, and gates away every file
+  ## read, probe, write, env read and IPC connect — for a caller that asked for
+  ## all of them. Measured on Linux, same command line, NO `--interest` flag,
+  ## only the shim differing: current shim 20 records / `mcIncomplete`; shim
+  ## built at `0c312f2` **14 records / `mcComplete` / no file records at all**,
+  ## over a depfile stating full scope and `evidenceComplete=true`. The host
+  ## filter cannot repair it (`fs_snoop`, after `mergeFragments`): that filter
+  ## only ever REMOVES records, and no filter can restore one the shim never
+  ## emitted.
+  ##
+  ## THE RULE, and it is DERIVED rather than written down. A legacy token is
+  ## emitted beside the canonical ones exactly when the legacy category it names
+  ## contains a record kind this interest WANTS:
+  ##
+  ##     emit legacyInterestToken(L)  iff  legacyMemberKinds(L) ∩ wanted ≠ {}
+  ##
+  ## where `wanted` is `recordWanted` over every kind — so the ungate-able kinds
+  ## (`mrIpcConnect`, `mrExternalContent`) count as wanted always, which is why
+  ## `ipc` and `nondet` are emitted for EVERY interest set. That is deliberate:
+  ## those two kinds are what `mergeFragments` derives its synthetic event-loss
+  ## markers from, so an old shim that gates them away is the exact false
+  ## `mcComplete` the interest axis exists to refuse.
+  ##
+  ## WHY THIS DIRECTION IS THE SAFE ONE, and the proof is two lines. Let `K` be
+  ## the kinds the host wants and `E` the kinds an old shim emits under this
+  ## value. Take any `k ∈ K`. Either the old vocabulary classed `k` as META, in
+  ## which case the old shim never gated it and `k ∈ E`; or `k` lay in some
+  ## legacy category `L`, and then `legacyMemberKinds(L) ∩ K ∋ k` is non-empty,
+  ## so `L`'s token is emitted and `k ∈ E`. Hence **`E ⊇ K` for every interest
+  ## set** — the old shim over-captures, never under-captures, and the host
+  ## filter narrows `E` back to exactly `K`. Over-capture costs work; the filter
+  ## is already there and already tested.
+  ##
+  ## The weaker rule "emit the token when ALL of a legacy category's members are
+  ## requested" is a STRICT SUBSET of this one and is not sufficient. It repairs
+  ## the default (`FullInterest` requests every member of every legacy category,
+  ## so both rules emit everything) and leaves the flagged case broken: under it
+  ## `--interest file-reads` sends `file-reads,ipc`, an old shim recognises only
+  ## `ipc`, and the capture comes back with no file records under a stamp saying
+  ## `interest=file-reads` — the same cardinal sin, one flag away. DA-5's own
+  ## safe subset (`FullInterest - {ecAmbientReads}`) would likewise lose
+  ## `mrEnvRead`, which keys the action cache. Every set this rule covers, the
+  ## ALL rule also covers; the converse fails, so this is the rule.
+  ##
+  ## AND WHY IT DOES NOT COST A CURRENT SHIM ITS NARROWING. The padding would be
+  ## read by a CURRENT shim as a widening too (its alias arm is the same one that
+  ## decodes old depfiles), which would quietly make `--interest` stop skipping
+  ## work. `LegacyPaddingToken` is the fence: it is emitted immediately before
+  ## the padding, `parseInterestTokens` drops the alias arm when it sees it, and
+  ## a shim that predates the fence ignores it exactly as it ignores every other
+  ## token it does not know. So the same bytes mean the precise set to a reader
+  ## that understands them and the safe superset to one that does not.
+  let normalized = normalizeInterest(interest)
+  var parts: seq[string] = @[]
+  for cat in EventCategory:
+    if cat in normalized: parts.add(interestToken(cat))
+  var wanted: set[MonitorRecordKind] = {}
+  for kind in MonitorRecordKind:
+    if recordWanted(normalized, kind): wanted.incl(kind)
+  var padding: seq[string] = @[]
+  for legacy in LegacyEventCategory:
+    let tok = legacyInterestToken(legacy)
+    if tok notin parts and tok notin padding and
+       (legacyMemberKinds(legacy) * wanted) != {}:
+      padding.add(tok)
+  if padding.len > 0:
+    parts.add(LegacyPaddingToken)
+    parts &= padding
+  parts.join(",")
+
+func parseInterestTokens*(s: string): set[EventCategory] =
+  ## Decode a `REPRO_MONITOR_INTEREST` value. Empty/absent -> `FullInterest`
+  ## (back-compat). Unknown tokens are ignored (forward-compat: an older shim
+  ## treats a new category as "not mine"; the host filter is the source of truth).
+  ##
+  ## DERIVED from `interestToken`, never a second table — one direction of a
+  ## codec that can be forgotten separately from the other is two tables that
+  ## drift, and the drift is silent.
+  ##
+  ## DA-5 — pre-split spellings are accepted too, and for the same
+  ## forward/backward-compatibility reason unknown tokens are ignored. They are
+  ## tried AFTER the canonical vocabulary, and they are `LegacyEventCategory`'s
+  ## DERIVED expansions rather than a second hand-written table; see
+  ## `legacyInterestExpansion`. Where a legacy spelling is also a canonical one
+  ## (`proc`, `lib` — the two categories DA-5 did not split) both arms produce
+  ## the identical set, and the `static:` block below proves it rather than
+  ## leaving it to reading order.
+  ##
+  ## `LegacyPaddingToken` SUPPRESSES THE ALIAS ARM, and only a value this build
+  ## composed can contain it. `interestToShimTokens` writes the canonical
+  ## spellings, then the fence, then the back-compat padding an old shim needs;
+  ## a reader that knows the fence must take the canonical part alone, or the
+  ## padding — whose whole job is to be WIDER — would widen this build's own
+  ## reading of its own value. No historical depfile stamp and no operator
+  ## command line carries the fence, so every value that ever existed decodes
+  ## exactly as it did before.
+  let trimmed = s.strip()
+  if trimmed.len == 0: return FullInterest
+  var fenced = false
+  for raw in trimmed.split(','):
+    if raw.strip() == LegacyPaddingToken: fenced = true
+  for raw in trimmed.split(','):
+    let tok = raw.strip()
+    for cat in EventCategory:
+      if tok == interestToken(cat): result.incl(cat)
+    if not fenced:
+      for legacy in LegacyEventCategory:
+        if tok == legacyInterestToken(legacy):
+          result.incl(legacyInterestExpansion(legacy))
+
+func shimInterestFromEnv*(value: string): set[EventCategory] =
+  ## What a SHIM's gate should be set to for a `REPRO_MONITOR_INTEREST` value.
+  ## The env channel's own reader, deliberately separate from the depfile
+  ## decoder, because it answers a different question: not "what did that
+  ## capture observe" but "what may I decline to observe".
+  ##
+  ## A NON-EMPTY VALUE NAMING NOTHING THIS BUILD KNOWS MEANS CAPTURE
+  ## EVERYTHING. It cannot be a request — nothing in it can be honoured — so the
+  ## only two readings are "capture nothing" and "capture everything", and only
+  ## one of them can be wrong in the direction that matters: capturing too much
+  ## costs work the host filter then discards, capturing too little is a missing
+  ## dependency under a stamp that says it is not missing.
+  ##
+  ## Today this is belt-and-braces: `recordWanted` normalises the empty set, so
+  ## the gate already widens. It is written HERE, at the read, so the property
+  ## belongs to the channel rather than to a normalisation two calls away that a
+  ## future reader of `gInterest` would not inherit — and so the next vocabulary
+  ## change has a second line of defence that costs nothing. It is NOT a
+  ## substitute for `interestToShimTokens`: this arm fires only when the shim
+  ## recognises NOTHING, and the failure that motivated the padding is a shim
+  ## that recognises SOMETHING (`proc` and `lib`) and is confidently wrong.
+  ##
+  ## Note the deliberate asymmetry with `parseInterestFlag`, which REFUSES the
+  ## same input. There, a value naming nothing is an operator typo and widening
+  ## it would discard a reduction the operator asked for and could still fix.
+  ## Here there is no operator and no way to report: the shim is inside a
+  ## monitored process and its only choices are to observe or not.
+  result = parseInterestTokens(value)
+  if result == {}: result = FullInterest
+
+static:
+  # The interest axis's copy of the evidence axis's construction, and it needs
+  # no sentinel exemption: EVERY `EventCategory` is a category a consumer can
+  # ask for, so every one of them must be spellable.
+  #
+  # Same three failure shapes, same reasons (see `evidenceScopeToken`'s block),
+  # with one extra separator to exclude: the interest value is COMMA-joined, so
+  # a token carrying a comma decodes as two tokens neither of which is a
+  # category — the exact shape `writes;only` has on the other axis.
+  for category in EventCategory:
+    let token = interestToken(category)
+    doAssert token.len > 0,
+      "EventCategory." & $category & " needs a wire token: without one it is " &
+      "silently absent from every `interest=` stamp this build writes, and a " &
+      "capture that DID observe it reads as one that did not. " &
+      "See interestToken."
+    doAssert token == token.strip() and ',' notin token and ';' notin token,
+      "EventCategory." & $category & "'s wire token `" & token &
+      "` is not wire-safe: the value is comma-joined, the `interest=` stamp " &
+      "rides inside a `;`-joined record detail, and the decoder strips. " &
+      "See interestToken."
+    doAssert parseInterestTokens(token) == {category},
+      "EventCategory." & $category & "'s wire token `" & token &
+      "` decodes back to " & $parseInterestTokens(token) &
+      ": two categories share a wire token, or the codec's two directions " &
+      "have drifted. See interestToken."
+
+  # DA-5 — THE ALIAS VOCABULARY, held to the same standard and to one more.
+  #
+  # The extra one is the whole reason aliases are safe to have. On this axis a
+  # missing token can only shrink a stamp and therefore points at rejection —
+  # but an alias that expands to a category the old capture never observed
+  # WIDENS one, and a widened stamp is accepted. So the expansion is not
+  # merely asserted non-empty or well-formed; it is asserted EQUAL to the
+  # image of the legacy category's frozen kind list under today's `categoryOf`,
+  # recomputed here so a hand edit to either side reddens the compile.
+  for legacy in LegacyEventCategory:
+    let token = legacyInterestToken(legacy)
+    doAssert token.len > 0,
+      "LegacyEventCategory." & $legacy & " needs the wire token it shipped " &
+      "with: it names bytes already written into depfiles, and without it " &
+      "those files read as stating a scope this build cannot evaluate. " &
+      "See legacyInterestToken."
+    doAssert token == token.strip() and ',' notin token and ';' notin token,
+      "LegacyEventCategory." & $legacy & "'s wire token `" & token &
+      "` is not wire-safe; see interestToken's block for the two separators."
+    doAssert legacyMemberKinds(legacy) != {},
+      "LegacyEventCategory." & $legacy & " claims no record kinds, so its " &
+      "expansion is empty for a reason that is not a fact about the split. " &
+      "See legacyMemberKinds — it is frozen history, not a mirror of " &
+      "categoryOf."
+    var derived: set[EventCategory] = {}
+    for kind in legacyMemberKinds(legacy):
+      let c = categoryOf(kind)
+      if c.isSome: derived.incl(c.get)
+    doAssert legacyInterestExpansion(legacy) == derived,
+      "LegacyEventCategory." & $legacy & "'s expansion " &
+      $legacyInterestExpansion(legacy) & " is not the image of its record " &
+      "kinds under categoryOf (" & $derived & "). An alias that names a " &
+      "category the old capture did not observe WIDENS every stamp carrying " &
+      "it, which is the one mistake this axis can otherwise not make. " &
+      "See legacyInterestExpansion."
+    doAssert parseInterestTokens(token) == derived,
+      "LegacyEventCategory." & $legacy & "'s wire token `" & token &
+      "` decodes to " & $parseInterestTokens(token) & ", not to its " &
+      "expansion " & $derived & ". Where a legacy spelling is ALSO a current " &
+      "one the two arms must agree; where it is not, the alias arm must be " &
+      "reached. See parseInterestTokens."
+
+  # DA-5 FOLLOW-UP — THE TOKEN↔LEGACY-CATEGORY PAIRING ITSELF.
+  #
+  # Everything above grades the EXPANSION and none of it grades the PAIRING, and
+  # the gap is reachable by a one-character edit: SWAP the `file` and `nondet`
+  # spellings in `legacyInterestToken` and every assertion above still holds,
+  # because each is quantified over `legacy` and re-derives both sides from the
+  # same (now swapped) table. The result is a build in which every old
+  # `interest=file,proc,lib` depfile reads as having observed environment reads
+  # and entropy — the FALSE ACCEPT this axis has no other defence against,
+  # caught until now only by hand-written runtime expectations.
+  #
+  # The pairing is frozen history, so it cannot be derived from anything in
+  # today's code. It CAN be pinned to something no edit to this table can move:
+  # the NAMES OF THE RECORD KINDS the legacy category gated. Each shipped token
+  # is a case-insensitive substring of at least one of its own members'
+  # identifiers (`file`/`mrFileOpen`, `proc`/`mrProcessStart`,
+  # `lib`/`mrLibraryLoad`, `nondet`/`mrNonDeterministic`, `ipc`/`mrIpcConnect`),
+  # and — the part that makes it a proof rather than a coincidence — it is the
+  # ONLY shipped token that is. So the witness relation is a bijection, the
+  # pairing is the unique one satisfying it, and any permutation of the five
+  # spellings fails to compile. Renaming a `MonitorRecordKind` out from under a
+  # legacy category fails it too, which is correct: that is the other way this
+  # table can quietly stop describing the bytes it claims to describe.
+  for legacy in LegacyEventCategory:
+    var witnessed: seq[LegacyEventCategory] = @[]
+    for candidate in LegacyEventCategory:
+      let probe = legacyInterestToken(candidate).toLowerAscii
+      var hit = false
+      for kind in legacyMemberKinds(legacy):
+        if probe in ($kind).toLowerAscii: hit = true
+      if hit: witnessed.add(candidate)
+    doAssert witnessed == @[legacy],
+      "LegacyEventCategory." & $legacy & " is paired with the wire token `" &
+      legacyInterestToken(legacy) & "`, but the record kinds it gated name " &
+      $witnessed & " instead. The expansion assertions above cannot see this: " &
+      "they re-derive both sides from this same table, so SWAPPING two " &
+      "spellings satisfies every one of them while making every old depfile " &
+      "carrying either token decode to the other one's categories. " &
+      "See legacyInterestToken."
+
+  # DA-5 FOLLOW-UP — THE ENV CHANNEL'S ENCODER, whose safe direction is the
+  # OPPOSITE of the stamp's. `interestToShimTokens` must round-trip exactly
+  # through this build's own decoder (so the padding never widens a CURRENT
+  # shim's gate) while still naming every legacy category an OLD shim needs in
+  # order not to gate away a kind the host asked for.
+  for bits in 0 ..< (1 shl (ord(EventCategory.high) + 1)):
+    var s: set[EventCategory] = {}
+    for cat in EventCategory:
+      if (bits and (1 shl ord(cat))) != 0: s.incl(cat)
+    let wire = interestToShimTokens(s)
+    doAssert parseInterestTokens(wire) == normalizeInterest(s),
+      "interestToShimTokens(" & $s & ") = `" & wire & "` decodes to " &
+      $parseInterestTokens(wire) & ", not to " & $normalizeInterest(s) &
+      ". The back-compat padding is for shims that predate the split; a " &
+      "current shim must read the value as exactly the set the host asked " &
+      "for, or `--interest` silently stops narrowing. See LegacyPaddingToken."
+    var wanted: set[MonitorRecordKind] = {}
+    for kind in MonitorRecordKind:
+      if recordWanted(normalizeInterest(s), kind): wanted.incl(kind)
+    var emitted: set[MonitorRecordKind] = {}
+    for raw in wire.split(','):
+      for legacy in LegacyEventCategory:
+        if raw == legacyInterestToken(legacy):
+          emitted.incl(legacyMemberKinds(legacy))
+    for kind in MonitorRecordKind:
+      if categoryOf(kind).isNone and kind notin {mrIpcConnect, mrExternalContent}:
+        emitted.incl(kind)          # META: never gated by any vocabulary
+    doAssert (wanted - emitted) == {},
+      "interestToShimTokens(" & $s & ") = `" & wire & "` leaves " &
+      $(wanted - emitted) & " outside every legacy category it names, so a " &
+      "shim built before DA-5 gates those kinds away while the host stamps " &
+      "the depfile as having asked for them. The host filter cannot repair " &
+      "this — it only ever removes records. See interestToShimTokens."
+
+func statesUnevaluableInterest*(dep: MonitorDepFile): bool =
+  ## The capture STATED a scope, and this build could not name a single category
+  ## in it. The file is not silent about its scope and it is not full scope: it
+  ## is a narrowing written in a vocabulary this build does not have.
+  dep.observedInterestStated and dep.observedInterest == {}
+
+func effectiveObservedInterest*(dep: MonitorDepFile): set[EventCategory] =
+  ## THE ONLY CORRECT WAY TO READ THE SCOPE STAMP. Three inputs, three answers,
+  ## and the middle one is the reason this function exists rather than a call to
+  ## `normalizeInterest(dep.observedInterest)`:
+  ##
+  ##   not stated                  -> `FullInterest`. An old depfile (or a
+  ##                                  library caller that said nothing) keeps
+  ##                                  exactly its previous meaning.
+  ##   stated, nothing recognised  -> `{}`. NOT full scope. No non-empty
+  ##                                  requirement is a subset of `{}`, so a
+  ##                                  consumer needing evidence of anything at
+  ##                                  all rejects the file — which is the honest
+  ##                                  verdict, because the file states a scope
+  ##                                  this build cannot evaluate.
+  ##   stated, some recognised     -> what was recognised. Unknown tokens beside
+  ##                                  known ones drop out, which narrows the read
+  ##                                  scope and therefore errs toward rejection.
+  ##
+  ## Every direction of the degrade points at "reject", never at "accept": a
+  ## scope this build misreads costs a re-capture, whereas the opposite mistake
+  ## publishes a narrowed capture as complete evidence.
+  if dep.observedInterestStated: dep.observedInterest
+  else: FullInterest
+
+func observedInterestCovers*(dep: MonitorDepFile;
+                             required: set[EventCategory]): bool =
+  ## Does this capture's stated scope cover what a consumer needs? The
+  ## consumer-side half of the DA-1j contract, in one place so that no consumer
+  ## has to rediscover the `{}` ambiguity for itself. `required = {}` (a consumer
+  ## that needs no particular category) accepts anything, including an
+  ## unevaluable stamp — it asked for nothing, so nothing can be missing.
+  required <= effectiveObservedInterest(dep)

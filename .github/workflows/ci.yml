@@ -1,18 +1,52 @@
 name: CI
 
 on:
+  workflow_dispatch:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main, dev, stable, io-mon-fixes]
   pull_request:
     branches: [main, dev, stable]
 
-env:
-  MANIFESTS_REF: io-mon-fixes
+# No MANIFESTS_REF pin: setup-dev-env defaults to `latest`, which is where the
+# workspace-lock publishing tooling (`repro workspace lock` / the pre-push hook)
+# actually writes. The previous `io-mon-fixes` pin pointed at a campaign branch
+# of metacraft-manifests that is now 591 commits behind `latest` and carries no
+# non-lock content of its own, so every io-mon commit failed `Setup Dev
+# Environment` with "No workspace lock for io-mon" — the lock existed, just not
+# on the pinned branch. `ci-reprobuild.yml` was never pinned and resolves fine.
+
+# Cancel superseded PR runs only: a new push to a PR makes its previous run
+# moot, and stale runs otherwise hold scarce self-hosted runners. Every other
+# event (mainline push, merge_group, tag, dispatch, schedule) gets a group
+# unique to its run_id, so it is never cancelled and never cancels anything.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  choose-macos:
+    # Native macOS jobs retain their full gates while the fleet repair lands.
+    # Owner: zah. Follow-up: metacraft-specs/issues/
+    # 2026-09-28-shared-macos-host-has-no-headroom-for-runquota-measurements.md
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: macos-26
+      fallback: '["self-hosted","macos","arm64"]'
+
+  choose-linux:
+    # The shared CI_RUNNER_MODE policy selects free hosted runners for public
+    # repos by default and preserves the org-controlled self-hosted fallback.
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: ubuntu-24.04
+      fallback: '["self-hosted","linux","x64"]'
+
   lint:
+    needs: choose-linux
     name: Lint
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ${{ fromJSON(needs.choose-linux.outputs.runs_on) }}
     steps:
       - name: Generate CI token
         id: app-token
@@ -26,12 +60,17 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: Run lint
+        # `shell: bash` is load-bearing, not style. The default `run` shell is
+        # `bash -e` WITHOUT pipefail, so `cmd | tee` reports tee's exit status
+        # and a failing `just` was reported as a passing job. `shell: bash`
+        # selects `bash --noprofile --norc -eo pipefail`.
+        shell: bash
         run: dev-exec just lint 2>&1 | tee lint.log
 
       - name: Upload logs
@@ -44,7 +83,7 @@ jobs:
       - name: Mirror logs to S3 (non-blocking)
         if: always()
         continue-on-error: true
-        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@dev
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
         with:
           path: lint.log
           prefix: lint-logs/${{ github.run_id }}
@@ -55,12 +94,21 @@ jobs:
           secret-access-key: ${{ secrets.MCL_S3_ARTIFACTS_SECRET_ACCESS_KEY }}
 
   build:
+    needs: [choose-linux, choose-macos]
     name: Build
-    runs-on: ${{ matrix.runs-on }}
+    runs-on: ${{ matrix.slug == 'macos-arm64' && fromJSON(needs.choose-macos.outputs.runs_on) || matrix.slug == 'linux-x64' && fromJSON(needs.choose-linux.outputs.runs_on) || matrix.runs-on }}
     strategy:
       fail-fast: false
       matrix:
-        runs-on: [eph-linux-x64, eph-macos-arm64]
+        # `slug` names the artifact (a plain platform string); `runs-on` carries
+        # the capability-label ARRAY. They are decoupled because an artifact name
+        # cannot be a bracketed label list — see the release.yml / ci-reprobuild.yml
+        # platform-key convention (RC4).
+        include:
+          - slug: linux-x64
+            runs-on: [self-hosted, linux, x64]
+          - slug: macos-arm64
+            runs-on: [self-hosted, macos, arm64]
     steps:
       - name: Generate CI token
         id: app-token
@@ -74,28 +122,30 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: Run build
+        # See the note on `Run lint`: without pipefail, `| tee` masks failure.
+        shell: bash
         run: dev-exec just build 2>&1 | tee build.log
 
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs-${{ matrix.runs-on }}
+          name: build-logs-${{ matrix.slug }}
           path: build.log
           retention-days: 1
       - name: Mirror logs to S3 (non-blocking)
         if: always()
         continue-on-error: true
-        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@dev
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
         with:
           path: build.log
-          prefix: build-logs-${{ matrix.runs-on }}/${{ github.run_id }}
+          prefix: build-logs-${{ matrix.slug }}/${{ github.run_id }}
           endpoint: ${{ vars.MCL_S3_ARTIFACTS_ENDPOINT }}
           bucket: ${{ vars.MCL_S3_ARTIFACTS_BUCKET }}
           region: ${{ vars.MCL_S3_ARTIFACTS_REGION }}
@@ -103,18 +153,24 @@ jobs:
           secret-access-key: ${{ secrets.MCL_S3_ARTIFACTS_SECRET_ACCESS_KEY }}
 
   test:
+    needs: [choose-linux, choose-macos]
     name: Test
-    runs-on: ${{ matrix.runs-on }}
+    runs-on: ${{ matrix.slug == 'macos-arm64' && fromJSON(needs.choose-macos.outputs.runs_on) || matrix.slug == 'linux-x64' && fromJSON(needs.choose-linux.outputs.runs_on) || matrix.runs-on }}
     strategy:
       fail-fast: false
       matrix:
+        # `slug` names the artifact; `runs-on` carries the capability-label array
+        # (decoupled — an artifact name cannot be a bracketed label list).
         include:
           - env: nix
-            runs-on: eph-linux-x64
+            slug: linux-x64
+            runs-on: [self-hosted, linux, x64]
           - env: nix
-            runs-on: eph-macos-arm64
+            slug: macos-arm64
+            runs-on: [self-hosted, macos, arm64]
           - env: reprobuild
-            runs-on: eph-linux-x64
+            slug: linux-x64
+            runs-on: [self-hosted, linux, x64]
     steps:
       - name: Generate CI token
         id: app-token
@@ -128,15 +184,20 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
         with:
           env-flavor: ${{ matrix.env }}
+          repro-from-source: ${{ matrix.env == 'reprobuild' }}
+          repro-build-pin: c14b1e618d7c4b64476d89792e80b8e8f10b8a52
+          repro-posix-io-mon-pin: ${{ matrix.env == 'reprobuild' && '3df08c24ee91900b950ed20a3827923d213f2a9c' || '' }}
           gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: Run tests
+        # See the note on `Run lint`: without pipefail, `| tee` masks failure.
+        shell: bash
         run: |
           if [ "${{ matrix.env }}" = "reprobuild" ]; then
-            repro test 2>&1 | tee test.log
+            dev-exec repro test --tool-provisioning=nix 2>&1 | tee test.log
           else
             dev-exec just test 2>&1 | tee test.log
           fi
@@ -145,18 +206,109 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs-${{ matrix.env }}-${{ matrix.runs-on }}
+          name: test-logs-${{ matrix.env }}-${{ matrix.slug }}
           path: test.log
           retention-days: 1
       - name: Mirror logs to S3 (non-blocking)
         if: always()
         continue-on-error: true
-        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@dev
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
         with:
           path: test.log
-          prefix: test-logs-${{ matrix.env }}-${{ matrix.runs-on }}/${{ github.run_id }}
+          prefix: test-logs-${{ matrix.env }}-${{ matrix.slug }}/${{ github.run_id }}
           endpoint: ${{ vars.MCL_S3_ARTIFACTS_ENDPOINT }}
           bucket: ${{ vars.MCL_S3_ARTIFACTS_BUCKET }}
           region: ${{ vars.MCL_S3_ARTIFACTS_REGION }}
           access-key-id: ${{ secrets.MCL_S3_ARTIFACTS_ACCESS_KEY_ID }}
           secret-access-key: ${{ secrets.MCL_S3_ARTIFACTS_SECRET_ACCESS_KEY }}
+
+  windows-injection:
+    name: Windows complete suite (x64)
+    # Run the complete portable + Windows catalog directly as well as under
+    # Reprobuild. Native execution isolates product failures from interference
+    # by an outer monitor; both paths keep their assertions and remain gates.
+    runs-on: [self-hosted, windows, x64, dev-env-ready]
+    steps:
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      # io-mon resolves its siblings as ../<repo> (config.nims), so check the
+      # repo and its siblings out side by side.
+      - uses: actions/checkout@v4
+        with:
+          path: io-mon
+      - uses: actions/checkout@v4
+        with:
+          repository: metacraft-labs/nim-stackable-hooks
+          # Keep in lockstep with stackable-hooks-src in flake.nix.
+          ref: 72f578249e9d8bbca8e3705c8a41ed5085c05bf9
+          path: nim-stackable-hooks
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: metacraft-labs/nim-shm-queue
+          ref: dev
+          path: nim-shm-queue
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: metacraft-labs/nim-shm-gset
+          # Same revision as .github/sibling-repos.
+          ref: cf0adf2f39647f5b203b2ab694414a3c50e93951
+          path: nim-shm-gset
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Build payload and run every portable and Windows test
+        shell: pwsh
+        working-directory: io-mon
+        run: |
+          # The PATH `gcc` on these runners is not the provisioned toolchain
+          # (it reports 2.95 and cannot read the CRT headers). The profile
+          # installs WinLibs GCC per service account; put it first.
+          $gccRoots = @(
+            "$env:LOCALAPPDATA\repo-workspaces\toolchains\gcc",
+            'C:\Windows\ServiceProfiles\NetworkService\AppData\Local\repo-workspaces\toolchains\gcc',
+            'C:\Windows\System32\config\systemprofile\AppData\Local\repo-workspaces\toolchains\gcc'
+          )
+          $gccBin = $null
+          foreach ($r in $gccRoots) {
+            if (Test-Path $r) {
+              $cand = Get-ChildItem $r -Directory | Sort-Object Name -Descending |
+                ForEach-Object { Join-Path $_.FullName 'bin' } |
+                Where-Object { Test-Path (Join-Path $_ 'gcc.exe') } | Select-Object -First 1
+              if ($cand) { $gccBin = $cand; break }
+            }
+          }
+          if (-not $gccBin) { throw "no provisioned WinLibs gcc found under: $($gccRoots -join ', ')" }
+          $env:PATH = "$gccBin;$env:PATH"
+          nim -v
+          gcc --version
+          New-Item -ItemType Directory -Force build/bin, build/test-bin, test-logs/windows-complete | Out-Null
+          & bash scripts/build_shim.sh
+          if ($LASTEXITCODE -ne 0) { throw "monitor shim build failed" }
+          & nim c --hints:off --cc:gcc "--out:build/bin/io-mon.exe" cmd/io_mon_snoop.nim
+          if ($LASTEXITCODE -ne 0) { throw "standalone CLI build failed" }
+          $tests = Get-ChildItem tests/portable, tests/windows -Filter 'test_*.nim' -File | Sort-Object FullName
+          if ($tests.Count -eq 0) { throw "the complete test catalog is empty" }
+          $failed = @()
+          foreach ($t in $tests) {
+            Write-Host "=== $($t.FullName)"
+            $stem = $t.BaseName
+            & nim c -r --hints:off --cc:gcc --path:tests/helpers "--out:build/test-bin/$stem.exe" $t.FullName 2>&1 |
+              Tee-Object "test-logs/windows-complete/$stem.log"
+            if ($LASTEXITCODE -ne 0) { $failed += "$stem (exit $LASTEXITCODE)" }
+          }
+          Write-Host "Executed $($tests.Count) test programs; $($failed.Count) failed"
+          if ($failed.Count -gt 0) { throw "failed: $($failed -join '; ')" }
+      - name: Preserve complete Windows suite logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-complete-test-logs
+          path: io-mon/test-logs/windows-complete/
+          retention-days: 7

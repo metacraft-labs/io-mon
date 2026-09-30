@@ -79,6 +79,11 @@ proc capabilityGapJson(gap: MonitorCapabilityGap): JsonNode =
   result["backendFamily"] = %backendFamilyId(gap.backendFamily)
   result["capability"] = %capabilityId(gap.capability)
   result["required"] = %gap.required
+  # Whether the shortfall is on the INPUT side. `required` says only whether
+  # the caller asked for the capability, so without this a consumer had to
+  # read the English `reason` to tell an unobserved input from output-side
+  # bookkeeping.
+  result["inputChannel"] = %gap.inputChannel
   result["reason"] = %gap.reason
 
 proc backendProfileJson(profile: MonitorBackendProfile): JsonNode =
@@ -159,7 +164,7 @@ proc renderMonitorStreamItemJsonl*(item: FsSnoopStreamItem): string =
 
 proc renderMonitorDepFileText*(dep: MonitorDepFile): string =
   var lines: seq[string] = @[
-    "RMDF version=" & $dep.version &
+    "iomon version=" & $dep.version &
       " records=" & $dep.summary.recordCount &
       " completeness=" & $dep.completeness
   ]
@@ -173,7 +178,7 @@ proc renderMonitorDepFileText*(dep: MonitorDepFile): string =
 
 proc renderMonitorDepFileJson*(dep: MonitorDepFile): string =
   var root = newJObject()
-  root["format"] = %"RMDF"
+  root["format"] = %"iomon"
   root["version"] = %int(dep.version)
   root["producerVersion"] = %dep.producerVersion
   root["backendFamily"] = %backendFamilyId(dep.backendFamily)

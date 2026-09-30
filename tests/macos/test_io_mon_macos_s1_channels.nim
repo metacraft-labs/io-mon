@@ -145,14 +145,10 @@ int main(int argc,char**argv){
   trivialSrc = "int main(void){return 0;}\n"
 
 when defined(macosx):
+  from build_test_shim import buildPrivateMacosShim
+
   proc buildShim(): string =
-    let (output, code) = execCmdEx("bash " &
-      quoteShell(repoRoot / "scripts" / "build_shim.sh"))
-    if code != 0:
-      raise newException(IOError, "build_shim.sh failed: " & output)
-    let shim = repoRoot / "build" / "lib" / "librepro_monitor_shim.dylib"
-    doAssert fileExists(shim), "shim not produced at " & shim
-    shim
+    buildPrivateMacosShim(repoRoot)
 
   proc cc(args: string) =
     let ccBin = getEnv("CC", "cc")
@@ -240,7 +236,7 @@ when defined(macosx):
       $code & " out=" & outText)
     if requireExit0:
       doAssert code == 0, "probe should exit 0 (" & probe & "): " & outText
-    mergeAndRead(fragmentDir, work / "cap.rdep")
+    mergeAndRead(fragmentDir, work / "cap.iomon")
 
   proc hasPathRead(records: seq[MonitorRecord]; path: string): bool =
     for r in records:
@@ -396,16 +392,25 @@ suite "io-mon macOS ROUND-3 S1 content-channel hooks":
       fenv.del "REPRO_MONITOR_FRAGMENT_DIR"
       let feederProc = startProcess(feeder, args = @[fifo], env = fenv,
         options = {poStdErrToStdOut})
+      defer:
+        if feederProc.running(): feederProc.kill()
+        discard feederProc.waitForExit()
+        feederProc.close()
       var renv = baseEnv(shim, fragmentDir, "both")
       let readerProc = startProcess(reader, args = @[fifo], env = renv,
         options = {poStdErrToStdOut})
-      discard readerProc.outputStream.readAll()
-      let rcode = readerProc.waitForExit()
+      let rcode = readerProc.waitForExit(30_000)
+      if rcode == -1:
+        readerProc.kill()
+        discard readerProc.waitForExit()
+      let readerOutput = readerProc.outputStream.readAll()
       readerProc.close()
-      discard feederProc.waitForExit()
-      feederProc.close()
-      doAssert rcode == 0, "fifo reader should exit 0"
-      let res = mergeAndRead(fragmentDir, readerWork / "cap.rdep")
+      # Check startup before waiting for a feeder blocked on its FIFO open.
+      doAssert rcode == 0,
+        "fifo reader exit=" & $rcode & " (30s bound): " & readerOutput
+      let fcode = feederProc.waitForExit(30_000)
+      doAssert fcode == 0, "fifo feeder exit=" & $fcode & " (30s bound)"
+      let res = mergeAndRead(fragmentDir, readerWork / "cap.iomon")
       check res.completeness == mcIncomplete
 
     test "S1d in-tree FIFO pipeline stays mcComplete (cardinal sin)":

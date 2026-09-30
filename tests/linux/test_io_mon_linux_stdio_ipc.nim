@@ -101,7 +101,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "marker.txt"
     writeFile(marker, "stdio marker\n")
-    let depfile = work / "stdio.rdep"
+    let depfile = work / "stdio.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -145,7 +145,7 @@ int main(int argc, char **argv) {
     createDir(buildDir)
     createDir(buildDir / "src")
     let expected = buildDir / "src" / "result.o"
-    let depfile = work / "chdir-relative.rdep"
+    let depfile = work / "chdir-relative.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -195,7 +195,7 @@ int main(int argc, char **argv) {
 }
 """)
     let output = work / "otmpfile-mode-output"
-    let depfile = work / "otmpfile-mode.rdep"
+    let depfile = work / "otmpfile-mode.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -210,6 +210,49 @@ int main(int argc, char **argv) {
     check fpUserWrite in permissions
     check fpGroupRead in permissions
     check fpOthersRead in permissions
+
+  test "repeated reads emit one dependency record per descriptor":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let reader = buildC(work, "byte_reader", """
+#include <fcntl.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  char byte;
+  long total = 0;
+  int fd = open(argv[1], O_RDONLY);
+  if (fd < 0) return 2;
+  while (read(fd, &byte, 1) > 0) ++total;
+  close(fd);
+  return total == 4096 ? 0 : 3;
+}
+""")
+    let marker = work / "byte-reader-marker.txt"
+    writeFile(marker, repeat("x", 4096))
+    let depfile = work / "byte-reader.iomon"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", reader, marker],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check dep.records.countIt(it.kind == mrFileRead and marker in it.path) == 1
 
   test "read batch is flushed when a process exits through _exit":
     let snoopBin = work / "io-mon"
@@ -238,7 +281,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "direct-exit-marker.txt"
     writeFile(marker, "direct exit marker\n")
-    let depfile = work / "direct-exit.rdep"
+    let depfile = work / "direct-exit.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -286,7 +329,7 @@ int main(int argc, char **argv) {
     check trueBin.len > 0
     let marker = work / "read-then-exec-marker.txt"
     writeFile(marker, "read then exec marker\n")
-    let depfile = work / "read-then-exec.rdep"
+    let depfile = work / "read-then-exec.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -437,7 +480,7 @@ int main(int argc, char **argv) {
     writeFile(marker, "daemon late marker\n")
 
     block quiescesInsideGrace:
-      let depfile = work / "daemon-quiesce.rdep"
+      let depfile = work / "daemon-quiesce.iomon"
       let proof = work / "daemon-quiesce.proof"
       try: removeFile(proof)
       except OSError: discard
@@ -460,7 +503,7 @@ int main(int argc, char **argv) {
         "linux injected descendants still live" in it.detail)
 
     block livePastGrace:
-      let depfile = work / "daemon-live-past-grace.rdep"
+      let depfile = work / "daemon-live-past-grace.iomon"
       let proof = work / "daemon-live-past-grace.proof"
       # Gated mode: the daemon blocks on this sentinel until we drop it, so it
       # is deterministically still alive across the whole grace window. We
@@ -577,7 +620,7 @@ int main(int argc, char **argv) {
     for mode in ["pread", "readv", "preadv", "sendfile",
                  "copy_file_range", "splice"]:
       let outPath = work / ("content-channel-" & mode & ".out")
-      let depfile = work / ("content-channel-" & mode & ".rdep")
+      let depfile = work / ("content-channel-" & mode & ".iomon")
       let cap = run(snoopBin, @["run", "--depfile", depfile, "--", mover,
         mode, source, outPath], childEnv)
       checkpoint(mode & " output: " & cap.output)
@@ -628,7 +671,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "inherited-fd3-marker.txt"
     writeFile(marker, "inherited fd marker\n")
-    let depfile = work / "inherited-fd3-file.rdep"
+    let depfile = work / "inherited-fd3-file.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -644,6 +687,51 @@ int main(int argc, char **argv) {
     check not dep.records.anyIt(it.kind == mrFileRead and it.path.len == 0)
     check dep.records.anyIt(it.kind == mrFileRead and marker in it.path and
       detailToken(it.detail, "run").len > 0)
+
+  test "named device moved onto an inherited fd remains a file dependency":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let reader = buildC(work, "dup2_zero_reader", """
+#include <fcntl.h>
+#include <unistd.h>
+int main(void) {
+  int fd = open("/dev/zero", O_RDONLY);
+  if (fd < 0) return 2;
+  if (fd != STDIN_FILENO) {
+    if (dup2(fd, STDIN_FILENO) != STDIN_FILENO) return 3;
+    close(fd);
+  }
+  unsigned char buf[32];
+  ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+  return n == (ssize_t)sizeof(buf) ? 0 : 4;
+}
+""")
+    let depfile = work / "dup2-zero.iomon"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", reader],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check hasFileRead(dep, "/dev/zero")
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      "out-of-tree content channel consumed" in it.detail)
 
   test "inherited fd 3 deleted regular file does not become stable proc fd path":
     let snoopBin = work / "io-mon"
@@ -687,7 +775,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "inherited-fd3-deleted-marker.txt"
     writeFile(marker, "deleted inherited fd marker\n")
-    let depfile = work / "inherited-fd3-deleted-file.rdep"
+    let depfile = work / "inherited-fd3-deleted-file.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -800,7 +888,7 @@ int main(int argc, char **argv) {
     writeFile(source, "source identity marker\n")
     writeFile(exchangeLeft, "exchange left marker\n")
     writeFile(exchangeRight, "exchange right marker\n")
-    let depfile = work / "path-mutation.rdep"
+    let depfile = work / "path-mutation.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -913,7 +1001,7 @@ int main(int argc, char **argv) {
       var childEnv = newStringTable(modeCaseSensitive)
       for k, v in envPairs(): childEnv[k] = v
       childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
-      let depfile = work / "ipc.rdep"
+      let depfile = work / "ipc.iomon"
       let cap = run(snoopBin, @["run", "--depfile", depfile, "--", client, socketPath],
         childEnv)
       checkpoint(cap.output)
@@ -957,7 +1045,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "raw-marker.txt"
     writeFile(marker, "raw marker\n")
-    let depfile = work / "raw-syscall.rdep"
+    let depfile = work / "raw-syscall.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1012,7 +1100,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "raw-openat2-marker.txt"
     writeFile(marker, "raw openat2 marker\n")
-    let depfile = work / "raw-openat2.rdep"
+    let depfile = work / "raw-openat2.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1103,7 +1191,7 @@ int main(int argc, char **argv) {
 
     for mode in ["sendfile", "copy_file_range", "splice"]:
       let outPath = work / ("raw-zero-copy-" & mode & ".out")
-      let depfile = work / ("raw-zero-copy-" & mode & ".rdep")
+      let depfile = work / ("raw-zero-copy-" & mode & ".iomon")
       let cap = run(snoopBin, @["run", "--depfile", depfile, "--", mover,
         mode, marker, outPath], childEnv)
       checkpoint(mode & ": " & cap.output)
@@ -1158,7 +1246,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "inline-raw-marker.txt"
     writeFile(marker, "inline raw marker\n")
-    let depfile = work / "inline-raw-syscall.rdep"
+    let depfile = work / "inline-raw-syscall.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1222,7 +1310,7 @@ int main(int argc, char **argv) {
 """, @["-L" & work, "-lrawdso", "-Wl,-rpath," & work])
     let marker = work / "inline-dso-marker.txt"
     writeFile(marker, "inline dso marker\n")
-    let depfile = work / "inline-dso-syscall.rdep"
+    let depfile = work / "inline-dso-syscall.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1302,7 +1390,7 @@ int main(int argc, char **argv) {
     childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
 
     for mode in ["dlopen", "dlmopen-base"]:
-      let depfile = work / ("late-load-" & mode & ".rdep")
+      let depfile = work / ("late-load-" & mode & ".iomon")
       let cap = run(snoopBin, @["run", "--depfile", depfile, "--", loader,
         mode, plugin, marker], childEnv)
       checkpoint(mode & ": " & cap.output)
@@ -1316,7 +1404,7 @@ int main(int argc, char **argv) {
       check not dep.records.anyIt(it.kind == mrEventLoss and
         "late inline raw-syscall scanner unavailable" in it.detail)
 
-    let newlmDepfile = work / "late-load-dlmopen-newlm.rdep"
+    let newlmDepfile = work / "late-load-dlmopen-newlm.iomon"
     let newlm = run(snoopBin, @["run", "--depfile", newlmDepfile, "--",
       loader, "dlmopen-newlm", plugin, marker], childEnv)
     checkpoint("dlmopen-newlm: " & newlm.output)
@@ -1392,7 +1480,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "jit-mprotect-marker.txt"
     writeFile(marker, "jit mprotect marker\n")
-    let depfile = work / "jit-mprotect-syscall.rdep"
+    let depfile = work / "jit-mprotect-syscall.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1435,7 +1523,7 @@ int main(void) {
   return 0;
 }
 """)
-    let depfile = work / "rwx-mmap.rdep"
+    let depfile = work / "rwx-mmap.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1523,7 +1611,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "jit-munmap-reuse-marker.txt"
     writeFile(marker, "jit munmap reuse marker\n")
-    let depfile = work / "jit-munmap-reuse.rdep"
+    let depfile = work / "jit-munmap-reuse.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1609,7 +1697,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "jit-mprotect-mixed-marker.txt"
     writeFile(marker, "jit mixed mprotect marker\n")
-    let depfile = work / "jit-mprotect-mixed.rdep"
+    let depfile = work / "jit-mprotect-mixed.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1695,7 +1783,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "jit-mremap-marker.txt"
     writeFile(marker, "jit mremap marker\n")
-    let depfile = work / "jit-mremap.rdep"
+    let depfile = work / "jit-mremap.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1751,7 +1839,7 @@ int main(void) {
   return 0;
 }
 """)
-    let depfile = work / "jit-mremap-partial.rdep"
+    let depfile = work / "jit-mremap-partial.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1806,7 +1894,7 @@ int main(int argc, char **argv) {
     let linkPath = work / "raw-probe-link.txt"
     writeFile(marker, "raw probe marker\n")
     createSymlink(marker, linkPath)
-    let depfile = work / "raw-probe.rdep"
+    let depfile = work / "raw-probe.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1868,7 +1956,7 @@ int main(void) {
   return rnd[0] == 255 ? 9 : 0;
 }
 """)
-    let depfile = work / "non-file-determinism.rdep"
+    let depfile = work / "non-file-determinism.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -1890,6 +1978,151 @@ int main(void) {
     check hasRecord(dep, mrTimeRead, "gettimeofday")
     check hasRecord(dep, mrTimeRead, "time")
     check hasRecord(dep, mrNonDeterministic, "getrandom")
+
+  test "the glibc BSD entropy set is recorded, not just getrandom":
+    # CROSS-PLATFORM ENTROPY PARITY (io_mon/types.nim, record 16). The macOS
+    # shim has always recorded getentropy / arc4random / arc4random_buf /
+    # arc4random_uniform; the Linux shim recorded ONLY getrandom, so the very
+    # same program was entropy-flagged on macOS and completely invisible here.
+    #
+    # These do NOT collapse into the getrandom hook, by two different routes
+    # (glibc 2.42): getentropy issues getrandom(2) itself as an inline syscall
+    # instruction in its own body, never touching the public getrandom symbol;
+    # arc4random* call the LOCAL, non-exported __getrandom_nocancel, and only
+    # when re-seeding. Measured against the pre-change shim, this exact probe
+    # produced ZERO mrNonDeterministic records — every check below failed —
+    # even though getentropy demonstrably made a getrandom(2) syscall. Each
+    # source is asserted separately so a hook that is dropped for one API
+    # cannot hide behind the other three.
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let probe = buildC(work, "linux_bsd_entropy_set", """
+#define _GNU_SOURCE
+#include <stdlib.h>
+#include <sys/random.h>
+
+int main(void) {
+  unsigned char seed[16];
+  unsigned char buf[16];
+  unsigned int draw;
+  unsigned int bounded;
+  if (getentropy(seed, sizeof(seed)) != 0) return 2;
+  draw = arc4random();
+  arc4random_buf(buf, sizeof(buf));
+  bounded = arc4random_uniform(1000u);
+  if (bounded >= 1000u) return 3;
+  /* Consume every result so nothing is optimised away. */
+  return (seed[0] == 1 && buf[0] == 2 && draw == 3u) ? 4 : 0;
+}
+""")
+    let depfile = work / "bsd-entropy-set.iomon"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", probe],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    # Forwarding must stay genuine: the probe returns non-zero if any hooked
+    # entry point handed it an out-of-contract value.
+    check dep.completeness == mcComplete
+    check hasRecord(dep, mrNonDeterministic, "getentropy")
+    check hasRecord(dep, mrNonDeterministic, "arc4random")
+    check hasRecord(dep, mrNonDeterministic, "arc4random_buf")
+    check hasRecord(dep, mrNonDeterministic, "arc4random_uniform")
+    # Exactly the four the probe drew from — no source is invented, and the
+    # `allIt` below cannot pass vacuously on an empty record set.
+    let entropy = dep.records.filterIt(it.kind == mrNonDeterministic)
+    check entropy.len == 4
+    check entropy.allIt(it.detail.startsWith(NonDeterministicEntropyDetail))
+
+  test "repeated entropy draws collapse to one record per source":
+    # DEDUP PARITY. macOS routes entropy through recordObservedOnce (per process
+    # per source); Linux built the record by hand and called emitRecord — the
+    # only non-file recorder on that shim that skipped its own dedup helper.
+    # Identical records from one thread already collapse in the fragment merge,
+    # so the divergence only becomes visible across THREADS: measured against
+    # the pre-change shim, these 8 threads x 8 draws produced EIGHT getrandom
+    # records (one per tid) instead of one. A build's worker pool multiplied one
+    # fact by its thread count.
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let probe = buildC(work, "linux_entropy_dedup", """
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <stdlib.h>
+#include <sys/random.h>
+
+static void *worker(void *arg) {
+  unsigned char buf[8];
+  int i;
+  (void)arg;
+  for (i = 0; i < 8; i++) {
+    if (getrandom(buf, sizeof(buf), 0) != (ssize_t)sizeof(buf)) abort();
+    arc4random_buf(buf, sizeof(buf));
+  }
+  return NULL;
+}
+
+int main(void) {
+  pthread_t threads[8];
+  int i;
+  for (i = 0; i < 8; i++)
+    if (pthread_create(&threads[i], NULL, worker, NULL) != 0) return 2;
+  for (i = 0; i < 8; i++) pthread_join(threads[i], NULL);
+  return 0;
+}
+""", @["-pthread"])
+    let depfile = work / "entropy-dedup.iomon"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", probe],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    # 128 draws across 8 threads, 2 sources: exactly 2 records.
+    check dep.records.countIt(it.kind == mrNonDeterministic and
+      it.path == "getrandom") == 1
+    check dep.records.countIt(it.kind == mrNonDeterministic and
+      it.path == "arc4random_buf") == 1
+    check dep.records.countIt(it.kind == mrNonDeterministic) == 2
+    # DETAIL PARITY, asserted where a `getrandom` record exists either way: this
+    # shim used to write "linux non-deterministic source" while macOS wrote
+    # NonDeterministicEntropyDetail for the same observation, so a consumer
+    # matching on the detail string behaved differently per platform.
+    check dep.records.filterIt(it.kind == mrNonDeterministic and
+      it.path == "getrandom").allIt(
+        it.detail.startsWith(NonDeterministicEntropyDetail))
 
   test "direct linux vDSO dlsym calls record determinism evidence or fail closed":
     let snoopBin = work / "io-mon"
@@ -1987,7 +2220,7 @@ int main(void) {
   return called > 0 ? 0 : 9;
 }
 """, @["-ldl"])
-    let depfile = work / "direct-vdso-dlsym.rdep"
+    let depfile = work / "direct-vdso-dlsym.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -2041,7 +2274,7 @@ int main(void) {
   return pid > 0 ? 0 : 2;
 }
 """)
-    let depfile = work / "raw-unknown.rdep"
+    let depfile = work / "raw-unknown.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -2087,7 +2320,7 @@ int main(void) {
   return tid > 0 ? 0 : 2;
 }
 """)
-    let depfile = work / "raw-gettid.rdep"
+    let depfile = work / "raw-gettid.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -2101,6 +2334,170 @@ int main(void) {
     check dep.completeness == mcComplete
     check not dep.records.anyIt(it.kind == mrEventLoss and
       ("unsupported nr=186" in it.detail or
+       "libc raw syscall unsupported" in it.detail))
+
+  test "raw libc SYS_getrandom is observed, not lost (IoMon-Pipeline-Capture IM-5)":
+    # Nim's `std/sysrand` reaches getrandom(2) as `syscall(SYS_getrandom, …)`
+    # rather than through the libc symbol, so EVERY Nim binary that touches
+    # `std/tempfiles` produced `libc raw syscall unsupported nr=318`. The
+    # consumer classifies an unrecognised loss detail as Level 2 (unknown
+    # scope), which sets `disableCacheHits` and skips the action-cache
+    # publish — so reprobuild's own monitored `nim c` helper edges (interface
+    # extraction, provider compile) could never hold a cache entry.
+    #
+    # This is a CLASSIFICATION gap, not a monitoring gap: the same call is
+    # already observed as `mrNonDeterministic` on both other entry points
+    # (`repro_hook_getrandom` for the libc symbol, `repro_vdso_getrandom` for
+    # the vDSO). The record is deliberately not a completeness downgrade —
+    # io-mon SAW the entropy read, so nothing is missing.
+    #
+    # Both assertions carry weight and fail together under the mutation that
+    # removes the classifier arm: the loss reappears (assertion 1, and with
+    # it mcComplete) and the observation disappears (assertion 2).
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    # Deliberately the RAW form. Calling `getrandom()` (the libc symbol)
+    # would exercise the already-hooked path and pass with or without the
+    # classifier arm — the test would be green both ways.
+    let probe = buildC(work, "raw_getrandom", """
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <stdint.h>
+#ifndef SYS_getrandom
+#define SYS_getrandom 318
+#endif
+int main(void) {
+  unsigned char buf[16];
+  long n = syscall(SYS_getrandom, buf, sizeof(buf), 0);
+  return n == (long)sizeof(buf) ? 0 : 2;
+}
+""")
+    let depfile = work / "raw-getrandom.iomon"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", probe],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    # 1. No loss, so the edge stays publishable.
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      ("unsupported nr=318" in it.detail or
+       "libc raw syscall unsupported" in it.detail))
+    check dep.completeness == mcComplete
+    # 2. The entropy read is still REPORTED — "supported" must not mean
+    #    "invisible". This is the assertion that separates the fix from
+    #    silently swallowing the syscall.
+    check dep.records.anyIt(it.kind == mrNonDeterministic and
+      it.path == "getrandom")
+
+  test "raw libc SYS_futex is treated as supported (no event-loss)":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let probe = buildC(work, "raw_futex", """
+#define _GNU_SOURCE
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#ifndef SYS_futex
+#define SYS_futex 202
+#endif
+int main(void) {
+  int word = 0;
+  long woken = syscall(SYS_futex, &word, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
+  return woken >= 0 ? 0 : 2;
+}
+""")
+    let depfile = work / "raw-futex.iomon"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", probe],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      ("unsupported nr=202" in it.detail or
+       "libc raw syscall unsupported" in it.detail))
+
+  test "raw libc Landlock sandbox syscalls are supported (no event-loss)":
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+    checkpoint(buildShim.output)
+    check buildShim.code == 0
+    let shimLib = findShimLibrary()
+
+    let probe = buildC(work, "raw_landlock", """
+#include <sys/syscall.h>
+#include <unistd.h>
+#ifndef SYS_landlock_create_ruleset
+#define SYS_landlock_create_ruleset 444
+#endif
+#ifndef SYS_landlock_add_rule
+#define SYS_landlock_add_rule 445
+#endif
+#ifndef SYS_landlock_restrict_self
+#define SYS_landlock_restrict_self 446
+#endif
+int main(void) {
+  (void)syscall(SYS_landlock_create_ruleset, 0, 0, 1);
+  (void)syscall(SYS_landlock_add_rule, -1, 0, 0, 0);
+  (void)syscall(SYS_landlock_restrict_self, -1, 0);
+  return 0;
+}
+""")
+    let depfile = work / "raw-landlock.iomon"
+
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", probe],
+      childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    check dep.completeness == mcComplete
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      ("unsupported nr=444" in it.detail or
+       "unsupported nr=445" in it.detail or
+       "unsupported nr=446" in it.detail or
        "libc raw syscall unsupported" in it.detail))
 
   test "raw libc io_uring_setup probe (failing) is supported (no event-loss)":
@@ -2173,7 +2570,7 @@ int main(void) {
   return 0;
 }
 """)
-    let depfile = work / "raw-io-uring-setup.rdep"
+    let depfile = work / "raw-io-uring-setup.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -2251,7 +2648,7 @@ int main(int argc, char **argv) {
   return 3;
 }
 """)
-    let depfile = work / "execvp-path-search.rdep"
+    let depfile = work / "execvp-path-search.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v
@@ -2289,7 +2686,7 @@ int main(void) {
   return 77;
 }
 """)
-    let depfile = work / "sigtrap-unrelated.rdep"
+    let depfile = work / "sigtrap-unrelated.iomon"
 
     var childEnv = newStringTable(modeCaseSensitive)
     for k, v in envPairs(): childEnv[k] = v

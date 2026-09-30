@@ -122,7 +122,7 @@ suite "M9.R.62.2 async-signal-safe committed-marker pre-encoding":
       discard close(fd)
       sigSafeMarkSlotClosed()
 
-      let outPath = dir / "merged.rmdf"
+      let outPath = dir / "merged.iomon"
       let merged = mergeFragments(dir, outPath)
       let summary = summarizeRecords(merged.records)
       # The pending + committed net cleanly — no synthetic kill-before-

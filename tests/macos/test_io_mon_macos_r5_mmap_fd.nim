@@ -29,27 +29,20 @@ import io_mon
 when defined(macosx):
   import std/[osproc, streams, strtabs]
   import macos_backend_toggle
+  import build_test_cli
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
   r5ipc = repoRoot / "research" / "adversarial-2026-07-round5" / "ipc"
 
 when defined(macosx):
+  from build_test_shim import buildPrivateMacosShim
+
   proc buildShim(): string =
-    let (output, code) = execCmdEx("bash " &
-      quoteShell(repoRoot / "scripts" / "build_shim.sh"))
-    if code != 0:
-      raise newException(IOError, "build_shim.sh failed: " & output)
-    let shim = repoRoot / "build" / "lib" / "librepro_monitor_shim.dylib"
-    doAssert fileExists(shim), "shim not produced at " & shim
-    shim
+    buildPrivateMacosShim(repoRoot)
 
   proc buildCli(): string =
-    let (output, code) = execCmdEx("cd " & quoteShell(repoRoot) &
-      " && nimble buildSnoop")
-    let cli = repoRoot / "build" / "bin" / "io-mon"
-    doAssert fileExists(cli), "io-mon CLI not produced: " & output
-    cli
+    buildTestCli(repoRoot)
 
   proc ccExe(src, outBin: string) =
     let cc = getEnv("CC", "cc")
@@ -130,7 +123,7 @@ suite "io-mon macOS R5 Phase-3 mmap of out-of-tree fd (Break B)":
       ccExe(r5ipc / "F3_client.c", client)
       let launcher = work / "F3_launcher"
       ccExe(r5ipc / "F3_launcher.c", launcher)
-      let depfile = work / "breakB.rdep"
+      let depfile = work / "breakB.iomon"
       let dep = runIomon(cli, shim, depfile,
         @[launcher, marker, cli, depfile, client])
       # The marker is now recorded as a content read on its canonical path,
@@ -167,7 +160,7 @@ suite "io-mon macOS R5 Phase-3 mmap of out-of-tree fd (Break B)":
       discard p.outputStream.readAll()
       doAssert p.waitForExit() == 0
       p.close()
-      let depfile = work / "intree.rdep"
+      let depfile = work / "intree.iomon"
       discard mergeFragments(runWork, depfile)
       let dep = readMonitorDepFile(depfile)
       # The dep IS captured (via the in-tree open), but NOT via a mmap-inherited-fd
@@ -213,7 +206,7 @@ int main(int argc, char **argv) {
 """)
       let bin = work / "mprotect_promote"
       ccExe(src, bin)
-      let dep = runProbe(shim, bin, @[target], work / "mprotect.rdep")
+      let dep = runProbe(shim, bin, @[target], work / "mprotect.iomon")
       check readFile(target).startsWith("Zaaaaa")
       check dep.completeness == mcComplete
       check countMprotectWrites(dep, "mprotect_promote.bin") == 1

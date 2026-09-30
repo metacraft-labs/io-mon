@@ -93,6 +93,12 @@ const
   HookGetFileAttributesA* = "GetFileAttributesA"
   HookCreateProcessW* = "CreateProcessW"
   HookCreateProcessA* = "CreateProcessA"
+  # Not a filesystem entry point. `NtTerminateProcess` is the ONE
+  # chokepoint every process exit passes through -- `ExitProcess`,
+  # `TerminateProcess` and a Cygwin runtime's own teardown alike -- and it is
+  # where the shim gets its last chance to make buffered records durable. See
+  # `windows_interpose.snoopNtTerminateProcess`.
+  HookNtTerminateProcess* = "NtTerminateProcess"
   # M73 Phase 5 — additional Win32 entry points from
   # Monitor-Hook-Shim.md §Windows Hook Surface.
   HookDeleteFileW* = "DeleteFileW"
@@ -108,6 +114,15 @@ const
   HookSetCurrentDirectoryA* = "SetCurrentDirectoryA"
   # NT Native API backstop — lives in ntdll.dll, not kernel32.
   HookNtCreateFile* = "NtCreateFile"
+  # NtReadFile — the read that MSYS2/Cygwin actually performs. The Cygwin
+  # runtime imports BOTH kernel32!ReadFile and ntdll!NtReadFile and uses the
+  # NT export for ordinary disk files, so without this hook an MSYS child is
+  # observed opening a file and never reading it: every `bash <script>`
+  # action captured zero `file-read` records, which is precisely what an
+  # action cache keys on. See `snoopNtReadFile` for the double-count rule
+  # that keeps a NATIVE child (whose kernel32!ReadFile lowers to this very
+  # function) from being counted through both layers.
+  HookNtReadFile* = "NtReadFile"
   # libuv on Windows routes fs.statSync through NtQueryAttributesFile /
   # NtQueryFullAttributesFile (no handle is opened), and fs.readdirSync
   # through NtQueryDirectoryFile. None of these cross the kernel32 layer
@@ -142,8 +157,72 @@ const
   # stub prologue), so we have to intercept the pointer LOOKUP
   # instead of the function body.
   HookGetProcAddress* = "GetProcAddress"
+  # M5 — IPC-connect (mcapIpcConnect). The socket half lives in ws2_32.dll;
+  # the named-pipe half needs no new entry point at all, because a Windows
+  # pipe CLIENT connects by opening `\\.\pipe\<name>` through the already
+  # hooked CreateFileW/A + NtCreateFile. That half is therefore a
+  # CLASSIFICATION change in those snoops, not a new hook.
+  HookConnect* = "connect"
+  HookWSAConnect* = "WSAConnect"
+  # M5 — external content (mcapExternalContent). Windows' analogues of the
+  # POSIX shm / FIFO / inherited-fd channels the macOS arm covers:
+  #   * file mappings — a NAMED section is the shm analogue, and a view of a
+  #     FILE-backed section is a content read that NEVER passes ReadFile;
+  #   * anonymous pipes — CreatePipe is the `pipe(2)` analogue, and the
+  #     kernel object it makes has a process-independent name
+  #     (`\Win32Pipes.<hi>.<lo>`) that the merge can pair create against read;
+  #   * NTFS alternate data streams — `file:stream`, already visible to
+  #     CreateFileW but never classified.
+  HookCreateFileMappingW* = "CreateFileMappingW"
+  HookCreateFileMappingA* = "CreateFileMappingA"
+  HookOpenFileMappingW* = "OpenFileMappingW"
+  HookOpenFileMappingA* = "OpenFileMappingA"
+  HookMapViewOfFile* = "MapViewOfFile"
+  HookMapViewOfFileEx* = "MapViewOfFileEx"
+  HookCreatePipe* = "CreatePipe"
+  # M5 — non-determinism (mcapNonDeterminism). Entropy sources live in
+  # bcrypt.dll / advapi32.dll / bcryptprimitives.dll; clock sources in
+  # kernel32.dll.
+  HookBCryptGenRandom* = "BCryptGenRandom"
+  HookProcessPrng* = "ProcessPrng"
+  HookSystemFunction036* = "SystemFunction036"
+  HookCryptGenRandom* = "CryptGenRandom"
+  HookQueryPerformanceCounter* = "QueryPerformanceCounter"
+  HookGetSystemTimeAsFileTime* = "GetSystemTimeAsFileTime"
+  HookGetTickCount64* = "GetTickCount64"
+  # M10 — observed environment (mcapObservedEnv). Windows reaches its
+  # environment through TWO independent copies, and a hook on either one alone
+  # sees only half the programs:
+  #
+  #   * the PEB block, read by the Win32 APIs below (kernel32.dll);
+  #   * the C runtime's OWN snapshot, taken from the PEB block once at CRT
+  #     startup and served by `getenv` from then on. A program linked against
+  #     a CRT may therefore never call a Win32 environment API at all.
+  #
+  # Both CRTs a Windows toolchain actually links are covered, and they are
+  # SEPARATE modules with separate copies in the same process: `ucrtbase.dll`
+  # (MSVC, clang-cl, mingw-w64 UCRT builds, Node, Python) and `msvcrt.dll`
+  # (classic mingw-w64, cmd.exe, and much of the shipped system). Since the
+  # registry is keyed by NAME and both export `getenv`, the CRT keys are
+  # qualified by module and the hook table carries the undecorated
+  # `exportName` for the install pass.
+  HookGetEnvironmentVariableW* = "GetEnvironmentVariableW"
+  HookGetEnvironmentVariableA* = "GetEnvironmentVariableA"
+  HookGetEnvironmentStringsW* = "GetEnvironmentStringsW"
+  HookGetEnvironmentStringsA* = "GetEnvironmentStringsA"
+  HookGetEnvironmentStrings* = "GetEnvironmentStrings"
+  HookUcrtGetenv* = "ucrtbase!getenv"
+  HookUcrtWGetenv* = "ucrtbase!_wgetenv"
+  HookUcrtGetenvS* = "ucrtbase!getenv_s"
+  HookUcrtWGetenvS* = "ucrtbase!_wgetenv_s"
+  HookUcrtDupenvS* = "ucrtbase!_dupenv_s"
+  HookUcrtWDupenvS* = "ucrtbase!_wdupenv_s"
+  HookMsvcrtGetenv* = "msvcrt!getenv"
+  HookMsvcrtWGetenv* = "msvcrt!_wgetenv"
+  HookMsvcrtGetenvS* = "msvcrt!getenv_s"
+  HookMsvcrtWGetenvS* = "msvcrt!_wgetenv_s"
 
-const MonitorShimHookNames*: array[33, string] = [
+const MonitorShimHookNames*: array[65, string] = [
   HookCreateFileW, HookCreateFileA, HookReadFile, HookWriteFile,
   HookCloseHandle,
   HookGetFileAttributesExW, HookGetFileAttributesExA,
@@ -155,12 +234,26 @@ const MonitorShimHookNames*: array[33, string] = [
   HookMoveFileExW, HookMoveFileExA,
   HookGetFileInformationByHandleEx,
   HookSetCurrentDirectoryW, HookSetCurrentDirectoryA,
-  HookNtCreateFile,
+  HookNtCreateFile, HookNtReadFile,
   HookNtQueryAttributesFile, HookNtQueryFullAttributesFile,
   HookNtQueryDirectoryFile, HookNtQueryInformationByName,
   HookNtQueryDirectoryFileEx,
   HookFindFirstFileW, HookFindFirstFileExW, HookFindNextFileW, HookFindClose,
-  HookGetProcAddress
+  HookGetProcAddress,
+  HookConnect, HookWSAConnect,
+  HookCreateFileMappingW, HookCreateFileMappingA,
+  HookOpenFileMappingW, HookOpenFileMappingA,
+  HookMapViewOfFile, HookMapViewOfFileEx, HookCreatePipe,
+  HookBCryptGenRandom, HookProcessPrng, HookSystemFunction036,
+  HookCryptGenRandom,
+  HookQueryPerformanceCounter, HookGetSystemTimeAsFileTime,
+  HookGetTickCount64,
+  HookGetEnvironmentVariableW, HookGetEnvironmentVariableA,
+  HookGetEnvironmentStringsW, HookGetEnvironmentStringsA,
+  HookGetEnvironmentStrings,
+  HookUcrtGetenv, HookUcrtWGetenv, HookUcrtGetenvS, HookUcrtWGetenvS,
+  HookUcrtDupenvS, HookUcrtWDupenvS,
+  HookMsvcrtGetenv, HookMsvcrtWGetenv, HookMsvcrtGetenvS, HookMsvcrtWGetenvS
 ]
 
 # --- Standard hook priorities ----------------------------------------------

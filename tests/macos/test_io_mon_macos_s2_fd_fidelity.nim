@@ -58,14 +58,10 @@ const
   fdDir = "/tmp/r3_fd"
 
 when defined(macosx):
+  from build_test_shim import buildPrivateMacosShim
+
   proc buildShim(): string =
-    let (output, code) = execCmdEx("bash " &
-      quoteShell(repoRoot / "scripts" / "build_shim.sh"))
-    if code != 0:
-      raise newException(IOError, "build_shim.sh failed: " & output)
-    let shim = repoRoot / "build" / "lib" / "librepro_monitor_shim.dylib"
-    doAssert fileExists(shim), "shim not produced at " & shim
-    shim
+    buildPrivateMacosShim(repoRoot)
 
   proc cc(args: string) =
     let ccBin = getEnv("CC", "cc")
@@ -115,7 +111,7 @@ when defined(macosx):
       $code & " out=" & outText)
     if requireExit0:
       doAssert code == 0, "probe should exit 0 (" & probe & "): " & outText
-    let depfile = work / "cap.rdep"
+    let depfile = work / "cap.iomon"
     let dep = mergeFragments(fragmentDir, depfile)
     result.records = readMonitorDepFile(depfile).records
     result.completeness = dep.completeness

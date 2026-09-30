@@ -65,7 +65,11 @@
 ##   nim check --path:<reprobuild>/libs/repro_project_dsl/src \
 ##             --path:<reprobuild>/libs/repro_dsl_stdlib/src ... repro.nim
 
+import std/[algorithm, os, strutils]
+
 import repro_project_dsl
+import repro_dsl_stdlib/foreign_env
+import repro_dsl_stdlib/fs as dslfs
 import repro_dsl_stdlib/packages/sh
 # NOTE: ``repro_dsl_stdlib/packages/nim`` is deliberately NOT imported here.
 # The ``package`` macro's ``usesImportCode`` pass auto-imports it ``as
@@ -77,7 +81,20 @@ import repro_dsl_stdlib/packages/sh
 # reprobuild's own ``repro.nim``.
 import ct_test_nim_unittest
 
+when defined(macosx):
+  import ./repro_support/cctools
+when defined(windows):
+  import repro_dsl_stdlib/packages/coreutils_install
+when defined(linux):
+  import ./repro_support/getconf
+  import ./repro_support/strace
+
 package io_mon:
+  # Keep this declaration directly in the package body: the DSL recognizes
+  # it before Nim evaluates platform branches. Windows realizes declared
+  # release archives; POSIX development commands use Nix.
+  defaultToolProvisioning(when defined(windows): tarball else: nix)
+
   uses:
     # Toolchain floor — mirrors ``io_mon.nimble``'s ``requires "nim >= 2.0.0"``
     # and the binaries the wrapped scripts shell out to. ``nimble`` drives the
@@ -85,7 +102,25 @@ package io_mon:
     # bash script) and is the tool every ``shell(...)`` edge invokes.
     "nim >=2.0"
     "nimble"
+    "just"
     "sh"
+    "bash >=4"
+    "mkdir"
+    when defined(windows):
+      # PortableGit's usr/bin contains the real mkdir/dirname used by Bash.
+      # cmd.exe's built-in mkdir does not satisfy that script dependency.
+      "install-file"
+    when not defined(windows):
+      "dirname"
+      "uname"
+      "rustc"
+    when defined(macosx):
+      "cctools"
+    when defined(linux):
+      "getconf"
+      "grep"
+      "nm"
+      "strace"
     # The C-family compiler ``nim c`` shells out to for the C backend. macOS
     # builds (and the shim's arm64/arm64e fat link) use Apple ``clang``; Linux
     # and Windows (``--cc:gcc`` for the shim DLL) use ``gcc``. The user supplies
@@ -127,9 +162,13 @@ package io_mon:
     name: "io-mon"
 
   devEnv:
+    when not defined(windows):
+      useFlakeDevShell()
+
     task "bump-version", command = "nim r scripts/bump_version.nim", description = "Bump version number"
 
   build:
+    const backendCompiler = (when defined(macosx): "clang" else: "gcc")
     const binSuffix = (when defined(windows): ".exe" else: "")
     const shimExt =
       when defined(windows): "dll"
@@ -155,6 +194,18 @@ package io_mon:
         "config.nims",
       ],
       extraOutputs = @[shimOutput])
+    # The script invokes Bash, Nim and its C backend inside the action's
+    # isolated PATH. A package-level uses entry alone does not expose them.
+    appendRegisteredActionToolIdentityRefs(shimBuild.id,
+      ["bash", "nim", backendCompiler, "mkdir"])
+    when defined(windows):
+      appendRegisteredActionToolIdentityRefs(shimBuild.id, ["install-file"])
+    when not defined(windows):
+      appendRegisteredActionToolIdentityRefs(shimBuild.id, ["dirname", "uname"])
+    when defined(macosx):
+      appendRegisteredActionToolIdentityRefs(shimBuild.id, ["cctools"])
+    when defined(linux):
+      appendRegisteredActionToolIdentityRefs(shimBuild.id, ["getconf"])
     discard collect("shim", @[shimBuild])
 
     # ---- Standalone CLI (``io-mon`` / the ``default`` collection) -----------
@@ -191,6 +242,7 @@ package io_mon:
 
     var testBuildActions: seq[BuildActionDef] = @[]
     var testExecuteActions: seq[BuildActionDef] = @[]
+    var isolatedTestActions: seq[BuildActionDef] = @[]
 
     proc emitTestPair(source, binary: string;
                       buildActions, executeActions: var seq[BuildActionDef]) =
@@ -211,96 +263,132 @@ package io_mon:
         paths = @["src", "tests/helpers"],
         extraInputs = @["src", "tests/helpers", "io_mon.nimble"],
         actionId = "io-mon.test_build." & stem)
+      appendRegisteredActionToolIdentityRefs(edge.action.id, [backendCompiler])
       buildActions.add(edge.action)
 
+      # These Windows tests install their own hooks or deliberately select
+      # an inert/slow DLL. An outer injected shim changes that premise (the
+      # inert root unexpectedly reports complete evidence) and interferes with
+      # the parked main thread used by the inner injector. All five pass
+      # directly at 303e1ef and fail under Reprobuild's monitor at that SHA.
+      # The system-child regression also needs an uninjected baseline: its
+      # outer fixture compares native execution with its own monitored run.
+      #
+      # Keep their compilation monitored and execute every assertion. The
+      # generated depfile orders the known artifacts but does not discover all
+      # runtime reads, so these execute edges MUST remain non-cacheable.
+      # Monitor-Hook-Shim.md / Failure Semantics permits this disposition.
+      # macOS fixtures also install their own interposers. A distinct outer
+      # dylib can recurse during dyld initialization, before main is reached.
+      # Linux's nested-monitor programs must also own their transport and
+      # loader closure: an outer shared-memory session defeats file-transport
+      # fixtures and adds a second shim to the loader comparison.
+      let isolatesMonitor = (defined(macosx) and (
+        source.startsWith("tests/macos/") or source.extractFilename in [
+          "test_io_mon_cli_exit_status.nim",
+          "test_io_mon_snoop_cli_capture.nim",
+          "test_io_mon_monitored_compile_depset.nim",
+          "test_io_mon_dep_identity_scope.nim",
+          "test_io_mon_cli_interest_stamp.nim",
+          "test_io_mon_cli_evidence_scope.nim",
+          "test_io_mon_host_session_scope.nim"])) or
+        (defined(linux) and source.extractFilename in [
+          "test_io_mon_shared_producer_growth.nim",
+          "test_io_mon_cli_exit_status.nim",
+          "test_io_mon_dep_identity_scope.nim",
+          "test_io_mon_host_session_scope.nim",
+          "test_io_mon_evidence_scope_older_shim.nim",
+          "test_io_mon_evidence_scope_shim_gate.nim",
+          "test_io_mon_library_load_closure.nim",
+          "test_io_mon_linux_fragment_fd_reuse.nim"]) or
+        (defined(windows) and source.extractFilename in [
+        "test_io_mon_cli_exit_status.nim",
+        "test_io_mon_windows_exit_status.nim",
+        "test_io_mon_windows_host_session_scope.nim",
+        "test_io_mon_windows_native_system_child.nim",
+        "test_io_mon_windows_read_capture.nim",
+        "test_io_mon_windows_root_guard.nim",
+        "test_io_mon_windows_spawn_abandoned_injection.nim",
+        "test_io_mon_windows_spawn_resume_invariant.nim"])
+      var executeAfter: seq[BuildActionDef] = @[]
+      var executePolicy = automaticMonitorPolicy()
+      if isolatesMonitor:
+        let depfile = "build/test-deps/" & stem & ".d"
+        let depfileEdge = dslfs.unmonitorableActionDepfile(
+          output = depfile,
+          inputs = @[binary, cliOutput, shimOutput],
+          reason = "Injection test owns its hooks and shim selection; " &
+            "an outer shim changes the experiment. Execution always reruns.",
+          actionId = "io-mon.test_dependencies." & stem)
+        buildActions.add(depfileEdge)
+        executeAfter.add(depfileEdge)
+        executePolicy = makeDepfilePolicy(depfile, suppressMonitorShimSeed = true)
       let executeEdge = edge.testBinary.run(
         actionId = "io-mon.test_execute." & stem,
         requiredBinaries = @[cliOutput],
         extraInputs = @[shimOutput],
+        after = executeAfter,
+        cacheable = not isolatesMonitor,
+        dependencyPolicy = executePolicy,
         registerImplicitName = false)
+      if isolatesMonitor:
+        isolatedTestActions.add(executeEdge)
+      # Tests compile real child programs and shims, including shell fixtures.
+      appendRegisteredActionToolIdentityRefs(executeEdge.id,
+        ["nim", backendCompiler, "sh", "bash", "mkdir"])
+      when defined(windows):
+        appendRegisteredActionToolIdentityRefs(executeEdge.id, ["install-file"])
+      when not defined(windows):
+        appendRegisteredActionToolIdentityRefs(executeEdge.id,
+          ["dirname", "uname", "rustc"])
+      when defined(macosx):
+        appendRegisteredActionToolIdentityRefs(executeEdge.id, ["cctools"])
+      when defined(linux):
+        appendRegisteredActionToolIdentityRefs(executeEdge.id,
+          ["strace", "nm", "getconf", "grep"])
       executeActions.add(executeEdge)
 
     # Portable tests — always in the graph.
-    let portableTestSpecs = @[
-      TestSpec(source: "tests/portable/test_io_mon_builds_standalone.nim", binary: "build/test-bin/test_io_mon_builds_standalone" & binSuffix),
-      TestSpec(source: "tests/portable/test_io_mon_snoop_cli_smoke.nim", binary: "build/test-bin/test_io_mon_snoop_cli_smoke" & binSuffix),
-      TestSpec(source: "tests/portable/test_io_mon_capabilities.nim", binary: "build/test-bin/test_io_mon_capabilities" & binSuffix),
-      TestSpec(source: "tests/portable/test_io_mon_endpoint_security.nim", binary: "build/test-bin/test_io_mon_endpoint_security" & binSuffix),
-      TestSpec(source: "tests/portable/test_io_mon_rd_classification.nim", binary: "build/test-bin/test_io_mon_rd_classification" & binSuffix),
-      TestSpec(source: "tests/portable/test_io_mon_parity_with_fs_snoop.nim", binary: "build/test-bin/test_io_mon_parity_with_fs_snoop" & binSuffix),
-      TestSpec(source: "tests/portable/test_io_mon_sig_safe_committed_frame.nim", binary: "build/test-bin/test_io_mon_sig_safe_committed_frame" & binSuffix),
-      TestSpec(source: "tests/portable/test_io_mon_s1_external_content.nim", binary: "build/test-bin/test_io_mon_s1_external_content" & binSuffix),
-      TestSpec(source: "tests/portable/test_io_mon_post_fork_sentinel_hygiene.nim", binary: "build/test-bin/test_io_mon_post_fork_sentinel_hygiene" & binSuffix),
-      TestSpec(source: "tests/portable/test_io_mon_t0_completeness.nim", binary: "build/test-bin/test_io_mon_t0_completeness" & binSuffix),
-    ]
+    proc testSpecsUnder(dir: string): seq[TestSpec] =
+      ## Keep the Reprobuild graph in lockstep with Nimble's directory-based
+      ## discovery. Sorting removes filesystem enumeration order from the graph.
+      if not dirExists(dir):
+        return
+      for kind, path in walkDir(dir):
+        if kind notin {pcFile, pcLinkToFile}:
+          continue
+        let name = path.extractFilename
+        if not name.startsWith("test_") or not name.endsWith(".nim"):
+          continue
+        let stem = name[0 ..< name.len - ".nim".len]
+        result.add TestSpec(
+          source: path.replace('\\', '/'),
+          binary: "build/test-bin/" & stem & binSuffix)
+      result.sort(proc(a, b: TestSpec): int = cmp(a.source, b.source))
 
-    for spec in portableTestSpecs:
-      emitTestPair(spec.source, spec.binary, testBuildActions, testExecuteActions)
+    var selectedTestDirs = @["tests/portable"]
 
     # POSIX tests — only compilable/runnable on POSIX platforms.
     when defined(posix):
-      let posixTestSpecs = @[
-        TestSpec(source: "tests/posix/test_io_mon_shim_builds_standalone.nim", binary: "build/test-bin/test_io_mon_shim_builds_standalone" & binSuffix),
-        TestSpec(source: "tests/posix/test_io_mon_snoop_cli_capture.nim", binary: "build/test-bin/test_io_mon_snoop_cli_capture" & binSuffix),
-      ]
-      for spec in posixTestSpecs:
-        emitTestPair(spec.source, spec.binary, testBuildActions, testExecuteActions)
+      selectedTestDirs.add("tests/posix")
 
     # macOS tests — macOS only.
     when defined(macosx):
-      let macosTestSpecs = @[
-        TestSpec(source: "tests/macos/test_io_mon_macos_s2_fd_fidelity.nim", binary: "build/test-bin/test_io_mon_macos_s2_fd_fidelity" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_mmap_reentrancy.nim", binary: "build/test-bin/test_io_mon_macos_mmap_reentrancy" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_r5_path_canon.nim", binary: "build/test-bin/test_io_mon_macos_r5_path_canon" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_r5_mmap_fd.nim", binary: "build/test-bin/test_io_mon_macos_r5_mmap_fd" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_bodypatch_open_mode.nim", binary: "build/test-bin/test_io_mon_macos_bodypatch_open_mode" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_threaded_write.nim", binary: "build/test-bin/test_io_mon_macos_threaded_write" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_r5_raw_syscall.nim", binary: "build/test-bin/test_io_mon_macos_r5_raw_syscall" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_xpc_mach_breakaway.nim", binary: "build/test-bin/test_io_mon_macos_xpc_mach_breakaway" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_symlink.nim", binary: "build/test-bin/test_io_mon_macos_symlink" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_r4_write.nim", binary: "build/test-bin/test_io_mon_macos_r4_write" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_record_once.nim", binary: "build/test-bin/test_io_mon_macos_record_once" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_bodypatch_resolution.nim", binary: "build/test-bin/test_io_mon_macos_bodypatch_resolution" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_r4_residual.nim", binary: "build/test-bin/test_io_mon_macos_r4_residual" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_content_hooks.nim", binary: "build/test-bin/test_io_mon_macos_content_hooks" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_r4_s3b_linktime.nim", binary: "build/test-bin/test_io_mon_macos_r4_s3b_linktime" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_setexec.nim", binary: "build/test-bin/test_io_mon_macos_setexec" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_r4_v1_vfork_exit.nim", binary: "build/test-bin/test_io_mon_macos_r4_v1_vfork_exit" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_r4_dir.nim", binary: "build/test-bin/test_io_mon_macos_r4_dir" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_ipc_breakaway.nim", binary: "build/test-bin/test_io_mon_macos_ipc_breakaway" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_s3_residuals.nim", binary: "build/test-bin/test_io_mon_macos_s3_residuals" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_r5_determinism.nim", binary: "build/test-bin/test_io_mon_macos_r5_determinism" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_sip_system_child.nim", binary: "build/test-bin/test_io_mon_macos_sip_system_child" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_bodypatch.nim", binary: "build/test-bin/test_io_mon_macos_bodypatch" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_round2_rb.nim", binary: "build/test-bin/test_io_mon_macos_round2_rb" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_s1_channels.nim", binary: "build/test-bin/test_io_mon_macos_s1_channels" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_readdir_inode64.nim", binary: "build/test-bin/test_io_mon_macos_readdir_inode64" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_rd.nim", binary: "build/test-bin/test_io_mon_macos_rd" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_bodypatch_spawn.nim", binary: "build/test-bin/test_io_mon_macos_bodypatch_spawn" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_library_load.nim", binary: "build/test-bin/test_io_mon_macos_library_load" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_rename.nim", binary: "build/test-bin/test_io_mon_macos_rename" & binSuffix),
-        TestSpec(source: "tests/macos/test_io_mon_macos_r5_kill_sentinel.nim", binary: "build/test-bin/test_io_mon_macos_r5_kill_sentinel" & binSuffix),
-      ]
-      for spec in macosTestSpecs:
-        emitTestPair(spec.source, spec.binary, testBuildActions, testExecuteActions)
+      selectedTestDirs.add("tests/macos")
 
     # Linux tests — Linux only.
     when defined(linux):
-      let linuxTestSpecs = @[
-        TestSpec(source: "tests/linux/test_io_mon_inline_patch_predicate.nim", binary: "build/test-bin/test_io_mon_inline_patch_predicate" & binSuffix),
-        TestSpec(source: "tests/linux/test_io_mon_linux_stdio_ipc.nim", binary: "build/test-bin/test_io_mon_linux_stdio_ipc" & binSuffix),
-        TestSpec(source: "tests/linux/test_io_mon_linux_inline_asm_exit_group.nim", binary: "build/test-bin/test_io_mon_linux_inline_asm_exit_group" & binSuffix),
-      ]
-      for spec in linuxTestSpecs:
-        emitTestPair(spec.source, spec.binary, testBuildActions, testExecuteActions)
+      selectedTestDirs.add("tests/linux")
 
     # Windows tests — Windows only.
     when defined(windows):
-      let windowsTestSpecs = @[
-        TestSpec(source: "tests/windows/test_io_mon_windows_flush_parity.nim", binary: "build/test-bin/test_io_mon_windows_flush_parity" & binSuffix),
-      ]
-      for spec in windowsTestSpecs:
+      selectedTestDirs.add("tests/windows")
+
+    for dir in selectedTestDirs:
+      for spec in testSpecsUnder(dir):
         emitTestPair(spec.source, spec.binary, testBuildActions, testExecuteActions)
 
     discard collect("test", testExecuteActions)
+    when defined(windows) or defined(macosx) or defined(linux):
+      discard collect("test-monitor-isolation", isolatedTestActions)
     discard collect("test-builds", testBuildActions)

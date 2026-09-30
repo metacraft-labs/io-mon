@@ -56,7 +56,7 @@ suite "ROUND-5 F post-fork sentinel-state hygiene":
     closeFragmentSlot()
 
     # With the hygiene fix, both cycles net cleanly.
-    let outPath = dir / "merged.rmdf"
+    let outPath = dir / "merged.iomon"
     let merged = mergeFragments(dir, outPath)
     let summary = summarizeRecords(merged.records)
     check summary.eventLossCount == 0'u64
@@ -95,7 +95,7 @@ suite "ROUND-5 F post-fork sentinel-state hygiene":
     # the child never wrote a pending marker (inherited-active
     # flag suppressed it), so merge would report ZERO losses even
     # though the child died mid-batch — a soundness hole.
-    let outPath = dir / "merged.rmdf"
+    let outPath = dir / "merged.iomon"
     let merged = mergeFragments(dir, outPath)
     let summary = summarizeRecords(merged.records)
     # Exactly one un-matched pending for the child (osPid=101).

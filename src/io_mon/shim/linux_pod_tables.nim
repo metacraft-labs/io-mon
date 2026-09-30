@@ -78,6 +78,7 @@ var
   fdSetLock: Lock
   emptyFdBits: array[fdBitWords, uint8]
   inheritedFdBits: array[fdBitWords, uint8]
+  fileReadSeenFdBits: array[fdBitWords, uint8]
 
   podTablesReady = false
 
@@ -336,4 +337,21 @@ proc podInheritedFdClear*() {.raises: [].} =
   acquire(fdSetLock)
   for i in 0 ..< fdBitWords:
     inheritedFdBits[i] = 0
+  release(fdSetLock)
+
+proc podFileReadMarkIsNew*(fd: cint): bool {.raises: [].} =
+  ## Return true once per tracked descriptor lifecycle. Descriptors above the
+  ## fixed table remain fail-open and continue emitting every observation.
+  if fd < 0 or fd >= fdPathCap:
+    return true
+  acquire(fdSetLock)
+  bitOp(fileReadSeenFdBits, fd):
+    result = (fileReadSeenFdBits[w] and m) == 0
+    fileReadSeenFdBits[w] = fileReadSeenFdBits[w] or m
+  release(fdSetLock)
+
+proc podFileReadExcl*(fd: cint) {.raises: [].} =
+  acquire(fdSetLock)
+  bitOp(fileReadSeenFdBits, fd):
+    fileReadSeenFdBits[w] = fileReadSeenFdBits[w] and (not m)
   release(fdSetLock)

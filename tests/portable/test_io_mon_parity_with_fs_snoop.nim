@@ -6,7 +6,7 @@
 ## io-mon is a faithful relocation of reprobuild's `repro_monitor_depfile`
 ## fs-snoop stack. The behaviour it must preserve is: a monitored run produces
 ## a set of `MonitorRecord`s (file reads / writes / opens / probes), which are
-## encoded into the binary RMDF depfile and decoded back into the SAME read and
+## encoded into the binary iomon depfile and decoded back into the SAME read and
 ## written file sets.
 ##
 ## Driving the REAL interpose monitor (`fs_snoop.runFsSnoop`) end-to-end
@@ -109,17 +109,17 @@ suite "io-mon parity with fs-snoop (record/encode/decode level)":
     for p in expectedWrites:
       records.add writeRecord(seqNo, p); inc seqNo
 
-    let depfile = root / "capture.rdep"
+    let depfile = root / "capture.iomon"
     writeCanonical(depfile, records)
 
-    # The depfile is the canonical binary RMDF format, not JSON.
+    # The depfile is the canonical binary iomon format, not JSON.
     let raw = readFile(depfile)
     check raw.len > 8
-    check raw[0 .. 3] == RmdfMagic
+    check raw[0 .. 3] == IomonMagic
     check raw[0] != '{'
 
     let dep = readMonitorDepFile(depfile)
-    check dep.version == RmdfVersion
+    check dep.version == IomonVersion
     check readPaths(dep) == toHashSet(expectedReads)
     check writtenPaths(dep) == toHashSet(expectedWrites)
     # Every observation survived; none were dropped or duplicated.
@@ -153,12 +153,12 @@ suite "io-mon parity with fs-snoop (record/encode/decode level)":
       inc seqNo
     closeFragmentSlot()
 
-    let merged = mergeFragments(fragDir, root / "merged.rdep")
+    let merged = mergeFragments(fragDir, root / "merged.iomon")
     check readPaths(merged) == toHashSet(reads)
     check writtenPaths(merged) == toHashSet(writes)
 
     # Re-reading the merged file from disk yields the same sets.
-    let reMerged = readMonitorDepFile(root / "merged.rdep")
+    let reMerged = readMonitorDepFile(root / "merged.iomon")
     check readPaths(reMerged) == toHashSet(reads)
     check writtenPaths(reMerged) == toHashSet(writes)
 
@@ -217,12 +217,12 @@ suite "io-mon parity with fs-snoop (record/encode/decode level)":
     # The complete leading frames are recovered, but the truncated tail means
     # the fragment did NOT decode cleanly to EOF — the fail-closed signal that
     # blocks cache publication (Monitor-Hook-Shim.md §"Failure Semantics":
-    # "partial RMDF writes MUST fail reader validation").
+    # "partial iomon writes MUST fail reader validation").
     check not cleanEof
 
   test "merge fails closed on a corrupt fragment (incomplete evidence)":
     # Fail-closed contract (Monitor-Hook-Shim.md §"Failure Semantics":
-    # "partial RMDF writes MUST fail reader validation"; "shim crash MUST
+    # "partial iomon writes MUST fail reader validation"; "shim crash MUST
     # reject cache publication"; "successful child exit MUST NOT hide monitor
     # failure"). A fragment that does not decode cleanly — e.g. a shim that
     # crashed before writing any complete frame, leaving garbage — MUST make
@@ -238,9 +238,9 @@ suite "io-mon parity with fs-snoop (record/encode/decode level)":
     var rec = readRecord(1'u64, root / "good-input")
     appendFragmentRecord(fragDir, rec)
     closeFragmentSlot()
-    writeFile(fragDir / "corrupt.rmdf-frag", "not an RMDF fragment")
+    writeFile(fragDir / "corrupt.iomon-frag", "not an iomon fragment")
 
-    let dep = mergeFragments(fragDir, root / "merged.rdep")
+    let dep = mergeFragments(fragDir, root / "merged.iomon")
     check dep.completeness == mcIncomplete
     check dep.summary.eventLossCount >= 1'u64
     # The valid fragment's record is still recovered for diagnostics.
@@ -252,7 +252,7 @@ suite "io-mon parity with fs-snoop (record/encode/decode level)":
 
     # And the on-disk depfile re-reads as incomplete via the canonical reader
     # the build engine uses, confirming the signal survives canonicalization.
-    let reread = readMonitorDepFile(root / "merged.rdep")
+    let reread = readMonitorDepFile(root / "merged.iomon")
     check reread.completeness == mcIncomplete
 
   test "reader rejects a corrupted depfile (checksum mismatch)":
@@ -260,12 +260,12 @@ suite "io-mon parity with fs-snoop (record/encode/decode level)":
     # as reprobuild's reader-validation test asserts.
     let root = createTempDir("io-mon-corrupt", "")
     defer: removeDir(root)
-    let depfile = root / "ok.rdep"
+    let depfile = root / "ok.iomon"
     writeCanonical(depfile, @[readRecord(1, root / "input.txt")])
 
     var raw = readFile(depfile)
     raw[^1] = char(ord(raw[^1]) xor 0x01)
-    let bad = root / "bad.rdep"
+    let bad = root / "bad.iomon"
     writeFile(bad, raw)
 
     var caught = false
@@ -287,7 +287,7 @@ suite "io-mon parity with fs-snoop (record/encode/decode level)":
     ]
     let root = createTempDir("io-mon-order", "")
     defer: removeDir(root)
-    let depfile = root / "seq.rdep"
+    let depfile = root / "seq.iomon"
     writeCanonical(depfile, recs)
     let dep = readMonitorDepFile(depfile)
     var seqs: seq[uint64]

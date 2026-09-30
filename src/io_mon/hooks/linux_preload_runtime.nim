@@ -5,6 +5,9 @@ import std/[algorithm, locks, os, strutils]
 
 import stackable_hooks/platform/linux_preload
 import stackable_hooks/platform/linux_raw_syscalls
+import ./linux_mapping_policy
+
+export linux_mapping_policy
 
 const linuxPreloadBackend* = "stackable_hooks/platform/linux_preload"
 const
@@ -134,6 +137,30 @@ type
     fd*: cint
     address*: pointer
     addrLen*: uint32
+    result*: cint
+    nextIndex: int
+
+  PipeContext* = object
+    ## IM-3 — `pipe(2)`. `fds` points at the caller's `int[2]`, filled by the
+    ## real call; a hook reads it only AFTER `callNext`/`callReal` returns 0.
+    fds*: ptr cint
+    result*: cint
+    nextIndex: int
+
+  Pipe2Context* = object
+    ## IM-3 — `pipe2(2)`. Separate from `PipeContext` because the extra `flags`
+    ## argument is part of the ABI; the observation logic is identical.
+    fds*: ptr cint
+    flags*: cint
+    result*: cint
+    nextIndex: int
+
+  SocketpairContext* = object
+    ## IM-3 — `socketpair(2)`. `sv` points at the caller's `int[2]`.
+    domain*: cint
+    typ*: cint
+    protocol*: cint
+    sv*: ptr cint
     result*: cint
     nextIndex: int
 
@@ -288,6 +315,28 @@ type
     result*: clong
     nextIndex: int
 
+  LinuxEntropySource* = enum
+    ## The libc entropy entry points hooked BESIDES `getrandom` (which keeps its
+    ## own context because it has three distinct entry paths: libc symbol, raw
+    ## syscall and vDSO). The enum's string values are the exact names that go
+    ## into the `mrNonDeterministic` record's `path`, so the recorded identity
+    ## cannot drift from the symbol that was hooked.
+    lesGetentropy = "getentropy"
+    lesArc4random = "arc4random"
+    lesArc4randomBuf = "arc4random_buf"
+    lesArc4randomUniform = "arc4random_uniform"
+
+  EntropyContext* = object
+    ## One context for all four sources: they differ only in which fields are
+    ## meaningful, and a hook that only records evidence reads `source` alone.
+    source*: LinuxEntropySource
+    buf*: pointer         ## getentropy / arc4random_buf destination
+    length*: csize_t      ## getentropy / arc4random_buf byte count
+    upper*: cuint         ## arc4random_uniform exclusive bound
+    value*: cuint         ## arc4random / arc4random_uniform RESULT
+    result*: cint         ## getentropy RESULT (0 on success, -1 on failure)
+    nextIndex: int
+
   ForkContext* = object
     result*: PidT
     nextIndex: int
@@ -352,6 +401,9 @@ type
   FreadHook* = proc(ctx: var FreadContext) {.raises: [].}
   FcloseHook* = proc(ctx: var FcloseContext) {.raises: [].}
   ConnectHook* = proc(ctx: var ConnectContext) {.raises: [].}
+  PipeHook* = proc(ctx: var PipeContext) {.raises: [].}
+  Pipe2Hook* = proc(ctx: var Pipe2Context) {.raises: [].}
+  SocketpairHook* = proc(ctx: var SocketpairContext) {.raises: [].}
   SendfileHook* = proc(ctx: var SendfileContext) {.raises: [].}
   CopyFileRangeHook* = proc(ctx: var CopyFileRangeContext) {.raises: [].}
   SpliceHook* = proc(ctx: var SpliceContext) {.raises: [].}
@@ -373,6 +425,7 @@ type
   GettimeofdayHook* = proc(ctx: var GettimeofdayContext) {.raises: [].}
   TimeHook* = proc(ctx: var TimeContext) {.raises: [].}
   GetrandomHook* = proc(ctx: var GetrandomContext) {.raises: [].}
+  EntropyHook* = proc(ctx: var EntropyContext) {.raises: [].}
   ForkHook* = proc(ctx: var ForkContext) {.raises: [].}
   ExecveHook* = proc(ctx: var ExecveContext) {.raises: [].}
   PosixSpawnHook* = proc(ctx: var PosixSpawnContext) {.raises: [].}
@@ -428,6 +481,15 @@ type
   ConnectHookEntry = object
     priority: int
     callback: ConnectHook
+  PipeHookEntry = object
+    priority: int
+    callback: PipeHook
+  Pipe2HookEntry = object
+    priority: int
+    callback: Pipe2Hook
+  SocketpairHookEntry = object
+    priority: int
+    callback: SocketpairHook
   SendfileHookEntry = object
     priority: int
     callback: SendfileHook
@@ -491,6 +553,9 @@ type
   GetrandomHookEntry = object
     priority: int
     callback: GetrandomHook
+  EntropyHookEntry = object
+    priority: int
+    callback: EntropyHook
   ForkHookEntry = object
     priority: int
     callback: ForkHook
@@ -511,9 +576,12 @@ type
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <link.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -549,6 +617,9 @@ typedef void *(*ct_fopen_hook_fn)(char *, char *);
 typedef size_t (*ct_fread_hook_fn)(void *, size_t, size_t, void *);
 typedef int (*ct_fclose_hook_fn)(void *);
 typedef int (*ct_connect_hook_fn)(int, void *, unsigned int);
+typedef int (*ct_pipe_hook_fn)(void *);
+typedef int (*ct_pipe2_hook_fn)(void *, int);
+typedef int (*ct_socketpair_hook_fn)(int, int, int, void *);
 typedef ssize_like_t (*ct_sendfile_hook_fn)(int, int, void *, size_t);
 typedef ssize_like_t (*ct_copy_file_range_hook_fn)(int, void *, int, void *,
                                                    size_t, unsigned int);
@@ -573,6 +644,17 @@ typedef int (*ct_clock_gettime_hook_fn)(int, void *);
 typedef int (*ct_gettimeofday_hook_fn)(void *, void *);
 typedef long (*ct_time_hook_fn)(void *);
 typedef ssize_like_t (*ct_getrandom_hook_fn)(void *, size_t, unsigned int);
+/* ENTROPY-PARITY — glibc >= 2.36 exports the BSD entropy set
+   (getentropy since 2.25; arc4random/arc4random_buf/arc4random_uniform since
+   2.36) and real programs use it in preference to getrandom(2). The macOS shim
+   has always recorded these APIs; Linux hooked only getrandom, so the SAME
+   program was flagged as an entropy consumer on macOS and invisible here.
+   They are hooked as four distinct symbols (not folded into getrandom) so the
+   record names the API the program actually called. */
+typedef int (*ct_getentropy_hook_fn)(void *, size_t);
+typedef unsigned int (*ct_arc4random_hook_fn)(void);
+typedef void (*ct_arc4random_buf_hook_fn)(void *, size_t);
+typedef unsigned int (*ct_arc4random_uniform_hook_fn)(unsigned int);
 typedef pid_t (*ct_fork_hook_fn)(void);
 typedef int (*ct_execve_hook_fn)(char *, char **, char **);
 typedef int (*ct_posix_spawn_hook_fn)(pid_t *, char *, void *, void *,
@@ -596,6 +678,9 @@ typedef FILE *(*ct_fopen_real_fn)(const char *, const char *);
 typedef size_t (*ct_fread_real_fn)(void *, size_t, size_t, FILE *);
 typedef int (*ct_fclose_real_fn)(FILE *);
 typedef int (*ct_connect_real_fn)(int, const struct sockaddr *, socklen_t);
+typedef int (*ct_pipe_real_fn)(int *);
+typedef int (*ct_pipe2_real_fn)(int *, int);
+typedef int (*ct_socketpair_real_fn)(int, int, int, int *);
 typedef ssize_t (*ct_sendfile_real_fn)(int, int, off_t *, size_t);
 typedef ssize_t (*ct_copy_file_range_real_fn)(int, off64_t *, int, off64_t *,
                                               size_t, unsigned int);
@@ -621,6 +706,10 @@ typedef int (*ct_clock_gettime_real_fn)(clockid_t, struct timespec *);
 typedef int (*ct_gettimeofday_real_fn)(struct timeval *, void *);
 typedef time_t (*ct_time_real_fn)(time_t *);
 typedef ssize_t (*ct_getrandom_real_fn)(void *, size_t, unsigned int);
+typedef int (*ct_getentropy_real_fn)(void *, size_t);
+typedef unsigned int (*ct_arc4random_real_fn)(void);
+typedef void (*ct_arc4random_buf_real_fn)(void *, size_t);
+typedef unsigned int (*ct_arc4random_uniform_real_fn)(unsigned int);
 typedef pid_t (*ct_fork_real_fn)(void);
 typedef int (*ct_execve_real_fn)(const char *, char *const [], char *const []);
 typedef int (*ct_execvp_real_fn)(const char *, char *const []);
@@ -653,6 +742,9 @@ static ct_fopen_hook_fn ct_fopen64_hook = NULL;
 static ct_fread_hook_fn ct_fread_hook = NULL;
 static ct_fclose_hook_fn ct_fclose_hook = NULL;
 static ct_connect_hook_fn ct_connect_hook = NULL;
+static ct_pipe_hook_fn ct_pipe_hook = NULL;
+static ct_pipe2_hook_fn ct_pipe2_hook = NULL;
+static ct_socketpair_hook_fn ct_socketpair_hook = NULL;
 static ct_sendfile_hook_fn ct_sendfile_hook = NULL;
 static ct_copy_file_range_hook_fn ct_copy_file_range_hook = NULL;
 static ct_splice_hook_fn ct_splice_hook = NULL;
@@ -675,6 +767,10 @@ static ct_clock_gettime_hook_fn ct_clock_gettime_hook = NULL;
 static ct_gettimeofday_hook_fn ct_gettimeofday_hook = NULL;
 static ct_time_hook_fn ct_time_hook = NULL;
 static ct_getrandom_hook_fn ct_getrandom_hook = NULL;
+static ct_getentropy_hook_fn ct_getentropy_hook = NULL;
+static ct_arc4random_hook_fn ct_arc4random_hook = NULL;
+static ct_arc4random_buf_hook_fn ct_arc4random_buf_hook = NULL;
+static ct_arc4random_uniform_hook_fn ct_arc4random_uniform_hook = NULL;
 static ct_fork_hook_fn ct_fork_hook = NULL;
 static ct_execve_hook_fn ct_execve_hook = NULL;
 static ct_posix_spawn_hook_fn ct_posix_spawn_hook = NULL;
@@ -722,6 +818,9 @@ static ct_fopen_real_fn real_fopen64_ptr = NULL;
 static ct_fread_real_fn real_fread_ptr = NULL;
 static ct_fclose_real_fn real_fclose_ptr = NULL;
 static ct_connect_real_fn real_connect_ptr = NULL;
+static ct_pipe_real_fn real_pipe_ptr = NULL;
+static ct_pipe2_real_fn real_pipe2_ptr = NULL;
+static ct_socketpair_real_fn real_socketpair_ptr = NULL;
 static ct_sendfile_real_fn real_sendfile_ptr = NULL;
 static ct_copy_file_range_real_fn real_copy_file_range_ptr = NULL;
 static ct_splice_real_fn real_splice_ptr = NULL;
@@ -744,6 +843,10 @@ static ct_clock_gettime_real_fn real_clock_gettime_ptr = NULL;
 static ct_gettimeofday_real_fn real_gettimeofday_ptr = NULL;
 static ct_time_real_fn real_time_ptr = NULL;
 static ct_getrandom_real_fn real_getrandom_ptr = NULL;
+static ct_getentropy_real_fn real_getentropy_ptr = NULL;
+static ct_arc4random_real_fn real_arc4random_ptr = NULL;
+static ct_arc4random_buf_real_fn real_arc4random_buf_ptr = NULL;
+static ct_arc4random_uniform_real_fn real_arc4random_uniform_ptr = NULL;
 static ct_fork_real_fn real_fork_ptr = NULL;
 static ct_execve_real_fn real_execve_ptr = NULL;
 static ct_execvp_real_fn real_execvp_ptr = NULL;
@@ -763,8 +866,33 @@ static volatile unsigned long ct_inline_syscall_last_address_value = 0;
 
 extern void *stackable_linux_preload_resolve_next(const char *name);
 extern int stackable_linux_preload_hooks_allowed(void);
+extern int stackable_linux_preload_current_depth(void);
 extern void stackable_linux_preload_enter_hook(void);
 extern void stackable_linux_preload_exit_hook(void);
+/* The raw-syscall / INT3 substrate below lives in nim-stackable-hooks'
+ * ``platform/linux_raw_syscalls.nim``, whose entire ``{.emit.}`` body is
+ * guarded by ``when defined(linux) and defined(amd64)``. On any other Linux
+ * architecture NONE of these symbols exist, and the same module's
+ * ``linuxRawSyscallSupported()`` reports ``lrsUnsupportedArchitecture``.
+ *
+ * The Nim side of this file already honours that predicate:
+ * ``installRawSyscallWrapperPatch`` and ``installInlineSyscallPatches`` both
+ * return early when ``linuxRawSyscallSupported() != lrsOk``, so on aarch64 the
+ * substrate is never *used*. But a runtime guard does not stop the C below from
+ * being COMPILED and REFERENCING the symbols, and ``librepro_monitor_shim.so``
+ * is consumed via ``LD_PRELOAD`` — which binds every undefined symbol eagerly.
+ * The result on ``eph-linux-arm64`` was that the very first monitored process
+ * died before ``main``:
+ *
+ *   repro: symbol lookup error: .../build/lib/librepro_monitor_shim.so:
+ *     undefined symbol: stackable_linux_chain_sigtrap
+ *
+ * So the reference has to disappear at COMPILE time, not merely go untaken at
+ * run time. ``__x86_64__`` is the C-preprocessor spelling of Nim's ``amd64``
+ * define, keeping this guard byte-for-byte aligned with the producing module's.
+ * Every entry point the Nim ``importc``s below still exists on non-x86_64 — the
+ * stubs just never touch the absent substrate. */
+#if defined(__x86_64__)
 extern long stackable_linux_raw_syscall6(long nr, long a1, long a2, long a3,
                                          long a4, long a5, long a6);
 struct stackable_linux_syscall_regs {
@@ -783,6 +911,7 @@ extern int stackable_linux_write_syscall_result_to_ucontext(
     void *ucontext_ptr, long result, unsigned long resume_rip);
 extern int stackable_linux_chain_sigtrap(int signum, void *siginfo_ptr,
                                          void *ucontext_ptr);
+#endif /* __x86_64__ */
 
 /* Provided by shim/linux_preload.nim. Async-signal-safe: writes the
  * batched read frames + the pre-encoded committed marker via raw
@@ -875,6 +1004,7 @@ int ct_linux_inline_syscall_record_site(unsigned long address) {
   return 0;
 }
 
+#if defined(__x86_64__)
 static void ct_linux_inline_syscall_sigtrap_handler(
     int signum, siginfo_t *info, void *ucontext) {
   struct stackable_linux_syscall_regs regs;
@@ -933,6 +1063,15 @@ static void ct_linux_inline_syscall_sigtrap_handler(
 void *ct_linux_inline_syscall_handler_address(void) {
   return (void *)&ct_linux_inline_syscall_sigtrap_handler;
 }
+#else /* !__x86_64__ */
+/* No INT3 syscall-trap substrate on this architecture. Returning NULL is the
+ * value ``installInlineSyscallPatches`` already treats as "no handler" — it
+ * records ``lrsInvalidArgument`` and installs nothing. In practice that branch
+ * is unreachable because the caller bails on
+ * ``linuxRawSyscallSupported() != lrsOk`` first; this keeps the symbol defined
+ * so the Nim ``importc`` binding resolves. */
+void *ct_linux_inline_syscall_handler_address(void) { return NULL; }
+#endif /* __x86_64__ */
 
 long ct_linux_inline_syscall_site_count(void) {
   return (long)ct_inline_syscall_site_count_value;
@@ -958,12 +1097,48 @@ int ct_linux_inline_syscall_overflowed(void) {
   return ct_inline_syscall_overflow_value != 0;
 }
 
-#define CT_BYPASS() (!stackable_linux_preload_hooks_allowed())
+/* vfork shares TLS with its suspended parent. A successful exec never returns
+ * through CT_CALL_HOOK, leaving that parent's guard raised. Remember the
+ * guard depth before an exec dispatch and restore it when the parent resumes.
+ * Keep the guard during libc PATH lookup to suppress duplicate exec records.
+ * Only an outstanding exec bracket needs the live PID check. */
+static __thread pid_t ct_exec_guard_pid = 0;
+static __thread int ct_exec_guard_resume_depth = 0;
+
+static void ct_restore_vfork_exec_guard(void) {
+  if (ct_exec_guard_pid != 0 && ct_exec_guard_pid != getpid()) {
+    while (stackable_linux_preload_current_depth() > ct_exec_guard_resume_depth)
+      stackable_linux_preload_exit_hook();
+    ct_exec_guard_pid = 0;
+    ct_exec_guard_resume_depth = 0;
+  }
+}
+
+static int ct_preload_hooks_allowed(void) {
+  ct_restore_vfork_exec_guard();
+  return stackable_linux_preload_hooks_allowed();
+}
+
+#define CT_BYPASS() (!ct_preload_hooks_allowed())
 #define CT_CALL_HOOK(expr) ({ \
   stackable_linux_preload_enter_hook(); \
   __typeof__(expr) _ct_result = (expr); \
   stackable_linux_preload_exit_hook(); \
   _ct_result; \
+})
+
+#define CT_CALL_EXEC_HOOK(expr) ({ \
+  ct_restore_vfork_exec_guard(); \
+  pid_t _ct_previous_exec_pid = ct_exec_guard_pid; \
+  int _ct_previous_exec_depth = ct_exec_guard_resume_depth; \
+  if (ct_exec_guard_pid == 0) { \
+    ct_exec_guard_pid = getpid(); \
+    ct_exec_guard_resume_depth = stackable_linux_preload_current_depth(); \
+  } \
+  __typeof__(expr) _ct_exec_result = CT_CALL_HOOK(expr); \
+  ct_exec_guard_pid = _ct_previous_exec_pid; \
+  ct_exec_guard_resume_depth = _ct_previous_exec_depth; \
+  _ct_exec_result; \
 })
 
 static int ct_starts_with(const char *value, const char *prefix) {
@@ -1178,6 +1353,9 @@ void ct_linux_preload_register_fopen64_hook(ct_fopen_hook_fn hook) { ct_fopen64_
 void ct_linux_preload_register_fread_hook(ct_fread_hook_fn hook) { ct_fread_hook = hook; }
 void ct_linux_preload_register_fclose_hook(ct_fclose_hook_fn hook) { ct_fclose_hook = hook; }
 void ct_linux_preload_register_connect_hook(ct_connect_hook_fn hook) { ct_connect_hook = hook; }
+void ct_linux_preload_register_pipe_hook(ct_pipe_hook_fn hook) { ct_pipe_hook = hook; }
+void ct_linux_preload_register_pipe2_hook(ct_pipe2_hook_fn hook) { ct_pipe2_hook = hook; }
+void ct_linux_preload_register_socketpair_hook(ct_socketpair_hook_fn hook) { ct_socketpair_hook = hook; }
 void ct_linux_preload_register_sendfile_hook(ct_sendfile_hook_fn hook) { ct_sendfile_hook = hook; }
 void ct_linux_preload_register_copy_file_range_hook(ct_copy_file_range_hook_fn hook) { ct_copy_file_range_hook = hook; }
 void ct_linux_preload_register_splice_hook(ct_splice_hook_fn hook) { ct_splice_hook = hook; }
@@ -1200,6 +1378,10 @@ void ct_linux_preload_register_clock_gettime_hook(ct_clock_gettime_hook_fn hook)
 void ct_linux_preload_register_gettimeofday_hook(ct_gettimeofday_hook_fn hook) { ct_gettimeofday_hook = hook; }
 void ct_linux_preload_register_time_hook(ct_time_hook_fn hook) { ct_time_hook = hook; }
 void ct_linux_preload_register_getrandom_hook(ct_getrandom_hook_fn hook) { ct_getrandom_hook = hook; }
+void ct_linux_preload_register_getentropy_hook(ct_getentropy_hook_fn hook) { ct_getentropy_hook = hook; }
+void ct_linux_preload_register_arc4random_hook(ct_arc4random_hook_fn hook) { ct_arc4random_hook = hook; }
+void ct_linux_preload_register_arc4random_buf_hook(ct_arc4random_buf_hook_fn hook) { ct_arc4random_buf_hook = hook; }
+void ct_linux_preload_register_arc4random_uniform_hook(ct_arc4random_uniform_hook_fn hook) { ct_arc4random_uniform_hook = hook; }
 void ct_linux_preload_register_fork_hook(ct_fork_hook_fn hook) { ct_fork_hook = hook; }
 void ct_linux_preload_register_execve_hook(ct_execve_hook_fn hook) { ct_execve_hook = hook; }
 void ct_linux_preload_register_posix_spawn_hook(ct_posix_spawn_hook_fn hook) { ct_posix_spawn_hook = hook; }
@@ -1216,9 +1398,51 @@ void ct_linux_preload_real_exit(int status) {
   __builtin_unreachable();
 }
 
+/* Raw (un-interposed) syscall entry. On x86_64 this is nim-stackable-hooks'
+ * hand-written ``syscall`` instruction wrapper, which returns the kernel's
+ * ``-errno`` convention directly. On other architectures that substrate does
+ * not exist (see the ``__x86_64__`` note above the extern block), so fall back
+ * to libc ``syscall(2)`` and re-encode its ``-1``/``errno`` convention into the
+ * kernel convention the callers below expect.
+ *
+ * It must NOT fall back to libc ``syscall(2)``. ``shim/linux_preload.nim``
+ * DEFINES ``long syscall(long, ...)`` with default visibility -- that is the
+ * LD_PRELOAD interposer for libc's ``syscall``. Since this shim is preloaded it
+ * is first in the lookup scope, so a call to ``syscall`` from anywhere inside
+ * it binds back to that interposer: unbounded recursion in every monitored
+ * process. The non-amd64 arm therefore issues the syscall instruction directly,
+ * exactly as nim-stackable-hooks does for x86_64.
+ *
+ * aarch64 Linux ABI: number in x8, args in x0-x5, ``svc #0``, result in x0
+ * under the kernel ``-errno`` convention -- which is already the convention the
+ * callers below test against, so there is nothing to re-encode. */
+static long ct_raw_syscall6(long nr, long a1, long a2, long a3, long a4,
+                            long a5, long a6) {
+#if defined(__x86_64__)
+  return stackable_linux_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
+#elif defined(__aarch64__)
+  register long x8 __asm__("x8") = nr;
+  register long x0 __asm__("x0") = a1;
+  register long x1 __asm__("x1") = a2;
+  register long x2 __asm__("x2") = a3;
+  register long x3 __asm__("x3") = a4;
+  register long x4 __asm__("x4") = a5;
+  register long x5 __asm__("x5") = a6;
+  __asm__ volatile("svc #0"
+                   : "+r"(x0)
+                   : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+                   : "memory", "cc");
+  return x0;
+#else
+#error "io-mon: no raw syscall primitive for this architecture. Add one here \
+rather than routing through libc syscall(2) -- this shim interposes that \
+symbol, so calling it would recurse forever."
+#endif
+}
+
 static long ct_linux_preload_raw_syscall6(long nr, long a1, long a2, long a3,
                                           long a4, long a5, long a6) {
-  long result = stackable_linux_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
+  long result = ct_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
   if (result < 0 && result >= -4095) {
     errno = (int)-result;
     return -1;
@@ -1231,7 +1455,7 @@ long ct_linux_preload_syscall_replacement(long nr, long a1, long a2, long a3,
     __attribute__((visibility("default")));
 long ct_linux_preload_syscall_replacement(long nr, long a1, long a2, long a3,
                                           long a4, long a5, long a6) {
-  long result = stackable_linux_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
+  long result = ct_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
   if (!CT_BYPASS() && ct_raw_syscall_hook != NULL) {
     CT_CALL_HOOK((ct_raw_syscall_hook(nr, a1, a2, a3, a4, a5, a6, result,
                                       CT_RAW_SYSCALL_SOURCE_LIBC), 0));
@@ -1346,14 +1570,45 @@ int ct_linux_preload_real_close(int fd) {
   return real_close_ptr(fd);
 }
 
+/* Before glibc 2.33 the public stat/lstat entrypoints were header wrappers
+ * around __xstat/__lxstat, not dynamically exported symbols. Newer build
+ * headers no longer define _STAT_VER. Preserve the host libc's struct stat
+ * ABI when forwarding into an older runtime. See glibc 2.31's
+ * sysdeps/unix/sysv/linux/{x86,generic}/bits/stat.h. */
+#if defined(_STAT_VER)
+#define CT_STAT_VER _STAT_VER
+#elif defined(__x86_64__)
+#define CT_STAT_VER 1
+#elif defined(__aarch64__)
+#define CT_STAT_VER 0
+#endif
+
 int ct_linux_preload_real_stat(char *path, void *buf) {
-  CT_REAL("stat", real_stat_ptr, ct_stat_real_fn);
-  return real_stat_ptr(path, (struct stat *)buf);
+  if (real_stat_ptr == NULL)
+    real_stat_ptr = (ct_stat_real_fn)ct_resolve("stat");
+  if (real_stat_ptr != NULL) return real_stat_ptr(path, (struct stat *)buf);
+#ifdef CT_STAT_VER
+  if (real_xstat_ptr == NULL)
+    real_xstat_ptr = (ct_xstat_real_fn)ct_resolve("__xstat");
+  if (real_xstat_ptr != NULL)
+    return real_xstat_ptr(CT_STAT_VER, path, (struct stat *)buf);
+#endif
+  errno = ENOSYS;
+  return -1;
 }
 
 int ct_linux_preload_real_lstat(char *path, void *buf) {
-  CT_REAL("lstat", real_lstat_ptr, ct_stat_real_fn);
-  return real_lstat_ptr(path, (struct stat *)buf);
+  if (real_lstat_ptr == NULL)
+    real_lstat_ptr = (ct_stat_real_fn)ct_resolve("lstat");
+  if (real_lstat_ptr != NULL) return real_lstat_ptr(path, (struct stat *)buf);
+#ifdef CT_STAT_VER
+  if (real_lxstat_ptr == NULL)
+    real_lxstat_ptr = (ct_xstat_real_fn)ct_resolve("__lxstat");
+  if (real_lxstat_ptr != NULL)
+    return real_lxstat_ptr(CT_STAT_VER, path, (struct stat *)buf);
+#endif
+  errno = ENOSYS;
+  return -1;
 }
 
 void *ct_linux_preload_real_opendir(char *path) {
@@ -1402,6 +1657,26 @@ int ct_linux_preload_real_fclose(void *stream) {
 int ct_linux_preload_real_connect(int fd, void *addr, unsigned int addrlen) {
   CT_REAL("connect", real_connect_ptr, ct_connect_real_fn);
   return real_connect_ptr(fd, (const struct sockaddr *)addr, (socklen_t)addrlen);
+}
+
+/* IM-3 — genuine entries for the local-IPC-fd CREATE hooks. `pipe`/`pipe2`/
+   `socketpair` are thin libc wrappers, but they are resolved through the same
+   `ct_resolve` next-object walk as every other real forwarder so the shim never
+   re-enters its own interposed symbol. */
+int ct_linux_preload_real_pipe(void *fds) {
+  CT_REAL("pipe", real_pipe_ptr, ct_pipe_real_fn);
+  return real_pipe_ptr((int *)fds);
+}
+
+int ct_linux_preload_real_pipe2(void *fds, int flags) {
+  CT_REAL("pipe2", real_pipe2_ptr, ct_pipe2_real_fn);
+  return real_pipe2_ptr((int *)fds, flags);
+}
+
+int ct_linux_preload_real_socketpair(int domain, int type, int protocol,
+                                     void *sv) {
+  CT_REAL("socketpair", real_socketpair_ptr, ct_socketpair_real_fn);
+  return real_socketpair_ptr(domain, type, protocol, (int *)sv);
 }
 
 ssize_like_t ct_linux_preload_real_sendfile(int out_fd, int in_fd, void *offset,
@@ -1471,13 +1746,422 @@ void *ct_linux_preload_real_dlmopen(long namespace_id, char *path, int flags) {
   return real_dlmopen_ptr((Lmid_t)namespace_id, path, flags);
 }
 
+/* --- Monitor transparency: caller-scoped dlopen soname resolution -----------
+ *
+ * The shim interposes dlopen and forwards the real call to
+ * dlsym(RTLD_NEXT, "dlopen"). glibc attributes the CALLING object by the
+ * return address at the real dlopen call site — which is inside THIS shim —
+ * and therefore resolves a bare-soname dlopen("libfoo.so.N") against the
+ * SHIM's DT_RPATH/DT_RUNPATH instead of the monitored caller's. A program
+ * that dlopens a library by soname relying on its OWN DT_RUNPATH then gets a
+ * silent ENOENT under monitoring. That is a transparency violation: the
+ * monitor must not change how the target resolves libraries.
+ *
+ * Fix: before entering the real dlopen, replicate glibc's caller-scoped
+ * search order for a bare soname (no '/') using the ORIGINAL caller's
+ * link_map (found from the wrapper's __builtin_return_address(0)):
+ *   1. caller DT_RPATH   (only when the caller has NO DT_RUNPATH)
+ *   2. LD_LIBRARY_PATH
+ *   3. caller DT_RUNPATH
+ * On a hit we hand the real dlopen an ABSOLUTE path, which glibc loads
+ * verbatim independent of any object's search list. On a miss we return the
+ * soname UNCHANGED so glibc's own ld.so.cache + default-path fallback (both
+ * caller-independent) still apply. Any failure falls back to unmodified
+ * behavior. $ORIGIN is expanded; $LIB / $PLATFORM dirs are left to glibc. */
+
+static const char *ct_dlopen_dyn_paths(struct link_map *lm,
+                                       const char **rpath,
+                                       const char **runpath) {
+  /* Extract the DT_RPATH / DT_RUNPATH strings for `lm` by walking its dynamic
+     section (lm->l_ld). The PUBLIC struct link_map does NOT expose glibc's
+     private l_info[] array, so we scan l_ld directly. On x86_64 glibc
+     (!DL_RO_DYN_SECTION) the loader relocates DT_STRTAB's d_ptr in place, so
+     it is an absolute pointer; DT_RPATH/DT_RUNPATH carry byte offsets into it.
+     Returns the strtab base (or NULL) and sets *rpath / *runpath. */
+  *rpath = NULL;
+  *runpath = NULL;
+  if (lm == NULL || lm->l_ld == NULL) return NULL;
+  const char *strtab = NULL;
+  ElfW(Sxword) rpath_off = -1, runpath_off = -1;
+  for (ElfW(Dyn) *d = lm->l_ld; d->d_tag != DT_NULL; d++) {
+    switch (d->d_tag) {
+      case DT_STRTAB:  strtab = (const char *)d->d_un.d_ptr; break;
+      case DT_RPATH:   rpath_off = (ElfW(Sxword))d->d_un.d_val; break;
+      case DT_RUNPATH: runpath_off = (ElfW(Sxword))d->d_un.d_val; break;
+      default: break;
+    }
+  }
+  if (strtab == NULL) return NULL;
+  if (rpath_off >= 0) *rpath = strtab + rpath_off;
+  if (runpath_off >= 0) *runpath = strtab + runpath_off;
+  return strtab;
+}
+
+static int ct_dlopen_origin_dir(struct link_map *lm, char *out, size_t cap) {
+  /* Directory used to expand $ORIGIN for object `lm`: dirname(l_name) for a
+     normal library, or dirname(readlink("/proc/self/exe")) for the main
+     executable (l_name == ""). Returns 1 on success. */
+  char path[PATH_MAX];
+  const char *src = NULL;
+  if (lm != NULL && lm->l_name != NULL && lm->l_name[0] != '\0') {
+    src = lm->l_name;
+  } else {
+    ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (n <= 0) return 0;
+    path[n] = '\0';
+    src = path;
+  }
+  size_t len = strlen(src);
+  while (len > 0 && src[len - 1] != '/') len--;
+  if (len == 0) { if (cap < 2) return 0; out[0] = '.'; out[1] = '\0'; return 1; }
+  size_t copy = (len > 1) ? len - 1 : len; /* strip trailing '/', keep root */
+  if (copy >= cap) return 0;
+  memcpy(out, src, copy);
+  out[copy] = '\0';
+  return 1;
+}
+
+static int ct_dlopen_try_dir(const char *dir, size_t dirlen,
+                             const char *soname, const char *origin,
+                             char *out, size_t cap) {
+  /* Expand $ORIGIN in `dir`; on an unsupported token ($LIB/$PLATFORM/unknown)
+     return 0 (skip). Then test "dir/soname" for existence; on a hit copy the
+     full path into `out` and return 1. */
+  char expanded[PATH_MAX];
+  size_t pos = 0, i = 0;
+  while (i < dirlen) {
+    if (dir[i] == '$') {
+      const char *tok = dir + i + 1;
+      size_t rem = dirlen - i - 1;
+      int brace = 0;
+      if (rem > 0 && *tok == '{') { brace = 1; tok++; rem--; }
+      if (rem >= 6 && strncmp(tok, "ORIGIN", 6) == 0) {
+        size_t olen = strlen(origin);
+        if (pos + olen >= sizeof(expanded)) return 0;
+        memcpy(expanded + pos, origin, olen); pos += olen;
+        i += 1 + (brace ? 1 : 0) + 6 + (brace ? 1 : 0);
+        continue;
+      }
+      return 0; /* $LIB / $PLATFORM / unknown — unsupported; skip this dir. */
+    }
+    if (pos + 1 >= sizeof(expanded)) return 0;
+    expanded[pos++] = dir[i++];
+  }
+  expanded[pos] = '\0';
+  if (pos == 0) return 0;
+  int n = snprintf(out, cap, "%s/%s", expanded, soname);
+  if (n < 0 || (size_t)n >= cap) return 0;
+  if (access(out, F_OK) != 0) return 0;
+  return 1;
+}
+
+static int ct_dlopen_search_list(const char *list, const char *soname,
+                                 const char *origin, char *out, size_t cap) {
+  /* First existing "dir/soname" across a colon-separated dir list wins. */
+  if (list == NULL) return 0;
+  const char *p = list;
+  while (*p) {
+    const char *sep = strchr(p, ':');
+    size_t len = sep ? (size_t)(sep - p) : strlen(p);
+    if (len > 0 && ct_dlopen_try_dir(p, len, soname, origin, out, cap))
+      return 1;
+    if (!sep) break;
+    p = sep + 1;
+  }
+  return 0;
+}
+
+const char *ct_linux_preload_resolve_dlopen_caller_path(const char *path,
+                                                        void *caller) {
+  static __thread char resolved[PATH_MAX];
+  if (path == NULL || strchr(path, '/') != NULL || caller == NULL)
+    return path;
+  /* Suppress our own interposed hooks (getenv/access/readlink) during
+     resolution so it neither recurses nor records spurious dependencies. */
+  stackable_linux_preload_enter_hook();
+  const char *out = path;
+  Dl_info info;
+  struct link_map *lm = NULL;
+  if (dladdr1(caller, &info, (void **)&lm, RTLD_DL_LINKMAP) != 0 &&
+      lm != NULL) {
+    char origin[PATH_MAX];
+    if (!ct_dlopen_origin_dir(lm, origin, sizeof(origin)))
+      origin[0] = '\0';
+    const char *rpath = NULL;
+    const char *runpath = NULL;
+    ct_dlopen_dyn_paths(lm, &rpath, &runpath);
+    /* glibc honors DT_RPATH only when DT_RUNPATH is absent. */
+    if (runpath == NULL && rpath != NULL &&
+        ct_dlopen_search_list(rpath, path, origin, resolved, sizeof(resolved)))
+      out = resolved;
+    else if (ct_dlopen_search_list(getenv("LD_LIBRARY_PATH"), path, origin,
+                                   resolved, sizeof(resolved)))
+      out = resolved;
+    else if (runpath != NULL &&
+             ct_dlopen_search_list(runpath, path, origin, resolved,
+                                   sizeof(resolved)))
+      out = resolved;
+  }
+  stackable_linux_preload_exit_hook();
+  return out;
+}
+
+/* ---------------------------------------------------------------------------
+ * LIBRARY-LOAD OBSERVATION — ask the loader, do not interpose it.
+ *
+ * THE DEFECT THIS CLOSES. ld.so maps a shared object with its own internal
+ * __mmap / __open64_nocancel calls, which do NOT traverse LD_PRELOAD
+ * symbol interposition. So none of this shim's open/openat/mmap hooks
+ * ever fire for a loader-driven load, and the runtime shared-library closure of
+ * a monitored process was captured NOWHERE. Measured on this repo before the
+ * fix: a monitored gcc -c loads ten shared objects (libisl, libmpfr, libmpc,
+ * libgmp, libbfd, libz, libsframe, libc, libdl, libm — strace -f ground
+ * truth) and the depfile contained ZERO .so paths while reporting
+ * completeness=mcComplete. An in-place upgrade of any of those libraries
+ * changes what the compiler DOES and busts nothing: a content-addressed
+ * consumer serves a stale result. That is the cardinal sin.
+ *
+ * WHY dl_iterate_phdr AND NOT AN EVENT HOOK. The macOS shim already solved the
+ * same problem the right way: _dyld_register_func_for_add_image asks dyld for
+ * its image set instead of hooking the calls that produce it. dl_iterate_phdr
+ * is the Linux equivalent — it walks the loader's OWN link map, so what it
+ * reports is what the loader actually has, regardless of which code path put it
+ * there. Three consequences matter:
+ *
+ *   1. It is STATE, not EVENTS. Objects mapped before this shim's constructor
+ *      ran — every DT_NEEDED of the executable, every other LD_PRELOAD, the
+ *      loader itself — are all visible at the first scan, because ld.so maps
+ *      the entire initial closure BEFORE running any ELF initializer. An
+ *      event hook can only ever see what happens after it is installed; a
+ *      state scan sees what is there. This is what makes "loaded before we
+ *      were initialised" a covered case rather than a hole.
+ *   2. It cannot perturb. It resolves nothing, opens nothing, and returns the
+ *      loader's already-resolved dlpi_name. Contrast the interposed dlopen
+ *      immediately below, which had to be taught to reconstruct the caller's
+ *      RUNPATH precisely because interposing a resolution path CHANGES it.
+ *   3. It is not privileged and adds no process. LD_AUDIT's la_objopen sees
+ *      strictly more (it fires for loader-internal __libc_dlopen_mode too),
+ *      but an audit library is loaded into its OWN link-map namespace with its
+ *      own libc, so it cannot share this shim's recording state and would have
+ *      to attach to the shm transport independently — a second injected copy of
+ *      io-mon in every monitored process. That cost buys coverage of a case
+ *      this design DETECTS instead (see the accounting below), so it stays the
+ *      documented future direction, not this change.
+ *
+ * THE ACCOUNTING — why sampling is honest here. Scanning at chosen points
+ * would normally leave the question "what about a library loaded and unloaded
+ * BETWEEN two scans?" unanswerable, and an unanswerable question about input
+ * coverage must not be answered with mcComplete. struct dl_phdr_info
+ * carries dlpi_adds and dlpi_subs: the loader's own cumulative counts of
+ * objects added and removed. That turns the question into arithmetic. Between
+ * two scans, adds - lastAdds reports load operations. Scans immediately before
+ * and after interposed loader calls distinguish ordinary unload/reload cycles:
+ * a reloaded object appears in the current link map relative to the pre-call
+ * snapshot. A short newly-active count plus an unload therefore identifies a
+ * load that may have disappeared without a scan and requires a downgrade.
+ *
+ * SAFETY. The dl_iterate_phdr callback runs with the loader's
+ * dl_load_write_lock held. It therefore does only memcpy into a
+ * preallocated buffer: no allocation, no Nim, no locks, no recording. The sink
+ * — which allocates and records — is invoked AFTER dl_iterate_phdr returns
+ * and the loader lock is released. (This is stricter than the macOS arm, which
+ * records from inside dyld's add-image callback; on glibc a shim hook can
+ * allocate while the loader lock is held, so the lock-ordering risk is real
+ * enough to design out rather than argue about.)
+ *
+ * The snapshot buffer is a single static, and callers serialise scans, so
+ * there is no per-scan allocation on any path. Overflowing it is treated as an
+ * observation failure, not silently truncated.
+ * ------------------------------------------------------------------------- */
+#define CT_LL_MAX_OBJECTS 512
+#define CT_LL_NAME_BYTES (128 * 1024)
+#define CT_LL_SEEN_MAX 2048
+#define CT_LL_SEEN_NAME_BYTES (256 * 1024)
+
+typedef void (*ct_ll_sink_fn)(char *name, unsigned long address, char *reason);
+
+typedef struct {
+  unsigned long long adds;
+  unsigned long long subs;
+  int counters_valid;
+  int count;
+  int overflow;
+  unsigned long addrs[CT_LL_MAX_OBJECTS];
+  int name_off[CT_LL_MAX_OBJECTS];
+  int name_used;
+  char names[CT_LL_NAME_BYTES];
+} ct_ll_snapshot;
+
+static ct_ll_snapshot ct_ll_snap;
+
+/* The PERSISTENT state -- the set of link-map entries already enumerated, and
+   the loader's cumulative load/unload counts as of the previous scan -- live
+   HERE, in C, and not in a Nim seq.
+   That is not a style preference. A scan can run on ANY thread (the interposed
+   dlopen fires on whichever thread called it), so a Nim heap object that
+   survives between scans would be allocated on one thread and freed or grown on
+   another. That is precisely the FUP-C/FUP-H mechanism documented at the top of
+   linux_preload.nim: an ORC chunk allocated on one thread and released on
+   another corrupts the process allocator, and it crashed live-Vulkan replay in
+   rawDealloc off updateFdPath. Keeping this state POD and C-owned removes the
+   class rather than hoping the lock is enough -- the lock orders the accesses,
+   it does not make the allocator cross-thread safe.
+   Nim still allocates per RECORD, but those temporaries are created and
+   released on the same thread inside one sink call, exactly like every other
+   hook. */
+static unsigned long ct_ll_seen_addr[CT_LL_SEEN_MAX];
+static int ct_ll_seen_off[CT_LL_SEEN_MAX];
+static char ct_ll_seen_names[CT_LL_SEEN_NAME_BYTES];
+static int ct_ll_seen_count;
+static int ct_ll_seen_used;
+static unsigned long ct_ll_active_addr[CT_LL_MAX_OBJECTS];
+static int ct_ll_active_off[CT_LL_MAX_OBJECTS];
+static char ct_ll_active_names[CT_LL_NAME_BYTES];
+static int ct_ll_active_count;
+static unsigned long long ct_ll_last_adds;
+static unsigned long long ct_ll_last_subs;
+
+static int ct_ll_collect(struct dl_phdr_info *info, size_t size, void *data) {
+  ct_ll_snapshot *s = (ct_ll_snapshot *)data;
+  const char *name;
+  size_t len;
+  /* dlpi_adds/dlpi_subs are a later addition to the struct; a runtime whose
+     struct stops short of them leaves counters_valid at 0, and the caller then
+     treats coverage as UNPROVEN rather than assuming the counters were zero. */
+  if (size >= offsetof(struct dl_phdr_info, dlpi_subs) +
+                  sizeof(info->dlpi_subs)) {
+    s->adds = (unsigned long long)info->dlpi_adds;
+    s->subs = (unsigned long long)info->dlpi_subs;
+    s->counters_valid = 1;
+  }
+  if (s->count >= CT_LL_MAX_OBJECTS) {
+    s->overflow = 1;
+    return 0;
+  }
+  name = (info->dlpi_name != NULL) ? info->dlpi_name : "";
+  len = strlen(name);
+  if (s->name_used + (int)len + 1 > CT_LL_NAME_BYTES) {
+    s->overflow = 1;
+    return 0;
+  }
+  s->addrs[s->count] = (unsigned long)info->dlpi_addr;
+  s->name_off[s->count] = s->name_used;
+  memcpy(s->names + s->name_used, name, len + 1);
+  s->name_used += (int)len + 1;
+  s->count++;
+  return 0;
+}
+
+static int ct_ll_seen_has(unsigned long addr, const char *name) {
+  int i;
+  for (i = 0; i < ct_ll_seen_count; i++)
+    if (ct_ll_seen_addr[i] == addr &&
+        strcmp(ct_ll_seen_names + ct_ll_seen_off[i], name) == 0)
+      return 1;
+  return 0;
+}
+
+static int ct_ll_seen_add(unsigned long addr, const char *name) {
+  size_t len = strlen(name);
+  if (ct_ll_seen_count >= CT_LL_SEEN_MAX) return 0;
+  if (ct_ll_seen_used + (int)len + 1 > CT_LL_SEEN_NAME_BYTES) return 0;
+  ct_ll_seen_addr[ct_ll_seen_count] = addr;
+  ct_ll_seen_off[ct_ll_seen_count] = ct_ll_seen_used;
+  memcpy(ct_ll_seen_names + ct_ll_seen_used, name, len + 1);
+  ct_ll_seen_used += (int)len + 1;
+  ct_ll_seen_count++;
+  return 1;
+}
+
+static int ct_ll_active_has(unsigned long addr, const char *name) {
+  int i;
+  for (i = 0; i < ct_ll_active_count; i++)
+    if (ct_ll_active_addr[i] == addr &&
+        strcmp(ct_ll_active_names + ct_ll_active_off[i], name) == 0)
+      return 1;
+  return 0;
+}
+
+static void ct_ll_replace_active_snapshot(void) {
+  int i;
+  ct_ll_active_count = ct_ll_snap.count;
+  memcpy(ct_ll_active_names, ct_ll_snap.names, (size_t)ct_ll_snap.name_used);
+  for (i = 0; i < ct_ll_snap.count; i++) {
+    ct_ll_active_addr[i] = ct_ll_snap.addrs[i];
+    ct_ll_active_off[i] = ct_ll_snap.name_off[i];
+  }
+}
+
+/* Callers serialise scans with a lock on the Nim side, so no locking here. */
+int ct_linux_library_scan(ct_ll_sink_fn sink, char *reason,
+                          unsigned long long *performed,
+                          unsigned long long *removed, int *newly_active,
+                          int *newly_seen,
+                          int *counters_valid, int *overflow) {
+  int i, active_new = 0, seen_new = 0;
+  ct_ll_snap.count = 0;
+  ct_ll_snap.name_used = 0;
+  ct_ll_snap.overflow = 0;
+  ct_ll_snap.adds = 0;
+  ct_ll_snap.subs = 0;
+  ct_ll_snap.counters_valid = 0;
+  dl_iterate_phdr(ct_ll_collect, &ct_ll_snap);
+
+  /* Sink calls happen HERE, with the loader lock already released. */
+  for (i = 0; i < ct_ll_snap.count; i++) {
+    const char *name = ct_ll_snap.names + ct_ll_snap.name_off[i];
+    unsigned long addr = ct_ll_snap.addrs[i];
+    if (!ct_ll_active_has(addr, name)) active_new++;
+    if (ct_ll_seen_has(addr, name)) continue;
+    if (!ct_ll_seen_add(addr, name)) {
+      /* The seen-set is full: further entries cannot be tracked, so coverage
+         is no longer provable. Reported as an overflow, never truncated
+         silently. */
+      ct_ll_snap.overflow = 1;
+      break;
+    }
+    seen_new++;
+    if (sink != NULL) sink((char *)name, addr, reason);
+  }
+
+  if (performed != NULL) {
+    *performed = (ct_ll_snap.counters_valid && ct_ll_snap.adds >= ct_ll_last_adds)
+                     ? ct_ll_snap.adds - ct_ll_last_adds
+                     : 0;
+  }
+  if (removed != NULL) {
+    *removed = (ct_ll_snap.counters_valid && ct_ll_snap.subs >= ct_ll_last_subs)
+                   ? ct_ll_snap.subs - ct_ll_last_subs
+                   : 0;
+  }
+  if (ct_ll_snap.counters_valid && ct_ll_snap.adds >= ct_ll_last_adds)
+    ct_ll_last_adds = ct_ll_snap.adds;
+  if (ct_ll_snap.counters_valid && ct_ll_snap.subs >= ct_ll_last_subs)
+    ct_ll_last_subs = ct_ll_snap.subs;
+  if (!ct_ll_snap.overflow) ct_ll_replace_active_snapshot();
+  if (newly_active != NULL) *newly_active = active_new;
+  if (newly_seen != NULL) *newly_seen = seen_new;
+  if (counters_valid != NULL) *counters_valid = ct_ll_snap.counters_valid;
+  if (overflow != NULL) *overflow = ct_ll_snap.overflow;
+  return ct_ll_snap.count;
+}
+
+#if defined(__aarch64__)
+#define CT_DLSYM_GLIBC_BASE "GLIBC_2.17"
+#else
+#define CT_DLSYM_GLIBC_BASE "GLIBC_2.2.5"
+#endif
+
 void *ct_linux_preload_real_dlsym(void *handle, char *name) {
 #ifdef __GLIBC__
   if (real_dlsym_ptr == NULL)
-    real_dlsym_ptr = (ct_dlsym_real_fn)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
-#endif
+    real_dlsym_ptr = (ct_dlsym_real_fn)dlvsym(RTLD_NEXT, "dlsym", CT_DLSYM_GLIBC_BASE);
+  /* Never retry through ct_resolve on glibc: that calls our interposed
+   * dlsym again. ARM64's baseline is 2.17, not x86_64's 2.2.5. */
+#else
   if (real_dlsym_ptr == NULL)
     real_dlsym_ptr = (ct_dlsym_real_fn)ct_resolve("dlsym");
+#endif
   if (real_dlsym_ptr == NULL) { errno = ENOSYS; return NULL; }
   return real_dlsym_ptr(handle, name);
 }
@@ -1551,6 +2235,81 @@ ssize_like_t ct_linux_preload_real_getrandom(void *buf, size_t buflen,
                                              unsigned int flags) {
   CT_REAL("getrandom", real_getrandom_ptr, ct_getrandom_real_fn);
   return (ssize_like_t)real_getrandom_ptr(buf, buflen, flags);
+}
+
+/* ENTROPY-PARITY forwarders.
+ *
+ * Each resolves the genuine libc entry with ct_resolve (dlsym(RTLD_NEXT)), so a
+ * program that supplies its own arc4random from a DSO loaded after the shim
+ * still reaches ITS implementation. If no successor definition exists at all,
+ * we fall back to real getrandom(2) rather than returning a value: these are
+ * ENTROPY primitives, and handing a caller predictable bytes because a MONITOR
+ * could not resolve a symbol would be a security defect, not a monitoring one.
+ * The fallback is unreachable on any glibc >= 2.36 (all four symbols exist);
+ * it exists so the failure mode is "still random" instead of "silently weak".
+ */
+static void ct_entropy_fallback_bytes(void *buf, size_t n) {
+  unsigned char *out = (unsigned char *)buf;
+  size_t done = 0;
+  while (done < n) {
+    ssize_like_t got =
+        ct_linux_preload_real_getrandom(out + done, n - done, 0);
+    if (got <= 0) {
+      if (errno == EINTR) continue;
+      /* No entropy source at all. Returning would hand the caller
+         uninitialised or predictable bytes; refuse instead. */
+      abort();
+    }
+    done += (size_t)got;
+  }
+}
+
+int ct_linux_preload_real_getentropy(void *buf, size_t len) {
+  if (real_getentropy_ptr == NULL)
+    real_getentropy_ptr = (ct_getentropy_real_fn)ct_resolve("getentropy");
+  if (real_getentropy_ptr != NULL)
+    return real_getentropy_ptr(buf, len);
+  if (len > 256) { errno = EIO; return -1; }
+  ct_entropy_fallback_bytes(buf, len);
+  return 0;
+}
+
+unsigned int ct_linux_preload_real_arc4random(void) {
+  unsigned int value = 0;
+  if (real_arc4random_ptr == NULL)
+    real_arc4random_ptr = (ct_arc4random_real_fn)ct_resolve("arc4random");
+  if (real_arc4random_ptr != NULL)
+    return real_arc4random_ptr();
+  ct_entropy_fallback_bytes(&value, sizeof(value));
+  return value;
+}
+
+void ct_linux_preload_real_arc4random_buf(void *buf, size_t n) {
+  if (real_arc4random_buf_ptr == NULL)
+    real_arc4random_buf_ptr =
+        (ct_arc4random_buf_real_fn)ct_resolve("arc4random_buf");
+  if (real_arc4random_buf_ptr != NULL) {
+    real_arc4random_buf_ptr(buf, n);
+    return;
+  }
+  ct_entropy_fallback_bytes(buf, n);
+}
+
+unsigned int ct_linux_preload_real_arc4random_uniform(unsigned int upper) {
+  if (real_arc4random_uniform_ptr == NULL)
+    real_arc4random_uniform_ptr =
+        (ct_arc4random_uniform_real_fn)ct_resolve("arc4random_uniform");
+  if (real_arc4random_uniform_ptr != NULL)
+    return real_arc4random_uniform_ptr(upper);
+  if (upper < 2) return 0;
+  {
+    /* Same modulo-bias rejection the BSD/glibc implementation uses. */
+    unsigned int min = (unsigned int)(-upper) % upper;
+    for (;;) {
+      unsigned int r = ct_linux_preload_real_arc4random();
+      if (r >= min) return r % upper;
+    }
+  }
 }
 
 pid_t ct_linux_preload_real_fork(void) {
@@ -1793,6 +2552,28 @@ int connect(int fd, const struct sockaddr *addr, socklen_t addrlen) {
   return CT_CALL_HOOK(ct_connect_hook(fd, (void *)addr, (unsigned int)addrlen));
 }
 
+int pipe(int fds[2]) __attribute__((visibility("default")));
+int pipe(int fds[2]) {
+  if (CT_BYPASS() || ct_pipe_hook == NULL)
+    return ct_linux_preload_real_pipe((void *)fds);
+  return CT_CALL_HOOK(ct_pipe_hook((void *)fds));
+}
+
+int pipe2(int fds[2], int flags) __attribute__((visibility("default")));
+int pipe2(int fds[2], int flags) {
+  if (CT_BYPASS() || ct_pipe2_hook == NULL)
+    return ct_linux_preload_real_pipe2((void *)fds, flags);
+  return CT_CALL_HOOK(ct_pipe2_hook((void *)fds, flags));
+}
+
+int socketpair(int domain, int type, int protocol, int sv[2])
+    __attribute__((visibility("default")));
+int socketpair(int domain, int type, int protocol, int sv[2]) {
+  if (CT_BYPASS() || ct_socketpair_hook == NULL)
+    return ct_linux_preload_real_socketpair(domain, type, protocol, (void *)sv);
+  return CT_CALL_HOOK(ct_socketpair_hook(domain, type, protocol, (void *)sv));
+}
+
 ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count)
     __attribute__((visibility("default")));
 ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count) {
@@ -1879,17 +2660,24 @@ int renameat2(int olddirfd, const char *oldpath, int newdirfd,
 
 void *dlopen(const char *path, int flags) __attribute__((visibility("default")));
 void *dlopen(const char *path, int flags) {
+  /* Transparency: resolve a bare soname against the ORIGINAL caller's
+     RPATH/RUNPATH (not the shim's) before the real dlopen. See
+     ct_linux_preload_resolve_dlopen_caller_path. */
+  const char *rp = ct_linux_preload_resolve_dlopen_caller_path(
+      path, __builtin_return_address(0));
   if (CT_BYPASS() || ct_dlopen_hook == NULL)
-    return ct_linux_preload_real_dlopen((char *)path, flags);
-  return CT_CALL_HOOK(ct_dlopen_hook((char *)path, flags));
+    return ct_linux_preload_real_dlopen((char *)rp, flags);
+  return CT_CALL_HOOK(ct_dlopen_hook((char *)rp, flags));
 }
 
 void *dlmopen(Lmid_t namespace_id, const char *path, int flags)
     __attribute__((visibility("default")));
 void *dlmopen(Lmid_t namespace_id, const char *path, int flags) {
+  const char *rp = ct_linux_preload_resolve_dlopen_caller_path(
+      path, __builtin_return_address(0));
   if (CT_BYPASS() || ct_dlmopen_hook == NULL)
-    return ct_linux_preload_real_dlmopen((long)namespace_id, (char *)path, flags);
-  return CT_CALL_HOOK(ct_dlmopen_hook((long)namespace_id, (char *)path, flags));
+    return ct_linux_preload_real_dlmopen((long)namespace_id, (char *)rp, flags);
+  return CT_CALL_HOOK(ct_dlmopen_hook((long)namespace_id, (char *)rp, flags));
 }
 
 void *ct_linux_preload_public_dlsym(void *handle, const char *name)
@@ -1900,13 +2688,13 @@ void *ct_linux_preload_public_dlsym(void *handle, const char *name) {
   return CT_CALL_HOOK(ct_dlsym_hook(handle, (char *)name));
 }
 #ifdef __GLIBC__
-void *ct_linux_preload_public_dlsym_glibc_2_2_5(void *handle, const char *name)
+void *ct_linux_preload_public_dlsym_glibc_base(void *handle, const char *name)
     __attribute__((alias("ct_linux_preload_public_dlsym"),
                    visibility("default")));
 void *ct_linux_preload_public_dlsym_glibc_2_34(void *handle, const char *name)
     __attribute__((alias("ct_linux_preload_public_dlsym"),
                    visibility("default")));
-__asm__(".symver ct_linux_preload_public_dlsym_glibc_2_2_5,dlsym@GLIBC_2.2.5");
+__asm__(".symver ct_linux_preload_public_dlsym_glibc_base,dlsym@" CT_DLSYM_GLIBC_BASE);
 __asm__(".symver ct_linux_preload_public_dlsym_glibc_2_34,dlsym@@GLIBC_2.34");
 #else
 void *dlsym(void *handle, const char *name)
@@ -2005,6 +2793,40 @@ ssize_t getrandom(void *buf, size_t buflen, unsigned int flags) {
   return (ssize_t)CT_CALL_HOOK(ct_getrandom_hook(buf, buflen, flags));
 }
 
+int getentropy(void *buf, size_t len) __attribute__((visibility("default")));
+int getentropy(void *buf, size_t len) {
+  if (CT_BYPASS() || ct_getentropy_hook == NULL)
+    return ct_linux_preload_real_getentropy(buf, len);
+  return CT_CALL_HOOK(ct_getentropy_hook(buf, len));
+}
+
+unsigned int arc4random(void) __attribute__((visibility("default")));
+unsigned int arc4random(void) {
+  if (CT_BYPASS() || ct_arc4random_hook == NULL)
+    return ct_linux_preload_real_arc4random();
+  return CT_CALL_HOOK(ct_arc4random_hook());
+}
+
+void arc4random_buf(void *buf, size_t n) __attribute__((visibility("default")));
+void arc4random_buf(void *buf, size_t n) {
+  if (CT_BYPASS() || ct_arc4random_buf_hook == NULL) {
+    ct_linux_preload_real_arc4random_buf(buf, n);
+    return;
+  }
+  /* CT_CALL_HOOK is an expression macro (__typeof__ of the call), so a void
+     hook is sequenced with the comma operator — the same idiom the exit(3)
+     interposer uses. */
+  CT_CALL_HOOK((ct_arc4random_buf_hook(buf, n), 0));
+}
+
+unsigned int arc4random_uniform(unsigned int upper)
+    __attribute__((visibility("default")));
+unsigned int arc4random_uniform(unsigned int upper) {
+  if (CT_BYPASS() || ct_arc4random_uniform_hook == NULL)
+    return ct_linux_preload_real_arc4random_uniform(upper);
+  return CT_CALL_HOOK(ct_arc4random_uniform_hook(upper));
+}
+
 pid_t fork(void) __attribute__((visibility("default")));
 pid_t fork(void) {
   if (CT_BYPASS() || ct_fork_hook == NULL)
@@ -2017,7 +2839,7 @@ static int ct_linux_preload_dispatch_execve(const char *path,
                                             char *const envp[]) {
   if (CT_BYPASS() || ct_execve_hook == NULL)
     return ct_linux_preload_real_execve((char *)path, (char **)argv, (char **)envp);
-  return CT_CALL_HOOK(ct_execve_hook((char *)path, (char **)argv, (char **)envp));
+  return CT_CALL_EXEC_HOOK(ct_execve_hook((char *)path, (char **)argv, (char **)envp));
 }
 
 int execve(const char *path, char *const argv[], char *const envp[])
@@ -2125,11 +2947,8 @@ static int ct_linux_preload_dispatch_execvp(const char *file,
    * real_execvp call so those internal execve interposers see
    * CT_BYPASS() and delegate straight to real_execve without
    * re-emitting the hook. */
-  CT_CALL_HOOK(ct_execve_hook((char *)file, (char **)argv, environ));
-  stackable_linux_preload_enter_hook();
-  int rc = ct_linux_preload_real_execvp((char *)file, (char **)argv);
-  stackable_linux_preload_exit_hook();
-  return rc;
+  CT_CALL_EXEC_HOOK(ct_execve_hook((char *)file, (char **)argv, environ));
+  return CT_CALL_EXEC_HOOK(ct_linux_preload_real_execvp((char *)file, (char **)argv));
 }
 
 static int ct_linux_preload_dispatch_execvpe(const char *file,
@@ -2138,14 +2957,11 @@ static int ct_linux_preload_dispatch_execvpe(const char *file,
   if (CT_BYPASS() || ct_execve_hook == NULL)
     return ct_linux_preload_real_execvpe((char *)file, (char **)argv,
                                           (char **)envp);
-  CT_CALL_HOOK(ct_execve_hook((char *)file, (char **)argv,
+  CT_CALL_EXEC_HOOK(ct_execve_hook((char *)file, (char **)argv,
                               (char **)envp));
   /* M9.R.66.2: same PATH-lookup double-count guard as dispatch_execvp. */
-  stackable_linux_preload_enter_hook();
-  int rc = ct_linux_preload_real_execvpe((char *)file, (char **)argv,
-                                          (char **)envp);
-  stackable_linux_preload_exit_hook();
-  return rc;
+  return CT_CALL_EXEC_HOOK(ct_linux_preload_real_execvpe((char *)file, (char **)argv,
+                                          (char **)envp));
 }
 
 static int ct_linux_preload_dispatch_fexecve(int fd,
@@ -2159,14 +2975,11 @@ static int ct_linux_preload_dispatch_fexecve(int fd,
    * (better than skipping the flush entirely).  The child image is
    * determined by the fd, so callers using fexecve accept the same
    * ambiguity. */
-  CT_CALL_HOOK(ct_execve_hook("", (char **)argv, (char **)envp));
+  CT_CALL_EXEC_HOOK(ct_execve_hook("", (char **)argv, (char **)envp));
   /* M9.R.66.2: same double-count guard.  glibc's fexecve is a thin
    * wrapper around execve on /proc/self/fd/<fd>, so the same
    * PATH-lookup double-emission would happen without the bracket. */
-  stackable_linux_preload_enter_hook();
-  int rc = ct_linux_preload_real_fexecve(fd, (char **)argv, (char **)envp);
-  stackable_linux_preload_exit_hook();
-  return rc;
+  return CT_CALL_EXEC_HOOK(ct_linux_preload_real_fexecve(fd, (char **)argv, (char **)envp));
 }
 
 int execvp(const char *file, char *const argv[])
@@ -2335,6 +3148,12 @@ proc realFclose*(stream: pointer): cint
   {.importc: "ct_linux_preload_real_fclose", raises: [].}
 proc realConnect*(fd: cint; address: pointer; addrLen: uint32): cint
   {.importc: "ct_linux_preload_real_connect", raises: [].}
+proc realPipe*(fds: pointer): cint
+  {.importc: "ct_linux_preload_real_pipe", raises: [].}
+proc realPipe2*(fds: pointer; flags: cint): cint
+  {.importc: "ct_linux_preload_real_pipe2", raises: [].}
+proc realSocketpair*(domain, typ, protocol: cint; sv: pointer): cint
+  {.importc: "ct_linux_preload_real_socketpair", raises: [].}
 proc realSendfile*(outFd, inFd: cint; offset: pointer; count: csize_t): clong
   {.importc: "ct_linux_preload_real_sendfile", raises: [].}
 proc realCopyFileRange*(inFd: cint; offIn: pointer; outFd: cint;
@@ -2357,6 +3176,28 @@ proc realRenameat*(oldDirfd: cint; oldPath: cstring; newDirfd: cint;
 proc realRenameat2*(oldDirfd: cint; oldPath: cstring; newDirfd: cint;
                     newPath: cstring; flags: cuint): cint
   {.importc: "ct_linux_preload_real_renameat2", raises: [].}
+proc linuxLibraryScan*(sink: pointer; reason: cstring;
+                       performed, removed: ptr uint64;
+                       newlyActive, newlySeen, countersValid,
+                       overflow: ptr cint): cint
+  {.importc: "ct_linux_library_scan", raises: [].}
+  ## Enumerate the loader's link map (see the design note above
+  ## `ct_linux_library_scan`), invoking `sink` once for each entry NOT SEEN
+  ## BEFORE — a `proc(name: cstring; address: culong; reason: cstring) {.cdecl.}`
+  ## cast to `pointer`, called after `dl_iterate_phdr` has returned so the
+  ## loader lock is no longer held and the sink may allocate and record.
+  ##
+  ## `performed` and `removed` report the deltas of the loader's cumulative
+  ## `dlpi_adds` and `dlpi_subs`; `newlyActive` reports entries absent from the
+  ## immediately preceding link-map snapshot, while `newlySeen` reports entries
+  ## first observed during the process. A short newly-active count is a gap only
+  ## if an unload also occurred: scans immediately before and after interposed
+  ## loads make ordinary unload/reload cycles visible as separate transitions.
+  ##
+  ## The seen-set and previous loader counters live on the C side ON PURPOSE:
+  ## scans run on whichever thread called `dlopen`, and long-lived Nim heap
+  ## state shared between threads is the FUP-C allocator-corruption class.
+
 proc realDlopen*(path: cstring; flags: cint): pointer
   {.importc: "ct_linux_preload_real_dlopen", raises: [].}
 proc realDlmopen*(namespaceId: clong; path: cstring; flags: cint): pointer
@@ -2387,6 +3228,14 @@ proc realTime*(timePtr: pointer): clong
   {.importc: "ct_linux_preload_real_time", raises: [].}
 proc realGetrandom*(buf: pointer; buflen: csize_t; flags: cuint): clong
   {.importc: "ct_linux_preload_real_getrandom", raises: [].}
+proc realGetentropy*(buf: pointer; length: csize_t): cint
+  {.importc: "ct_linux_preload_real_getentropy", raises: [].}
+proc realArc4random*(): cuint
+  {.importc: "ct_linux_preload_real_arc4random", raises: [].}
+proc realArc4randomBuf*(buf: pointer; length: csize_t)
+  {.importc: "ct_linux_preload_real_arc4random_buf", raises: [].}
+proc realArc4randomUniform*(upper: cuint): cuint
+  {.importc: "ct_linux_preload_real_arc4random_uniform", raises: [].}
 proc realFork*(): PidT {.importc: "ct_linux_preload_real_fork", raises: [].}
 proc realExecve*(path: cstring; argv, envp: cstringArray): cint
   {.importc: "ct_linux_preload_real_execve", raises: [].}
@@ -2424,6 +3273,10 @@ type
     csize_t {.cdecl, raises: [].}
   FcloseDispatch = proc(stream: pointer): cint {.cdecl, raises: [].}
   ConnectDispatch = proc(fd: cint; address: pointer; addrLen: uint32): cint
+    {.cdecl, raises: [].}
+  PipeDispatch = proc(fds: pointer): cint {.cdecl, raises: [].}
+  Pipe2Dispatch = proc(fds: pointer; flags: cint): cint {.cdecl, raises: [].}
+  SocketpairDispatch = proc(domain, typ, protocol: cint; sv: pointer): cint
     {.cdecl, raises: [].}
   SendfileDispatch = proc(outFd, inFd: cint; offset: pointer;
                           count: csize_t): clong {.cdecl, raises: [].}
@@ -2468,6 +3321,12 @@ type
   TimeDispatch = proc(timePtr: pointer): clong {.cdecl, raises: [].}
   GetrandomDispatch = proc(buf: pointer; buflen: csize_t; flags: cuint): clong
     {.cdecl, raises: [].}
+  GetentropyDispatch = proc(buf: pointer; length: csize_t): cint
+    {.cdecl, raises: [].}
+  Arc4randomDispatch = proc(): cuint {.cdecl, raises: [].}
+  Arc4randomBufDispatch = proc(buf: pointer; length: csize_t)
+    {.cdecl, raises: [].}
+  Arc4randomUniformDispatch = proc(upper: cuint): cuint {.cdecl, raises: [].}
   ForkDispatch = proc(): PidT {.cdecl, raises: [].}
   ExecveDispatch = proc(path: cstring; argv, envp: cstringArray): cint
     {.cdecl, raises: [].}
@@ -2547,6 +3406,12 @@ proc installFcloseDispatcher(dispatch: FcloseDispatch)
   {.importc: "ct_linux_preload_register_fclose_hook", raises: [].}
 proc installConnectDispatcher(dispatch: ConnectDispatch)
   {.importc: "ct_linux_preload_register_connect_hook", raises: [].}
+proc installPipeDispatcher(dispatch: PipeDispatch)
+  {.importc: "ct_linux_preload_register_pipe_hook", raises: [].}
+proc installPipe2Dispatcher(dispatch: Pipe2Dispatch)
+  {.importc: "ct_linux_preload_register_pipe2_hook", raises: [].}
+proc installSocketpairDispatcher(dispatch: SocketpairDispatch)
+  {.importc: "ct_linux_preload_register_socketpair_hook", raises: [].}
 proc installSendfileDispatcher(dispatch: SendfileDispatch)
   {.importc: "ct_linux_preload_register_sendfile_hook", raises: [].}
 proc installCopyFileRangeDispatcher(dispatch: CopyFileRangeDispatch)
@@ -2591,6 +3456,14 @@ proc installTimeDispatcher(dispatch: TimeDispatch)
   {.importc: "ct_linux_preload_register_time_hook", raises: [].}
 proc installGetrandomDispatcher(dispatch: GetrandomDispatch)
   {.importc: "ct_linux_preload_register_getrandom_hook", raises: [].}
+proc installGetentropyDispatcher(dispatch: GetentropyDispatch)
+  {.importc: "ct_linux_preload_register_getentropy_hook", raises: [].}
+proc installArc4randomDispatcher(dispatch: Arc4randomDispatch)
+  {.importc: "ct_linux_preload_register_arc4random_hook", raises: [].}
+proc installArc4randomBufDispatcher(dispatch: Arc4randomBufDispatch)
+  {.importc: "ct_linux_preload_register_arc4random_buf_hook", raises: [].}
+proc installArc4randomUniformDispatcher(dispatch: Arc4randomUniformDispatch)
+  {.importc: "ct_linux_preload_register_arc4random_uniform_hook", raises: [].}
 proc installForkDispatcher(dispatch: ForkDispatch)
   {.importc: "ct_linux_preload_register_fork_hook", raises: [].}
 proc installExecveDispatcher(dispatch: ExecveDispatch)
@@ -2630,6 +3503,9 @@ var
   freadHooks: seq[FreadHookEntry] = @[]
   fcloseHooks: seq[FcloseHookEntry] = @[]
   connectHooks: seq[ConnectHookEntry] = @[]
+  pipeHooks: seq[PipeHookEntry] = @[]
+  pipe2Hooks: seq[Pipe2HookEntry] = @[]
+  socketpairHooks: seq[SocketpairHookEntry] = @[]
   sendfileHooks: seq[SendfileHookEntry] = @[]
   copyFileRangeHooks: seq[CopyFileRangeHookEntry] = @[]
   spliceHooks: seq[SpliceHookEntry] = @[]
@@ -2652,6 +3528,7 @@ var
   gettimeofdayHooks: seq[GettimeofdayHookEntry] = @[]
   timeHooks: seq[TimeHookEntry] = @[]
   getrandomHooks: seq[GetrandomHookEntry] = @[]
+  entropyHooks: seq[EntropyHookEntry] = @[]
   forkHooks: seq[ForkHookEntry] = @[]
   execveHooks: seq[ExecveHookEntry] = @[]
   posixSpawnHooks: seq[PosixSpawnHookEntry] = @[]
@@ -2814,6 +3691,26 @@ proc registerConnectHook*(hook: ConnectHook; priority = 100) {.raises: [].} =
   connectHooks.add(ConnectHookEntry(priority: priority, callback: hook))
   connectHooks.sort(proc(a, b: ConnectHookEntry): int = cmp(a.priority, b.priority))
 
+proc registerPipeHook*(hook: PipeHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  pipeHooks.add(PipeHookEntry(priority: priority, callback: hook))
+  pipeHooks.sort(proc(a, b: PipeHookEntry): int = cmp(a.priority, b.priority))
+
+proc registerPipe2Hook*(hook: Pipe2Hook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  pipe2Hooks.add(Pipe2HookEntry(priority: priority, callback: hook))
+  pipe2Hooks.sort(proc(a, b: Pipe2HookEntry): int = cmp(a.priority, b.priority))
+
+proc registerSocketpairHook*(hook: SocketpairHook; priority = 100)
+    {.raises: [].} =
+  if hook == nil:
+    return
+  socketpairHooks.add(SocketpairHookEntry(priority: priority, callback: hook))
+  socketpairHooks.sort(proc(a, b: SocketpairHookEntry): int =
+    cmp(a.priority, b.priority))
+
 proc registerSendfileHook*(hook: SendfileHook; priority = 100) {.raises: [].} =
   if hook == nil:
     return
@@ -2955,6 +3852,15 @@ proc registerGetrandomHook*(hook: GetrandomHook; priority = 100)
     return
   getrandomHooks.add(GetrandomHookEntry(priority: priority, callback: hook))
   getrandomHooks.sort(proc(a, b: GetrandomHookEntry): int =
+    cmp(a.priority, b.priority))
+
+proc registerEntropyHook*(hook: EntropyHook; priority = 100) {.raises: [].} =
+  ## One chain for getentropy / arc4random / arc4random_buf /
+  ## arc4random_uniform; the hook reads `ctx.source` to tell them apart.
+  if hook == nil:
+    return
+  entropyHooks.add(EntropyHookEntry(priority: priority, callback: hook))
+  entropyHooks.sort(proc(a, b: EntropyHookEntry): int =
     cmp(a.priority, b.priority))
 
 proc registerForkHook*(hook: ForkHook; priority = 100) {.raises: [].} =
@@ -3301,68 +4207,11 @@ proc installRawSyscallWrapperPatch*(): RawSyscallPatchStatus {.raises: [].} =
 proc rawSyscallWrapperPatchStatus*(): RawSyscallPatchStatus {.raises: [].} =
   rawSyscallPatchStatus
 
-proc normalizeMappingPath(path: string): string {.raises: [].} =
-  if path.len == 0:
-    return ""
-  try:
-    result = expandSymlink(path)
-  except CatchableError:
-    result = path
-
 proc currentExecutablePath(): string {.raises: [].} =
   try:
     result = expandSymlink("/proc/self/exe")
   except CatchableError:
     result = ""
-
-proc isSystemRuntimeMappingPath*(path: string): bool {.raises: [].} =
-  ## Keep startup DSO scanning out of loader/libc/toolchain runtime mappings.
-  ## io-mon can safely classify file syscalls once a selected site traps, but
-  ## broad runtime-library patching would turn ordinary libc/loader internals
-  ## into false raw-syscall event-loss for every monitored process.
-  ##
-  ## Exported for M9.R.67.1's regression test
-  ## (`tests/linux/test_io_mon_inline_patch_predicate.nim`) so the
-  ## precedence order between this predicate and the
-  ## `executable-mapping-short-circuit` in
-  ## `shouldPatchInlineSyscallMapping` stays under regression cover.
-  path.startsWith("/lib/") or path.startsWith("/lib64/") or
-    path.startsWith("/usr/lib/") or path.startsWith("/usr/lib64/") or
-    path.startsWith("/nix/store/")
-
-proc isMonitorShimMappingPath*(path: string): bool {.raises: [].} =
-  ## Exported alongside `isSystemRuntimeMappingPath` for the same M9.R.67.1
-  ## regression test.
-  path.contains("/librepro_monitor_shim.") or
-    path.endsWith("/librepro_monitor_shim.so") or
-    path.endsWith("/librepro_monitor_shim.so (deleted)")
-
-proc shouldPatchInlineSyscallMapping*(mapping: LinuxExecutableMapping;
-                                      executablePath: string): bool {.raises: [].} =
-  if not (mapping.readable and mapping.executable):
-    return false
-  if mapping.writable or mapping.path.len == 0 or not mapping.privateMapping:
-    return false
-  if mapping.path[0] == '[' or mapping.path[0] != '/':
-    return false
-  if executablePath.len == 0:
-    return false
-  let normalized = normalizeMappingPath(mapping.path)
-  # M9.R.67.1 — the system-runtime / monitor-shim exclusions MUST take
-  # precedence over the executable short-circuit. When a monitored
-  # subtree's top-of-tree exec is itself a toolchain binary (e.g. Nix's
-  # `/nix/store/…-gcc-14.3.0/…/cc1`) we still want the `isSystemRuntime`
-  # policy to apply: patching a `/nix/store/…/cc1` false-positive `0F 05
-  # XX` byte sequence (from `looksLikeLinuxX8664Syscall`) mid-instruction
-  # corrupts cc1 and crashes it at `init_emit_regs` on the FIRST
-  # sanitycheckc.c meson build. See
-  # `recipes/reproos-image/run-evidence/m9r67/m9r67_phaseA_byte_identity.txt`
-  # for the byte-identity + path-dependence characterization.
-  if isMonitorShimMappingPath(normalized) or isSystemRuntimeMappingPath(normalized):
-    return false
-  if normalized == executablePath:
-    return true
-  normalized.endsWith(".so") or normalized.contains(".so.")
 
 proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
                                status: var InlineSyscallPatchStatus)
@@ -3672,6 +4521,15 @@ proc callReal*(ctx: var FcloseContext) {.raises: [].} =
 proc callReal*(ctx: var ConnectContext) {.raises: [].} =
   ctx.result = realConnect(ctx.fd, ctx.address, ctx.addrLen)
 
+proc callReal*(ctx: var PipeContext) {.raises: [].} =
+  ctx.result = realPipe(ctx.fds)
+
+proc callReal*(ctx: var Pipe2Context) {.raises: [].} =
+  ctx.result = realPipe2(ctx.fds, ctx.flags)
+
+proc callReal*(ctx: var SocketpairContext) {.raises: [].} =
+  ctx.result = realSocketpair(ctx.domain, ctx.typ, ctx.protocol, ctx.sv)
+
 proc callReal*(ctx: var SendfileContext) {.raises: [].} =
   ctx.result = realSendfile(ctx.outFd, ctx.inFd, ctx.offset, ctx.count)
 
@@ -3745,6 +4603,17 @@ proc callReal*(ctx: var TimeContext) {.raises: [].} =
 
 proc callReal*(ctx: var GetrandomContext) {.raises: [].} =
   ctx.result = realGetrandom(ctx.buf, ctx.buflen, ctx.flags)
+
+proc callReal*(ctx: var EntropyContext) {.raises: [].} =
+  case ctx.source
+  of lesGetentropy:
+    ctx.result = realGetentropy(ctx.buf, ctx.length)
+  of lesArc4random:
+    ctx.value = realArc4random()
+  of lesArc4randomBuf:
+    realArc4randomBuf(ctx.buf, ctx.length)
+  of lesArc4randomUniform:
+    ctx.value = realArc4randomUniform(ctx.upper)
 
 proc callReal*(ctx: var ForkContext) {.raises: [].} =
   ctx.result = realFork()
@@ -3928,6 +4797,30 @@ proc callNext*(ctx: var ConnectContext) {.raises: [].} =
   else:
     callReal(ctx)
 
+proc callNext*(ctx: var PipeContext) {.raises: [].} =
+  if ctx.nextIndex < pipeHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    pipeHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var Pipe2Context) {.raises: [].} =
+  if ctx.nextIndex < pipe2Hooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    pipe2Hooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
+proc callNext*(ctx: var SocketpairContext) {.raises: [].} =
+  if ctx.nextIndex < socketpairHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    socketpairHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
 proc callNext*(ctx: var SendfileContext) {.raises: [].} =
   if ctx.nextIndex < sendfileHooks.len:
     let index = ctx.nextIndex
@@ -4105,6 +4998,14 @@ proc callNext*(ctx: var GetrandomContext) {.raises: [].} =
   else:
     callReal(ctx)
 
+proc callNext*(ctx: var EntropyContext) {.raises: [].} =
+  if ctx.nextIndex < entropyHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    entropyHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
 proc callNext*(ctx: var ForkContext) {.raises: [].} =
   if ctx.nextIndex < forkHooks.len:
     let index = ctx.nextIndex
@@ -4263,6 +5164,23 @@ proc dispatchConnect(fd: cint; address: pointer; addrLen: uint32): cint
   callNext(ctx)
   result = ctx.result
 
+proc dispatchPipe(fds: pointer): cint {.cdecl, raises: [].} =
+  var ctx = PipeContext(fds: cast[ptr cint](fds), result: -1)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchPipe2(fds: pointer; flags: cint): cint {.cdecl, raises: [].} =
+  var ctx = Pipe2Context(fds: cast[ptr cint](fds), flags: flags, result: -1)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchSocketpair(domain, typ, protocol: cint; sv: pointer): cint
+    {.cdecl, raises: [].} =
+  var ctx = SocketpairContext(domain: domain, typ: typ, protocol: protocol,
+                              sv: cast[ptr cint](sv), result: -1)
+  callNext(ctx)
+  result = ctx.result
+
 proc dispatchSendfile(outFd, inFd: cint; offset: pointer;
                       count: csize_t): clong {.cdecl, raises: [].} =
   var ctx = SendfileContext(outFd: outFd, inFd: inFd, offset: offset,
@@ -4412,6 +5330,27 @@ proc dispatchGetrandom(buf: pointer; buflen: csize_t; flags: cuint): clong
   callNext(ctx)
   result = ctx.result
 
+proc dispatchGetentropy(buf: pointer; length: csize_t): cint
+    {.cdecl, raises: [].} =
+  var ctx = EntropyContext(source: lesGetentropy, buf: buf, length: length,
+                           result: -1)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchArc4random(): cuint {.cdecl, raises: [].} =
+  var ctx = EntropyContext(source: lesArc4random)
+  callNext(ctx)
+  result = ctx.value
+
+proc dispatchArc4randomBuf(buf: pointer; length: csize_t) {.cdecl, raises: [].} =
+  var ctx = EntropyContext(source: lesArc4randomBuf, buf: buf, length: length)
+  callNext(ctx)
+
+proc dispatchArc4randomUniform(upper: cuint): cuint {.cdecl, raises: [].} =
+  var ctx = EntropyContext(source: lesArc4randomUniform, upper: upper)
+  callNext(ctx)
+  result = ctx.value
+
 proc dispatchFork(): PidT {.cdecl, raises: [].} =
   var ctx = ForkContext(result: -1)
   callNext(ctx)
@@ -4463,6 +5402,9 @@ installFopen64Dispatcher(dispatchFopen64)
 installFreadDispatcher(dispatchFread)
 installFcloseDispatcher(dispatchFclose)
 installConnectDispatcher(dispatchConnect)
+installPipeDispatcher(dispatchPipe)
+installPipe2Dispatcher(dispatchPipe2)
+installSocketpairDispatcher(dispatchSocketpair)
 installSendfileDispatcher(dispatchSendfile)
 installCopyFileRangeDispatcher(dispatchCopyFileRange)
 installSpliceDispatcher(dispatchSplice)
@@ -4485,6 +5427,10 @@ installClockGettimeDispatcher(dispatchClockGettime)
 installGettimeofdayDispatcher(dispatchGettimeofday)
 installTimeDispatcher(dispatchTime)
 installGetrandomDispatcher(dispatchGetrandom)
+installGetentropyDispatcher(dispatchGetentropy)
+installArc4randomDispatcher(dispatchArc4random)
+installArc4randomBufDispatcher(dispatchArc4randomBuf)
+installArc4randomUniformDispatcher(dispatchArc4randomUniform)
 installForkDispatcher(dispatchFork)
 installExecveDispatcher(dispatchExecve)
 installPosixSpawnDispatcher(dispatchPosixSpawn)

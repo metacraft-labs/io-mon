@@ -1,0 +1,21 @@
+{
+  "_comment": [
+    "tests/fixtures/dep_set_golden/ holds BINARY canonical-iomon golden depfiles.",
+    "editorconfig-checker reads them as text and reports a missing final newline",
+    "and a guessed 8-bit encoding. They were never actually lint-clean: pre-commit",
+    "only inspects STAGED files, so the fixtures simply had not been re-staged",
+    "since the hook landed, and renaming them is what first put them through it.",
+    "Excluded here rather than reshaped, because their whole purpose is to be the",
+    "exact bytes the monitor writes."
+  ],
+  "_comment2": [
+    "tests/fixtures/wire_informative/informative.iomon is the same kind of",
+    "artefact for the same reason: a BINARY canonical-iomon capture whose whole",
+    "purpose is to be the exact bytes the encoder writes, so it can neither gain",
+    "a final newline nor be re-encoded as UTF-8."
+  ],
+  "Exclude": [
+    "^tests/fixtures/dep_set_golden/",
+    "^tests/fixtures/wire_informative/"
+  ]
+}

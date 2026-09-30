@@ -40,14 +40,10 @@ const
   r5unhooked = repoRoot / "research" / "adversarial-2026-07-round5" / "unhooked"
 
 when defined(macosx):
+  from build_test_shim import buildPrivateMacosShim
+
   proc buildShim(): string =
-    let (output, code) = execCmdEx("bash " &
-      quoteShell(repoRoot / "scripts" / "build_shim.sh"))
-    if code != 0:
-      raise newException(IOError, "build_shim.sh failed: " & output)
-    let shim = repoRoot / "build" / "lib" / "librepro_monitor_shim.dylib"
-    doAssert fileExists(shim), "shim not produced at " & shim
-    shim
+    buildPrivateMacosShim(repoRoot)
 
   proc ccExe(src, outBin: string; cc = getEnv("CC", "cc");
       extra: seq[string] = @[]) =
@@ -92,7 +88,7 @@ when defined(macosx):
     checkpoint(probe.extractFilename() & " exit=" & $code & " out=" & stdoutText)
     doAssert code == 0, "probe should exit 0 (" & probe & ", out=" &
       stdoutText & ")"
-    let depfile = runWork / "cap.rdep"
+    let depfile = runWork / "cap.iomon"
     discard mergeFragments(fragmentDir, depfile)
     doAssert fileExists(depfile)
     result = readMonitorDepFile(depfile)

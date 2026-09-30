@@ -43,15 +43,10 @@ const
 when defined(macosx):
   import macos_backend_toggle  # applyMacosBackendToggle (A/B → debug toggles)
 
+  from build_test_shim import buildPrivateMacosShim
+
   proc buildShim(): string =
-    ## Build the fat (arm64+arm64e) shim and return its path. Fails loudly.
-    let (output, code) = execCmdEx("bash " &
-      quoteShell(repoRoot / "scripts" / "build_shim.sh"))
-    if code != 0:
-      raise newException(IOError, "build_shim.sh failed: " & output)
-    let shim = repoRoot / "build" / "lib" / "librepro_monitor_shim.dylib"
-    doAssert fileExists(shim), "shim not produced at " & shim
-    shim
+    buildPrivateMacosShim(repoRoot)
 
   proc compileModeProbe(work: string): string =
     ## Compile a tiny C program that exercises BOTH the libsystem-internal

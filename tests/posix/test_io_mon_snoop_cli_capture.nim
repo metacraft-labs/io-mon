@@ -77,7 +77,7 @@ suite "io-mon CLI (M8) — POSIX live capture":
     let inputPath = work / "input.txt"
     writeFile(inputPath, "io-mon snoop CLI capture fixture\n")
     let outputPath = work / "output.txt"
-    let depfile = work / "cap.rdep"
+    let depfile = work / "cap.iomon"
 
     # Drive the live capture OUT OF PROCESS through the snoop CLI, pinning the
     # shim so it resolves without an install. This is the exact topology the
@@ -127,6 +127,6 @@ suite "io-mon CLI (M8) — POSIX live capture":
       @["inspect", depfile, "--format", "text"])
     checkpoint(insOut)
     check insCode == 0
-    check "RMDF" in insOut
+    check "iomon" in insOut
 
   removeDir(work)

@@ -1,6 +1,6 @@
 ## test_io_mon_dep_flush — milestone io-mon-DEP-FLUSH integration tests.
 ##
-## Closes the "exit/thread-exit/fork-before-flush loses buffered RMDF records"
+## Closes the "exit/thread-exit/fork-before-flush loses buffered iomon records"
 ## gap in the file-based dependency channel (see
 ## reprobuild-specs/io-mon-Dependency-Flush-Robustness.md). Each test drives the
 ## LIVE Linux LD_PRELOAD shim (rebuilt from source) against a short-lived C
@@ -114,7 +114,7 @@ int main(int argc, char **argv) {
 }
 """, @["-ldl"])
 
-    let depfile = work / "shim-flush.rdep"
+    let depfile = work / "shim-flush.iomon"
     let cap = run(snoopBin, @["run", "--depfile", depfile, "--", reader] & markers,
       childEnvWith(shimLib))
     checkpoint(cap.output)
@@ -159,7 +159,7 @@ int main(int argc, char **argv) {
 }
 """)
 
-    let depfile = work / "short-lived.rdep"
+    let depfile = work / "short-lived.iomon"
     let cap = run(snoopBin, @["run", "--depfile", depfile, "--", reader] & markers,
       childEnvWith(shimLib))
     checkpoint(cap.output)
@@ -217,7 +217,7 @@ int main(int argc, char **argv) {
 }
 """, @["-pthread"])
 
-    let depfile = work / "worker-thread.rdep"
+    let depfile = work / "worker-thread.iomon"
     let cap = run(snoopBin, @["run", "--depfile", depfile, "--", reader] & markers,
       childEnvWith(shimLib))
     checkpoint(cap.output)
@@ -273,7 +273,7 @@ int main(int argc, char **argv) {
 }
 """)
 
-    let depfile = work / "fork-no-dup.rdep"
+    let depfile = work / "fork-no-dup.iomon"
     let cap = run(snoopBin, @["run", "--depfile", depfile, "--",
       forker, parentPre, childMarker, parentPost], childEnvWith(shimLib))
     checkpoint(cap.output)
@@ -286,16 +286,18 @@ int main(int argc, char **argv) {
     check fileReadCount(dep, parentPre) == 1
     check fileReadCount(dep, childMarker) == 1
     check fileReadCount(dep, parentPost) == 1
-    # The parent's pre-fork read belongs to the parent pid; the child's read
-    # belongs to the child pid. Confirm they are attributed to DIFFERENT pids
-    # (no cross-pid duplication of the parent's buffered frame).
+    # Path-scoped SET records deliberately normalize process-local pid/fd values.
+    # Exact per-path counts prove the inherited parent batch was not replayed;
+    # process-start records retain the distinct parent/child identities.
     let preReads = dep.records.filterIt(
       it.kind == mrFileRead and parentPre in it.path)
     let childReads = dep.records.filterIt(
       it.kind == mrFileRead and childMarker in it.path)
     check preReads.len == 1
     check childReads.len == 1
-    check preReads[0].osPid != childReads[0].osPid
+    check preReads[0].osPid == 0'u64
+    check childReads[0].osPid == 0'u64
+    check dep.records.countIt(it.kind == mrProcessStart) >= 2
 
   test "t_exit_flush_depfile_byte_identical_to_lazy":
     # DEP-FLUSH-5 — determinism guard. The SAME workload is captured twice:
@@ -336,7 +338,7 @@ int main(int argc, char **argv) {
 """)
 
     proc canonicalBytes(sleepMs: string; tag: string): seq[byte] =
-      let depfile = work / ("determinism-" & tag & ".rdep")
+      let depfile = work / ("determinism-" & tag & ".iomon")
       let cap = run(snoopBin, @["run", "--depfile", depfile, "--",
         reader, sleepMs] & markers, childEnvWith(shimLib))
       checkpoint(tag & ": " & cap.output)

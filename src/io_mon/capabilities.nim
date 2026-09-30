@@ -1,4 +1,4 @@
-import std/[strutils]
+import std/[options, strutils]
 
 import io_mon/types
 
@@ -64,7 +64,18 @@ const
     # or uses RENAME_SWAP) and is OUTPUT-side only: a missed mutation record is
     # never an INPUT false-complete (the cardinal sin), it only leaves the
     # output-tree view of that rare op uncaptured.
-    mcapPathMutation
+    mcapPathMutation,
+    # DA-10 — MOVED HERE FROM THE UNSUPPORTED SET. This backend writes
+    # `.iomon-frag` frames and has no set producer, and the file writer still
+    # encodes every field verbatim; what changed is that the FOLD no longer lives
+    # in the transport. `writer.foldObservationIdentity` applies DA-1b's element
+    # key (`encodeDepRecordIdentity`) inside `mergeFragments`, which every
+    # depfile this backend produces goes through, so one fact observed by N
+    # processes now lands as one record here too. See
+    # `backendFoldsObservationIdentity` for what the fold does and does NOT cover
+    # on a file transport, and for why this capability must still never join
+    # `InputEvidenceCapabilities`.
+    mcapObservationIdentityFold
   }
 
   MacosInterposeKnownUnsupportedCapabilities* = {
@@ -108,10 +119,22 @@ const
     # ROUND-3 S1 — content-channel coverage (see MacosInterposeSupportedCapabilities).
     mcapExternalContent,
     # ROUND-4 RW2 — output-directory mutation surface (mkdir/rmdir/unlink/unlinkat).
-    mcapPathMutation
+    mcapPathMutation,
+    # DA-10 — see the same entry in `MacosInterposeSupportedCapabilities`: the
+    # fold is applied at merge time, so it reaches this taxonomy's backends too.
+    mcapObservationIdentityFold
   }
 
   LinuxPreloadSupportedCapabilities* = {
+    # DA-1b — the Linux backend publishes into a consumer-owned nim-shm-gset
+    # whose element key IS the observation identity, so repeated observations
+    # of one fact collapse to one element. DA-10 added the merge-time fold that
+    # gives the file transports the fact-scoped half of the same reduction, so
+    # this entry is no longer what distinguishes Linux; what still does is that
+    # the set ALSO folds the path-scoped kinds, which the file path cannot
+    # reconstruct. See `backendFoldsObservationIdentity`, which must agree with
+    # this entry.
+    mcapObservationIdentityFold,
     mcapProcess,
     mcapFileRead,
     mcapFileWrite,
@@ -126,19 +149,155 @@ const
     mcapFileAppend,
     mcapRename,
     mcapIpcConnect,
+    # LIBRARY-LOAD OBSERVATION. The runtime shared-library closure is captured
+    # by asking the LOADER for its link map (`dl_iterate_phdr`) rather than by
+    # hooking the calls that populate it — the Linux counterpart of the macOS
+    # arm's `_dyld_register_func_for_add_image`, and for the same reason: ld.so
+    # maps a dependency through internal `__mmap`/`__open64_nocancel` calls that
+    # LD_PRELOAD symbol interposition cannot see, so the entire closure was
+    # previously invisible (a monitored `gcc -c` captured ZERO of its ten loaded
+    # shared objects while reporting mcComplete).
+    #
+    # THIS IS A PROMISE, and it is kept by arithmetic rather than by assertion:
+    # every scan compares the number of newly-enumerated objects against the
+    # loader's own cumulative `dlpi_adds` counter, so a load that happened
+    # without being enumerated — the one case sampling cannot see, a
+    # loader-internal `__libc_dlopen_mode` undone before the next scan — is
+    # DETECTED and emits an event-loss marker that downgrades the capture. The
+    # capability therefore means "every load was observed, or this capture is
+    # mcIncomplete", which is what a supported capability has to mean.
+    #
+    # Residual, stated because it is not covered: a process SIGKILLed before its
+    # shutdown scan loses the closing account, so a loader-internal load in that
+    # window is neither observed nor detected. That is the pre-existing
+    # kill-before-flush inherent-loss class, not a new one. LD_AUDIT's
+    # la_objopen would close it — see docs/cases/dlopen-runpath-transparency.md
+    # alternative C — at the cost of a second injected copy of io-mon per
+    # process, in its own link-map namespace.
+    mcapLibraryLoad,
     # M-FW-6C — Linux libc-visible getenv/uname/sysconf are recorded as
     # observed inputs; clock_gettime/gettimeofday/time are time-read evidence;
-    # getrandom is entropy evidence. Direct raw/vDSO variants remain outside
-    # this positive capability.
+    # getrandom (libc symbol, raw syscall and vDSO entry) plus the glibc >= 2.36
+    # BSD set getentropy/arc4random/arc4random_buf/arc4random_uniform are
+    # entropy evidence — the same per-platform-complete entropy surface the
+    # macOS profile advertises (io_mon/types.nim, record 16). Other direct raw
+    # variants remain outside this positive capability.
     mcapObservedEnv,
     mcapNonDeterminism
+  }
+
+  InputChannelCapabilities* = {
+    # THE CAPABILITIES THAT ARE ABOUT AN INPUT — a way for bytes, or for a
+    # decision the build depends on, to reach the monitored program. A gap in
+    # one of these means something may have come IN unobserved; a gap in
+    # anything else means the capture describes the program's OUTPUTS, its own
+    # identity, or an alternative implementation less well.
+    #
+    # WHY THIS IS EMITTED AND NOT LEFT TO THE PROSE. Every gap already carries a
+    # `reason` string, and until now that string was the ONLY place the
+    # distinction lived. So a depfile consumer deciding whether a capture may be
+    # trusted had to tell "no rename record kind" from "environment reads are
+    # not recorded as observed inputs" by reading English. Those two demand
+    # opposite responses and are one string-match apart. The Windows profile is
+    # the case that forced it: after M5 closed ipc-connect and external-content
+    # it HAD five declared gaps, four of them output-side or identity fidelity
+    # and exactly one -- `mcapObservedEnv` -- an input channel, with nothing in
+    # the record saying which. M10 then gave that one records, so Windows now
+    # declares NO input-channel gap at all. The key is not thereby decoration:
+    # older Windows depfiles still carry `input=true` for it, the other
+    # profiles still have gaps of both kinds, and a capability's membership
+    # here is a property of the CAPABILITY rather than of whether any
+    # particular backend happens to implement it.
+    #
+    # THIS IS NOT `InputEvidenceCapabilities`, which is a SUBSET: the floor
+    # whose absence forces `mcIncomplete` outright. A capability can be an input
+    # channel without being in the floor -- `mcapObservedEnv` is precisely that
+    # -- meaning the shortfall is real and on the input side, but a substitute
+    # record or a narrower blast radius keeps it from voiding the claim.
+    #
+    # WHAT IS DELIBERATELY OUT, and why, since the omissions are the load-
+    # bearing part:
+    #   * `mcapFileWrite` / `mcapFileCreate` / `mcapFileTruncate` /
+    #     `mcapFileAppend` / `mcapRename` / `mcapPathMutation` — OUTPUT-side.
+    #     A missed mutation leaves the output view poorer; it is not an input a
+    #     cache key would silently omit.
+    #   * `mcapSymlink` / `mcapPathIdentity` — IDENTITY FIDELITY. A read through
+    #     a symlink still records a path that resolves to the same bytes.
+    #   * `mcapNonDeterminism` — EVIDENCE, not an input. Nothing downgrades on
+    #     it; the caller's policy decides what an entropy or clock read means.
+    #   * `mcapEndpointSecurity` / `mcapHybrid` — ALTERNATIVE BACKENDS. Their
+    #     absence says another implementation was not used.
+    #   * `mcapAuthorizationEnforcement` — about DENYING operations. io-mon
+    #     observes; it never claimed to enforce.
+    #   * `mcapAdversarialRawSyscall` / `mcapExecutableMappingLifecycle` —
+    #     THREAT MODELS. A hostile program can defeat an input channel through
+    #     either, but that is a stance about the adversary, not a statement that
+    #     an ordinary build's inputs went unseen, and the profile's diagnostics
+    #     already tell a consumer to request them explicitly.
+    mcapFileRead,
+    mcapPathProbe,
+    mcapDirectoryEnumerate,
+    mcapLibraryLoad,
+    mcapObservedEnv,
+    mcapIpcConnect,
+    mcapExternalContent
+  }
+
+  InputEvidenceCapabilities* = {
+    # The capabilities WITHOUT WHICH AN INPUT-COMPLETENESS CLAIM IS NOT
+    # AVAILABLE — the observation channels a depfile's own `mcComplete` asserts
+    # were present. A backend that does not support one of these has an input
+    # channel it cannot see at all, so a capture from it downgrades to
+    # `mcIncomplete` whether or not the consumer thought to ask.
+    #
+    # WHY THIS SET EXISTS. `docs/contributors/architecture.md` states the
+    # contract as "every uncertainty downgrades to mcIncomplete", but the
+    # machinery did not enforce it: `depFileFromOwnedRecords` derived the
+    # profile with an EMPTY required-set, and a gap is only ever marked
+    # `required` — the thing that clears `evidenceComplete` — for capabilities
+    # in that set. So every declared capability gap was emitted with
+    # `required=false` and could never affect completeness. The declaration was
+    # real and the consequence was missing. That is how `mcapLibraryLoad` sat
+    # in `LinuxPreloadKnownUnsupportedCapabilities` while a monitored `gcc -c`
+    # reported `mcComplete` having observed none of its ten loaded libraries.
+    #
+    # WHY IT IS THIS SET AND NOT ALL GAPS. Making every declared gap downgrade
+    # would make Linux permanently `mcIncomplete` and destroy the signal, and it
+    # would be wrong on the merits, because the other entries are not missing
+    # input channels:
+    #   * `mcapEndpointSecurity` / `mcapHybrid` are ALTERNATIVE BACKENDS. Their
+    #     absence says another implementation was not used, not that anything
+    #     went unobserved.
+    #   * `mcapAuthorizationEnforcement` is about DENYING operations. io-mon
+    #     observes; it never claimed to enforce.
+    #   * `mcapPathMutation` / `mcapPathIdentity` are OUTPUT-side and identity
+    #     fidelity. A missed mutation record leaves the output view poorer; it
+    #     is not an input a cache key would silently omit.
+    #   * `mcapSymlink` / `mcapExternalContent` are PARTIAL, with a recorded
+    #     substitute — a read through a symlink still records a path that
+    #     resolves to the same bytes, and the libc-visible content movers are
+    #     recorded. The gaps are narrower coverage, not blindness.
+    #   * `mcapAdversarialRawSyscall` / `mcapExecutableMappingLifecycle` are
+    #     THREAT MODELS the profile's own diagnostics already tell consumers to
+    #     request explicitly if they need them.
+    # `mcapLibraryLoad` was the one entry in the Linux list that was none of
+    # those: a whole class of real content inputs, observed by nothing else,
+    # absent from the capture, with no substitute record anywhere.
+    mcapProcess,
+    mcapProcessTree,
+    mcapProcessExec,
+    mcapFileRead,
+    mcapFileWrite,
+    mcapPathProbe,
+    mcapDirectoryEnumerate,
+    mcapEventLoss,
+    mcapLibraryLoad
   }
 
   LinuxPreloadKnownUnsupportedCapabilities* = {
     mcapEndpointSecurity,
     mcapHybrid,
     mcapSymlink,
-    mcapLibraryLoad,
     mcapAuthorizationEnforcement,
     mcapPathMutation,
     mcapAdversarialRawSyscall,
@@ -146,6 +305,175 @@ const
     mcapPathIdentity,
     # ROUND-3 S1 — xattr/shm/FIFO/sendfile content-channel hooks are macOS-only so far.
     mcapExternalContent
+  }
+
+  # What the Windows shim can actually observe, derived from the record and
+  # observation kinds it emits (`shim/windows_interpose.nim`) rather than
+  # from the hooks it installs -- a hooked entry point that produces no
+  # record observes nothing as far as a consumer is concerned.
+  #
+  # Windows used to report the macOS set here, because
+  # `defaultHooksMonitorProfile` had no Windows branch and fell through to
+  # the macOS profile. That claimed rename, symlink, library-load,
+  # ipc-connect, observed-env, non-determinism and external-content on a
+  # backend that emits no such record, and labelled every Windows depfile
+  # `backend=macos-interpose-hooks`. The banner is what a consumer reads to
+  # decide what the evidence covers, so an over-claim there is the same
+  # class of defect as a monitoring failure that reports success.
+  WindowsInterposeSupportedCapabilities* = {
+    mcapProcess,              # mrProcessStart
+    mcapFileRead,             # mrFileRead / moFileRead
+    mcapFileWrite,            # mrFileWrite / moFileWrite
+    mcapPathProbe,            # mrPathProbe (GetFileAttributes*, NtQuery*)
+    mcapDirectoryEnumerate,   # mrDirectoryEnumerate (FindFirstFileEx family)
+    mcapEventLoss,            # mrEventLoss
+    mcapProcessTree,          # mrProcessSpawn + CreateRemoteThread propagation
+    mcapProcessExec,          # moExecute on the spawn record
+    mcapBackendProvenance,    # this profile record
+    # mrLibraryLoad, from LdrRegisterDllNotification plus an enumeration of
+    # the images already mapped at init. Sourced from the LOADER rather than
+    # from hooked calls, because LoadLibraryW is only one route into
+    # LdrLoadDll and a statically imported DLL is mapped before any of them
+    # runs. This capability is in InputEvidenceCapabilities -- the floor a
+    # backend must meet before a capture may claim mcComplete.
+    mcapLibraryLoad,
+    # M5 --------------------------------------------------------------------
+    #
+    # The three gaps M4 declared that could hide a real INPUT, each moved here
+    # only once records genuinely flow. The standard is M4's: a capability is
+    # not advertised without a record kind behind it, so what follows names
+    # the record kind for each.
+    #
+    # mrIpcConnect. Two arms, because Windows has two ways to reach a peer and
+    # only one of them looks like a socket. `connect`/`WSAConnect` in ws2_32
+    # are hooked; a named-pipe CLIENT needs no new entry point at all, since it
+    # reaches its peer by OPENING `\\.\pipe\<name>` through the already hooked
+    # CreateFileW/A and NtCreateFile -- so that arm is a classification of
+    # paths those hooks already carried. The pipe arm also supplies what the
+    # socket arm cannot: `GetNamedPipeServerProcessId` names the peer process,
+    # the Windows counterpart of LOCAL_PEERPID, so the merge can PROVE whether
+    # a peer is one of this run's monitored processes. A socket peer has no
+    # such answer on Windows and is reported as unknown, which the merge treats
+    # conservatively -- a re-run, never a false skip.
+    mcapIpcConnect,
+    # mrNonDeterministic (entropy) + mrTimeRead (clocks). BCryptGenRandom,
+    # ProcessPrng, RtlGenRandom/SystemFunction036 and CryptGenRandom;
+    # QueryPerformanceCounter, GetSystemTimeAsFileTime and GetTickCount64.
+    # Evidence only: `nonDeterminismObservationCount` counts them and nothing
+    # downgrades, because io-mon DID observe the read and caller policy decides
+    # what it means. This is the reporting half of the entropy-blessing design
+    # (M6), which had no Windows implementation at all before.
+    mcapNonDeterminism,
+    # mrExternalContent. Windows' content channels that are not file reads:
+    # named file mappings (the shm analogue, via CreateFileMapping/
+    # OpenFileMapping), anonymous pipes (CreatePipe, paired against a read from
+    # a handle the shim never saw opened), and NTFS alternate data streams.
+    # Plus the one Windows adds that a build actually hits constantly -- a
+    # MAPPED VIEW of a file, whose bytes arrive by page fault and pass no read
+    # hook anywhere -- recorded as an ordinary `moFileRead` on the underlying
+    # path so the bytes land in the cache key rather than merely in the log.
+    mcapExternalContent,
+    # M10 -------------------------------------------------------------------
+    #
+    # mrEnvRead / moEnvRead, carrying the variable NAME, deduped per process,
+    # never downgrading -- the SAME contract the macOS and Linux arms
+    # implement, because a consumer compares captures across platforms and a
+    # Windows record that meant something subtly different would be worse than
+    # the honest gap it replaces.
+    #
+    # This was the last Windows gap that was an INPUT channel, and the only
+    # one that could produce a false `mcComplete` over something unseen: a
+    # build reads a variable, nothing records it, the capture grades complete,
+    # and the action cache serves a stale result the next time the value
+    # changes. The four gaps left below are output-side or identity fidelity.
+    #
+    # WHAT IS COVERED, stated as the claim rather than as a list of hooks:
+    # every read that goes through a CALL. Windows keeps TWO copies of the
+    # environment and a program reads exactly one of them, so both are hooked:
+    #
+    #   * the PEB block, through kernel32's `GetEnvironmentVariableW`/`A` and
+    #     the three whole-block exports `GetEnvironmentStringsW`/`A`/
+    #     `GetEnvironmentStrings` (three, because they are three separate
+    #     bodies -- measured, not assumed);
+    #   * each C runtime's OWN snapshot, taken from that block once at CRT
+    #     startup and served by `getenv` thereafter, so a program linked
+    #     against a CRT may never call a Win32 environment API at all. Both
+    #     runtimes a Windows toolchain actually links are covered:
+    #     `ucrtbase.dll` (`getenv`, `_wgetenv`, `getenv_s`, `_wgetenv_s`,
+    #     `_dupenv_s`, `_wdupenv_s`) and `msvcrt.dll` (the same four minus
+    #     `_dupenv_s`/`_wdupenv_s`, which it does not export).
+    #
+    # A whole-block read is expanded into per-name records ONLY when the
+    # caller is the monitored program's own image. Every CRT reads the block
+    # once at startup, in every process; expanding that would make every
+    # Windows action depend on its entire environment, which is a monitor that
+    # makes everything uncacheable.
+    #
+    # WHAT IS NOT COVERED, and it is a residual rather than a hole in the
+    # claim: a program that walks the CRT's environment ARRAY directly --
+    # `msvcrt!_environ`, `ucrtbase!__p__environ`/`__p__wenviron` -- performs no
+    # call for a detour to intercept. This is the exact Windows counterpart of
+    # the POSIX `environ` walk, which the macOS and Linux arms do not cover
+    # either while advertising this same capability; the claim is "every
+    # environment read that goes through a call", on all three platforms.
+    mcapObservedEnv,
+    # DA-10 — MOVED HERE FROM THE UNSUPPORTED SET, for the same reason as the
+    # macOS entry: the fold moved out of the transport and into
+    # `writer.foldObservationIdentity`, which runs inside `mergeFragments` —
+    # the one funnel every Windows depfile is written through. See
+    # `backendFoldsObservationIdentity` for the half of the Linux reduction
+    # this does NOT deliver.
+    mcapObservationIdentityFold
+  }
+
+  # Capabilities with no Windows record kind behind them today. Reported as
+  # gaps so the shortfall is visible rather than silently absent.
+  #
+  # EndpointSecurity / hybrid / authorization-enforcement are macOS
+  # concepts with no Windows analogue at all. The rest are real gaps in
+  # this backend: the entry points for several are hooked, but no record
+  # kind carries the observation, so nothing reaches the depfile.
+  #
+  # M5 closed three of the eight gaps M4 declared -- ipc-connect,
+  # non-determinism and external-content -- and DELIBERATELY left five open
+  # rather than half-closing all eight. M10 then closed the one of those five
+  # that was an INPUT channel, `mcapObservedEnv`, which is why the list is now
+  # four. The ordering came from the consequence, not from effort: a missing
+  # input channel is the only kind of gap that can produce a false
+  # `mcComplete`. WHAT REMAINS IS OUTPUT-SIDE OR IDENTITY FIDELITY, none of it
+  # inside `InputEvidenceCapabilities` and none of it inside
+  # `InputChannelCapabilities`:
+  #
+  #   * mcapFileCreate / mcapFileTruncate / mcapFileAppend -- the access IS
+  #     recorded, as an open/read/write; what is missing is the finer
+  #     classification of the creation disposition. No input goes unseen.
+  #   * mcapRename -- MoveFileExW/A is hooked and BOTH sides are recorded as
+  #     writes, so the output tree is tracked; there is no distinct rename
+  #     record kind. Output-side.
+  #   * mcapPathMutation -- SetCurrentDirectory / DeleteFile / CreateDirectory
+  #     are hooked and recorded as writes; there is no `mrPathMutation` record.
+  #     Output-side.
+  #   * mcapSymlink -- CreateSymbolicLinkW is not hooked and no path is
+  #     resolved to its link target. Identity fidelity: a read THROUGH a
+  #     symlink still records a path that resolves to the same bytes.
+  #
+  # `mcapObservedEnv` is NOT here any more. See the M10 block in
+  # `WindowsInterposeSupportedCapabilities` for what the capability now claims
+  # and for the one residual it does not (a direct walk of the CRT's `_environ`
+  # array, which performs no call and is uncovered on POSIX too).
+  WindowsInterposeKnownUnsupportedCapabilities* = {
+    mcapEndpointSecurity,
+    mcapHybrid,
+    mcapAuthorizationEnforcement,
+    mcapFileCreate,
+    mcapFileTruncate,
+    mcapFileAppend,
+    mcapRename,
+    mcapSymlink,
+    mcapPathMutation,
+    mcapAdversarialRawSyscall,
+    mcapExecutableMappingLifecycle,
+    mcapPathIdentity
   }
 
 proc backendFamilyId*(family: MonitorBackendFamily): string =
@@ -158,6 +486,8 @@ proc backendFamilyId*(family: MonitorBackendFamily): string =
     "macos-hybrid"
   of mbfLinuxPreloadHooks:
     "linux-preload-hooks"
+  of mbfWindowsInterposeHooks:
+    "windows-interpose-hooks"
   of mbfUnknown:
     "unknown"
 
@@ -215,12 +545,33 @@ proc capabilityId*(capability: MonitorCapability): string =
     "executable-mapping-lifecycle"
   of mcapPathIdentity:
     "path-identity"
+  of mcapObservationIdentityFold:
+    "observation-identity-fold"
 
-proc capabilityFromId*(value: string): MonitorCapability =
+proc tryCapabilityFromId*(value: string): Option[MonitorCapability] =
+  ## The TOLERANT half of the wire-id lookup: `none` for an id this build does
+  ## not know, rather than an exception.
+  ##
+  ## It exists because the raising form below cannot be used on a decode path.
+  ## A depfile written by a NEWER io-mon advertises capability ids this build has
+  ## never heard of, and every such id used to reach `capabilityFromId` and
+  ## escape `readMonitorDepFile` as an unhandled `ValueError` — measured: a
+  ## reader built before `observation-identity-fold` existed exits rc=1 on a file
+  ## that merely mentions it in `supported=`. Unknown is a normal state of the
+  ## world for a format that grows by appending, so it is answered, not raised.
   for capability in MonitorCapability:
     if capabilityId(capability) == value:
-      return capability
-  raise newException(ValueError, "unknown monitor capability: " & value)
+      return some(capability)
+  none(MonitorCapability)
+
+proc capabilityFromId*(value: string): MonitorCapability =
+  ## The STRICT form, for a caller that has already decided an unknown id is a
+  ## programming error (or that catches the exception itself, as `parseGapDetail`
+  ## does). Decode paths must use `tryCapabilityFromId`.
+  let capability = tryCapabilityFromId(value)
+  if capability.isNone:
+    raise newException(ValueError, "unknown monitor capability: " & value)
+  capability.get
 
 proc backendFamilyFromId*(value: string): MonitorBackendFamily =
   for family in MonitorBackendFamily:
@@ -228,12 +579,36 @@ proc backendFamilyFromId*(value: string): MonitorBackendFamily =
       return family
   mbfUnknown
 
-proc parseCapabilityList(value: string): set[MonitorCapability] =
+proc parseCapabilityList(value: string; unnamable: var seq[string]):
+    set[MonitorCapability] =
+  ## Decode a `supported=` / `required=` list, DEGRADING on an id this build
+  ## cannot name instead of raising through the caller and out of
+  ## `readMonitorDepFile`.
+  ##
+  ## The unknown id is RETAINED, in `unnamable`, and the caller turns it into a
+  ## profile diagnostic. Dropping it silently would be one line shorter and is
+  ## the wrong trade: this project's whole argument is attribution rather than
+  ## suppression, and an id that vanishes without a word leaves a consumer unable
+  ## to tell "the producer declared nothing else" from "the producer declared
+  ## something I am too old to understand". The set is enum-typed, so the id
+  ## cannot be carried IN it; a named diagnostic is the closest honest thing.
+  ##
+  ## Direction of the degrade, which is why it is safe: an unnamable id in
+  ## `supported=` is simply not counted as supported, so this build UNDER-claims
+  ## what the backend can do and never over-claims it. It cannot flip a grade
+  ## either — `profileFromRecords` only clears `evidenceComplete` for a
+  ## capability the CALLER required, and a caller's required set is enum-typed
+  ## and therefore cannot contain an id this build does not have.
   if value.len == 0:
     return {}
   for item in value.split(','):
-    if item.len > 0:
-      result.incl capabilityFromId(item)
+    if item.len == 0:
+      continue
+    let capability = tryCapabilityFromId(item)
+    if capability.isSome:
+      result.incl capability.get
+    elif item notin unnamable:
+      unnamable.add item
 
 proc unsupportedReason(capability: MonitorCapability): string =
   case capability
@@ -291,6 +666,85 @@ proc unsupportedReason(capability: MonitorCapability): string =
   else:
     "capability is not advertised by the selected macOS interpose profile"
 
+proc windowsUnsupportedReason(capability: MonitorCapability): string =
+  ## Why the Windows interpose backend does not advertise a capability.
+  ##
+  ## The distinction that matters here is between "no Win32 analogue exists"
+  ## and "the entry point IS hooked but no record kind carries the
+  ## observation". The second is a gap a reader can close; the first is not.
+  case capability
+  of mcapEndpointSecurity:
+    "EndpointSecurity is a macOS kernel facility with no Windows analogue"
+  of mcapHybrid:
+    "hybrid native plus interpose profile is macOS-specific"
+  of mcapAuthorizationEnforcement:
+    "the Windows interpose shim observes only and cannot authorize or deny " &
+      "operations"
+  of mcapFileCreate, mcapFileTruncate, mcapFileAppend:
+    "CreateFileW/A is hooked, but the shim does not yet classify the " &
+      "creation disposition into create/truncate/append observations -- the " &
+      "access is recorded as an open/read/write"
+  of mcapRename:
+    "MoveFileExW/A is hooked but no rename record kind is emitted"
+  of mcapSymlink:
+    "CreateSymbolicLinkW is not hooked and no symlink resolution is performed"
+  of mcapLibraryLoad:
+    "LoadLibrary is not hooked and the loaded-module set is not enumerated, " &
+      "so a DLL the process maps is not recorded as a content dependency"
+  of mcapPathMutation:
+    "SetCurrentDirectory/DeleteFile/CreateDirectory are hooked but no " &
+      "path-mutation record kind is emitted"
+  of mcapIpcConnect:
+    # M5: connect/WSAConnect ARE hooked and a named-pipe client open IS
+    # classified with its server pid. This branch is retained only for
+    # profiles that share this enum and have not wired it, and as a defensive
+    # default.
+    "connect/WSAConnect and named-pipe client opens are recorded by the " &
+      "Windows interpose shim; this reason applies only where IPC-connect " &
+      "is not yet advertised"
+  of mcapObservedEnv:
+    # M10: environment reads ARE recorded now, through both the Win32 block
+    # and both C runtimes' getenv families. This branch is retained only for
+    # profiles that share this enum and have not wired it, and as a defensive
+    # default -- the same status the ipc-connect / non-determinism /
+    # external-content branches took when M5 closed them.
+    #
+    # It is worth saying why the sentence this replaces mattered. It was the
+    # one Windows gap that was an INPUT channel, and the record carried
+    # `input=true` from `InputChannelCapabilities` precisely so a consumer did
+    # not have to tell it apart from "renames are not classified" by reading
+    # English. That machinery is unchanged and still distinguishes the four
+    # remaining gaps, all of which are `input=false`.
+    "environment reads are recorded as observed inputs by the Windows " &
+      "interpose shim (kernel32's GetEnvironmentVariable/Strings plus the " &
+      "getenv families of both ucrtbase and msvcrt); this reason applies " &
+      "only where observed-env recording is not yet advertised"
+  of mcapNonDeterminism:
+    # M5: entropy (BCryptGenRandom / ProcessPrng / RtlGenRandom /
+    # CryptGenRandom) and clocks (QueryPerformanceCounter /
+    # GetSystemTimeAsFileTime / GetTickCount64) ARE hooked. Defensive default
+    # only, as above.
+    "entropy and clock sources are hooked on the Windows interpose shim; " &
+      "this reason applies only where non-determinism handling is not yet " &
+      "advertised"
+  of mcapExternalContent:
+    # M5: file mappings, anonymous pipes and NTFS alternate data streams ARE
+    # covered. Defensive default only, as above.
+    "file mappings, anonymous pipes and alternate data streams are recorded " &
+      "by the Windows interpose shim; this reason applies only where " &
+      "external-content coverage is not yet advertised"
+  of mcapAdversarialRawSyscall:
+    "direct NTDLL syscall stubs bypass the IAT and the detoured entry " &
+      "points; no adversarial completeness is claimed"
+  of mcapExecutableMappingLifecycle:
+    "executable mapping lifecycle (VirtualAlloc/VirtualProtect of RX pages) " &
+      "is not tracked"
+  of mcapPathIdentity:
+    "paths are recorded as the caller spelled them, without resolving to a " &
+      "canonical file identity"
+  else:
+    "not supported by the Windows interpose backend"
+
 proc linuxUnsupportedReason(capability: MonitorCapability): string =
   case capability
   of mcapEndpointSecurity:
@@ -303,7 +757,9 @@ proc linuxUnsupportedReason(capability: MonitorCapability): string =
   of mcapSymlink:
     "Linux preload shim does not yet normalize symlink/readlink as path mutations"
   of mcapLibraryLoad:
-    "Linux preload shim does not yet emit library-load records"
+    "Linux preload shim observes the loader's link map (dl_iterate_phdr) and " &
+      "emits library-load records; this reason applies only where library-load " &
+      "observation is not advertised"
   of mcapAuthorizationEnforcement:
     "Linux preload shim observes only and cannot authorize or deny operations"
   of mcapPathMutation:
@@ -333,8 +789,9 @@ proc linuxUnsupportedReason(capability: MonitorCapability): string =
       "system-configuration coverage is required"
   of mcapNonDeterminism:
     "Linux preload shim records libc-visible clock_gettime/gettimeofday/time " &
-      "as time reads and getrandom as non-determinism; this reason applies " &
-      "only where direct raw/vDSO or broader entropy/time APIs are required"
+      "as time reads and getrandom/getentropy/arc4random/arc4random_buf/" &
+      "arc4random_uniform as non-determinism; this reason applies " &
+      "only where direct raw or broader entropy/time APIs are required"
   of mcapExternalContent:
     "Linux preload shim records libc-visible positioned/vector and zero-copy " &
       "file movers, but broader external content channels and direct raw " &
@@ -343,14 +800,21 @@ proc linuxUnsupportedReason(capability: MonitorCapability): string =
     "capability is not advertised by the selected Linux preload profile"
 
 proc gapDetail*(gap: MonitorCapabilityGap): string =
+  ## `input=` goes BEFORE `reason=` deliberately: `reason` is free text and is
+  ## therefore always last, so a key appended after it would be swallowed by
+  ## the reason of any consumer that split on the first `;` after `reason=`.
+  ## An older parser ignores the unknown key (`parseGapDetail`'s `else: discard`
+  ## arm), so adding it does not break a depfile written before it existed.
   "backend=" & backendFamilyId(gap.backendFamily) &
     ";capability=" & capabilityId(gap.capability) &
     ";required=" & (if gap.required: "true" else: "false") &
+    ";input=" & (if gap.inputChannel: "true" else: "false") &
     ";reason=" & gap.reason
 
 proc parseGapDetail*(detail: string): MonitorCapabilityGap =
   result.backendFamily = mbfUnknown
   result.capability = mcapProcess
+  var sawInput = false
   for part in detail.split(';'):
     let pair = part.split("=", 1)
     if pair.len != 2:
@@ -362,10 +826,18 @@ proc parseGapDetail*(detail: string): MonitorCapabilityGap =
       result.capability = capabilityFromId(pair[1])
     of "required":
       result.required = pair[1] == "true"
+    of "input":
+      result.inputChannel = pair[1] == "true"
+      sawInput = true
     of "reason":
       result.reason = pair[1]
     else:
       discard
+  if not sawInput:
+    # A depfile written before `input=` existed. Derive it rather than leaving
+    # it false: silently answering "not an input channel" for every gap in an
+    # older capture is the same over-claim in a new place.
+    result.inputChannel = result.capability in InputChannelCapabilities
 
 proc capabilityGapRecord*(gap: MonitorCapabilityGap): MonitorRecord =
   MonitorRecord(
@@ -377,6 +849,82 @@ proc capabilityGapRecord*(gap: MonitorCapabilityGap): MonitorRecord =
     probeResult: prUnknown,
     path: capabilityId(gap.capability),
     detail: gapDetail(gap))
+
+func backendFoldsObservationIdentity*(family: MonitorBackendFamily): bool =
+  ## Does a capture from this backend FOLD repeated observations of one fact
+  ## into one record?
+  ##
+  ## IT USED TO BE A PROPERTY OF THE TRANSPORT ALONE, AND DA-10 MOVED IT. The
+  ## Linux backend publishes each observation into a consumer-owned
+  ## `nim-shm-gset` whose element key IS the observation's identity
+  ## (`depIdentityScope`), so two processes observing one fact insert one
+  ## element. Every other backend writes `.iomon-frag` frames, and that writer
+  ## still encodes every field verbatim with the record's real `seq` — but the
+  ## fold is no longer only in the transport. `writer.foldObservationIdentity`
+  ## applies the SAME DA-1b element key inside `mergeFragments`, which every
+  ## depfile from every backend is written through, so a fact observed by N
+  ## processes is now one record on a file transport too.
+  ##
+  ## WHAT THE FILE TRANSPORTS STILL DO NOT GET, stated so this answer is not
+  ## read as more than it is: the merge-time fold covers exactly the kinds whose
+  ## `depIdentityKeepsIncarnation` is FALSE — `mrLibraryLoad`, `mrEnvRead`,
+  ## `mrSysctlRead`, `mrTimeRead`, the four the DA-1b measurement found to be
+  ## 46.3% of a real `nim c`'s depfile. The PATH-scoped kinds
+  ## (`mrFileOpen` / `mrFileRead` / `mrPathProbe` / `mrDirectoryEnumerate`) keep
+  ## the observer's per-exec incarnation in their set key
+  ## (`writer.encodeDepSetElement`'s `setElemImage`), and the fragment writer
+  ## carries no incarnation coordinate — so that half of the Linux reduction is
+  ## NOT reconstructible at merge time and is not attempted. Folding those
+  ## without the incarnation would be a dedup decision DA-1b explicitly did not
+  ## take. The residual is small and was measured: path-scoped kinds dedup at
+  ## 1.0–1.1x, i.e. they carry almost no cross-process repetition to recover.
+  ##
+  ## ASSERTED AS DATA, per family, and NOT behind `when defined(...)`. On Linux
+  ## `defined(linux) or defined(macosx)` and a bare `true` are the same value,
+  ## so a host-conditional assertion cannot catch a claim that is wrong for a
+  ## platform the host is not. Grading every family's answer from any host is
+  ## what makes the macOS answer reviewable from a Linux box.
+  ##
+  ## THIS IS A COST AND SIZE DEFECT, NOT A CORRECTNESS ONE, AND THE DISTINCTION
+  ## IS LOAD-BEARING. On a non-folding backend **no fact is lost**: the records
+  ## are all present, just repeated. Completeness is unaffected — the monitor
+  ## observed everything it was asked to. Consumers already fold by path
+  ## (reprobuild's `addUnique`), so the repetition costs capture time, transport
+  ## and depfile bytes, and changes no verdict and no cache key.
+  ##
+  ## Which is exactly why the gap this used to drive was declared
+  ## `required = false` — and why `mcapObservationIdentityFold` is deliberately
+  ## NOT a member of `InputEvidenceCapabilities`, which is the part DA-10 does
+  ## not change: no family declares this gap any more, but a family that
+  ## answered `false` here must still not be forced incomplete by it.
+  ## Promoting it into that floor set would force
+  ## `mcIncomplete` on such a capture, and that grade would be FALSE:
+  ## `mcIncomplete` means *the monitor could not observe everything*, and here
+  ## it observed everything and wrote some of it down more than once. Encoding a
+  ## non-fidelity fact as a fidelity grade is the same mistake the reduced-scope
+  ## mode had to withdraw, and it would corrupt the very signal
+  ## `observedInterest` exists to make trustworthy. **Do not "fix" this by
+  ## moving the capability into the floor set.**
+  case family
+  of mbfLinuxPreloadHooks:
+    true
+  of mbfMacosHooks, mbfMacosEndpointSecurity, mbfMacosHybrid,
+     mbfWindowsInterposeHooks:
+    # DA-10 — was `false`, and the change is deliberate rather than a loosening.
+    # These families all reach the consumer through `mergeFragments`, and that
+    # is where the fold now is. The non-folding arm of
+    # `test_io_mon_dep_identity_scope`'s headline case exists precisely to
+    # redden "the day someone brings the fold to a file-transport backend";
+    # this is that day, and the declaration is being moved rather than the
+    # assertion weakened.
+    true
+  of mbfUnknown:
+    # Conservative, and still false AFTER DA-10. The fold reaches a capture
+    # because `mergeFragments` wrote it; a capture whose backend this build
+    # cannot even name is not one it can claim to have written. Promising a
+    # reduction we have not verified is the direction that misleads a consumer
+    # sizing a capture.
+    false
 
 proc backendProfileRecord*(profile: MonitorBackendProfile): MonitorRecord =
   var caps: seq[string] = @[]
@@ -423,6 +971,7 @@ proc macosInterposeMonitorProfile*(
       backendFamily: result.backendFamily,
       capability: capability,
       required: requiredGap,
+      inputChannel: capability in InputChannelCapabilities,
       reason: unsupportedReason(capability))
     if requiredGap:
       result.diagnostics.add MonitorDiagnostic(
@@ -455,7 +1004,9 @@ proc linuxPreloadMonitorProfile*(
       "renameat2 record hardlink source/alias and final rename destinations; " &
       "libc-visible getenv/uname/sysconf are observed inputs, " &
       "clock_gettime/gettimeofday/time are time-read evidence, and " &
-      "getrandom is entropy evidence left to caller invalidation policy; " &
+      "getrandom/getentropy/arc4random/arc4random_buf/arc4random_uniform are " &
+      "entropy evidence (deduped per process per source) left to caller " &
+      "invalidation policy; " &
       "and io-mon fails closed for unsupported raw syscall numbers, " &
       "untracked or partially tracked anonymous executable mprotect, " &
       "partial-overlap mremap ownership escapes, or anonymous writable+" &
@@ -468,7 +1019,8 @@ proc linuxPreloadMonitorProfile*(
       "direct raw zero-copy/mutation syscalls, pre-existing hardlink/inode " &
       "aliases, direct raw/vDSO non-file determinism paths, and broader Linux " &
       "non-file APIs beyond getenv/uname/sysconf/clock/gettimeofday/time/" &
-      "getrandom. Consumers that require those " &
+      "getrandom/getentropy/arc4random(_buf|_uniform). " &
+      "Consumers that require those " &
       "threat models must request the corresponding capability and treat the " &
       "gap as incomplete.")
 
@@ -485,7 +1037,94 @@ proc linuxPreloadMonitorProfile*(
       backendFamily: result.backendFamily,
       capability: capability,
       required: requiredGap,
+      inputChannel: capability in InputChannelCapabilities,
       reason: linuxUnsupportedReason(capability))
+    if requiredGap:
+      result.diagnostics.add MonitorDiagnostic(
+        level: mdlError,
+        message: "required monitor capability is unsupported by " &
+          backendFamilyId(result.backendFamily) & ": " &
+          capabilityId(capability))
+
+proc windowsInterposeMonitorProfile*(
+    required: set[MonitorCapability] = {}): MonitorBackendProfile =
+  result.profileName = "windows-interpose-hooks-m14"
+  result.backendFamily = mbfWindowsInterposeHooks
+  result.supportedCapabilities = WindowsInterposeSupportedCapabilities
+  result.requiredCapabilities = required
+  result.evidenceComplete = true
+  result.diagnostics.add MonitorDiagnostic(
+    level: mdlInfo,
+    message: "selected Windows interpose/hooks backend (inline detours with " &
+      "an IAT-patching fallback, injected via CreateRemoteThread)")
+  result.diagnostics.add MonitorDiagnostic(
+    level: mdlInfo,
+    message: "M5 coverage: connect/WSAConnect plus named-pipe client opens " &
+      "are recorded as ipc-connect (the pipe peer carries its server pid " &
+      "from GetNamedPipeServerProcessId; a socket peer is reported unknown " &
+      "and treated conservatively); named file mappings, anonymous pipes and " &
+      "NTFS alternate data streams are recorded as external content, and a " &
+      "mapped view of a file is recorded as a read of that file; entropy " &
+      "(BCryptGenRandom, ProcessPrng, RtlGenRandom, CryptGenRandom) and " &
+      "clocks (QueryPerformanceCounter, GetSystemTimeAsFileTime, " &
+      "GetTickCount64) are recorded as evidence that never downgrades")
+  result.diagnostics.add MonitorDiagnostic(
+    level: mdlWarning,
+    message: "Windows non-determinism coverage is limited to calls through " &
+      "the exported entry points. GetTickCount64 and GetSystemTimeAsFileTime " &
+      "are served from KUSER_SHARED_DATA, and a program that reads that page " &
+      "directly -- or issues rdtsc -- performs NO call for a detour to " &
+      "intercept, so such a read is neither observed nor detected. Entropy " &
+      "and clock observations are recorded once per source per caller origin " &
+      "(program vs system image), so they are evidence that a source was " &
+      "used, not a count of uses.")
+  result.diagnostics.add MonitorDiagnostic(
+    level: mdlInfo,
+    message: "M10 coverage: environment reads are recorded as observed " &
+      "declared inputs (mrEnvRead, the variable name, deduped " &
+      "case-insensitively per process, never downgrading). Windows keeps two " &
+      "copies of the environment and a program reads exactly one, so both " &
+      "are hooked: the PEB block through kernel32 " &
+      "GetEnvironmentVariableW/A and GetEnvironmentStringsW/A/" &
+      "GetEnvironmentStrings, and each C runtime's own startup snapshot " &
+      "through its getenv family -- ucrtbase (getenv, _wgetenv, getenv_s, " &
+      "_wgetenv_s, _dupenv_s, _wdupenv_s) and msvcrt (the same minus " &
+      "_dupenv_s/_wdupenv_s, which it does not export). A lookup that found " &
+      "nothing is recorded too: absence is a dependency. The monitor's own " &
+      "per-run control variables (REPRO_MONITOR_*, IO_MON_*) are excluded, " &
+      "because folding them into a consumer's cache key would change that " &
+      "key on every run.")
+  result.diagnostics.add MonitorDiagnostic(
+    level: mdlWarning,
+    message: "Windows observed-env coverage is limited to reads that go " &
+      "through a CALL. A program that walks the C runtime's environment " &
+      "ARRAY directly -- msvcrt's _environ, ucrtbase's __p__environ / " &
+      "__p__wenviron -- performs no call for a detour to intercept, so such " &
+      "a read is neither observed nor detected. This is the Windows " &
+      "counterpart of the POSIX environ walk, which the macOS and Linux arms " &
+      "do not cover either. A whole-block read (GetEnvironmentStrings*) is " &
+      "expanded into one record per variable only when the CALLER is the " &
+      "monitored program's own image: every C runtime reads the block once " &
+      "at startup in every process, and expanding that would make every " &
+      "action depend on its entire environment. A program whose block read " &
+      "comes through a bundled DLL is attributed to the system image and " &
+      "gets no expansion; its named reads are still recorded.")
+
+  var gapCapabilities = WindowsInterposeKnownUnsupportedCapabilities
+  for capability in required:
+    if capability notin result.supportedCapabilities:
+      gapCapabilities.incl capability
+      result.evidenceComplete = false
+
+  for capability in gapCapabilities:
+    let requiredGap = capability in required and
+      capability notin result.supportedCapabilities
+    result.gaps.add MonitorCapabilityGap(
+      backendFamily: result.backendFamily,
+      capability: capability,
+      required: requiredGap,
+      inputChannel: capability in InputChannelCapabilities,
+      reason: windowsUnsupportedReason(capability))
     if requiredGap:
       result.diagnostics.add MonitorDiagnostic(
         level: mdlError,
@@ -497,6 +1136,8 @@ proc defaultHooksMonitorProfile*(
     required: set[MonitorCapability] = {}): MonitorBackendProfile =
   when defined(linux):
     linuxPreloadMonitorProfile(required)
+  elif defined(windows):
+    windowsInterposeMonitorProfile(required)
   else:
     macosInterposeMonitorProfile(required)
 
@@ -511,6 +1152,11 @@ proc profileFromRecords*(records: openArray[MonitorRecord];
   result = defaultHooksMonitorProfile(required)
   var sawProfile = false
   var gaps: seq[MonitorCapabilityGap] = @[]
+  # Capability ids the PRODUCER declared and this build cannot name. Collected
+  # rather than raised (the reader must survive a newer writer) and rather than
+  # discarded (a declaration nobody can see is a suppressed declaration); they
+  # become profile diagnostics below.
+  var unnamableIds: seq[string] = @[]
   for record in records:
     case record.kind
     of mrBackendProfile:
@@ -523,9 +1169,11 @@ proc profileFromRecords*(records: openArray[MonitorRecord];
         of "backend":
           result.backendFamily = backendFamilyFromId(pair[1])
         of "supported":
-          result.supportedCapabilities = parseCapabilityList(pair[1])
+          result.supportedCapabilities =
+            parseCapabilityList(pair[1], unnamableIds)
         of "required":
-          result.requiredCapabilities = parseCapabilityList(pair[1])
+          result.requiredCapabilities =
+            parseCapabilityList(pair[1], unnamableIds)
         of "evidenceComplete":
           result.evidenceComplete = pair[1] == "true"
         else:
@@ -544,6 +1192,19 @@ proc profileFromRecords*(records: openArray[MonitorRecord];
     else:
       discard
 
+  # The unnamable declarations, surfaced. This is the same tolerance a malformed
+  # gap record already gets (the `parseGapDetail` branch above) applied to the
+  # `supported=` / `required=` lists, which were the last place in the decoder
+  # where a newer producer's vocabulary could kill the read outright.
+  for id in unnamableIds:
+    result.diagnostics.add MonitorDiagnostic(
+      level: mdlWarning,
+      message: "monitor capability id declared by the producer that this " &
+        "io-mon build cannot name: " & id & " — this capture was written by a " &
+        "newer io-mon; the id is reported rather than dropped, and is counted " &
+        "as UNSUPPORTED here, which under-claims the backend rather than " &
+        "over-claiming it")
+
   if sawProfile and gaps.len > 0:
     result.gaps = gaps
 
@@ -561,6 +1222,7 @@ proc profileFromRecords*(records: openArray[MonitorRecord];
           backendFamily: result.backendFamily,
           capability: capability,
           required: true,
+          inputChannel: capability in InputChannelCapabilities,
           reason: if result.backendFamily == mbfLinuxPreloadHooks:
               linuxUnsupportedReason(capability)
             else:

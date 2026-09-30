@@ -40,14 +40,10 @@ const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
 
 when defined(macosx):
+  from build_test_shim import buildPrivateMacosShim
+
   proc buildShim(): string =
-    let (output, code) = execCmdEx("bash " &
-      quoteShell(repoRoot / "scripts" / "build_shim.sh"))
-    if code != 0:
-      raise newException(IOError, "build_shim.sh failed: " & output)
-    let shim = repoRoot / "build" / "lib" / "librepro_monitor_shim.dylib"
-    doAssert fileExists(shim), "shim not produced at " & shim
-    shim
+    buildPrivateMacosShim(repoRoot)
 
   proc cc(args: string) =
     let ccBin = getEnv("CC", "cc")
@@ -132,7 +128,7 @@ int main(int argc, char **argv) {
     if fileExists(fx.dstPath) and not fileExists(fx.tmpPath):
       result.completed = readFile(fx.dstPath).contains("second")
 
-    let depfile = runWork / "cap.rdep"
+    let depfile = runWork / "cap.iomon"
     discard mergeFragments(fragmentDir, depfile)
     if not fileExists(depfile):
       return

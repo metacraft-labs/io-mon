@@ -1,127 +1,18 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
-    tags:
-      - 'v*'
+    branches: [release/unified-0.1.0]
+    tags: ["v*"]
 
-env:
-  MANIFESTS_REF: io-mon-fixes
+permissions:
+  contents: write
+  id-token: write
 
 jobs:
-  build:
-    name: Build Release Asset
-    runs-on: ${{ matrix.runs-on }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runs-on: [self-hosted, linux, x64]
-            platform: linux-amd64
-            is_windows: false
-          - runs-on: [self-hosted, linux, arm64]
-            platform: linux-arm64
-            is_windows: false
-          - runs-on: [self-hosted, macos, arm64]
-            platform: macos-arm64
-            is_windows: false
-          - runs-on: [self-hosted, macos, arm64]
-            platform: macos-amd64
-            is_windows: false
-            cross_arch: amd64
-          - runs-on: [self-hosted, windows, x64]
-            platform: windows-amd64
-            is_windows: true
-    steps:
-      - name: Generate CI token
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
-          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
-          owner: metacraft-labs
-
-      - name: Checkout io-mon
-        uses: actions/checkout@v4
-        with:
-          path: io-mon
-
-      - name: Checkout nim-stackable-hooks (Windows/Cross)
-        uses: actions/checkout@v4
-        with:
-          repository: metacraft-labs/nim-stackable-hooks
-          path: nim-stackable-hooks
-          ref: dev
-          token: ${{ steps.app-token.outputs.token }}
-
-      - name: Setup Dev Environment (Non-Windows)
-        if: ${{ !matrix.is_windows }}
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
-        with:
-          env-flavor: nix
-          gh-token: ${{ steps.app-token.outputs.token }}
-
-      - name: Setup Nim (Windows)
-        if: ${{ matrix.is_windows }}
-        uses: iffy/install-nim@v5
-
-      - name: Run build (Non-Windows)
-        if: ${{ !matrix.is_windows }}
-        working-directory: io-mon
-        run: |
-          mkdir -p staging dist
-          if [ "${{ matrix.cross_arch }}" = "amd64" ]; then
-            export STACKABLE_HOOKS_SRC="../nim-stackable-hooks/src"
-            export IO_MON_BUILD_MODE="release"
-            export IO_MON_SHIM_OUT_DIR="build/lib"
-            dev-exec nim c -d:release --app:lib --threads:on --cpu:amd64 --passC:"-arch x86_64" --passL:"-arch x86_64" --path:src --path:"$STACKABLE_HOOKS_SRC" --out:"build/lib/librepro_monitor_shim.dylib" src/io_mon/shim/macos_interpose.nim
-            dev-exec nim c -d:release --cpu:amd64 --passC:"-arch x86_64" --passL:"-arch x86_64" --path:"$STACKABLE_HOOKS_SRC" --path:src --threads:on --out:build/bin/io-mon cmd/io_mon_snoop.nim
-          else
-            dev-exec just build
-          fi
-          cp build/bin/io-mon staging/
-          cp build/lib/librepro_monitor_shim.* staging/
-          tar -czf dist/io-mon-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz -C staging .
-
-      - name: Run build (Windows)
-        if: ${{ matrix.is_windows }}
-        working-directory: io-mon
-        shell: bash
-        run: |
-          mkdir -p build/bin build/lib staging dist
-          export STACKABLE_HOOKS_SRC="../nim-stackable-hooks/src"
-          export IO_MON_BUILD_MODE="release"
-          bash scripts/build_shim.sh
-          nim c -d:release --path:"$STACKABLE_HOOKS_SRC" --path:src --threads:on --out:build/bin/io-mon.exe cmd/io_mon_snoop.nim
-          cp build/bin/io-mon.exe staging/
-          cp build/lib/librepro_monitor_shim.dll staging/
-          tar -czf dist/io-mon-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz -C staging .
-
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist-${{ matrix.platform }}
-          path: io-mon/dist/*
-          retention-days: 7
-
   release:
-    name: Publish Github Release
-    needs: build
-    runs-on: [self-hosted, linux, x64]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: artifacts/*
-          draft: false
-          prerelease: false
-          token: ${{ secrets.GITHUB_TOKEN }}
+    uses: metacraft-labs/metacraft-github-actions/.github/workflows/release-tools.yml@96ac63b99d8d6c3a06ca43a9214abbc00f4ac01e
+    with:
+      tooling-ref: 96ac63b99d8d6c3a06ca43a9214abbc00f4ac01e
+    secrets: inherit

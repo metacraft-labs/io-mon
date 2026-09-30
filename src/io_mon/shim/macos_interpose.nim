@@ -1,6 +1,17 @@
 when not defined(macosx):
   {.error: "repro_monitor_shim/macos_interpose is macOS-only".}
 
+# The shim is loaded into processes whose threads it does not own, and Nim's
+# default allocator owns one heap per thread: a cell freed on a thread other
+# than its allocator's is handed back through a pointer into the OWNING
+# thread's TLS, which the loader discards when that thread exits. Measured as
+# a 0xC0000005 in `addToSharedFreeList` on .NET's finalizer thread -- see
+# scripts/build_shim.sh. Only the library build is held to this: a test that
+# imports the module into a console binary runs on threads Nim created.
+when appType == "lib" and not defined(useMalloc):
+  {.error: "the io-mon shim must be built with -d:useMalloc; " &
+    "scripts/build_shim.sh sets it, and says why".}
+
 import std/[locks, os, sets, strutils, tables]
 from io_mon/paths import extendedPath
 
@@ -363,6 +374,11 @@ var
   # paired-down breakaway, never a false skip). See repro_hook_xpc_*.
   pendingAppleXpc = initTable[uint, string]()
   fragmentDir: string
+  # The consumer's event-interest set (REPRO_MONITOR_INTEREST), set once at init
+  # and only read in `emitRecord` thereafter. `FullInterest` by default so a shim
+  # never told an interest captures everything. See
+  # docs/contributors/event-interest-filter.md.
+  gInterest: set[EventCategory] = FullInterest
   nextProcessSeq: uint64 = 0
   fdPaths = initTable[cint, string]()
   dirPaths = initTable[uint, string]()
@@ -401,11 +417,11 @@ var
   # would lose its buffered tail — and crucially we CANNOT flush it from a
   # pthread-key thread-exit destructor, because macOS tears down a non-Nim
   # thread's Nim runtime TLS before pthread destructors run, so any Nim call from
-  # there faults. We therefore flush a worker thread's batch SYNCHRONOUSLY on
+  # there faults. We therefore flush and close a worker thread's slot SYNCHRONOUSLY on
   # every emit (see emitRecord): the main thread keeps the batching win (the
   # millions of single-threaded configure probes the optimization targeted),
-  # while worker threads trade a little batching for guaranteed capture of their
-  # reads AND writes regardless of when they exit. This closes the threaded-write
+  # while worker threads trade batching for capture of their reads and writes without
+  # retaining descriptors or registry pointers after they exit. This closes the threaded-write
   # capture gap without a teardown-time Nim call.
   mainThreadId: uint64 = 0
   # ROUND-2 R8 — this invocation's RUN ID, read once from REPRO_MONITOR_SESSION at
@@ -464,10 +480,16 @@ proc baseRecord(kind: MonitorRecordKind; observationKind: MonitorObservationKind
 proc emitRecord(record: MonitorRecord) {.raises: [].} =
   if not initialized or fragmentDir.len == 0 or disabled > 0:
     return
+  # Event-interest gate — skip a category the consumer did not ask for before the
+  # fragment write. `recordWanted` returns true for META/loss kinds, so an
+  # `mrEventLoss` is never suppressed (LF-1). See
+  # docs/contributors/event-interest-filter.md §4.1.
+  if not recordWanted(gInterest, record.kind):
+    return
   withShimMuted:
     appendFragmentRecord(fragmentDir, record)
     # Threaded-write capture fix: if this record was emitted from a WORKER thread
-    # (not the main/constructor thread), flush its per-thread fragment batch
+    # (not the main/constructor thread), flush and close its fragment slot
     # synchronously. The batch is otherwise flushed only on overflow / 100 ms age
     # / process-exit, and the process-exit destructor flushes only the MAIN
     # thread's batch — a worker thread that exits early would lose its buffered
@@ -479,7 +501,9 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
     # targeted); worker-thread I/O is comparatively rare, so per-record flushing
     # there is an acceptable trade for guaranteed capture of its reads AND writes.
     if record.threadId != mainThreadId:
-      flushFragmentBatch()
+      # Flush and release the descriptor AND registry pointer while worker TLS
+      # is valid. A flush alone leaks one handle for every exited worker.
+      closeFragmentSlot(retainIdentity = true)
 
 proc runIdToken(): string {.raises: [].} =
   ## ROUND-2 R8 — the ` run=<id>` detail suffix (empty when no run id). Single
@@ -530,7 +554,7 @@ proc metaSuffix(detail: string; mtime, size: uint64): string {.raises: [].} =
   ## when a directory gains/loses an entry or a stat-only file's content changes,
   ## so the consumer (folding mtime/size into its key) re-runs iff they changed.
   ## Same whitespace-separated `key=value` wire encoding as devInoSuffix (read back
-  ## via writer.detailToken), so no RMDF wire-format field is added.
+  ## via writer.detailToken), so no iomon wire-format field is added.
   result = detail
   if result.len > 0: result.add ' '
   result.add "mtime=" & $mtime & " size=" & $size
@@ -715,7 +739,7 @@ proc devInoSuffix(detail: string; dev, ino: uint64): string {.raises: [].} =
   ## Append a ` dev=<n> ino=<n>` token pair to `detail` (ROUND-2 R4 hardlink
   ## identity). The tokens are whitespace-separated `key=value` pairs read back via
   ## writer.detailToken, exactly like the round-2 R7/R8 start/peer tokens — so no
-  ## wire-format field is added (RMDF stays byte-stable). realpath collapses two
+  ## wire-format field is added (iomon stays byte-stable). realpath collapses two
   ## NAMES of one file to one canonical path, but it CANNOT collapse a HARDLINK
   ## (distinct directory entries, same inode); the (dev, ino) lets a consumer match
   ## that alternate-name case by inode identity.
@@ -1384,6 +1408,11 @@ proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
     return 0
   withShimMuted:
     fragmentDir = getEnv("REPRO_MONITOR_FRAGMENT_DIR")
+    # `shimInterestFromEnv`, not `parseInterestTokens`: a value naming nothing
+    # this build knows is read as "capture everything" rather than "capture
+    # nothing". The shim has no way to refuse, and only one of the two readings
+    # can be wrong in a direction the host filter cannot undo.
+    gInterest = shimInterestFromEnv(getEnv("REPRO_MONITOR_INTEREST"))
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))
     # ROUND-2 R8 — capture the invocation run id for report authentication.
@@ -1394,7 +1423,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
     setFragmentRunToken(runIdToken())
   # Record the constructor thread as the "main" thread. Its fragment batch is
   # flushed by the dyld process-exit destructor; worker threads (which the
-  # destructor cannot reach safely) flush eagerly per record in emitRecord. Init
+  # destructor cannot reach safely) flush and close per record in emitRecord. Init
   # runs in the dyld constructor, single-threaded, so this captures the main
   # thread id before any worker thread can emit.
   mainThreadId = currentThreadId()
@@ -2319,7 +2348,7 @@ proc recordNonDeterministic(source: string) {.raises: [].} =
   if source.len == 0:
     return
   recordObservedOnce(mrNonDeterministic, moNonDeterministic, "nd:" & source,
-    source, "non-deterministic entropy source")
+    source, NonDeterministicEntropyDetail)
 
 proc recordTimeRead(source: string) {.raises: [].} =
   ## Record a WALL-CLOCK read (clock_gettime/gettimeofday/time/mach_absolute_time)
@@ -3981,7 +4010,18 @@ proc repro_hook_posix_spawn*(pid: ptr PidT; path: cstring;
       attrp, argv, envp, ct_macos_interpose_real_posix_spawn)
   # A POSIX_SPAWN_SETEXEC spawn re-images THIS process and never returns on
   # success — record + flush the exec BEFORE forwarding (break #2).
-  recordSetexecExec(attrp, path)
+  #
+  # Only at the OUTERMOST forward, for the same reason `spawnForward` applies
+  # env-propagation and the SIP rewrite exactly once: `posix_spawnp` reaches
+  # the real implementation through libSystem's internal `posix_spawn`, which
+  # the body patch also intercepts, so one user-level spawn fires both hooks.
+  # Recording in both emitted the identical exec record twice, and a duplicate
+  # is not cosmetic here — T0's coverage check compares exec and start tallies
+  # (`execs >= starts` ⇒ unmonitored subtree), so a fully monitored
+  # `arch -arch arm64 prog` chain came out as execs=3 starts=3 and was reported
+  # as a loss. The subtree was captured; only the arithmetic said otherwise.
+  if inSpawnForward == 0:
+    recordSetexecExec(attrp, path)
   let detail =
     if bodypatchPosixSpawnTramp != nil and inSpawnForward == 0:
       "bodypatch-posix_spawn"
@@ -4000,7 +4040,9 @@ proc repro_hook_posix_spawnp*(pid: ptr PidT; path: cstring;
     # (see `spawnForwardMuted` / `inSpawnForward`).
     return spawnForwardMuted(bodypatchPosixSpawnpTramp, pid, path, fileActions,
       attrp, argv, envp, ct_macos_interpose_real_posix_spawnp)
-  recordSetexecExec(attrp, path)
+  # Outermost only — see the note in `repro_hook_posix_spawn`.
+  if inSpawnForward == 0:
+    recordSetexecExec(attrp, path)
   let detail =
     if bodypatchPosixSpawnpTramp != nil and inSpawnForward == 0:
       "bodypatch-posix_spawnp"
@@ -4434,6 +4476,14 @@ proc installBodypatchHooks(envp: ptr cstring) {.exportc: "repro_monitor_install_
 #include <xpc/xpc.h>
 
 static int repro_monitor_runtime_ready = 0;
+
+/* The launch forwarders call this AFTER environment/path rewriting, which
+ * can emit new sandbox path probes after the exec hook's first flush. Never
+ * enter the Nim writer before its runtime is ready. */
+extern int repro_monitor_shim_flush(void);
+void repro_macos_flush_before_image_replacement(void) {
+  if (repro_monitor_runtime_ready) (void)repro_monitor_shim_flush();
+}
 extern void NimMain(void);
 extern void repro_monitor_install_bodypatch(char **envp);
 extern int repro_monitor_shim_flush(void);
@@ -4550,13 +4600,16 @@ void repro_macos_set_interpose_disabled(int value) {
  * its Nim-runtime TLS BEFORE pthread key destructors run, so ANY Nim proc call
  * from such a destructor (even a trivial `raises: []` one) faults (verified
  * empirically on this host: the destructor ran but the Nim flush call never
- * entered its body). We therefore flush the worker thread's batch SYNCHRONOUSLY
+ * entered its body). We therefore flush and close the worker thread's slot SYNCHRONOUSLY
  * inside `emitRecord` — while the thread is still alive and its Nim runtime is
  * intact — for every record whose `threadId` differs from the main/constructor
  * thread. The main thread keeps the full batching win (the single-threaded
  * configure probe storm the M9.R.15f.1 optimization targeted); worker-thread I/O
  * is comparatively rare, so per-record flushing there is an acceptable trade for
- * guaranteed capture. See `mainThreadId` / `emitRecord` in the Nim section.
+ * capture and bounded descriptor ownership. A flush alone leaves the cached
+ * FILE and registry pointer behind after TLS destruction, leaking one handle
+ * per exited worker. Synchronous close retains the fragment byte budget across
+ * reopens. See `mainThreadId` / `emitRecord` in the Nim section.
  */
 
 typedef DIR *(*repro_real_opendir_fn)(const char *);

@@ -47,8 +47,12 @@ proc timeRead(pid: uint64; source: string): MonitorRecord =
     path: source, detail: "time-read")
 
 proc nonDet(pid: uint64; source: string): MonitorRecord =
+  # Built from the shared constant rather than a copy of its text. This fixture
+  # is synthetic — it asserts merge-side classification, not shim output — so
+  # the constant adds no assertion; it just stops a second copy of the wire text
+  # from existing, which is how macOS and Linux drifted apart in the first place.
   MonitorRecord(kind: mrNonDeterministic, observationKind: moNonDeterministic,
-    osPid: pid, path: source, detail: "non-deterministic entropy source")
+    osPid: pid, path: source, detail: NonDeterministicEntropyDetail)
 
 proc legacyNonDetLossCount(records: openArray[MonitorRecord]): int =
   {.push warning[Deprecated]: off.}
@@ -83,7 +87,7 @@ suite "io-mon R-D merge downgrade (mergeFragments)":
     createDir(frag)
     appendFragmentRecord(frag, start(700'u64))
     appendFragmentRecord(frag, nonDet(700'u64, "arc4random"))
-    let dep = mergeFragments(frag, work / "out.rdep")
+    let dep = mergeFragments(frag, work / "out.iomon")
     check dep.completeness == mcComplete
     check dep.records.anyIt(it.kind == mrNonDeterministic and
       it.path == "arc4random")
@@ -99,7 +103,7 @@ suite "io-mon R-D merge downgrade (mergeFragments)":
     appendFragmentRecord(frag, start(700'u64))
     appendFragmentRecord(frag, envRead(700'u64, "SOURCE_DATE_EPOCH"))
     appendFragmentRecord(frag, timeRead(700'u64, "clock_gettime"))
-    let dep = mergeFragments(frag, work / "out.rdep")
+    let dep = mergeFragments(frag, work / "out.iomon")
     check dep.completeness == mcComplete
     # The env read is preserved in the depfile so the consumer CAN fold it.
     var sawEnv = false

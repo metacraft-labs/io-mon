@@ -2,7 +2,7 @@
 ##
 ## Reproduces (and pins the fix for) the live-workstation resource leak in which
 ## the long-running reprobuild dev daemon held ONE monitor "data fragment" file
-## (`repro-monitor-<pid>-<pid>.rmdf-frag`) open WRITE-ONLY, kept appending to it
+## (`repro-monitor-<pid>-<pid>.iomon-frag`) open WRITE-ONLY, kept appending to it
 ## for ~17.5h with no rotation / size cap, and — after the launcher's grace-period
 ## timeout removed the fragment dir (`fs_snoop.waitForLinuxInjectedDescendants`) —
 ## kept growing the now-UNLINKED (`(deleted)`) inode until it reached ~61 GiB and
@@ -41,8 +41,8 @@ const
 
 proc fdPointsToDeletedFrag(fdLink: string): bool =
   ## True while `fdLink` (a `/proc/self/fd/<n>` entry) is a LIVE symlink whose
-  ## target is a deleted `.rmdf-frag` inode — i.e. the exact leaked state
-  ## (`... .rmdf-frag (deleted)`, fd still open). A closed fd leaves no symlink,
+  ## target is a deleted `.iomon-frag` inode — i.e. the exact leaked state
+  ## (`... .iomon-frag (deleted)`, fd still open). A closed fd leaves no symlink,
   ## so this reads false. `symlinkExists` inspects the LINK itself; `fileExists`
   ## would FOLLOW it to the already-removed target and always report false.
   if not symlinkExists(fdLink):
@@ -50,7 +50,7 @@ proc fdPointsToDeletedFrag(fdLink: string): bool =
   let target =
     try: expandSymlink(fdLink)
     except OSError: return false
-  ".rmdf-frag" in target and target.endsWith("(deleted)")
+  ".iomon-frag" in target and target.endsWith("(deleted)")
 
 proc victimRecord(dir: string; osPid, threadId, seqNo: uint64): MonitorRecord =
   MonitorRecord(
@@ -115,7 +115,7 @@ suite "io-mon Linux fragment byte cap (LEAK-GUARD)":
     check getFileSize(path) == sizeAfterCap
 
     # Fail-incomplete — the cap marker downgrades the merged depfile.
-    let depOut = dir / "capped.rdep"
+    let depOut = dir / "capped.iomon"
     let dep = mergeFragments(dir, depOut)
     check dep.completeness == mcIncomplete
 
@@ -163,5 +163,5 @@ suite "io-mon Linux fragment byte cap (LEAK-GUARD)":
     when defined(linux):
       # The fd is closed, so it no longer pins the deleted fragment inode — the
       # blocks are reclaimable. On the pre-fix writer the fd stays open and this
-      # would still report the `... .rmdf-frag (deleted)` leak.
+      # would still report the `... .iomon-frag (deleted)` leak.
       check not fdPointsToDeletedFrag(fdLink)

@@ -10,7 +10,7 @@
 ## (`encodeDepRecordIdentity`: the identity tuple with `seq` DROPPED) plus the
 ## process's real `/proc/self/exe` image as the per-exec incarnation identity, and
 ## enforces LF-7 (unbuffered publish-before-return) + LF-2 (unattached ⇒ hard
-## `mcIncomplete`, NO file spill). The `.rmdf-frag` file path stays COMPILED but
+## `mcIncomplete`, NO file spill). The `.iomon-frag` file path stays COMPILED but
 ## dormant (deletion is part 2b). These tests drive the LIVE Linux LD_PRELOAD shim
 ## (rebuilt from source) and assert:
 ##
@@ -31,7 +31,7 @@
 ##                                    the part-1 LF-6-vs-file proof now the active
 ##                                    path never uses the file.
 ##   t_lf2_hard_fail_no_file        — LF-2: a producer told to use the set but whose
-##                                    set is unattached/dead writes NO `.rmdf-frag`
+##                                    set is unattached/dead writes NO `.iomon-frag`
 ##                                    file and the edge is mcIncomplete; and even on
 ##                                    SUCCESS the active set path never touches the
 ##                                    file writer.
@@ -73,8 +73,15 @@ proc buildC(work, name, source: string; extraArgs: seq[string] = @[]): string =
 proc ensureSnoop(work: string): string =
   result = work / "io-mon"
   if not fileExists(result):
+    # `--nimcache` is NOT optional. Without it this `nim c` lands in the shared
+    # `~/.cache/nim/io_mon_snoop_d`, whose object names are PROJECT-RELATIVE, so
+    # a second io-mon checkout compiling the same CLI collides with the first and
+    # the loser dies with `ld: final link failed: bad value` — a link error that
+    # looks like a code break and is not one. Keyed under `work`, which is
+    # per-run.
     let cli = run("nim", @[
       "c", "--hints:off", "--warnings:off", "--threads:on",
+      "--nimcache:" & (work / "nimcache-snoop"),
       "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
       "--out:" & result, snoopSrc])
     checkpoint(cli.output)
@@ -125,7 +132,7 @@ proc goldenProjection(dep: MonitorDepFile; workPrefix: string): seq[byte] =
   ## records — process lifecycle (start/exec, always) plus reads/probes whose path
   ## is under `workPrefix` (so incidental system-library reads/stats under
   ## /nix/store are excluded) — rewrite each path to its BASENAME, and zero every
-  ## per-run launcher-noise field. The resulting canonical RMDF bytes depend only
+  ## per-run launcher-noise field. The resulting canonical iomon bytes depend only
   ## on the observed dependency identities the SET transport must preserve — a
   ## committable golden.
   var norm: seq[MonitorRecord]
@@ -258,14 +265,81 @@ int main(int argc, char **argv) {
 
     check growth == 0'u64
     # StormN=500 probes of the SAME path → exactly ONE distinct probe element for
-    # that path (distinct-not-events). NO `.rmdf-frag` spill on the active path.
+    # that path (distinct-not-events). NO `.iomon-frag` spill on the active path.
     let stormProbes = found.filterIt(
       it.kind == mrPathProbe and it.path == target)
     check stormProbes.len == 1
-    # No `.rmdf-frag` spill on the active set path (the shard files themselves
+    # No `.iomon-frag` spill on the active set path (the shard files themselves
     # live under fragDir, so filter to the file-fallback extension).
     check toSeq(walkDir(fragDir)).filterIt(
-      it.path.endsWith(".rmdf-frag")).len == 0
+      it.path.endsWith(".iomon-frag")).len == 0
+
+  test "t_cross_process_open_dedup":
+    check shmGSetSupported
+    let shimLib = ensureShim()
+
+    const WorkerN = 32
+    let target = work / "cross-process-open-target.txt"
+    writeFile(target, "cross-process open target\n")
+
+    let storm = buildC(work, "cross_process_open_storm", """
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  if (argc == 3 && strcmp(argv[1], "--child") == 0) {
+    int fd = open(argv[2], O_RDONLY);
+    if (fd < 0) return 2;
+    close(fd);
+    return 0;
+  }
+  if (argc != 2) return 3;
+  for (int i = 0; i < """ & $WorkerN & """; i++) {
+    pid_t pid = fork();
+    if (pid < 0) return 4;
+    if (pid == 0) {
+      execl(argv[0], argv[0], "--child", argv[1], (char *)0);
+      _exit(5);
+    }
+  }
+  for (int i = 0; i < """ & $WorkerN & """; i++) {
+    int status = 0;
+    if (wait(&status) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+      return 6;
+  }
+  return 0;
+}
+""")
+
+    let fragDir = work / "cross-process-open-frags"
+    createDir(fragDir)
+    var host = startHost(fragDir, "cross-process-open-run")
+    check host.available
+
+    let env = childEnvWith(shimLib, {
+      "LD_PRELOAD": shimLib,
+      "REPRO_MONITOR_FRAGMENT_DIR": fragDir,
+      "REPRO_MONITOR_DEP_SHM": host.path0,
+      "REPRO_MONITOR_SESSION": "cross-process-open-run",
+    })
+    let cap = run(storm, @[target], env)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let found = decodeSet(host)
+    let growth = host.growthFailures()
+    host.finish()
+
+    check growth == 0'u64
+    let targetOpens = found.filterIt(
+      it.kind == mrFileOpen and it.path == target)
+    check targetOpens.len == 1
+    check targetOpens[0].osPid == 0'u64
+    check targetOpens[0].result == 0
+    # Process-lifecycle records retain their full identities.
+    check found.countIt(it.kind == mrProcessStart) >= WorkerN + 1
 
   test "t_exec_distinct_incarnations":
     # The exec teeth WITHOUT any incarnation tag. A pid that reads a marker then
@@ -297,7 +371,7 @@ int main(int argc, char **argv) {
     check trueBin.len > 0
     let marker = work / "exec-set-marker.txt"
     writeFile(marker, "exec set marker\n")
-    let depfile = work / "exec-set.rdep"
+    let depfile = work / "exec-set.iomon"
 
     let env = childEnvWith(shimLib)
     let cap = run(snoopBin, @["run", "--depfile", depfile, "--",
@@ -372,7 +446,7 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "reexec-set-marker.txt"
     writeFile(marker, "same-image reexec marker\n")
-    let depfile = work / "reexec-set.rdep"
+    let depfile = work / "reexec-set.iomon"
 
     let env = childEnvWith(shimLib)
     let cap = run(snoopBin, @["run", "--depfile", depfile, "--",
@@ -403,15 +477,28 @@ int main(int argc, char **argv) {
     # The set-only UNBUFFERED path reproduces committed golden depfiles
     # byte-for-byte (normalising only genuine launcher noise via goldenProjection).
     # Three representative workloads: a marker read set, an exec-heavy chain, and a
-    # probe-heavy storm. Each golden is regenerated (self-heal) when absent so the
-    # fixture is produced deterministically, then asserted byte-identical on reruns.
-    createDir(fixturesDir)
+    # probe-heavy storm.
+    #
+    # THE GOLDENS ARE COMMITTED AND ARE NEVER WRITTEN BY THIS TEST. An earlier
+    # revision self-healed a missing fixture by writing the projection it had
+    # just computed and then comparing the two, which on any fresh checkout
+    # generated the golden and compared it against ITSELF — a pass that could
+    # not fail. It was invisible because the committed fixtures were named
+    # `<tag>.rmdf` (the format's name before `2d602cc` renamed RMDF to iomon)
+    # while the comparison read `<tag>.iomon`, so the tracked bytes were never
+    # opened and the generated ones were never tracked. A golden that the test
+    # can produce is not a golden, so the regeneration is gone: an absent
+    # fixture is a FAILURE naming the file, never a silent re-baseline.
+    #
+    # Regenerating deliberately is still possible and is deliberately manual —
+    # `io-mon run --depfile` the workload and project it — so that a changed
+    # projection has to be looked at by a person.
     let snoopBin = ensureSnoop(work)
     let shimLib = ensureShim()
 
     proc runOnce(tag: string; reader: string; args: seq[string]):
         MonitorDepFile =
-      let depfile = work / ("golden-" & tag & ".rdep")
+      let depfile = work / ("golden-" & tag & ".iomon")
       let cap = run(snoopBin, @["run", "--depfile", depfile, "--", reader] & args,
         childEnvWith(shimLib))
       checkpoint(tag & ": " & cap.output)
@@ -420,11 +507,23 @@ int main(int argc, char **argv) {
 
     proc assertGolden(tag: string; dep: MonitorDepFile) =
       let projected = goldenProjection(dep, work)
-      let fixture = fixturesDir / (tag & ".rmdf")
+      let fixture = fixturesDir / (tag & ".iomon")
+      # An absent fixture is a RED, not a cue to write one — see the note above.
+      check fileExists(fixture)
       if not fileExists(fixture):
-        writeFile(fixture, cast[string](projected))
-        checkpoint("generated golden fixture " & fixture)
+        checkpoint("missing committed golden fixture " & fixture)
+        return
       let golden = toBytes(readFile(fixture))
+      # Report the shape of the disagreement, not just that there was one: a
+      # length change and a single flipped byte want different investigations.
+      if projected != golden:
+        checkpoint(tag & ": projection " & $projected.len &
+          " bytes vs committed golden " & $golden.len & " bytes")
+        for i in 0 ..< min(projected.len, golden.len):
+          if projected[i] != golden[i]:
+            checkpoint(tag & ": first differing byte at offset " & $i &
+              " (got " & $projected[i] & ", golden " & $golden[i] & ")")
+            break
       check projected == golden
 
     # -- marker workload (distinct reads) --
@@ -488,16 +587,16 @@ int main(int argc, char **argv) {
     check goldenProjection(depP, work) == goldenProjection(depP2, work)
 
   test "t_lf2_hard_fail_no_file":
-    # LF-2 — on the ACTIVE set path the `.rmdf-frag` file writer is NEVER touched.
+    # LF-2 — on the ACTIVE set path the `.iomon-frag` file writer is NEVER touched.
     #
     # (1) HARD FAIL: the shim is told to use the set (REPRO_MONITOR_DEP_SHM names a
     #     `.shard0`) but the segment does not exist, so the producer cannot map it.
-    #     No record — not even the process-start — is captured, and NO `.rmdf-frag`
+    #     No record — not even the process-start — is captured, and NO `.iomon-frag`
     #     file is spilled. The consumer's root-spawn guard then downgrades the edge
     #     to mcIncomplete (a missing root process-start), never a silent false
     #     mcComplete.
     # (2) SUCCESS: the same workload against a LIVE set is mcComplete and STILL
-    #     writes no `.rmdf-frag` — proving the file path is dormant on the active
+    #     writes no `.iomon-frag` — proving the file path is dormant on the active
     #     set path (LF-7: the shim publishes only to the set).
     check shmGSetSupported
     let shimLib = ensureShim()
@@ -521,11 +620,11 @@ int main(int argc, char **argv) {
     discard badCap.outputStream.readAll()
     check badCap.waitForExit() == 0
     badCap.close()
-    # NO `.rmdf-frag` spill on the active set path even though attach failed.
+    # NO `.iomon-frag` spill on the active set path even though attach failed.
     check toSeq(walkDir(badFragDir)).filterIt(
-      it.path.endsWith(".rmdf-frag")).len == 0
+      it.path.endsWith(".iomon-frag")).len == 0
     # The empty fragment dir + the launcher-known root pid ⇒ mcIncomplete.
-    let badDep = mergeFragments(badFragDir, work / "lf2-bad.rdep",
+    let badDep = mergeFragments(badFragDir, work / "lf2-bad.iomon",
       expectedRootPid = badPid, currentRunId = "lf2-bad-run")
     check badDep.completeness == mcIncomplete
 
@@ -553,8 +652,8 @@ int main(int argc, char **argv) {
     check okRecords.anyIt(it.kind == mrFileRead and marker in it.path)
     # File path dormant on the active set path even on success.
     check toSeq(walkDir(okFragDir)).filterIt(
-      it.path.endsWith(".rmdf-frag")).len == 0
-    let okDep = mergeFragments(okFragDir, work / "lf2-ok.rdep",
+      it.path.endsWith(".iomon-frag")).len == 0
+    let okDep = mergeFragments(okFragDir, work / "lf2-ok.iomon",
       expectedRootPid = okPid, currentRunId = "lf2-ok-run",
       setRecords = okRecords)
     check okDep.completeness == mcComplete
@@ -601,9 +700,9 @@ int main(int argc, char **argv) {
   test "t_launcher_loss_recorded_in_set_no_file":
     # io-mon-Lossless-Event-Capture M7 (Linux slice) — the CONSUMER's launcher-side
     # event-loss (a monitored descendant still alive past the grace window) is now
-    # recorded into the consumer-owned nim-shm-gset, NOT a `.rmdf-frag` file. Prove
+    # recorded into the consumer-owned nim-shm-gset, NOT a `.iomon-frag` file. Prove
     # Linux is file-free end-to-end: (1) `appendLauncherEventLoss` writes NO
-    # `.rmdf-frag` on the active-set path; (2) the set snapshot carries the
+    # `.iomon-frag` on the active-set path; (2) the set snapshot carries the
     # `mrEventLoss`; (3) `mergeFragments` folds it → `mcIncomplete`.
     check shmGSetSupported
     # The migration is Linux-only: on this platform the file producer is NOT the
@@ -622,11 +721,11 @@ int main(int argc, char **argv) {
       "linux injected descendants still live after root exit pids=4242",
       host.path0)
 
-    # (1) NO `.rmdf-frag` file anywhere in the fragment dir — the launcher loss
+    # (1) NO `.iomon-frag` file anywhere in the fragment dir — the launcher loss
     # never touched the file writer (Linux file-free).
     var fragFiles = 0
     for kind, path in walkDir(dir):
-      if kind == pcFile and path.endsWith(".rmdf-frag"):
+      if kind == pcFile and path.endsWith(".iomon-frag"):
         inc fragFiles
     check fragFiles == 0
 
@@ -638,15 +737,15 @@ int main(int argc, char **argv) {
 
     # (3) Folding the set snapshot into the merge downgrades the edge, exactly as a
     # file-borne launcher loss used to — but with an empty fragment dir on disk.
-    let dep = mergeFragments(dir, dir / "launcher-loss.rdep",
+    let dep = mergeFragments(dir, dir / "launcher-loss.iomon",
       currentRunId = runId, setRecords = setRecs)
     check dep.completeness == mcIncomplete
-    # The merged depfile references NO `.rmdf-frag` path (nothing was scanned).
-    check not dep.records.anyIt(it.path.endsWith(".rmdf-frag"))
+    # The merged depfile references NO `.iomon-frag` path (nothing was scanned).
+    check not dep.records.anyIt(it.path.endsWith(".iomon-frag"))
     host.finish()
 
   test "t_launcher_loss_file_fallback_retained_when_set_unavailable":
-    # The shared `.rmdf-frag` writer is the RETAINED fallback (macOS/Windows arm +
+    # The shared `.iomon-frag` writer is the RETAINED fallback (macOS/Windows arm +
     # the Linux `REPRO_MONITOR_DEP_SHM_DISABLE` pure-file baseline): when no set is
     # available (empty `depSetPath0`), `appendLauncherEventLoss` still records the
     # loss to a fragment file so the edge is honestly `mcIncomplete`, never dropped.
@@ -657,8 +756,162 @@ int main(int argc, char **argv) {
       "linux injected-descendant /proc scan failed", "")  # no set → file fallback
     var fragFiles = 0
     for kind, path in walkDir(dir):
-      if kind == pcFile and path.endsWith(".rmdf-frag"):
+      if kind == pcFile and path.endsWith(".iomon-frag"):
         inc fragFiles
     check fragFiles == 1
-    let dep = mergeFragments(dir, dir / "fallback.rdep", currentRunId = runId)
+    let dep = mergeFragments(dir, dir / "fallback.iomon", currentRunId = runId)
     check dep.completeness == mcIncomplete
+
+  test "pipeline_processes_share_one_gset":
+    # IoMon-Pipeline-Capture IM-1 (required test) — segment identity reaches every
+    # member of a shell PIPELINE, so `sh -c 'a | b'` contributes to exactly ONE
+    # grow-only set rather than to per-process side channels.
+    #
+    # The two pipeline members are DISTINCT binaries reading DISTINCT markers, so
+    # the assertion is a real cross-pid attribution and not one process observed
+    # twice: the single consumer snapshot must carry BOTH markers' reads AND a
+    # `process-exec` for BOTH binaries under two DIFFERENT pids.
+    #
+    # Note on attribution: `encodeDepRecordIdentity` deliberately ZEROES the pid on
+    # path-scoped records (that normalization is what collapses probe storms), so
+    # per-pid attribution is asserted through the process-lifecycle records, which
+    # retain their full identity by design. Together they say: two distinct child
+    # pids ran, and both of their reads are in the one set.
+    check shmGSetSupported
+    let shimLib = ensureShim()
+
+    let markerA = work / "pipeline-marker-a.txt"
+    let markerB = work / "pipeline-marker-b.txt"
+    writeFile(markerA, "pipeline marker a\n")
+    writeFile(markerB, "pipeline marker b\n")
+
+    # Two separately-named binaries so `process-exec` distinguishes the producer
+    # end of the pipe from the consumer end.
+    let readerA = buildC(work, "pipeline_reader_a", markerReaderSrc())
+    let readerB = buildC(work, "pipeline_reader_b", markerReaderSrc())
+
+    let fragDir = work / "pipeline-frags"
+    createDir(fragDir)
+    var host = startHost(fragDir, "pipeline-run")
+    check host.available
+    check host.path0.endsWith(".shard0")
+
+    let env = childEnvWith(shimLib, {
+      "LD_PRELOAD": shimLib,
+      "REPRO_MONITOR_FRAGMENT_DIR": fragDir,
+      "REPRO_MONITOR_DEP_SHM": host.path0,
+      "REPRO_MONITOR_SESSION": "pipeline-run",
+    })
+    # A genuine pipeline: both members run concurrently, each in its own process.
+    let cap = run("/bin/sh", @["-c",
+      readerA & " " & markerA & " | " & readerB & " " & markerB], env)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let found = decodeSet(host)
+    let growth = host.growthFailures()
+    host.finish()
+    check growth == 0'u64
+
+    # ONE set carries BOTH pipeline members' file dependencies.
+    check found.anyIt(it.kind == mrFileRead and markerA in it.path)
+    check found.anyIt(it.kind == mrFileRead and markerB in it.path)
+
+    # ...and both members are present as distinct, pid-bearing processes.
+    let execA = found.filterIt(it.kind == mrProcessExec and readerA in it.path)
+    let execB = found.filterIt(it.kind == mrProcessExec and readerB in it.path)
+    check execA.len >= 1
+    check execB.len >= 1
+    let pidsA = execA.mapIt(it.osPid).deduplicate()
+    let pidsB = execB.mapIt(it.osPid).deduplicate()
+    check pidsA.allIt(it != 0'u64)
+    check pidsB.allIt(it != 0'u64)
+    # The producer and consumer ends of the pipe are genuinely different pids.
+    check pidsA.allIt(it notin pidsB)
+
+    # LF-2 — the pipeline never fell back to a per-process file side channel.
+    check toSeq(walkDir(fragDir)).filterIt(
+      it.path.endsWith(".iomon-frag")).len == 0
+
+  test "killed_child_records_survive":
+    # IoMon-Pipeline-Capture IM-1 (required test) — a child SIGKILLed with what the
+    # file transport would still be holding as an un-flushed read batch loses NONE
+    # of its already-observed reads.
+    #
+    # This is the teeth of the "exit-flush replaced by an equivalent that cannot
+    # lose a killed process's records" deliverable. On the SET path LF-7 holds:
+    # every observation is published into consumer-owned shared memory BEFORE the
+    # hooked syscall returns the data to the process, so there is no buffered tail
+    # for the kill to take. SIGKILL is uncatchable — no destructor, no atexit, no
+    # signal handler, no explicit flush runs — so anything present in the snapshot
+    # got there via publish-before-return and nothing else.
+    #
+    # The existing Level-1 `kill-before-flush` loss class belongs to the `.iomon-frag`
+    # batch writer; on the set path it must not merely be unreported, it must be
+    # UNNEEDED — hence the assertion that every read survived AND no loss marker was
+    # produced.
+    check shmGSetSupported
+    let shimLib = ensureShim()
+
+    const N = 12
+    var markers: seq[string]
+    for i in 0 ..< N:
+      let m = work / ("killed-marker-" & $i & ".txt")
+      writeFile(m, "killed marker " & $i & "\n")
+      markers.add m
+
+    # Read every marker, then die instantly and uncatchably. No exit(), so the
+    # shim's `__attribute__((destructor))` exit sweep NEVER runs.
+    let killer = buildC(work, "killed_mid_batch_reader", """
+#include <fcntl.h>
+#include <signal.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  char buf[64];
+  for (int i = 1; i < argc; i++) {
+    int fd = open(argv[i], O_RDONLY);
+    if (fd < 0) _exit(2);
+    read(fd, buf, sizeof(buf));
+    close(fd);
+  }
+  kill(getpid(), SIGKILL);
+  _exit(3);
+}
+""")
+
+    let fragDir = work / "killed-frags"
+    createDir(fragDir)
+    var host = startHost(fragDir, "killed-run")
+    check host.available
+
+    let env = childEnvWith(shimLib, {
+      "LD_PRELOAD": shimLib,
+      "REPRO_MONITOR_FRAGMENT_DIR": fragDir,
+      "REPRO_MONITOR_DEP_SHM": host.path0,
+      "REPRO_MONITOR_SESSION": "killed-run",
+    })
+    let proc0 = startProcess(killer, args = markers, env = env,
+      options = {poStdErrToStdOut, poUsePath})
+    discard proc0.outputStream.readAll()
+    let code = proc0.waitForExit()
+    proc0.close()
+    # Died by SIGKILL, not by a clean exit path that could have flushed.
+    check code != 0
+    check code != 3
+
+    let found = decodeSet(host)
+    let growth = host.growthFailures()
+    host.finish()
+    check growth == 0'u64
+
+    # Every read observed before the kill is durable in consumer-owned memory.
+    for m in markers:
+      check found.anyIt(it.kind == mrFileRead and m in it.path)
+    # Not "lost but honestly reported" — on the set path there is nothing to lose.
+    check not found.anyIt(it.kind == mrEventLoss and
+      "kill-before-flush" in it.detail)
+    check not found.anyIt(it.kind == mrEventLoss and
+      "dep-set-capture-loss" in it.detail)
+    # LF-2 — no per-process file side channel was used.
+    check toSeq(walkDir(fragDir)).filterIt(
+      it.path.endsWith(".iomon-frag")).len == 0
