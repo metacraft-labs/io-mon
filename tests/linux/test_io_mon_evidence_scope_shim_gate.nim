@@ -41,6 +41,7 @@
 import std/[os, osproc, sequtils, streams, strtabs, unittest]
 
 import io_mon
+import build_test_shim
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
@@ -69,20 +70,9 @@ suite "io-mon evidence-scope gate in the shim (DA-1i, Linux)":
 
     # ONE shim and ONE fixture binary for both arms: two builds could differ,
     # and then a record-count difference would not be evidence about the flag.
-    #
-    # `--nimcache` is the shim script's own (`IO_MON_SHIM_NIMCACHE_DIR`), for the
-    # reason every build in this repo passes one: Nim's object names are
-    # project-relative, so two builds of one project from different directories
-    # share `~/.cache/nim/<project>_d` and the second can die with
-    # `ld: final link failed: bad value`.
-    var shimEnv = newStringTable(modeCaseSensitive)
-    for k, v in envPairs(): shimEnv[k] = v
-    shimEnv["IO_MON_SHIM_NIMCACHE_DIR"] = work / "shim-nimcache"
-    let shimBuild = run("bash", @[repoRoot / "scripts" / "build_shim.sh"],
-      shimEnv)
-    checkpoint("build_shim: " & shimBuild.output)
-    require shimBuild.code == 0
-    let shimLib = findShimLibrary()
+    # Own both the library and compiler cache; another fixture may relink the
+    # shipping library while any of the four captures below is starting.
+    let shimLib = buildPrivateLinuxShim(repoRoot)
     require shimLib.len > 0
 
     let tool = work / "evidence-scope-tool"

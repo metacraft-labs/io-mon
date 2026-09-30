@@ -1,7 +1,7 @@
 import std/os
 
 switch("path", "src")
-switch("path", "../nim-stackable-hooks/src")
+switch("path", getEnv("STACKABLE_HOOKS_SRC", "../nim-stackable-hooks/src"))
 switch("path", "tests/helpers")
 
 # io-mon's shared-memory dependency queue (io_mon/shm/dep_queue) now sits on the

@@ -58,4 +58,10 @@ when isMainModule:
   # status on success and a non-zero failure code otherwise — exactly what an
   # out-of-process caller (the runner) needs to fail-safe on.
   let args = commandLineParams()
-  quit(runFsSnoopCli(ProgramName, args))
+  let code = runFsSnoopCli(ProgramName, args)
+  # Nim quit saturates to the signed native range. Pass the same native bits
+  # in that range so statuses 128..255 and Windows crash codes survive.
+  when defined(windows):
+    quit(cast[int32](uint32(code)))
+  else:
+    quit(cast[int8](uint8(code)))

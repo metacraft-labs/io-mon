@@ -40,6 +40,7 @@ import std/[os, osproc, streams, strtabs, strutils, unittest]
 when defined(macosx):
   import io_mon
   import macos_backend_toggle
+  import build_test_cli
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
@@ -116,14 +117,10 @@ int main(void) {
 """
 
 when defined(macosx):
+  from build_test_shim import buildPrivateMacosShim
+
   proc buildShim(): string =
-    let (output, code) = execCmdEx("bash " &
-      quoteShell(repoRoot / "scripts" / "build_shim.sh"))
-    if code != 0:
-      raise newException(IOError, "build_shim.sh failed: " & output)
-    let shim = repoRoot / "build" / "lib" / "librepro_monitor_shim.dylib"
-    doAssert fileExists(shim), "shim not produced at " & shim
-    shim
+    buildPrivateMacosShim(repoRoot)
 
   proc cc(args: string; clang = false) =
     let ccBin = if clang:
@@ -245,9 +242,7 @@ suite "io-mon macOS ROUND-4 RW3 exempt-by-name re-breaks":
       # pipe create — there is none (the launcher is out-of-tree) → mcIncomplete.
       let launcher = compileProbe(work, r4Residual / "pipe_launcher.c", "pipe_launcher")
       let client = compileProbe(work, r4Residual / "pipe_client.c", "pipe_client")
-      let ioMon = repoRoot / "build" / "bin" / "io-mon"
-      doAssert fileExists(ioMon), "io-mon CLI not built at " & ioMon &
-        " (run `nimble buildSnoop`)"
+      let ioMon = buildTestCli(repoRoot)
       let depfile = work / "ip1.iomon"
       let outFile = work / "ip1.out"
       # pipe_launcher argv: io-mon depfile client out marker

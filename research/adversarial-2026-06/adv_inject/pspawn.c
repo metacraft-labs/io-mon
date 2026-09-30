@@ -27,7 +27,7 @@ static char** env_scrub(void){ // drop DYLD_* and CT_SANDBOX_TOOLS_DIR entirely
   e[j]=NULL; return e;
 }
 int main(int argc,char**argv){
-  if(argc<5){fprintf(stderr,"usage: pspawn setexec env prog marker\n");return 2;}
+  if(argc<5){fprintf(stderr,"usage: pspawn mode(0=spawn,1=setexec,2=execve) env prog marker\n");return 2;}
   int setexec=atoi(argv[1]);
   const char*envmode=argv[2];
   char*prog=argv[3]; char*marker=argv[4];
@@ -42,10 +42,15 @@ int main(int argc,char**argv){
   pid_t pid;
   printf("[pspawn] setexec=%d env=%s prog=%s pid=%d\n",setexec,envmode,prog,(int)getpid());
   fflush(stdout);
+  if(setexec == 2){
+    execve(prog,child,envp);
+    perror("execve");
+    return 1;
+  }
   int rc=posix_spawn(&pid,prog,NULL,&attr,child,envp);
   // with SETEXEC, we never get here on success
   if(rc){fprintf(stderr,"[pspawn] spawn rc=%d (%s)\n",rc,strerror(rc));return 1;}
   int st; waitpid(pid,&st,0);
   printf("[pspawn] child exited status=%d\n",WEXITSTATUS(st));
-  return 0;
+  return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
 }

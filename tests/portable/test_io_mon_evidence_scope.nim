@@ -39,7 +39,7 @@
 ## Assertion helpers are `template`s, never `proc`s: a `check` inside a plain
 ## `proc` prints "Check failed" and the enclosing test still reports `[OK]`.
 
-import std/[options, os, osproc, streams, strutils, unittest]
+import std/[options, os, osproc, strutils, unittest]
 
 import io_mon
 
@@ -738,6 +738,11 @@ echo $legacyInterestExpansion(lecFileDeps)
 echo $parseInterestTokens("proc")
 """
 
+proc readTypesSource(): string =
+  # Git may check out this source as CRLF on Windows. Mutation anchors model
+  # Nim source lines, so normalize line endings before counting exact matches.
+  readFile(TypesSource).replace("\r\n", "\n")
+
 proc spliceOnce(text, anchor, insertion: string): string =
   ## Insert `insertion` immediately BEFORE the sole occurrence of `anchor`.
   ## Raises when the anchor is missing or repeated: a source-rewriting probe
@@ -758,7 +763,7 @@ proc mutatedTypes(tokenArm: string): string =
   ## Filling those other two cases is what makes the measurement ATTRIBUTABLE: a
   ## new member reddens them too, so without their arms every probe below would
   ## fail and none of the failures would be about the token.
-  result = readFile(TypesSource)
+  result = readTypesSource()
   result = spliceOnce(result, EnumAnchor,
     "    esWritesOnly      ## PROBE-ONLY, never a member of the shipped enum.\n")
   result = spliceOnce(result, ScopeCaseAnchor, "  of esWritesOnly: true\n")
@@ -774,7 +779,7 @@ proc mutatedCategories(tokenArm: string): string =
   ## this file switches exhaustively on `EventCategory`, so a new category costs
   ## exactly one arm. That is also why the axis was unpoliced for two rounds —
   ## there was no compiler complaint to prompt anyone.
-  result = readFile(TypesSource)
+  result = readTypesSource()
   result = spliceOnce(result, CategoryEnumAnchor,
     "    ecProvenance     ## PROBE-ONLY, never a member of the shipped enum.\n")
   if tokenArm.len > 0:
@@ -797,7 +802,7 @@ proc swappedLegacyTokens(): string =
   const
     FileArm = "  of lecFileDeps: \"file\"\n"
     NondetArm = "  of lecNonDeterminism: \"nondet\"\n"
-  result = readFile(TypesSource)
+  result = readTypesSource()
   let fileCount = result.count(FileArm)
   let nondetCount = result.count(NondetArm)
   if fileCount != 1 or nondetCount != 1:
@@ -828,7 +833,12 @@ proc compileAgainstTypes(name, typesText: string):
       "c", "--hints:off", "--warnings:off", "--compileOnly",
       "--nimcache:" & (dir / "cache"), "--path:" & dir, main],
     options = {poStdErrToStdOut, poUsePath})
-  result = (p.outputStream.readAll(), p.waitForExit())
+  # Windows pipes can return a short chunk before the compiler has finished.
+  # Stream.readAll stops at that chunk; read lines until the pipe reaches EOF
+  # so the rejection assertion sees the complete compiler diagnostic.
+  for line in p.lines(keepNewLines = true):
+    result.output.add(line)
+  result.code = p.waitForExit()
   p.close()
   removeDir(dir)
 
@@ -838,7 +848,7 @@ suite "io-mon evidence scope: a scope with no wire token cannot reach a depfile 
     # NEGATIVE CONTROL 1. Without it, both refusals below would also "pass"
     # against a probe that fails to compile for some unrelated reason — the
     # standard way a compile-refusal test becomes a test that cannot fail.
-    let (output, code) = compileAgainstTypes("control", readFile(TypesSource))
+    let (output, code) = compileAgainstTypes("control", readTypesSource())
     checkpoint("control: exit " & $code & "\n" & output)
     check code == 0
 
@@ -916,7 +926,7 @@ suite "io-mon interest: a category with no wire token cannot reach a depfile (DA
   test "t_the_unmutated_interest_codec_compiles":
     # NEGATIVE CONTROL 1 for this axis. Shares `ProbeProgram`, which now touches
     # both directions of BOTH codecs.
-    let (output, code) = compileAgainstTypes("cat-control", readFile(TypesSource))
+    let (output, code) = compileAgainstTypes("cat-control", readTypesSource())
     checkpoint("cat-control: exit " & $code & "\n" & output)
     check code == 0
 

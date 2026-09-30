@@ -333,8 +333,10 @@ suite "io-mon merge-time observation-identity fold (DA-10)":
       duplicates.add observed(mrLibraryLoad, "/lib/libfact.so", "run=r1", pid, 1)
       duplicates.add observed(mrEnvRead, "MARKER", "run=r1", pid, 1)
       duplicates.add observed(mrFileWrite, "/out/" & $pid, "run=r1", pid, 1)
+    # These records belong to r1. An enclosing build monitor has its own
+    # session, which the merge must not use to filter this fixture's records.
     let dep = mergeFragments(work, work / "folded.iomon",
-      setRecords = duplicates)
+      currentRunId = "r1", setRecords = duplicates)
     var loads, envs, writes = 0
     for r in dep.records:
       case r.kind

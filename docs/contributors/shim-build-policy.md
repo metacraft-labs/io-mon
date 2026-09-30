@@ -74,6 +74,26 @@ substitute for keeping the hostile path in C.)
 The `IO_MON_DEBUG_*` diagnostic toggles remain compiled in (they are
 `when not defined(release)`), because the settings above do not define `release`.
 
+### Linux shared producer ownership
+
+All host threads publish through one process-local producer view. The shared
+table uses atomic inserts, but the view's list of mapped shards can grow and
+must have one caller at a time. Linux holds `recordLock` around publication,
+after muting recursive capture. The same lock already protects sequence-number
+assignment; neither operation nests the other.
+
+The fork prepare handler waits for that lock. Parent and child release their
+copies before further capture, and the child then replaces its inherited
+producer view. This keeps fork from copying a partially resized mapping list.
+The lock serializes publication within one process; separate processes retain
+the shared table's atomic publication protocol. Capture still finishes before
+the hook returns and reports loss on a failed publication.
+
+`test_io_mon_shared_producer_growth.nim` uses real pthreads, absent filesystem
+paths and fork/exec children to force growth and require complete capture of
+every distinct path. Its outer runner owns the transport, so compilation is
+monitored while test execution is isolated and always reruns.
+
 ## The structural rule (what actually keeps us safe)
 
 > **No code path reachable from inside libmalloc may touch any thread-local

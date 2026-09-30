@@ -159,7 +159,7 @@ fi
 case "${io_mon_host_platform_name}" in
   darwin)
     macos_shim_arch_flags=()
-    if io_mon_host_is_arm64; then
+    if [ "${IO_MON_TARGET_CPU:-}" != amd64 ] && io_mon_host_is_arm64; then
       macos_shim_arch_flags+=(
         "--passC:-arch arm64"
         "--passC:-arch arm64e"
@@ -179,6 +179,7 @@ case "${io_mon_host_platform_name}" in
       --path:"${shm_gset_src}" \
       --nimcache:"${nimcache_dir}/io-mon-shim-dylib" \
       --out:"${out_dir}/librepro_monitor_shim.dylib" \
+      "$@" \
       src/io_mon/shim/macos_interpose.nim
     ;;
   linux)
@@ -209,6 +210,7 @@ case "${io_mon_host_platform_name}" in
       --path:"${shm_gset_src}" \
       --nimcache:"${nimcache_dir}/io-mon-shim-so" \
       --out:"${out_dir}/librepro_monitor_shim.so" \
+      "$@" \
       src/io_mon/shim/linux_preload.nim
     ;;
   windows)
@@ -235,6 +237,7 @@ case "${io_mon_host_platform_name}" in
       --path:"${shm_gset_src}" \
       --nimcache:"${nimcache_dir}/io-mon-shim-dll" \
       --out:"${out_dir}/librepro_monitor_shim.dll" \
+      "$@" \
       src/io_mon/shim/windows_interpose.nim
 
     # 32-bit (WOW64) companions.

@@ -5,6 +5,9 @@ import std/[algorithm, locks, os, strutils]
 
 import stackable_hooks/platform/linux_preload
 import stackable_hooks/platform/linux_raw_syscalls
+import ./linux_mapping_policy
+
+export linux_mapping_policy
 
 const linuxPreloadBackend* = "stackable_hooks/platform/linux_preload"
 const
@@ -863,6 +866,7 @@ static volatile unsigned long ct_inline_syscall_last_address_value = 0;
 
 extern void *stackable_linux_preload_resolve_next(const char *name);
 extern int stackable_linux_preload_hooks_allowed(void);
+extern int stackable_linux_preload_current_depth(void);
 extern void stackable_linux_preload_enter_hook(void);
 extern void stackable_linux_preload_exit_hook(void);
 /* The raw-syscall / INT3 substrate below lives in nim-stackable-hooks'
@@ -1093,12 +1097,48 @@ int ct_linux_inline_syscall_overflowed(void) {
   return ct_inline_syscall_overflow_value != 0;
 }
 
-#define CT_BYPASS() (!stackable_linux_preload_hooks_allowed())
+/* vfork shares TLS with its suspended parent. A successful exec never returns
+ * through CT_CALL_HOOK, leaving that parent's guard raised. Remember the
+ * guard depth before an exec dispatch and restore it when the parent resumes.
+ * Keep the guard during libc PATH lookup to suppress duplicate exec records.
+ * Only an outstanding exec bracket needs the live PID check. */
+static __thread pid_t ct_exec_guard_pid = 0;
+static __thread int ct_exec_guard_resume_depth = 0;
+
+static void ct_restore_vfork_exec_guard(void) {
+  if (ct_exec_guard_pid != 0 && ct_exec_guard_pid != getpid()) {
+    while (stackable_linux_preload_current_depth() > ct_exec_guard_resume_depth)
+      stackable_linux_preload_exit_hook();
+    ct_exec_guard_pid = 0;
+    ct_exec_guard_resume_depth = 0;
+  }
+}
+
+static int ct_preload_hooks_allowed(void) {
+  ct_restore_vfork_exec_guard();
+  return stackable_linux_preload_hooks_allowed();
+}
+
+#define CT_BYPASS() (!ct_preload_hooks_allowed())
 #define CT_CALL_HOOK(expr) ({ \
   stackable_linux_preload_enter_hook(); \
   __typeof__(expr) _ct_result = (expr); \
   stackable_linux_preload_exit_hook(); \
   _ct_result; \
+})
+
+#define CT_CALL_EXEC_HOOK(expr) ({ \
+  ct_restore_vfork_exec_guard(); \
+  pid_t _ct_previous_exec_pid = ct_exec_guard_pid; \
+  int _ct_previous_exec_depth = ct_exec_guard_resume_depth; \
+  if (ct_exec_guard_pid == 0) { \
+    ct_exec_guard_pid = getpid(); \
+    ct_exec_guard_resume_depth = stackable_linux_preload_current_depth(); \
+  } \
+  __typeof__(expr) _ct_exec_result = CT_CALL_HOOK(expr); \
+  ct_exec_guard_pid = _ct_previous_exec_pid; \
+  ct_exec_guard_resume_depth = _ct_previous_exec_depth; \
+  _ct_exec_result; \
 })
 
 static int ct_starts_with(const char *value, const char *prefix) {
@@ -1530,14 +1570,45 @@ int ct_linux_preload_real_close(int fd) {
   return real_close_ptr(fd);
 }
 
+/* Before glibc 2.33 the public stat/lstat entrypoints were header wrappers
+ * around __xstat/__lxstat, not dynamically exported symbols. Newer build
+ * headers no longer define _STAT_VER. Preserve the host libc's struct stat
+ * ABI when forwarding into an older runtime. See glibc 2.31's
+ * sysdeps/unix/sysv/linux/{x86,generic}/bits/stat.h. */
+#if defined(_STAT_VER)
+#define CT_STAT_VER _STAT_VER
+#elif defined(__x86_64__)
+#define CT_STAT_VER 1
+#elif defined(__aarch64__)
+#define CT_STAT_VER 0
+#endif
+
 int ct_linux_preload_real_stat(char *path, void *buf) {
-  CT_REAL("stat", real_stat_ptr, ct_stat_real_fn);
-  return real_stat_ptr(path, (struct stat *)buf);
+  if (real_stat_ptr == NULL)
+    real_stat_ptr = (ct_stat_real_fn)ct_resolve("stat");
+  if (real_stat_ptr != NULL) return real_stat_ptr(path, (struct stat *)buf);
+#ifdef CT_STAT_VER
+  if (real_xstat_ptr == NULL)
+    real_xstat_ptr = (ct_xstat_real_fn)ct_resolve("__xstat");
+  if (real_xstat_ptr != NULL)
+    return real_xstat_ptr(CT_STAT_VER, path, (struct stat *)buf);
+#endif
+  errno = ENOSYS;
+  return -1;
 }
 
 int ct_linux_preload_real_lstat(char *path, void *buf) {
-  CT_REAL("lstat", real_lstat_ptr, ct_stat_real_fn);
-  return real_lstat_ptr(path, (struct stat *)buf);
+  if (real_lstat_ptr == NULL)
+    real_lstat_ptr = (ct_stat_real_fn)ct_resolve("lstat");
+  if (real_lstat_ptr != NULL) return real_lstat_ptr(path, (struct stat *)buf);
+#ifdef CT_STAT_VER
+  if (real_lxstat_ptr == NULL)
+    real_lxstat_ptr = (ct_xstat_real_fn)ct_resolve("__lxstat");
+  if (real_lxstat_ptr != NULL)
+    return real_lxstat_ptr(CT_STAT_VER, path, (struct stat *)buf);
+#endif
+  errno = ENOSYS;
+  return -1;
 }
 
 void *ct_linux_preload_real_opendir(char *path) {
@@ -2075,13 +2146,22 @@ int ct_linux_library_scan(ct_ll_sink_fn sink, char *reason,
   return ct_ll_snap.count;
 }
 
+#if defined(__aarch64__)
+#define CT_DLSYM_GLIBC_BASE "GLIBC_2.17"
+#else
+#define CT_DLSYM_GLIBC_BASE "GLIBC_2.2.5"
+#endif
+
 void *ct_linux_preload_real_dlsym(void *handle, char *name) {
 #ifdef __GLIBC__
   if (real_dlsym_ptr == NULL)
-    real_dlsym_ptr = (ct_dlsym_real_fn)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
-#endif
+    real_dlsym_ptr = (ct_dlsym_real_fn)dlvsym(RTLD_NEXT, "dlsym", CT_DLSYM_GLIBC_BASE);
+  /* Never retry through ct_resolve on glibc: that calls our interposed
+   * dlsym again. ARM64's baseline is 2.17, not x86_64's 2.2.5. */
+#else
   if (real_dlsym_ptr == NULL)
     real_dlsym_ptr = (ct_dlsym_real_fn)ct_resolve("dlsym");
+#endif
   if (real_dlsym_ptr == NULL) { errno = ENOSYS; return NULL; }
   return real_dlsym_ptr(handle, name);
 }
@@ -2608,13 +2688,13 @@ void *ct_linux_preload_public_dlsym(void *handle, const char *name) {
   return CT_CALL_HOOK(ct_dlsym_hook(handle, (char *)name));
 }
 #ifdef __GLIBC__
-void *ct_linux_preload_public_dlsym_glibc_2_2_5(void *handle, const char *name)
+void *ct_linux_preload_public_dlsym_glibc_base(void *handle, const char *name)
     __attribute__((alias("ct_linux_preload_public_dlsym"),
                    visibility("default")));
 void *ct_linux_preload_public_dlsym_glibc_2_34(void *handle, const char *name)
     __attribute__((alias("ct_linux_preload_public_dlsym"),
                    visibility("default")));
-__asm__(".symver ct_linux_preload_public_dlsym_glibc_2_2_5,dlsym@GLIBC_2.2.5");
+__asm__(".symver ct_linux_preload_public_dlsym_glibc_base,dlsym@" CT_DLSYM_GLIBC_BASE);
 __asm__(".symver ct_linux_preload_public_dlsym_glibc_2_34,dlsym@@GLIBC_2.34");
 #else
 void *dlsym(void *handle, const char *name)
@@ -2759,7 +2839,7 @@ static int ct_linux_preload_dispatch_execve(const char *path,
                                             char *const envp[]) {
   if (CT_BYPASS() || ct_execve_hook == NULL)
     return ct_linux_preload_real_execve((char *)path, (char **)argv, (char **)envp);
-  return CT_CALL_HOOK(ct_execve_hook((char *)path, (char **)argv, (char **)envp));
+  return CT_CALL_EXEC_HOOK(ct_execve_hook((char *)path, (char **)argv, (char **)envp));
 }
 
 int execve(const char *path, char *const argv[], char *const envp[])
@@ -2867,11 +2947,8 @@ static int ct_linux_preload_dispatch_execvp(const char *file,
    * real_execvp call so those internal execve interposers see
    * CT_BYPASS() and delegate straight to real_execve without
    * re-emitting the hook. */
-  CT_CALL_HOOK(ct_execve_hook((char *)file, (char **)argv, environ));
-  stackable_linux_preload_enter_hook();
-  int rc = ct_linux_preload_real_execvp((char *)file, (char **)argv);
-  stackable_linux_preload_exit_hook();
-  return rc;
+  CT_CALL_EXEC_HOOK(ct_execve_hook((char *)file, (char **)argv, environ));
+  return CT_CALL_EXEC_HOOK(ct_linux_preload_real_execvp((char *)file, (char **)argv));
 }
 
 static int ct_linux_preload_dispatch_execvpe(const char *file,
@@ -2880,14 +2957,11 @@ static int ct_linux_preload_dispatch_execvpe(const char *file,
   if (CT_BYPASS() || ct_execve_hook == NULL)
     return ct_linux_preload_real_execvpe((char *)file, (char **)argv,
                                           (char **)envp);
-  CT_CALL_HOOK(ct_execve_hook((char *)file, (char **)argv,
+  CT_CALL_EXEC_HOOK(ct_execve_hook((char *)file, (char **)argv,
                               (char **)envp));
   /* M9.R.66.2: same PATH-lookup double-count guard as dispatch_execvp. */
-  stackable_linux_preload_enter_hook();
-  int rc = ct_linux_preload_real_execvpe((char *)file, (char **)argv,
-                                          (char **)envp);
-  stackable_linux_preload_exit_hook();
-  return rc;
+  return CT_CALL_EXEC_HOOK(ct_linux_preload_real_execvpe((char *)file, (char **)argv,
+                                          (char **)envp));
 }
 
 static int ct_linux_preload_dispatch_fexecve(int fd,
@@ -2901,14 +2975,11 @@ static int ct_linux_preload_dispatch_fexecve(int fd,
    * (better than skipping the flush entirely).  The child image is
    * determined by the fd, so callers using fexecve accept the same
    * ambiguity. */
-  CT_CALL_HOOK(ct_execve_hook("", (char **)argv, (char **)envp));
+  CT_CALL_EXEC_HOOK(ct_execve_hook("", (char **)argv, (char **)envp));
   /* M9.R.66.2: same double-count guard.  glibc's fexecve is a thin
    * wrapper around execve on /proc/self/fd/<fd>, so the same
    * PATH-lookup double-emission would happen without the bracket. */
-  stackable_linux_preload_enter_hook();
-  int rc = ct_linux_preload_real_fexecve(fd, (char **)argv, (char **)envp);
-  stackable_linux_preload_exit_hook();
-  return rc;
+  return CT_CALL_EXEC_HOOK(ct_linux_preload_real_fexecve(fd, (char **)argv, (char **)envp));
 }
 
 int execvp(const char *file, char *const argv[])
@@ -4136,77 +4207,11 @@ proc installRawSyscallWrapperPatch*(): RawSyscallPatchStatus {.raises: [].} =
 proc rawSyscallWrapperPatchStatus*(): RawSyscallPatchStatus {.raises: [].} =
   rawSyscallPatchStatus
 
-proc normalizeMappingPath(path: string): string {.raises: [].} =
-  if path.len == 0:
-    return ""
-  try:
-    result = expandSymlink(path)
-  except CatchableError:
-    result = path
-
 proc currentExecutablePath(): string {.raises: [].} =
   try:
     result = expandSymlink("/proc/self/exe")
   except CatchableError:
     result = ""
-
-proc isSystemRuntimeMappingPath*(path: string): bool {.raises: [].} =
-  ## Keep startup DSO scanning out of loader/libc/toolchain runtime mappings.
-  ## io-mon can safely classify file syscalls once a selected site traps, but
-  ## broad runtime-library patching would turn ordinary libc/loader internals
-  ## into false raw-syscall event-loss for every monitored process.
-  ##
-  ## Exported for M9.R.67.1's regression test
-  ## (`tests/linux/test_io_mon_inline_patch_predicate.nim`) so the
-  ## precedence order between this predicate and the
-  ## `executable-mapping-short-circuit` in
-  ## `shouldPatchInlineSyscallMapping` stays under regression cover.
-  let filename = path.extractFilename
-  filename in [
-      "libanl.so.1", "libBrokenLocale.so.1", "libc.so.6", "libdl.so.2",
-      "libm.so.6", "libmvec.so.1", "libpthread.so.0", "libresolv.so.2",
-      "librt.so.1", "libthread_db.so.1", "libutil.so.1",
-    ] or
-    filename.startsWith("libnss_") or
-    filename.startsWith("ld-linux-") or
-    filename.startsWith("ld-musl-") or
-    path.startsWith("/lib/") or path.startsWith("/lib64/") or
-    path.startsWith("/usr/lib/") or path.startsWith("/usr/lib64/") or
-    path.startsWith("/nix/store/")
-
-proc isMonitorShimMappingPath*(path: string): bool {.raises: [].} =
-  ## Exported alongside `isSystemRuntimeMappingPath` for the same M9.R.67.1
-  ## regression test.
-  path.contains("/librepro_monitor_shim.") or
-    path.endsWith("/librepro_monitor_shim.so") or
-    path.endsWith("/librepro_monitor_shim.so (deleted)")
-
-proc shouldPatchInlineSyscallMapping*(mapping: LinuxExecutableMapping;
-                                      executablePath: string): bool {.raises: [].} =
-  if not (mapping.readable and mapping.executable):
-    return false
-  if mapping.writable or mapping.path.len == 0 or not mapping.privateMapping:
-    return false
-  if mapping.path[0] == '[' or mapping.path[0] != '/':
-    return false
-  if executablePath.len == 0:
-    return false
-  let normalized = normalizeMappingPath(mapping.path)
-  # M9.R.67.1 — the system-runtime / monitor-shim exclusions MUST take
-  # precedence over the executable short-circuit. When a monitored
-  # subtree's top-of-tree exec is itself a toolchain binary (e.g. Nix's
-  # `/nix/store/…-gcc-14.3.0/…/cc1`) we still want the `isSystemRuntime`
-  # policy to apply: patching a `/nix/store/…/cc1` false-positive `0F 05
-  # XX` byte sequence (from `looksLikeLinuxX8664Syscall`) mid-instruction
-  # corrupts cc1 and crashes it at `init_emit_regs` on the FIRST
-  # sanitycheckc.c meson build. See
-  # `recipes/reproos-image/run-evidence/m9r67/m9r67_phaseA_byte_identity.txt`
-  # for the byte-identity + path-dependence characterization.
-  if isMonitorShimMappingPath(normalized) or isSystemRuntimeMappingPath(normalized):
-    return false
-  if normalized == executablePath:
-    return true
-  normalized.endsWith(".so") or normalized.contains(".so.")
 
 proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
                                status: var InlineSyscallPatchStatus)

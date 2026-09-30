@@ -29,27 +29,20 @@ import io_mon
 when defined(macosx):
   import std/[osproc, streams, strtabs]
   import macos_backend_toggle
+  import build_test_cli
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
   r5ipc = repoRoot / "research" / "adversarial-2026-07-round5" / "ipc"
 
 when defined(macosx):
+  from build_test_shim import buildPrivateMacosShim
+
   proc buildShim(): string =
-    let (output, code) = execCmdEx("bash " &
-      quoteShell(repoRoot / "scripts" / "build_shim.sh"))
-    if code != 0:
-      raise newException(IOError, "build_shim.sh failed: " & output)
-    let shim = repoRoot / "build" / "lib" / "librepro_monitor_shim.dylib"
-    doAssert fileExists(shim), "shim not produced at " & shim
-    shim
+    buildPrivateMacosShim(repoRoot)
 
   proc buildCli(): string =
-    let (output, code) = execCmdEx("cd " & quoteShell(repoRoot) &
-      " && nimble buildSnoop")
-    let cli = repoRoot / "build" / "bin" / "io-mon"
-    doAssert fileExists(cli), "io-mon CLI not produced: " & output
-    cli
+    buildTestCli(repoRoot)
 
   proc ccExe(src, outBin: string) =
     let cc = getEnv("CC", "cc")

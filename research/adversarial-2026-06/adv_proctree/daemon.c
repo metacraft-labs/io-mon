@@ -8,7 +8,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 int main(int argc,char**argv){
-  if(argc<2){fprintf(stderr,"usage: daemon <sockpath>\n");return 2;}
+  if(argc<2){fprintf(stderr,"usage: daemon <sockpath> [readyfile]\n");return 2;}
   unlink(argv[1]);
   int s=socket(AF_UNIX,SOCK_STREAM,0);
   struct sockaddr_un a; memset(&a,0,sizeof a); a.sun_family=AF_UNIX;
@@ -17,7 +17,10 @@ int main(int argc,char**argv){
   if(listen(s,16)<0){perror("listen");return 1;}
   fprintf(stderr,"daemon: listening on %s pid=%d\n",argv[1],getpid());
   // signal readiness
-  FILE*rf=fopen("/tmp/adv_proctree/daemon.ready","w"); if(rf){fprintf(rf,"%d\n",getpid());fclose(rf);}
+  const char *ready = argc > 2 ? argv[2] : "/tmp/adv_proctree/daemon.ready";
+  FILE*rf=fopen(ready,"w");
+  if(!rf){perror("ready file");close(s);unlink(argv[1]);return 1;}
+  fprintf(rf,"%d\n",getpid());fclose(rf);
   for(;;){
     int c=accept(s,NULL,NULL);
     if(c<0)continue;

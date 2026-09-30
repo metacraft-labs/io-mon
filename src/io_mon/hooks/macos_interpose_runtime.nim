@@ -73,6 +73,8 @@ proc repro_macos_get_sandbox_tools_dir*(): cstring
 extern char **environ;
 extern char *repro_macos_rewrite_sip_path(char *path);
 extern char *repro_macos_get_sandbox_tools_dir(void);
+extern void repro_macos_flush_before_image_replacement(void);
+int repro_macos_spawnattr_has_setexec(void *attrp);
 
 int repro_macos_real_open_syscall(char *path, int flags, int mode) {
   return (int)syscall(SYS_open, path, flags, mode);
@@ -1459,6 +1461,8 @@ static char **repro_macos_env_with_preload(char **envp) {
 int repro_macos_real_execve_syscall(char *path, char **argv, char **envp) {
   char **effective_envp = repro_macos_env_with_preload(envp);
   char *effective_path = repro_macos_rewrite_sip_path(path);
+  /* Rewriting can probe the sandbox after the hook's initial flush. */
+  repro_macos_flush_before_image_replacement();
   return (int)syscall(SYS_execve, effective_path, argv, effective_envp);
 }
 
@@ -1765,6 +1769,8 @@ int repro_macos_real_posix_spawn(pid_t *pid, char *path, void *file_actions,
   if (!repro_macos_real_posix_spawn_ptr) return -1;
   char **effective_envp = repro_macos_env_with_preload(envp);
   char *effective_path = repro_macos_rewrite_sip_path(path);
+  if (repro_macos_spawnattr_has_setexec(attrp))
+    repro_macos_flush_before_image_replacement();
   return repro_macos_real_posix_spawn_ptr(pid, effective_path,
     (const posix_spawn_file_actions_t *)file_actions,
     (const posix_spawnattr_t *)attrp, argv, effective_envp);
@@ -1776,6 +1782,8 @@ int repro_macos_real_posix_spawnp(pid_t *pid, char *path, void *file_actions,
   if (!repro_macos_real_posix_spawnp_ptr) return -1;
   char **effective_envp = repro_macos_env_with_preload(envp);
   char *effective_path = repro_macos_rewrite_sip_path(path);
+  if (repro_macos_spawnattr_has_setexec(attrp))
+    repro_macos_flush_before_image_replacement();
   return repro_macos_real_posix_spawnp_ptr(pid, effective_path,
     (const posix_spawn_file_actions_t *)file_actions,
     (const posix_spawnattr_t *)attrp, argv, effective_envp);
@@ -1846,6 +1854,10 @@ int repro_macos_bodypatch_call_posix_spawn(void *tramp, pid_t *pid, char *path,
     void *file_actions, void *attrp, char **argv, char **envp) {
   if (tramp == NULL) return -1;
   repro_macos_posix_spawn_fn fn = (repro_macos_posix_spawn_fn)tramp;
+  /* Both outer and internal forwards may replace this image. Preserve any
+   * observations made by path rewriting or libSystem's launch preparation. */
+  if (repro_macos_spawnattr_has_setexec(attrp))
+    repro_macos_flush_before_image_replacement();
   return fn(pid, path,
     (const posix_spawn_file_actions_t *)file_actions,
     (const posix_spawnattr_t *)attrp, argv, envp);

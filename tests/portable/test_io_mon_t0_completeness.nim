@@ -384,6 +384,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
   # report (3b) and a stale cross-run report (3c). A report is now trusted only if
   # it is run-scoped, bound to an OBSERVED connection, explicitly complete, and
   # accounts for ≥1 read. These platform-independent tests lock the auth in.
+  # Synthetic records belong to this fixture, even under an outer monitor.
   const runId = "session-abc-123"
 
   proc clientFrag(work: string; clientPid, daemonPid: uint64): string =
@@ -407,9 +408,9 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
       "io-mon-breakaway-report v1\nrun " & runId & "\nclient 4242\ndaemon 9999\n" &
         "read " & served & "\ncomplete\n")
     # WITHOUT the report the out-of-tree peer downgrades…
-    check mergeFragments(frag, work / "no.iomon").completeness == mcIncomplete
+    check mergeFragments(frag, work / "no.iomon", currentRunId = runId).completeness == mcIncomplete
     # …WITH the authenticated report it stays complete and the read is folded in.
-    let dep = mergeFragments(frag, work / "yes.iomon", reportDir)
+    let dep = mergeFragments(frag, work / "yes.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcComplete
     var sawServed = false
     for r in dep.records:
@@ -427,7 +428,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     let frag = clientFrag(work, 4242'u64, 9999'u64)
     writeFile(reportDir / "forged.io-mon-report",
       "io-mon-breakaway-report v1\nrun " & runId & "\nclient 4242\ndaemon 9999\n")
-    let dep = mergeFragments(frag, work / "out.iomon", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcIncomplete
     removeDir(work)
 
@@ -440,7 +441,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "partial.io-mon-report",
       "io-mon-breakaway-report v1\nrun " & runId &
         "\nclient 4242\ndaemon 9999\nread /x/y.h\n")  # no `complete`
-    check mergeFragments(frag, work / "out.iomon", reportDir).completeness ==
+    check mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId).completeness ==
       mcIncomplete
     removeDir(work)
 
@@ -454,7 +455,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "no-header.io-mon-report",
       "run " & runId & "\nclient 4242\ndaemon 9999\n" &
         "read " & decoy & "\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.iomon", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcIncomplete
     for r in dep.records:
       check r.path != decoy
@@ -470,7 +471,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "padded-header.io-mon-report",
       " " & BreakawayReportMagic & "\nrun " & runId &
         "\nclient 4242\ndaemon 9999\nread " & decoy & "\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.iomon", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcIncomplete
     for r in dep.records:
       check r.path != decoy
@@ -486,7 +487,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "stale.io-mon-report",
       "io-mon-breakaway-report v1\nrun OLD-SESSION-999\nclient 4242\ndaemon 9999\n" &
         "read /stale/build/file.h\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.iomon", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcIncomplete
     for r in dep.records:
       check r.path != "/stale/build/file.h"
@@ -505,7 +506,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "duplicate-run.io-mon-report",
       "io-mon-breakaway-report v1\nrun OLD-SESSION-999\nrun " & runId &
         "\nclient 4242\ndaemon 9999\nread " & decoy & "\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.iomon", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcIncomplete
     for r in dep.records:
       check r.path != decoy
@@ -522,7 +523,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
       "io-mon-breakaway-report v1\nrun " & runId &
         "\nclient 4242\ndaemon 9999\nunexpected structural-field\nread " &
         decoy & "\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.iomon", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcIncomplete
     for r in dep.records:
       check r.path != decoy
@@ -538,7 +539,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "wrong.io-mon-report",
       "io-mon-breakaway-report v1\nrun " & runId &
         "\nclient 4242\ndaemon 7777\nread /x.h\ncomplete\n")  # daemon 7777!
-    check mergeFragments(frag, work / "out.iomon", reportDir).completeness ==
+    check mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId).completeness ==
       mcIncomplete
     removeDir(work)
 
@@ -551,7 +552,7 @@ suite "io-mon R8 authenticated breakaway-report folding (mergeFragments)":
     writeFile(reportDir / "foreign.io-mon-report",
       "io-mon-breakaway-report v1\nrun " & runId &
         "\nclient 1111\ndaemon 9999\nread /other/build/file.h\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.iomon", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcIncomplete
     for r in dep.records:
       check r.path != "/other/build/file.h"
@@ -687,6 +688,7 @@ suite "io-mon S3a self-authored breakaway-report forgery (write provenance)":
   # monitored, so the shim DID record the write of its report file. A report whose
   # own file is an in-tree output write is therefore rejected as a forgery. These
   # platform-independent tests drive the exact write-provenance discriminator.
+  # Synthetic records belong to this fixture, even under an outer monitor.
   const runId = "session-s3a-xyz"
 
   proc clientFragWithWrite(work, reportPath: string;
@@ -718,7 +720,7 @@ suite "io-mon S3a self-authored breakaway-report forgery (write provenance)":
     writeFile(reportPath,
       "io-mon-breakaway-report v1\nrun " & runId & "\nclient 4242\ndaemon 9999\n" &
         "read /tmp/DECOY.txt\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.iomon", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcIncomplete
     # The decoy must NOT have been folded as a dependency.
     for r in dep.records:
@@ -750,7 +752,7 @@ suite "io-mon S3a self-authored breakaway-report forgery (write provenance)":
       observationKind: moFileWrite, osPid: 4242'u64,
       path: "/some/other/spelling.io-mon-report",
       detail: "dev=" & dev & " ino=" & ino))
-    let dep = mergeFragments(frag, work / "out.iomon", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcIncomplete
     removeDir(work)
 
@@ -771,7 +773,7 @@ suite "io-mon S3a self-authored breakaway-report forgery (write provenance)":
     writeFile(reportDir / "report-4242-9999-0.io-mon-report",
       "io-mon-breakaway-report v1\nrun " & runId & "\nclient 4242\ndaemon 9999\n" &
         "read " & served & "\ncomplete\n")
-    let dep = mergeFragments(frag, work / "out.iomon", reportDir)
+    let dep = mergeFragments(frag, work / "out.iomon", reportDir, currentRunId = runId)
     check dep.completeness == mcComplete
     var sawServed = false
     for r in dep.records:

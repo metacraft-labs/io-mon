@@ -52,10 +52,29 @@ import std/[os, osproc, sequtils, streams, strutils, unittest]
 
 import io_mon                            # runMonitored / FsSnoopRequest (PUBLIC)
 import shm_gset                          # shmGSetSupported
+import build_test_shim
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
 
+  privateFixtureName = "io_mon_per_call_env_private"
+
+# The absent-environment case must use discovery, not a shim override. Give
+# this process its own canonical bin/../lib layout so concurrent fixtures can
+# relink build/lib without changing the library discovered by this test. The
+# parent owns cleanup, after the real copied executable and its children exit.
+if getAppFilename().extractFilename != privateFixtureName:
+  let shim = buildPrivateLinuxShim(repoRoot)
+  let privateBin = shim.parentDir.parentDir / "bin" / privateFixtureName
+  createDir(privateBin.parentDir)
+  copyFileWithPermissions(getAppFilename(), privateBin)
+  let child = startProcess(privateBin, args = commandLineParams(),
+    options = {poParentStreams})
+  let exitCode = child.waitForExit()
+  child.close()
+  quit(exitCode)
+
+const
   ## Every environment variable `runMonitored` injects, across ALL THREE arms.
   ## Enumerated from the arms in `src/io_mon/fs_snoop.nim` rather than from the
   ## milestone's count: Linux publishes seven (`LD_PRELOAD`,
@@ -110,13 +129,9 @@ proc buildC(work, name, source: string): string =
         built.output)
 
 proc ensureShim(): string =
-  ## Build the shim the way the rest of the Linux suite does, and resolve it
-  ## with the SAME discovery `runMonitored` uses — deliberately WITHOUT pinning
-  ## `REPRO_MONITOR_SHIM_LIB` in this process, because this file's whole point
-  ## is that the injection variables are absent from this process.
-  let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-  if buildShim.code != 0:
-    raise newException(IOError, "build_shim.sh failed: " & buildShim.output)
+  ## The parent has built a private production shim beside this executable.
+  ## Resolve it using the same discovery as runMonitored, without introducing
+  ## an override into the environment this fixture is testing.
   result = findShimLibrary()
   if result.len == 0:
     raise newException(IOError, "findShimLibrary() resolved nothing after build")
@@ -355,6 +370,8 @@ suite "io-mon per-call injection env and cwd (DH-1)":
       delEnv(name)
     for name in injectionEnvVars:
       check not existsEnv(name)          # baseline precondition
+    check expandFilename(findShimLibrary()) == expandFilename(
+      getAppDir() / ".." / "lib" / "librepro_monitor_shim.so")
 
     var req: FsSnoopRequest
     req.command = @[reader, input]

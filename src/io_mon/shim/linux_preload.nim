@@ -137,9 +137,10 @@ var
   # `gettid(2)` are un-cached raw syscalls in glibc (since 2.25) / musl, so
   # a recorder-heavy workload (the BEAM VM emitting a record per port write)
   # pays THREE extra syscalls per record. pid/ppid are process-constant and
-  # tid is thread-constant for a thread's whole lifetime; the only event
-  # that invalidates them is `fork`, after which the pthread_atfork CHILD
-  # handler (`repro_linux_atfork_child`) resets the caches. A sentinel of 0
+  # tid is thread-constant for a thread's whole lifetime. After `fork`, the
+  # pthread_atfork CHILD handler (`repro_linux_atfork_child`) resets them.
+  # Exec records sample live identities instead: a vfork child shares these
+  # caches with its parent and does not run the atfork handlers. A sentinel of 0
   # means "unset"; a real pid/tid is always > 0, so 0 unambiguously forces a
   # first fetch. The recorded VALUES are byte-identical to the un-cached path
   # — this is a pure syscall-count reduction, not a semantic change.
@@ -865,6 +866,14 @@ proc armThreadExitFlush() {.raises: [].} =
   ## right after it first opens its fragment slot (see emitRecord).
   repro_linux_arm_thread_exit_flush_c()
 
+proc repro_linux_atfork_prepare() {.cdecl, raises: [].} =
+  # The shared table is atomic; its process-local mapped-shard sequence is
+  # mutable. Fork must copy that view only between complete publications.
+  acquire(recordLock)
+
+proc repro_linux_atfork_parent() {.cdecl, raises: [].} =
+  release(recordLock)
+
 proc repro_linux_atfork_child() {.exportc, cdecl, raises: [].} =
   ## DEP-FLUSH-4 — reset the child's inherited slot + registry so it never
   ## replays the parent's buffered frames or writes through the COW-shared
@@ -872,6 +881,9 @@ proc repro_linux_atfork_child() {.exportc, cdecl, raises: [].} =
   # FUP-K — the child has a fresh pid/ppid/tid; drop the inherited (COW) caches
   # so `baseRecord` re-fetches them for the child's records. Runs inside fork()
   # in the child before fork() returns, so every child record sees fresh values.
+  # prepare acquired this lock on the forking thread. Release the child's
+  # copy before detaching/re-attaching its private producer view.
+  release(recordLock)
   resetIdentityCaches()
   withShimMuted:
     try: discardFragmentSlotAfterFork()
@@ -926,14 +938,22 @@ proc sampleKillDiagArgvOnce() {.raises: [].} =
 
 proc baseRecord(kind: MonitorRecordKind;
                 observationKind: MonitorObservationKind): MonitorRecord =
-  MonitorRecord(
+  result = MonitorRecord(
     kind: kind,
     observationKind: observationKind,
     seq: processSeq(),
-    osPid: currentPid(),
-    parentOsPid: currentPpid(),
-    threadId: currentThreadId(),
     probeResult: prUnknown)
+  if kind == mrProcessExec:
+    # vfork shares the suspended parent's TLS and skips pthread_atfork.
+    # Attribute both exec attempts and failures to the actual caller without
+    # overwriting caches the parent will reuse when the child execs or exits.
+    result.osPid = uint64(c_getpid())
+    result.parentOsPid = uint64(c_getppid())
+    result.threadId = uint64(c_gettid())
+  else:
+    result.osPid = currentPid()
+    result.parentOsPid = currentPpid()
+    result.threadId = currentThreadId()
 
 proc stampRunId(record: var MonitorRecord) {.raises: [].} =
   ## Scope Linux records to the launcher's run id so reused fragment directories
@@ -998,7 +1018,14 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
   withShimMuted:
     var stamped = record
     stampRunId(stamped)
-    appendFragmentRecord(fragmentDir, stamped)
+    # All host threads share one producer. Its local shard mapping sequence
+    # can grow even though the shared-memory inserts themselves are atomic.
+    # Muting precedes the lock so allocation/file hooks cannot reenter it.
+    acquire(recordLock)
+    try:
+      appendFragmentRecord(fragmentDir, stamped)
+    finally:
+      release(recordLock)
     # DEP-FLUSH-3 — arm the pthread-key thread-exit flush once per thread,
     # right after this thread's slot is open (appendFragmentRecord opened /
     # registered it above). libc then fires the value-destructor on this
@@ -1579,7 +1606,8 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   # including those spawned through a clone(2) path the hook does not see,
   # resetting the inherited slot + registry so the child never replays the
   # parent's buffered frames. Best-effort; a non-zero return is ignored.
-  discard c_pthread_atfork(nil, nil,
+  discard c_pthread_atfork(cast[pointer](repro_linux_atfork_prepare),
+    cast[pointer](repro_linux_atfork_parent),
     cast[pointer](repro_linux_atfork_child_c))
   let sigInstalled = repro_linux_install_terminating_signal_handlers()
   if killDiagDeepIsOn() and sigInstalled > 0:

@@ -28,9 +28,10 @@
 ##   3. TRUSTED DAEMON: a cooperating daemon that reports its reads keeps the
 ##      build `mcComplete` AND the daemon-read file appears in the depfile.
 ##
+## No mocks: real daemons, sockets, compiler and shim.
 ## macOS-only; a no-op pass elsewhere.
 
-import std/[os, osproc, streams, strtabs, unittest]
+import std/[os, osproc, streams, strtabs, strutils, unittest]
 
 when defined(macosx):
   import io_mon
@@ -44,14 +45,10 @@ const
   testRunId = "io-mon-ipc-test-run"
 
 when defined(macosx):
+  from build_test_shim import buildPrivateMacosShim
+
   proc buildShim(): string =
-    let (output, code) = execCmdEx("bash " &
-      quoteShell(repoRoot / "scripts" / "build_shim.sh"))
-    if code != 0:
-      raise newException(IOError, "build_shim.sh failed: " & output)
-    let shim = repoRoot / "build" / "lib" / "librepro_monitor_shim.dylib"
-    doAssert fileExists(shim), "shim not produced at " & shim
-    shim
+    buildPrivateMacosShim(repoRoot)
 
   proc cc(src, bin: string) =
     let ccBin = getEnv("CC", "cc")
@@ -59,15 +56,18 @@ when defined(macosx):
       quoteShell(src) & " -o " & quoteShell(bin))
     doAssert code == 0, "cc failed (" & src & "): " & output
 
-  proc waitForFile(path: string; timeoutMs = 5000): bool =
+  proc waitForFile(path: string; timeoutMs = 5000; expectedPid = 0): bool =
     ## Poll until `path` exists (a daemon writes its ready file after listen()).
+    proc isReady(): bool =
+      fileExists(path) and (expectedPid == 0 or
+        readFile(path).strip() == $expectedPid)
     var waited = 0
     while waited < timeoutMs:
-      if fileExists(path):
+      if isReady():
         return true
       sleep(25)
       waited += 25
-    fileExists(path)
+    isReady()
 
   proc shimEnv(shim, fragmentDir: string): StringTableRef =
     ## Environment that runs a child UNDER the shim with direct DYLD injection and
@@ -115,12 +115,21 @@ suite "io-mon macOS IPC / daemon-over-socket breakaway (T3a, break #1)":
 
     proc startPlainDaemon(sock, ready: string): Process =
       ## Start daemon.c OUTSIDE the shim (the test process carries no DYLD inject).
-      ## daemon.c writes its readiness to the fixed /tmp/adv_proctree/daemon.ready.
-      createDir("/tmp/adv_proctree")
+      ## Readiness belongs to this process's private test directory. A shared
+      ## /tmp marker races other suites and may belong to another runner user.
       removeFile(ready)
-      result = startProcess(daemonBin, args = @[sock],
+      result = startProcess(daemonBin, args = @[sock, ready],
         options = {poStdErrToStdOut})
-      doAssert waitForFile(ready), "daemon did not become ready"
+      if not waitForFile(ready, expectedPid = result.processID):
+        result.terminate()
+        if result.waitForExit(5000) == -1:
+          result.kill()
+          discard result.waitForExit()
+        let output = result.outputStream.readAll()
+        result.close()
+        doAssert false, "daemon did not become ready: " & output
+      doAssert readFile(ready).strip() == $result.processID,
+        "readiness must identify the daemon this test started"
 
     proc quitDaemon(sock: string; daemon: Process) =
       ## Graceful shutdown: a __QUIT__ request is processed only AFTER the daemon
@@ -132,7 +141,7 @@ suite "io-mon macOS IPC / daemon-over-socket breakaway (T3a, break #1)":
       daemon.close()
 
     test "REGRESSION: adv_proctree escape now downgrades to mcIncomplete":
-      let ready = "/tmp/adv_proctree/daemon.ready"
+      let ready = work / "daemon.ready"
       let sock = work / "regress.sock"
       let inputA = work / "inputA.txt"
       writeFile(inputA, "secret-input-A-distinct-bytes\n")
@@ -143,7 +152,7 @@ suite "io-mon macOS IPC / daemon-over-socket breakaway (T3a, break #1)":
       checkpoint("client A: " & outA)
       quitDaemon(sock, daemon)
 
-      let depA = mergeFragments(fragA, work / "A.iomon")
+      let depA = mergeFragments(fragA, work / "A.iomon", currentRunId = testRunId)
       # An mrIpcConnect to the out-of-tree daemon was captured (peer pid known)…
       var sawConnect = false
       for r in depA.records:
@@ -154,7 +163,7 @@ suite "io-mon macOS IPC / daemon-over-socket breakaway (T3a, break #1)":
       check depA.completeness == mcIncomplete
 
     test "false-cache-hit demo closed: two different daemon inputs both re-run":
-      let ready = "/tmp/adv_proctree/daemon.ready"
+      let ready = work / "daemon.ready"
       let inputA = work / "inA.txt"
       let inputB = work / "inB.txt"
       writeFile(inputA, "AAAA-distinct\n")
@@ -165,7 +174,7 @@ suite "io-mon macOS IPC / daemon-over-socket breakaway (T3a, break #1)":
         createDir(frag)
         discard runUnderShim(shim, clientBin, @[sock, input], frag)
         quitDaemon(sock, daemon)
-        mergeFragments(frag, frag / "out.iomon").completeness
+        mergeFragments(frag, frag / "out.iomon", currentRunId = testRunId).completeness
 
       let cA = captureFor(inputA, work / "demoA.sock", work / "demoFragA")
       let cB = captureFor(inputB, work / "demoB.sock", work / "demoFragB")
@@ -184,7 +193,7 @@ suite "io-mon macOS IPC / daemon-over-socket breakaway (T3a, break #1)":
       createDir(frag)
       let outP = runUnderShim(shim, pairBin, @[sock], frag)
       checkpoint("ipc_pair: " & outP)
-      let dep = mergeFragments(frag, work / "pair.iomon")
+      let dep = mergeFragments(frag, work / "pair.iomon", currentRunId = testRunId)
       # The intra-tree connect was recorded…
       var sawConnect = false
       for r in dep.records:
@@ -224,10 +233,10 @@ suite "io-mon macOS IPC / daemon-over-socket breakaway (T3a, break #1)":
       daemon.close()
 
       # WITHOUT the report dir the out-of-tree daemon would downgrade…
-      check mergeFragments(frag, work / "tNo.iomon").completeness == mcIncomplete
+      check mergeFragments(frag, work / "tNo.iomon", currentRunId = testRunId).completeness == mcIncomplete
       # …but WITH the report folded in, the daemon accounted for its read, so the
       # build stays mcComplete and the served file is a recorded dependency.
-      let dep = mergeFragments(frag, work / "tYes.iomon", reportDir)
+      let dep = mergeFragments(frag, work / "tYes.iomon", reportDir, currentRunId = testRunId)
       check dep.completeness == mcComplete
       var sawServed = false
       for r in dep.records:

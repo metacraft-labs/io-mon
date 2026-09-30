@@ -55,14 +55,10 @@ const
   corpus = repoRoot / "research" / "adversarial-2026-07-round5" / "pathfidelity"
 
 when defined(macosx):
+  from build_test_shim import buildPrivateMacosShim
+
   proc buildShim(): string =
-    let (output, code) = execCmdEx("bash " &
-      quoteShell(repoRoot / "scripts" / "build_shim.sh"))
-    if code != 0:
-      raise newException(IOError, "build_shim.sh failed: " & output)
-    let shim = repoRoot / "build" / "lib" / "librepro_monitor_shim.dylib"
-    doAssert fileExists(shim), "shim not produced at " & shim
-    shim
+    buildPrivateMacosShim(repoRoot)
 
   proc ccExe(src, outBin: string) =
     let ccBin = getEnv("CC", "cc")
@@ -82,7 +78,7 @@ when defined(macosx):
         return true
 
   proc runProbe(shim, probe: string; args: seq[string];
-      workingDir: string; requireMonitoredRoot = true): ProbeCapture =
+      workingDir: string; requireMonitoredRoot = true; injectShim = true): ProbeCapture =
     ## Run `probe args` under the shim ("both" backend — interpose + body-patch, the
     ## production default) from `workingDir` and return the merged depfile plus
     ## the concrete root pid. Passing that pid to `mergeFragments` is essential:
@@ -99,8 +95,12 @@ when defined(macosx):
     for k, v in envPairs():
       if k == "CT_SANDBOX_TOOLS_DIR": continue
       env[k] = v
-    env["DYLD_INSERT_LIBRARIES"] = shim
-    env["REPRO_MONITOR_SHIM_LIB"] = shim
+    if injectShim:
+      env["DYLD_INSERT_LIBRARIES"] = shim
+      env["REPRO_MONITOR_SHIM_LIB"] = shim
+    else:
+      env.del("DYLD_INSERT_LIBRARIES")
+      env.del("REPRO_MONITOR_SHIM_LIB")
     env["REPRO_MONITOR_FRAGMENT_DIR"] = fragmentDir
     applyMacosBackendToggle(env, "both")
     let p = startProcess(probe, workingDir = workingDir, args = args, env = env,
@@ -289,14 +289,11 @@ suite "io-mon macOS R5 P1 path canonicalisation (ENOENT / failed-open, live)":
       check dep.records.len < 60000
       removeDir(state)
 
-    test "ROOT GUARD: a SIP root with no shim evidence is mcIncomplete":
-      # /bin/cat is SIP-protected. Direct DYLD injection is stripped and, because
-      # this helper deliberately removes CT_SANDBOX_TOOLS_DIR, no non-SIP
-      # replacement is involved. The expected-root synthetic spawn must therefore
-      # expose the missing process-start and fail closed instead of accepting an
-      # empty depfile as mcComplete.
+    test "ROOT GUARD: an uninjected root always fails closed":
+      # Real child, deliberately launched without injection. This proves the
+      # missing-root guard even on hosts where SIP allows library injection.
       let sipCap = runProbe(shim, "/bin/cat", @["/dev/null"], "/",
-        requireMonitoredRoot = false)
+        requireMonitoredRoot = false, injectShim = false)
       check sipCap.rootPid != 0
       check not sipCap.hasRootProcessStart
       check sipCap.dep.completeness == mcIncomplete
@@ -309,6 +306,30 @@ suite "io-mon macOS R5 P1 path canonicalisation (ENOENT / failed-open, live)":
           sawEventLoss = true
       check sawRootSpawn
       check sawEventLoss
+
+    test "a system root's injection follows the independently measured SIP mode":
+      let (sipStatus, statusCode) = execCmdEx("/usr/bin/csrutil status")
+      checkpoint(sipStatus.strip())
+      require statusCode == 0
+      let enabled = "status: enabled." in sipStatus
+      let disabled = "status: disabled." in sipStatus
+      require enabled or disabled
+      let cap = runProbe(shim, "/bin/cat", @["/dev/null"], "/",
+        requireMonitoredRoot = false)
+      check cap.rootPid != 0
+      if enabled:
+        # Keep the real platform-binary SIP assertion on protected hosts.
+        check not cap.hasRootProcessStart
+        check cap.dep.completeness == mcIncomplete
+        var sawEventLoss = false
+        for rec in cap.dep.records:
+          if rec.kind == mrEventLoss: sawEventLoss = true
+        check sawEventLoss
+      else:
+        # With SIP disabled this process really is monitored. Calling its
+        # evidence incomplete would be a false downgrade.
+        check cap.hasRootProcessStart
+        check cap.dep.completeness == mcComplete
 
     removeDir(work)
   else:

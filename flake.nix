@@ -14,6 +14,14 @@
       url = "github:metacraft-labs/nim-stackable-hooks/72f578249e9d8bbca8e3705c8a41ed5085c05bf9";
       flake = false;
     };
+    shm-queue-src = {
+      url = "github:metacraft-labs/nim-shm-queue/02f442ac12ce2587d9c053c527041097af38609f";
+      flake = false;
+    };
+    shm-gset-src = {
+      url = "github:metacraft-labs/nim-shm-gset/43a61120ae54b542c3e3038453094cca707a6c05";
+      flake = false;
+    };
   };
 
   outputs =
@@ -34,6 +42,13 @@
         { pkgs, config, ... }:
         let
           version = builtins.replaceStrings [ "\n" "\r" ] [ "" "" ] (builtins.readFile ./version.txt);
+          # Nimble 0.20.1 dynamically looks up TLS methods as well as linking
+          # OpenSSL. On Darwin its unconstrained lookup finds system LibreSSL,
+          # then passes that library's method to OpenSSL 3 and crashes before
+          # executing a task. Bind both lookups to the Nix OpenSSL ABI.
+          nimble = pkgs.nimble.overrideAttrs (old: {
+            nimFlags = (old.nimFlags or [ ]) ++ [ "-d:sslVersion=3" ];
+          });
         in
         {
           pre-commit.settings.hooks = {
@@ -59,6 +74,8 @@
             ];
 
             STACKABLE_HOOKS_SRC = "${inputs.stackable-hooks-src}/src";
+            SHM_QUEUE_SRC = "${inputs.shm-queue-src}/src";
+            SHM_GSET_SRC = "${inputs.shm-gset-src}/src";
 
             buildPhase = ''
               runHook preBuild
@@ -81,13 +98,42 @@
           };
 
           devShells.default = pkgs.mkShell {
+            RELEASE_STACKABLE_HOOKS_SRC = "${inputs.stackable-hooks-src}/src";
+            RELEASE_SHM_QUEUE_SRC = "${inputs.shm-queue-src}/src";
+            RELEASE_SHM_GSET_SRC = "${inputs.shm-gset-src}/src";
+            # Paired workspace editing keeps using siblings. Release scripts
+            # explicitly select the immutable inputs exported above.
+            shellHook = ''
+              if [ -z "''${STACKABLE_HOOKS_SRC:-}" ]; then
+                if [ -d ../nim-stackable-hooks/src ]; then
+                  export STACKABLE_HOOKS_SRC="$(cd ../nim-stackable-hooks/src && pwd)"
+                else
+                  export STACKABLE_HOOKS_SRC="$RELEASE_STACKABLE_HOOKS_SRC"
+                fi
+              fi
+              if [ -z "''${SHM_QUEUE_SRC:-}" ]; then
+                if [ -d ../nim-shm-queue/src ]; then
+                  export SHM_QUEUE_SRC="$(cd ../nim-shm-queue/src && pwd)"
+                else
+                  export SHM_QUEUE_SRC="$RELEASE_SHM_QUEUE_SRC"
+                fi
+              fi
+              if [ -z "''${SHM_GSET_SRC:-}" ]; then
+                if [ -d ../nim-shm-gset/src ]; then
+                  export SHM_GSET_SRC="$(cd ../nim-shm-gset/src && pwd)"
+                else
+                  export SHM_GSET_SRC="$RELEASE_SHM_GSET_SRC"
+                fi
+              fi
+            '';
             inputsFrom = [ config.pre-commit.devShell ];
             packages = [
               pkgs.just
               pkgs.nim2
-              pkgs.nimble
+              nimble
               pkgs.git
               pkgs.nixfmt
+              pkgs.nodejs
               # tests/linux/test_io_mon_library_load_closure.nim derives its
               # ground truth from `strace -f -e trace=openat`: the loader
               # closure io-mon claims to observe is compared against the one
@@ -95,7 +141,6 @@
               # comparison cannot run, and CI failed with "Could not find
               # command: 'strace'" while it passed on developer machines that
               # happened to have it on PATH.
-              pkgs.strace
               # The §4.5(h) REAL-BUILD COMPLETENESS ORACLE
               # (`just test-realbuild-oracle`, tests/realbuild/run_oracle.sh) —
               # the cardinal-sin gate: it drives real cmake+ninja and cargo
@@ -122,6 +167,14 @@
               pkgs.ninja
               pkgs.cargo
               pkgs.rustc
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              pkgs.strace
+              pkgs.zig
+              pkgs.patchelf
+              pkgs.binutils
+              pkgs.dpkg
+              pkgs.rpm
             ];
           };
         };

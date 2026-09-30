@@ -98,13 +98,12 @@ suite "io-mon evidence-scope filter on the host (DA-1i, older shim)":
     # ── BUILD AN "OLDER" SHIM: this repo, minus the gate ────────────────────
     let repoCopy = work / "repo"
     createDir(repoCopy)
-    for kind, path in walkDir(repoRoot):
-      let name = path.extractFilename()
-      if name in ["build", ".git", "tests", ".direnv"]: continue
-      case kind
-      of pcDir: copyDir(path, repoCopy / name)
-      of pcFile: copyFile(path, repoCopy / name)
-      else: discard
+    # Only source/build configuration belongs to this mutation. In particular,
+    # `.repro` contains live depfiles that disappear while another action ends.
+    for name in ["src", "scripts"]:
+      copyDir(repoRoot / name, repoCopy / name)
+    for name in ["config.nims", "io_mon.nimble", "version.txt"]:
+      copyFile(repoRoot / name, repoCopy / name)
 
     let preload = repoCopy / "src" / "io_mon" / "shim" / "linux_preload.nim"
     let before = readFile(preload)

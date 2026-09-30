@@ -24,18 +24,11 @@
 ## by the real `/proc` scan; the verdict asserted on is decoded from the
 ## canonical depfile io-mon actually wrote.
 ##
-##   t_a_descendant_born_in_the_same_clock_tick_as_the_root_is_still_found —
-##       THE boundary. `/proc`'s start times are quantised to USER_HZ (10 ms),
-##       and a descendant forked immediately by the root normally lands in the
-##       SAME tick as it, so `descendantTicks == rootTicks` is the ordinary case
-##       rather than an exotic one — and a prune written `<=` instead of `<`
-##       drops exactly it. The fixture REPORTS both tick values, the case
-##       retries until it has actually observed a same-tick run (and fails
-##       loudly if it never does, rather than passing on a case it never
-##       exercised), and only then demands the `mcIncomplete` downgrade.
-##       A CONTROL arm runs the same fixture with the descendant quiescing
-##       inside the grace window and demands `mcComplete`, so the headline
-##       cannot pass for some unrelated reason about the fixture.
+##   t_a_live_detached_descendant_is_found — real process integration.
+##       Loader and shim startup can take more than one USER_HZ tick on a
+##       loaded runner. Exact equal-tick behavior is checked against the actual
+##       predicate in tests/portable/test_proc_start_time.nim. This case keeps
+##       the real /proc scan and the quiescent control.
 ##
 ##   t_the_prune_bound_is_the_roots_own_start_time — structural. The soundness
 ##       argument names one specific quantity; this reads `fs_snoop.nim` and
@@ -60,13 +53,6 @@ const
   fsSnoopPath = repoRoot / "src" / "io_mon" / "fs_snoop.nim"
   GraceMs = 300
   PollMs = 10
-  ## How many times the boundary case may be re-run while waiting to observe a
-  ## root and a descendant that really did land in the same clock tick. Each
-  ## attempt is one process spawn; the same-tick outcome is the COMMON one (the
-  ## descendant is forked within a couple of milliseconds of the root), so this
-  ## is generous rather than hopeful.
-  SameTickAttempts = 12
-
 # --------------------------------------------------------------------------
 # Helpers. Every helper that ASSERTS is a `template`: `check` inside a plain
 # `proc` prints "Check failed" and still leaves the case labelled `[OK]`.
@@ -278,7 +264,7 @@ putEnv("IO_MON_LINUX_DESCENDANT_POLL_MS", $PollMs)
 
 suite "io-mon detached-descendant scan start-time prune":
 
-  test "t_a_descendant_born_in_the_same_clock_tick_as_the_root_is_still_found":
+  test "t_a_live_detached_descendant_is_found":
     let shimLib = ensureShim()
     check shimLib.len > 0
 
@@ -305,13 +291,9 @@ suite "io-mon detached-descendant scan start-time prune":
     check quietRes.completeness == mcComplete
     check descendantLossDetails(quietRes.depFile).len == 0
 
-    # ---- HEADLINE: a same-tick descendant outlives the grace window -------
-    var sameTickSeen = false
-    var attempts = 0
-    var observed: seq[string] = @[]
-    while attempts < SameTickAttempts and not sameTickSeen:
-      inc attempts
-      let tag = "attempt" & $attempts
+    # A live detached descendant outlives the grace window.
+    block:
+      let tag = "live"
       let report = work / (tag & ".report")
       let release = work / (tag & ".release")
       removeFile(report)
@@ -332,29 +314,16 @@ suite "io-mon detached-descendant scan start-time prune":
 
       let rootTicks = reportedTicks(report, "root")
       let descTicks = reportedTicks(report, "descendant")
-      observed.add($rootTicks & "/" & $descTicks & " -> " &
-        $res.completeness)
       # A descendant can never predate its own ancestor; if this ever failed,
       # the prune's whole soundness argument would be false.
       check descTicks >= rootTicks
-      # EVERY attempt is a real gated run whose descendant is held alive across
-      # the whole grace window, so every attempt must downgrade — the same-tick
-      # ones are simply the attempts that also exercise the boundary.
-      checkpoint("attempt " & $attempts & ": rootTicks=" & $rootTicks &
+      # The descendant is held alive across the whole grace window.
+      checkpoint("rootTicks=" & $rootTicks &
         " descTicks=" & $descTicks & " completeness=" & $res.completeness &
         " losses=" & $descendantLossDetails(res.depFile))
       check res.exitCode == 0
       check res.completeness == mcIncomplete
       check descendantLossDetails(res.depFile).len > 0
-      if descTicks == rootTicks:
-        sameTickSeen = true
-
-    checkpoint("attempts: " & observed.join("; "))
-    # Never let this case pass without having exercised the boundary it exists
-    # for. If the machine is so slow that root and descendant never share a
-    # tick, that is a fact worth failing on rather than a green tick.
-    check sameTickSeen
-
     removeDir(work)
 
   test "t_the_prune_bound_is_the_roots_own_start_time":
@@ -380,12 +349,9 @@ suite "io-mon detached-descendant scan start-time prune":
     checkpoint("call site: " & callSite)
     check callSite.startsWith("waitForLinuxInjectedDescendants(")
 
-    # The comparison must be STRICT. `<=` would prune a descendant that shares a
-    # clock tick with its root, which is the ordinary case, not a corner one.
-    let prune = code.linesContaining("startTicks < minStartTicks")
-    checkpoint("prune: " & $prune)
-    check prune.len == 1
-    check code.linesContaining("startTicks <= minStartTicks").len == 0
+    # The scanner must call the same predicate whose equal/unknown timestamp
+    # boundaries the portable test executes.
+    check code.linesContaining("if predatesRoot(startTicks, minStartTicks):").len == 1
 
     # `procStartTicks` must stay private: `io_mon` re-exports all of `fs_snoop`,
     # and a raw `/proc` reader is not part of this package's public surface.

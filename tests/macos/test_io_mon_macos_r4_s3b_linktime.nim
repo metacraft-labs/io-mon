@@ -44,14 +44,10 @@ const
   testRunId = "io-mon-r4-s3b-run"
 
 when defined(macosx):
+  from build_test_shim import buildPrivateMacosShim
+
   proc buildShim(): string =
-    let (output, code) = execCmdEx("bash " &
-      quoteShell(repoRoot / "scripts" / "build_shim.sh"))
-    if code != 0:
-      raise newException(IOError, "build_shim.sh failed: " & output)
-    let shim = repoRoot / "build" / "lib" / "librepro_monitor_shim.dylib"
-    doAssert fileExists(shim), "shim not produced at " & shim
-    shim
+    buildPrivateMacosShim(repoRoot)
 
   proc ccExe(src, outBin: string; extra = "") =
     let ccBin = getEnv("CC", "cc")
@@ -97,7 +93,7 @@ when defined(macosx):
     doAssert code == 0, "probe should exit 0 (" & probe & ", out=" &
       stdoutText & ")"
     let depfile = runWork / "cap.iomon"
-    discard mergeFragments(fragmentDir, depfile)
+    discard mergeFragments(fragmentDir, depfile, currentRunId = testRunId)
     doAssert fileExists(depfile)
     readMonitorDepFile(depfile)
 

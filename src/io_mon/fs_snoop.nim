@@ -22,6 +22,7 @@ import shm_gset/transport as shmset
 
 when defined(linux):
   import std/[algorithm, monotimes, posix]
+  from io_mon/proc_start_time import predatesRoot
 
   const
     LinuxInjectedDescendantGraceMsDefault = 500
@@ -348,7 +349,7 @@ when defined(linux):
       # (3) the start-time prune. `startTicks == 0` is "this stat line did not
       # tell us", and it keeps the pid as a CANDIDATE — an unparseable stat line
       # must never be the reason a live descendant goes unreported.
-      if minStartTicks > 0 and startTicks > 0 and startTicks < minStartTicks:
+      if predatesRoot(startTicks, minStartTicks):
         discard posix.close(envFd)
         continue
 
@@ -1852,6 +1853,7 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
     # no `putEnv`, so the hosting process's own `DYLD_INSERT_LIBRARIES` is never
     # briefly pointed at the shim (which would have injected the monitor into
     # anything else the host spawned in that window).
+    h.runId = newRunId()
     let injected = @[
       ("CT_SANDBOX_TOOLS_DIR", sandboxDir),
       ("DYLD_INSERT_LIBRARIES",
@@ -1859,7 +1861,7 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
           requestEnvValue(request, "DYLD_INSERT_LIBRARIES"))),
       ("REPRO_MONITOR_FRAGMENT_DIR", h.fragmentDir),
       ("REPRO_MONITOR_OUTPUT", request.depFilePath),
-      ("REPRO_MONITOR_SESSION", newRunId()),
+      ("REPRO_MONITOR_SESSION", h.runId),
       ("REPRO_MONITOR_SHIM_LIB", shimLib)
     ]
     let spawnEnv = childEnv(request, injected)
@@ -2019,10 +2021,11 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
     # rule (host env, then `request.env`, then io-mon's injection, injection
     # winning) has one implementation rather than three. NO arm mutates the
     # host any more.
+    h.runId = newRunId()
     let injected = @[
       ("REPRO_MONITOR_FRAGMENT_DIR", h.fragmentDir),
       ("REPRO_MONITOR_OUTPUT", request.depFilePath),
-      ("REPRO_MONITOR_SESSION", newRunId()),
+      ("REPRO_MONITOR_SESSION", h.runId),
       ("REPRO_MONITOR_SHIM_LIB", h.shimLib)
     ]
     h.spawnEnv = childEnv(request, injected)
@@ -2184,7 +2187,7 @@ proc collectMonitorEvidence(h: var MonitorHandle): MonitorDepFile =
         "false mcComplete over a set a detached descendant is still growing")
   when defined(macosx):
     result = mergeFragments(h.fragmentDir, h.request.depFilePath,
-      expectedRootPid = h.rootPid,
+      expectedRootPid = h.rootPid, currentRunId = h.runId,
       observedInterest = normalizeInterest(h.request.interest),
       observedEvidenceScope = h.request.evidenceScope)
   elif defined(linux):
@@ -2261,6 +2264,7 @@ proc collectMonitorEvidence(h: var MonitorHandle): MonitorDepFile =
     # cache hit for the whole action — and is now downgraded to `mcIncomplete`.
     result = mergeFragments(h.fragmentDir, h.request.depFilePath,
       expectedRootPid = h.rootPid, setRecords = launcherRecords,
+      currentRunId = h.runId,
       observedInterest = normalizeInterest(h.request.interest),
       observedEvidenceScope = h.request.evidenceScope)
 

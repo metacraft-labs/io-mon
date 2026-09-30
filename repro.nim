@@ -69,6 +69,7 @@ import std/[algorithm, os, strutils]
 
 import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
+import repro_dsl_stdlib/fs as dslfs
 import repro_dsl_stdlib/packages/sh
 # NOTE: ``repro_dsl_stdlib/packages/nim`` is deliberately NOT imported here.
 # The ``package`` macro's ``usesImportCode`` pass auto-imports it ``as
@@ -80,7 +81,20 @@ import repro_dsl_stdlib/packages/sh
 # reprobuild's own ``repro.nim``.
 import ct_test_nim_unittest
 
+when defined(macosx):
+  import ./repro_support/cctools
+when defined(windows):
+  import repro_dsl_stdlib/packages/coreutils_install
+when defined(linux):
+  import ./repro_support/getconf
+  import ./repro_support/strace
+
 package io_mon:
+  # Keep this declaration directly in the package body: the DSL recognizes
+  # it before Nim evaluates platform branches. Windows realizes declared
+  # release archives; POSIX development commands use Nix.
+  defaultToolProvisioning(when defined(windows): tarball else: nix)
+
   uses:
     # Toolchain floor — mirrors ``io_mon.nimble``'s ``requires "nim >= 2.0.0"``
     # and the binaries the wrapped scripts shell out to. ``nimble`` drives the
@@ -88,7 +102,25 @@ package io_mon:
     # bash script) and is the tool every ``shell(...)`` edge invokes.
     "nim >=2.0"
     "nimble"
+    "just"
     "sh"
+    "bash >=4"
+    "mkdir"
+    when defined(windows):
+      # PortableGit's usr/bin contains the real mkdir/dirname used by Bash.
+      # cmd.exe's built-in mkdir does not satisfy that script dependency.
+      "install-file"
+    when not defined(windows):
+      "dirname"
+      "uname"
+      "rustc"
+    when defined(macosx):
+      "cctools"
+    when defined(linux):
+      "getconf"
+      "grep"
+      "nm"
+      "strace"
     # The C-family compiler ``nim c`` shells out to for the C backend. macOS
     # builds (and the shim's arm64/arm64e fat link) use Apple ``clang``; Linux
     # and Windows (``--cc:gcc`` for the shim DLL) use ``gcc``. The user supplies
@@ -136,6 +168,7 @@ package io_mon:
     task "bump-version", command = "nim r scripts/bump_version.nim", description = "Bump version number"
 
   build:
+    const backendCompiler = (when defined(macosx): "clang" else: "gcc")
     const binSuffix = (when defined(windows): ".exe" else: "")
     const shimExt =
       when defined(windows): "dll"
@@ -161,6 +194,18 @@ package io_mon:
         "config.nims",
       ],
       extraOutputs = @[shimOutput])
+    # The script invokes Bash, Nim and its C backend inside the action's
+    # isolated PATH. A package-level uses entry alone does not expose them.
+    appendRegisteredActionToolIdentityRefs(shimBuild.id,
+      ["bash", "nim", backendCompiler, "mkdir"])
+    when defined(windows):
+      appendRegisteredActionToolIdentityRefs(shimBuild.id, ["install-file"])
+    when not defined(windows):
+      appendRegisteredActionToolIdentityRefs(shimBuild.id, ["dirname", "uname"])
+    when defined(macosx):
+      appendRegisteredActionToolIdentityRefs(shimBuild.id, ["cctools"])
+    when defined(linux):
+      appendRegisteredActionToolIdentityRefs(shimBuild.id, ["getconf"])
     discard collect("shim", @[shimBuild])
 
     # ---- Standalone CLI (``io-mon`` / the ``default`` collection) -----------
@@ -197,6 +242,7 @@ package io_mon:
 
     var testBuildActions: seq[BuildActionDef] = @[]
     var testExecuteActions: seq[BuildActionDef] = @[]
+    var isolatedTestActions: seq[BuildActionDef] = @[]
 
     proc emitTestPair(source, binary: string;
                       buildActions, executeActions: var seq[BuildActionDef]) =
@@ -217,13 +263,89 @@ package io_mon:
         paths = @["src", "tests/helpers"],
         extraInputs = @["src", "tests/helpers", "io_mon.nimble"],
         actionId = "io-mon.test_build." & stem)
+      appendRegisteredActionToolIdentityRefs(edge.action.id, [backendCompiler])
       buildActions.add(edge.action)
 
+      # These Windows tests install their own hooks or deliberately select
+      # an inert/slow DLL. An outer injected shim changes that premise (the
+      # inert root unexpectedly reports complete evidence) and interferes with
+      # the parked main thread used by the inner injector. All five pass
+      # directly at 303e1ef and fail under Reprobuild's monitor at that SHA.
+      # The system-child regression also needs an uninjected baseline: its
+      # outer fixture compares native execution with its own monitored run.
+      #
+      # Keep their compilation monitored and execute every assertion. The
+      # generated depfile orders the known artifacts but does not discover all
+      # runtime reads, so these execute edges MUST remain non-cacheable.
+      # Monitor-Hook-Shim.md / Failure Semantics permits this disposition.
+      # macOS fixtures also install their own interposers. A distinct outer
+      # dylib can recurse during dyld initialization, before main is reached.
+      # Linux's nested-monitor programs must also own their transport and
+      # loader closure: an outer shared-memory session defeats file-transport
+      # fixtures and adds a second shim to the loader comparison.
+      let isolatesMonitor = (defined(macosx) and (
+        source.startsWith("tests/macos/") or source.extractFilename in [
+          "test_io_mon_cli_exit_status.nim",
+          "test_io_mon_snoop_cli_capture.nim",
+          "test_io_mon_monitored_compile_depset.nim",
+          "test_io_mon_dep_identity_scope.nim",
+          "test_io_mon_cli_interest_stamp.nim",
+          "test_io_mon_cli_evidence_scope.nim",
+          "test_io_mon_host_session_scope.nim"])) or
+        (defined(linux) and source.extractFilename in [
+          "test_io_mon_shared_producer_growth.nim",
+          "test_io_mon_cli_exit_status.nim",
+          "test_io_mon_dep_identity_scope.nim",
+          "test_io_mon_host_session_scope.nim",
+          "test_io_mon_evidence_scope_older_shim.nim",
+          "test_io_mon_evidence_scope_shim_gate.nim",
+          "test_io_mon_library_load_closure.nim",
+          "test_io_mon_linux_fragment_fd_reuse.nim"]) or
+        (defined(windows) and source.extractFilename in [
+        "test_io_mon_cli_exit_status.nim",
+        "test_io_mon_windows_exit_status.nim",
+        "test_io_mon_windows_host_session_scope.nim",
+        "test_io_mon_windows_native_system_child.nim",
+        "test_io_mon_windows_read_capture.nim",
+        "test_io_mon_windows_root_guard.nim",
+        "test_io_mon_windows_spawn_abandoned_injection.nim",
+        "test_io_mon_windows_spawn_resume_invariant.nim"])
+      var executeAfter: seq[BuildActionDef] = @[]
+      var executePolicy = automaticMonitorPolicy()
+      if isolatesMonitor:
+        let depfile = "build/test-deps/" & stem & ".d"
+        let depfileEdge = dslfs.unmonitorableActionDepfile(
+          output = depfile,
+          inputs = @[binary, cliOutput, shimOutput],
+          reason = "Injection test owns its hooks and shim selection; " &
+            "an outer shim changes the experiment. Execution always reruns.",
+          actionId = "io-mon.test_dependencies." & stem)
+        buildActions.add(depfileEdge)
+        executeAfter.add(depfileEdge)
+        executePolicy = makeDepfilePolicy(depfile, suppressMonitorShimSeed = true)
       let executeEdge = edge.testBinary.run(
         actionId = "io-mon.test_execute." & stem,
         requiredBinaries = @[cliOutput],
         extraInputs = @[shimOutput],
+        after = executeAfter,
+        cacheable = not isolatesMonitor,
+        dependencyPolicy = executePolicy,
         registerImplicitName = false)
+      if isolatesMonitor:
+        isolatedTestActions.add(executeEdge)
+      # Tests compile real child programs and shims, including shell fixtures.
+      appendRegisteredActionToolIdentityRefs(executeEdge.id,
+        ["nim", backendCompiler, "sh", "bash", "mkdir"])
+      when defined(windows):
+        appendRegisteredActionToolIdentityRefs(executeEdge.id, ["install-file"])
+      when not defined(windows):
+        appendRegisteredActionToolIdentityRefs(executeEdge.id,
+          ["dirname", "uname", "rustc"])
+      when defined(macosx):
+        appendRegisteredActionToolIdentityRefs(executeEdge.id, ["cctools"])
+      when defined(linux):
+        appendRegisteredActionToolIdentityRefs(executeEdge.id,
+          ["strace", "nm", "getconf", "grep"])
       executeActions.add(executeEdge)
 
     # Portable tests — always in the graph.
@@ -267,4 +389,6 @@ package io_mon:
         emitTestPair(spec.source, spec.binary, testBuildActions, testExecuteActions)
 
     discard collect("test", testExecuteActions)
+    when defined(windows) or defined(macosx) or defined(linux):
+      discard collect("test-monitor-isolation", isolatedTestActions)
     discard collect("test-builds", testBuildActions)

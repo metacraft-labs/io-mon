@@ -41,8 +41,9 @@
 ##   * CT_SANDBOX_TOOLS_DIR=<bundle>: the SIP ``/bin/cat`` exec is redirected to
 ##     the injectable drop-in, which RUNS (exit 0), is injected, and its read of
 ##     ``/etc/services`` IS captured.
-##   * CT_SANDBOX_TOOLS_DIR unset/empty: ``/bin/cat`` runs SIP-protected, DYLD is
-##     stripped, the child goes blind, and ``/etc/services`` is NOT captured.
+##   * CT_SANDBOX_TOOLS_DIR unset/empty: a separate benign constructor dylib
+##     measures injection through the same launch path. Capture must match that
+##     independent result, including on hosted machines with SIP disabled.
 ##
 ## We ALSO drive the full libc ``system("/bin/sh -c …")`` probe and assert the
 ## SIP ``/bin/sh`` grandchild IS redirected to the drop-in and runs INJECTED
@@ -69,6 +70,7 @@ import std/[os, osproc, streams, strtabs, strutils, unittest]
 
 when defined(macosx):
   import io_mon  # readMonitorDepFile, mergeFragments, record kinds
+  import macos_injection_probe
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
@@ -78,15 +80,10 @@ const
   sipReadTarget = "/etc/services"
 
 when defined(macosx):
+  from build_test_shim import buildPrivateMacosShim
+
   proc buildShim(): string =
-    ## Build the fat (arm64+arm64e) shim and return its path. Fails loudly.
-    let (output, code) = execCmdEx("bash " &
-      quoteShell(repoRoot / "scripts" / "build_shim.sh"))
-    if code != 0:
-      raise newException(IOError, "build_shim.sh failed: " & output)
-    let shim = repoRoot / "build" / "lib" / "librepro_monitor_shim.dylib"
-    doAssert fileExists(shim), "shim not produced at " & shim
-    shim
+    buildPrivateMacosShim(repoRoot)
 
   proc buildSandboxBundle(dest: string): string =
     ## Resolve the NON-SIP drop-in bundle the SIP-child test redirects to.
@@ -190,7 +187,7 @@ int main(void) {
   char *argv[] = { "/bin/cat", """ & "\"" & sipReadTarget & "\"" & """, 0 };
   if (posix_spawn(&pid, "/bin/cat", 0, 0, argv, environ)) return 2;
   int st; waitpid(pid, &st, 0);
-  return 0;
+  return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
 }
 """)
     let probeBin = work / "catspawn"
@@ -223,7 +220,7 @@ int main(void) {
     _exit(127);
   }
   int st; waitpid(pid, &st, 0);
-  return 0;
+  return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
 }
 """)
     let probeBin = work / "catforkexec"
@@ -398,8 +395,11 @@ suite "io-mon macOS genuine SIP-child capture (§16.7.8, drop-in)":
       # ABSENT.
       let withoutCap = runCatSpawnCapture(shim, bundle, false, spawnFx)
 
-      test "without CT_SANDBOX_TOOLS_DIR the SIP-child read is NOT captured":
-        check not withoutCap.sipReadCaptured
+      test "system-child capture matches the independent loader control":
+        let images = injectedImages(spawnFx.probe)
+        check withoutCap.probeExit == 0
+        check withoutCap.catSpawn
+        check withoutCap.sipReadCaptured == ("cat" in images)
 
       removeDir(spawnFx.work)
 
@@ -416,8 +416,11 @@ suite "io-mon macOS genuine SIP-child capture (§16.7.8, drop-in)":
         check feWith.catSpawn                # the /bin/cat exec was observed
         check feWith.sipReadCaptured         # the fork+exec'd child's read WAS captured
 
-      test "without CT_SANDBOX_TOOLS_DIR the fork+exec'd SIP read is NOT captured":
-        check not feWithout.sipReadCaptured
+      test "fork+exec capture matches the independent loader control":
+        let images = injectedImages(forkExecFx.probe)
+        check feWithout.probeExit == 0
+        check feWithout.catSpawn
+        check feWithout.sipReadCaptured == ("cat" in images)
 
       removeDir(forkExecFx.work)
 
@@ -432,20 +435,22 @@ suite "io-mon macOS genuine SIP-child capture (§16.7.8, drop-in)":
       test "system() SIP /bin/sh grandchild is redirected and runs injected":
         check sysWith.probeExit == 0
         check sysWith.shellSpawn
-        # With the drop-in the shell child is itself injected → MORE injected
-        # processes than the no-sandbox arm (where the SIP shell ran blind).
-        check sysWithout.injectedProcs == 1 # only the directly-injected probe
-        check sysWith.injectedProcs > sysWithout.injectedProcs
         check sysWith.injectedProcs >= 2    # at least the probe + the drop-in sh
 
       # The fork trampoline preserves libsystem's userland fork bookkeeping, so
       # the real shell descendant is a deterministic production guarantee: the
       # drop-in cat must be injected and record its read. The no-drop-in contrast
       # proves this record is not attributable to the directly-injected probe.
-      test "system() shell's fork+exec'd cat read is captured and the " &
-          "no-drop-in baseline is blind":
+      test "system() shell capture matches the independent loader control":
+        let images = injectedImages(sysFx.probe)
         check sysWith.sipReadCaptured
-        check not sysWithout.sipReadCaptured
+        check sysWithout.probeExit == 0
+        check sysWithout.sipReadCaptured == ("cat" in images)
+        if "sh" in images:
+          check sysWithout.injectedProcs >= 2
+        else:
+          check sysWithout.injectedProcs == 1
+          check sysWith.injectedProcs > sysWithout.injectedProcs
 
       removeDir(sysFx.work)
 

@@ -242,7 +242,7 @@ proc buildEscapeShim(): bool =
     return false
   let p = startProcess("nim", args = @[
       "c", "--app:lib", "--threads:on", "--mm:orc", "--cc:gcc",
-      "--passL:-static-libgcc", "-d:ioMonShimSpawnEscapeTest",
+      "--passL:-static-libgcc", "-d:useMalloc", "-d:ioMonShimSpawnEscapeTest",
       "--hints:off", "--warnings:off",
       "--path:" & RepoRoot / "src",
       "--path:" & hooksSrc,

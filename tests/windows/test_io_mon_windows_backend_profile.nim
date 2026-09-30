@@ -22,6 +22,7 @@ when not defined(windows):
   {.error: "windows-only test".}
 
 import std/[os, strutils, tempfiles, unittest]
+import ../helpers/windows_fixture_child
 
 import io_mon
 import io_mon/capabilities
@@ -161,7 +162,7 @@ suite "Windows backend profile":
 suite "Windows library-load observation":
 
   test "a monitored process reports the images it mapped":
-    ## The capability has to be backed by records, not just declared. `cmd`
+    ## The capability has to be backed by records, not just declared. The real child
     ## maps its own import closure, so a live run must produce several.
     let dir = createTempDir("io_mon_libload_", "")
     defer:
@@ -170,7 +171,7 @@ suite "Windows library-load observation":
 
     let depFilePath = dir / "run.iomon"
     var request = FsSnoopRequest(
-      command: @[getEnv("ComSpec", r"C:\Windows\System32\cmd.exe"), "/c", "ver"],
+      command: windowsFixtureCommand(),
       depFilePath: depFilePath,
       captureChildStdio: true)
     let result = runMonitored(request)
@@ -196,7 +197,7 @@ suite "Windows library-load observation":
       except CatchableError: discard
 
     var request = FsSnoopRequest(
-      command: @[getEnv("ComSpec", r"C:\Windows\System32\cmd.exe"), "/c", "ver"],
+      command: windowsFixtureCommand(),
       depFilePath: dir / "run.iomon",
       captureChildStdio: true)
     let result = runMonitored(request)
