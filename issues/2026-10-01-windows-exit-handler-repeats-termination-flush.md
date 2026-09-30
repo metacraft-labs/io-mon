@@ -84,3 +84,11 @@ Shutdown observation tooling `d35cfcc` applies to exact io-mon `5e71adf` and
 hooks `def2464`; the complete diagnostic DLL and C observer compile/link for
 Windows x64 locally, and workflow/Python/PowerShell checks pass. Run
 `36778919434` is active; the existing `8817d55` observer is preserved.
+
+The controlled schedule is implemented as disposable tooling `f8c2615`,
+run `36779868958`, on Windows x64 and the ARM host. Both original and guarded
+DLLs, the real C child and the Nim fragment decoder compile/link for Windows
+x64 locally. Workflow/Python/PowerShell validation passes. The runtime result
+is pending. Each variant also runs ordinary exit; every case must retain the
+real file-read record, and an expected original stall must specifically show
+shutdown phase 211 rather than just exceed the diagnostic bound.
