@@ -3,6 +3,7 @@
 ## checks the entire observed path set, not just successful process exit.
 import std/[os, osproc, sets, strutils, tempfiles, unittest]
 import io_mon
+import build_test_shim
 
 const
   workers = 8
@@ -73,6 +74,11 @@ int main(int argc, char **argv) {
 """
 
 suite "Linux shared producer mapping growth":
+  # Other fixtures relink the shipping library concurrently. Own the default
+  # shim, but retain an explicit pin for the original/repaired control.
+  if getEnv(ShimLibOverrideEnv).len == 0:
+    const repoRoot = currentSourcePath.parentDir.parentDir.parentDir
+    putEnv(ShimLibOverrideEnv, buildPrivateLinuxShim(repoRoot))
   let work = createTempDir("io-mon-producer-growth-", "")
   defer: removeDir(work)
   let source = work / "host.c"

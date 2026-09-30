@@ -2,6 +2,7 @@
 ## through the OS API. A private CLI build prevents stale or competing binaries.
 import std/[os, osproc, strutils, tempfiles, unittest]
 import io_mon
+import fixture_cleanup
 
 when defined(windows):
   proc nativeExit(code: uint32) {.stdcall, dynlib: "kernel32",
@@ -20,7 +21,7 @@ if paramCount() == 3 and paramStr(1) == "--cli-exit-child":
 suite "standalone CLI preserves native exit status bits":
   test "the command status and file-read evidence survive the CLI boundary":
     let work = createTempDir("io-mon-cli-exit-", "")
-    defer: removeDir(work)
+    defer: removeFixtureTree(work)
     let repo = currentSourcePath.parentDir.parentDir.parentDir
     var cli = getEnv("IO_MON_EXIT_STATUS_CLI")
     if cli.len == 0:

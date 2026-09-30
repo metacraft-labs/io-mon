@@ -8,6 +8,7 @@
 
 import std/[os, osproc, strtabs, strutils, tempfiles, unittest]
 import io_mon
+import fixture_cleanup
 
 if paramCount() == 2 and paramStr(1) == "--session-scope-reader":
   doAssert readFile(paramStr(2)) == "host-session-scope-input"
@@ -55,7 +56,7 @@ suite "host monitor session scope":
   # Other tests may have the shipping shim loaded concurrently. Rebuilding
   # that shared file races their loader (and Windows refuses the write).
   let shimWork = createTempDir("io-mon-session-shim-", "-build")
-  defer: removeDir(shimWork)
+  defer: removeFixtureTree(shimWork)
   var buildEnv = newStringTable(modeCaseSensitive)
   for key, value in envPairs(): buildEnv[key] = value
   buildEnv["IO_MON_SHIM_OUT_DIR"] = shimWork / "lib"
