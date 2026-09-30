@@ -1,0 +1,166 @@
+name: Sanitizers
+
+# Runs the tests in `tests/portable/` a second time under AddressSanitizer and
+# UndefinedBehaviorSanitizer.
+#
+# ----------------------------------------------------------------------------
+# SCOPE.  This job sweeps `tests/portable/` and NOTHING ELSE.  A green tick here
+# is a statement about the portable tier only.  Four things it does NOT cover,
+# listed here because a one-tier gate reads as covering the suite:
+#
+#   * `tests/posix`, `tests/linux`, `tests/macos`, `tests/windows` -- none of
+#     the live-monitor tiers are swept.
+#   * The shim shared library is not built by this job at all.
+#   * Any compiler or binary a test spawns for ITSELF is an ordinary
+#     uninstrumented build; the instrumentation does not travel into children.
+#   * Leak detection is OFF (`detect_leaks=0`).  This arm grades memory SAFETY,
+#     not retention -- see the rationale in `scripts/run_sanitizer_tests.sh`.
+#
+# Within the tier it does sweep, every `test_*.nim` is compiled and run --
+# nothing is sampled and there is no skip list -- and the job prints the file
+# list it swept so the coverage is readable from the log rather than guessed
+# from the job name.
+# ----------------------------------------------------------------------------
+#
+# WHY A SEPARATE ARM AND NOT A FLAG ON `Test`.  io-mon's codec moves string
+# bodies and fixed-width header fields with `copyMem`.  A wrong SIZE on one of
+# those copies writes correct bytes and then keeps going: the round-trip checks,
+# the byte-for-byte `.iomon` goldens and the field digests all still agree with
+# themselves, so the ordinary suite has nothing to compare and cannot see it.
+# The sanitizers are the only oracle for that class, and they cost enough build
+# time that they belong in their own job rather than slowing `Test` down.
+#
+# THE GATING RESULT FIRST: on an unmutated tree at `53994c0` this job is rc=0, 25
+# files, 0 failed, with no ASan report and no UBSan `runtime error:` anywhere in
+# the sweep. That is what makes the rest of this section mean anything -- an arm
+# that is red on everything grades nothing, and every number below was taken on a
+# deliberately broken tree.
+#
+# WHAT THIS ARM ADDS, MEASURED, AND IT IS NOT UNIFORM.  Three mutations of
+# `src/io_mon/codec.nim` were applied in throwaway trees at `53994c0`, each anchor
+# asserted to occur exactly once. Read this before trusting the job with more than
+# it earns:
+#
+#   * `writeString` copy length + 1  -- the ordinary portable tier is GREEN on
+#     it, 25 of 25 files, both wire-format files included -- including the
+#     byte-for-byte golden, which cannot see this because there is no wire-format
+#     difference to see. The arm reddens 11 of the 25: ASan
+#     `heap-buffer-overflow WRITE ... 0 bytes after` the region, in `writeString`
+#     called from `encodeFrame`, in every one of them. THIS ONE MUTATION IS THE
+#     ENTIRE JUSTIFICATION FOR THE JOB -- nothing else in the tree grades it,
+#     because the byte written past the region is the string's NUL terminator, so
+#     the logical contents are unchanged and there is no wrong output for any
+#     oracle to compare.  (No byte count is quoted on purpose: the write size and
+#     the region size are whatever string the failing test happened to encode and
+#     differ from file to file, so a specific pair reads as a signature of the
+#     defect and is not one.)
+#   * `readString` bounds check REMOVED -- the ordinary tier already fails, but
+#     only by dying (SIGBUS, exit 135) with no verdict printed at all. The arm
+#     turns that into a named diagnosis: ASan `heap-buffer-overflow READ of size
+#     65540` at `readString`. An upgrade in DIAGNOSIS, not in detection.
+#   * `readString` bound off by one -- the ordinary tier already catches this BY
+#     VERDICT: `test_io_mon_wire_negative_oracle` reports `[FAILED]
+#     t_every_negative_case_is_refused_with_the_pinned_verdict` on its
+#     `detaillen_one_byte_past_the_payload` case. THE ARM ADDS NOTHING HERE.
+#
+# UBSAN CATCHES NONE OF THE THREE, and is kept deliberately. Every one of those
+# findings is ASan's, and UBSan reports nothing on a clean tree -- so its value
+# has to be stated as what it WOULD catch, and that was measured rather than
+# asserted. Two probes at `53994c0`, each a one-line change to `codec.nim` run
+# under this arm:
+#
+#   * `readU32Le`'s shift amount widened  -> `runtime error: shift exponent 64
+#     is too large for 64-bit type`.
+#   * `loadU32Le`'s `copyMem` replaced by a reinterpreting pointer cast, which
+#     is the obvious "faster" rewrite of it  -> `runtime error: load of
+#     misaligned address ... which requires 4 byte alignment`.
+#
+# ASan sees neither. Both are one edit away from the code as written, which is
+# what makes UBSan worth its (near-zero) marginal cost: same compile, same run,
+# and ASan dominates both. Read its silence as "no such defect today", never as
+# coverage of the copy sizes -- those are ASan's.
+#
+# Two limbs of an earlier version of this rationale were WRONG and are recorded
+# here so they are not re-added. The big-endian shift arms of the fixed-offset
+# accessors sit in a `when cpuEndian == littleEndian: ... else:` and are not
+# compiled at all on this job's only platform, so nothing here grades them. And
+# the out-of-range enum conversions are in `encode.nim` / `shm/dep_queue.nim`,
+# not `codec.nim`, where `decodeRecordPayload` explicitly range-checks every
+# ordinal before converting it -- so there is no unguarded conversion for UBSan
+# to reach, and Nim's own range check would fire first if there were.
+#
+# The instrumentation and the `-d:useMalloc` requirement are explained in
+# `scripts/run_sanitizer_tests.sh`.
+
+on:
+  workflow_dispatch:
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches: [main, dev, stable]
+  pull_request:
+    branches: [main, dev, stable]
+
+# Same policy as ci.yml: cancel superseded PR runs only, so a stale run does not
+# hold a scarce runner, while mainline pushes, merge groups and dispatches each
+# get a group unique to their run_id and are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  choose-linux:
+    # The shared CI_RUNNER_MODE policy selects free hosted runners for public
+    # repos by default and preserves the org-controlled self-hosted fallback.
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: ubuntu-24.04
+      fallback: '["self-hosted","linux","x64"]'
+
+  memory-safety:
+    needs: choose-linux
+    name: Memory safety (portable tests, linux-x64)
+    runs-on: ${{ fromJSON(needs.choose-linux.outputs.runs_on) }}
+    # The only job in this repo that sets one, because it is the only one whose
+    # whole cost is a single serialised sweep with no internal progress gate: a
+    # file that hangs looks exactly like a file that is slow, and without a bound
+    # it would hold the runner until GitHub's 6-hour default. This job's measured
+    # cost on a dedicated hosted runner is 320-435 s of sweep inside a job of
+    # 9-11 minutes, so 60 minutes is ~6x headroom -- enough for a slower or loaded
+    # self-hosted fallback, tight enough that a hang is caught the same hour.
+    timeout-minutes: 60
+    steps:
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Dev Environment
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
+        with:
+          env-flavor: nix
+          gh-token: ${{ steps.app-token.outputs.token }}
+
+      - name: Run the portable tests under ASan + UBSan
+        # NO `| tee`. Every other run step in this repo pipes to `tee` and
+        # compensates with `shell: bash` for pipefail; this one does not pipe at
+        # all, because the thing being reported IS an exit status and a pipeline
+        # reports its last stage's. The script already writes a per-file log and
+        # a per-file `.rc` under build/sanitizers/logs, and GitHub captures
+        # stdout into the job log without help.
+        shell: bash
+        run: dev-exec ./scripts/run_sanitizer_tests.sh tests/portable
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitizer-logs-linux-x64
+          path: build/sanitizers/logs/
+          retention-days: 30
