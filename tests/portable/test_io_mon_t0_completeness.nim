@@ -288,6 +288,32 @@ suite "io-mon T3a IPC-breakaway downgrade (unmonitoredSubtreeLossCount)":
     let records = @[start(100), ipc(100, 999), ipc(100, 888)]
     check unmonitoredSubtreeLossCount(records) == 2
 
+  test "ONE activator serving TWO endpoints counts as two losses":
+    # Socket activation: systemd (pid 1) accepts on behalf of every service it
+    # activates, so SO_PEERCRED names pid 1 for all of them. Keyed on the pid
+    # alone these collapsed into ONE loss, and a consumer that forgave one
+    # endpoint (a trusted daemon's) forgave the other with it. Keyed per
+    # endpoint, each stays its own loss (reprobuild Dev-Env-Warm-Entry.md §3).
+    let records = @[start(100),
+      ipc(100, 1, "/nix/var/nix/daemon-socket/socket"),
+      ipc(100, 1, "/run/some-other-service.sock")]
+    check unmonitoredSubtreeLossCount(records) == 2
+    # The same endpoint dialled repeatedly still counts once.
+    let repeated = @[start(100),
+      ipc(100, 1, "/nix/var/nix/daemon-socket/socket"),
+      ipc(100, 1, "/nix/var/nix/daemon-socket/socket")]
+    check unmonitoredSubtreeLossCount(repeated) == 1
+
+  test "an IPC-peer loss names the endpoint and the peer uid":
+    # What a consumer needs to attribute the loss to a declared endpoint:
+    # the dialled path and the kernel-reported uid of whoever accepted.
+    var rec = ipc(100, 1, "/nix/var/nix/daemon-socket/socket")
+    rec.detail = "connect af_unix peer=1 peeruid=0"
+    let details = unmonitoredSubtreeLossDetails(@[start(100), rec])
+    check details.len == 1
+    check " peeruid=0 " in details[0]
+    check details[0].endsWith(" path=/nix/var/nix/daemon-socket/socket")
+
   test "a TRUSTED daemon (reported its reads) is exempt from downgrade":
     # The peer pid 999 is out-of-tree, but a breakaway report accounted for its
     # reads, so it is trusted and does NOT downgrade (BuildXL Trusted-Tools).
