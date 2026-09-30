@@ -62,3 +62,23 @@ inputs; the mutation build does not consume the build engine's working state.
 Keep all mutation, capture and completeness assertions. Refreshed dev
 `9c03325` and searched current and archived fixture issues before extending
 this record.
+
+## Observation-fold fixture at `53994c0`
+
+Post-merge Linux Reprobuild [job 109820421857](https://github.com/metacraft-labs/io-mon/actions/runs/36694888720/job/109820421857)
+at `53994c0ca76f263ff04f046b2f99d98a038d41f3` fails
+`test_io_mon_dep_identity_scope` after its first three cases pass. The
+file-transport case logs fourteen loader refusals for the canonical
+`build/lib/librepro_monitor_shim.so`: `file too short`. Its fan-out runs but
+records zero processes instead of thirteen and no library/environment facts.
+The fixture rebuilds and discovers that shared output even though its
+transport-owning execution correctly runs outside the enclosing monitor.
+Other concurrently executing fixtures still rebuild the same path.
+
+Use the existing private production-shim builder on both POSIX hosts and
+pass its exact path through the fixture's existing request environment.
+Retain every transport, process-count, identity and completeness assertion,
+as well as parallel execution. The published product binaries are unchanged.
+Before extending this record, fetched dev `53994c0`, searched current issues
+and the deleted-issue history for partial libraries and shared builds, and
+confirmed this is the same ownership defect.
