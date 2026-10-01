@@ -1,7 +1,12 @@
+## Real compiler, shim and socket fixtures; no mocks. The shared private-shim
+## helper builds this checkout and returns its exact library path, independent
+## of an enclosing build monitor's REPRO_MONITOR_SHIM_LIB. Build errors remain
+## fatal in that helper; every capture and completeness assertion stays here.
 import std/[net, os, osproc, sequtils, streams, strtabs, strutils, unittest]
 from std/posix import getuid
 
 import io_mon
+import build_test_shim
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
@@ -84,10 +89,7 @@ suite "io-mon Linux LD_PRELOAD live gaps":
     checkpoint(cli.output)
     check cli.code == 0
 
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let reader = buildC(work, "stdio_reader", """
 #include <stdio.h>
@@ -129,10 +131,7 @@ int main(int argc, char **argv) {
       "--out:" & snoopBin, snoopSrc])
     checkpoint(cli.output)
     check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let client = buildC(work, "unix_client", """
 #include <string.h>
@@ -194,10 +193,7 @@ int main(int argc, char **argv) {
       checkpoint(cli.output)
       require cli.code == 0
 
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    require buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let writer = buildC(work, "chdir_relative_writer", """
 #include <fcntl.h>
@@ -240,10 +236,7 @@ int main(int argc, char **argv) {
       checkpoint(cli.output)
       require cli.code == 0
 
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    require buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let writer = buildC(work, "otmpfile_mode_writer", """
 #define _GNU_SOURCE
@@ -289,10 +282,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let reader = buildC(work, "byte_reader", """
 #include <fcntl.h>
@@ -332,10 +322,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let reader = buildC(work, "direct_exit_reader", """
 #include <fcntl.h>
@@ -375,10 +362,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let reader = buildC(work, "read_then_exec", """
 #include <fcntl.h>
@@ -424,10 +408,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     # The injected descendant is a double-forked, setsid'd daemon that is
     # re-parented to init and outlives the monitored root. Two modes, selected
@@ -612,10 +593,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let mover = buildC(work, "linux_content_channels", """
 #define _GNU_SOURCE
@@ -708,10 +686,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let reader = buildC(work, "inherited_fd3_reader", """
 #include <unistd.h>
@@ -766,10 +741,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let reader = buildC(work, "dup2_zero_reader", """
 #include <fcntl.h>
@@ -811,10 +783,7 @@ int main(void) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let reader = buildC(work, "inherited_fd3_deleted_reader", """
 #include <unistd.h>
@@ -873,10 +842,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let mutator = buildC(work, "linux_path_mutations", """
 #define _GNU_SOURCE
@@ -993,8 +959,7 @@ int main(int argc, char **argv) {
         "c", "--hints:off", "--warnings:off", "--threads:on",
         "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
         "--out:" & snoopBin, snoopSrc])
-    discard run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let daemon = buildC(work, "daemon", """
 #include <sys/socket.h>
@@ -1093,10 +1058,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let reader = buildC(work, "raw_syscall_reader", """
 #define _GNU_SOURCE
@@ -1139,10 +1101,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let reader = buildC(work, "raw_syscall_openat2_reader", """
 #define _GNU_SOURCE
@@ -1194,10 +1153,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let mover = buildC(work, "raw_zero_copy_syscalls", """
 #define _GNU_SOURCE
@@ -1282,10 +1238,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let reader = buildC(work, "inline_syscall_reader", """
 #include <fcntl.h>
@@ -1340,10 +1293,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     discard buildSharedC(work, "rawdso", """
 #include <fcntl.h>
@@ -1404,10 +1354,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let plugin = buildSharedC(work, "late", """
 #include <stdio.h>
@@ -1493,10 +1440,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let jitReader = buildC(work, "jit_mprotect_reader", """
 #include <fcntl.h>
@@ -1576,10 +1520,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let rwxMapper = buildC(work, "rwx_mmap_probe", """
 #include <sys/mman.h>
@@ -1616,10 +1557,7 @@ int main(void) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let reuseProbe = buildC(work, "jit_munmap_reuse_reader", """
 #define _GNU_SOURCE
@@ -1705,10 +1643,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let mixedProbe = buildC(work, "jit_mprotect_mixed_reader", """
 #define _GNU_SOURCE
@@ -1790,10 +1725,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let remapProbe = buildC(work, "jit_mremap_reader", """
 #define _GNU_SOURCE
@@ -1879,10 +1811,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let partialRemapProbe = buildC(work, "jit_mremap_partial_probe", """
 #define _GNU_SOURCE
@@ -1932,10 +1861,7 @@ int main(void) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let probe = buildC(work, "raw_syscall_probe", """
 #define _GNU_SOURCE
@@ -1987,10 +1913,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let probe = buildC(work, "linux_non_file_determinism", """
 #define _GNU_SOURCE
@@ -2071,10 +1994,7 @@ int main(void) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let probe = buildC(work, "linux_bsd_entropy_set", """
 #define _GNU_SOURCE
@@ -2136,10 +2056,7 @@ int main(void) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let probe = buildC(work, "linux_entropy_dedup", """
 #define _GNU_SOURCE
@@ -2202,10 +2119,7 @@ int main(void) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let probe = buildC(work, "linux_direct_vdso_dlsym", """
 #define _GNU_SOURCE
@@ -2330,10 +2244,7 @@ int main(void) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let probe = buildC(work, "raw_unknown_syscall", """
 #include <sys/syscall.h>
@@ -2373,10 +2284,7 @@ int main(void) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let probe = buildC(work, "raw_gettid", """
 #include <sys/syscall.h>
@@ -2431,10 +2339,7 @@ int main(void) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     # Deliberately the RAW form. Calling `getrandom()` (the libc symbol)
     # would exercise the already-hooked path and pass with or without the
@@ -2483,10 +2388,7 @@ int main(void) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let probe = buildC(work, "raw_futex", """
 #define _GNU_SOURCE
@@ -2527,10 +2429,7 @@ int main(void) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let probe = buildC(work, "raw_landlock", """
 #include <sys/syscall.h>
@@ -2592,10 +2491,7 @@ int main(void) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     # The probe attempts io_uring_setup(1, &params). On kernels without
     # io_uring the syscall returns -ENOSYS. If the kernel DOES support
@@ -2683,10 +2579,7 @@ int main(void) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     # Build a minimal target binary + place it at the END of a $PATH with
     # 3 empty leading directories so real_execvp does 3 failed execve()s
@@ -2743,10 +2636,7 @@ int main(int argc, char **argv) {
         "--out:" & snoopBin, snoopSrc])
       checkpoint(cli.output)
       check cli.code == 0
-    let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
-    checkpoint(buildShim.output)
-    check buildShim.code == 0
-    let shimLib = findShimLibrary()
+    let shimLib = buildPrivateLinuxShim(repoRoot)
 
     let trapper = buildC(work, "sigtrap_unrelated", """
 #include <signal.h>
