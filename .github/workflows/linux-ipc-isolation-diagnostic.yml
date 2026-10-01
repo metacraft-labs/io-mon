@@ -49,3 +49,38 @@ jobs:
             build/diagnostics/linux-ipc-isolation/*.summary.json
           if-no-files-found: warn
           retention-days: 7
+
+  windows-exit-control:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - name: Check native failure propagation through the exact pinned tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'io-mon-native-exit-control'
+          New-Item -ItemType Directory -Force $root | Out-Null
+          Invoke-WebRequest 'https://nim-lang.org/download/nim-2.2.10_x64.zip' -OutFile "$root/nim.zip"
+          if ((Get-FileHash "$root/nim.zip").Hash.ToLower() -ne 'fe0686a9b298e5b13d0a983df37e002a8c6320f8b16cc45a51d15cf4046a109f') { throw 'Nim archive checksum mismatch' }
+          Expand-Archive "$root/nim.zip" "$root/nim"
+          Invoke-WebRequest 'https://github.com/casey/just/releases/download/1.51.0/just-1.51.0-x86_64-pc-windows-msvc.zip' -OutFile "$root/just.zip"
+          if ((Get-FileHash "$root/just.zip").Hash.ToLower() -ne '09d1138b6845e73f04bff5e26be3f57663bddca25e36fe6241d28a5aa310b64e') { throw 'Just archive checksum mismatch' }
+          Expand-Archive "$root/just.zip" "$root/just"
+          $nimBin = (Get-ChildItem "$root/nim" -Filter nimble.exe -Recurse | Select-Object -First 1).DirectoryName
+          $env:PATH = "$nimBin;$root/just;$env:PATH"
+          Set-Location $root
+          @'
+          version = "0.1.0"
+          author = "Metacraft Labs"
+          description = "Real child exit status diagnostic"
+          license = "MIT"
+          task test, "Fail through a real child process":
+            exec "cmd /c exit 17"
+          '@ | Set-Content -Encoding ascii exit_control.nimble
+          "test:`n    nimble test" | Set-Content -Encoding ascii Justfile
+          & nimble test
+          $nimbleExit = $LASTEXITCODE
+          & just test
+          $justExit = $LASTEXITCODE
+          Write-Host "Nimble exit=$nimbleExit; Just exit=$justExit; expected both nonzero"
+          if ($nimbleExit -eq 0 -or $justExit -eq 0) { throw 'A real child failure was reported as success' }
