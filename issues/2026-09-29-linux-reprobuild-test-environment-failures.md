@@ -144,3 +144,25 @@ The existing issue already owns nested Linux monitor interference; the
 `Monitor-Hook-Shim.md` failure semantics above govern the proposed disposition.
 Log: `/tmp/io-mon-13d-linux-repro-flavor-promotion.log`; full-graph artifacts:
 `/tmp/io-mon-13d-linux-full-repro-artifacts`.
+
+## Identical IPC fixture control
+
+[Diagnostic `e13a98f`](https://github.com/metacraft-labs/io-mon/actions/runs/36900671607/job/110498730972)
+reproduces the first three child exits of 139 under automatic monitoring, then
+executes all 39 cases successfully under the existing isolated, non-cacheable
+policy. The fixture and CLI hashes are identical in these two executions;
+compilation remains `dgAutomaticMonitor` and the successful execution reports
+`launched=true`, `cdNotCacheable`, and `dgRecognizedFormat` (the depfile policy).
+
+The diagnostic mistakenly expected the nonexistent report value `dgDepfile`
+and stopped after that first successful execution. Its repeat and final
+monitored negative control are being rerun with the corrected assertion. The
+graph's shared-library artifact changed hash between builds; it is not selected
+by this fixture, which builds and explicitly selects its own private shim.
+The report retains that hash, without treating it as the fixture's loaded DLL.
+
+Extend the existing Linux disposition by one filename, and change the CI repeat
+inventory from eight to nine Linux programs. Preserve every fixture assertion
+and uncached repeat requirement. The controls are in
+`/tmp/io-mon-e13-ipc-controls`; `agents` / `dev` were refreshed at
+`2ccf0ca` / `2d07041` before this update.
