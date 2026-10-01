@@ -30,7 +30,7 @@ The production implementation lives in:
   `KERN_PROTECTION_FAILURE`, `VM_PROT_COPY` → `SIGBUS`. Do NOT use that path.
 - `remap.c` — proves the WORKING technique: allocate a fresh page, copy the
   original, patch the prologue, mark the copy RX, then `mach_vm_remap(...,
-  VM_FLAGS_OVERWRITE, ...)` over the original VA. Works for both own `__TEXT`
+VM_FLAGS_OVERWRITE, ...)` over the original VA. Works for both own `__TEXT`
   and shared-cache callees.
 - `internal3.c` — the end-to-end proof: body-patching `open` /
   `open$NOCANCEL` / `__open_nocancel` intercepts `fopen`'s
@@ -48,7 +48,7 @@ The production implementation lives in:
    8-byte hook address (16 bytes total).
 4. `mach_vm_protect` the copy to `VM_PROT_READ | VM_PROT_EXECUTE`.
 5. `mach_vm_remap(mach_task_self(), &origPageVA, len, 0, VM_FLAGS_OVERWRITE,
-   mach_task_self(), newPage, FALSE, &cur, &max, VM_INHERIT_COPY)`.
+mach_task_self(), newPage, FALSE, &cur, &max, VM_INHERIT_COPY)`.
 6. `sys_icache_invalidate(target, 16)`.
 
 The FILE hook forwards to the kernel via the RAW syscall

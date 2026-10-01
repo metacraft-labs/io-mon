@@ -157,3 +157,21 @@ Give these two fixture trees bounded removal retries; persistent failure must
 still raise. Confirm with unchanged assertions on real ARM and x64 Windows
 hosts. Refreshed dev `9c03325`; searched the existing and deleted cleanup
 records before adding this evidence.
+
+At `122cb167f36f51c642fecb4f2a18f399c5248511`, Windows ARM-host
+[job 110510173629](https://github.com/metacraft-labs/io-mon/actions/runs/36903822440/job/110510173629)
+passes the complete Reprobuild graph and its eight required isolated repeats.
+The truthful native runner then exposes another immediate-removal site:
+`test_io_mon_snoop_cli_smoke` passes both standalone-build and depfile-inspection
+assertions, but `removeDir(work)` raises `Access is denied` on the finished
+`io-mon.exe`. Apply the existing 30-second `removeFixtureTree` helper at this
+site, retaining both assertions and fatal persistent cleanup errors. This is
+consistent with the earlier finished-image symptom; the retaining process was
+not measured in this run. The complete Windows x64 and macOS native cross-checks
+pass at the same revision. ARM native qualification remains incomplete.
+
+Refreshed `agents` at `122cb16` and `dev` at `2d07041`; searched current and
+archived cleanup/XtaCache records before extending this issue. Log:
+`/tmp/io-mon-122-windows-arm-repro-complete.log`. The final workflow cancellation
+stopped the optional S3 mirror after it spent 51 minutes retrying connection
+timeouts; every build/test step had already finished.

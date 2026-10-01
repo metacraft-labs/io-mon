@@ -300,7 +300,11 @@ package io_mon:
           "test_io_mon_evidence_scope_older_shim.nim",
           "test_io_mon_evidence_scope_shim_gate.nim",
           "test_io_mon_library_load_closure.nim",
-          "test_io_mon_linux_fragment_fd_reuse.nim"]) or
+          "test_io_mon_linux_fragment_fd_reuse.nim",
+          # This suite builds and selects a private current shim. The same
+          # fixture exits 139 with an enclosing shim and passes all 39 cases
+          # under this policy (diagnostic e13a98f, Linux job 110498730972).
+          "test_io_mon_linux_stdio_ipc.nim"]) or
         (defined(windows) and source.extractFilename in [
         "test_io_mon_cli_exit_status.nim",
         "test_io_mon_windows_exit_status.nim",

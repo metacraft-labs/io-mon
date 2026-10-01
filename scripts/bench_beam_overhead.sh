@@ -62,8 +62,8 @@ PY
 median(){ python3 -c "import sys;v=sorted(float(x) for x in sys.stdin.read().split());print('%.3f'%v[len(v)//2])"; }
 
 echo "iters=$ITERS runs=$RUNS shim=$SHIM"
-NAT=$(for i in $(seq "$RUNS"); do timeit "$work/beamlike" "$ITERS"; done | median)
-MON=$(for i in $(seq "$RUNS"); do REPRO_MONITOR_SHIM_LIB="$SHIM" timeit "$CLI" run --depfile "$work/out.rdep" -- "$work/beamlike" "$ITERS"; done | median)
+NAT=$(for _ in $(seq "$RUNS"); do timeit "$work/beamlike" "$ITERS"; done | median)
+MON=$(for _ in $(seq "$RUNS"); do REPRO_MONITOR_SHIM_LIB="$SHIM" timeit "$CLI" run --depfile "$work/out.rdep" -- "$work/beamlike" "$ITERS"; done | median)
 echo "native    median = ${NAT}s"
 echo "monitored median = ${MON}s   (multiplier: $(python3 -c "print('%.1fx'%($MON/$NAT))"))"
 

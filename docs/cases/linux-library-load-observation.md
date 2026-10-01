@@ -34,11 +34,11 @@ after an in-place compiler-library upgrade" — and macOS acted on it. Linux did
 **1. Nothing observed loader-driven loads.** `ld.so` maps a dependency using internal
 `__mmap` / `__open64_nocancel` calls. Those do **not** traverse `LD_PRELOAD` symbol
 interposition, so the shim's `open`/`openat`/`mmap` hooks never fire for any library
-the loader maps. The interposed `dlopen` only ever saw *explicit* runtime loads, and
+the loader maps. The interposed `dlopen` only ever saw _explicit_ runtime loads, and
 even then recorded nothing.
 
 **2. The declared gap could not downgrade.** `mcapLibraryLoad` was correctly listed in
-`LinuxPreloadKnownUnsupportedCapabilities`, so the depfile *said* the capability was
+`LinuxPreloadKnownUnsupportedCapabilities`, so the depfile _said_ the capability was
 missing — but `depFileFromOwnedRecords` derived the profile with an **empty
 required-set**, and a gap only clears `evidenceComplete` when it is marked `required`,
 which only happens for capabilities in that set. Every gap was emitted `required=false`
@@ -57,11 +57,11 @@ it there.
 
 Scans run at three points:
 
-| Point | What it covers |
-| --- | --- |
-| shim init (ELF constructor) | The **entire** initial closure. `ld.so` maps every object before running any constructor, so objects loaded *before* the shim existed are visible — the case an event hook structurally cannot cover. Also satisfies publish-before-use: the closure is in consumer-owned memory before `main` runs. |
-| after each interposed `dlopen`/`dlmopen` | The explicit runtime load, recorded before the handle is returned (LF-7) and while the object is still mapped, so a later `dlclose` cannot erase it. |
-| shutdown | Closes the account (below). |
+| Point                                    | What it covers                                                                                                                                                                                                                                                                                       |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| shim init (ELF constructor)              | The **entire** initial closure. `ld.so` maps every object before running any constructor, so objects loaded _before_ the shim existed are visible — the case an event hook structurally cannot cover. Also satisfies publish-before-use: the closure is in consumer-owned memory before `main` runs. |
+| after each interposed `dlopen`/`dlmopen` | The explicit runtime load, recorded before the handle is returned (LF-7) and while the object is still mapped, so a later `dlclose` cannot erase it.                                                                                                                                                 |
+| shutdown                                 | Closes the account (below).                                                                                                                                                                                                                                                                          |
 
 **Coverage is proven, not assumed.** `struct dl_phdr_info` carries `dlpi_adds`, the
 loader's cumulative count of loads. A load in a window is one io-mon saw iff the object
@@ -73,7 +73,7 @@ observe, it detects.**
 
 The capability then moves to `LinuxPreloadSupportedCapabilities`, and
 `InputEvidenceCapabilities` is introduced and passed as the required-set when a depfile
-is finalised, so that a *future* missing input channel downgrades instead of being
+is finalised, so that a _future_ missing input channel downgrades instead of being
 declared and ignored. See `architecture.md` §2 for why that set is narrower than "every
 declared gap".
 

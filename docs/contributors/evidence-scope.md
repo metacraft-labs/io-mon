@@ -13,14 +13,14 @@ or the host-side filter at the end of `collectMonitorEvidence`.
 ## 1. Why it cannot be an `EventCategory`
 
 `--evidence=reads-only` means "record only the lookups that FOUND something".
-The obvious implementation — split the file categories and gate a *probes*
+The obvious implementation — split the file categories and gate a _probes_
 category — does not deliver it, and the gap was measured on one `nim c`:
 
-| | records |
-|---|---|
-| total | 66,996 |
+|                                                    | records    |
+| -------------------------------------------------- | ---------- |
+| total                                              | 66,996     |
 | drop every FAILED lookup — what `reads-only` MEANS | **23,049** |
-| gate a probes *category* instead | 41,736 |
+| gate a probes _category_ instead                   | 41,736     |
 
 The category gate discards **2,066 successful probes** it should keep and leaves
 **20,753 failed `mrFileOpen`s** it should drop.
@@ -41,11 +41,11 @@ So the two axes are **composed, never conflated**: a record is written iff
 
 ## 2. The vocabulary
 
-| token | `EvidenceScope` | meaning |
-|---|---|---|
-| `full` | `esFull` (the zero value) | every observation, including failed lookups |
-| `reads-only` | `esReadsOnly` | drop failed **existence** lookups |
-| *(none — not producible)* | `esUnrecognized` | READ SIDE ONLY: a depfile states a scope this build cannot name |
+| token                     | `EvidenceScope`           | meaning                                                         |
+| ------------------------- | ------------------------- | --------------------------------------------------------------- |
+| `full`                    | `esFull` (the zero value) | every observation, including failed lookups                     |
+| `reads-only`              | `esReadsOnly`             | drop failed **existence** lookups                               |
+| _(none — not producible)_ | `esUnrecognized`          | READ SIDE ONLY: a depfile states a scope this build cannot name |
 
 One vocabulary and one codec (`evidenceScopeToken` / `parseEvidenceScopeToken`)
 for all three channels: the `--evidence` flag, the `REPRO_MONITOR_EVIDENCE`
@@ -60,34 +60,34 @@ compile error, not a runtime surprise.** `evidenceScopeToken` is an exhaustive
 `case` (so a forgotten member does not compile), `parseEvidenceScopeToken` is
 derived from that one function rather than from a second table (so the two
 directions of the codec cannot drift), and a `static:` block below the decoder
-asserts, over the whole enum, that `esUnrecognized` is the *only* member whose
+asserts, over the whole enum, that `esUnrecognized` is the _only_ member whose
 token is empty **and that every other member's token survives a round trip
 through the wire**.
 
 The reason is specific: the write side in `mergeFragments` stamps any scope that
 is neither `esFull` nor `esUnrecognized`, so a member the codec cannot spell
 ships a stamp no consumer can evaluate. Four shapes were measured on real
-depfile bytes, and *only the first* is the one an emptiness check catches:
+depfile bytes, and _only the first_ is the one an emptiness check catches:
 
-| token arm | compiles? | what reaches the depfile |
-| --- | --- | --- |
-| *(no arm)* | **no** — `case` is exhaustive | — |
-| `""` | **no** — the emptiness assertion | bare `;evidence=`, read as *stated and unevaluable*, refused by every consumer including one asking for exactly that scope, residual **unnameable** |
-| `"writes;only"` | **no** — the wire-safety assertion | the stamp rides inside a `;`-joined record detail, so the decoder splits on `;` first: read as `esUnrecognized` with the residual **misnamed** `writes` |
-| `"full"` (a duplicate) | **no** — the round-trip assertion | decodes to the *first* member holding the token, so the narrowed capture reads back as `esFull` and a full-evidence consumer **accepts** it |
+| token arm              | compiles?                          | what reaches the depfile                                                                                                                                |
+| ---------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| _(no arm)_             | **no** — `case` is exhaustive      | —                                                                                                                                                       |
+| `""`                   | **no** — the emptiness assertion   | bare `;evidence=`, read as _stated and unevaluable_, refused by every consumer including one asking for exactly that scope, residual **unnameable**     |
+| `"writes;only"`        | **no** — the wire-safety assertion | the stamp rides inside a `;`-joined record detail, so the decoder splits on `;` first: read as `esUnrecognized` with the residual **misnamed** `writes` |
+| `"full"` (a duplicate) | **no** — the round-trip assertion  | decodes to the _first_ member holding the token, so the narrowed capture reads back as `esFull` and a full-evidence consumer **accepts** it             |
 
-`"writes;only"` is the instructive one: it is non-empty *and* round-trips in
+`"writes;only"` is the instructive one: it is non-empty _and_ round-trips in
 memory, so it passed both the emptiness assertion and the runtime enum case, and
 the whole suite stayed green while the depfile was unreadable. **Non-empty was
 never the property; the round trip is.**
 
 Making the write-side guard test the token instead of the value does not help
 and was measured to be worse: the stamp is then omitted, the capture reads as
-*not stated*, and a full-evidence consumer **accepts** a narrowed capture. With
+_not stated_, and a full-evidence consumer **accepts** a narrowed capture. With
 the assertions above the two spellings are provably the same predicate, so
 neither is load-bearing by itself. Graded by the compile-refusal cases in
 `tests/portable/test_io_mon_evidence_scope.nim`, each with two negative controls
-(the unmutated codec compiles; a member *with* a good token compiles).
+(the unmutated codec compiles; a member _with_ a good token compiles).
 
 The interest axis carries the identical construction — see
 [event-interest-filter.md](event-interest-filter.md).
@@ -106,29 +106,29 @@ marker would manufacture a false `mcComplete` out of a capture that lost data
 
 **Lookups that did not succeed.** Only the three EXISTENCE lookups qualify:
 
-| kind | dropped when |
-|---|---|
-| `mrPathProbe` | `probeResult == prAbsent`, or `prUnknown` with a negative result (the Windows `NtCreateFile` / `NtQueryAttributesFile` arms) |
-| `mrFileOpen` | `result < 0` |
-| `mrDirectoryEnumerate` | `result < 0` |
+| kind                   | dropped when                                                                                                                 |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `mrPathProbe`          | `probeResult == prAbsent`, or `prUnknown` with a negative result (the Windows `NtCreateFile` / `NtQueryAttributesFile` arms) |
+| `mrFileOpen`           | `result < 0`                                                                                                                 |
+| `mrDirectoryEnumerate` | `result < 0`                                                                                                                 |
 
 **NOT "proven absences", and the difference is measurable.** An earlier draft of
-this section, and of the predicate's own comment, said the gate drops *absences*
-and keeps *errors*. The record shape cannot draw that line:
+this section, and of the predicate's own comment, said the gate drops _absences_
+and keeps _errors_. The record shape cannot draw that line:
 
 - `record.result` is the raw call return — **`-1` for every `open` failure**,
   whatever the reason;
 - `probeFromResult` stamps **`prAbsent` on every non-zero `stat` return**;
 - **no errno reaches `MonitorRecord`.** There is no field for it.
 
-So `result < 0` and `prAbsent` mean *the call failed*, never *the path is
-absent*. Four shapes where the path **exists** are dropped, measured: `EACCES` (a
+So `result < 0` and `prAbsent` mean _the call failed_, never _the path is
+absent_. Four shapes where the path **exists** are dropped, measured: `EACCES` (a
 mode-000 `open`), `EISDIR`, `EACCES` on a `stat` through a no-exec directory, and
 `ELOOP`. Magnitude on a real `nim c`: **5 of 2,104** dropped records name an
 existing path (all `/dev/tty`, `ENXIO`).
 
 That is a deliberate narrowing, not a defect to be papered over — `reads-only`
-keeps the lookups that found something *usable*, which is what a
+keeps the lookups that found something _usable_, which is what a
 compiler-emitted depfile carries — but it costs a staleness blind spot, and that
 blind spot is **row 4 of the hazard table in §8**.
 
@@ -146,14 +146,13 @@ and wrong:
    the required position, put there for an unrelated reason (preserving the
    tracee's errno across the hook): `linux_preload` takes `c_get_errno()`,
    `macos_interpose` `getErrno()` and `windows_interpose` `GetLastError()` on
-   the line *after* the real call and *before* anything that could clobber it —
+   the line _after_ the real call and _before_ anything that could clobber it —
    one Windows probe site's comment already reads "`ERROR_FILE_NOT_FOUND` on
    absent path". What would actually have to be built is two other things:
-
-   - **Plumbing, not capture.** The saved value is a *local in the hook*, while
+   - **Plumbing, not capture.** The saved value is a _local in the hook_, while
      the record is built a frame or two down in helpers (`recordOpen`,
      `recordPathProbe`, `probeFromResult`, `recordFailedOpenCanonical`, …) that
-     receive the *call result* and not the errno. Counted over the procs that
+     receive the _call result_ and not the errno. Counted over the procs that
      build a droppable record without the saved value in scope: **~16 on macOS,
      ~5 on Linux, ~4 on Windows** — each a signature change on a hot path.
    - **Three error vocabularies**, and Windows has two of its own: a negative
@@ -164,6 +163,7 @@ and wrong:
    reducing anything on the backends that have not — a far larger behaviour
    change than the 0.24% blind spot it closes. **That consequence is the
    load-bearing half of this cost.**
+
 2. **There is no spare field that is also free.** "Carrying errno moves the
    measurement" is true of one carrier and false of the other, and `full` is the
    baseline DA-1i exists to measure the per-record cost against, so which
@@ -203,7 +203,7 @@ under-keeping costs correctness.
 
 1. **The shim (Linux), in `emitRecord`** — right beside the interest gate, so the
    expensive part (gset insert + dedup, or the fragment write) never happens.
-   This is not an optimisation of the mode; it *is* the mode. A gate that
+   This is not an optimisation of the mode; it _is_ the mode. A gate that
    published the record and filtered it at the merge would save nothing, and
    `--evidence` exists to measure what records cost.
 2. **The host, in `collectMonitorEvidence`** — belt-and-suspenders, and the
@@ -249,12 +249,12 @@ if not observedEvidenceScopeCovers(dep, esFull):
 
 Three fields, not one, and the middle row is why:
 
-| file | `observedEvidenceScopeStated` | `effectiveObservedEvidenceScope` | full-evidence consumer |
-|---|---|---|---|
-| no stamp (written before DA-1i, or a full capture) | `false` | `esFull` | ACCEPT — unchanged from before the field existed |
-| `evidence=reads-only` | `true` | `esReadsOnly` | **REJECT** |
-| `evidence=writes-only` — a scope a NEWER io-mon narrowed to | `true` | `esUnrecognized` | **REJECT** — the file states a scope this build cannot evaluate |
-| `evidence=` (empty VALUE) | `true` | `esUnrecognized` | **REJECT** — same reason, and it needs its own answer: `parseEvidenceScopeToken` widens `""` to `esFull`, which is right for the env channel (an unset `REPRO_MONITOR_EVIDENCE` means "write everything down") and a false ACCEPT here |
+| file                                                        | `observedEvidenceScopeStated` | `effectiveObservedEvidenceScope` | full-evidence consumer                                                                                                                                                                                                                 |
+| ----------------------------------------------------------- | ----------------------------- | -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| no stamp (written before DA-1i, or a full capture)          | `false`                       | `esFull`                         | ACCEPT — unchanged from before the field existed                                                                                                                                                                                       |
+| `evidence=reads-only`                                       | `true`                        | `esReadsOnly`                    | **REJECT**                                                                                                                                                                                                                             |
+| `evidence=writes-only` — a scope a NEWER io-mon narrowed to | `true`                        | `esUnrecognized`                 | **REJECT** — the file states a scope this build cannot evaluate                                                                                                                                                                        |
+| `evidence=` (empty VALUE)                                   | `true`                        | `esUnrecognized`                 | **REJECT** — same reason, and it needs its own answer: `parseEvidenceScopeToken` widens `""` to `esFull`, which is right for the env channel (an unset `REPRO_MONITOR_EVIDENCE` means "write everything down") and a false ACCEPT here |
 
 The last two rows are what matter for a wire format: each is a NARROWED capture,
 and reading it as full scope would publish narrowed evidence as complete
@@ -304,12 +304,12 @@ teammate cannot consume it. `evidenceScopeCovers` states the order in one place.
 (`gcc -MD` lists headers opened, never headers searched for) — and with it
 ninja's precise unsoundness:
 
-| change to the tree | detected under `reads-only`? |
-|---|---|
-| a recorded file is **modified** | yes |
-| a recorded file is **deleted** | yes |
-| a file is **added** that shadows one earlier in a search path | **no** |
-| a file that **exists but could not be opened** becomes openable (a `chmod`, a directory replaced by a file) | **no** |
+| change to the tree                                                                                          | detected under `reads-only`? |
+| ----------------------------------------------------------------------------------------------------------- | ---------------------------- |
+| a recorded file is **modified**                                                                             | yes                          |
+| a recorded file is **deleted**                                                                              | yes                          |
+| a file is **added** that shadows one earlier in a search path                                               | **no**                       |
+| a file that **exists but could not be opened** becomes openable (a `chmod`, a directory replaced by a file) | **no**                       |
 
 Rows 3 and 4 are one rule with two faces: **only successful lookups are
 recorded, so any later change that makes an unsuccessful lookup succeed is
@@ -322,14 +322,14 @@ were absent.
 The table is normative and must appear in the same shape everywhere it appears:
 here, in [`docs/usage.md`](../usage.md) where an operator meets the flag, and in
 reprobuild's `CLI/build.md` §"Dependency Evidence Scope". The framing that must
-survive editing: this degrades *"is this build up to date?"*, **not** *"are
-these bytes usable?"*.
+survive editing: this degrades _"is this build up to date?"_, **not** _"are
+these bytes usable?"_.
 
 ## 9. Tests
 
-| file | grades |
-|---|---|
-| `tests/portable/test_io_mon_evidence_scope.nim` | the predicate (exhaustive over `MonitorRecordKind`), that it answers on the RESULT and cannot see WHY a call failed, the grade not moving, the three-field stamp read and written, and `evidenceScopeCovers` over all nine pairs (including `esUnrecognized` not covering itself) |
-| `tests/linux/test_io_mon_evidence_scope_shim_gate.nim` | the SHIM gate, with the host filter provably out of the call path, and the byte saving bounded against the fixture's own guaranteed paths rather than a loose ratio |
-| `tests/linux/test_io_mon_evidence_scope_older_shim.nim` | the HOST filter, against a stand-in shim built from this repo minus the gate — and the stand-in proved not to gate by running it shim-only at `reads-only` with the host out of the call path |
-| `tests/posix/test_io_mon_cli_evidence_scope.nim` | the real CLI run twice on one command: counts, stamps, that every successful lookup survives, and that an unknown OR EMPTY `--evidence` value is refused in the scope vocabulary |
+| file                                                    | grades                                                                                                                                                                                                                                                                            |
+| ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tests/portable/test_io_mon_evidence_scope.nim`         | the predicate (exhaustive over `MonitorRecordKind`), that it answers on the RESULT and cannot see WHY a call failed, the grade not moving, the three-field stamp read and written, and `evidenceScopeCovers` over all nine pairs (including `esUnrecognized` not covering itself) |
+| `tests/linux/test_io_mon_evidence_scope_shim_gate.nim`  | the SHIM gate, with the host filter provably out of the call path, and the byte saving bounded against the fixture's own guaranteed paths rather than a loose ratio                                                                                                               |
+| `tests/linux/test_io_mon_evidence_scope_older_shim.nim` | the HOST filter, against a stand-in shim built from this repo minus the gate — and the stand-in proved not to gate by running it shim-only at `reads-only` with the host out of the call path                                                                                     |
+| `tests/posix/test_io_mon_cli_evidence_scope.nim`        | the real CLI run twice on one command: counts, stamps, that every successful lookup survives, and that an unknown OR EMPTY `--evidence` value is refused in the scope vocabulary                                                                                                  |

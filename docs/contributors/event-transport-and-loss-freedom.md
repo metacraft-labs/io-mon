@@ -2,9 +2,9 @@
 
 This document specifies **how observed events travel from a monitored process to
 the consumer, and why that channel must lose nothing.** It complements
-[architecture.md](architecture.md) (which defines the *observation* mechanisms
+[architecture.md](architecture.md) (which defines the _observation_ mechanisms
 and the `mcComplete` / `mcIncomplete` correctness contract) by defining the
-*transport* underneath that contract.
+_transport_ underneath that contract.
 
 Read this before touching `src/io_mon/writer.nim`, `src/io_mon/shm/dep_queue.nim`,
 `src/io_mon/fs_snoop.nim`, or the `nim-shm-queue` ring.
@@ -40,7 +40,7 @@ The historical design (milestone `io-mon-DEP-SHM`, see
 `reprobuild-specs/io-mon-Dependency-Shm-Queue.md`) nonetheless shipped a
 **bounded, drop-on-full** ring. That was only self-consistent because it was
 paired with a **file fallback**: `dep_queue.tryPushRecord` returns `dpsDropped`
-on a full ring, and the caller was *required* to re-emit the dropped record to a
+on a full ring, and the caller was _required_ to re-emit the dropped record to a
 per-thread `.iomon-frag` file (`writer.nim`). Under that two-channel design a ring
 drop was **not** a loss event — the file caught it — so the ring's drop-on-full
 looked "signalled, never silent, never lossy."
@@ -52,7 +52,7 @@ The same fallback is also what produced the production incident that motivated
 this work (§4.1). So the corrected model is: **the ring is the single channel,
 and the ring must be lossless.**
 
-Note the contrast that makes this subtle: the *same ring shape* is reused by
+Note the contrast that makes this subtle: the _same ring shape_ is reused by
 reprobuild's **action-cache submission ring**, where drop-on-full **is** correct
 — a dropped cache submission is a missed optimization (a later build recomputes),
 never a correctness violation. Two consumers, two truths. If the shm ring is kept
@@ -78,17 +78,17 @@ gets its own structure, the action cache keeps its ring).
 ```
 
 - **Producers** are the shim instances injected into every process/thread of the
-  monitored tree (`src/io_mon/shim/*`). They only ever *emit*.
+  monitored tree (`src/io_mon/shim/*`). They only ever _emit_.
 - **Consumer** is the single process that launched the monitor and owns the
   shared structure. It sets `REPRO_MONITOR_DEP_SHM` to the segment path
   immediately before spawning the tree (`fs_snoop.nim`) and writes the canonical
   depfile itself.
 - The structure lives in **consumer-owned memory that outlives every producer**,
-  so a producer that is `SIGKILL`ed *after publishing a record* loses nothing —
+  so a producer that is `SIGKILL`ed _after publishing a record_ loses nothing —
   the record is already in the consumer's memory. With `MAP_SHARED` a store lands
   directly in the pages the consumer maps: no flush, no `fsync`, no page-cache
   window. This is **strictly more crash-safe than a buffered file** — the file
-  fallback needed a flush protocol precisely because its writes were *not*
+  fallback needed a flush protocol precisely because its writes were _not_
   synchronous to consumer-visible state.
 
 **No shim buffering (retires read-tail netting).** Because a store is instantly
@@ -96,20 +96,20 @@ consumer-visible, the shim does **not batch**. It publishes each input observati
 **before returning the observed data to the monitored process** (record the
 read/stat/mmap dependency, then hand back the syscall result). So the process can
 never act on data whose dependency is not already in consumer-owned memory — the
-"acted-on-unrecorded-read" cardinal-sin window is closed *structurally*, and the
+"acted-on-unrecorded-read" cardinal-sin window is closed _structurally_, and the
 whole file-era batch apparatus (64 KiB/100 ms buffer, `read-tail-pending`/
 `read-tail-committed` markers, `.io-mon-reading` sentinel, sig-safe committed
 frame, `mergeFragments` netting — the `io-mon-Dependency-Flush-Robustness` protocol)
-is deleted, not ported. It existed *only* to compensate for the buffer. A producer
+is deleted, not ported. It existed _only_ to compensate for the buffer. A producer
 killed mid-insert (before the publishing release-store) loses only a slot the
 consumer skips (torn-writer skip) — and that is not a loss, because the process had
 not yet received the data. Idempotency, not batching, is the throughput mechanism.
 
 **The data is a set, not a stream.** The high-volume traffic is file
-reads/writes/probes; the deliverable is the *distinct* input set (reduction — a
-path read *and* written — is derived at the single-threaded final merge, §3
+reads/writes/probes; the deliverable is the _distinct_ input set (reduction — a
+path read _and_ written — is derived at the single-threaded final merge, §3
 Candidate C). `configure`/`cmake` probes read the same handful of files thousands
-of times, so *events* ≫ *distinct dependencies*. A lower-volume second class
+of times, so _events_ ≫ _distinct dependencies_. A lower-volume second class
 (process-tree edges `exec`/`fork`/`childOsPid`; IPC peers; event-loss markers) is
 also set-shaped under its own keys. This set-accumulation shape drives the
 transport decision in §3.
@@ -208,7 +208,7 @@ mechanisms, in order of preference:
   oversize record, publish it as a length-prefixed run of consecutive slots that
   the consumer reassembles. This keeps loss-freedom inside the ring.
 
-An `prOversize` that is *not* handled by one of the above MUST become an
+An `prOversize` that is _not_ handled by one of the above MUST become an
 event-loss marker → `mcIncomplete`, never a silent drop.
 
 ### 3.3 Torn / crashed producers
@@ -216,13 +216,13 @@ event-loss marker → `mcIncomplete`, never a silent drop.
 The ticket-CAS protocol already tolerates a producer that dies mid-write: the
 slot's `ready` word is published via a release-store only after the blob is
 fully written, so the consumer skips an unpublished/torn slot (`drEmpty`) rather
-than reading garbage. A producer killed *before* the release-store loses only
+than reading garbage. A producer killed _before_ the release-store loses only
 that one in-flight record — which becomes an `mcIncomplete` downgrade if it was
 material, per the flush-robustness invariant
 (`reprobuild-specs/io-mon-Dependency-Flush-Robustness.md`).
 
 **Known weakness of Candidate A.** Loss-freedom on a lock-free ring means bolting
-a *blocking* discipline onto a structure designed to be *non-blocking*. The
+a _blocking_ discipline onto a structure designed to be _non-blocking_. The
 result is busy-waiting on both sides: the producer bounded-spins then futex-waits
 (§3.1); the consumer must drain continuously (today a 2 ms poll in `fs_snoop`) or
 the ring backs up and stalls every producer. Backpressure is not the ring's
@@ -243,13 +243,13 @@ the kernel does the waiting.
   killing the orphan class (LF-2) without a heartbeat protocol.
 - **Con:** **a syscall per event.** Under a fork/probe storm that is millions of
   `mq_send`s — precisely the per-record syscall churn `io-mon-DEP-SHM` introduced
-  the shm ring to *avoid* (the file path's syscall-per-record cost was a named
+  the shm ring to _avoid_ (the file path's syscall-per-record cost was a named
   motivation). Also: `mq` depth/size caps are sysctl-bounded; datagram sockets
   need framing; `SCM_RIGHTS` is not needed but message-boundary handling is.
 - This con is only fatal **at event volume.** If the set-accumulation channel
   dedups at the source (Candidate C), the surviving volume is distinct-deps, not
-  events, and a syscall-per-*distinct-dep* is cheap. B is most attractive for the
-  *small ordered* channel (§2), where volume is low and native ordering + native
+  events, and a syscall-per-_distinct-dep_ is cheap. B is most attractive for the
+  _small ordered_ channel (§2), where volume is low and native ordering + native
   backpressure are exactly what is wanted.
 
 ### Candidate C — new `nim-shm-gset`: an append-only shared-memory set
@@ -267,7 +267,7 @@ to `nim-shm-queue`).
 **idempotent slot-claim** (CAS an empty slot to the element hash; identical element
 already there ⇒ done). There is **no per-element mutable value and no atomic value
 read-modify-write**, so the lost-update race class simply does not exist. Any
-reduction (deriving that a path was read *and* written from two membership
+reduction (deriving that a path was read _and_ written from two membership
 elements) is done in the single-threaded final merge, where there is no
 concurrency. (There is no read-tail pending/committed netting to do — LF-7 removes
 buffering, so the markers are never emitted.) (The
@@ -276,8 +276,8 @@ reintroduces the concurrent value RMW; not worth it unless the element count
 proves a problem.)
 
 - **Idempotent inserts eliminate the backpressure problem at the source.**
-  Re-observing a key is a no-op — the set is bounded by *distinct* dependencies
-  (thousands), not *events* (millions). The thousandth `stat` of the same header
+  Re-observing a key is a no-op — the set is bounded by _distinct_ dependencies
+  (thousands), not _events_ (millions). The thousandth `stat` of the same header
   is one CAS that finds the key present and returns; the probe storm collapses.
 - **No consumer drain loop.** The consumer does not race the producers; it
   snapshots at edge end (or reads live for progress). No poll, no busy-wait on
@@ -292,7 +292,7 @@ sealing, robust-mutex recovery), the set **shards**: when the newest shard cross
 a load threshold (~0.5), a producer atomically links a **new, larger shard**
 (growth factor 4–8) onto a chain and inserts continue there. Producers that have
 not noticed keep writing older shards — harmless, because there is no migration to
-race and the reader unions all shards. This *defers* the merge work to a single
+race and the reader unions all shards. This _defers_ the merge work to a single
 place instead of doing it eagerly under contention, and keeps pure append-only
 lock-freedom.
 
@@ -308,11 +308,11 @@ lock-freedom.
   generation/shard count, consumer-liveness token, reaper metadata. Producers
   resolve the live shard through it; the parent walks the chain.
 - **Publish-before-write.** Link a new shard into the chain (release-ordered)
-  *before* any insert lands in it, so a producer that dies right after allocating
+  _before_ any insert lands in it, so a producer that dies right after allocating
   cannot strand data the reader can't discover.
 
 **Cross-OS lifetime — file-backed on all three OSes.** Named shared-memory
-lifetime is *not* uniform: POSIX `shm_open`/file-backed mmap persists until
+lifetime is _not_ uniform: POSIX `shm_open`/file-backed mmap persists until
 `shm_unlink`/delete independent of mapping count, but a **Windows page-file-backed
 section** (`CreateFileMapping(INVALID_HANDLE_VALUE,…)`) is **handle-refcounted** —
 the last handle closing destroys it, so all producers dying would lose the data
@@ -321,13 +321,13 @@ shard in a parent-owned dir; POSIX `mmap(MAP_SHARED)`; Windows `CreateFileMappin
 over a real `CreateFile` handle). Then "persists" == "the file exists" everywhere,
 decoupled from mapping count, surviving producer death and `exec`; it also dodges
 macOS's 31-char `shm_open` name limit and Windows' namespace privileges, and
-matches io-mon's existing treatment of `REPRO_MONITOR_DEP_SHM` as a *path*. Notes:
+matches io-mon's existing treatment of `REPRO_MONITOR_DEP_SHM` as a _path_. Notes:
 prefer a **tmpfs** dir on Linux (`/dev/shm`) to avoid writeback;
 `FILE_ATTRIBUTE_TEMPORARY` on Windows; open with `FILE_SHARE_DELETE` so the reaper
 can unlink a mapped file.
 
-**Reaper (cross-restart GC).** LF-2 stops a *live* orphan; the reaper cleans up
-after the *consumer* (the reprobuild daemon) crashing and leaving shard files
+**Reaper (cross-restart GC).** LF-2 stops a _live_ orphan; the reaper cleans up
+after the _consumer_ (the reprobuild daemon) crashing and leaving shard files
 behind. `reapStaleSegments(dir, appId)` — called by the daemon on startup and
 periodically — reaps a run's shards (named `{appId}~{runId}.{creatorBootId}.{ownerPid}.shardN`)
 when `creatorBootId != currentBootId` (survived a reboot) or the owner pid is dead
@@ -353,13 +353,13 @@ it.
 crash-exposed structure; functional tests pass for months while a missing fence
 waits to fault on ARM64. The plan (design spec **§4.5**, the authoritative list)
 requires: a **TLA+** protocol model + **stateless model checking**
-(GenMC/CDSChecker) of the *shipped* C11 atomics core on a tiny forced-collision
+(GenMC/CDSChecker) of the _shipped_ C11 atomics core on a tiny forced-collision
 table + **litmus tests** (herd7) for every release→acquire pair;
 **position-independence** (map at different bases in producer vs consumer, offsets
 only — no absolute pointer may live in shared memory); structure-specific
 adversarial interleavings (slot-claim race, torn key, the intern arena as its own
 lock-free structure, sharding double-grow with **no leaked shard file**, reaper
-races) via deterministic schedule hooks *and* stress; **real multi-process
+races) via deterministic schedule hooks _and_ stress; **real multi-process
 (fork+exec)** SIGKILL fault injection at every publish point; the **LF-7
 publish-before-return** shim test; a `final == union(intended)` oracle + a
 multi-hour `rr`-chaos **soak**; a **real-build completeness oracle** (ninja-cmake /
@@ -369,16 +369,16 @@ processes) + ASan/UBSan + DRD. **Mandatory on x86 AND ARM64.**
 
 ### Comparison and leaning
 
-| | A: SHM ring + backpressure | B: OS-primitive MPSC queue | C: `nim-shm-gset` (sharded append-only set) |
-|---|---|---|---|
-| Backpressure | hand-rolled, busy-wait both sides | native (kernel blocks) | moot (idempotent inserts) |
-| Cost per event | zero-syscall push | **one syscall per event** | one CAS; dup = one CAS, no growth |
-| Volume handled | every event | every event | **distinct deps only** |
-| Ordering | preserved | preserved | irrelevant (set; final merge canonicalizes) |
-| Consumer | continuous drain (poll) | blocking `recv` | snapshot + merge at end (no loop) |
-| Growth / full | must not drop (block) | kernel-bounded | shard + link (never drop) |
-| Liveness / orphan | heartbeat + `prConsumerGone` | native (`EPIPE`) | consumer-owned; reaper for cross-restart |
-| Complexity | ring + grafted blocking | lowest | set + shards + intern arena |
+|                   | A: SHM ring + backpressure        | B: OS-primitive MPSC queue | C: `nim-shm-gset` (sharded append-only set) |
+| ----------------- | --------------------------------- | -------------------------- | ------------------------------------------- |
+| Backpressure      | hand-rolled, busy-wait both sides | native (kernel blocks)     | moot (idempotent inserts)                   |
+| Cost per event    | zero-syscall push                 | **one syscall per event**  | one CAS; dup = one CAS, no growth           |
+| Volume handled    | every event                       | every event                | **distinct deps only**                      |
+| Ordering          | preserved                         | preserved                  | irrelevant (set; final merge canonicalizes) |
+| Consumer          | continuous drain (poll)           | blocking `recv`            | snapshot + merge at end (no loop)           |
+| Growth / full     | must not drop (block)             | kernel-bounded             | shard + link (never drop)                   |
+| Liveness / orphan | heartbeat + `prConsumerGone`      | native (`EPIPE`)           | consumer-owned; reaper for cross-restart    |
+| Complexity        | ring + grafted blocking           | lowest                     | set + shards + intern arena                 |
 
 **Decision:** implement **both** principal models — Candidate **A** (the
 `nim-shm-queue` ring with the `opBlockProducer` policy) and Candidate **C** (the
@@ -400,9 +400,9 @@ swappable.
 **The `.iomon-frag` per-process file spill is removed as a producer path.** Its
 two historical jobs are both subsumed:
 
-- *Durability across producer death* → provided by consumer-owned ring memory
+- _Durability across producer death_ → provided by consumer-owned ring memory
   (§2).
-- *Overflow capture* → provided by lossless backpressure (§3.1) and jumbo
+- _Overflow capture_ → provided by lossless backpressure (§3.1) and jumbo
   framing (§3.2).
 
 What remains on disk is only the **canonical final depfile** the consumer writes
@@ -422,7 +422,7 @@ treated as a **hard error, not a reason to write a file**:
 A long-lived `repro-full daemon serve --dev` was left as an **orphaned monitored
 descendant**: its monitor's root command had exited, the grace period lapsed, and
 `fs_snoop` removed the fragment directory — but the descendant kept running and
-kept appending to its now-*unlinked* `.iomon-frag` fd. With no consumer draining
+kept appending to its now-_unlinked_ `.iomon-frag` fd. With no consumer draining
 it, that single fragment grew to **~61 GiB** and filled the root tmpfs. This is
 exactly the `dpsUnavailable`/orphan class: a producer on the file fallback with
 no consumer. LF-2 makes it structurally impossible — there is no file to grow.
@@ -439,11 +439,11 @@ deleted together with the file producer.
 Loss-freedom is delivered per platform; the file path is only retired on a
 platform once that platform's ring producer exists.
 
-| Platform | Producer mechanism | Ring producer status | File fallback |
-|----------|--------------------|----------------------|---------------|
-| **Linux**   | `LD_PRELOAD` shim + raw-syscall substrate | present (`dep_queue` attaches via `REPRO_MONITOR_DEP_SHM`) | **removed** once `opBlockProducer` lands |
-| **macOS**   | interpose + `mach_vm_remap` body-patch / EndpointSecurity | `depQueueSupported` compiles, **producer arm is future work** | retained until the macOS ring producer lands |
-| **Windows** | injected hooks (`CreateRemoteThread` + `LoadLibraryW`) | not yet | retained until the Windows ring producer lands |
+| Platform    | Producer mechanism                                        | Ring producer status                                          | File fallback                                  |
+| ----------- | --------------------------------------------------------- | ------------------------------------------------------------- | ---------------------------------------------- |
+| **Linux**   | `LD_PRELOAD` shim + raw-syscall substrate                 | present (`dep_queue` attaches via `REPRO_MONITOR_DEP_SHM`)    | **removed** once `opBlockProducer` lands       |
+| **macOS**   | interpose + `mach_vm_remap` body-patch / EndpointSecurity | `depQueueSupported` compiles, **producer arm is future work** | retained until the macOS ring producer lands   |
+| **Windows** | injected hooks (`CreateRemoteThread` + `LoadLibraryW`)    | not yet                                                       | retained until the Windows ring producer lands |
 
 `depQueueSupported = defined(linux) or defined(macosx)`; on any other platform the
 ring is a no-op and the producer must degrade to an explicit `mcIncomplete`
@@ -485,9 +485,9 @@ library API**, not only a CLI:
   `runFsSnoopCli` is now a thin wrapper over it (`runMonitored(req).exitCode`) —
   no duplicated lifecycle. Because the consumer structure is created, named, and
   torn down inside this proc, **LF-2** (no orphan spill: a producer never runs
-  without a consumer) and **LF-4** (consumer liveness) hold *by construction*
+  without a consumer) and **LF-4** (consumer liveness) hold _by construction_
   for any well-formed parent: "the set was never set up" is structurally
-  impossible. See `io-mon/docs/usage.md` → *The public host API* for the caller
+  impossible. See `io-mon/docs/usage.md` → _The public host API_ for the caller
   contract, and `tests/linux/test_io_mon_public_host_api.nim` for the end-to-end
   proof (public-surface-only: `mcComplete`, inputs captured, no `.iomon-frag`
   spill).
@@ -498,7 +498,7 @@ library API**, not only a CLI:
   process-global, so N monitors can run concurrently in one host process without
   clobbering each other's `LD_PRELOAD` / `REPRO_MONITOR_*`. Windows was the last
   arm to get there: `stackable_hooks.runWithMonitorShim` now takes an `env`
-  (a non-nil table being the child's *complete* environment, encoded into an
+  (a non-nil table being the child's _complete_ environment, encoded into an
   explicit `CreateProcessW` environment block), so its four injection variables
   no longer need a scope-restored `putEnv`. One `childEnv` helper composes the
   child environment for every arm, so there is a single layering rule (host env,

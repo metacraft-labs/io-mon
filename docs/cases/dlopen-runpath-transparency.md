@@ -21,7 +21,7 @@ red `Test` job in the reprobuild CI (the provider-compile edge is monitored).
 
 The shim interposes `dlopen` by exporting a `dlopen` symbol whose wrapper calls the
 real `dlopen` (obtained via `dlsym(RTLD_NEXT, "dlopen")`) **from inside the shim
-object**. glibc determines the *calling object* from the call's return address, so it
+object**. glibc determines the _calling object_ from the call's return address, so it
 attributes the `dlopen` to the **shim** and resolves a bare soname
 (`"libpcre.so.1"`, no `/`) against the **shim's** `DT_RPATH`/`DT_RUNPATH` — which has
 no pcre — instead of the original caller's. Every candidate is `ENOENT`.
@@ -44,7 +44,7 @@ in-tool there.
   Succeeds unmonitored; **fails** under the (pre-fix) shim; the absolute-path and
   missing-soname cases are unaffected.
 - Concrete: `LD_PRELOAD=<shim> IO_MON_MUTE=1 <nimfork>/bin/nim c -d:reproProviderMode
-  … repro.nim` → `could not load: libpcre.so`. Adding
+… repro.nim` → `could not load: libpcre.so`. Adding
   `LD_LIBRARY_PATH=<pcre>/lib` makes it pass (proving it is a RUNPATH-resolution
   hijack, since `LD_LIBRARY_PATH` is consulted regardless of the calling object).
 
@@ -62,8 +62,8 @@ and opens the file via **internal aliases / direct inline syscalls** (`__mmap`,
 `__open64_nocancel`) that do **not** traverse `LD_PRELOAD` symbol interposition, so
 the interposed `mmap`/`openat` hooks never fire for loader mappings. The re-scan for
 late `dlopen`s would stop running → regressed inline-syscall coverage. (io-mon's
-inline-syscall patching does observe the loader's *patched* code, but the loader's
-own mapping syscalls are not visible through the *symbol* hooks this option relies
+inline-syscall patching does observe the loader's _patched_ code, but the loader's
+own mapping syscalls are not visible through the _symbol_ hooks this option relies
 on.)
 
 ### B. Resolve the soname against the **caller's** RUNPATH, then call the real `dlopen` with an absolute path — **chosen**
@@ -75,7 +75,7 @@ since the public `struct link_map` does not expose glibc's private `l_info[]`), 
 replicates glibc's search order — **RPATH-if-no-RUNPATH → `LD_LIBRARY_PATH` →
 RUNPATH**, with `$ORIGIN` expanded — handing the real `dlopen` an absolute path. On a
 miss it passes the soname through unchanged, so glibc's caller-independent
-`ld.so.cache` + default paths still apply (never *worse* than today). Runs under the
+`ld.so.cache` + default paths still apply (never _worse_ than today). Runs under the
 shim's reentrancy guard so its own `getenv`/`access` don't recurse or record spurious
 deps. Only the path string handed to the real `dlopen` changes; hook bodies, dlmopen
 namespace handling, vdso handling and all recording are untouched.
@@ -87,7 +87,7 @@ strictly more correct than the state of the art for in-tool `dlopen` interpositi
 
 ### C. `LD_AUDIT` / rtld-audit (`la_objsearch` / `la_objopen`) — **deferred (principled future direction)**
 
-glibc's auditing API is the textbook-correct *transparent* mechanism:
+glibc's auditing API is the textbook-correct _transparent_ mechanism:
 `la_objsearch` is called on every search candidate and, when it **returns the name
 unchanged, resolution is completely unaltered** (pure observation); `la_objopen`
 fires when a new object loads and hands you its `link_map` (resolved `l_name`) —
@@ -128,7 +128,7 @@ through pins. **E** is a separate, larger architectural discussion.
 ## Residual risks / known gaps
 
 - ~~The `dlopen`'d `.so`'s own load is still not recorded as a file-read
-  *dependency*~~ — **RESOLVED** by
+  _dependency_~~ — **RESOLVED** by
   [linux-library-load-observation.md](linux-library-load-observation.md): the shim now
   observes the loader's link map with `dl_iterate_phdr` (scans at init, after each
   interposed `dlopen`/`dlmopen`, and at shutdown) and records every loaded object as an

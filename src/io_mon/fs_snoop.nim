@@ -1352,8 +1352,9 @@ proc childEnv(request: FsSnoopRequest;
   ## `hooks/linux_preload_runtime.nim` is not a needle and runs only inside
   ## processes that are already descendants, so it does not bear on this.)
   result = newStringTable(mode)
-  for key, value in envPairs():
-    addHostEnvEntry(result, key, value)
+  if not request.isolateEnv:
+    for key, value in envPairs():
+      addHostEnvEntry(result, key, value)
   for (key, value) in request.env:
     result[key] = value
   for (key, value) in injected:
