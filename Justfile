@@ -16,7 +16,7 @@ build-snoop:
 
 # Run the test suite
 test:
-    nimble test
+    nim e scripts/run_tests.nims
 
 # Real-build completeness oracle (§4.5(h)) — fast fixtures + class-(a) gate.
 # The heavier B/C/D differentials run with: tests/realbuild/run_oracle.sh --full
@@ -32,11 +32,11 @@ test-realbuild-oracle:
 
 # Run portable tests only
 test-portable:
-    nimble testPortable
+    nim e -d:ioMonPortableTests scripts/run_tests.nims
 
 # Run platform tests only
 test-platform:
-    nimble testPlatform
+    nim e -d:ioMonPlatformTests scripts/run_tests.nims
 
 # Lint all files
 lint: lint-nix
