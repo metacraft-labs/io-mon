@@ -159,7 +159,7 @@ and stopped after that first successful execution. Its repeat and final
 monitored negative control are being rerun with the corrected assertion. The
 graph's shared-library artifact changed hash between builds; it is not selected
 by this fixture, which builds and explicitly selects its own private shim.
-The report retains that hash, without treating it as the fixture's loaded DLL.
+The report retains that hash, without treating it as the fixture's loaded library.
 
 Extend the existing Linux disposition by one filename, and change the CI repeat
 inventory from eight to nine Linux programs. Preserve every fixture assertion
