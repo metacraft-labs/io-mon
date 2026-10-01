@@ -119,3 +119,28 @@ The expected real connect identity is specified in
 Fetched `agents` and `dev` and searched the existing and archived fixture-shim
 records before extending this issue. The Linux CI log is retained locally as
 `/tmp/io-mon-378-linux-repro-flavor-promotion.log`.
+
+## Private IPC shim exposes the enclosing monitor
+
+At `13d12f3`, the private-shim repair selects the current fixture artifact.
+The native Linux IPC cases pass, apart from the independent valid-entropy-byte
+rejection recorded and repaired by `f4c99a9` / `bee8758`. Both Reprobuild lanes
+now fail at the first stdio, AF_UNIX and relative-cwd cases with child exit 139;
+the first capture is incomplete and the new connect capture contains no event.
+[Ordinary Reprobuild-flavor job 110470015758](https://github.com/metacraft-labs/io-mon/actions/runs/36892095599/job/110470015758)
+and full Reprobuild job `110470523403` expose the same program failure.
+
+The fixture supplies its private shim path but retains the enclosing
+`LD_PRELOAD`; `injectionValue` prepends the private shim to that value. The
+resulting child loads two distinct monitor libraries. This is a concrete
+candidate mechanism, not yet an identical-binary control. Compare monitored
+and isolated executions using the same fixture binary and dependency sources.
+If confirmed, extend the existing non-cacheable execution disposition to this
+suite, keeping compilation monitored, every capture assertion, and a second
+real execution. Retain a monitored negative control.
+
+Fetched `agents` / `dev` at `bee8758` / `2d07041` before extending this record.
+The existing issue already owns nested Linux monitor interference; the
+`Monitor-Hook-Shim.md` failure semantics above govern the proposed disposition.
+Log: `/tmp/io-mon-13d-linux-repro-flavor-promotion.log`; full-graph artifacts:
+`/tmp/io-mon-13d-linux-full-repro-artifacts`.
