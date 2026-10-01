@@ -2,10 +2,10 @@
 
 This guide documents the **`io-mon` command-line tool** and the **`io_mon`
 library**. For what io-mon is responsible for (and what it deliberately is
-not), see the *Scope & responsibilities* section of the [README](../README.md).
+not), see the _Scope & responsibilities_ section of the [README](../README.md).
 
 For building/testing io-mon through reprobuild, see [`repro.nim`](../repro.nim);
-for the standalone build, see *Building and testing* in the README.
+for the standalone build, see _Building and testing_ in the README.
 
 ---
 
@@ -36,17 +36,17 @@ reprobuild `repro internal io monitor` form).
 
 Options (each accepts both `--flag value` and `--flag=value`):
 
-| Option | Meaning |
-| --- | --- |
-| `--depfile PATH` | Where to write the captured iomon depfile. If omitted, a temp file is used and discarded after rendering. |
-| `--events MODE` | Stream the captured records in MODE. One of `none` (default), `text`, `jsonl`, `binary` / `binary-stream`. |
-| `--format MODE` | Alias for `--events` (same `FsSnoopOutputMode` values). |
-| `--event-stream PATH` | Write the streamed events to PATH instead of stderr. **Required** when MODE is `binary`/`binary-stream` (so the binary stream stays separate from child output). |
-| `--interest TOKENS` | The event categories to capture, as a comma-separated subset of `file-reads,path-probes,file-writes,proc,lib,env,entropy,ambient` (the `REPRO_MONITOR_INTEREST` vocabulary — see [event-interest-filter.md](contributors/event-interest-filter.md)). **Omitting the flag, or passing an empty value in either spelling (`--interest ""` and `--interest=` alike), means all categories**, so every existing invocation keeps its current behaviour and a consumer that wants a reduced set must ask for one on each run; forgetting costs capture work, never a missed dependency. An unknown token alongside known ones is ignored (a newer consumer may name a category this build does not have); a value naming *no* known token is refused rather than silently widened to "all". The pre-DA-5 spellings `file` / `proc` / `lib` / `nondet` / `ipc` are still accepted and expand to the categories their record kinds moved into; `ipc` expands to nothing, because `mrIpcConnect` is now captured unconditionally, and a value naming only such retired tokens is refused with its own diagnostic. The value io-mon then hands the monitored child is deliberately **not** the same string: `REPRO_MONITOR_INTEREST` carries the categories you asked for and then, after a `legacy-padding` marker, the pre-DA-5 spellings a shim built before the split needs in order not to record *less* than you asked for. `legacy-padding` is a wire marker rather than a category and is refused on this flag. |
-| `--evidence SCOPE` | How much of what the monitor observes is **written down**. One of `full` (default) or `reads-only`. See [Evidence scope](#evidence-scope--how-much-of-what-is-observed-is-recorded) below (and [evidence-scope.md](contributors/evidence-scope.md)) — **`reads-only` carries a named hazard**. An unknown value is refused rather than widened to `full`. |
-| `--capture-stdio` | Capture the child's merged stdout+stderr instead of inheriting the parent's stdio (mirrors how the reprobuild engine launches monitored actions). |
-| `--capture-stdio-path PATH` | Like `--capture-stdio`, but dump the captured bytes to PATH (implies `--capture-stdio`). |
-| `--` | End of options; everything after is the command + args to run. **Required.** |
+| Option                      | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--depfile PATH`            | Where to write the captured iomon depfile. If omitted, a temp file is used and discarded after rendering.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `--events MODE`             | Stream the captured records in MODE. One of `none` (default), `text`, `jsonl`, `binary` / `binary-stream`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `--format MODE`             | Alias for `--events` (same `FsSnoopOutputMode` values).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `--event-stream PATH`       | Write the streamed events to PATH instead of stderr. **Required** when MODE is `binary`/`binary-stream` (so the binary stream stays separate from child output).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `--interest TOKENS`         | The event categories to capture, as a comma-separated subset of `file-reads,path-probes,file-writes,proc,lib,env,entropy,ambient` (the `REPRO_MONITOR_INTEREST` vocabulary — see [event-interest-filter.md](contributors/event-interest-filter.md)). **Omitting the flag, or passing an empty value in either spelling (`--interest ""` and `--interest=` alike), means all categories**, so every existing invocation keeps its current behaviour and a consumer that wants a reduced set must ask for one on each run; forgetting costs capture work, never a missed dependency. An unknown token alongside known ones is ignored (a newer consumer may name a category this build does not have); a value naming _no_ known token is refused rather than silently widened to "all". The pre-DA-5 spellings `file` / `proc` / `lib` / `nondet` / `ipc` are still accepted and expand to the categories their record kinds moved into; `ipc` expands to nothing, because `mrIpcConnect` is now captured unconditionally, and a value naming only such retired tokens is refused with its own diagnostic. The value io-mon then hands the monitored child is deliberately **not** the same string: `REPRO_MONITOR_INTEREST` carries the categories you asked for and then, after a `legacy-padding` marker, the pre-DA-5 spellings a shim built before the split needs in order not to record _less_ than you asked for. `legacy-padding` is a wire marker rather than a category and is refused on this flag. |
+| `--evidence SCOPE`          | How much of what the monitor observes is **written down**. One of `full` (default) or `reads-only`. See [Evidence scope](#evidence-scope--how-much-of-what-is-observed-is-recorded) below (and [evidence-scope.md](contributors/evidence-scope.md)) — **`reads-only` carries a named hazard**. An unknown value is refused rather than widened to `full`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `--capture-stdio`           | Capture the child's merged stdout+stderr instead of inheriting the parent's stdio (mirrors how the reprobuild engine launches monitored actions).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `--capture-stdio-path PATH` | Like `--capture-stdio`, but dump the captured bytes to PATH (implies `--capture-stdio`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `--`                        | End of options; everything after is the command + args to run. **Required.**                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 
 With `--events text` / `--events jsonl` and no `--event-stream`, the rendered
 event stream goes to **stderr**.
@@ -67,7 +67,7 @@ io-mon run --evidence=reads-only
 
 `--evidence` selects **how much of what the monitor observes is written down**.
 It does not change what the monitor observes: the same events are detected
-either way, and a monitoring *failure* still downgrades the capture to
+either way, and a monitoring _failure_ still downgrades the capture to
 `mcIncomplete` exactly as it does today.
 
 `full` records every observation, including **failed lookups** — searches for
@@ -92,16 +92,16 @@ you asked for without a word.
 
 ##### The hazard, exactly
 
-The risk is **one-directional**. It affects the question *"is this build up to
-date?"*, and only for changes of one shape — something that did not exist, or
+The risk is **one-directional**. It affects the question _"is this build up to
+date?"_, and only for changes of one shape — something that did not exist, or
 could not be reached, becoming available:
 
-| change to your tree | detected under `reads-only`? |
-|---|---|
-| a file the build read is **modified** | ✓ yes |
-| a file the build read is **deleted** | ✓ yes |
-| a file is **added** that shadows one earlier in a search path | ✗ **no** |
-| a file that **exists but could not be opened** becomes openable (a `chmod`, a directory replaced by a file) | ✗ **no** |
+| change to your tree                                                                                         | detected under `reads-only`? |
+| ----------------------------------------------------------------------------------------------------------- | ---------------------------- |
+| a file the build read is **modified**                                                                       | ✓ yes                        |
+| a file the build read is **deleted**                                                                        | ✓ yes                        |
+| a file is **added** that shadows one earlier in a search path                                               | ✗ **no**                     |
+| a file that **exists but could not be opened** becomes openable (a `chmod`, a directory replaced by a file) | ✗ **no**                     |
 
 Rows 3 and 4 are one rule with two faces: **`reads-only` records only lookups
 that succeeded, so any later change that makes an unsuccessful lookup succeed is
@@ -109,7 +109,7 @@ invisible.** Row 1 does not cover row 4, however much it looks as though it
 should — the file is **not recorded at all**, so "a file the build read" never
 names it.
 
-Row 4 exists because the record cannot tell *why* a lookup failed: `open`
+Row 4 exists because the record cannot tell _why_ a lookup failed: `open`
 returns `-1` for `ENOENT` and for `EACCES` alike, a failed `stat` is classified
 as "absent" whatever the reason, and no errno is carried in the depfile. So
 `EACCES`, `EISDIR` and `ELOOP` lookups are dropped alongside genuine absences.
@@ -130,7 +130,7 @@ corrupted.
 ##### What it does **not** affect
 
 - **What was built.** The output bytes are a function of the inputs actually
-  used, so a narrower *record* of those inputs does not change the artefact.
+  used, so a narrower _record_ of those inputs does not change the artefact.
 - **Completeness grading.** `reads-only` is a deliberate choice, not a
   monitoring failure, so it does not report `mcIncomplete`; a real monitoring
   failure still does. An `mrEventLoss` can never be dropped by the narrowing.
@@ -171,7 +171,7 @@ io-mon inspect <depfile> [--format text|json]
 defaults to `text`; `json` emits the full structured form. (`--events` is
 accepted as an alias for `--format` here.)
 
-> **Note:** `inspect` supports only `text` and `json`. `jsonl` is a *streaming*
+> **Note:** `inspect` supports only `text` and `json`. `jsonl` is a _streaming_
 > mode for `run --events jsonl`, not an `inspect` format — passing
 > `--format jsonl` to `inspect` errors. (`renderMonitorDepFile` in
 > `src/io_mon/render.nim` only implements `text` and `json`.)
@@ -198,11 +198,11 @@ correspond to `MonitorRecordKind`.
 
 Variables a user or consumer cares about:
 
-| Variable | Role |
-| --- | --- |
-| `REPRO_MONITOR_SHIM_LIB` | **Operator override** for the shim shared-library path. Honoured first by `findShimLibrary()`; otherwise the canonical `build/lib/librepro_monitor_shim.<ext>` layout is probed. A set-but-nonexistent value is a **hard error**, never a silent fall-back to a discovered shim — see below. |
-| `CT_SANDBOX_TOOLS_DIR` | macOS SIP bypass: directory of non-SIP drop-ins for `/bin/sh`, `/bin/cat`, coreutils, etc. If unset, `run` creates and populates a temp one. Point it at a pre-built portable bundle (`scripts/build-sandbox-tools.sh`) to widen subtree coverage. |
-| `IO_MON_BREAKAWAY_REPORT_DIR` | Directory where a cooperating "trusted daemon" drops breakaway reports; `mergeFragments` folds the daemon-read files into the depfile and exempts the daemon's pid from the IPC-connect downgrade (BuildXL Trusted-Tools prior art). |
+| Variable                      | Role                                                                                                                                                                                                                                                                                         |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `REPRO_MONITOR_SHIM_LIB`      | **Operator override** for the shim shared-library path. Honoured first by `findShimLibrary()`; otherwise the canonical `build/lib/librepro_monitor_shim.<ext>` layout is probed. A set-but-nonexistent value is a **hard error**, never a silent fall-back to a discovered shim — see below. |
+| `CT_SANDBOX_TOOLS_DIR`        | macOS SIP bypass: directory of non-SIP drop-ins for `/bin/sh`, `/bin/cat`, coreutils, etc. If unset, `run` creates and populates a temp one. Point it at a pre-built portable bundle (`scripts/build-sandbox-tools.sh`) to widen subtree coverage.                                           |
+| `IO_MON_BREAKAWAY_REPORT_DIR` | Directory where a cooperating "trusted daemon" drops breakaway reports; `mergeFragments` folds the daemon-read files into the depfile and exempts the daemon's pid from the IPC-connect downgrade (BuildXL Trusted-Tools prior art).                                                         |
 
 Variables the **driver sets for the shim** (you normally do not set these by
 hand): `REPRO_MONITOR_FRAGMENT_DIR` (per-capture fragment-log dir),
@@ -300,7 +300,7 @@ else:
   **set but does not name an existing file**, this raises `IOError` rather than
   returning a discovered shim: an override is a pin, so honouring it "first"
   has to mean honouring it, not preferring it. Falling through would run the
-  capture under a *different* shim than the operator pinned and still report
+  capture under a _different_ shim than the operator pinned and still report
   `mcComplete`, with no diagnostic anywhere — a stale pin or a typo would
   silently change the provenance of the evidence.
 
@@ -335,13 +335,13 @@ else:
   set → write the canonical depfile (passing the spawned root pid as the R1
   root-guard) → on finish `markConsumerGone` + detach. **LF-2** (no orphan
   spill: a producer never runs without a consumer) and **LF-4** (consumer
-  liveness) hold *by construction* for any parent that uses it.
+  liveness) hold _by construction_ for any parent that uses it.
   Prefer this to copying `fs_snoop`'s driver: a copy that skips the set/consumer
   setup is exactly the producer-with-no-consumer bug (LF-2) this API prevents.
   It still raises on a genuine setup failure (no shim / unsupported platform);
   the CLI wrapper `runFsSnoopCli` converts those to a diagnostic + non-zero exit.
   Since DH-2 it is literally `finishMonitor(startMonitor(req))` — see
-  *The decomposed host API* below — so the batch and streaming forms are one
+  _The decomposed host API_ below — so the batch and streaming forms are one
   implementation and cannot drift apart.
 - `MonitorResult` — `exitCode` (the monitored command's status), `depFilePath`
   (where the canonical iomon depfile was written), and `depFile` (the merged
@@ -386,8 +386,8 @@ the forked child and Windows passes `lpCurrentDirectory`, so both are.
 Executable resolution still uses the HOST's `PATH` on every arm, and `env` does
 not redirect it — same answer on all three arms, reached three different ways:
 
-- **Linux.** `osproc`'s fork path resolves `command[0]` with `findExe` *inside
-  the forked child*, whose `environ` is still the parent's, and then `execve`s
+- **Linux.** `osproc`'s fork path resolves `command[0]` with `findExe` _inside
+  the forked child_, whose `environ` is still the parent's, and then `execve`s
   the resolved absolute path with the child's environment. The search therefore
   never sees `env`.
 - **macOS.** `osproc` uses `posix_spawnp(…, env)` instead, and `posix_spawnp`

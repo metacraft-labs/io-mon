@@ -7,21 +7,21 @@ Scratch artifacts: `/tmp/io_mon_linux_round4`.
 
 ## Probes run
 
-| # | Probe | Outcome |
-|---|-------|---------|
-| 1 | Baseline `open`/`read`/`write` | Captured: source `mrFileRead`, output `mrFileWrite`, `mcComplete`. |
-| 2 | `pread` positioned file read | Captured by the new Linux preload wrapper. |
-| 3 | `readv` vector file read | Captured by the new Linux preload wrapper. |
-| 4 | `preadv` positioned vector file read | Captured by the new Linux preload wrapper. |
-| 5 | `sendfile` libc zero-copy file copy | Captured: source read plus destination write. |
-| 6 | `copy_file_range` libc zero-copy file copy | Captured: source read plus destination write. |
-| 7 | `splice` libc file-to-pipe-to-file copy | Captured: source read plus destination write. |
-| 8 | Direct raw `syscall(SYS_sendfile)` | Captured by M-FW-6D: source read plus destination write. |
-| 9 | Direct raw `syscall(SYS_copy_file_range)` | Captured by M-FW-6D: source read plus destination write. |
-| 10 | Direct raw `syscall(SYS_splice)` | Captured by M-FW-6D over file-to-pipe and pipe-to-file legs. |
-| 11 | Hardlink alias read | Captured by M-FW-6B for libc-visible `link`/`linkat`: source identity is recorded as a file read and the alias as a write. Direct raw mutation variants remain residual. |
-| 12 | Rename staging write | Captured by M-FW-6B for libc-visible `rename`/`renameat`/`renameat2`: final destination path is recorded as a write. Direct raw mutation variants remain residual. |
-| 13 | Non-file determinism (`getenv`, `uname`, `sysconf`, clock, `getrandom`) | Captured by M-FW-6C for the libc-visible subset: observed-input records for env/uname/sysconf/time diagnostics plus `getrandom` non-determinism evidence, while completeness remains `mcComplete` when no monitoring loss occurs. |
+| #   | Probe                                                                   | Outcome                                                                                                                                                                                                                           |
+| --- | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Baseline `open`/`read`/`write`                                          | Captured: source `mrFileRead`, output `mrFileWrite`, `mcComplete`.                                                                                                                                                                |
+| 2   | `pread` positioned file read                                            | Captured by the new Linux preload wrapper.                                                                                                                                                                                        |
+| 3   | `readv` vector file read                                                | Captured by the new Linux preload wrapper.                                                                                                                                                                                        |
+| 4   | `preadv` positioned vector file read                                    | Captured by the new Linux preload wrapper.                                                                                                                                                                                        |
+| 5   | `sendfile` libc zero-copy file copy                                     | Captured: source read plus destination write.                                                                                                                                                                                     |
+| 6   | `copy_file_range` libc zero-copy file copy                              | Captured: source read plus destination write.                                                                                                                                                                                     |
+| 7   | `splice` libc file-to-pipe-to-file copy                                 | Captured: source read plus destination write.                                                                                                                                                                                     |
+| 8   | Direct raw `syscall(SYS_sendfile)`                                      | Captured by M-FW-6D: source read plus destination write.                                                                                                                                                                          |
+| 9   | Direct raw `syscall(SYS_copy_file_range)`                               | Captured by M-FW-6D: source read plus destination write.                                                                                                                                                                          |
+| 10  | Direct raw `syscall(SYS_splice)`                                        | Captured by M-FW-6D over file-to-pipe and pipe-to-file legs.                                                                                                                                                                      |
+| 11  | Hardlink alias read                                                     | Captured by M-FW-6B for libc-visible `link`/`linkat`: source identity is recorded as a file read and the alias as a write. Direct raw mutation variants remain residual.                                                          |
+| 12  | Rename staging write                                                    | Captured by M-FW-6B for libc-visible `rename`/`renameat`/`renameat2`: final destination path is recorded as a write. Direct raw mutation variants remain residual.                                                                |
+| 13  | Non-file determinism (`getenv`, `uname`, `sysconf`, clock, `getrandom`) | Captured by M-FW-6C for the libc-visible subset: observed-input records for env/uname/sysconf/time diagnostics plus `getrandom` non-determinism evidence, while completeness remains `mcComplete` when no monitoring loss occurs. |
 
 No new silent false-negative was confirmed in the newly targeted
 libc-visible positioned/vector/zero-copy file-content channels. The first two

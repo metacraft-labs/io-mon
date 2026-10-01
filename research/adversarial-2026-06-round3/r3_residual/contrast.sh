@@ -11,7 +11,7 @@ rm -f daemon.ready
 pkill -9 -f /tmp/r3_residual/res4_forge/daemon 2>/dev/null || true; sleep 0.3
 ./daemon "$SOCK" >/dev/null 2>&1 &
 DPID=$!
-for i in $(seq 1 20); do [ -f daemon.ready ] && break; sleep 0.1; done
+for _ in $(seq 1 20); do [ -f daemon.ready ] && break; sleep 0.1; done
 echo "secret" > REAL_SECRET.txt
 echo "=== OLD forgery (no run/no complete/no reads) -> should be REJECTED ==="
 "$IO_MON" run --depfile old.rdep -- ./malicious_client "$SOCK" /tmp/r3_residual/res4_forge/REAL_SECRET.txt 2>/dev/null >/dev/null || true

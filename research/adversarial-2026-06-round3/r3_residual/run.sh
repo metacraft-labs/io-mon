@@ -3,7 +3,8 @@ set -e
 cd /tmp/r3_residual/res4_forge
 IO_MON=/Users/zahary/m/dev/io-mon/build/bin/io-mon
 export IO_MON_BREAKAWAY_REPORT_DIR=/tmp/r3_residual/res4_forge/reports
-export REPRO_MONITOR_SESSION="r3-session-$(uuidgen)"
+REPRO_MONITOR_SESSION="r3-session-$(uuidgen)"
+export REPRO_MONITOR_SESSION
 mkdir -p "$IO_MON_BREAKAWAY_REPORT_DIR"
 rm -f "$IO_MON_BREAKAWAY_REPORT_DIR"/*.io-mon-report
 echo "session=$REPRO_MONITOR_SESSION"
@@ -13,7 +14,7 @@ pkill -9 -f /tmp/r3_residual/res4_forge/daemon 2>/dev/null || true
 sleep 0.3
 ./daemon "$SOCK" >daemon.log 2>&1 &
 DPID=$!
-for i in $(seq 1 20); do [ -f daemon.ready ] && break; sleep 0.1; done
+for _ in $(seq 1 20); do [ -f daemon.ready ] && break; sleep 0.1; done
 cat daemon.log
 MARK="R8-FORGE-$(uuidgen)"
 echo "$MARK" > REAL_SECRET.txt

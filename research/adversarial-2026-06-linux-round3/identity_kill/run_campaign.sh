@@ -38,4 +38,3 @@ done
 run_capture socket_breakaway "$ROOT/socket_client" "$SOCK"
 wait "$daemon_pid"
 printf 'socket_daemon_exit=%s\n' "$?"
-

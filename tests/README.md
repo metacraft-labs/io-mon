@@ -9,15 +9,15 @@ The test tree mirrors that split so a regression in the shared machinery is
 caught on **every** OS, while platform-specific behaviour is tested only where it
 applies. The directories form the contract:
 
-| Directory          | Runs on                                   | What belongs here |
-|--------------------|-------------------------------------------|-------------------|
-| `portable/`        | **every** OS                              | Pure-logic tests on shared modules. NO live shim, NO platform-specific API/import. Codec round-trip, `mergeFragments`, the completeness-downgrade algorithm on **synthetic** records, capabilities/render, the CLI build + `inspect`. |
-| `posix/`           | POSIX hosts (macOS, Linux, *BSD, Solaris) | Behaviour shared across POSIX shims — e.g. the live snoop-CLI capture (DYLD on macOS / `LD_PRELOAD` on Linux) and the shim's drop-in shared-library build + exported-ABI check. |
-| `macos/`           | macOS only                                | DYLD `__interpose` + `mach_vm_remap` body-patch live capture, SIP-child, XPC/Mach breakaway, content/metadata hooks, etc. |
-| `linux/`           | Linux only                                | `LD_PRELOAD` shim live behaviour (placeholder for now — see `linux/README.md`). |
-| `windows/`         | Windows only                              | Injected-hook live behaviour (placeholder for now — see `windows/README.md`). |
-| `helpers/`         | —                                         | Shared test-only helpers (not tests). Imported via `--path:tests/helpers`. |
-| `fixtures/`        | —                                         | Shared C probe sources and input fixtures. |
+| Directory   | Runs on                                    | What belongs here                                                                                                                                                                                                                     |
+| ----------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `portable/` | **every** OS                               | Pure-logic tests on shared modules. NO live shim, NO platform-specific API/import. Codec round-trip, `mergeFragments`, the completeness-downgrade algorithm on **synthetic** records, capabilities/render, the CLI build + `inspect`. |
+| `posix/`    | POSIX hosts (macOS, Linux, \*BSD, Solaris) | Behaviour shared across POSIX shims — e.g. the live snoop-CLI capture (DYLD on macOS / `LD_PRELOAD` on Linux) and the shim's drop-in shared-library build + exported-ABI check.                                                       |
+| `macos/`    | macOS only                                 | DYLD `__interpose` + `mach_vm_remap` body-patch live capture, SIP-child, XPC/Mach breakaway, content/metadata hooks, etc.                                                                                                             |
+| `linux/`    | Linux only                                 | `LD_PRELOAD` shim live behaviour (placeholder for now — see `linux/README.md`).                                                                                                                                                       |
+| `windows/`  | Windows only                               | Injected-hook live behaviour (placeholder for now — see `windows/README.md`).                                                                                                                                                         |
+| `helpers/`  | —                                          | Shared test-only helpers (not tests). Imported via `--path:tests/helpers`.                                                                                                                                                            |
+| `fixtures/` | —                                          | Shared C probe sources and input fixtures.                                                                                                                                                                                            |
 
 A test is **portable** if it only exercises shared logic (`mergeFragments`,
 `readMonitorDepFile`, `encodeFrame`/`decodeFrame`, `MonitorRecord` construction,
@@ -67,6 +67,7 @@ Convenience sub-tasks: `nimble testPortable` (only the every-OS tests) and
    (POSIX OSes are already covered by the `when defined(posix)` arm, so a new
    POSIX OS automatically runs `portable/` + `posix/` even before it has its own
    directory.)
+
 3. Put OS-specific live tests in `tests/<os>/`. Keep any pure-logic assertions in
    `portable/` so they also run everywhere else.
 

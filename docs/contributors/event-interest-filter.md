@@ -27,22 +27,22 @@ type EventCategory* = enum
   ecAmbientReads   ## mrTimeRead, mrSysctlRead
 ```
 
-| category | token | the consumer it exists for |
-|---|---|---|
-| `ecFileReads` | `file-reads` | the INPUT CONTENT set (`PathSetEvidence.monitorReads`) — what the staleness detector re-hashes and the strong fingerprint is taken over |
-| `ecPathProbes` | `path-probes` | the EXISTENCE / MEMBERSHIP set (`monitorProbes`, `monitorDirectoryEnumerations`) — invalidated by a path being *added*, which a content hash cannot see |
-| `ecFileWrites` | `file-writes` | the OUTPUT set (`monitorWrites`) and output-tree state tracking |
-| `ecProcessTree` | `proc` | process-tree attribution: pid→image, subtree/breakaway analysis, the executed binary as a content dependency |
-| `ecLibraryLoads` | `lib` | the loaded-object closure of the tool |
-| `ecEnvReads` | `env` | the ACTION CACHE KEY (`monitorEnvReads` → `cacheEnvInputs`) |
-| `ecEntropy` | `entropy` | the CACHE-PUBLISH GATE (`entropyObservations` → `applyEntropyBlessingPolicy`) |
-| `ecAmbientReads` | `ambient` | **nothing, today.** Clock and sysctl reads reach reprobuild's record fold and land on its `else: discard` arm. This is the one category a reprobuild edge can drop without losing anything a consumer reads |
+| category         | token         | the consumer it exists for                                                                                                                                                                                  |
+| ---------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ecFileReads`    | `file-reads`  | the INPUT CONTENT set (`PathSetEvidence.monitorReads`) — what the staleness detector re-hashes and the strong fingerprint is taken over                                                                     |
+| `ecPathProbes`   | `path-probes` | the EXISTENCE / MEMBERSHIP set (`monitorProbes`, `monitorDirectoryEnumerations`) — invalidated by a path being _added_, which a content hash cannot see                                                     |
+| `ecFileWrites`   | `file-writes` | the OUTPUT set (`monitorWrites`) and output-tree state tracking                                                                                                                                             |
+| `ecProcessTree`  | `proc`        | process-tree attribution: pid→image, subtree/breakaway analysis, the executed binary as a content dependency                                                                                                |
+| `ecLibraryLoads` | `lib`         | the loaded-object closure of the tool                                                                                                                                                                       |
+| `ecEnvReads`     | `env`         | the ACTION CACHE KEY (`monitorEnvReads` → `cacheEnvInputs`)                                                                                                                                                 |
+| `ecEntropy`      | `entropy`     | the CACHE-PUBLISH GATE (`entropyObservations` → `applyEntropyBlessingPolicy`)                                                                                                                               |
+| `ecAmbientReads` | `ambient`     | **nothing, today.** Clock and sysctl reads reach reprobuild's record fold and land on its `else: discard` arm. This is the one category a reprobuild edge can drop without losing anything a consumer reads |
 
 ### 1.1 What the split replaced, and why "coarse" was not the problem
 
 The five pre-DA-5 categories were `ecFileDeps` / `ecProcessTree` /
 `ecLibraryLoads` / `ecNonDeterminism` / `ecIpc`. They grouped record kinds that
-*look* alike, and the result was a switch no consumer could use.
+_look_ alike, and the result was a switch no consumer could use.
 `ecNonDeterminism` alone carried `mrEnvRead` (cache key), `mrNonDeterministic`
 (publish gate), `mrTimeRead` / `mrSysctlRead` (no consumer at all) and
 `mrExternalContent` (completeness) — **four consumers behind one bit.** So no
@@ -51,7 +51,7 @@ engine asked for every category unconditionally, and its `captureNonDeterminism`
 / `captureIpc` policy fields were documented as `INERT`.
 
 The fix is not "more categories". It is that a category is now the unit a
-*single* consumer reads, so a narrowing can be argued one consumer at a time.
+_single_ consumer reads, so a narrowing can be argued one consumer at a time.
 
 ### 1.2 Two classes of kind have NO category and are never gated
 
@@ -61,19 +61,19 @@ to its category, and `none` means **no interest set may suppress this record**:
 - **META** — `mrEventLoss` (LF-1: loss markers must always flow, or a dropped
   input becomes a false `mcComplete`), `mrBackendProfile`, `mrCapabilityGap`.
 - **COMPLETENESS-BEARING** — `mrIpcConnect` and `mrExternalContent`.
-  `mergeFragments` *derives* a synthetic `mrEventLoss` from each out-of-tree IPC
+  `mergeFragments` _derives_ a synthetic `mrEventLoss` from each out-of-tree IPC
   peer (`unmonitoredSubtreeLossDetails`) and each unpaired external-content
   channel (`externalContentLossCount`), and the shim's gate runs at
   `emitRecord`, **before** that merge. Gating these kinds therefore does not
   hide a record the consumer declined to see — it deletes the input a loss
   marker would have been derived from, turning an `mcIncomplete` edge into an
   `mcComplete` one. No granularity makes that safe, so there is no category:
-  DA-5 retired `ecIpc` rather than renaming it. (The `ipc` token still *reads*;
+  DA-5 retired `ecIpc` rather than renaming it. (The `ipc` token still _reads_;
   see §3.2.)
 
 Gating a loss marker is forbidden by construction: `categoryOf` answers `none`,
-and the gate only ever suppresses kinds whose category is *present and
-disabled*. `recordIsFailedExistenceLookup` asks the same `categoryOf`, so the
+and the gate only ever suppresses kinds whose category is _present and
+disabled_. `recordIsFailedExistenceLookup` asks the same `categoryOf`, so the
 evidence axis inherits the identical protection from one definition.
 
 ## 2. Request API
@@ -109,7 +109,7 @@ treats a category it has no name for as "not in my set".
 
 **That ignore rule is safe in ONE direction only, and this paragraph used to
 claim both.** It read "safe, because the host also filters, §5". That is true for
-a shim which ignores the variable *entirely* and therefore over-captures: the
+a shim which ignores the variable _entirely_ and therefore over-captures: the
 host filter removes what the consumer did not ask for and the result is correct.
 It is **false** for a shim which honours the variable in an OLDER vocabulary.
 Such a shim ignores the tokens it does not know, keeps the ones it does, and
@@ -175,7 +175,7 @@ compiled, and every `interest=` stamp thereafter silently omitted it.
 
 The harm on this axis is **strictly lesser** than on the evidence axis, and the
 difference is worth being precise about rather than glossing. A missing token can
-only *shrink* what a stamp declares, and `observedInterestCovers` is a subset
+only _shrink_ what a stamp declares, and `observedInterestCovers` is a subset
 test, so every consequence points at **rejection**: a capture that really did
 observe the new category is read as one that did not, and a consumer needing it
 recaptures for nothing. It cannot produce the opposite mistake, because a
@@ -203,19 +203,19 @@ both wire directions over real depfile bytes
 `file` `proc` `lib` `nondet` `ipc` are still accepted, on the flag and on the
 env channel, and they expand to today's categories:
 
-| old token | expands to | note |
-|---|---|---|
-| `file` | `ecFileReads`, `ecPathProbes`, `ecFileWrites` | |
-| `proc` | `ecProcessTree` | unsplit — this IS the current token |
-| `lib` | `ecLibraryLoads` | unsplit — this IS the current token |
-| `nondet` | `ecEnvReads`, `ecEntropy`, `ecAmbientReads` | `mrExternalContent` became ungate-able |
-| `ipc` | *nothing* | `mrIpcConnect` became ungate-able |
+| old token | expands to                                    | note                                   |
+| --------- | --------------------------------------------- | -------------------------------------- |
+| `file`    | `ecFileReads`, `ecPathProbes`, `ecFileWrites` |                                        |
+| `proc`    | `ecProcessTree`                               | unsplit — this IS the current token    |
+| `lib`     | `ecLibraryLoads`                              | unsplit — this IS the current token    |
+| `nondet`  | `ecEnvReads`, `ecEntropy`, `ecAmbientReads`   | `mrExternalContent` became ungate-able |
+| `ipc`     | _nothing_                                     | `mrIpcConnect` became ungate-able      |
 
 **The expansions are DERIVED from `categoryOf`, never written down.** The
 alternative is the one construction on this axis whose failure direction is
 ACCEPT: give `file` an expansion containing `ecEnvReads` and every old
 `--interest file,proc,lib` capture — which observed no environment read — reads
-back as though it had. Computing the expansion from where the kinds *actually*
+back as though it had. Computing the expansion from where the kinds _actually_
 went makes that unwritable, and a `static:` block recomputes it at compile time
 and refuses a mismatch. `legacyMemberKinds` is frozen history and must never be
 "updated" to match a later `categoryOf`.
@@ -251,8 +251,8 @@ quantified over the legacy category and re-derives both sides from the same
 table, so SWAPPING the `file` and `nondet` spellings satisfies all of them — and
 every old `interest=file,proc,lib` depfile then reads as having observed
 environment reads and entropy, which is exactly the false accept the derivation
-was introduced to make unwritable. The derivation guarantees the *expansion*, not
-the *pairing*.
+was introduced to make unwritable. The derivation guarantees the _expansion_, not
+the _pairing_.
 
 The pairing is frozen history, so it cannot be derived from anything in today's
 code. It is instead pinned to something no edit to the table can move: **the
@@ -272,10 +272,10 @@ the bytes it claims to describe.
 The stamp and the env value are one vocabulary with **two encoders**, because the
 two channels have opposite safe directions:
 
-| channel | reader | harm | so the encoder |
-|---|---|---|---|
-| depfile `interest=` stamp | a consumer comparing scope against its requirement | over-stating ⇒ **false accept** | emits canonical spellings only (`interestToTokens`) |
-| `REPRO_MONITOR_INTEREST` | a shim deciding what it may decline to observe | under-stating ⇒ **records that never exist** | emits canonical spellings **plus** the pre-DA-5 ones (`interestToShimTokens`) |
+| channel                   | reader                                             | harm                                         | so the encoder                                                                |
+| ------------------------- | -------------------------------------------------- | -------------------------------------------- | ----------------------------------------------------------------------------- |
+| depfile `interest=` stamp | a consumer comparing scope against its requirement | over-stating ⇒ **false accept**              | emits canonical spellings only (`interestToTokens`)                           |
+| `REPRO_MONITOR_INTEREST`  | a shim deciding what it may decline to observe     | under-stating ⇒ **records that never exist** | emits canonical spellings **plus** the pre-DA-5 ones (`interestToShimTokens`) |
 
 The rule is derived, not written down: a legacy token is emitted exactly when the
 legacy category it names contains a record kind this interest wants —
@@ -337,7 +337,7 @@ vocabulary change, including one that retires `proc` or `lib`.
 **Recording, at the emit funnel.** The POSIX shims read `REPRO_MONITOR_INTEREST`
 at init into a global `set[EventCategory]` and consult it at exactly ONE site
 each — `emitRecord` in `shim/linux_preload.nim` and in `shim/macos_interpose.nim`
-— returning early when the record's category is disabled, *before* constructing
+— returning early when the record's category is disabled, _before_ constructing
 the record and publishing it to the gset. That removes the expensive part
 (record build + shm insert + dedup) for unwanted categories. The hook still
 fires but does almost nothing.
@@ -355,7 +355,7 @@ here rather than left for the next reader to discover:
   appears nowhere in `shim/windows_interpose.nim`. A narrowed Windows capture is
   correct anyway — the shim over-captures and the host filter (§5) removes what
   was not asked for, which is the one direction that filter can fix — but it pays
-  the full recording cost. Note that this is the *safe* half of the ignore rule:
+  the full recording cost. Note that this is the _safe_ half of the ignore rule:
   a Windows shim that started honouring the variable would join the class §3.3
   exists for.
 
@@ -363,6 +363,7 @@ here rather than left for the next reader to discover:
 
 `collectMonitorEvidence` drops any record whose category is present-and-disabled
 before it reaches the depfile, so:
+
 - an older shim that does not honour the env at all, or honours it and
   over-captures, still yields a correctly-filtered result, and
 - the invariant "the depfile contains only categories the consumer asked for"
@@ -374,11 +375,11 @@ before it reaches the depfile, so:
 FALSE OF WHAT IT IS MISSING**, and the two used to be stated as one. This filter
 runs after `mergeFragments` and its only operation is to **remove** records. So:
 
-| the shim emits | the host filter | result |
-|---|---|---|
-| more than asked for | removes the excess | **correct** — the guarantee above |
-| exactly what was asked for | removes nothing | correct |
-| **less** than asked for | **cannot restore anything** | a short depfile that says it is complete |
+| the shim emits             | the host filter             | result                                   |
+| -------------------------- | --------------------------- | ---------------------------------------- |
+| more than asked for        | removes the excess          | **correct** — the guarantee above        |
+| exactly what was asked for | removes nothing             | correct                                  |
+| **less** than asked for    | **cannot restore anything** | a short depfile that says it is complete |
 
 The third row is not hypothetical and is not an adversary: it is what a shim
 honouring `REPRO_MONITOR_INTEREST` in an older token vocabulary does. §3 has the
@@ -406,13 +407,13 @@ if not observedInterestCovers(dep, {ecFileReads, ecEnvReads}):
 `normalizeInterest` is the trap this accessor exists to remove. `{}` arises three
 ways and they do not mean the same thing:
 
-| file | `observedInterestStated` | `effectiveObservedInterest` | full-scope consumer |
-|---|---|---|---|
-| no stamp (written before DA-1j, or a caller that stated no scope) | `false` | `FullInterest` | ACCEPT — unchanged from before the field existed |
-| stamp naming categories this build knows | `true` | those categories | ACCEPT iff they cover the requirement |
-| stamp naming **only** categories this build cannot name (`interest=gpu`, from a newer io-mon) | `true` | `{}` | **REJECT** — the file states a scope this build cannot evaluate |
-| stamp whose VALUE is empty (`interest=`) | `true` | `{}` | **REJECT** — same reason, and it needs its own answer: `parseInterestTokens` widens `""` to `FullInterest`, which is right for the env channel (an unset `REPRO_MONITOR_INTEREST` means "capture everything") and a false ACCEPT here |
-| **pre-DA-5 stamp** naming only OLD tokens (`interest=file,proc,lib,nondet,ipc`) | `true` | the derived expansion — here `FullInterest` | ACCEPT iff it covers the requirement. §3.2; the expansion is computed from `categoryOf`, so it can never name a category the old capture did not observe |
+| file                                                                                          | `observedInterestStated` | `effectiveObservedInterest`                 | full-scope consumer                                                                                                                                                                                                                   |
+| --------------------------------------------------------------------------------------------- | ------------------------ | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| no stamp (written before DA-1j, or a caller that stated no scope)                             | `false`                  | `FullInterest`                              | ACCEPT — unchanged from before the field existed                                                                                                                                                                                      |
+| stamp naming categories this build knows                                                      | `true`                   | those categories                            | ACCEPT iff they cover the requirement                                                                                                                                                                                                 |
+| stamp naming **only** categories this build cannot name (`interest=gpu`, from a newer io-mon) | `true`                   | `{}`                                        | **REJECT** — the file states a scope this build cannot evaluate                                                                                                                                                                       |
+| stamp whose VALUE is empty (`interest=`)                                                      | `true`                   | `{}`                                        | **REJECT** — same reason, and it needs its own answer: `parseInterestTokens` widens `""` to `FullInterest`, which is right for the env channel (an unset `REPRO_MONITOR_INTEREST` means "capture everything") and a false ACCEPT here |
+| **pre-DA-5 stamp** naming only OLD tokens (`interest=file,proc,lib,nondet,ipc`)               | `true`                   | the derived expansion — here `FullInterest` | ACCEPT iff it covers the requirement. §3.2; the expansion is computed from `categoryOf`, so it can never name a category the old capture did not observe                                                                              |
 
 The last two rows are the ones that matter for a wire format: each is a NARROWED capture,
 and reading it as full scope would republish the false complete this stamp exists
@@ -429,7 +430,7 @@ consumer must still be able to accept a full capture.
 here. It drops the lookups that found NOTHING, which is a predicate on a
 record's RESULT; every category in §1 gates on its KIND, and success is not a
 kind. Measured on one `nim c`: dropping every failed lookup leaves 23,049
-records, while gating a probes *category* leaves 41,736 — discarding 2,066
+records, while gating a probes _category_ leaves 41,736 — discarding 2,066
 successful probes and keeping 20,753 failed opens.
 
 DA-5 introduced `ecPathProbes`, which IS the probes category that table prices,
@@ -455,7 +456,7 @@ caveat. §7 keeps the measurement, because it is what the rule now rests on.
 
 ## 7. Non-goals
 
-- No per-*path* or per-*kind* filtering (categories only — keep it coarse).
+- No per-_path_ or per-_kind_ filtering (categories only — keep it coarse).
 - No dynamic re-configuration mid-run (interest is fixed at spawn).
 - reprobuild wiring is a separate change in reprobuild's monitored-action
   launch; this doc specifies io-mon's surface only. Recorded here because it
@@ -467,7 +468,7 @@ caveat. §7 keeps the measurement, because it is what the rule now rests on.
   exactly one category — `ecAmbientReads` — has no consumer on that side. io-mon
   does not make reprobuild's decision for it; it now makes one expressible.
 - **The §6 caveat that USED to live here, and what closed it.** Two gate-able
-  kinds were *completeness-bearing*: `mrIpcConnect` (`ecIpc`) and
+  kinds were _completeness-bearing_: `mrIpcConnect` (`ecIpc`) and
   `mrExternalContent` (`ecNonDeterminism`). `mergeFragments` turns each
   out-of-tree IPC peer (`unmonitoredSubtreeLossDetails`) and each unpaired
   external content channel (`externalContentLossCount`) into a synthetic
@@ -489,20 +490,20 @@ caveat. §7 keeps the measurement, because it is what the rule now rests on.
   `socat UNIX-LISTEN` peer started OUTSIDE the monitored tree, and the same
   monitored command (`socat -u - UNIX-CONNECT:<sock>`) run twice:
 
-  | run | completeness | eventLoss | records |
-  |---|---|---|---|
-  | `io-mon run` (all categories) | `mcIncomplete` | 1 | 32 |
-  | `io-mon run --interest file,proc,lib` (pre-DA-5 vocabulary) | **`mcComplete`** | 0 | 23 |
+  | run                                                         | completeness     | eventLoss | records |
+  | ----------------------------------------------------------- | ---------------- | --------- | ------- |
+  | `io-mon run` (all categories)                               | `mcIncomplete`   | 1         | 32      |
+  | `io-mon run --interest file,proc,lib` (pre-DA-5 vocabulary) | **`mcComplete`** | 0         | 23      |
 
   **AND RE-MEASURED ON THE SAME SHAPE AFTER DA-5** (2026-09-25, Linux, this
   build's shim and CLI, one `socat UNIX-LISTEN` peer started outside the
   monitored tree, three sequential arms against one live listener):
 
-  | run | completeness | eventLoss | records | `mrIpcConnect` |
-  |---|---|---|---|---|
-  | `io-mon run` (all categories) | `mcIncomplete` | 1 | 31 | 1 |
-  | `--interest file-reads,path-probes,file-writes,proc,lib` | `mcIncomplete` | **1** | 26 | **1** |
-  | `--interest file,proc,lib` (the alias) | `mcIncomplete` | **1** | 26 | **1** |
+  | run                                                      | completeness   | eventLoss | records | `mrIpcConnect` |
+  | -------------------------------------------------------- | -------------- | --------- | ------- | -------------- |
+  | `io-mon run` (all categories)                            | `mcIncomplete` | 1         | 31      | 1              |
+  | `--interest file-reads,path-probes,file-writes,proc,lib` | `mcIncomplete` | **1**     | 26      | **1**          |
+  | `--interest file,proc,lib` (the alias)                   | `mcIncomplete` | **1**     | 26      | **1**          |
 
   The same command line that used to publish a false clean now keeps the
   `mrIpcConnect` record and the `mrEventLoss` derived from it, and grades
@@ -512,7 +513,7 @@ caveat. §7 keeps the measurement, because it is what the rule now rests on.
   stamped `interest=file-reads,path-probes,file-writes,proc,lib`.
 
   The loss record the full run carries is `unmonitored subtree/peer … IPC
-  connect to an out-of-tree breakaway daemon`. Reducing the interest did not
+connect to an out-of-tree breakaway daemon`. Reducing the interest did not
   hide a record the consumer had declined to see; it published a **false
   clean** for an edge whose real inputs came from a daemon io-mon never
   watched — the cardinal sin, reached by asking the monitor not to look. The
