@@ -98,3 +98,24 @@ before extending this record. The expected session behavior is documented on
 cited above. Logs: `/tmp/io-mon-80a7-linux-repro-native-failure.log`,
 `/tmp/io-mon-80a7-linux-new-repro-failure.log`, and
 `/tmp/io-mon-fold-old-outer-session.log`.
+
+## IPC fixture selects the bootstrap shim instead of its own build
+
+At `378d272`, the complete native Linux suite passes. The Reprobuild-flavor
+[job 110447411884](https://github.com/metacraft-labs/io-mon/actions/runs/36885410804/job/110447411884)
+fails only the new AF_UNIX endpoint/peer-UID case in
+`test_io_mon_linux_stdio_ipc`: the captured connect has an empty path and the
+older detail format `connect af_unix peer=... run=...`, with no `peeruid`.
+
+The fixture runs `build_shim.sh` but then calls `findShimLibrary`, which honors
+the enclosing build's `REPRO_MONITOR_SHIM_LIB`. Thus building the current shim
+does not ensure the test selects it. Use the existing real private-shim builder
+and its exact returned path for this suite, preserving the endpoint, UID and
+incomplete-capture assertions. Verify the fixture with a deliberately different
+ambient shim selection and retain any further nested-monitor finding separately.
+
+The expected real connect identity is specified in
+`reprobuild-specs/Dev-Env-Warm-Entry.md`, section 3, as cited by the test.
+Fetched `agents` and `dev` and searched the existing and archived fixture-shim
+records before extending this issue. The Linux CI log is retained locally as
+`/tmp/io-mon-378-linux-repro-flavor-promotion.log`.
