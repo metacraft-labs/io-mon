@@ -38,7 +38,7 @@ jobs:
           owner: metacraft-labs
       - name: Compare the identical fixture with both execution policies
         shell: bash
-        run: dev-exec /usr/bin/python3 .github/scripts/diagnose_linux_ipc_isolation.py
+        run: /usr/bin/python3 .github/scripts/diagnose_linux_ipc_isolation.py
       - name: Retain focused evidence
         if: always()
         uses: actions/upload-artifact@v4
