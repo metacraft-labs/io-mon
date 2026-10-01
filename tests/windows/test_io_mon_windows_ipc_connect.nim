@@ -298,6 +298,19 @@ suite "Windows ipc-connect: what must NOT be recorded":
       let decoy = dir / "pipe"
       createDir(decoy)
       writeFile(decoy / "notapipe.txt", "ordinary bytes")
+      # Native Nimble binaries live under tests/windows, so discovery needs
+      # the repo cwd. Resolve the real DLL before changing that cwd, while
+      # preserving an enclosing caller's explicit shim selection.
+      let shimLib = findShimLibrary()
+      require shimLib.len > 0
+      let hadShimOverride = existsEnv(ShimLibOverrideEnv)
+      let previousShimOverride = getEnv(ShimLibOverrideEnv)
+      putEnv(ShimLibOverrideEnv, shimLib)
+      defer:
+        if hadShimOverride:
+          putEnv(ShimLibOverrideEnv, previousShimOverride)
+        else:
+          delEnv(ShimLibOverrideEnv)
       let previous = getCurrentDir()
       setCurrentDir(dir)          # the child inherits this
       defer: setCurrentDir(previous)
