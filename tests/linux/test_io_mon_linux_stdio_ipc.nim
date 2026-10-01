@@ -1945,7 +1945,10 @@ int main(void) {
     fprintf(stderr, "getrandom failed: %s\n", strerror(errno));
     return 8;
   }
-  return rnd[0] == 255 ? 9 : 0;
+  /* Every byte is valid entropy, including 255. Consume it without making
+   * successful execution depend on its value. */
+  printf("entropy-byte=%u\n", (unsigned int)rnd[0]);
+  return 0;
 }
 """)
     let depfile = work / "non-file-determinism.iomon"
