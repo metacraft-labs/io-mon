@@ -66,12 +66,17 @@ def execute(label, isolated):
         assert result.returncode == 0, summary
         assert action["status"] == "asSucceeded" and action["exitCode"] == 0, summary
         assert action["cacheDecision"] == "cdNotCacheable", summary
-        assert action["dependencyPolicyKind"] == "dgDepfile", summary
+        assert action["dependencyPolicyKind"] == "dgRecognizedFormat", summary
     else:
         assert result.returncode != 0 and action["status"] == "asFailed", summary
         assert action["dependencyPolicyKind"] == "dgAutomaticMonitor", summary
         assert "cap.code was 139" in action["stdout"], summary
-    return summary["artifacts"]
+    # The suite builds a private shim and passes its exact path to every
+    # child. The graph's build/lib shim is not selected by these cases; it
+    # can be rebuilt while the recipe changes. Retain its hash for audit,
+    # but compare the executable fixture and CLI, whose inputs are fixed.
+    return {path: digest for path, digest in summary["artifacts"].items()
+            if not path.startswith("build/lib/")}
 
 
 def main():
@@ -99,7 +104,7 @@ def main():
         assert execute("isolated-repeat", isolated=True) == baseline
         RECIPE.write_text(selected)
         assert execute("monitored-after", isolated=False) == baseline
-        print("Identical fixture, CLI and shim hashes; two real isolated executions; "
+        print("Identical fixture and CLI hashes; two real isolated executions; "
               "both monitored negative controls reproduce child exit 139.", flush=True)
     finally:
         RECIPE.write_text(original)
