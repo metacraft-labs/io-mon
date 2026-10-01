@@ -29,8 +29,8 @@ or compiles + runs a live C probe.
 
 ## How the suite selects tests per OS
 
-`nimble test` (see the `test` task in `io_mon.nimble`) does **directory
-discovery**, not a hand-maintained list:
+`just test` runs `scripts/run_tests.nims`, using the directory catalog shared
+with Nimble in `scripts/test_catalog.nims`:
 
 - it ALWAYS runs every `portable/test_*.nim`;
 - it adds `posix/test_*.nim` when the host is POSIX (`when defined(posix)`);
@@ -42,7 +42,7 @@ selected directory's `test_*.nim` files are discovered with `listFiles`, sorted
 for determinism, and compiled + run with:
 
 ```
-nim c -r --path:../nim-stackable-hooks/src --path:tests/helpers <file>
+nim c -r --path:tests/helpers <file>
 ```
 
 `--path:src` is supplied by the repo-root `config.nims`, and resolves correctly
@@ -50,14 +50,16 @@ no matter how deep a test file lives because the suite always runs from the repo
 root. Adding a `test_*.nim` to a selected directory makes it run with **no edit
 to the task**.
 
-Convenience sub-tasks: `nimble testPortable` (only the every-OS tests) and
-`nimble testPlatform` (only the host-OS platform-specific tests).
+Convenience commands: `just test-portable` (only the every-OS tests) and
+`just test-platform` (only the host-OS platform-specific tests). Just invokes
+Nim directly so a test failure reaches the caller even on Windows, where the
+Nimble bundled with Nim 2.2.10 can return zero after a task exception.
 
 ## Adding support for a new OS (e.g. FreeBSD / Solaris)
 
 1. Create `tests/<os>/` (e.g. `tests/freebsd/`) and add a short `README.md`
    describing what live behaviour belongs there.
-2. Add an arm to `selectedTestDirs()` in `io_mon.nimble`:
+2. Add an arm to `selectedTestDirs()` in `scripts/test_catalog.nims`:
 
    ```nim
    when defined(freebsd):

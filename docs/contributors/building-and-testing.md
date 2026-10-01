@@ -67,21 +67,24 @@ Runs the portable tests plus whatever directories match the host operating syste
 ```sh
 just test
 # OR
-repro build io-mon:test
-# OR
-nimble test
+repro test
 ```
+
+`just test` invokes Nim directly through `scripts/run_tests.nims`. Its sorted
+catalog is shared with the compatibility Nimble tasks. Use Just or Reprobuild
+for test verdicts: the Windows Nimble bundled with Nim 2.2.10 can return zero
+after a task exception.
 
 ### Run only portable tests
 
 ```sh
-nimble testPortable
+just test-portable
 ```
 
 ### Run only host-platform specific tests
 
 ```sh
-nimble testPlatform
+just test-platform
 ```
 
 ---
