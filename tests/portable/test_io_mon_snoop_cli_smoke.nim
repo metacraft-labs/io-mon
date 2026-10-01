@@ -12,6 +12,7 @@
 import std/[os, osproc, streams, strutils, tempfiles, unittest]
 
 import io_mon  # writeCanonical, MonitorRecord, observation kinds
+import fixture_cleanup
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
@@ -67,4 +68,4 @@ suite "io-mon CLI (M8) — portable build + inspect":
     check code == 0
     check "iomon" in output
 
-  removeDir(work)
+  removeFixtureTree(work)
