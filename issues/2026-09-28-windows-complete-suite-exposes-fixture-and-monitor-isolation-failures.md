@@ -296,3 +296,12 @@ uncached uninjected premise, every case and the existing bounded cleanup; do
 not suppress errors, disable Windows caches, move images or change deadlines.
 Full Windows CI must qualify this scheduling repair. A passing focused run
 alone does not close this issue or permit release.
+
+The ordering patch at `f756aa3` plus the working diff materializes all 117
+macOS build/dependency actions successfully. Windows alone delays the two
+cleanup-sensitive execute actions; POSIX execution dependencies are unchanged.
+The isolated Windows repeat collection now also includes ordinary prerequisites,
+so its CI checker identifies each of the original eight execute actions by name
+and still requires all eight to launch, succeed and exit zero. The names must
+match exactly once each. Actionlint and the expanded PowerShell syntax check
+pass. Full execution and native Windows qualification remain pending.

@@ -165,8 +165,23 @@ jobs:
           dev-exec repro build --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }} .#test-monitor-isolation --write-report=build/monitor-isolation-repeat.json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $report = Get-Content build/monitor-isolation-repeat.json -Raw | ConvertFrom-Json
-          $runs = @($report.actions | Where-Object { $_.id -like 'io-mon.test_execute.*' })
-          if ($runs.Count -ne 8) { throw "Expected all eight isolated test programs" }
+          # Cleanup ordering adds ordinary test prerequisites to this closure.
+          # Still require each of the original eight programs to launch again.
+          $expected = @(
+            'test_io_mon_cli_exit_status',
+            'test_io_mon_windows_exit_status',
+            'test_io_mon_windows_host_session_scope',
+            'test_io_mon_windows_native_system_child',
+            'test_io_mon_windows_read_capture',
+            'test_io_mon_windows_root_guard',
+            'test_io_mon_windows_spawn_abandoned_injection',
+            'test_io_mon_windows_spawn_resume_invariant'
+          ) | ForEach-Object { "io-mon.test_execute.$_.exe" }
+          $runs = @($report.actions | Where-Object { $_.id -in $expected })
+          if ($runs.Count -ne 8 -or
+              (Compare-Object ($expected | Sort-Object) ($runs.id | Sort-Object))) {
+            throw "Expected each of the eight isolated test programs exactly once"
+          }
           foreach ($run in $runs) {
             if (-not $run.launched -or $run.status -ne 'asSucceeded' -or $run.exitCode -ne 0) {
               throw "Test did not execute successfully again: $($run.id)"
