@@ -39,3 +39,13 @@ but cannot qualify glibc behavior.
 Before filing, fetched `agents`/`dev` and searched current issues plus deleted
 issue history for dlopen, RUNPATH and ELF; no existing owner issue covers this.
 Consumer evidence: [Reprobuild loader issue](../../reprobuild-specs/issues/2026-10-03-source-interface-extraction-cannot-load-openssl-in-codetracer-ci.md).
+
+## Verified repair
+
+Implementation `10249629cc97f01aa5bafe9dff8fa3c00cc82749` passes all six real
+Linux loader cases in [run 37132084729](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/37132084729),
+using diagnostic workflow `6d41c0c9aa67e2fdbca0bbeed9269c99f69e113e` on
+`ubuntu-24.04`. Restoring the existence-only search reproduces `ELFCLASS32` for
+RPATH, RUNPATH and LD_LIBRARY_PATH, failing the new assertion. The malformed
+candidate case remains fatal in both runs. Local Linux-targeted C generation
+passes for the shim and regression on macOS. Full promotion CI remains required.
