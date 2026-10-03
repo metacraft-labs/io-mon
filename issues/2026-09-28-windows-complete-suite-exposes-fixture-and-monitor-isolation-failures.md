@@ -216,3 +216,28 @@ attributes and actual process owners and validates the query against its own
 live image. Diagnostic failure must not replace the original fatal cleanup
 error. No waits, assertions, fixture placement, or cache policy change. The
 full native Windows ARM64 Reprobuild graph must produce the missing evidence.
+
+## Retaining processes measured in the full ARM graph
+
+At `91a0e66909ef6d7d8ecd5a515038f559450604e1`, Windows ARM64 emulation
+[job 111224969896](https://github.com/metacraft-labs/io-mon/actions/runs/37130650109/job/111224969896)
+again completes 98 of 100 actions. All native exit-status and session-scope
+assertions pass before the unchanged 30-second cleanup fails. Artifact
+`11278619336` contains the actual failure report and positive-control evidence:
+
+- The private CLI image has ordinary attributes (128, not read-only).
+  Restart Manager names `xtac64se.exe` (PID 8976) and `XtaCache.exe` (PID 2544).
+- The private session shim DLL has the same ordinary attributes. Its sole
+  reported owner is `XtaCache.exe` (PID 2544).
+- Both live-image query controls detect their own fixture process correctly
+  (PIDs 3276 and 6072). No query failed.
+
+This establishes the owners in the failing full graph. It does not establish
+that a particular removal API can unlink their retained image mappings.
+Preserve cleanup failure, all functional assertions, and the default Windows
+translation-cache behavior. Investigate documented removal semantics against
+real handles and mapped images before changing the cleanup helper. Do not kill
+these system processes, disable the cache or defer deletion until reboot.
+
+Refreshed `agents` at `081f95fb` before extending this existing issue. Ordinary
+CI, sanitizers and Linux/macOS/Windows x64 Reprobuild jobs pass at `91a0e669`.
