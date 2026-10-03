@@ -273,3 +273,26 @@ is still running as of 18:43 UTC on 2026-10-03. Every report must show its
 selected action actually launched. No assertion, dependency policy, cacheability
 or cleanup deadline changes. Its superseded predecessor `37141310130` stopped
 at an incorrect version probe and supplies no product verdict.
+
+## Exact focused Repro qualification and scheduling repair
+
+At product `b464ce17cdf2196e61ccf4ab3e61ed0ee1a70ed2`, shared-actions
+`e01b508fdf5dcf12e17191be38f1de1612da022b`
+[run 37143020045](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/37143020045)
+passes both affected fixtures three times each on Windows ARM x64 emulation.
+Every report records the expected execute action as launched and successful,
+using its original dependency policy. The diagnostic uses the production
+Repro bootstrap, compiler, monitor and dependency revisions; temporary collection
+aliases select the existing actions without changing their implementations.
+Every functional assertion and the original 30-second cleanup bound passes.
+This removes the differing compiler/dependency pins from the earlier quiet-run
+comparison. It does not prove which Windows cache service activity causes the
+full graph's retained images.
+
+The remaining difference is the concurrent full-suite context. Under LOCAL-4,
+finish all test compilation and ordinary execute actions before these two
+cleanup-sensitive programs, and run the two one at a time. Preserve their
+uncached uninjected premise, every case and the existing bounded cleanup; do
+not suppress errors, disable Windows caches, move images or change deadlines.
+Full Windows CI must qualify this scheduling repair. A passing focused run
+alone does not close this issue or permit release.
