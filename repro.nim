@@ -116,6 +116,7 @@ package io_mon:
       "rustc"
     when defined(macosx):
       "cctools"
+      "python3"
     when defined(linux):
       "getconf"
       "grep"
@@ -347,6 +348,8 @@ package io_mon:
           ["dirname", "uname", "rustc"])
       when defined(macosx):
         appendRegisteredActionToolIdentityRefs(executeEdge.id, ["cctools"])
+        if stem == "test_io_mon_macos_readdir_inode64":
+          appendRegisteredActionToolIdentityRefs(executeEdge.id, ["python3"])
       when defined(linux):
         appendRegisteredActionToolIdentityRefs(executeEdge.id,
           ["strace", "nm", "getconf", "grep"])
