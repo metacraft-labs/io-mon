@@ -875,35 +875,37 @@ void *repro_macos_real_mmap_syscall(void *addr, size_t len, int prot, int flags,
 #endif
 }
 
-/* ROUND-5 D — faithful forward for the `syscall(2)` hook: issue the BSD syscall
- * `number` with up to six register args (arm64: x16=number, x0..x5=args, result in
- * x0, carry flag = error → errno). Mirrors libsystem's own `syscall` wrapper, so
+/* Faithful forward for the `syscall(2)` hook: use the kernel's indirect entry,
+ * x16=SYS_syscall, x0=number, x1..x7=arguments, x0=result, carry=error. This
+ * preserves all seven argument slots exposed by libsyscall's ARM64 entry, so
  * forwarding through it is transparent. Used by repro_hook_syscall to record/flag a
  * file syscall a monitored program issued via the (non-inlined) `syscall(2)` escape
  * hatch and then complete it. NOT a raw-svc the interpose can't see — this IS the
  * interposed path; the un-hookable case is an INLINE svc in the program's own code,
  * caught instead by repro_macos_scan_main_text_for_raw_syscall. */
 long repro_macos_real_syscall(long number, long a1, long a2, long a3,
-                              long a4, long a5, long a6) {
+                              long a4, long a5, long a6, long a7) {
 #if defined(__arm64__) || defined(__aarch64__)
-  register long x0 __asm__("x0") = a1;
-  register long x1 __asm__("x1") = a2;
-  register long x2 __asm__("x2") = a3;
-  register long x3 __asm__("x3") = a4;
-  register long x4 __asm__("x4") = a5;
-  register long x5 __asm__("x5") = a6;
-  register long x16 __asm__("x16") = number;
-  register long err __asm__("x6");
+  register long x0 __asm__("x0") = number;
+  register long x1 __asm__("x1") = a1;
+  register long x2 __asm__("x2") = a2;
+  register long x3 __asm__("x3") = a3;
+  register long x4 __asm__("x4") = a4;
+  register long x5 __asm__("x5") = a5;
+  register long x6 __asm__("x6") = a6;
+  register long x7 __asm__("x7") = a7;
+  register long x16 __asm__("x16") = SYS_syscall;
+  register long err __asm__("x8");
   __asm__ volatile(
     "svc #0x80\n\t"
-    "cset x6, cs\n"
+    "cset x8, cs\n"
     : "+r"(x0), "=r"(err)
-    : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x16)
+    : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x6), "r"(x7), "r"(x16)
     : "cc", "memory");
   if (err) { errno = (int)x0; return -1; }
   return x0;
 #else
-  (void)number; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+  (void)number; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7;
   errno = ENOSYS;
   return -1;
 #endif
@@ -1364,26 +1366,6 @@ static const char *repro_macos_env_value(char **envp, const char *name) {
 }
 
 /*
- * True if colon-delimited `list` already contains `item` as a whole element.
- * Used to keep our shim present EXACTLY ONCE in DYLD_INSERT_LIBRARIES across a
- * deep monitored process tree (prepending unconditionally would grow the value
- * shim:shim:shim… at every generation).
- */
-static int repro_macos_pathlist_has(const char *list, const char *item) {
-  if (!list || !item || !item[0]) return 0;
-  size_t item_len = strlen(item);
-  const char *p = list;
-  while (*p) {
-    const char *end = strchr(p, ':');
-    size_t seg_len = end ? (size_t)(end - p) : strlen(p);
-    if (seg_len == item_len && strncmp(p, item, item_len) == 0) return 1;
-    if (!end) break;
-    p = end + 1;
-  }
-  return 0;
-}
-
-/*
  * Build the monitored child's environment: OVERRIDE (not skip-if-present) the
  * injection vars (findings doc T1, break #2). A caller that scrubs or sets an
  * EMPTY/bogus DYLD_INSERT_LIBRARIES / CT_SANDBOX_TOOLS_DIR previously BLOCKED
@@ -1391,7 +1373,7 @@ static int repro_macos_pathlist_has(const char *list, const char *item) {
  * and unmonitored. We now:
  *   * Force DYLD_INSERT_LIBRARIES to our shim, PREPENDED so it is always first,
  *     while preserving any genuine additional libraries the caller listed (and
- *     never duplicating our own shim — see repro_macos_pathlist_has).
+ *     never duplicating our own shim).
  *   * Force CT_SANDBOX_TOOLS_DIR to the active sandbox-tools dir.
  * The caller's matching entries are dropped and our overrides appended, so the
  * result has exactly one authoritative value for each.
@@ -1431,19 +1413,27 @@ static char **repro_macos_env_with_preload(char **envp) {
 
   if (want_dyld) {
     const char *prefix = "DYLD_INSERT_LIBRARIES=";
-    /* Append the caller's other libraries after ours, unless they already
-     * include our shim (avoid unbounded shim:shim… growth across the tree). */
-    int append_existing =
-      existing_dyld && existing_dyld[0] != '\0' &&
-      !repro_macos_pathlist_has(existing_dyld, shim);
-    size_t value_len = strlen(prefix) + strlen(shim) +
-      (append_existing ? 1 + strlen(existing_dyld) : 0) + 1;
+    /* Put the monitor first once, then retain the caller's other entries in
+     * their original order. Finding our shim in the list must not discard
+     * the OTHER libraries (including an inner monitor's distinct image). */
+    size_t shim_len = strlen(shim);
+    size_t value_len = strlen(prefix) + shim_len +
+      (existing_dyld ? 1 + strlen(existing_dyld) : 0) + 1;
     char *value = (char *)malloc(value_len);
     if (!value) { free(result); return envp; }
-    if (append_existing)
-      snprintf(value, value_len, "%s%s:%s", prefix, shim, existing_dyld);
-    else
-      snprintf(value, value_len, "%s%s", prefix, shim);
+    size_t used = (size_t)snprintf(value, value_len, "%s%s", prefix, shim);
+    for (const char *p = existing_dyld; p && *p;) {
+      const char *end = strchr(p, ':');
+      size_t len = end ? (size_t)(end - p) : strlen(p);
+      if (len && !(len == shim_len && strncmp(p, shim, len) == 0)) {
+        value[used++] = ':';
+        memcpy(value + used, p, len);
+        used += len;
+      }
+      if (!end) break;
+      p = end + 1;
+    }
+    value[used] = '\0';
     result[slot++] = value;
   }
   if (want_sandbox) {
@@ -3140,11 +3130,11 @@ proc ct_macos_capture_main_image*() =
   proc impl() {.importc: "repro_macos_capture_main_image", cdecl.}
   impl()
 
-proc ct_macos_real_syscall*(number, a1, a2, a3, a4, a5, a6: clong): clong =
+proc ct_macos_real_syscall*(number, a1, a2, a3, a4, a5, a6, a7: clong): clong =
   ## ROUND-5 D — faithful forward of a `syscall(2)` indirect call (see the C note).
-  proc impl(number, a1, a2, a3, a4, a5, a6: clong): clong
+  proc impl(number, a1, a2, a3, a4, a5, a6, a7: clong): clong
     {.importc: "repro_macos_real_syscall", cdecl.}
-  impl(number, a1, a2, a3, a4, a5, a6)
+  impl(number, a1, a2, a3, a4, a5, a6, a7)
 
 proc ct_macos_syscall_is_file_op*(number: clong): bool =
   ## ROUND-5 D — true iff `number` is a file open/read/dir/stat syscall that, issued

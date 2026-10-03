@@ -75,6 +75,19 @@ catalog is shared with the compatibility Nimble tasks. Use Just or Reprobuild
 for test verdicts: the Windows Nimble bundled with Nim 2.2.10 can return zero
 after a task exception.
 
+### Verify isolated programs execute again
+
+`repro build .#test-monitor-isolation --write-report=build/monitor-isolation-repeat.json`
+reruns the programs whose fixture must own its monitor environment. Their
+compilation stays monitored and their execution stays uncached. CI requires
+all selected programs to launch and succeed on the repeat: 45 on macOS, nine
+on Linux and eight on Windows. Update that explicit inventory when adding an
+isolated program; keep the complete report among failure artifacts.
+
+At `40a0adc` plus the workflow inventory repair, the macOS repeat passes all
+137 actions and launches all 45 isolated programs. The previous expectation
+of 42 rejects that complete successful report; the corrected count accepts it.
+
 ### Run only portable tests
 
 ```sh

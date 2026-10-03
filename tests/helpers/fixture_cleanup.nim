@@ -4,6 +4,7 @@
 import std/os
 when defined(windows):
   import std/[monotimes, times]
+  import windows_file_owners
 
 proc removeFixtureTree*(path: string) =
   when defined(windows):
@@ -14,6 +15,11 @@ proc removeFixtureTree*(path: string) =
         return
       except OSError:
         if getMonoTime() >= deadline:
+          echo "Fixture cleanup failed: ", getCurrentExceptionMsg()
+          try:
+            diagnosticCleanupOwners(path)
+          except CatchableError as diagnosticError:
+            echo "Cleanup owner query failed: ", diagnosticError.msg
           raise
         sleep(25)
   else:

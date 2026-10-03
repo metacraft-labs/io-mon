@@ -130,6 +130,31 @@ Nim and without touching any thread-local**. The Nim hook (and its `inMmapHook`
 mappings, which are never issued from inside libmalloc. All recording behaviour is
 preserved. See `tests/macos/test_io_mon_macos_mmap_reentrancy.nim`.
 
+## macOS variadic syscall forwarding
+
+Apple ARM64 puts variadic arguments on the stack. The interposed `syscall(int,
+...)` entry must marshal those slots before calling a fixed-signature helper.
+Its assembly entry preserves all seven slots supported by libsyscall and enters
+the kernel through the indirect syscall entry. Before initialization, dispatch
+stays in C and assembly; it neither allocates nor enters Nim TLS. The kernel's
+carry flag controls errno, and successful results retain their full width.
+
+A fixed-argument replacement reads unrelated registers. With two distinct shim
+images, one image's entropy forwarder calls the other's interposed syscall during
+libmalloc initialization, which can return without filling the random buffer and
+leave rejection sampling spinning before `main`.
+
+`test_io_mon_macos_syscall_abi.nim` uses real file operations, a mapping at a
+nonzero offset, a wide seek result, errno and entropy controls. Its two-image
+startup test is bounded and requires captured input evidence. The raw-syscall
+fixture also checks the child status and output: an incomplete verdict alone
+cannot prove that forwarding worked.
+
+This fixes startup with distinct images. It does not give an outer session the
+records owned by an independent inner session. The outer monitor must continue
+to report missing descendant evidence as incomplete. Self-injecting Reprobuild
+fixtures retain their uncached execution isolation.
+
 ## Adding a new hook — checklist
 
 1. **Can the host's libmalloc/dyld/signal machinery call this function
@@ -145,3 +170,14 @@ preserved. See `tests/macos/test_io_mon_macos_mmap_reentrancy.nim`.
 4. Add a regression test that exercises the hook from inside a real allocator on
    multiple threads (a heavy multi-threaded toolchain like `rustc` is the reliable
    reproducer — see the mmap-reentrancy test).
+
+### Child library propagation
+
+`repro_macos_env_with_preload` keeps the monitor first and present once, then
+retains every other requested `DYLD_INSERT_LIBRARIES` entry in its original
+relative order. Finding the monitor already in the list must not discard the
+other libraries. The regression in
+`tests/macos/test_io_mon_macos_preload_libraries.nim` loads two real marker
+dylibs through spawn, SETEXEC and execve under both backends. It also requires
+captured input evidence, rejects duplicated monitor entries and supervises
+each launch with a process-group timeout.

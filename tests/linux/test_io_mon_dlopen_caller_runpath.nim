@@ -87,12 +87,13 @@ int main(void) {
   # LD_LIBRARY_PATH); `--disable-new-dtags` emits legacy DT_RPATH (searched
   # BEFORE it). glibc treats the two differently, the fix reproduces both
   # orderings, so both get their own binary.
-  proc buildApp(name: string; dtagFlag: string): string =
+  proc buildApp(name: string; dtagFlag: string;
+      searchPath = "$ORIGIN/privlib"): string =
     result = work / name
     let src = work / (name & ".c")
     writeFile(src, appSource)
     let built = run(cc, @[src, "-o", result, "-ldl",
-      "-Wl," & dtagFlag, "-Wl,-rpath,$ORIGIN/privlib"])
+      "-Wl," & dtagFlag, "-Wl,-rpath," & searchPath])
     checkpoint(name & ": " & built.output)
     require built.code == 0
 
@@ -207,4 +208,54 @@ int main(void) {
     # falsifiable: a resolver that rewrote the unresolvable soname into a
     # RUNPATH-relative path would still fail, but `dlerror` would name that
     # invented path instead of the soname the program asked for.
+    check monitored.output.strip() == bare.output.strip()
+
+  test "both RPATH tags skip an incompatible ELF class before a native library":
+    # Mutate only EI_CLASS in a real shared object. The real native loader must
+    # demonstrate that this candidate is skippable before we grade the shim.
+    # No mock loader and no multilib toolchain prerequisite are involved.
+    createDir(work / "otherclass")
+    var incompatible = readFile(work / "privlib" / "libplug.so")
+    require incompatible.len >= 64
+    require incompatible[0 .. 3] == "\x7fELF"
+    require incompatible[4] in {'\x01', '\x02'}
+    incompatible[4] = if incompatible[4] == '\x02': '\x01' else: '\x02'
+    writeFile(work / "otherclass" / "libplug.so", incompatible)
+    for (name, tag) in [("class_runpath", "--enable-new-dtags"),
+                        ("class_rpath", "--disable-new-dtags")]:
+      let app = buildApp(name, tag, "$ORIGIN/otherclass:$ORIGIN/privlib")
+      let bare = run(app, @[])
+      checkpoint(name & " native: " & bare.output)
+      require bare.code == 0
+      require "plug_answer=42" in bare.output
+      let depfile = work / (name & ".iomon")
+      let monitored = captureRun(app, depfile)
+      checkpoint(name & " monitored: " & monitored.output)
+      check monitored.code == bare.code
+      check monitored.output.strip() == bare.output.strip()
+      require fileExists(depfile)
+      check readMonitorDepFile(depfile).completeness == mcComplete
+
+    let searchEnv = [("LD_LIBRARY_PATH", work / "otherclass")]
+    let bare = run(runpathApp, @[], childEnvWith(searchEnv))
+    require bare.code == 0
+    require "plug_answer=42" in bare.output
+    let monitored = captureRun(runpathApp, work / "envclass.iomon", searchEnv)
+    checkpoint("environment monitored: " & monitored.output)
+    check monitored.code == bare.code
+    check monitored.output.strip() == bare.output.strip()
+
+  test "a malformed candidate remains fatal even before a working library":
+    createDir(work / "malformed")
+    # Enough bytes to distinguish invalid magic from an accidentally short file.
+    writeFile(work / "malformed" / "libplug.so", repeat('x', 128))
+    let app = buildApp("malformed_app", "--enable-new-dtags",
+      "$ORIGIN/malformed:$ORIGIN/privlib")
+    let bare = run(app, @[])
+    checkpoint("malformed native: " & bare.output)
+    require bare.code == 1
+    require "invalid ELF header" in bare.output
+    let monitored = captureRun(app, work / "malformed.iomon")
+    checkpoint("malformed monitored: " & monitored.output)
+    check monitored.code == bare.code
     check monitored.output.strip() == bare.output.strip()

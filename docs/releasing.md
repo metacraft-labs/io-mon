@@ -21,13 +21,14 @@ The archive includes the CLI and matching monitor shim. The smoke check runs a n
 Each target emits JSON evidence naming the source commit, pinned dependency
 revisions, smoke result, signing state and artifact hashes. The assembly step
 checks the exact asset set and hashes after upload and generates `SHA256SUMS`.
-The user approved unsigned version 0.1.0 releases on 2026-09-28;
-`unsignedReleaseVersion` scopes this exception to that version. Signing evidence
+The current 0.1.1 preparation carries forward the user-approved unsigned
+payload scope; `unsignedReleaseVersion` explicitly names 0.1.1. Signing evidence
 remains false. Later versions must update the policy explicitly or use OS
 signatures and a verified Sigstore checksum-manifest signature. The shared Linux
 package publisher retains its existing package and repository signatures.
 
-Linux ARM64 is deferred from version 0.1.0 by the 2026-09-29 release decision.
+Linux ARM64 was deferred by the 2026-09-29 release decision and remains
+deferred for 0.1.1 under the approved patch-release scope.
 Its syscall backend remains tracked in
 [`issues/2026-09-29-linux-arm64-syscall-backend-is-incomplete.md`](../issues/2026-09-29-linux-arm64-syscall-backend-is-incomplete.md).
 The manual **CI (reprobuild)** dispatch can include the full ARM64 port diagnostic.
@@ -43,7 +44,7 @@ and a passing full native suite.
    commit. Wait for the complete matrix, packaging checks and checksum manifest.
    Download the `verified-release` workflow artifact for review. A dispatch
    never publishes, including one dispatched at an existing tag.
-3. Check the signing scope. Version 0.1.0 has an explicit unsigned-release
+3. Check the signing scope. Version 0.1.1 has an explicit unsigned-release
    exception. A version change rejects that exception until the policy is
    updated; it cannot silently waive signing for future releases. Required
    ad-hoc Mach-O execution signatures do not imply Developer ID signing.
@@ -54,8 +55,10 @@ and a passing full native suite.
 5. Track the dispatched `publish-release` run in
    [metacraft-desktop-packages](https://github.com/metacraft-labs/metacraft-desktop-packages/actions/workflows/publish-release.yaml).
    Verify x86_64 in the live apt and RPM indices and install from
-   those repositories in clean environments. The producer carries no package
-   repository keys or bucket credentials.
+   those repositories in clean environments. Also verify publication to the
+   maintained Nix channels, Homebrew tap and Scoop bucket, then run the
+   publisher's live Homebrew and Scoop installation workflows. The producer
+   carries no package repository keys or bucket credentials.
 6. Download the published archives, verify `SHA256SUMS` (and its Sigstore bundle for signed releases),
    and record the tag SHA, dry-run/tag/publisher URLs and installation evidence.
    Only then fast-forward `stable` to the published tag.
@@ -63,6 +66,16 @@ and a passing full native suite.
 Do not reuse a published version to repair an artifact. Do not treat a queued
 ARM runner as an outage; consult the fleet runbook before diagnosis.
 
-The broader org distribution draft also covers Homebrew, installers, additional
-package formats and nixpkgs publication. Those channels are outside this staged
-release scope and must not be claimed as shipped by this workflow.
+Homebrew, Scoop and the maintained Nix channels are published by the shared
+package publisher. The proposed shared installer service still requires review;
+this workflow does not deploy it. Additional package formats remain governed by
+the organization's distribution requirements.
+
+## Current preparation evidence
+
+At `b464ce17cdf2196e61ccf4ab3e61ed0ee1a70ed2`, release rehearsal
+[37144764559](https://github.com/metacraft-labs/io-mon/actions/runs/37144764559)
+passes Linux x86_64, macOS ARM64 and Windows x64 builds, package checks and
+assembly. These are CI artifacts, not a published 0.1.1 release. Full promotion
+CI still needs to qualify the Windows ARM emulation fixture cleanup and the
+final merged source revision needs its own release rehearsal.

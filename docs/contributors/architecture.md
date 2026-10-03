@@ -79,6 +79,29 @@ wants a wider bar still calls `evaluateMonitorEvidence` with its own required-se
 - **SIP Bypass**: System Integrity Protection (SIP) automatically strips `DYLD_INSERT_LIBRARIES` for binaries in `/bin`, `/usr/bin`, etc. `io-mon` handles this by mapping system calls to GNU drop-in equivalents (sandbox-tools) that are not protected by SIP.
 - **Diagnostics (Debug builds only)**: Toggles such as `IO_MON_DEBUG_DISABLE_BODYPATCH`, `IO_MON_DEBUG_DISABLE_INTERPOSE`, and `IO_MON_DEBUG_SKIP` allow isolating mechanisms for A/B testing.
 
+#### Cooperating nested macOS monitors
+
+When an injected process starts another monitor, the inner host captures full
+interest and evidence for the child. After the normal merge and completeness
+checks, it transfers those observed records into the enclosing session before
+filtering its own depfile to its requested scope. Process identities, loss
+markers and capability gaps survive the transfer; each depfile retains its own
+profile and request stamps. Transferred records carry the enclosing run token
+and the source run as provenance.
+
+The host writes a pending loss fragment before launching the inner child. It
+removes that marker only after writing, checking the buffered close and
+atomically publishing the completed evidence fragment. A killed host, abandoned
+handle or failed publication therefore leaves the outer capture incomplete.
+This handoff requires a cooperating host to finish its monitor; it does not
+provide live event delivery from an unfinished inner session or a macOS
+detached-descendant guard.
+
+Implementation: `src/io_mon/nested_capture.nim` and `fs_snoop.nim`.
+The real-process controls are in
+`tests/macos/test_io_mon_macos_nested_capture.nim`; they cover differing scopes,
+three nesting levels, inner loss, interruption and real filesystem failures.
+
 ### Linux
 
 - **`LD_PRELOAD` Shim**: Injects wrapper symbols that route filesystem activity to the monitor.
