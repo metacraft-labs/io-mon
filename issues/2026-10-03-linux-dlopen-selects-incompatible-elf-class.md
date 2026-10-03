@@ -68,3 +68,16 @@ ordering. Full CI must establish the enclosing repair; do not remove preload
 state or isolate the fixture to bypass the old implementation. This extends
 the existing consumer qualification of the same ELF transparency requirement.
 Refreshed `agents` and searched the issue archive before recording this result.
+
+## Enclosing-monitor result
+
+At `db2f11cd767fa489ccf5bf1265ded7373b5c2501`, supplemental run
+[37152432111](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/37152432111)
+passes on `ubuntu-24.04` using shared diagnostic `1749c38783215f27cecf6396ffb6836ff7950244`.
+All four selected actions actually launch and succeed; the real ELF regression
+passes all six unchanged cases. The only recipe addition is a collection alias
+for the existing action. The production bootstrap engine, RunQuota and repaired
+outer-monitor pins are used, without changing monitoring or cache policy.
+Full product CI still must repeat the result. The promotion PR remains at
+`f84d25aa` while its Windows ARM cleanup run finishes, preserving that separate
+qualification before advancing the Linux-only pin repair.
