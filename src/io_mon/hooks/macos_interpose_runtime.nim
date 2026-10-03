@@ -875,35 +875,37 @@ void *repro_macos_real_mmap_syscall(void *addr, size_t len, int prot, int flags,
 #endif
 }
 
-/* ROUND-5 D — faithful forward for the `syscall(2)` hook: issue the BSD syscall
- * `number` with up to six register args (arm64: x16=number, x0..x5=args, result in
- * x0, carry flag = error → errno). Mirrors libsystem's own `syscall` wrapper, so
+/* Faithful forward for the `syscall(2)` hook: use the kernel's indirect entry,
+ * x16=SYS_syscall, x0=number, x1..x7=arguments, x0=result, carry=error. This
+ * preserves all seven argument slots exposed by libsyscall's ARM64 entry, so
  * forwarding through it is transparent. Used by repro_hook_syscall to record/flag a
  * file syscall a monitored program issued via the (non-inlined) `syscall(2)` escape
  * hatch and then complete it. NOT a raw-svc the interpose can't see — this IS the
  * interposed path; the un-hookable case is an INLINE svc in the program's own code,
  * caught instead by repro_macos_scan_main_text_for_raw_syscall. */
 long repro_macos_real_syscall(long number, long a1, long a2, long a3,
-                              long a4, long a5, long a6) {
+                              long a4, long a5, long a6, long a7) {
 #if defined(__arm64__) || defined(__aarch64__)
-  register long x0 __asm__("x0") = a1;
-  register long x1 __asm__("x1") = a2;
-  register long x2 __asm__("x2") = a3;
-  register long x3 __asm__("x3") = a4;
-  register long x4 __asm__("x4") = a5;
-  register long x5 __asm__("x5") = a6;
-  register long x16 __asm__("x16") = number;
-  register long err __asm__("x6");
+  register long x0 __asm__("x0") = number;
+  register long x1 __asm__("x1") = a1;
+  register long x2 __asm__("x2") = a2;
+  register long x3 __asm__("x3") = a3;
+  register long x4 __asm__("x4") = a4;
+  register long x5 __asm__("x5") = a5;
+  register long x6 __asm__("x6") = a6;
+  register long x7 __asm__("x7") = a7;
+  register long x16 __asm__("x16") = SYS_syscall;
+  register long err __asm__("x8");
   __asm__ volatile(
     "svc #0x80\n\t"
-    "cset x6, cs\n"
+    "cset x8, cs\n"
     : "+r"(x0), "=r"(err)
-    : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x16)
+    : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x6), "r"(x7), "r"(x16)
     : "cc", "memory");
   if (err) { errno = (int)x0; return -1; }
   return x0;
 #else
-  (void)number; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+  (void)number; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7;
   errno = ENOSYS;
   return -1;
 #endif
@@ -3140,11 +3142,11 @@ proc ct_macos_capture_main_image*() =
   proc impl() {.importc: "repro_macos_capture_main_image", cdecl.}
   impl()
 
-proc ct_macos_real_syscall*(number, a1, a2, a3, a4, a5, a6: clong): clong =
+proc ct_macos_real_syscall*(number, a1, a2, a3, a4, a5, a6, a7: clong): clong =
   ## ROUND-5 D — faithful forward of a `syscall(2)` indirect call (see the C note).
-  proc impl(number, a1, a2, a3, a4, a5, a6: clong): clong
+  proc impl(number, a1, a2, a3, a4, a5, a6, a7: clong): clong
     {.importc: "repro_macos_real_syscall", cdecl.}
-  impl(number, a1, a2, a3, a4, a5, a6)
+  impl(number, a1, a2, a3, a4, a5, a6, a7)
 
 proc ct_macos_syscall_is_file_op*(number: clong): bool =
   ## ROUND-5 D — true iff `number` is a file open/read/dir/stat syscall that, issued

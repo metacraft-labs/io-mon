@@ -3501,7 +3501,7 @@ var rawSyscallFileOpFlagged {.threadvar.}: bool
   ## depfile bounded). A downgrade is idempotent — one event-loss already forces
   ## mcIncomplete — so flagging once is sufficient.
 
-proc repro_hook_syscall*(number, a1, a2, a3, a4, a5, a6: clong): clong
+proc repro_hook_syscall*(number, a1, a2, a3, a4, a5, a6, a7: clong): clong
     {.exportc, cdecl, dynlib.} =
   ## ROUND-5 D — the `syscall(2)` escape hatch. A program can reach a file through
   ## the (non-inlined) libsystem `syscall` indirect trap instead of the named
@@ -3515,14 +3515,14 @@ proc repro_hook_syscall*(number, a1, a2, a3, a4, a5, a6: clong): clong
   ## symbol, so there is no re-entry. (An INLINE svc in the program's own code never
   ## reaches here — it is caught at load by the main-__text scan.)
   if not initialized or disabled > 0:
-    return ct_macos_real_syscall(number, a1, a2, a3, a4, a5, a6)
+    return ct_macos_real_syscall(number, a1, a2, a3, a4, a5, a6, a7)
   if ct_macos_syscall_is_file_op(number) and not rawSyscallFileOpFlagged:
     rawSyscallFileOpFlagged = true
     var rec = baseRecord(mrEventLoss, moEventLoss)
     rec.detail = "monitored binary reads files via the syscall(2) escape hatch; " &
       "interpose cannot attribute them (raw-syscall blind spot; EndpointSecurity)"
     emitRecord(rec)
-  result = ct_macos_real_syscall(number, a1, a2, a3, a4, a5, a6)
+  result = ct_macos_real_syscall(number, a1, a2, a3, a4, a5, a6, a7)
 
 proc repro_hook_getenv*(name: cstring): cstring {.exportc, cdecl, dynlib.} =
   ## Observed declared input (env). Forwards via the genuine getenv (environ walk)
@@ -4507,7 +4507,7 @@ extern int repro_macos_real_pipe_call(int fds[2]);
  * recording hook never re-enters its own wrapper). */
 extern char *repro_macos_real_getenv(const char *name);
 extern long repro_macos_real_syscall(long number, long a1, long a2, long a3,
-    long a4, long a5, long a6);
+    long a4, long a5, long a6, long a7);
 extern int repro_macos_real_sysctlbyname_call(const char *name, void *oldp,
     size_t *oldlenp, void *newp, size_t newlen);
 extern int repro_macos_real_sysctl_call(int *name, unsigned int namelen,
@@ -5526,17 +5526,37 @@ static char *repro_wrap_getenv(const char *name) {
   return repro_hook_getenv((char *)name);
 }
 
-/* ROUND-5 D — the `syscall(2)` indirect-trap thunk. syscall is variadic; we read a
- * fixed six register args (extra/absent args are harmless — an underlying syscall
- * taking fewer just ignores the high registers). Forward the raw svc before the
- * runtime is ready. Interpose-only (a program calls the libsystem `syscall` symbol
- * by name; an INLINE svc bypasses this and is caught by the load-time __text scan). */
-static long repro_wrap_syscall(long number, long a1, long a2, long a3,
-                               long a4, long a5, long a6) {
+/* syscall(int, ...) uses Apple's variadic ABI: arguments after the number live
+ * on the stack, even when registers are free. Marshal its seven slots before
+ * entering the fixed-signature dispatcher. Loading them in assembly mirrors
+ * libsyscall's own entry without va_arg reads past a C argument list's end:
+ * https://github.com/apple-oss-distributions/xnu/blob/main/libsyscall/custom/__syscall.s
+ * The kernel decides how many slots the selected call actually consumes.
+ * Pre-runtime dispatch stays in C and raw assembly (no allocation or Nim TLS). */
+static long __attribute__((used, noinline)) repro_dispatch_syscall(
+    long number, long a1, long a2, long a3, long a4, long a5, long a6, long a7) {
   if (!repro_monitor_runtime_ready)
-    return repro_macos_real_syscall(number, a1, a2, a3, a4, a5, a6);
-  return repro_hook_syscall(number, a1, a2, a3, a4, a5, a6);
+    return repro_macos_real_syscall(number, a1, a2, a3, a4, a5, a6, a7);
+  return repro_hook_syscall(number, a1, a2, a3, a4, a5, a6, a7);
 }
+
+#if defined(__arm64__) || defined(__aarch64__)
+static long __attribute__((naked)) repro_wrap_syscall(int number, ...) {
+  __asm__ volatile(
+    "sxtw x0, w0\n\t"
+    "ldp x1, x2, [sp]\n\t"
+    "ldp x3, x4, [sp, #16]\n\t"
+    "ldp x5, x6, [sp, #32]\n\t"
+    "ldr x7, [sp, #48]\n\t"
+    "b _repro_dispatch_syscall\n\t");
+}
+#else
+/* Intel forwarding is still unsupported (the raw helper returns ENOSYS). */
+static long repro_wrap_syscall(int number, ...) {
+  errno = ENOSYS;
+  return -1;
+}
+#endif
 
 static int repro_wrap_sysctlbyname(const char *name, void *oldp,
     size_t *oldlenp, void *newp, size_t newlen) {

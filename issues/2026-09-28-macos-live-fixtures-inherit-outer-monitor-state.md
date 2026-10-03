@@ -50,3 +50,20 @@ Fetched `origin/agents` and `origin/dev`, both `d3826a3`. Searched current issue
 and deleted issue history for nested, macOS, entropy and initialization. The
 archived issue at `368cc1c` records the same two-copy startup symptom; reopen it
 instead of creating a duplicate.
+
+## Startup repair and remaining session scope
+
+The accompanying ABI repair passes the new real syscall and distinct-image
+startup controls. Restoring the `a5fce6a` runtime makes the syscall control fail
+and the distinct-image child time out; the strengthened older raw-syscall test
+also rejects that runtime because its child exits 11 instead of reading the
+file. Logs: `/tmp/io-mon-syscall-abi-tests.log` and
+`/tmp/io-mon-syscall-negative-controls.log`.
+
+The independent-session control launches a real monitor inside another monitor.
+The inner session captures its input and is complete; the outer captures its
+own input, lacks the inner child's reads, and reports a missing-process-start
+loss marker. It terminates normally and remains honestly incomplete. The test
+accepts a future complete outer capture only if it includes the inner input.
+Full descendant evidence sharing remains open; the existing uncached fixture
+isolation stays in place.
