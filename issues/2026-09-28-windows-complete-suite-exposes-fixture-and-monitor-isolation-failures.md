@@ -175,3 +175,28 @@ archived cleanup/XtaCache records before extending this issue. Log:
 `/tmp/io-mon-122-windows-arm-repro-complete.log`. The final workflow cancellation
 stopped the optional S3 mirror after it spent 51 minutes retrying connection
 timeouts; every build/test step had already finished.
+
+## Persistent finished-image cleanup failure at f03032af
+
+At `f03032af422c2fcc2f59568135167b203b9abdd6`, Windows ARM64 emulation
+[job 111202263312](https://github.com/metacraft-labs/io-mon/actions/runs/37122834544/job/111202263312)
+completes 98 of 100 graph actions successfully. Two execution actions fail only
+at fixture cleanup, after their native exit-status and session-scope checks pass:
+
+- `test_io_mon_cli_exit_status`: the private `io-mon.exe` cannot be removed.
+- `test_io_mon_windows_host_session_scope`: its private
+  `librepro_monitor_shim.dll` cannot be removed.
+
+Both failures survive the existing 30-second monotonic removal bound and report
+`Access is denied`. The failure artifact is `11276046801`, containing the actual
+build failure report. The same commit passes all Linux, macOS and Windows x64 CI.
+The ARM repeat and native cross-check steps do not execute after this failure.
+
+The previous XtaCache observation is a hypothesis for this run, not an owner
+measurement. Preserve the current cleanup bound and every functional assertion.
+Use the existing real Restart Manager diagnostic, including its live-image
+positive control, to record the remaining file users and attributes before
+choosing another cleanup repair. A focused native Windows diagnostic can run the
+two unchanged fixtures and retain its precise source patch and output. It must
+not kill cache services, delete unrelated files, bypass access checks or treat
+persistent cleanup failure as success.
