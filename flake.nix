@@ -159,6 +159,9 @@
               pkgs.just
               pkgs.nim2
               nimble
+              # The macOS directory-transparency regression starts real Python
+              # under the production shim; absence must fail, never skip it.
+              pkgs.python3
               pkgs.git
               pkgs.nixfmt
               pkgs.nodejs
