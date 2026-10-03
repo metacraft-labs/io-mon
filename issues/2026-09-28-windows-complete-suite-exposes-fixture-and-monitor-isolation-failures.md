@@ -241,3 +241,16 @@ these system processes, disable the cache or defer deletion until reboot.
 
 Refreshed `agents` at `081f95fb` before extending this existing issue. Ordinary
 CI, sanitizers and Linux/macOS/Windows x64 Reprobuild jobs pass at `91a0e669`.
+
+The real API probe at shared-actions `f910ab5ab8965a771290f6b36bb4e29ea91b32ca`
+([37137809665](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/37137809665))
+rules out substituting POSIX unlink for ordinary deletion. On both Windows
+2025 x64 and Windows 11 ARM, a private real SEC_IMAGE mapping blocks both
+`DeleteFileW` and `SetFileInformationByHandle(FileDispositionInfoEx, DELETE |
+POSIX_SEMANTICS)` with error 5. Closing the probe's own mapping makes deletion
+succeed. Ordinary-file removal and a sharing-denial/handle-close control also
+pass. The probe only creates private files and handles; it does not change
+system services, close another process's handles or modify product tests.
+The production helper is unchanged. A proper repair still needs the actual
+translation-cache mapping lifetime to end; merely replacing the removal API
+would leave the full-graph failure intact.
