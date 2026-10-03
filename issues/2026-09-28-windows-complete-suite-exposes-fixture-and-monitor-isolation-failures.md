@@ -254,3 +254,22 @@ system services, close another process's handles or modify product tests.
 The production helper is unchanged. A proper repair still needs the actual
 translation-cache mapping lifetime to end; merely replacing the removal API
 would leave the full-graph failure intact.
+
+## Quiet debug comparison and exact Repro context
+
+At product `b464ce17`, shared-actions `1d83211`
+[37139650319](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/37139650319)
+runs both unchanged programs three times each on Windows ARM using Nim 2.2.8
+and GCC 16.1.0 debug builds. All six executions pass, including their original
+cleanup bounds; each complete fixture takes 14–16 seconds. The dependency
+clones differ from the full failing graph, so this does not establish that
+concurrent compilation causes retention.
+
+The next diagnostic uses the production setup action and bootstrap pins,
+tarball provisioning, and temporary names for the two existing Repro execution
+actions. Shared-actions `e01b508`
+[37143020045](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/37143020045)
+is still running as of 18:50 UTC on 2026-10-03. Every report must show its
+selected action actually launched. No assertion, dependency policy, cacheability
+or cleanup deadline changes. Its superseded predecessor `37141310130` stopped
+at an incorrect version probe and supplies no product verdict.
