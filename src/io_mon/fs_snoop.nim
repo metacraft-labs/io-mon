@@ -7,6 +7,8 @@ import io_mon/types
 import io_mon/writer
 import io_mon/shm/dep_queue
 import io_mon/shim_discovery
+when defined(macosx):
+  import io_mon/nested_capture
 export shim_discovery  ## `findShimLibrary`/`ShimLibOverrideEnv` moved to their
                        ## own module (capture-machinery-free so a `--mm:refc`
                        ## consumer can locate the shim without compiling the
@@ -1619,6 +1621,7 @@ type
     when defined(macosx):
       sandboxDir: string
       ownsSandboxDir: bool
+      nestedCapture: NestedCapture
     when defined(windows):
       shimLib: string
       spawnEnv: StringTableRef
@@ -1855,6 +1858,8 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
     # briefly pointed at the shim (which would have injected the monitor into
     # anything else the host spawned in that window).
     h.runId = newRunId()
+    h.nestedCapture = startNestedCapture(getEnv("REPRO_MONITOR_FRAGMENT_DIR"),
+      getEnv("REPRO_MONITOR_SESSION"), h.runId)
     let injected = @[
       ("CT_SANDBOX_TOOLS_DIR", sandboxDir),
       ("DYLD_INSERT_LIBRARIES",
@@ -1866,6 +1871,13 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
       ("REPRO_MONITOR_SHIM_LIB", shimLib)
     ]
     let spawnEnv = childEnv(request, injected)
+
+    if h.nestedCapture.active:
+      # Capture enough for both consumers. The ordinary host-side filter still
+      # narrows the inner depfile to its own request after the observed evidence
+      # has reached its parent. No host environment variable is changed.
+      spawnEnv["REPRO_MONITOR_INTEREST"] = interestToShimTokens(FullInterest)
+      spawnEnv["REPRO_MONITOR_EVIDENCE"] = evidenceScopeToken(esFull)
 
     # SIP shebang bypass: if the target is a shell script whose
     # interpreter (``#!/bin/sh`` etc.) lives under a SIP-protected
@@ -2268,6 +2280,9 @@ proc collectMonitorEvidence(h: var MonitorHandle): MonitorDepFile =
       currentRunId = h.runId,
       observedInterest = normalizeInterest(h.request.interest),
       observedEvidenceScope = h.request.evidenceScope)
+
+  when defined(macosx):
+    finishNestedCapture(h.nestedCapture, result.records)
 
   # Host-side event-interest filter (belt-and-suspenders — see
   # docs/contributors/event-interest-filter.md §5). The shim is meant to skip

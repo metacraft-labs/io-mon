@@ -158,7 +158,7 @@ int main(int argc, char **argv) {
         let dep = readMonitorDepFile(depfile)
         check dep.records.anyIt(it.kind == mrFileRead and it.path == input)
 
-    test "independent sessions retain their own reads and expose outer capture gaps":
+    test "independent sessions retain their own reads and nested child evidence":
       let nested = expandFilename(work) / "nested"
       createDir(nested)
       writeFile(nested / "outer-input", "outer-input")
@@ -185,12 +185,10 @@ int main(int argc, char **argv) {
         it.path == nested / "inner-input")
       check outer.records.anyIt(it.kind == mrFileRead and
         it.path == nested / "outer-input")
-      if outer.completeness == mcComplete:
-        check outer.records.anyIt(it.kind == mrFileRead and
-          it.path == nested / "inner-input")
-      else:
-        check outer.records.anyIt(it.kind == mrEventLoss and
-          "spawn child missing process-start" in it.detail)
+      check outer.records.anyIt(it.kind == mrFileRead and
+        it.path == nested / "inner-input")
+      checkpoint("outer loss=" & $outer.records.filterIt(it.kind == mrEventLoss))
+      check outer.completeness == mcComplete
   else:
     test "macOS-only syscall ABI":
       skip()

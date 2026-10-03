@@ -67,3 +67,19 @@ loss marker. It terminates normally and remains honestly incomplete. The test
 accepts a future complete outer capture only if it includes the inner input.
 Full descendant evidence sharing remains open; the existing uncached fixture
 isolation stays in place.
+
+## Cooperating-host evidence handoff
+
+The follow-up implementation under LOCAL-3 transfers the inner host's collected
+records into the enclosing run before filtering the inner depfile. A pending
+loss fragment precedes the inner launch and remains until checked, atomic
+publication succeeds. The current patch on `2427e992` passes the strengthened
+independent-session control and eight real handoff controls: different interests,
+different evidence scope, inner syscall loss, three nesting levels, abandoned
+handles, killed hosts, refused writes and buffered-close failure under a real
+file-size limit. Restoring the old host implementation rejects the strengthened
+controls. Full native and Reprobuild qualification is in progress.
+
+This repairs evidence for cooperating hosts that finish their monitor. Live
+delivery from unfinished sessions and a macOS detached-descendant guard remain
+outside this handoff; pending work must remain incomplete.
