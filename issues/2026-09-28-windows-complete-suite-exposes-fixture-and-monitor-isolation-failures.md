@@ -200,3 +200,19 @@ choosing another cleanup repair. A focused native Windows diagnostic can run the
 two unchanged fixtures and retain its precise source patch and output. It must
 not kill cache services, delete unrelated files, bypass access checks or treat
 persistent cleanup failure as success.
+
+Focused diagnostic [37129790109](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/37129790109)
+at shared-actions `6f7fb73` runs io-mon `f03032af` with the pinned release
+compiler and added cleanup diagnostics. Both unchanged programs pass three
+times each on Windows x64 and Windows ARM64 x64 emulation. On ARM, CLI
+rounds take 10.0–10.6 seconds and session-scope rounds 29.9–30.6 seconds
+including their private builds. There is no persistent cleanup failure in
+that narrower compiler/environment context, so it establishes no owner for
+the full Reprobuild failure.
+
+Retain the Restart Manager query in the shared Windows fixture cleanup helper,
+only after the existing 30-second limit has already failed. It records file
+attributes and actual process owners and validates the query against its own
+live image. Diagnostic failure must not replace the original fatal cleanup
+error. No waits, assertions, fixture placement, or cache policy change. The
+full native Windows ARM64 Reprobuild graph must produce the missing evidence.
