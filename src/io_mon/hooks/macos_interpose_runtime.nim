@@ -1366,26 +1366,6 @@ static const char *repro_macos_env_value(char **envp, const char *name) {
 }
 
 /*
- * True if colon-delimited `list` already contains `item` as a whole element.
- * Used to keep our shim present EXACTLY ONCE in DYLD_INSERT_LIBRARIES across a
- * deep monitored process tree (prepending unconditionally would grow the value
- * shim:shim:shim… at every generation).
- */
-static int repro_macos_pathlist_has(const char *list, const char *item) {
-  if (!list || !item || !item[0]) return 0;
-  size_t item_len = strlen(item);
-  const char *p = list;
-  while (*p) {
-    const char *end = strchr(p, ':');
-    size_t seg_len = end ? (size_t)(end - p) : strlen(p);
-    if (seg_len == item_len && strncmp(p, item, item_len) == 0) return 1;
-    if (!end) break;
-    p = end + 1;
-  }
-  return 0;
-}
-
-/*
  * Build the monitored child's environment: OVERRIDE (not skip-if-present) the
  * injection vars (findings doc T1, break #2). A caller that scrubs or sets an
  * EMPTY/bogus DYLD_INSERT_LIBRARIES / CT_SANDBOX_TOOLS_DIR previously BLOCKED
@@ -1393,7 +1373,7 @@ static int repro_macos_pathlist_has(const char *list, const char *item) {
  * and unmonitored. We now:
  *   * Force DYLD_INSERT_LIBRARIES to our shim, PREPENDED so it is always first,
  *     while preserving any genuine additional libraries the caller listed (and
- *     never duplicating our own shim — see repro_macos_pathlist_has).
+ *     never duplicating our own shim).
  *   * Force CT_SANDBOX_TOOLS_DIR to the active sandbox-tools dir.
  * The caller's matching entries are dropped and our overrides appended, so the
  * result has exactly one authoritative value for each.
@@ -1433,19 +1413,27 @@ static char **repro_macos_env_with_preload(char **envp) {
 
   if (want_dyld) {
     const char *prefix = "DYLD_INSERT_LIBRARIES=";
-    /* Append the caller's other libraries after ours, unless they already
-     * include our shim (avoid unbounded shim:shim… growth across the tree). */
-    int append_existing =
-      existing_dyld && existing_dyld[0] != '\0' &&
-      !repro_macos_pathlist_has(existing_dyld, shim);
-    size_t value_len = strlen(prefix) + strlen(shim) +
-      (append_existing ? 1 + strlen(existing_dyld) : 0) + 1;
+    /* Put the monitor first once, then retain the caller's other entries in
+     * their original order. Finding our shim in the list must not discard
+     * the OTHER libraries (including an inner monitor's distinct image). */
+    size_t shim_len = strlen(shim);
+    size_t value_len = strlen(prefix) + shim_len +
+      (existing_dyld ? 1 + strlen(existing_dyld) : 0) + 1;
     char *value = (char *)malloc(value_len);
     if (!value) { free(result); return envp; }
-    if (append_existing)
-      snprintf(value, value_len, "%s%s:%s", prefix, shim, existing_dyld);
-    else
-      snprintf(value, value_len, "%s%s", prefix, shim);
+    size_t used = (size_t)snprintf(value, value_len, "%s%s", prefix, shim);
+    for (const char *p = existing_dyld; p && *p;) {
+      const char *end = strchr(p, ':');
+      size_t len = end ? (size_t)(end - p) : strlen(p);
+      if (len && !(len == shim_len && strncmp(p, shim, len) == 0)) {
+        value[used++] = ':';
+        memcpy(value + used, p, len);
+        used += len;
+      }
+      if (!end) break;
+      p = end + 1;
+    }
+    value[used] = '\0';
     result[slot++] = value;
   }
   if (want_sandbox) {

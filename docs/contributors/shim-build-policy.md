@@ -170,3 +170,14 @@ fixtures retain their uncached execution isolation.
 4. Add a regression test that exercises the hook from inside a real allocator on
    multiple threads (a heavy multi-threaded toolchain like `rustc` is the reliable
    reproducer — see the mmap-reentrancy test).
+
+### Child library propagation
+
+`repro_macos_env_with_preload` keeps the monitor first and present once, then
+retains every other requested `DYLD_INSERT_LIBRARIES` entry in its original
+relative order. Finding the monitor already in the list must not discard the
+other libraries. The regression in
+`tests/macos/test_io_mon_macos_preload_libraries.nim` loads two real marker
+dylibs through spawn, SETEXEC and execve under both backends. It also requires
+captured input evidence, rejects duplicated monitor entries and supervises
+each launch with a process-group timeout.
