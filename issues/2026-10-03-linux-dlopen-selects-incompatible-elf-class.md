@@ -49,3 +49,22 @@ using diagnostic workflow `6d41c0c9aa67e2fdbca0bbeed9269c99f69e113e` on
 RPATH, RUNPATH and LD_LIBRARY_PATH, failing the new assertion. The malformed
 candidate case remains fatal in both runs. Local Linux-targeted C generation
 passes for the shim and regression on macOS. Full promotion CI remains required.
+
+## Bootstrap pin in full-suite CI
+
+At io-mon `f84d25aa091224ac98433cdf35086dae90d8027e`, full Reprobuild
+[run 37150204740](https://github.com/metacraft-labs/io-mon/actions/runs/37150204740)
+reports 132 successful actions and one failure on Linux x64. The new real ELF
+class case fails its `bare.code == 0` prerequisite with `ELFCLASS32`; all four
+older loader cases pass. Artifact `11283962983` retains the failure report.
+This execution is inside Repro's enclosing monitor. Both CI workflows still
+pin that Linux bootstrap monitor to `3df08c24`, whose `ct_dlopen_try_dir`
+uses the old existence-only search. The fixture's own monitor includes the
+repaired implementation, but that does not repair an enclosing older shim.
+
+Refresh both Linux bootstrap pins to qualified `10249629`. Keep all real-loader
+assertions, the outer automatic-monitor policy, cacheability and current test
+ordering. Full CI must establish the enclosing repair; do not remove preload
+state or isolate the fixture to bypass the old implementation. This extends
+the existing consumer qualification of the same ELF transparency requirement.
+Refreshed `agents` and searched the issue archive before recording this result.
