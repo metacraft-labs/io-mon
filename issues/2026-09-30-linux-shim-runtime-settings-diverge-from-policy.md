@@ -136,3 +136,12 @@ defined several times and Linux linking failed before the probe could run.
 Guard it with `when isMainModule` so one symbol is exported. The local actual
 macOS shim build with this guard links successfully; native Linux positive
 and negative controls remain required. No assertion or runtime flag changes.
+
+The permanent regression passes on Linux x64 and ARM at `19ea53c` in
+`37166957605`. Its original-settings control fails on the required abandoned
+frame (`before-null=1 after-null=0`, child exit 71), while production reports
+both null. The host-handler controls and all four x64 propagation cases pass.
+RunQuota `f369c34` completes all six fresh monitored provider builds in
+`37165456283` with monitor `004b8fc3`; the preceding old-monitor run crashed
+on the fifth. Update both enclosing Linux CI pins to this qualified runtime
+so ordinary io-mon builds also use it. Full product CI remains required.

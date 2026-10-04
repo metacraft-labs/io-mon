@@ -189,7 +189,7 @@ jobs:
           env-flavor: ${{ matrix.env }}
           repro-from-source: ${{ matrix.env == 'reprobuild' }}
           repro-build-pin: 1f85ace0037d0a70e966fe8eee645d766522b1ab
-          repro-posix-io-mon-pin: ${{ matrix.env == 'reprobuild' && '10249629cc97f01aa5bafe9dff8fa3c00cc82749' || '' }}
+          repro-posix-io-mon-pin: ${{ matrix.env == 'reprobuild' && '004b8fc3eb0a6c31f78622272ba323c221b79b28' || '' }}
           gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: Run tests
