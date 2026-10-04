@@ -7,11 +7,11 @@
     flake-parts.follows = "nixos-modules/flake-parts";
     git-hooks.follows = "nixos-modules/git-hooks-nix";
     stackable-hooks-src = {
-      # Pinned to the dev revision the Windows shim compiles against
-      # (injectShimIntoChildReport / ioChildTerminated, the fix that never
-      # resumes a child mid-injection). It used to float on the default
-      # branch (`main`), which lags dev, and the lock sat on c6cf6ad.
-      url = "github:metacraft-labs/nim-stackable-hooks/72f578249e9d8bbca8e3705c8a41ed5085c05bf9";
+      # Keep release payloads and ordinary CI on the same qualified hook
+      # source: captured-output lifetime, initialized injection permits and
+      # one preparation per executable page. Match .github/sibling-repos,
+      # the ordinary Windows checkout and the committed Repro lock.
+      url = "github:metacraft-labs/nim-stackable-hooks/a043a07f71a9b662c6ae9bae7837107e6c1ade67";
       flake = false;
     };
     shm-queue-src = {

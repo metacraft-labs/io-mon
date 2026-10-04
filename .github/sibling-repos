@@ -30,7 +30,7 @@
 # the workspace sibling checkout there is a live `dev` tree that has the file;
 # the stale pin is only consulted in CI.
 #
-# 72f57824 is the revision `flake.nix` pins `stackable-hooks-src` to, so this
+# a043a07 is the revision `flake.nix` pins `stackable-hooks-src` to, so this
 # entry names the SAME commit as the flake input rather than introducing a
 # third opinion. Keep the two in step: a `nim c` in the dev shell resolves
 # `stackable_hooks/...` through this checkout, while `nix build .#default`
@@ -39,8 +39,8 @@
 # to prevent.
 #
 # Drop the '!=' back to a bare name once a re-locked mainline commit pins
-# 72f57824 or later; until then a bare name silently reinstates 25bf49e4.
-nim-stackable-hooks!=72f578249e9d8bbca8e3705c8a41ed5085c05bf9
+# a043a07 or later; until then a bare name silently reinstates 25bf49e4.
+nim-stackable-hooks!=a043a07f71a9b662c6ae9bae7837107e6c1ade67
 nim-shm-queue
 
 # nim-shm-gset is required by `src/io_mon/writer.nim` (`import

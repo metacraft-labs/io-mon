@@ -103,14 +103,14 @@ limitation into a recurring outage:
 `.github/sibling-repos` now carries an acknowledged override:
 
 ```
-nim-stackable-hooks!=72f578249e9d8bbca8e3705c8a41ed5085c05bf9
+nim-stackable-hooks!=a043a07f71a9b662c6ae9bae7837107e6c1ade67
 ```
 
-`72f57824` is the revision `flake.nix` pins `stackable-hooks-src` to, so the two
+`a043a07` is the revision `flake.nix` pins `stackable-hooks-src` to, so the two
 channels name one commit.
 
 **Removal condition:** drop the `!=` back to a bare name only once a re-locked
-mainline commit pins `72f57824` or later. Until then a bare name silently
+mainline commit pins `a043a07` or later. Until then a bare name silently
 reinstates `25bf49e4` — it does not fall back to something reasonable, and it
 does not warn. That is the trap, and it is why the entry carries its reasoning
 inline rather than only here.
