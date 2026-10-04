@@ -71,3 +71,13 @@ nonfunction dynamic definitions. Before selecting that supported option, compile
 the current full release shim with the exact Zig target and inspect its dynamic
 symbols too. Require native two-image lookup/I/O, the full Linux suite and
 extracted-release checks; do not remove binding or relax the glibc baseline.
+
+The candidate at `d45b90b` plus the local binding patch compiles the complete
+release shim on macOS with Zig 0.15.2 for both x64 and ARM64 Linux, explicitly
+targeting glibc 2.28. ELF inspection finds 285 and 244 defined dynamic functions
+respectively, zero defined dynamic data symbols, and all required public hooks.
+The highest imported GLIBC versions are 2.16 and 2.17 respectively; versioned
+exports are distinguished from imported requirements. The original option fails
+the real compiler control; the supported local-binding option succeeds. Lint
+passes. Native Linux execution and extracted-package checks remain required;
+this does not enable a deferred Linux ARM release payload.
