@@ -95,3 +95,11 @@ also reports its known unsupported raw-syscall patch capability in all
 propagation cases; these existing completeness assertions remain intact.
 Linux ARM payload support is still deferred. The four configurations do not
 yet distinguish the vfork crash, so a direct frame-state diagnostic is next.
+
+The x64 fixture copied the library as `distinct-monitor.so`. That violates
+the current loader contract: `linux_mapping_policy.nim` excludes the monitor's
+own raw syscall instructions by its production basename. Use a private
+directory with `librepro_monitor_shim.so` to preserve a distinct loaded image
+without making the scanner patch itself. The retained-core comparison at
+`28f5995` still investigates the original trap; the corrected fixture must
+pass natively with all signal and mask assertions intact.

@@ -54,7 +54,10 @@ suite "Linux injected shim preserves host fault handlers":
     let work = createTempDir("io-mon-host-faults-", "")
     defer: removeDir(work)
     let builtShim = buildPrivateLinuxShim(repoRoot)
-    let shim = work / "distinct-monitor.so"
+    # Keep the production basename: the x64 mapping policy uses it to exclude
+    # the shim's own raw syscall instructions. The private directory already
+    # gives dlopen a distinct image without changing that loader contract.
+    let shim = work / "librepro_monitor_shim.so"
     copyFile(builtShim, shim)
     let source = work / "host.c"
     let host = work / "host"
