@@ -1,6 +1,6 @@
 # Linux shim runtime settings diverge from the injected-library policy
 
-Status: open. Observed at io-mon `80a7c4a`; the same Linux build path is
+Status: in progress; native comparison pending. Observed at io-mon `80a7c4a`; the same Linux build path is
 present at `5e71adf` and `4b2bb3`.
 
 ## Observed
@@ -67,3 +67,14 @@ the documented POSIX settings. Preserve process exit, capture completeness,
 child identity and resumed-parent evidence checks. Also verify host signal
 handler ownership with an actual loaded shim. No allocator diagnosis is
 inferred from this separate stack-trace crash.
+
+Candidate applies the existing POSIX policy through `linux_preload.nim.cfg`
+and extends the portable configuration test. New real Linux regressions
+exercise 256 vfork/exec children with stack reuse, every child's read/identity,
+complete capture and the resumed parent's writes. A separate C host installs
+fault handlers before loading the shim, then verifies delivery and signal masks
+for SIGSEGV, SIGILL, SIGFPE, SIGBUS and SIGABRT in separate bounded processes.
+The C flush wrapper remains enabled and must reach the original host handler.
+No existing assertion, deadline or capture policy changes. Local macOS checks
+cover the portable test, Linux semantic compilation and lint; native Linux
+execution and old-settings controls remain required before qualification.

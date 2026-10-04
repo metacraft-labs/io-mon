@@ -16,6 +16,7 @@ concrete choices and the reasoning.
 ## Build settings
 
 The shim is built (see `scripts/build_shim.sh`,
+`src/io_mon/shim/linux_preload.nim.cfg`,
 `src/io_mon/shim/macos_interpose.nim.cfg` and
 `src/io_mon/shim/windows_interpose.nim.cfg`) with the settings below. On
 Windows only `-d:noSignalHandler` is applied through the `.nim.cfg`. The
@@ -33,10 +34,22 @@ Windows build keeps `--mm:orc`, and its trace settings are unchanged.
   which hides the real exception and blames Nim in a program (gcc, cc1) that
   contains none. That is how an injection defect presented on a Windows CI
   host in 2026-09. `tests/portable/test_shim_signal_handler_policy.nim` pins
-  the define for both shims.
+  the define for all three shims. Linux also loads a real library after
+  installing host fault handlers and verifies that signal delivery reaches
+  them with their masks intact. Its C flush wrapper still forwards to the
+  original disposition; the forbidden handler here is Nim's runtime handler.
 - `--mm:arc` — deterministic reference counting, no background cycle-collector
   thread; more C-like than `orc`. The shim's data has no reference cycles.
 - `--threads:on` — required: the shim records from every host thread.
+
+On Linux, a successful exec in a `vfork` child cannot unwind Nim trace frames.
+The suspended parent shares the child's TLS, so retaining `framePtr` can leave
+it pointing into abandoned child stack memory. Disabling trace generation at
+the library entry module removes that runtime state from all shim modules.
+The existing live-PID and C recursion-guard restoration remain required.
+`test_io_mon_propagation.nim` exercises repeated real vfork/exec, reuses the
+child stack, and requires child reads and resumed-parent writes with complete
+capture. This is separate from allocation ownership and exception handling.
 
 On Linux/glibc, `-d:useMalloc` is paired with `ioMonGlibcPrivateHeap`. The
 shim's own malloc/calloc/realloc/free references are linked through private,

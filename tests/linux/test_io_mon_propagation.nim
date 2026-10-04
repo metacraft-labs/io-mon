@@ -43,7 +43,9 @@
 ## A third test calls real vfork, attempts a failed exec, then execs the reader.
 ## It checks the child's live identities and the resumed parent's write identity.
 ## This catches a child borrowing cached parent IDs without changing completeness
-## accounting. All probes use real processes, files and compilers; no mocks.
+## accounting. A repeated-vfork case also reuses the child stack before the
+## parent resumes close hooks, covering abandoned compiler-generated frames.
+## All probes use real processes, files and compilers; no mocks.
 ##
 ## The second arm drops ONLY `LD_PRELOAD` and preserves the rest of the
 ## environment on purpose. Wiping the whole environment would also remove
@@ -320,3 +322,79 @@ int main(int argc, char **argv) {
       it.threadId == childPid)
     check vforkDep.records.anyIt(it.kind == mrFileWrite and
       it.path == parentMarker and it.osPid == parentPid)
+
+  test "repeated_vfork_exec_preserves_parent_runtime_and_capture":
+    let snoopBin = ensureSnoop(work)
+    let shimLib = ensureShim()
+    let reader = buildC(work, "vfork_repeat_reader", readerSrc)
+    let launcher = buildC(work, "vfork_repeat_launcher", """
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/wait.h>
+#include <unistd.h>
+/* Reuse memory below main's stack frame after the vfork child execs. The
+ * child and parent share TLS, so a trace-frame pointer left by the child's
+ * nonreturning exec must never be consulted by the resumed parent. */
+__attribute__((noinline)) static void reuse_stack(unsigned char value) {
+  volatile unsigned char scratch[65536];
+  for (unsigned int i = 0; i < sizeof(scratch); ++i) scratch[i] = value;
+}
+int main(int argc, char **argv) {
+  if (argc != 4) return 20;
+  alarm(60);
+  for (int i = 0; i < 256; ++i) {
+    int fd = open(argv[3], O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd < 0) return 21;
+    pid_t child = vfork();
+    if (child < 0) return 22;
+    if (child == 0) {
+      execl(argv[1], argv[1], argv[2], (char *)0);
+      _exit(23);
+    }
+    reuse_stack((unsigned char)i);
+    if (write(fd, "p", 1) != 1 || close(fd) != 0) return 24;
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0) {
+      if (errno != EINTR) return 25;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 26;
+    printf("repeat-child=%ld\n", (long)child);
+  }
+  printf("repeat-parent=%ld\n", (long)getpid());
+  return 0;
+}
+""")
+    let marker = work / "vfork-repeat-input.txt"
+    let parentMarker = work / "vfork-repeat-parent.txt"
+    writeFile(marker, "repeated vfork reader payload\n")
+    if fileExists(parentMarker): removeFile(parentMarker)
+    let depfile = work / "vfork-repeat.iomon"
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--",
+      launcher, reader, marker, parentMarker], childEnvWith(shimLib))
+    checkpoint(cap.output)
+    require cap.code == 0
+    require readFile(parentMarker) == repeat("p", 256)
+    var children: seq[uint64]
+    var parentPid: uint64
+    for field in cap.output.splitWhitespace():
+      if field.startsWith("repeat-child="):
+        children.add parseBiggestUInt(field.split('=')[1])
+      elif field.startsWith("repeat-parent="):
+        parentPid = parseBiggestUInt(field.split('=')[1])
+    require parentPid != 0
+    require children.deduplicate().len == 256
+    let dep = readMonitorDepFile(depfile)
+    for record in dep.records:
+      if record.kind == mrEventLoss: checkpoint($record)
+    check dep.completeness == mcComplete
+    check not dep.records.anyIt(it.kind == mrEventLoss)
+    for child in children:
+      check child != parentPid
+      check dep.records.anyIt(it.kind == mrProcessExec and it.path == reader and
+        it.osPid == child and it.parentOsPid == parentPid and it.threadId == child)
+      check dep.records.anyIt(it.kind == mrFileRead and it.path == marker and
+        it.osPid == child)
+    check dep.records.anyIt(it.kind == mrFileWrite and it.path == parentMarker and
+      it.osPid == parentPid)
