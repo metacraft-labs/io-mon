@@ -49,7 +49,9 @@ the library entry module removes that runtime state from all shim modules.
 The existing live-PID and C recursion-guard restoration remain required.
 `test_io_mon_propagation.nim` exercises repeated real vfork/exec, reuses the
 child stack, and requires child reads and resumed-parent writes with complete
-capture. This is separate from allocation ownership and exception handling.
+capture. `test_io_mon_vfork_frame_state.nim` also queries the actual frame
+pointer through a test-only include immediately before and after vfork; this
+catches an abandoned frame even when later stack reuse does not crash. This is separate from allocation ownership and exception handling.
 
 On Linux/glibc, `-d:useMalloc` is paired with `ioMonGlibcPrivateHeap`. The
 shim's own malloc/calloc/realloc/free references are linked through private,

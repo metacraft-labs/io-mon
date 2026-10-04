@@ -103,3 +103,27 @@ directory with `librepro_monitor_shim.so` to preserve a distinct loaded image
 without making the scanner patch itself. The retained-core comparison at
 `28f5995` still investigates the original trap; the corrected fixture must
 pass natively with all signal and mask assertions intact.
+
+### Frame-state control — confirmed on both architectures
+
+At `28f5995`, [37165147188](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/37165147188)
+loads the real shim with one temporary trace-free getter. On x64 and ARM,
+original settings and ARC alone report `before-null=1 after-null=0 changed=1`
+after a successful vfork/exec, and the C probe exits 71. Disabling trace frames
+reports `before-null=1 after-null=1 changed=0` and exits zero, under both ORC
+and ARC. This directly establishes the abandoned frame state; ARC alone does
+not repair it. The original GCC close-hook core is consistent with that state
+being reused. The candidate bootstrap still needs the real compiler repetition.
+
+The corrected distinct-input propagation suite passes all four cases on x64
+in every configuration. This workload alone does not detect the stale frame,
+so add `test_io_mon_vfork_frame_state.nim` as a permanent regression. It builds
+the production shim with a test-only included getter and checks the state
+immediately on return from vfork. The getter changes no hook or compiler
+setting and is absent from release builds.
+
+The x64 retained core enters `stackable_linux_raw_syscall6` from
+`installInt3SyscallPatchTransaction` during `distinct-monitor.so` initialization,
+confirming the renamed-fixture self-patching diagnosis. ARM's five host-handler
+checks pass under the candidate policy and fail under original settings. The
+corrected production-basename fixture at `004b8fc3` is under native validation.
