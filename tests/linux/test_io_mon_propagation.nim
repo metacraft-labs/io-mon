@@ -345,12 +345,15 @@ int main(int argc, char **argv) {
   if (argc != 4) return 20;
   alarm(60);
   for (int i = 0; i < 256; ++i) {
+    char marker[4096];
+    if (snprintf(marker, sizeof(marker), "%s-%d", argv[2], i) >= sizeof(marker))
+      return 27;
     int fd = open(argv[3], O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (fd < 0) return 21;
     pid_t child = vfork();
     if (child < 0) return 22;
     if (child == 0) {
-      execl(argv[1], argv[1], argv[2], (char *)0);
+      execl(argv[1], argv[1], marker, (char *)0);
       _exit(23);
     }
     reuse_stack((unsigned char)i);
@@ -368,7 +371,10 @@ int main(int argc, char **argv) {
 """)
     let marker = work / "vfork-repeat-input.txt"
     let parentMarker = work / "vfork-repeat-parent.txt"
-    writeFile(marker, "repeated vfork reader payload\n")
+    # The dependency set deliberately drops observer IDs for file reads.
+    # A distinct path per child proves every read without inventing PID data.
+    for i in 0 ..< 256:
+      writeFile(marker & "-" & $i, "repeated vfork reader payload\n")
     if fileExists(parentMarker): removeFile(parentMarker)
     let depfile = work / "vfork-repeat.iomon"
     let cap = run(snoopBin, @["run", "--depfile", depfile, "--",
@@ -390,11 +396,10 @@ int main(int argc, char **argv) {
       if record.kind == mrEventLoss: checkpoint($record)
     check dep.completeness == mcComplete
     check not dep.records.anyIt(it.kind == mrEventLoss)
-    for child in children:
+    for i, child in children:
       check child != parentPid
       check dep.records.anyIt(it.kind == mrProcessExec and it.path == reader and
         it.osPid == child and it.parentOsPid == parentPid and it.threadId == child)
-      check dep.records.anyIt(it.kind == mrFileRead and it.path == marker and
-        it.osPid == child)
+      check hasFileRead(dep, marker & "-" & $i)
     check dep.records.anyIt(it.kind == mrFileWrite and it.path == parentMarker and
       it.osPid == parentPid)

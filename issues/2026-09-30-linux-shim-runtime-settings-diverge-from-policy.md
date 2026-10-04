@@ -78,3 +78,20 @@ The C flush wrapper remains enabled and must reach the original host handler.
 No existing assertion, deadline or capture policy changes. Local macOS checks
 cover the portable test, Linux semantic compilation and lint; native Linux
 execution and old-settings controls remain required before qualification.
+
+Native comparison [37164525650](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/37164525650)
+at candidate `00a6286` separates two results. On ARM, both original settings
+and ARC alone prevent delivery to the host handlers; disabling Nim traces
+and its signal handler passes with either allocator. On x64, every variant
+of the new late-load handler fixture dies with SIGTRAP, requiring its own
+trace before attribution. No whole-suite pass is claimed.
+
+The new repeated-vfork fixture incorrectly required a PID on every read.
+`src/io_mon/shm/dep_queue.nim` deliberately uses path-scoped read identity
+and drops the observer fields. Give each child a distinct input and require
+all 256 reads plus the unchanged per-child exec identities. That corrects
+the new fixture without changing the existing three propagation cases. ARM
+also reports its known unsupported raw-syscall patch capability in all
+propagation cases; these existing completeness assertions remain intact.
+Linux ARM payload support is still deferred. The four configurations do not
+yet distinguish the vfork crash, so a direct frame-state diagnostic is next.
