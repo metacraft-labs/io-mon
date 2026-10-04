@@ -69,6 +69,16 @@ older executable's libc and fail before the program starts. This preserves
 compatibility only down to the shim's actual imported glibc symbol floor; it
 does not promise arbitrary old-glibc or cross-libc injection compatibility.
 
+Linux also uses `-Bsymbolic-functions`: calls to functions defined by the shim
+bind to that same image. Public exports remain available, including the libc
+interposition entry points. With two distinct preloads, default ELF preemption
+otherwise sends the second constructor into the first initializer and can send
+the second dlsym wrapper back to the first real-dlsym helper indefinitely.
+`test_io_mon_distinct_preloads.nim` launches two real library images in both
+orders and checks startup, image-specific helper lookup and real file reads.
+The enclosing monitored vfork-frame test remains an additional release gate.
+Successful startup does not establish independent nested-session delivery.
+
 This depends on an ownership boundary: only shim-owned pointers may reach the
 wrapped frees. The current callers are Nim's `useMalloc` runtime, the Linux POD
 tables, raw-syscall snapshots, and exec-environment construction. Each frees its
