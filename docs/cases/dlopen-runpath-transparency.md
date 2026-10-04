@@ -125,6 +125,17 @@ Ship **B** now. Track **C (`LD_AUDIT`)** as the principled evolution of library-
 observation. Use **D** as a per-consumer stopgap while the shim fix propagates
 through pins. **E** is a separate, larger architectural discussion.
 
+## Candidate class validation
+
+The caller-path search must skip a candidate with an incompatible ELF class,
+as glibc does. Existence alone is insufficient on a host with both 32-bit and
+64-bit libraries: rewriting the first candidate to an absolute path prevents
+native fallback. The probe reads the ELF header without loading the candidate.
+Short files and invalid magic still reach the real loader and fail; they must
+not be hidden by continuing to a working copy. Tests compare both RPATH forms
+and an environment search against the real unmonitored loader, plus a malformed
+candidate negative case. Native Linux qualification is required.
+
 ## Residual risks / known gaps
 
 - ~~The `dlopen`'d `.so`'s own load is still not recorded as a file-read

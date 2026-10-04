@@ -1821,6 +1821,31 @@ static int ct_dlopen_origin_dir(struct link_map *lm, char *out, size_t cap) {
   return 1;
 }
 
+static int ct_dlopen_has_other_elf_class(const char *path) {
+  /* glibc's open_verify skips a different ELF class while searching, but
+     treats short files and bad magic as real errors. An existence-only probe
+     changes a search into an absolute dlopen of (for example) a 32-bit library
+     in a 64-bit process. Inspect bytes without executing any candidate's
+     constructors. Leave every other validation decision to the real loader. */
+  int saved_errno = errno;
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) { errno = saved_errno; return 0; }
+  ElfW(Ehdr) header;
+  size_t used = 0;
+  while (used < sizeof(header)) {
+    ssize_t n = read(fd, (char *)&header + used, sizeof(header) - used);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) break;
+    used += (size_t)n;
+  }
+  close(fd);
+  int other = used == sizeof(header) &&
+      memcmp(header.e_ident, ELFMAG, SELFMAG) == 0 &&
+      header.e_ident[EI_CLASS] != (sizeof(void *) == 8 ? ELFCLASS64 : ELFCLASS32);
+  errno = saved_errno;
+  return other;
+}
+
 static int ct_dlopen_try_dir(const char *dir, size_t dirlen,
                              const char *soname, const char *origin,
                              char *out, size_t cap) {
@@ -1857,13 +1882,15 @@ static int ct_dlopen_try_dir(const char *dir, size_t dirlen,
 
 static int ct_dlopen_search_list(const char *list, const char *soname,
                                  const char *origin, char *out, size_t cap) {
-  /* First existing "dir/soname" across a colon-separated dir list wins. */
+  /* Preserve the loader's fallback past incompatible ELF classes. A malformed
+     candidate still wins here so the real loader reports its genuine error. */
   if (list == NULL) return 0;
   const char *p = list;
   while (*p) {
     const char *sep = strchr(p, ':');
     size_t len = sep ? (size_t)(sep - p) : strlen(p);
-    if (len > 0 && ct_dlopen_try_dir(p, len, soname, origin, out, cap))
+    if (len > 0 && ct_dlopen_try_dir(p, len, soname, origin, out, cap) &&
+        !ct_dlopen_has_other_elf_class(out))
       return 1;
     if (!sep) break;
     p = sep + 1;

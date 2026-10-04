@@ -175,3 +175,133 @@ archived cleanup/XtaCache records before extending this issue. Log:
 `/tmp/io-mon-122-windows-arm-repro-complete.log`. The final workflow cancellation
 stopped the optional S3 mirror after it spent 51 minutes retrying connection
 timeouts; every build/test step had already finished.
+
+## Persistent finished-image cleanup failure at f03032af
+
+At `f03032af422c2fcc2f59568135167b203b9abdd6`, Windows ARM64 emulation
+[job 111202263312](https://github.com/metacraft-labs/io-mon/actions/runs/37122834544/job/111202263312)
+completes 98 of 100 graph actions successfully. Two execution actions fail only
+at fixture cleanup, after their native exit-status and session-scope checks pass:
+
+- `test_io_mon_cli_exit_status`: the private `io-mon.exe` cannot be removed.
+- `test_io_mon_windows_host_session_scope`: its private
+  `librepro_monitor_shim.dll` cannot be removed.
+
+Both failures survive the existing 30-second monotonic removal bound and report
+`Access is denied`. The failure artifact is `11276046801`, containing the actual
+build failure report. The same commit passes all Linux, macOS and Windows x64 CI.
+The ARM repeat and native cross-check steps do not execute after this failure.
+
+The previous XtaCache observation is a hypothesis for this run, not an owner
+measurement. Preserve the current cleanup bound and every functional assertion.
+Use the existing real Restart Manager diagnostic, including its live-image
+positive control, to record the remaining file users and attributes before
+choosing another cleanup repair. A focused native Windows diagnostic can run the
+two unchanged fixtures and retain its precise source patch and output. It must
+not kill cache services, delete unrelated files, bypass access checks or treat
+persistent cleanup failure as success.
+
+Focused diagnostic [37129790109](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/37129790109)
+at shared-actions `6f7fb73` runs io-mon `f03032af` with the pinned release
+compiler and added cleanup diagnostics. Both unchanged programs pass three
+times each on Windows x64 and Windows ARM64 x64 emulation. On ARM, CLI
+rounds take 10.0–10.6 seconds and session-scope rounds 29.9–30.6 seconds
+including their private builds. There is no persistent cleanup failure in
+that narrower compiler/environment context, so it establishes no owner for
+the full Reprobuild failure.
+
+Retain the Restart Manager query in the shared Windows fixture cleanup helper,
+only after the existing 30-second limit has already failed. It records file
+attributes and actual process owners and validates the query against its own
+live image. Diagnostic failure must not replace the original fatal cleanup
+error. No waits, assertions, fixture placement, or cache policy change. The
+full native Windows ARM64 Reprobuild graph must produce the missing evidence.
+
+## Retaining processes measured in the full ARM graph
+
+At `91a0e66909ef6d7d8ecd5a515038f559450604e1`, Windows ARM64 emulation
+[job 111224969896](https://github.com/metacraft-labs/io-mon/actions/runs/37130650109/job/111224969896)
+again completes 98 of 100 actions. All native exit-status and session-scope
+assertions pass before the unchanged 30-second cleanup fails. Artifact
+`11278619336` contains the actual failure report and positive-control evidence:
+
+- The private CLI image has ordinary attributes (128, not read-only).
+  Restart Manager names `xtac64se.exe` (PID 8976) and `XtaCache.exe` (PID 2544).
+- The private session shim DLL has the same ordinary attributes. Its sole
+  reported owner is `XtaCache.exe` (PID 2544).
+- Both live-image query controls detect their own fixture process correctly
+  (PIDs 3276 and 6072). No query failed.
+
+This establishes the owners in the failing full graph. It does not establish
+that a particular removal API can unlink their retained image mappings.
+Preserve cleanup failure, all functional assertions, and the default Windows
+translation-cache behavior. Investigate documented removal semantics against
+real handles and mapped images before changing the cleanup helper. Do not kill
+these system processes, disable the cache or defer deletion until reboot.
+
+Refreshed `agents` at `081f95fb` before extending this existing issue. Ordinary
+CI, sanitizers and Linux/macOS/Windows x64 Reprobuild jobs pass at `91a0e669`.
+
+The real API probe at shared-actions `f910ab5ab8965a771290f6b36bb4e29ea91b32ca`
+([37137809665](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/37137809665))
+rules out substituting POSIX unlink for ordinary deletion. On both Windows
+2025 x64 and Windows 11 ARM, a private real SEC_IMAGE mapping blocks both
+`DeleteFileW` and `SetFileInformationByHandle(FileDispositionInfoEx, DELETE |
+POSIX_SEMANTICS)` with error 5. Closing the probe's own mapping makes deletion
+succeed. Ordinary-file removal and a sharing-denial/handle-close control also
+pass. The probe only creates private files and handles; it does not change
+system services, close another process's handles or modify product tests.
+The production helper is unchanged. A proper repair still needs the actual
+translation-cache mapping lifetime to end; merely replacing the removal API
+would leave the full-graph failure intact.
+
+## Quiet debug comparison and exact Repro context
+
+At product `b464ce17`, shared-actions `1d83211`
+[37139650319](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/37139650319)
+runs both unchanged programs three times each on Windows ARM using Nim 2.2.8
+and GCC 16.1.0 debug builds. All six executions pass, including their original
+cleanup bounds; each complete fixture takes 14–16 seconds. The dependency
+clones differ from the full failing graph, so this does not establish that
+concurrent compilation causes retention.
+
+The next diagnostic uses the production setup action and bootstrap pins,
+tarball provisioning, and temporary names for the two existing Repro execution
+actions. Shared-actions `e01b508`
+[37143020045](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/37143020045)
+is still running as of 18:43 UTC on 2026-10-03. Every report must show its
+selected action actually launched. No assertion, dependency policy, cacheability
+or cleanup deadline changes. Its superseded predecessor `37141310130` stopped
+at an incorrect version probe and supplies no product verdict.
+
+## Exact focused Repro qualification and scheduling repair
+
+At product `b464ce17cdf2196e61ccf4ab3e61ed0ee1a70ed2`, shared-actions
+`e01b508fdf5dcf12e17191be38f1de1612da022b`
+[run 37143020045](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/37143020045)
+passes both affected fixtures three times each on Windows ARM x64 emulation.
+Every report records the expected execute action as launched and successful,
+using its original dependency policy. The diagnostic uses the production
+Repro bootstrap, compiler, monitor and dependency revisions; temporary collection
+aliases select the existing actions without changing their implementations.
+Every functional assertion and the original 30-second cleanup bound passes.
+This removes the differing compiler/dependency pins from the earlier quiet-run
+comparison. It does not prove which Windows cache service activity causes the
+full graph's retained images.
+
+The remaining difference is the concurrent full-suite context. Under LOCAL-4,
+finish all test compilation and ordinary execute actions before these two
+cleanup-sensitive programs, and run the two one at a time. Preserve their
+uncached uninjected premise, every case and the existing bounded cleanup; do
+not suppress errors, disable Windows caches, move images or change deadlines.
+Full Windows CI must qualify this scheduling repair. A passing focused run
+alone does not close this issue or permit release.
+
+The ordering patch at `f756aa3` plus the working diff materializes all 117
+macOS build/dependency actions successfully. Windows alone delays the two
+cleanup-sensitive execute actions; POSIX execution dependencies are unchanged.
+The isolated Windows repeat collection now also includes ordinary prerequisites,
+so its CI checker identifies each of the original eight execute actions by name
+and still requires all eight to launch, succeed and exit zero. The names must
+match exactly once each. Actionlint and the expanded PowerShell syntax check
+pass. Full execution and native Windows qualification remain pending.

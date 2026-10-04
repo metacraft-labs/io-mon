@@ -47,7 +47,8 @@ when defined(macosx):
     doAssert code == 0, "cc failed (" & src & "): " & output
     doAssert fileExists(outBin), "probe not produced: " & outBin
 
-  proc runProbe(shim, probe: string; args: seq[string]): MonitorDepFile =
+  proc runProbe(shim, probe: string; args: seq[string];
+      expectedOutput = ""): MonitorDepFile =
     let runWork = getTempDir() / ("io-mon-r5raw-" & probe.extractFilename() &
       "-" & $getCurrentProcessId())
     removeDir(runWork); createDir(runWork)
@@ -63,9 +64,11 @@ when defined(macosx):
     applyMacosBackendToggle(env, "both")
     let p = startProcess(probe, args = args, env = env,
       options = {poStdErrToStdOut})
-    discard p.outputStream.readAll()
-    discard p.waitForExit()
+    let output = p.outputStream.readAll()
+    let code = p.waitForExit()
     p.close()
+    doAssert code == 0, "probe failed: " & $code & " " & output
+    doAssert expectedOutput in output, "missing probe output: " & output
     let depfile = runWork / "cap.iomon"
     discard mergeFragments(fragmentDir, depfile)
     doAssert fileExists(depfile)
@@ -106,13 +109,17 @@ suite "io-mon macOS R5 raw-syscall blind spot (make-safe by downgrade)":
 long (*volatile sc)(int, ...) = (long (*)(int, ...))syscall;
 int main(int c, char** v){
   int fd = (int)sc(SYS_open, v[1], O_RDONLY, 0);
-  if (fd >= 0) { char b[64]; sc(SYS_read, fd, b, sizeof b); sc(SYS_close, fd); }
+  if (fd < 0) return 11;
+  char b[64]; long n = sc(SYS_read, fd, b, sizeof b);
+  if (n <= 0) return 12;
+  if (sc(SYS_close, fd) != 0) return 13;
+  if (write(1, b, n) != n) return 14;
   return 0;
 }
 """)
       let bin = work / "sc_noinline"
       ccExe(src, bin, extraFlags = "-O0")
-      let dep = runProbe(shim, bin, @[mk])
+      let dep = runProbe(shim, bin, @[mk], "raw-syscall-marker")
       check dep.completeness == mcIncomplete
 
     test "CARDINAL SIN: a normal cc compile stays mcComplete (scans clean)":

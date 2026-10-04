@@ -116,6 +116,7 @@ package io_mon:
       "rustc"
     when defined(macosx):
       "cctools"
+      "python3"
     when defined(linux):
       "getconf"
       "grep"
@@ -243,9 +244,12 @@ package io_mon:
     var testBuildActions: seq[BuildActionDef] = @[]
     var testExecuteActions: seq[BuildActionDef] = @[]
     var isolatedTestActions: seq[BuildActionDef] = @[]
+    var testPrograms: seq[tuple[source, binary: string,
+                                testBinary: NimUnittestBinary]] = @[]
 
-    proc emitTestPair(source, binary: string;
-                      buildActions, executeActions: var seq[BuildActionDef]) =
+    proc emitTestBuild(spec: TestSpec) =
+      let source = spec.source
+      let binary = spec.binary
       var lastSlash = -1
       for i in 0 ..< binary.len:
         if binary[i] == '/' or binary[i] == '\\':
@@ -264,8 +268,13 @@ package io_mon:
         extraInputs = @["src", "tests/helpers", "io_mon.nimble"],
         actionId = "io-mon.test_build." & stem)
       appendRegisteredActionToolIdentityRefs(edge.action.id, [backendCompiler])
-      buildActions.add(edge.action)
+      testBuildActions.add(edge.action)
 
+      testPrograms.add((source, binary, edge.testBinary))
+
+    proc emitTestExecution(source, binary: string; testBinary: NimUnittestBinary;
+                           after: seq[BuildActionDef]) =
+      let stem = binary.extractFilename
       # These Windows tests install their own hooks or deliberately select
       # an inert/slow DLL. An outer injected shim changes that premise (the
       # inert root unexpectedly reports complete evidence) and interferes with
@@ -314,7 +323,7 @@ package io_mon:
         "test_io_mon_windows_root_guard.nim",
         "test_io_mon_windows_spawn_abandoned_injection.nim",
         "test_io_mon_windows_spawn_resume_invariant.nim"])
-      var executeAfter: seq[BuildActionDef] = @[]
+      var executeAfter = after
       var executePolicy = automaticMonitorPolicy()
       if isolatesMonitor:
         let depfile = "build/test-deps/" & stem & ".d"
@@ -324,10 +333,10 @@ package io_mon:
           reason = "Injection test owns its hooks and shim selection; " &
             "an outer shim changes the experiment. Execution always reruns.",
           actionId = "io-mon.test_dependencies." & stem)
-        buildActions.add(depfileEdge)
+        testBuildActions.add(depfileEdge)
         executeAfter.add(depfileEdge)
         executePolicy = makeDepfilePolicy(depfile, suppressMonitorShimSeed = true)
-      let executeEdge = edge.testBinary.run(
+      let executeEdge = testBinary.run(
         actionId = "io-mon.test_execute." & stem,
         requiredBinaries = @[cliOutput],
         extraInputs = @[shimOutput],
@@ -347,10 +356,12 @@ package io_mon:
           ["dirname", "uname", "rustc"])
       when defined(macosx):
         appendRegisteredActionToolIdentityRefs(executeEdge.id, ["cctools"])
+        if stem == "test_io_mon_macos_readdir_inode64":
+          appendRegisteredActionToolIdentityRefs(executeEdge.id, ["python3"])
       when defined(linux):
         appendRegisteredActionToolIdentityRefs(executeEdge.id,
           ["strace", "nm", "getconf", "grep"])
-      executeActions.add(executeEdge)
+      testExecuteActions.add(executeEdge)
 
     # Portable tests — always in the graph.
     proc testSpecsUnder(dir: string): seq[TestSpec] =
@@ -390,7 +401,25 @@ package io_mon:
 
     for dir in selectedTestDirs:
       for spec in testSpecsUnder(dir):
-        emitTestPair(spec.source, spec.binary, testBuildActions, testExecuteActions)
+        emitTestBuild(spec)
+
+    # These two Windows programs enforce bounded cleanup of executed images.
+    # Their original actions pass repeatedly in the production Repro context
+    # when run alone; the full graph overlaps them with compiler/test processes
+    # and Windows translation services retain their images past the deadline.
+    # Finish that competing work first, then execute these programs serially.
+    # Every assertion, cleanup bound, monitor policy and cache setting remains.
+    for cleanupPhase in [false, true]:
+      for program in testPrograms:
+        let cleanupSensitive = defined(windows) and
+          program.source.extractFilename in [
+            "test_io_mon_cli_exit_status.nim",
+            "test_io_mon_windows_host_session_scope.nim"]
+        if cleanupSensitive == cleanupPhase:
+          let after = if cleanupPhase:
+            testBuildActions & testExecuteActions
+          else: newSeq[BuildActionDef]()
+          emitTestExecution(program.source, program.binary, program.testBinary, after)
 
     discard collect("test", testExecuteActions)
     when defined(windows) or defined(macosx) or defined(linux):

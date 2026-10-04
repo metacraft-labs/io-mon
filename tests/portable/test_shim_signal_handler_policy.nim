@@ -29,7 +29,7 @@ proc cfgDefines(cfgPath: string): seq[string] =
       result.add line.split(':', 1)[1].strip()
 
 suite "injected shims do not install signal handlers":
-  for shim in ["windows_interpose", "macos_interpose"]:
+  for shim in ["windows_interpose", "macos_interpose", "linux_preload"]:
     test shim & ".nim.cfg defines noSignalHandler":
       let cfg = shimDir / (shim & ".nim.cfg")
       require fileExists(cfg)
@@ -46,3 +46,15 @@ suite "injected shims do not install signal handlers":
       checkpoint(output)
       check rc == 0
       check "noSignalHandler" in output
+
+  test "nim applies the Linux shim configuration":
+    let nim = findExe("nim")
+    require nim.len > 0
+    let (output, rc) = execCmdEx(quoteShellCommand([nim, "dump",
+      "--hints:off", "--os:linux", "--cpu:arm64", "--app:lib",
+      shimDir / "linux_preload.nim"]))
+    checkpoint(output)
+    check rc == 0
+    check "noSignalHandler" in output
+    check "gcarc" in output.toLowerAscii()
+    check "gcorc" notin output.toLowerAscii()

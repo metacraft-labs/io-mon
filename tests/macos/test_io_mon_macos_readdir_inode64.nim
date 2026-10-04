@@ -36,9 +36,10 @@
 ##      fix must NOT lose monitoring) — a `mrDirectoryEnumerate` record naming the
 ##      enumerated directory is present in the captured depfile.
 ##
-## As the strongest end-to-end check, when a real `python3` is on PATH it must
-## START successfully under the shim (the pre-fix shim aborted it with
-## "Failed to import encodings module").
+## As the strongest end-to-end check, a real `python3` must be on PATH and START
+## successfully under the shim (the pre-fix shim aborted it with "Failed to
+## import encodings module"). Its read of a private input must be captured too,
+## so an interpreter that evades injection cannot produce a false green result.
 ##
 ## macOS-only; a no-op pass elsewhere.
 
@@ -165,14 +166,6 @@ int main(int argc, char **argv) {
         if rec.kind == mrDirectoryEnumerate and rec.path == dir:
           result.dirEnumRecorded = true
 
-  proc findRealPython(): string =
-    ## Locate a real `python3` interpreter for the end-to-end start check. Returns
-    ## "" when none is available (the e2e assertion then no-ops — the byte-identity
-    ## assertions above are the primary guard and need no external tool).
-    let exe = findExe("python3")
-    if exe.len == 0: return ""
-    exe
-
 suite "io-mon macOS readdir INODE64 transparency (round-4 P0)":
   when defined(macosx):
     let shim = buildShim()
@@ -208,26 +201,42 @@ suite "io-mon macOS readdir INODE64 transparency (round-4 P0)":
     test "a real python3 STARTS under the shim (encodings import works)":
       # The strongest end-to-end check: CPython enumerates its stdlib directory via
       # readdir at startup. Pre-fix the corrupted listing made it fail with
-      # "Failed to import encodings module". When no python3 is on PATH this
-      # no-ops (the byte-identity tests above remain the primary guard).
-      let py = findRealPython()
-      if py.len == 0:
-        skip()
-      else:
-        var env = newStringTable(modeCaseSensitive)
-        for k, v in envPairs(): env[k] = v
-        env["DYLD_INSERT_LIBRARIES"] = shim
-        env["REPRO_MONITOR_SHIM_LIB"] = shim
-        applyMacosBackendToggle(env, "both")
-        let p = startProcess(py, args = @["-c", "print('ok')"], env = env,
-          options = {poStdErrToStdOut})
-        let outText = p.outputStream.readAll()
-        let code = p.waitForExit()
-        p.close()
-        checkpoint("python3=" & py & " exit=" & $code & " out=" & outText)
-        check code == 0
-        check "ok" in outText
-        check "Failed to import encodings" notin outText
+      # "Failed to import encodings module". Both supported runners declare
+      # Python. A missing dependency is a failed control, not a skipped test.
+      let py = findExe("python3")
+      checkpoint("python3 is required; enter the project development shell")
+      require py.len > 0
+      let input = fx.work / "python-input.txt"
+      writeFile(input, "python-input-read")
+      # fd-based read records resolve macOS's /tmp -> /private/tmp symlink.
+      let canonicalInput = expandFilename(input)
+      let fragmentDir = fx.work / "python-frags"
+      createDir(fragmentDir)
+      var env = newStringTable(modeCaseSensitive)
+      for k, v in envPairs(): env[k] = v
+      env["DYLD_INSERT_LIBRARIES"] = shim
+      env["REPRO_MONITOR_SHIM_LIB"] = shim
+      env["REPRO_MONITOR_FRAGMENT_DIR"] = fragmentDir
+      applyMacosBackendToggle(env, "both")
+      let p = startProcess(py, args = @["-c",
+        "import encodings, sys; print(open(sys.argv[1]).read()); print('ok')", input],
+        env = env, options = {poStdErrToStdOut})
+      let outText = p.outputStream.readAll()
+      let code = p.waitForExit()
+      p.close()
+      checkpoint("python3=" & py & " exit=" & $code & " out=" & outText)
+      check code == 0
+      check "ok" in outText
+      check "python-input-read" in outText
+      check "Failed to import encodings" notin outText
+      let depfile = fx.work / "python.iomon"
+      discard mergeFragments(fragmentDir, depfile)
+      require fileExists(depfile)
+      let dep = readMonitorDepFile(depfile)
+      for rec in dep.records:
+        if "python-input" in rec.path:
+          checkpoint("captured=" & $rec.kind & " path=" & rec.path)
+      check dep.records.anyIt(it.kind == mrFileRead and it.path == canonicalInput)
 
     removeDir(fx.work)
   else:

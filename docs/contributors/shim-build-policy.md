@@ -16,6 +16,7 @@ concrete choices and the reasoning.
 ## Build settings
 
 The shim is built (see `scripts/build_shim.sh`,
+`src/io_mon/shim/linux_preload.nim.cfg`,
 `src/io_mon/shim/macos_interpose.nim.cfg` and
 `src/io_mon/shim/windows_interpose.nim.cfg`) with the settings below. On
 Windows only `-d:noSignalHandler` is applied through the `.nim.cfg`. The
@@ -33,10 +34,24 @@ Windows build keeps `--mm:orc`, and its trace settings are unchanged.
   which hides the real exception and blames Nim in a program (gcc, cc1) that
   contains none. That is how an injection defect presented on a Windows CI
   host in 2026-09. `tests/portable/test_shim_signal_handler_policy.nim` pins
-  the define for both shims.
+  the define for all three shims. Linux also loads a real library after
+  installing host fault handlers and verifies that signal delivery reaches
+  them with their masks intact. Its C flush wrapper still forwards to the
+  original disposition; the forbidden handler here is Nim's runtime handler.
 - `--mm:arc` — deterministic reference counting, no background cycle-collector
   thread; more C-like than `orc`. The shim's data has no reference cycles.
 - `--threads:on` — required: the shim records from every host thread.
+
+On Linux, a successful exec in a `vfork` child cannot unwind Nim trace frames.
+The suspended parent shares the child's TLS, so retaining `framePtr` can leave
+it pointing into abandoned child stack memory. Disabling trace generation at
+the library entry module removes that runtime state from all shim modules.
+The existing live-PID and C recursion-guard restoration remain required.
+`test_io_mon_propagation.nim` exercises repeated real vfork/exec, reuses the
+child stack, and requires child reads and resumed-parent writes with complete
+capture. `test_io_mon_vfork_frame_state.nim` also queries the actual frame
+pointer through a test-only include immediately before and after vfork; this
+catches an abandoned frame even when later stack reuse does not crash. This is separate from allocation ownership and exception handling.
 
 On Linux/glibc, `-d:useMalloc` is paired with `ioMonGlibcPrivateHeap`. The
 shim's own malloc/calloc/realloc/free references are linked through private,
@@ -53,6 +68,16 @@ a Nix RUNPATH can otherwise load a newer libm/librt/libdl/libpthread beside an
 older executable's libc and fail before the program starts. This preserves
 compatibility only down to the shim's actual imported glibc symbol floor; it
 does not promise arbitrary old-glibc or cross-libc injection compatibility.
+
+Linux also uses `-Bsymbolic-functions`: calls to functions defined by the shim
+bind to that same image. Public exports remain available, including the libc
+interposition entry points. With two distinct preloads, default ELF preemption
+otherwise sends the second constructor into the first initializer and can send
+the second dlsym wrapper back to the first real-dlsym helper indefinitely.
+`test_io_mon_distinct_preloads.nim` launches two real library images in both
+orders and checks startup, image-specific helper lookup and real file reads.
+The enclosing monitored vfork-frame test remains an additional release gate.
+Successful startup does not establish independent nested-session delivery.
 
 This depends on an ownership boundary: only shim-owned pointers may reach the
 wrapped frees. The current callers are Nim's `useMalloc` runtime, the Linux POD
@@ -130,6 +155,31 @@ Nim and without touching any thread-local**. The Nim hook (and its `inMmapHook`
 mappings, which are never issued from inside libmalloc. All recording behaviour is
 preserved. See `tests/macos/test_io_mon_macos_mmap_reentrancy.nim`.
 
+## macOS variadic syscall forwarding
+
+Apple ARM64 puts variadic arguments on the stack. The interposed `syscall(int,
+...)` entry must marshal those slots before calling a fixed-signature helper.
+Its assembly entry preserves all seven slots supported by libsyscall and enters
+the kernel through the indirect syscall entry. Before initialization, dispatch
+stays in C and assembly; it neither allocates nor enters Nim TLS. The kernel's
+carry flag controls errno, and successful results retain their full width.
+
+A fixed-argument replacement reads unrelated registers. With two distinct shim
+images, one image's entropy forwarder calls the other's interposed syscall during
+libmalloc initialization, which can return without filling the random buffer and
+leave rejection sampling spinning before `main`.
+
+`test_io_mon_macos_syscall_abi.nim` uses real file operations, a mapping at a
+nonzero offset, a wide seek result, errno and entropy controls. Its two-image
+startup test is bounded and requires captured input evidence. The raw-syscall
+fixture also checks the child status and output: an incomplete verdict alone
+cannot prove that forwarding worked.
+
+This fixes startup with distinct images. It does not give an outer session the
+records owned by an independent inner session. The outer monitor must continue
+to report missing descendant evidence as incomplete. Self-injecting Reprobuild
+fixtures retain their uncached execution isolation.
+
 ## Adding a new hook — checklist
 
 1. **Can the host's libmalloc/dyld/signal machinery call this function
@@ -145,3 +195,14 @@ preserved. See `tests/macos/test_io_mon_macos_mmap_reentrancy.nim`.
 4. Add a regression test that exercises the hook from inside a real allocator on
    multiple threads (a heavy multi-threaded toolchain like `rustc` is the reliable
    reproducer — see the mmap-reentrancy test).
+
+### Child library propagation
+
+`repro_macos_env_with_preload` keeps the monitor first and present once, then
+retains every other requested `DYLD_INSERT_LIBRARIES` entry in its original
+relative order. Finding the monitor already in the list must not discard the
+other libraries. The regression in
+`tests/macos/test_io_mon_macos_preload_libraries.nim` loads two real marker
+dylibs through spawn, SETEXEC and execve under both backends. It also requires
+captured input evidence, rejects duplicated monitor entries and supervises
+each launch with a process-group timeout.

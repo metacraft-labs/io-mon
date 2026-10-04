@@ -103,14 +103,14 @@ limitation into a recurring outage:
 `.github/sibling-repos` now carries an acknowledged override:
 
 ```
-nim-stackable-hooks!=72f578249e9d8bbca8e3705c8a41ed5085c05bf9
+nim-stackable-hooks!=a043a07f71a9b662c6ae9bae7837107e6c1ade67
 ```
 
-`72f57824` is the revision `flake.nix` pins `stackable-hooks-src` to, so the two
+`a043a07` is the revision `flake.nix` pins `stackable-hooks-src` to, so the two
 channels name one commit.
 
 **Removal condition:** drop the `!=` back to a bare name only once a re-locked
-mainline commit pins `72f57824` or later. Until then a bare name silently
+mainline commit pins `a043a07` or later. Until then a bare name silently
 reinstates `25bf49e4` — it does not fall back to something reasonable, and it
 does not warn. That is the trap, and it is why the entry carries its reasoning
 inline rather than only here.
@@ -150,3 +150,20 @@ situation strictly better and fully documented.
 - `.github/sibling-repos` — carries the override and its removal condition.
 - `3aaa2bd` — the flake url pin; correct on its own terms, and the reason
   `72f57824` is the revision both channels now name.
+
+## Release dependency refresh — 2026-10-04
+
+At io-mon `d344703`, the committed lock names hooks `3b99d26`, while the
+release flake, sibling override and ordinary Windows checkout still select
+`72f5782`. Gosti's monitored bootstrap is now qualifying hooks `a043a07`
+(runtime `10ed82a`) for reduced Windows page-preparation overhead. Changing
+that consumer bootstrap alone would not ship the repair in io-mon's release.
+The newer hook dependency also includes the already qualified Windows
+injection permit initialization and captured-output lifetime repairs.
+
+Refresh the release flake and generated lock, sibling override, ordinary
+Windows checkout and committed Repro lock together to the same candidate.
+Keep the existing explicit override until the forward-carry contract is fixed.
+Require full product CI and exact-source release rehearsal with the resulting
+dependency; the old release rehearsal cannot qualify a newly pinned library.
+No existing test or supported-platform gate is removed.

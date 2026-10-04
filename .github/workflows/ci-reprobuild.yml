@@ -126,10 +126,10 @@ jobs:
           # Exercise the published bootstrap repairs before a new CLI release.
           # Windows ARM64 keeps the existing emulated x64 Reprobuild tools.
           repro-from-source: true
-          repro-build-pin: c14b1e618d7c4b64476d89792e80b8e8f10b8a52
+          repro-build-pin: 1f85ace0037d0a70e966fe8eee645d766522b1ab
           repro-runquota-pin: 292e578d57eb85d6037f9e2d3a03f0bcb0489dbb
           repro-io-mon-pin: 5e71adf033b860c0fdbe13dda4320cf4a580f632
-          repro-posix-io-mon-pin: ${{ matrix.os == 'linux' && '3df08c24ee91900b950ed20a3827923d213f2a9c' || '' }}
+          repro-posix-io-mon-pin: ${{ matrix.os == 'linux' && '004b8fc3eb0a6c31f78622272ba323c221b79b28' || '' }}
           gh-token: ${{ steps.ci_token.outputs.token }}
 
       - name: Refresh authentication before repro build
@@ -165,8 +165,23 @@ jobs:
           dev-exec repro build --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }} .#test-monitor-isolation --write-report=build/monitor-isolation-repeat.json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $report = Get-Content build/monitor-isolation-repeat.json -Raw | ConvertFrom-Json
-          $runs = @($report.actions | Where-Object { $_.id -like 'io-mon.test_execute.*' })
-          if ($runs.Count -ne 8) { throw "Expected all eight isolated test programs" }
+          # Cleanup ordering adds ordinary test prerequisites to this closure.
+          # Still require each of the original eight programs to launch again.
+          $expected = @(
+            'test_io_mon_cli_exit_status',
+            'test_io_mon_windows_exit_status',
+            'test_io_mon_windows_host_session_scope',
+            'test_io_mon_windows_native_system_child',
+            'test_io_mon_windows_read_capture',
+            'test_io_mon_windows_root_guard',
+            'test_io_mon_windows_spawn_abandoned_injection',
+            'test_io_mon_windows_spawn_resume_invariant'
+          ) | ForEach-Object { "io-mon.test_execute.$_.exe" }
+          $runs = @($report.actions | Where-Object { $_.id -in $expected })
+          if ($runs.Count -ne 8 -or
+              (Compare-Object ($expected | Sort-Object) ($runs.id | Sort-Object))) {
+            throw "Expected each of the eight isolated test programs exactly once"
+          }
           foreach ($run in $runs) {
             if (-not $run.launched -or $run.status -ne 'asSucceeded' -or $run.exitCode -ne 0) {
               throw "Test did not execute successfully again: $($run.id)"
@@ -178,7 +193,7 @@ jobs:
         if: matrix.os == 'macos' || matrix.os == 'linux'
         shell: bash
         env:
-          EXPECTED_ISOLATED_TESTS: ${{ matrix.os == 'macos' && '42' || '9' }}
+          EXPECTED_ISOLATED_TESTS: ${{ matrix.os == 'macos' && '45' || '9' }}
         run: |
           dev-exec repro build --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }} .#test-monitor-isolation --write-report=build/monitor-isolation-repeat.json
           "$REPROBUILD_BOOTSTRAP_PYTHON" - <<'PYCODE'
@@ -252,6 +267,7 @@ jobs:
           name: reprobuild-logs-${{ matrix.os }}-${{ matrix.arch }}
           path: |
             build/**/*.log
+            build/monitor-isolation-repeat.json
             .repro/build/*/build-failure-report.json
             .repro/build/*/build-engine-cache/actions/
           include-hidden-files: true
