@@ -150,3 +150,20 @@ situation strictly better and fully documented.
 - `.github/sibling-repos` — carries the override and its removal condition.
 - `3aaa2bd` — the flake url pin; correct on its own terms, and the reason
   `72f57824` is the revision both channels now name.
+
+## Release dependency refresh — 2026-10-04
+
+At io-mon `d344703`, the committed lock names hooks `3b99d26`, while the
+release flake, sibling override and ordinary Windows checkout still select
+`72f5782`. Gosti's monitored bootstrap is now qualifying hooks `a043a07`
+(runtime `10ed82a`) for reduced Windows page-preparation overhead. Changing
+that consumer bootstrap alone would not ship the repair in io-mon's release.
+The newer hook dependency also includes the already qualified Windows
+injection permit initialization and captured-output lifetime repairs.
+
+Refresh the release flake and generated lock, sibling override, ordinary
+Windows checkout and committed Repro lock together to the same candidate.
+Keep the existing explicit override until the forward-carry contract is fixed.
+Require full product CI and exact-source release rehearsal with the resulting
+dependency; the old release rehearsal cannot qualify a newly pinned library.
+No existing test or supported-platform gate is removed.
