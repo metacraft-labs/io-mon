@@ -49,3 +49,25 @@ live multi-session evidence delivery from successful library initialization.
 - Refreshed `agents` at `f17733c` and searched current/deleted issue history for
   dlsym recursion and symbol preemption before filing. Existing ARM symbol-version
   and Linux runtime-policy records concern different defects.
+
+## Release linker follow-up at 83e34c0
+
+The complete 19-check matrix passes at `58530eb`; PR 49 merges its identical
+tree at `83e34c0fb5f478e32bdc7f103017c94f55479d35`. Exact-source release
+rehearsal `37184430516`, Linux job `111383357689`, then fails at link time:
+`error: unsupported linker arg: -Bsymbolic-functions`. The release compiler is
+Zig 0.15.2 targeting glibc 2.28; normal CI uses a linker that accepts the option.
+The same Zig command reproduces on the macOS development host when compiling
+a real ELF shared library. Selecting lld does not avoid Zig's argument parser.
+[Zig issue 18804](https://github.com/ziglang/zig/issues/18804) tracks this missing
+option upstream. No 0.1.1 tag or public asset has been created.
+
+The expected behavior remains the owning shim build policy and the release's
+glibc 2.28 compatibility floor. Preserve local function ownership, public hooks,
+real capture and the complete tests. Zig accepts `-Bsymbolic`, which additionally
+binds defined data to the owning image; undefined imports still resolve through
+the host. The released 0.1.0 Linux shim has 283 defined dynamic functions and no
+nonfunction dynamic definitions. Before selecting that supported option, compile
+the current full release shim with the exact Zig target and inspect its dynamic
+symbols too. Require native two-image lookup/I/O, the full Linux suite and
+extracted-release checks; do not remove binding or relax the glibc baseline.
