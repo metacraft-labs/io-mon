@@ -145,3 +145,18 @@ RunQuota `f369c34` completes all six fresh monitored provider builds in
 `37165456283` with monitor `004b8fc3`; the preceding old-monitor run crashed
 on the fifth. Update both enclosing Linux CI pins to this qualified runtime
 so ordinary io-mon builds also use it. Full product CI remains required.
+
+### Full enclosing-monitor qualification
+
+At `87bc824`, both full native Linux x64 and macOS suites pass, as do
+sanitizers. The complete Linux Repro test step in `37167428001` runs 137
+actions: 136 succeed and the new frame-state execution fails. The actual
+production shim with its test getter compiles successfully, but the C host
+exits 139 without output under the enclosing monitor. The retained failure
+report is artifact `11289989627`. Native success does not qualify this path.
+
+Retain that exact probe and library for a direct comparison, collect an
+argument-free core backtrace under the same outer monitor and compiler tuple,
+and identify whether the failure is library loading, nested interception or
+the vfork path. Do not relax the null-frame assertions or infer that a fresh
+retry repairs the crash. No monitoring or cache policy is changed here.
