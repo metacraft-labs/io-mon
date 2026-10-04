@@ -127,3 +127,12 @@ The x64 retained core enters `stackable_linux_raw_syscall6` from
 confirming the renamed-fixture self-patching diagnosis. ARM's five host-handler
 checks pass under the candidate policy and fail under original settings. The
 corrected production-basename fixture at `004b8fc3` is under native validation.
+
+The corrected handler fixture and temporary frame probe both pass on x64 and
+ARM at `004b8fc3` in run `37165454833`; original settings fail both controls.
+The permanent fixture at `de87b223` exposed a separate test-build mistake:
+Nim applies `--include` to every project module, so the exported getter was
+defined several times and Linux linking failed before the probe could run.
+Guard it with `when isMainModule` so one symbol is exported. The local actual
+macOS shim build with this guard links successfully; native Linux positive
+and negative controls remain required. No assertion or runtime flag changes.

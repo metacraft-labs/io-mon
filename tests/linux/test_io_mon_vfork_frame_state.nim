@@ -48,9 +48,11 @@ suite "Linux vfork preserves the suspended host runtime":
     let work = createTempDir("io-mon-vfork-frame-", "")
     defer: removeDir(work)
     let getter = work / "frame_state_probe.nim"
-    writeFile(getter, "proc io_mon_test_frame_state(): pointer " &
+    # --include is applied to every project module; export the getter once.
+    writeFile(getter, "when isMainModule:\n" &
+      "  proc io_mon_test_frame_state(): pointer " &
       "{.exportc, dynlib, stackTrace: off, raises: [].} =\n" &
-      "  cast[pointer](getFrame())\n")
+      "    cast[pointer](getFrame())\n")
     var buildEnv = newStringTable(modeCaseSensitive)
     for key, value in envPairs(): buildEnv[key] = value
     buildEnv["IO_MON_SHIM_OUT_DIR"] = work / "lib"
