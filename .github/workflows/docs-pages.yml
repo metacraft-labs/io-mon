@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: 2026 Metacraft Labs / Schelling Point Labs
+# SPDX-License-Identifier: Apache-2.0
+
+name: Docs — GitHub Pages
+
+# Build the io-mon docs site (docs/site, an isonim-docs consumer) and
+# publish it to GitHub *project* Pages at https://metacraft-labs.github.io/io-mon/
+# using the modern Pages flow (configure-pages + upload-pages-artifact +
+# deploy-pages). The site is self-contained: its flake (docs/site/flake.nix)
+# declares the isonim-docs framework + toolchain as inputs, so the build needs
+# no sibling checkouts.
+
+on:
+  push:
+    branches: [dev, stable, agents]
+    paths:
+      - "docs/site/**"
+      - ".github/workflows/docs-pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build docs site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Nix build cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Build static site
+        run: |
+          nix develop ./docs/site --command bash -c '
+            cd docs/site &&
+            nim c -r --hints:off -o:build/build src/build.nim
+          '
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/site/public
+
+  deploy:
+    name: Deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
