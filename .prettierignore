@@ -1,0 +1,2 @@
+# Ignore isonim-docs content from prettier formatting to prevent mangling custom container syntax
+docs/site/content/**

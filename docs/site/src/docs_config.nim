@@ -5,7 +5,7 @@
 import core/config
 import core/base_path
 
-const docsSiteOrigin* = "https://metacraft-labs.github.io/io-mon"
+const docsSiteOrigin* = "https://metacraft-labs.github.io"
 
 proc ioMonDocsConfig*(basePath = "/io-mon"): DocsConfig =
   let base = normalizeBasePath(basePath)
