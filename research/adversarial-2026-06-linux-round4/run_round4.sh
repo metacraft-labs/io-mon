@@ -82,54 +82,53 @@ int main(int argc, char **argv) {
 }
 C
 
-cat >"$RUN_DIR/probes/raw_zero_copy.c" <<'C'
-#define _GNU_SOURCE
-#include <fcntl.h>
-#include <stdio.h>
-#include <string.h>
-#include <sys/sendfile.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#ifndef SYS_copy_file_range
-#define SYS_copy_file_range 326
-#endif
-#ifndef SYS_splice
-#define SYS_splice 275
-#endif
-static long xsplice(int in, int out) {
-  int p[2];
-  if (pipe(p) != 0) return -1;
-  long n = syscall(SYS_splice, in, 0, p[1], 0, 4096, 0);
-  if (n > 0) {
-    long m = syscall(SYS_splice, p[0], 0, out, 0, (size_t)n, 0);
-    if (m < 0) n = -1;
-  }
-  close(p[0]);
-  close(p[1]);
-  return n;
-}
-int main(int argc, char **argv) {
-  if (argc != 4) return 2;
-  int in = (int)syscall(SYS_openat, AT_FDCWD, argv[2], O_RDONLY, 0);
-  if (in < 0) return 2;
-  int out = (int)syscall(SYS_openat, AT_FDCWD, argv[3],
-                         O_WRONLY | O_CREAT | O_TRUNC, 0666);
-  if (out < 0) return 3;
-  long n = -1;
-  if (strcmp(argv[1], "sendfile") == 0) {
-    n = syscall(SYS_sendfile, out, in, 0, 4096);
-  } else if (strcmp(argv[1], "copy_file_range") == 0) {
-    n = syscall(SYS_copy_file_range, in, 0, out, 0, 4096, 0);
-  } else if (strcmp(argv[1], "splice") == 0) {
-    n = xsplice(in, out);
-  } else {
-    return 4;
-  }
-  syscall(SYS_close, out);
-  syscall(SYS_close, in);
-  return n > 0 ? 0 : 5;
-}
-C
+printf '%s\n' \
+  '#define _GNU_SOURCE' \
+  '#include <fcntl.h>' \
+  '#include <stdio.h>' \
+  '#include <string.h>' \
+  '#include <sys/sendfile.h>' \
+  '#include <sys/syscall.h>' \
+  '#include <unistd.h>' \
+  '#ifndef SYS_copy_file_range' \
+  '#define SYS_copy_file_range 326' \
+  '#endif' \
+  '#ifndef SYS_splice' \
+  '#define SYS_splice 275' \
+  '#endif' \
+  'static long xsplice(int in, int out) {' \
+  '  int p[2];' \
+  '  if (pipe(p) != 0) return -1;' \
+  '  long n = syscall(SYS_splice, in, 0, p[1], 0, 4096, 0);' \
+  '  if (n > 0) {' \
+  '    long m = syscall(SYS_splice, p[0], 0, out, 0, (size_t)n, 0);' \
+  '    if (m < 0) n = -1;' \
+  '  }' \
+  '  close(p[0]);' \
+  '  close(p[1]);' \
+  '  return n;' \
+  '}' \
+  'int main(int argc, char **argv) {' \
+  '  if (argc != 4) return 2;' \
+  '  int in = (int)syscall(SYS_openat, AT_FDCWD, argv[2], O_RDONLY, 0);' \
+  '  if (in < 0) return 2;' \
+  '  int out = (int)syscall(SYS_openat, AT_FDCWD, argv[3],' \
+  '                         O_WRONLY | O_CREAT | O_TRUNC, 0666);' \
+  '  if (out < 0) return 3;' \
+  '  long n = -1;' \
+  '  if (strcmp(argv[1], "sendfile") == 0) {' \
+  '    n = syscall(SYS_sendfile, out, in, 0, 4096);' \
+  '  } else if (strcmp(argv[1], "copy_file_range") == 0) {' \
+  '    n = syscall(SYS_copy_file_range, in, 0, out, 0, 4096, 0);' \
+  '  } else if (strcmp(argv[1], "splice") == 0) {' \
+  '    n = xsplice(in, out);' \
+  '  } else {' \
+  '    return 4;' \
+  '  }' \
+  '  syscall(SYS_close, out);' \
+  '  syscall(SYS_close, in);' \
+  '  return n > 0 ? 0 : 5;' \
+  '}' >"$RUN_DIR/probes/raw_zero_copy.c"
 
 cat >"$RUN_DIR/probes/hardlink_alias.c" <<'C'
 #define _GNU_SOURCE
@@ -227,9 +226,9 @@ run_probe() {
   fi
   observed_nonfile=no
   if grep -Eq '^#[0-9]+ env-read .*IO_MON_ROUND4_ENV' "$inspect" &&
-     grep -Eq '^#[0-9]+ sysctl-read .*uname' "$inspect" &&
-     grep -Eq '^#[0-9]+ sysctl-read .*sysconf:' "$inspect" &&
-     grep -Eq '^#[0-9]+ time-read .*clock_gettime:' "$inspect"; then
+      grep -Eq '^#[0-9]+ sysctl-read .*uname' "$inspect" &&
+      grep -Eq '^#[0-9]+ sysctl-read .*sysconf:' "$inspect" &&
+      grep -Eq '^#[0-9]+ time-read .*clock_gettime:' "$inspect"; then
     observed_nonfile=yes
   fi
   grep -Eq '^#[0-9]+ non-deterministic .*getrandom' "$inspect" && nondeterminism=yes || nondeterminism=no
@@ -241,8 +240,8 @@ run_probe() {
     classification="unsupported-capability-gated"
   fi
   if [ "$name" = "nonfile" ] && [ "$observed_nonfile" = "yes" ] &&
-     [ "$nondeterminism" = "yes" ] && [ "$completeness" = "mcComplete" ] &&
-     [ "$event_loss" = "no" ]; then
+      [ "$nondeterminism" = "yes" ] && [ "$completeness" = "mcComplete" ] &&
+      [ "$event_loss" = "no" ]; then
     classification="captured"
   fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \

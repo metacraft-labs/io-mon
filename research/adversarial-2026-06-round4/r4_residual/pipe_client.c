@@ -1,5 +1,5 @@
 /* MONITORED client: read a build-relevant marker from an INHERITED fd (a pipe
-   read-end set up by an out-of-tree parent) and bake it into the output. */
+    read-end set up by an out-of-tree parent) and bake it into the output. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>

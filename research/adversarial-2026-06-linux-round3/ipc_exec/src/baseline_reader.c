@@ -36,6 +36,6 @@ int main(int argc, char **argv) {
   }
   close(fd);
   printf("baseline bytes=%zu hash=%llu path=%s\n",
-         total, (unsigned long long)h, argv[1]);
+          total, (unsigned long long)h, argv[1]);
   return 0;
 }

@@ -14,7 +14,7 @@ int main(int argc,char**argv){
     if(p==0){
       char path[600]; snprintf(path,sizeof path,"%s/marker_%d.txt",dir,i);
       FILE*f=fopen(path,"rb");
-      if(f){ char b[64]; size_t n=fread(b,1,sizeof b,f); (void)n; fclose(f);} 
+      if(f){ char b[64]; size_t n=fread(b,1,sizeof b,f); (void)n; fclose(f);}
       _exit(f?0:1);
     }
     pids[i]=p;

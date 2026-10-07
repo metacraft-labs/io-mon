@@ -55,6 +55,6 @@ int main(void){
 
     int ok = (hits-b1)>0 && strstr(last,"services");
     fprintf(stderr,"%s\n", ok?"==> CONFIRMED: shared-cache-internal open() intercepted by body patch"
-                             :"==> NOT caught via these variants");
+                              :"==> NOT caught via these variants");
     return ok?0:1;
 }

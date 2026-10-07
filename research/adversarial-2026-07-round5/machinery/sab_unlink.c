@@ -16,7 +16,7 @@ int main(){
   uint64_t tid=0; pthread_threadid_np(NULL,&tid);
   char sp[1024];
   if(fd_dir){ snprintf(sp,sizeof sp,"%s/repro-reading-%d-%llu.io-mon-reading",
-                       fd_dir,getpid(),(unsigned long long)tid); unlink(sp); }
+                        fd_dir,getpid(),(unsigned long long)tid); unlink(sp); }
   kill(getpid(),SIGKILL);
   return 0;
 }

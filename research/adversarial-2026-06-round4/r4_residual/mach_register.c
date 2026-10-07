@@ -10,7 +10,7 @@ int main(int argc,char**argv){
   mach_port_insert_right(mach_task_self(),port,port,MACH_MSG_TYPE_MAKE_SEND);
   kr=bootstrap_register(bootstrap_port,(char*)name,port);
   printf("bootstrap_register('%s') -> kr=%d (%s)\n",name,kr,
-         kr==0?"SUCCESS-OWNS-NAME":(kr==1100?"NOT_PRIVILEGED":kr==1101?"NAME_IN_USE/SERVICE_UNKNOWN":"other"));
+          kr==0?"SUCCESS-OWNS-NAME":(kr==1100?"NOT_PRIVILEGED":kr==1101?"NAME_IN_USE/SERVICE_UNKNOWN":"other"));
   if(kr==0){
     /* confirm we can be looked up */
     mach_port_t look=MACH_PORT_NULL;

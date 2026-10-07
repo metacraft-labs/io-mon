@@ -36,6 +36,6 @@ int main(int argc, char **argv) {
   }
   close(s);
   printf("unix-client bytes=%zu hash=%llu path=%s\n",
-         total, (unsigned long long)h, argv[2]);
+          total, (unsigned long long)h, argv[2]);
   return 0;
 }

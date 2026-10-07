@@ -1,5 +1,5 @@
 /* Lookup-only client: isolates io-mon's S0 exemption decision. Does a single
-   bootstrap_look_up then writes a trivial output (so a clean injectable run). */
+    bootstrap_look_up then writes a trivial output (so a clean injectable run). */
 #include <servers/bootstrap.h>
 #include <mach/mach.h>
 #include <stdio.h>

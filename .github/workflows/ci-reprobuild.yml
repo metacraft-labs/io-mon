@@ -153,7 +153,20 @@ jobs:
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
           owner: metacraft-labs
 
+      - name: Build the declared stable Linux monitor runtime
+        if: matrix.os == 'linux'
+        run: repro build --daemon=off --tool-provisioning=nix .#test-monitor-runtime --write-report=build/monitor-test-runtime-producer.json
+
+      - name: repro test with the owned Linux monitor runtime
+        if: matrix.os == 'linux'
+        run: |
+          monitor="$PWD/build/monitor-test-runtime/librepro_monitor_shim.so"
+          test -f "$monitor" && test ! -L "$monitor"
+          sha256sum "$monitor"
+          REPRO_MONITOR_SHIM_LIB="$monitor" repro test --daemon=off --tool-provisioning=nix --write-report=build/current-source-monitor-test-report.json
+
       - name: repro test
+        if: matrix.os != 'linux'
         # Materialises the `test` collection (the portable + host-OS
         # io-mon suites).
         run: dev-exec repro test --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }}
