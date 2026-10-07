@@ -1,6 +1,6 @@
 /* OUT-OF-TREE producer: create a POSIX shm object under the Apple system
-   namespace and write a build-relevant marker into it, then exit (the shm
-   object persists until shm_unlink). */
+    namespace and write a build-relevant marker into it, then exit (the shm
+    object persists until shm_unlink). */
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>

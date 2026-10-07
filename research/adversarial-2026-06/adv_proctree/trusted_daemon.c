@@ -70,12 +70,12 @@ int main(int argc, char **argv) {
     if (reportdir && reportdir[0] && client > 0) {
       char rp[8192];
       snprintf(rp, sizeof rp, "%s/report-%d-%d-%d.io-mon-report",
-               reportdir, (int)client, (int)getpid(), seq++);
+                reportdir, (int)client, (int)getpid(), seq++);
       FILE *r = fopen(rp, "w");
       if (r) {
         // ROUND-2 R8 authenticated report: run-scoped + explicitly complete.
         fprintf(r, "io-mon-breakaway-report v1\nrun %s\nclient %d\ndaemon %d\n"
-                   "read %s\ncomplete\n",
+                    "read %s\ncomplete\n",
                 runid ? runid : "", (int)client, (int)getpid(), path);
         fclose(r);
       }

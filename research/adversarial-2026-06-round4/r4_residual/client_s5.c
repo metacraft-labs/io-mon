@@ -1,6 +1,6 @@
 /* MONITORED client: connect to out-of-tree daemon (observed -> would downgrade),
-   receive served content, bake into output, then FORGE a breakaway report via a
-   RAW write(2) (mode=raw) or a normal hooked write (mode=hooked, control). */
+    receive served content, bake into output, then FORGE a breakaway report via a
+    RAW write(2) (mode=raw) or a normal hooked write (mode=hooked, control). */
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/syscall.h>

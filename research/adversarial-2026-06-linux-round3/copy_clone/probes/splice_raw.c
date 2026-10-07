@@ -19,7 +19,7 @@ static ssize_t xsplice(int in_fd, int out_fd, size_t len) {
   ssize_t n = (ssize_t)syscall(SYS_splice, in_fd, NULL, pipefd[1], NULL, len, 0);
   if (n > 0) {
     ssize_t m = (ssize_t)syscall(SYS_splice, pipefd[0], NULL, out_fd, NULL,
-                                 (size_t)n, 0);
+                                  (size_t)n, 0);
     if (m < 0) {
       n = -1;
     } else {

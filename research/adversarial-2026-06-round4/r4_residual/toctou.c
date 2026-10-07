@@ -1,5 +1,5 @@
 /* Within ONE monitored process: probe+read link/f (link->dirA), repoint
-   link->dirB, probe+read link/f again. Tests realpath-memo staleness. */
+    link->dirB, probe+read link/f again. Tests realpath-memo staleness. */
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>

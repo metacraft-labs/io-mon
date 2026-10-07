@@ -1,5 +1,5 @@
 /* MONITORED consumer: attach the shm object read-only, read the marker via a
-   plain memory load (no read(2)), and BAKE it into its build output file. */
+    plain memory load (no read(2)), and BAKE it into its build output file. */
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>

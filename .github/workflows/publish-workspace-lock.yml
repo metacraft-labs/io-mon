@@ -104,10 +104,7 @@ jobs:
   publish:
     # A push whose `before` is the all-zero SHA is a branch CREATION — there is
     # no previous tip to carry a lock forward from.
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' &&
-       github.event.before != '0000000000000000000000000000000000000000')
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000')
     runs-on: ubuntu-latest
     steps:
       - name: Generate CI token

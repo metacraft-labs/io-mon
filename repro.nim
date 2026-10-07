@@ -208,6 +208,20 @@ package io_mon:
     when defined(linux):
       appendRegisteredActionToolIdentityRefs(shimBuild.id, ["getconf"])
     discard collect("shim", @[shimBuild])
+    when defined(linux):
+      # Keep the monitor used for this project's tests separate from the
+      # default subject output that original tests legitimately rebuild.
+      let testMonitor = shell(
+        command = "scripts/build_shim.sh",
+        actionId = "io-mon.shim.build_test_monitor_runtime",
+        extraInputs = @["scripts/build_shim.sh", "src", "io_mon.nimble", "config.nims"],
+        extraOutputs = @["build/monitor-test-runtime/librepro_monitor_shim.so"],
+        extraEnv = @[
+          ("IO_MON_SHIM_OUT_DIR", "build/monitor-test-runtime"),
+          ("IO_MON_SHIM_NIMCACHE_DIR", "build/nimcache/monitor-test-runtime")])
+      appendRegisteredActionToolIdentityRefs(testMonitor.id,
+        ["bash", "nim", backendCompiler, "mkdir", "dirname", "uname", "getconf"])
+      discard collect("test-monitor-runtime", @[testMonitor])
 
     # ---- Standalone CLI (``io-mon`` / the ``default`` collection) -----------
     #

@@ -5,7 +5,7 @@
 int main(void){
     DIR *d = opendir("srcdir");
     if(!d){ printf("NO DIR\n"); return 1; }
-    struct dirent *e; int count=0; char names[4096]=""; 
+    struct dirent *e; int count=0; char names[4096]="";
     while((e=readdir(d))){
         size_t n=strlen(e->d_name);
         if(n>2 && strcmp(e->d_name+n-2,".c")==0){

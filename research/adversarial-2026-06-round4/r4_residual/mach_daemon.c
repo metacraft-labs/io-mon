@@ -1,6 +1,6 @@
 /* OUT-OF-TREE daemon: register a com.apple.* MachService name and serve the
-   contents of a file in reply to any request. Simulates an attacker-controlled
-   service the build's monitored client depends on. */
+    contents of a file in reply to any request. Simulates an attacker-controlled
+    service the build's monitored client depends on. */
 #include <servers/bootstrap.h>
 #include <mach/mach.h>
 #include <stdio.h>

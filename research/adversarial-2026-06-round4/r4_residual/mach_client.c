@@ -1,5 +1,5 @@
 /* MONITORED client: look up the com.apple.* service, request content, BAKE it
-   into the build output. The served content is a real build input. */
+    into the build output. The served content is a real build input. */
 #include <servers/bootstrap.h>
 #include <mach/mach.h>
 #include <stdio.h>

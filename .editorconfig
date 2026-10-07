@@ -1,0 +1,15 @@
+# Binary RMDF monitor captures preserve serialized bytes, not text formatting.
+# Other files inherit the original workspace EditorConfig rules unchanged.
+root = false
+
+[*.rdep]
+charset = unset
+end_of_line = unset
+insert_final_newline = unset
+trim_trailing_whitespace = unset
+indent_style = unset
+indent_size = unset
+
+# Captured compiler diagnostics include source-line-number gutters.
+[*.cc.err]
+indent_size = unset

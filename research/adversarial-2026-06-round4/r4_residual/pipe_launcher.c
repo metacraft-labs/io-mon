@@ -1,5 +1,5 @@
 /* OUT-OF-TREE launcher: create a pipe, feed a marker, clear CLOEXEC on the read
-   end, then exec io-mon so the monitored client inherits the pipe read fd. */
+    end, then exec io-mon so the monitored client inherits the pipe read fd. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>

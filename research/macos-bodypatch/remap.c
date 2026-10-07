@@ -30,7 +30,7 @@ static void cell(void *target){
     // 3) overwrite the mapping at the original VA with the fresh page
     mach_vm_address_t dst=vbase; vm_prot_t cur=0,max=0;
     kr=mach_vm_remap(mach_task_self(),&dst,pg,0,VM_FLAGS_OVERWRITE,
-                     mach_task_self(),newp,FALSE,&cur,&max,VM_INHERIT_COPY);
+                      mach_task_self(),newp,FALSE,&cur,&max,VM_INHERIT_COPY);
     hx("  vm_remap OVERWRITE kr=",(unsigned)kr); if(kr) _exit(22);
     sys_icache_invalidate(target,8);
     out("  calling target...\n");

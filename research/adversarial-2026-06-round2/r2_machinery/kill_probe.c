@@ -10,7 +10,7 @@
 int main(int argc, char**argv){
   char buf[64];
   /* Overflow the batch buffer many times so process-start + early reads are
-     all forced to disk. ~2000 opens >> 64KB/frame. */
+      all forced to disk. ~2000 opens >> 64KB/frame. */
   for(int i=0;i<2000;i++){
     int fd=open(argv[1],O_RDONLY);
     if(fd>=0){ (void)!read(fd,buf,sizeof buf); close(fd);}

@@ -35,9 +35,9 @@ int main(int argc, char **argv) {
     return 1;
   }
   printf("raw_statx size=%lld mtime=%lld.%u\n",
-         (long long)stx.stx_size,
-         (long long)stx.stx_mtime.tv_sec,
-         stx.stx_mtime.tv_nsec);
+          (long long)stx.stx_size,
+          (long long)stx.stx_mtime.tv_sec,
+          stx.stx_mtime.tv_nsec);
   return 0;
 #endif
 }

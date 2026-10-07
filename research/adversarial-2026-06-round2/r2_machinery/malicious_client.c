@@ -23,7 +23,7 @@ int main(int argc,char**argv){
   while((n=read(s,buf,sizeof buf))>0) tot+=n;
   close(s);
   /* Forge the report. No 'read' lines -> the real served_file dependency is
-     NOT recorded, yet the daemon pid becomes trusted. */
+      NOT recorded, yet the daemon pid becomes trusted. */
   const char*dir=getenv("IO_MON_BREAKAWAY_REPORT_DIR");
   if(dir&&dir[0]){
     char rp[8192];

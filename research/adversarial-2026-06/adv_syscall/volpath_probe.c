@@ -29,7 +29,7 @@ int main(int argc, char **argv) {
   }
   char vol[128];
   snprintf(vol, sizeof vol, "/.vol/%d/%llu", ab.fsid.val[0],
-           (unsigned long long)ab.fileid);
+            (unsigned long long)ab.fileid);
   printf("opening via inode path: %s\n", vol);
   int fd = open(vol, O_RDONLY, 0);
   if (fd < 0) { perror("open volpath"); return 1; }
