@@ -3935,11 +3935,11 @@
         "vscode-server": "vscode-server_2"
       },
       "locked": {
-        "lastModified": 1791083234,
-        "narHash": "sha256-udao1/txNzPf4guGbPmWAlV+ju5xP55hg5dpMlzpA1c=",
+        "lastModified": 1791500872,
+        "narHash": "sha256-7mVUoFnyrBsdT7uJqEXIaRUPOESwFp+aRznQRGgEd4o=",
         "owner": "metacraft-labs",
         "repo": "devops-modules",
-        "rev": "a7245933b53dc2ade27400f1580333bda58609de",
+        "rev": "073f57599af78eef3afbcb72c78555a78612311c",
         "type": "github"
       },
       "original": {
