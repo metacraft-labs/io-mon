@@ -651,9 +651,12 @@ long syscall(long number, ...) {
   return repro_raw_syscall6(number, a0, a1, a2, a3, a4, a5);
 }
 
+extern void ct_linux_preload_prepare_real_connect(void);
+
 __attribute__((constructor))
 static void repro_linux_monitor_constructor(void) {
   repro_monitor_shim_init(NULL);
+  ct_linux_preload_prepare_real_connect();
 }
 
 __attribute__((destructor))

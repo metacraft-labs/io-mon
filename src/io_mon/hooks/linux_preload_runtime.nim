@@ -1746,6 +1746,14 @@ int ct_linux_preload_real_fclose(void *stream) {
   return real_fclose_ptr((FILE *)stream);
 }
 
+/* Resolve before application dlopen constructors can start a worker while
+ * holding another library's lock. The normal next-object resolver and all
+ * connect dispatch/monitoring remain unchanged. */
+void ct_linux_preload_prepare_real_connect(void) {
+  if (real_connect_ptr == NULL)
+    real_connect_ptr = (ct_connect_real_fn)ct_resolve("connect");
+}
+
 int ct_linux_preload_real_connect(int fd, void *addr, unsigned int addrlen) {
   CT_REAL("connect", real_connect_ptr, ct_connect_real_fn);
   return real_connect_ptr(fd, (const struct sockaddr *)addr, (socklen_t)addrlen);
