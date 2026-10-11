@@ -1154,63 +1154,150 @@ void ct_linux_preload_set_shim_env_name(const char *name) {
   ct_linux_preload_shim_env_name = name;
 }
 
+/* Only arrays returned as different from the supplied envp are owned.
+ * Entry strings borrowed from envp/environ are never freed. */
+typedef struct ct_owned_env {
+  char *owned[8];
+  size_t ownedCount;
+  char **parent;
+  char *entries[];
+} ct_owned_env;
+static char **ct_alloc_env(size_t count) {
+  if (count > (SIZE_MAX - sizeof(ct_owned_env)) / sizeof(char *)) return NULL;
+  ct_owned_env *owner = calloc(1, sizeof(ct_owned_env) + count * sizeof(char *));
+  return owner != NULL ? owner->entries : NULL;
+}
+static ct_owned_env *ct_env_owner(char **entries) {
+  return (ct_owned_env *)((char *)entries - offsetof(ct_owned_env, entries));
+}
+void ct_linux_preload_free_owned_env(char **entries, char *const original[]) {
+  if (entries == NULL || entries == original) return;
+  ct_owned_env *owner = ct_env_owner(entries);
+  for (size_t i = 0; i < owner->ownedCount; ++i) free(owner->owned[i]);
+  if (owner->parent != NULL) ct_linux_preload_free_owned_env(owner->parent, NULL);
+  free(owner);
+}
+
+/* Explicit child routes are never combined with a parent's capture route. */
+static const char *ct_capture_seed_names[] = {
+  "REPRO_MONITOR_FRAGMENT_DIR", "REPRO_MONITOR_SESSION",
+  "REPRO_MONITOR_SHIM_LIB", "REPRO_MONITOR_INTEREST",
+  "REPRO_MONITOR_EVIDENCE", "REPRO_MONITOR_DEP_SHM"
+};
+
+static int ct_child_env_has(char *const source[], const char *name) {
+  size_t n = strlen(name);
+  for (char *const *it = source; *it != NULL; ++it)
+    if (strncmp(*it, name, n) == 0 && (*it)[n] == '=') return 1;
+  return 0;
+}
+
+/* Report malformed routing to the active parent; application syscalls still
+ * execute. Complete child routes are left to the existing nested handoff. */
+int ct_linux_preload_child_capture_route_status(char *const envp[]) {
+  if (ct_linux_preload_shim_env_name == NULL ||
+      strcmp(ct_linux_preload_shim_env_name, "REPRO_MONITOR_SHIM_LIB") != 0) return 0;
+  char *const *source = envp != NULL ? envp : environ;
+  if (source == NULL) return 0;
+  unsigned counts[6] = {0};
+  const char *values[6] = {0};
+  for (char *const *it = source; *it != NULL; ++it) {
+    for (size_t i = 0; i < 6; ++i) {
+      size_t n = strlen(ct_capture_seed_names[i]);
+      if (strncmp(*it, ct_capture_seed_names[i], n) == 0 && (*it)[n] == '=') {
+        if (++counts[i] > 1) return 1;
+        values[i] = *it + n + 1;
+      }
+    }
+  }
+  if ((counts[0] != 0) != (counts[1] != 0)) return 2;
+  if (counts[0] != 0) {
+    if (values[0][0] == '\0' || values[1][0] == '\0') return 3;
+    if (strpbrk(values[1], " \t\r\n") != NULL) return 4;
+  } else {
+    const char *fragment = getenv("REPRO_MONITOR_FRAGMENT_DIR");
+    const char *session = getenv("REPRO_MONITOR_SESSION");
+    int hasFragment = fragment != NULL && fragment[0] != '\0';
+    int hasSession = session != NULL && session[0] != '\0';
+    if (hasFragment != hasSession) return 5;
+    if (hasFragment && hasSession) {
+      for (size_t i = 2; i < 6; ++i) {
+        const char *parent = getenv(ct_capture_seed_names[i]);
+        if (counts[i] != 0 && (parent == NULL || strcmp(values[i], parent) != 0)) return 6;
+      }
+    }
+  }
+  return 0;
+}
+
 char **ct_linux_preload_env_with_preload(char *const envp[]) {
   if (ct_linux_preload_shim_env_name == NULL ||
-      ct_linux_preload_shim_env_name[0] == '\0') {
-    return (char **)envp;
-  }
+      ct_linux_preload_shim_env_name[0] == '\0') return (char **)envp;
   const char *shim = getenv(ct_linux_preload_shim_env_name);
-  if (shim == NULL || shim[0] == '\0') {
-    return (char **)envp;
-  }
+  if (shim == NULL || shim[0] == '\0') return (char **)envp;
   char *const *source = envp != NULL ? envp : environ;
-  if (source == NULL) {
-    return (char **)envp;
-  }
+  if (source == NULL) return (char **)envp;
 
-  int count = 0;
   const char *existing = NULL;
-  for (char *const *it = source; *it != NULL; it++) {
-    if (ct_starts_with(*it, "LD_PRELOAD=")) {
-      existing = *it;
-      if (ct_env_contains_shim(*it, shim)) {
-        return (char **)envp;
-      }
-    } else {
-      count++;
+  size_t count = 0;
+  for (char *const *it = source; *it != NULL; ++it) {
+    if (ct_starts_with(*it, "LD_PRELOAD=")) existing = *it;
+    else ++count;
+  }
+  /* This helper also serves other shim families; only the monitor's declared
+   * constructor may propagate its capture controls. An explicit route, even
+   * partial, stays untouched and must pass the actual capture protocol. */
+  int inherit = strcmp(ct_linux_preload_shim_env_name,
+                       "REPRO_MONITOR_SHIM_LIB") == 0 &&
+    !ct_child_env_has(source, "REPRO_MONITOR_FRAGMENT_DIR") &&
+    !ct_child_env_has(source, "REPRO_MONITOR_SESSION");
+  char *seeds[6] = {0};
+  size_t seedCount = 0;
+  if (inherit) {
+    const char *fragment = getenv("REPRO_MONITOR_FRAGMENT_DIR");
+    const char *session = getenv("REPRO_MONITOR_SESSION");
+    inherit = fragment != NULL && fragment[0] != '\0' &&
+              session != NULL && session[0] != '\0';
+  }
+  if (inherit) {
+    for (size_t i = 0; i < 6; ++i) {
+      const char *name = ct_capture_seed_names[i];
+      const char *value = getenv(name);
+      if (ct_child_env_has(source, name) || value == NULL) continue;
+      size_t size = strlen(name) + strlen(value) + 2;
+      seeds[seedCount] = (char *)malloc(size);
+      if (seeds[seedCount] == NULL) goto seed_failure;
+      snprintf(seeds[seedCount], size, "%s=%s", name, value);
+      ++seedCount;
     }
   }
-
-  const char *existingValue =
-    existing != NULL ? existing + strlen("LD_PRELOAD=") : "";
-  size_t entryLen = strlen("LD_PRELOAD=") + strlen(shim) + 1;
-  if (existingValue[0] != '\0') {
-    entryLen += 1 + strlen(existingValue);
-  }
-  char *entry = (char *)malloc(entryLen);
-  if (entry == NULL) {
-    return (char **)envp;
-  }
-  if (existingValue[0] != '\0') {
-    snprintf(entry, entryLen, "LD_PRELOAD=%s:%s", shim, existingValue);
-  } else {
-    snprintf(entry, entryLen, "LD_PRELOAD=%s", shim);
-  }
-
-  char **result = (char **)calloc((size_t)count + 2, sizeof(char *));
-  if (result == NULL) {
-    free(entry);
-    return (char **)envp;
-  }
-  int index = 0;
-  for (char *const *it = source; *it != NULL; it++) {
-    if (!ct_starts_with(*it, "LD_PRELOAD=")) {
-      result[index++] = *it;
-    }
-  }
+  if (existing != NULL && ct_env_contains_shim(existing, shim) &&
+      seedCount == 0) return (char **)envp;
+  const char *existingValue = existing != NULL ? existing + 11 : "";
+  int already = existing != NULL && ct_env_contains_shim(existing, shim);
+  size_t size = already ? strlen(existing) + 1 :
+    strlen("LD_PRELOAD=") + strlen(shim) + strlen(existingValue) + 2;
+  char *entry = (char *)malloc(size);
+  if (entry == NULL) goto seed_failure;
+  if (already) snprintf(entry, size, "%s", existing);
+  else if (existingValue[0] != '\0')
+    snprintf(entry, size, "LD_PRELOAD=%s:%s", shim, existingValue);
+  else snprintf(entry, size, "LD_PRELOAD=%s", shim);
+  char **result = ct_alloc_env(count + seedCount + 2);
+  if (result == NULL) { free(entry); goto seed_failure; }
+  ct_owned_env *owner = ct_env_owner(result);
+  owner->owned[owner->ownedCount++] = entry;
+  for (size_t i = 0; i < seedCount; ++i) owner->owned[owner->ownedCount++] = seeds[i];
+  size_t index = 0;
+  for (char *const *it = source; *it != NULL; ++it)
+    if (!ct_starts_with(*it, "LD_PRELOAD=")) result[index++] = *it;
   result[index++] = entry;
+  for (size_t i = 0; i < seedCount; ++i) result[index++] = seeds[i];
   result[index] = NULL;
   return result;
+seed_failure:
+  for (size_t i = 0; i < seedCount; ++i) free(seeds[i]);
+  return (char **)envp;
 }
 
 /* io-mon Lossless-Event-Capture M3 (exec-generation identity) — build the
@@ -1247,7 +1334,8 @@ char **ct_linux_preload_env_with_exec_gen(char *const envp[], long nextGen) {
     if (s != NULL && s[0] != '\0') shim = s;
   }
 
-  char *const *source = envp != NULL ? envp : environ;
+  char **prepared = ct_linux_preload_env_with_preload(envp);
+  char *const *source = prepared != NULL ? prepared : environ;
 
   int count = 0;
   const char *existingPreload = NULL;
@@ -1298,18 +1386,22 @@ char **ct_linux_preload_env_with_exec_gen(char *const envp[], long nextGen) {
     free(genEntry);
     /* Best-effort: still bump our own environ for the execvp family. */
     setenv("REPRO_MONITOR_EXEC_GEN", genValue, 1);
-    return ct_linux_preload_env_with_preload(envp);
+    return prepared;
   }
 
   int extra = 1 /* gen */ + (preloadEntry != NULL ? 1 : 0);
   char **result =
-    (char **)calloc((size_t)count + (size_t)extra + 1, sizeof(char *));
+    ct_alloc_env((size_t)count + (size_t)extra + 1);
   if (result == NULL) {
     free(preloadEntry);
     free(genEntry);
     setenv("REPRO_MONITOR_EXEC_GEN", genValue, 1);
-    return ct_linux_preload_env_with_preload(envp);
+    return prepared;
   }
+  ct_owned_env *owner = ct_env_owner(result);
+  if (preloadEntry != NULL) owner->owned[owner->ownedCount++] = preloadEntry;
+  owner->owned[owner->ownedCount++] = genEntry;
+  if (prepared != NULL && prepared != envp) owner->parent = prepared;
   int index = 0;
   if (source != NULL) {
     /* Copy the kept entries (pointers into `source`) BEFORE the setenv below,
@@ -3130,6 +3222,12 @@ ssize_t __read_chk(int fd, void *buf, size_t nbytes, size_t buflen) {
 
 proc setPreloadShimEnvVar*(name: cstring) {.importc: "ct_linux_preload_set_shim_env_name",
     raises: [].}
+proc childCaptureRouteStatus*(envp: cstringArray): cint
+  {.importc: "ct_linux_preload_child_capture_route_status", raises: [].}
+
+proc freeOwnedEnv*(envp: cstringArray; original: cstringArray)
+  {.importc: "ct_linux_preload_free_owned_env", raises: [].}
+
 proc envWithPreload*(envp: cstringArray): cstringArray
   {.importc: "ct_linux_preload_env_with_preload", raises: [].}
 proc envWithExecGen*(envp: cstringArray; nextGen: clong): cstringArray

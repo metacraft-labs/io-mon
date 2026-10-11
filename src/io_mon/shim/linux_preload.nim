@@ -3121,7 +3121,12 @@ proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
   # that the SET source-dedup collapses → execs>=starts → mrEventLoss →
   # mcIncomplete. `envWithExecGen` also bumps our own `environ` so the
   # PATH-searching exec family (execvp/execlp) propagates the generation too.
-  ctx.envp = envWithExecGen(ctx.envp, currentExecGen + 1)
+  let routeStatus = childCaptureRouteStatus(ctx.envp)
+  if routeStatus != 0:
+    emitEventLoss("linux child capture route invalid code=" & $routeStatus)
+  let originalEnv = ctx.envp
+  let preparedEnv = envWithExecGen(ctx.envp, currentExecGen + 1)
+  ctx.envp = preparedEnv
   sampleKillDiag("execve-pre-flush")
   discard repro_monitor_shim_flush()
   sampleKillDiag("execve-post-flush")
@@ -3143,6 +3148,8 @@ proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
   # contribution to execCount for signal (b). See
   # writer.nim :: unmonitoredSubtreeLossCount.
   let execFailedErrno = c_get_errno()
+  freeOwnedEnv(preparedEnv, originalEnv)
+  ctx.envp = originalEnv
   sampleKillDiag("execve-failed")
   var failRecord = baseRecord(mrProcessExec, moExecute)
   if ctx.path != nil:
@@ -3157,9 +3164,16 @@ proc repro_hook_posix_spawn*(ctx: var PosixSpawnContext) {.raises: [].} =
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
-  ctx.envp = envWithPreload(ctx.envp)
+  let routeStatus = childCaptureRouteStatus(ctx.envp)
+  if routeStatus != 0:
+    emitEventLoss("linux child capture route invalid code=" & $routeStatus)
+  let originalEnv = ctx.envp
+  let preparedEnv = envWithPreload(ctx.envp)
+  ctx.envp = preparedEnv
   callNext(ctx)
   let savedErrno = c_get_errno()
+  freeOwnedEnv(preparedEnv, originalEnv)
+  ctx.envp = originalEnv
   if ctx.result == 0 and ctx.pid != nil:
     var record = baseRecord(mrProcessSpawn, moExecute)
     record.childOsPid = uint64(ctx.pid[])
@@ -3175,9 +3189,16 @@ proc repro_hook_posix_spawnp*(ctx: var PosixSpawnContext) {.raises: [].} =
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
-  ctx.envp = envWithPreload(ctx.envp)
+  let routeStatus = childCaptureRouteStatus(ctx.envp)
+  if routeStatus != 0:
+    emitEventLoss("linux child capture route invalid code=" & $routeStatus)
+  let originalEnv = ctx.envp
+  let preparedEnv = envWithPreload(ctx.envp)
+  ctx.envp = preparedEnv
   callNext(ctx)
   let savedErrno = c_get_errno()
+  freeOwnedEnv(preparedEnv, originalEnv)
+  ctx.envp = originalEnv
   if ctx.result == 0 and ctx.pid != nil:
     var record = baseRecord(mrProcessSpawn, moExecute)
     record.childOsPid = uint64(ctx.pid[])
