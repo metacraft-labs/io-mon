@@ -7,7 +7,7 @@ import io_mon/types
 import io_mon/writer
 import io_mon/shm/dep_queue
 import io_mon/shim_discovery
-when defined(macosx):
+when defined(macosx) or defined(linux):
   import io_mon/nested_capture
 export shim_discovery  ## `findShimLibrary`/`ShimLibOverrideEnv` moved to their
                        ## own module (capture-machinery-free so a `--mm:refc`
@@ -1387,6 +1387,8 @@ proc childEnv(request: FsSnoopRequest;
   # host-side filter below then produces the correctly narrowed result anyway,
   # which is why the stamp describes the host's scope and not the shim's.
   result["REPRO_MONITOR_EVIDENCE"] = evidenceScopeToken(request.evidenceScope)
+  # Collection is host-owned; inherited internal policy cannot redirect a new run.
+  result["REPRO_MONITOR_COLLECTION_EVIDENCE"] = ""
 
 proc injectionValue(shimLib, existing: string): string =
   ## Prepend the shim to whatever the child's preload list would otherwise be.
@@ -1607,6 +1609,7 @@ type
     request: FsSnoopRequest
     when defined(linux) or defined(macosx):
       process: Process
+      nestedCapture: NestedCapture
     when defined(linux):
       depSet: SetHost
       depSetLive: bool
@@ -1621,7 +1624,6 @@ type
     when defined(macosx):
       sandboxDir: string
       ownsSandboxDir: bool
-      nestedCapture: NestedCapture
     when defined(windows):
       shimLib: string
       spawnEnv: StringTableRef
@@ -1877,7 +1879,7 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
       # narrows the inner depfile to its own request after the observed evidence
       # has reached its parent. No host environment variable is changed.
       spawnEnv["REPRO_MONITOR_INTEREST"] = interestToShimTokens(FullInterest)
-      spawnEnv["REPRO_MONITOR_EVIDENCE"] = evidenceScopeToken(esFull)
+      # Keep the requesting child's public evidence scope unchanged.
 
     # SIP shebang bypass: if the target is a shell script whose
     # interpreter (``#!/bin/sh`` etc.) lives under a SIP-protected
@@ -1923,12 +1925,15 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
     # `REPRO_MONITOR_APP_ID` only when the shm-gset host came up); no `putEnv`,
     # so a second monitor running concurrently in this process is unaffected.
     h.runId = newRunId()
+    h.nestedCapture = startNestedCapture(getEnv("REPRO_MONITOR_FRAGMENT_DIR"),
+      getEnv("REPRO_MONITOR_SESSION"), h.runId)
     var injected = @[
       ("LD_PRELOAD",
         injectionValue(shimLib, requestEnvValue(request, "LD_PRELOAD"))),
       ("REPRO_MONITOR_FRAGMENT_DIR", h.fragmentDir),
       ("REPRO_MONITOR_OUTPUT", request.depFilePath),
-      ("REPRO_MONITOR_SESSION", h.runId)
+      ("REPRO_MONITOR_SESSION", h.runId),
+      ("REPRO_MONITOR_EXEC_GEN", "0")
     ]
 
     # io-mon-Lossless-Event-Capture M3 (part 1) — the CONSUMER hosts the edge's
@@ -1970,6 +1975,11 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
         injected.add ("REPRO_MONITOR_APP_ID", depSetAppId)
     injected.add ("REPRO_MONITOR_SHIM_LIB", shimLib)
     let spawnEnv = childEnv(request, injected)
+    if h.nestedCapture.active:
+      # Observe the enclosing run's full evidence before the existing inner
+      # host filter narrows its own result; no parent environment is changed.
+      spawnEnv["REPRO_MONITOR_INTEREST"] = interestToShimTokens(FullInterest)
+      spawnEnv["REPRO_MONITOR_COLLECTION_EVIDENCE"] = "full:" & h.runId
 
     let childArgs =
       if request.command.len > 1:
@@ -2281,7 +2291,7 @@ proc collectMonitorEvidence(h: var MonitorHandle): MonitorDepFile =
       observedInterest = normalizeInterest(h.request.interest),
       observedEvidenceScope = h.request.evidenceScope)
 
-  when defined(macosx):
+  when defined(macosx) or defined(linux):
     finishNestedCapture(h.nestedCapture, result.records)
 
   # Host-side event-interest filter (belt-and-suspenders — see

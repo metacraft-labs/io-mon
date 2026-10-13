@@ -779,6 +779,35 @@ static ct_exit_hook_fn ct_exit_hook = NULL;
 typedef void (*ct_raw_syscall_hook_fn)(long, long, long, long, long, long, long,
                                        long, int);
 static ct_raw_syscall_hook_fn ct_raw_syscall_hook = NULL;
+/* A libc syscall patch is process-wide; hook state belongs to each loaded
+ * monitor. Keep the installing monitor and compatible subscribers together. */
+#define CT_RAW_OWNER_ABI_V2 0x4354524157303032ULL
+#include <pthread.h>
+#include <linux/futex.h>
+#include <sched.h>
+#define CT_RAW_SUBSCRIBER_CAP 16
+typedef void (*ct_raw_enqueue_fn)(long, const long *, long, int, unsigned long);
+typedef void (*ct_raw_flush_fn)(void);
+typedef void (*ct_library_scan_fn)(const char *);
+static ct_library_scan_fn ct_library_scan;
+static ct_library_scan_fn ct_library_subscriber_scan[CT_RAW_SUBSCRIBER_CAP];
+static ct_library_scan_fn ct_library_owner_scan;
+static ct_raw_syscall_hook_fn ct_raw_subscribers[CT_RAW_SUBSCRIBER_CAP];
+static ct_raw_enqueue_fn ct_raw_subscriber_enqueue[CT_RAW_SUBSCRIBER_CAP];
+static ct_raw_flush_fn ct_raw_subscriber_flush[CT_RAW_SUBSCRIBER_CAP];
+static int ct_raw_subscriber_lock = 0;
+static void *ct_raw_owner_target = NULL;
+static void *ct_raw_owner_handle = NULL;
+static void *ct_raw_self_handle = NULL;
+static char *ct_raw_owner_join_reason = "not-attempted";
+static char ct_raw_owner_join_image[4096];
+static char ct_raw_owner_refusal[64];
+char *ct_linux_preload_raw_owner_join_reason(void) {
+  return ct_raw_owner_join_reason;
+}
+char *ct_linux_preload_raw_owner_join_image(void) {
+  return ct_raw_owner_join_image;
+}
 
 #define CT_RAW_SYSCALL_EVENT_CAP 4096
 #define CT_RAW_SYSCALL_SOURCE_LIBC 0
@@ -924,6 +953,34 @@ extern int stackable_linux_chain_sigtrap(int signum, void *siginfo_ptr,
  * every code path. */
 extern void repro_linux_sig_safe_flush(void);
 
+/* A child cannot inherit a registration lock held by a vanished thread.
+ * No loader call runs under the lock; unpublished POD slots remain invisible.
+ * libc fork registers this child reset, and raw fork replay invokes it below. */
+static void ct_raw_owner_after_fork_child(void) {
+  __atomic_store_n(&ct_raw_subscriber_lock, 0, __ATOMIC_RELAXED);
+}
+
+static void ct_raw_owner_after_raw_fork(long nr, long a1, long result) {
+  if (result != 0) return;
+#ifdef SYS_fork
+  if (nr == SYS_fork) ct_raw_owner_after_fork_child();
+#endif
+#ifdef SYS_clone
+  /* CLONE_VM children share the live parent lock, not an abandoned copy. */
+  if (nr == SYS_clone && (a1 & CLONE_VM) == 0)
+    ct_raw_owner_after_fork_child();
+#endif
+#ifdef SYS_clone3
+  if (nr == SYS_clone3 && a1 != 0) {
+    /* The kernel accepted clone_args before returning in this child. Its
+     * first field is the 64-bit flags word, in this inherited address space. */
+    unsigned long long flags;
+    memcpy(&flags, (void *)a1, sizeof(flags));
+    if ((flags & CLONE_VM) == 0) ct_raw_owner_after_fork_child();
+  }
+#endif
+}
+
 static void *ct_resolve(const char *name) {
   return stackable_linux_preload_resolve_next(name);
 }
@@ -931,6 +988,10 @@ static void *ct_resolve(const char *name) {
 static void ct_record_raw_syscall_event(long nr, const long args[6],
                                         long result, int source,
                                         unsigned long address) {
+  for (int i = 0; i < CT_RAW_SUBSCRIBER_CAP; ++i) {
+    if (__atomic_load_n(&ct_raw_subscribers[i], __ATOMIC_ACQUIRE) != NULL)
+      ct_raw_subscriber_enqueue[i](nr, args, result, source, address);
+  }
   sig_atomic_t count = ct_raw_syscall_event_count_value;
   if (count >= CT_RAW_SYSCALL_EVENT_CAP) {
     ct_raw_syscall_event_overflow_value = 1;
@@ -943,6 +1004,22 @@ static void ct_record_raw_syscall_event(long nr, const long args[6],
   event->source = source;
   event->address = address;
   ct_raw_syscall_event_count_value = count + 1;
+}
+
+void ct_linux_preload_raw_enqueue_v1(long nr, const long *args,
+    long result, int source, unsigned long address)
+    __attribute__((visibility("default")));
+void ct_linux_preload_raw_enqueue_v1(long nr, const long *args,
+    long result, int source, unsigned long address) {
+  ct_record_raw_syscall_event(nr, args, result, source, address);
+}
+
+static void ct_raw_flush_observers(void) {
+  repro_linux_sig_safe_flush();
+  for (int i = 0; i < CT_RAW_SUBSCRIBER_CAP; ++i) {
+    if (__atomic_load_n(&ct_raw_subscribers[i], __ATOMIC_ACQUIRE) != NULL)
+      ct_raw_subscriber_flush[i]();
+  }
 }
 
 long ct_linux_raw_syscall_event_count(void) {
@@ -1038,16 +1115,17 @@ static void ct_linux_inline_syscall_sigtrap_handler(
    * so the handler is safe from all pre-init trap paths too. */
 #ifdef SYS_exit_group
   if (regs.nr == SYS_exit_group) {
-    repro_linux_sig_safe_flush();
+    ct_raw_flush_observers();
   }
 #endif
 #ifdef SYS_exit
   if (regs.nr == SYS_exit) {
-    repro_linux_sig_safe_flush();
+    ct_raw_flush_observers();
   }
 #endif
 
   long result = stackable_linux_replay_syscall_regs(&regs);
+  ct_raw_owner_after_raw_fork(regs.nr, regs.args[0], result);
   ct_record_raw_syscall_event(regs.nr, regs.args, result,
                               CT_RAW_SYSCALL_SOURCE_INLINE,
                               regs.syscall_address);
@@ -1154,63 +1232,151 @@ void ct_linux_preload_set_shim_env_name(const char *name) {
   ct_linux_preload_shim_env_name = name;
 }
 
+/* Only arrays returned as different from the supplied envp are owned.
+ * Entry strings borrowed from envp/environ are never freed. */
+typedef struct ct_owned_env {
+  char *owned[8];
+  size_t ownedCount;
+  char **parent;
+  char *entries[];
+} ct_owned_env;
+static char **ct_alloc_env(size_t count) {
+  if (count > (SIZE_MAX - sizeof(ct_owned_env)) / sizeof(char *)) return NULL;
+  ct_owned_env *owner = calloc(1, sizeof(ct_owned_env) + count * sizeof(char *));
+  return owner != NULL ? owner->entries : NULL;
+}
+static ct_owned_env *ct_env_owner(char **entries) {
+  return (ct_owned_env *)((char *)entries - offsetof(ct_owned_env, entries));
+}
+void ct_linux_preload_free_owned_env(char **entries, char *const original[]) {
+  if (entries == NULL || entries == original) return;
+  ct_owned_env *owner = ct_env_owner(entries);
+  for (size_t i = 0; i < owner->ownedCount; ++i) free(owner->owned[i]);
+  if (owner->parent != NULL) ct_linux_preload_free_owned_env(owner->parent, NULL);
+  free(owner);
+}
+
+/* Explicit child routes are never combined with a parent's capture route. */
+static const char *ct_capture_seed_names[] = {
+  "REPRO_MONITOR_FRAGMENT_DIR", "REPRO_MONITOR_SESSION",
+  "REPRO_MONITOR_SHIM_LIB", "REPRO_MONITOR_INTEREST",
+  "REPRO_MONITOR_EVIDENCE", "REPRO_MONITOR_DEP_SHM",
+  "REPRO_MONITOR_COLLECTION_EVIDENCE"
+};
+
+static int ct_child_env_has(char *const source[], const char *name) {
+  size_t n = strlen(name);
+  for (char *const *it = source; *it != NULL; ++it)
+    if (strncmp(*it, name, n) == 0 && (*it)[n] == '=') return 1;
+  return 0;
+}
+
+/* Report malformed routing to the active parent; application syscalls still
+ * execute. Complete child routes are left to the existing nested handoff. */
+int ct_linux_preload_child_capture_route_status(char *const envp[]) {
+  if (ct_linux_preload_shim_env_name == NULL ||
+      strcmp(ct_linux_preload_shim_env_name, "REPRO_MONITOR_SHIM_LIB") != 0) return 0;
+  char *const *source = envp != NULL ? envp : environ;
+  if (source == NULL) return 0;
+  unsigned counts[7] = {0};
+  const char *values[7] = {0};
+  for (char *const *it = source; *it != NULL; ++it) {
+    for (size_t i = 0; i < 7; ++i) {
+      size_t n = strlen(ct_capture_seed_names[i]);
+      if (strncmp(*it, ct_capture_seed_names[i], n) == 0 && (*it)[n] == '=') {
+        if (++counts[i] > 1) return 1;
+        values[i] = *it + n + 1;
+      }
+    }
+  }
+  if ((counts[0] != 0) != (counts[1] != 0)) return 2;
+  if (counts[0] != 0) {
+    if (values[0][0] == '\0' || values[1][0] == '\0') return 3;
+    if (strpbrk(values[1], " \t\r\n") != NULL) return 4;
+  } else {
+    const char *fragment = getenv("REPRO_MONITOR_FRAGMENT_DIR");
+    const char *session = getenv("REPRO_MONITOR_SESSION");
+    int hasFragment = fragment != NULL && fragment[0] != '\0';
+    int hasSession = session != NULL && session[0] != '\0';
+    if (hasFragment != hasSession) return 5;
+    if (hasFragment && hasSession) {
+      for (size_t i = 2; i < 7; ++i) {
+        const char *parent = getenv(ct_capture_seed_names[i]);
+        if (counts[i] != 0 && (parent == NULL || strcmp(values[i], parent) != 0)) return 6;
+      }
+    }
+  }
+  return 0;
+}
+
 char **ct_linux_preload_env_with_preload(char *const envp[]) {
   if (ct_linux_preload_shim_env_name == NULL ||
-      ct_linux_preload_shim_env_name[0] == '\0') {
-    return (char **)envp;
-  }
+      ct_linux_preload_shim_env_name[0] == '\0') return (char **)envp;
   const char *shim = getenv(ct_linux_preload_shim_env_name);
-  if (shim == NULL || shim[0] == '\0') {
-    return (char **)envp;
-  }
+  if (shim == NULL || shim[0] == '\0') return (char **)envp;
   char *const *source = envp != NULL ? envp : environ;
-  if (source == NULL) {
-    return (char **)envp;
-  }
+  if (source == NULL) return (char **)envp;
 
-  int count = 0;
   const char *existing = NULL;
-  for (char *const *it = source; *it != NULL; it++) {
-    if (ct_starts_with(*it, "LD_PRELOAD=")) {
-      existing = *it;
-      if (ct_env_contains_shim(*it, shim)) {
-        return (char **)envp;
-      }
-    } else {
-      count++;
+  size_t count = 0;
+  for (char *const *it = source; *it != NULL; ++it) {
+    if (ct_starts_with(*it, "LD_PRELOAD=")) existing = *it;
+    else ++count;
+  }
+  /* This helper also serves other shim families; only the monitor's declared
+   * constructor may propagate its capture controls. An explicit route, even
+   * partial, stays untouched and must pass the actual capture protocol. */
+  int inherit = strcmp(ct_linux_preload_shim_env_name,
+                       "REPRO_MONITOR_SHIM_LIB") == 0 &&
+    !ct_child_env_has(source, "REPRO_MONITOR_FRAGMENT_DIR") &&
+    !ct_child_env_has(source, "REPRO_MONITOR_SESSION");
+  char *seeds[7] = {0};
+  size_t seedCount = 0;
+  if (inherit) {
+    const char *fragment = getenv("REPRO_MONITOR_FRAGMENT_DIR");
+    const char *session = getenv("REPRO_MONITOR_SESSION");
+    inherit = fragment != NULL && fragment[0] != '\0' &&
+              session != NULL && session[0] != '\0';
+  }
+  if (inherit) {
+    for (size_t i = 0; i < 7; ++i) {
+      const char *name = ct_capture_seed_names[i];
+      const char *value = getenv(name);
+      if (ct_child_env_has(source, name) || value == NULL) continue;
+      size_t size = strlen(name) + strlen(value) + 2;
+      seeds[seedCount] = (char *)malloc(size);
+      if (seeds[seedCount] == NULL) goto seed_failure;
+      snprintf(seeds[seedCount], size, "%s=%s", name, value);
+      ++seedCount;
     }
   }
-
-  const char *existingValue =
-    existing != NULL ? existing + strlen("LD_PRELOAD=") : "";
-  size_t entryLen = strlen("LD_PRELOAD=") + strlen(shim) + 1;
-  if (existingValue[0] != '\0') {
-    entryLen += 1 + strlen(existingValue);
-  }
-  char *entry = (char *)malloc(entryLen);
-  if (entry == NULL) {
-    return (char **)envp;
-  }
-  if (existingValue[0] != '\0') {
-    snprintf(entry, entryLen, "LD_PRELOAD=%s:%s", shim, existingValue);
-  } else {
-    snprintf(entry, entryLen, "LD_PRELOAD=%s", shim);
-  }
-
-  char **result = (char **)calloc((size_t)count + 2, sizeof(char *));
-  if (result == NULL) {
-    free(entry);
-    return (char **)envp;
-  }
-  int index = 0;
-  for (char *const *it = source; *it != NULL; it++) {
-    if (!ct_starts_with(*it, "LD_PRELOAD=")) {
-      result[index++] = *it;
-    }
-  }
+  if (existing != NULL && ct_env_contains_shim(existing, shim) &&
+      seedCount == 0) return (char **)envp;
+  const char *existingValue = existing != NULL ? existing + 11 : "";
+  int already = existing != NULL && ct_env_contains_shim(existing, shim);
+  size_t size = already ? strlen(existing) + 1 :
+    strlen("LD_PRELOAD=") + strlen(shim) + strlen(existingValue) + 2;
+  char *entry = (char *)malloc(size);
+  if (entry == NULL) goto seed_failure;
+  if (already) snprintf(entry, size, "%s", existing);
+  else if (existingValue[0] != '\0')
+    snprintf(entry, size, "LD_PRELOAD=%s:%s", shim, existingValue);
+  else snprintf(entry, size, "LD_PRELOAD=%s", shim);
+  char **result = ct_alloc_env(count + seedCount + 2);
+  if (result == NULL) { free(entry); goto seed_failure; }
+  ct_owned_env *owner = ct_env_owner(result);
+  owner->owned[owner->ownedCount++] = entry;
+  for (size_t i = 0; i < seedCount; ++i) owner->owned[owner->ownedCount++] = seeds[i];
+  size_t index = 0;
+  for (char *const *it = source; *it != NULL; ++it)
+    if (!ct_starts_with(*it, "LD_PRELOAD=")) result[index++] = *it;
   result[index++] = entry;
+  for (size_t i = 0; i < seedCount; ++i) result[index++] = seeds[i];
   result[index] = NULL;
   return result;
+seed_failure:
+  for (size_t i = 0; i < seedCount; ++i) free(seeds[i]);
+  return (char **)envp;
 }
 
 /* io-mon Lossless-Event-Capture M3 (exec-generation identity) — build the
@@ -1236,6 +1402,32 @@ char **ct_linux_preload_env_with_preload(char *const envp[]) {
  * preload array on allocation failure. A stale generation can only ever cause
  * an over-conservative mcIncomplete, never a false mcComplete. */
 char **ct_linux_preload_env_with_exec_gen(char *const envp[], long nextGen) {
+  /* A newly declared public capture root has a distinct complete route and
+   * an explicit zero incarnation. Do not carry its enclosing observer's exec
+   * generation into that new route. Same-route descendants still advance. */
+  const char *child_session = NULL, *child_generation = NULL, *child_fragment = NULL;
+  unsigned session_count = 0, generation_count = 0, fragment_count = 0;
+  if (envp != NULL) for (char *const *it = envp; *it != NULL; ++it) {
+    if (ct_starts_with(*it, "REPRO_MONITOR_FRAGMENT_DIR=")) {
+      child_fragment = *it + strlen("REPRO_MONITOR_FRAGMENT_DIR="); ++fragment_count;
+    }
+    if (ct_starts_with(*it, "REPRO_MONITOR_SESSION=")) {
+      child_session = *it + strlen("REPRO_MONITOR_SESSION="); ++session_count;
+    }
+    if (ct_starts_with(*it, "REPRO_MONITOR_EXEC_GEN=")) {
+      child_generation = *it + strlen("REPRO_MONITOR_EXEC_GEN="); ++generation_count;
+    }
+  }
+  const char *parent_session = getenv("REPRO_MONITOR_SESSION");
+  if (ct_linux_preload_shim_env_name != NULL &&
+      strcmp(ct_linux_preload_shim_env_name, "REPRO_MONITOR_SHIM_LIB") == 0 &&
+      fragment_count == 1 && child_fragment[0] != '\0' &&
+      session_count == 1 && generation_count == 1 &&
+      child_session[0] != '\0' && parent_session != NULL &&
+      strcmp(child_session, parent_session) != 0 &&
+      strcmp(child_generation, "0") == 0 &&
+      ct_linux_preload_child_capture_route_status(envp) == 0)
+    nextGen = 0;
   char genValue[32];
   snprintf(genValue, sizeof(genValue), "%ld", nextGen);
   size_t genEntryLen = strlen("REPRO_MONITOR_EXEC_GEN=") + strlen(genValue) + 1;
@@ -1247,7 +1439,8 @@ char **ct_linux_preload_env_with_exec_gen(char *const envp[], long nextGen) {
     if (s != NULL && s[0] != '\0') shim = s;
   }
 
-  char *const *source = envp != NULL ? envp : environ;
+  char **prepared = ct_linux_preload_env_with_preload(envp);
+  char *const *source = prepared != NULL ? prepared : environ;
 
   int count = 0;
   const char *existingPreload = NULL;
@@ -1298,18 +1491,22 @@ char **ct_linux_preload_env_with_exec_gen(char *const envp[], long nextGen) {
     free(genEntry);
     /* Best-effort: still bump our own environ for the execvp family. */
     setenv("REPRO_MONITOR_EXEC_GEN", genValue, 1);
-    return ct_linux_preload_env_with_preload(envp);
+    return prepared;
   }
 
   int extra = 1 /* gen */ + (preloadEntry != NULL ? 1 : 0);
   char **result =
-    (char **)calloc((size_t)count + (size_t)extra + 1, sizeof(char *));
+    ct_alloc_env((size_t)count + (size_t)extra + 1);
   if (result == NULL) {
     free(preloadEntry);
     free(genEntry);
     setenv("REPRO_MONITOR_EXEC_GEN", genValue, 1);
-    return ct_linux_preload_env_with_preload(envp);
+    return prepared;
   }
+  ct_owned_env *owner = ct_env_owner(result);
+  if (preloadEntry != NULL) owner->owned[owner->ownedCount++] = preloadEntry;
+  owner->owned[owner->ownedCount++] = genEntry;
+  if (prepared != NULL && prepared != envp) owner->parent = prepared;
   int index = 0;
   if (source != NULL) {
     /* Copy the kept entries (pointers into `source`) BEFORE the setenv below,
@@ -1387,7 +1584,7 @@ void ct_linux_preload_register_execve_hook(ct_execve_hook_fn hook) { ct_execve_h
 void ct_linux_preload_register_posix_spawn_hook(ct_posix_spawn_hook_fn hook) { ct_posix_spawn_hook = hook; }
 void ct_linux_preload_register_posix_spawnp_hook(ct_posix_spawn_hook_fn hook) { ct_posix_spawnp_hook = hook; }
 void ct_linux_preload_register_exit_hook(ct_exit_hook_fn hook) { ct_exit_hook = hook; }
-void ct_linux_preload_register_raw_syscall_hook(ct_raw_syscall_hook_fn hook) { ct_raw_syscall_hook = hook; }
+void ct_linux_preload_register_raw_syscall_hook(ct_raw_syscall_hook_fn hook) { __atomic_store_n(&ct_raw_syscall_hook, hook, __ATOMIC_RELEASE); }
 
 void ct_linux_preload_real_exit(int status) __attribute__((noreturn));
 void ct_linux_preload_real_exit(int status) {
@@ -1453,17 +1650,221 @@ static long ct_linux_preload_raw_syscall6(long nr, long a1, long a2, long a3,
 long ct_linux_preload_syscall_replacement(long nr, long a1, long a2, long a3,
                                           long a4, long a5, long a6)
     __attribute__((visibility("default")));
+/* This protocol deliberately does not accept an arbitrary existing jump.
+ * Both its destination and the owner ABI must resolve inside the same loaded
+ * DSO; the owner then independently checks its live target/replacement pair. */
+static int ct_raw_patch_matches(void *target, void *replacement) {
+#if defined(__x86_64__)
+  static const unsigned char prefix[6] = {0xff, 0x25, 0, 0, 0, 0};
+  void *actual = NULL;
+  if (target == NULL || replacement == NULL ||
+      memcmp(target, prefix, sizeof(prefix)) != 0) return 0;
+  memcpy(&actual, (unsigned char *)target + 6, sizeof(actual));
+  return actual == replacement;
+#else
+  return 0;
+#endif
+}
+
+/* Fixed source-owned POD lock: child reset has no opaque pthread layout.
+ * Wait through a raw futex, not a CPU spin or a monitored libc syscall. */
+static int ct_raw_subscribers_lock(void) {
+  for (;;) {
+    int empty = 0;
+    if (__atomic_compare_exchange_n(&ct_raw_subscriber_lock, &empty, 1, 0,
+          __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 1;
+    long waited = ct_raw_syscall6(SYS_futex, (long)&ct_raw_subscriber_lock,
+                                  FUTEX_WAIT_PRIVATE, 1, 0, 0, 0);
+    if (waited < 0 && waited != -EINTR && waited != -EAGAIN) return 0;
+  }
+}
+
+static void ct_raw_subscribers_unlock(void) {
+  __atomic_store_n(&ct_raw_subscriber_lock, 0, __ATOMIC_RELEASE);
+  (void)ct_raw_syscall6(SYS_futex, (long)&ct_raw_subscriber_lock,
+                        FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
+}
+
+int ct_linux_preload_raw_owner_prepare(void) {
+  if (__atomic_load_n(&ct_raw_self_handle, __ATOMIC_ACQUIRE) != NULL) return 1;
+  Dl_info self;
+  if (!dladdr((void *)ct_linux_preload_syscall_replacement, &self)) return 0;
+  ct_dlopen_real_fn open_fn = (ct_dlopen_real_fn)ct_resolve("dlopen");
+  if (open_fn == NULL) return 0;
+  void *pin = open_fn(self.dli_fname, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+  if (pin == NULL) return 0;
+  if (pthread_atfork(NULL, NULL, ct_raw_owner_after_fork_child) != 0) {
+    dlclose(pin);
+    return 0;
+  }
+  void *empty = NULL;
+  if (!__atomic_compare_exchange_n(&ct_raw_self_handle, &empty, pin, 0,
+        __ATOMIC_RELEASE, __ATOMIC_RELAXED)) dlclose(pin);
+  return 1;
+}
+
+void ct_linux_preload_raw_owner_commit(void *target) {
+  __atomic_store_n(&ct_raw_owner_target, target, __ATOMIC_RELEASE);
+}
+
+typedef int (*ct_raw_owner_subscribe_fn)(unsigned long long, void *, void *,
+                                        ct_raw_syscall_hook_fn,
+                                        ct_raw_enqueue_fn, ct_raw_flush_fn, ct_library_scan_fn);
+int ct_linux_preload_raw_owner_subscribe_v2(unsigned long long abi,
+    void *target, void *replacement, ct_raw_syscall_hook_fn callback,
+    ct_raw_enqueue_fn enqueue, ct_raw_flush_fn flush, ct_library_scan_fn scan)
+    __attribute__((visibility("default")));
+int ct_linux_preload_raw_owner_subscribe_v2(unsigned long long abi,
+    void *target, void *replacement, ct_raw_syscall_hook_fn callback,
+    ct_raw_enqueue_fn enqueue, ct_raw_flush_fn flush, ct_library_scan_fn scan) {
+  Dl_info owner, subscriber, queue_image, flush_image, scan_image;
+  if (abi != CT_RAW_OWNER_ABI_V2) return -1;
+  if (callback == NULL || enqueue == NULL || flush == NULL || scan == NULL) return -2;
+  if (target != __atomic_load_n(&ct_raw_owner_target, __ATOMIC_ACQUIRE)) return -3;
+  if (replacement != (void *)ct_linux_preload_syscall_replacement) return -4;
+  if (!ct_raw_patch_matches(target, replacement)) return -5;
+  if (!dladdr(replacement, &owner) || !dladdr((void *)callback, &subscriber) ||
+      !dladdr((void *)enqueue, &queue_image) ||
+      !dladdr((void *)flush, &flush_image) ||
+      !dladdr((void *)scan, &scan_image)) return -6;
+  if (queue_image.dli_fbase != subscriber.dli_fbase ||
+      flush_image.dli_fbase != subscriber.dli_fbase ||
+      scan_image.dli_fbase != subscriber.dli_fbase) return -7;
+  if (callback == __atomic_load_n(&ct_raw_syscall_hook, __ATOMIC_ACQUIRE))
+    return 1;
+  /* Resolve and pin outside the table lock: loader constructors may themselves
+   * attach a monitor. The lock covers only bounded POD comparisons/publication. */
+  ct_dlopen_real_fn open_fn = (ct_dlopen_real_fn)ct_resolve("dlopen");
+  if (open_fn == NULL) return 0;
+  void *pin = open_fn(subscriber.dli_fname, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+  if (pin == NULL) return 0;
+  if (!ct_raw_subscribers_lock()) {
+    dlclose(pin);
+    return 0;
+  }
+  int attached = 0;
+  int published = 0;
+  int empty = -1;
+  for (int i = 0; i < CT_RAW_SUBSCRIBER_CAP; ++i) {
+    ct_raw_syscall_hook_fn found = __atomic_load_n(&ct_raw_subscribers[i],
+                                                  __ATOMIC_ACQUIRE);
+    if (found == callback) {
+      attached = ct_raw_subscriber_enqueue[i] == enqueue &&
+                 ct_raw_subscriber_flush[i] == flush &&
+                 ct_library_subscriber_scan[i] == scan;
+      empty = -1;
+      break;
+    }
+    if (found == NULL && empty == -1) empty = i;
+  }
+  if (!attached && empty != -1) {
+    ct_raw_subscriber_enqueue[empty] = enqueue;
+    ct_raw_subscriber_flush[empty] = flush;
+    ct_library_subscriber_scan[empty] = scan;
+    __atomic_store_n(&ct_raw_subscribers[empty], callback, __ATOMIC_RELEASE);
+    attached = published = 1;
+  }
+  ct_raw_subscribers_unlock();
+  if (!published) dlclose(pin);
+  return attached;
+}
+
+/* Callbacks are published with their pinned subscriber record. No loader or
+ * registration lock is held while an observer enumerates its own link map. */
+void ct_linux_preload_library_scan_owner(const char *reason)
+    __attribute__((visibility("default")));
+void ct_linux_preload_library_scan_owner(const char *reason) {
+  int saved_errno = errno;
+  ct_library_scan_fn primary = __atomic_load_n(&ct_library_scan, __ATOMIC_ACQUIRE);
+  if (primary != NULL) primary(reason);
+  for (int i = 0; i < CT_RAW_SUBSCRIBER_CAP; ++i) {
+    if (__atomic_load_n(&ct_raw_subscribers[i], __ATOMIC_ACQUIRE) != NULL)
+      ct_library_subscriber_scan[i](reason);
+  }
+  errno = saved_errno;
+}
+void ct_linux_preload_library_scan_register(ct_library_scan_fn scan) {
+  __atomic_store_n(&ct_library_scan, scan, __ATOMIC_RELEASE);
+}
+void ct_linux_preload_library_scan_all(const char *reason) {
+  ct_library_scan_fn owner = __atomic_load_n(&ct_library_owner_scan, __ATOMIC_ACQUIRE);
+  if (owner != NULL) owner(reason);
+  else ct_linux_preload_library_scan_owner(reason);
+}
+
+int ct_linux_preload_raw_owner_join(void *target) {
+#if defined(__x86_64__)
+  void *replacement = NULL;
+  Dl_info owner, api_image, scan_image;
+  static const unsigned char prefix[6] = {0xff, 0x25, 0, 0, 0, 0};
+  ct_raw_owner_join_reason = "target-not-absolute-jump";
+  if (target == NULL || memcmp(target, prefix, sizeof(prefix)) != 0) return 0;
+  memcpy(&replacement, (unsigned char *)target + 6, sizeof(replacement));
+  ct_raw_owner_join_reason = "replacement-image-unavailable";
+  if (replacement == NULL || !dladdr(replacement, &owner)) return 0;
+  snprintf(ct_raw_owner_join_image, sizeof(ct_raw_owner_join_image), "%s",
+           owner.dli_fname == NULL ? "" : owner.dli_fname);
+  ct_dlopen_real_fn open_fn = (ct_dlopen_real_fn)ct_resolve("dlopen");
+  ct_dlsym_real_fn symbol_fn = (ct_dlsym_real_fn)ct_resolve("dlsym");
+  ct_raw_owner_join_reason = "loader-functions-unavailable";
+  if (open_fn == NULL || symbol_fn == NULL) return 0;
+  void *handle = open_fn(owner.dli_fname, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+  ct_raw_owner_join_reason = "owner-handle-unavailable";
+  if (handle == NULL) return 0;
+  void *owner_replacement = symbol_fn(handle, "ct_linux_preload_syscall_replacement");
+  void *api = symbol_fn(handle, "ct_linux_preload_raw_owner_subscribe_v2");
+  void *scan_api = symbol_fn(handle, "ct_linux_preload_library_scan_owner");
+  ct_raw_owner_join_reason = "owner-replacement-symbol-mismatch";
+  if (owner_replacement != replacement) { dlclose(handle); return 0; }
+  ct_raw_owner_join_reason = "owner-api-unavailable";
+  if (api == NULL || scan_api == NULL) { dlclose(handle); return 0; }
+  ct_raw_owner_join_reason = "owner-api-image-mismatch";
+  if (!dladdr(api, &api_image) || api_image.dli_fbase != owner.dli_fbase ||
+      !dladdr(scan_api, &scan_image) || scan_image.dli_fbase != owner.dli_fbase) {
+    dlclose(handle); return 0;
+  }
+  ct_raw_owner_join_reason = "owner-rejected-subscription";
+  int joined = ((ct_raw_owner_subscribe_fn)api)(CT_RAW_OWNER_ABI_V2, target,
+          replacement, __atomic_load_n(&ct_raw_syscall_hook, __ATOMIC_ACQUIRE),
+          ct_linux_preload_raw_enqueue_v1, repro_linux_sig_safe_flush,
+          __atomic_load_n(&ct_library_scan, __ATOMIC_ACQUIRE));
+  if (joined != 1) {
+    snprintf(ct_raw_owner_refusal, sizeof(ct_raw_owner_refusal),
+              "owner-rejected-subscription:%d", joined);
+    ct_raw_owner_join_reason = ct_raw_owner_refusal;
+    dlclose(handle); return 0;
+  }
+  ct_raw_owner_join_reason = "attached";
+  ct_raw_owner_handle = handle;
+  __atomic_store_n(&ct_library_owner_scan, (ct_library_scan_fn)scan_api, __ATOMIC_RELEASE);
+  return 1;
+#else
+  return 0;
+#endif
+}
+
 long ct_linux_preload_syscall_replacement(long nr, long a1, long a2, long a3,
                                           long a4, long a5, long a6) {
+  int saved_errno = errno;
   long result = ct_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
-  if (!CT_BYPASS() && ct_raw_syscall_hook != NULL) {
-    CT_CALL_HOOK((ct_raw_syscall_hook(nr, a1, a2, a3, a4, a5, a6, result,
+  ct_raw_owner_after_raw_fork(nr, a1, result);
+  ct_raw_syscall_hook_fn primary = __atomic_load_n(&ct_raw_syscall_hook, __ATOMIC_ACQUIRE);
+  if (!CT_BYPASS() && primary != NULL) {
+    CT_CALL_HOOK((primary(nr, a1, a2, a3, a4, a5, a6, result,
                                       CT_RAW_SYSCALL_SOURCE_LIBC), 0));
+    for (int i = 0; i < CT_RAW_SUBSCRIBER_CAP; ++i) {
+      ct_raw_syscall_hook_fn callback = __atomic_load_n(&ct_raw_subscribers[i],
+                                                        __ATOMIC_ACQUIRE);
+      if (callback != NULL)
+        CT_CALL_HOOK((callback(nr, a1, a2, a3, a4, a5, a6, result,
+                               CT_RAW_SYSCALL_SOURCE_LIBC), 0));
+    }
   }
   if (result < 0 && result >= -4095) {
     errno = (int)-result;
     return -1;
   }
+  errno = saved_errno;
   return result;
 }
 
@@ -1652,6 +2053,14 @@ size_t ct_linux_preload_real_fread(void *buf, size_t size, size_t nmemb, void *s
 int ct_linux_preload_real_fclose(void *stream) {
   CT_REAL("fclose", real_fclose_ptr, ct_fclose_real_fn);
   return real_fclose_ptr((FILE *)stream);
+}
+
+/* Resolve before application dlopen constructors can start a worker while
+ * holding another library's lock. The normal next-object resolver and all
+ * connect dispatch/monitoring remain unchanged. */
+void ct_linux_preload_prepare_real_connect(void) {
+  if (real_connect_ptr == NULL)
+    real_connect_ptr = (ct_connect_real_fn)ct_resolve("connect");
 }
 
 int ct_linux_preload_real_connect(int fd, void *addr, unsigned int addrlen) {
@@ -2133,6 +2542,29 @@ int ct_linux_library_scan(ct_ll_sink_fn sink, char *reason,
   ct_ll_snap.subs = 0;
   ct_ll_snap.counters_valid = 0;
   dl_iterate_phdr(ct_ll_collect, &ct_ll_snap);
+
+  /* Optional bounded loader diagnostics report identities/counters, never
+   * environment values or captured file contents. Keep writes outside hooks. */
+  const char *debug_scan = secure_getenv("IO_MON_DIAGNOSTIC_LIBRARY_SCAN");
+  if (debug_scan != NULL && strcmp(debug_scan, "1") == 0) {
+    char line[4096];
+    Dl_info self;
+    const char *image = dladdr((void *)ct_linux_library_scan, &self)
+                          ? self.dli_fname : "unknown";
+    int used = snprintf(line, sizeof(line),
+      "IO_MON_LL image=%s reason=%s adds=%llu subs=%llu last=%llu/%llu active=%d count=%d\n",
+      image, reason == NULL ? "" : reason, ct_ll_snap.adds, ct_ll_snap.subs,
+      ct_ll_last_adds, ct_ll_last_subs, ct_ll_active_count, ct_ll_snap.count);
+    if (used > 0 && used < (int)sizeof(line))
+      (void)ct_raw_syscall6(SYS_write, 2, (long)line, used, 0, 0, 0);
+    for (int j = 0; j < ct_ll_snap.count; ++j) {
+      const char *name = ct_ll_snap.names + ct_ll_snap.name_off[j];
+      if (ct_ll_active_has(ct_ll_snap.addrs[j], name)) continue;
+      used = snprintf(line, sizeof(line), "IO_MON_LL new=%s\n", name);
+      if (used > 0 && used < (int)sizeof(line))
+        (void)ct_raw_syscall6(SYS_write, 2, (long)line, used, 0, 0, 0);
+    }
+  }
 
   /* Sink calls happen HERE, with the loader lock already released. */
   for (i = 0; i < ct_ll_snap.count; i++) {
@@ -3130,6 +3562,12 @@ ssize_t __read_chk(int fd, void *buf, size_t nbytes, size_t buflen) {
 
 proc setPreloadShimEnvVar*(name: cstring) {.importc: "ct_linux_preload_set_shim_env_name",
     raises: [].}
+proc childCaptureRouteStatus*(envp: cstringArray): cint
+  {.importc: "ct_linux_preload_child_capture_route_status", raises: [].}
+
+proc freeOwnedEnv*(envp: cstringArray; original: cstringArray)
+  {.importc: "ct_linux_preload_free_owned_env", raises: [].}
+
 proc envWithPreload*(envp: cstringArray): cstringArray
   {.importc: "ct_linux_preload_env_with_preload", raises: [].}
 proc envWithExecGen*(envp: cstringArray; nextGen: clong): cstringArray
@@ -3366,6 +3804,20 @@ type
 
 proc rawSyscallReplacement(number, a1, a2, a3, a4, a5, a6: clong): clong
   {.importc: "ct_linux_preload_syscall_replacement", cdecl, raises: [].}
+proc cRawSyscallOwnerReason(): cstring
+  {.importc: "ct_linux_preload_raw_owner_join_reason", raises: [].}
+proc cRawSyscallOwnerImage(): cstring
+  {.importc: "ct_linux_preload_raw_owner_join_image", raises: [].}
+proc rawSyscallOwnerJoinReason*(): string {.raises: [].} =
+  $cRawSyscallOwnerReason()
+proc rawSyscallOwnerJoinImage*(): string {.raises: [].} =
+  $cRawSyscallOwnerImage()
+proc cRawSyscallOwnerPrepare(): cint
+  {.importc: "ct_linux_preload_raw_owner_prepare", raises: [].}
+proc cRawSyscallOwnerCommit(target: pointer)
+  {.importc: "ct_linux_preload_raw_owner_commit", raises: [].}
+proc cRawSyscallOwnerJoin(target: pointer): cint
+  {.importc: "ct_linux_preload_raw_owner_join", raises: [].}
 proc cInlineSyscallReset()
   {.importc: "ct_linux_inline_syscall_reset", raises: [].}
 proc cInlineSyscallRecordSite(address: culong): cint
@@ -4204,6 +4656,10 @@ proc liveAnonymousExecutableCoverage*(start: pointer; length: csize_t):
     release(anonymousRangeLock)
 
 proc installRawSyscallWrapperPatch*(): RawSyscallPatchStatus {.raises: [].} =
+  # Interposed calls can initialise the shim before this module's ordinary
+  # registration tail runs. Publish the real dispatcher before joining an
+  # existing process-wide owner; a null callback cannot supply child evidence.
+  installRawSyscallDispatcher(rawSyscallDispatcher)
   if rawSyscallPatchAttempted:
     return rawSyscallPatchStatus
   rawSyscallPatchAttempted = true
@@ -4218,6 +4674,10 @@ proc installRawSyscallWrapperPatch*(): RawSyscallPatchStatus {.raises: [].} =
     result.diagnostic = lrsSymbolNotFound
     rawSyscallPatchStatus = result
     return
+  if cRawSyscallOwnerPrepare() == 0:
+    result.diagnostic = lrsPatchWriteFailed
+    rawSyscallPatchStatus = result
+    return
   try:
     let tx = installAbsoluteJumpPatchTransaction(
       target, cast[pointer](rawSyscallReplacement), captureRestoreBytes = false)
@@ -4226,6 +4686,11 @@ proc installRawSyscallWrapperPatch*(): RawSyscallPatchStatus {.raises: [].} =
     result.osErrno = tx.osErrno
     result.installed = tx.diagnostic == lrsOk or
       (tx.diagnostic == lrsPostPatchMprotectBackFailed and tx.patchLive)
+    if result.installed:
+      cRawSyscallOwnerCommit(target)
+    elif tx.diagnostic == lrsAlreadyPatched and cRawSyscallOwnerJoin(target) != 0:
+      result.installed = true
+      result.diagnostic = lrsOk
   except CatchableError:
     result.diagnostic = lrsPatchWriteFailed
     result.stage = lpsWritePatch
@@ -5464,3 +5929,9 @@ installPosixSpawnDispatcher(dispatchPosixSpawn)
 installPosixSpawnpDispatcher(dispatchPosixSpawnp)
 installExitDispatcher(dispatchExit)
 installRawSyscallDispatcher(rawSyscallDispatcher)
+
+type LibraryScanDispatch* = proc(reason: cstring) {.cdecl, raises: [].}
+proc registerCooperativeLibraryScan*(scan: LibraryScanDispatch)
+  {.importc: "ct_linux_preload_library_scan_register", raises: [].}
+proc cooperativeLibraryScan*(reason: cstring)
+  {.importc: "ct_linux_preload_library_scan_all", raises: [].}
