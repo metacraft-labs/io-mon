@@ -197,7 +197,11 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.env }}" = "reprobuild" ]; then
-            dev-exec repro test --tool-provisioning=nix 2>&1 | tee test.log
+            dev-exec repro build --daemon=off --tool-provisioning=nix .#test-monitor-runtime --write-report=build/monitor-test-runtime-producer.json
+            monitor="$PWD/build/monitor-test-runtime/librepro_monitor_shim.so"
+            test -f "$monitor" && test ! -L "$monitor"
+            dev-exec sha256sum "$monitor"
+            REPRO_MONITOR_SHIM_LIB="$monitor" dev-exec repro test --daemon=off --tool-provisioning=nix --write-report=build/current-source-monitor-test-report.json 2>&1 | tee test.log
           else
             dev-exec just test 2>&1 | tee test.log
           fi
