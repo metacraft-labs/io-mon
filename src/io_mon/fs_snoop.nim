@@ -1387,6 +1387,8 @@ proc childEnv(request: FsSnoopRequest;
   # host-side filter below then produces the correctly narrowed result anyway,
   # which is why the stamp describes the host's scope and not the shim's.
   result["REPRO_MONITOR_EVIDENCE"] = evidenceScopeToken(request.evidenceScope)
+  # Collection is host-owned; inherited internal policy cannot redirect a new run.
+  result["REPRO_MONITOR_COLLECTION_EVIDENCE"] = ""
 
 proc injectionValue(shimLib, existing: string): string =
   ## Prepend the shim to whatever the child's preload list would otherwise be.
@@ -1877,7 +1879,7 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
       # narrows the inner depfile to its own request after the observed evidence
       # has reached its parent. No host environment variable is changed.
       spawnEnv["REPRO_MONITOR_INTEREST"] = interestToShimTokens(FullInterest)
-      spawnEnv["REPRO_MONITOR_EVIDENCE"] = evidenceScopeToken(esFull)
+      # Keep the requesting child's public evidence scope unchanged.
 
     # SIP shebang bypass: if the target is a shell script whose
     # interpreter (``#!/bin/sh`` etc.) lives under a SIP-protected
@@ -1930,7 +1932,8 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
         injectionValue(shimLib, requestEnvValue(request, "LD_PRELOAD"))),
       ("REPRO_MONITOR_FRAGMENT_DIR", h.fragmentDir),
       ("REPRO_MONITOR_OUTPUT", request.depFilePath),
-      ("REPRO_MONITOR_SESSION", h.runId)
+      ("REPRO_MONITOR_SESSION", h.runId),
+      ("REPRO_MONITOR_EXEC_GEN", "0")
     ]
 
     # io-mon-Lossless-Event-Capture M3 (part 1) — the CONSUMER hosts the edge's
@@ -1976,7 +1979,7 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
       # Observe the enclosing run's full evidence before the existing inner
       # host filter narrows its own result; no parent environment is changed.
       spawnEnv["REPRO_MONITOR_INTEREST"] = interestToShimTokens(FullInterest)
-      spawnEnv["REPRO_MONITOR_EVIDENCE"] = evidenceScopeToken(esFull)
+      spawnEnv["REPRO_MONITOR_COLLECTION_EVIDENCE"] = "full:" & h.runId
 
     let childArgs =
       if request.command.len > 1:

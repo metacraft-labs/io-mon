@@ -198,6 +198,14 @@ case "${io_mon_host_platform_name}" in
         "--passL:-Wl,--version-script=${here}/src/io_mon/hooks/linux_preload_versions.map"
       )
     fi
+    # Each concurrent constructor owns its compiler cache and publishes only
+    # a complete canonical image. Readers of the prior inode remain valid.
+    linux_cache_parent="${nimcache_dir}/io-mon-shim-so"
+    mkdir -p "$linux_cache_parent"
+    linux_build_id="${BASHPID}-${RANDOM}-${RANDOM}"
+    linux_private_cache="${linux_cache_parent}/build-${linux_build_id}"
+    linux_publish_dir="${out_dir}/.io-mon-publish-${linux_build_id}"
+    mkdir "$linux_private_cache" "$linux_publish_dir"
     nim c \
       ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
       ${nim_shim_alloc_flags[@]+"${nim_shim_alloc_flags[@]}"} \
@@ -208,10 +216,12 @@ case "${io_mon_host_platform_name}" in
       --path:"${stackable_hooks_src}" \
       --path:"${shm_queue_src}" \
       --path:"${shm_gset_src}" \
-      --nimcache:"${nimcache_dir}/io-mon-shim-so" \
-      --out:"${out_dir}/librepro_monitor_shim.so" \
+      --nimcache:"${linux_private_cache}" \
+      --out:"${linux_publish_dir}/librepro_monitor_shim.so" \
       "$@" \
       src/io_mon/shim/linux_preload.nim
+    mv --no-copy -f -- "${linux_publish_dir}/librepro_monitor_shim.so" "${out_dir}/librepro_monitor_shim.so"
+    rmdir -- "$linux_publish_dir"
     ;;
   windows)
     # -static-libgcc: the shim is LoadLibraryW'd into arbitrary children by the
