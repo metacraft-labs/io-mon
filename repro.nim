@@ -87,6 +87,7 @@ when defined(windows):
   import repro_dsl_stdlib/packages/coreutils_install
 when defined(linux):
   import ./repro_support/getconf
+  import ./repro_support/shim_publication_tools
   import ./repro_support/strace
 
 package io_mon:
@@ -106,6 +107,9 @@ package io_mon:
     "sh"
     "bash >=4"
     "mkdir"
+    when defined(linux):
+      "mv"
+      "rmdir"
     when defined(windows):
       # PortableGit's usr/bin contains the real mkdir/dirname used by Bash.
       # cmd.exe's built-in mkdir does not satisfy that script dependency.
@@ -206,7 +210,7 @@ package io_mon:
     when defined(macosx):
       appendRegisteredActionToolIdentityRefs(shimBuild.id, ["cctools"])
     when defined(linux):
-      appendRegisteredActionToolIdentityRefs(shimBuild.id, ["getconf"])
+      appendRegisteredActionToolIdentityRefs(shimBuild.id, ["getconf", "mv", "rmdir"])
     discard collect("shim", @[shimBuild])
     when defined(linux):
       # Keep the monitor used for this project's tests separate from the
@@ -220,7 +224,7 @@ package io_mon:
           ("IO_MON_SHIM_OUT_DIR", "build/monitor-test-runtime"),
           ("IO_MON_SHIM_NIMCACHE_DIR", "build/nimcache/monitor-test-runtime")])
       appendRegisteredActionToolIdentityRefs(testMonitor.id,
-        ["bash", "nim", backendCompiler, "mkdir", "dirname", "uname", "getconf"])
+        ["bash", "nim", backendCompiler, "mkdir", "dirname", "uname", "getconf", "mv", "rmdir"])
       discard collect("test-monitor-runtime", @[testMonitor])
 
     # ---- Standalone CLI (``io-mon`` / the ``default`` collection) -----------
@@ -374,7 +378,7 @@ package io_mon:
           appendRegisteredActionToolIdentityRefs(executeEdge.id, ["python3"])
       when defined(linux):
         appendRegisteredActionToolIdentityRefs(executeEdge.id,
-          ["strace", "nm", "getconf", "grep"])
+          ["strace", "nm", "getconf", "grep", "mv", "rmdir"])
       testExecuteActions.add(executeEdge)
 
     # Portable tests — always in the graph.

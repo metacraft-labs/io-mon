@@ -1259,7 +1259,8 @@ proc recordRawSyscallCoverage(status: RawSyscallPatchStatus) {.raises: [].} =
     return
   emitEventLoss("linux raw-syscall wrapper patch unavailable diagnostic=" &
     $status.diagnostic & " stage=" & $status.stage &
-    " errno=" & $status.osErrno)
+    " errno=" & $status.osErrno & " ownerJoin=" & rawSyscallOwnerJoinReason() &
+    " ownerImage=" & rawSyscallOwnerJoinImage())
 
 proc recordInlineSyscallCoverage(status: InlineSyscallPatchStatus) {.raises: [].} =
   if inlineSyscallCoverageRecorded:
@@ -1302,6 +1303,9 @@ proc recordInlineSyscallTrapCoverage() {.raises: [].} =
       $inlineSyscallLastNumber() & " address=0x" &
       toHex(inlineSyscallLastAddress()) & " traps=" & $traps &
       " failures=" & $failures, int64(inlineSyscallLastNumber()))
+
+proc observerLibraryScan(reason: cstring) {.cdecl, raises: [].} =
+  scanLoadedLibraries(reason)
 
 proc repro_monitor_shim_init*(configPath: cstring): cint
     {.exportc, dynlib, raises: [].}
@@ -1570,6 +1574,11 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     # can be wrong in a direction the host filter cannot undo.
     gInterest = shimInterestFromEnv(getEnv("REPRO_MONITOR_INTEREST"))
     gEvidenceScope = parseEvidenceScopeToken(getEnv("REPRO_MONITOR_EVIDENCE"))
+    let collection = getEnv("REPRO_MONITOR_COLLECTION_EVIDENCE")
+    if collection.len > 0:
+      # This can only broaden collection. It never grants capture completeness.
+      # Tie the host collection request to this exact child capture route.
+      gEvidenceScope = esFull
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))
     # DEP-SHM-2 — attach the process to the edge's shared-memory dependency
@@ -1625,6 +1634,9 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   sampleKillDiagArgvOnce()
   sampleKillDiag("init")
   recordProcessStart()
+  let collection = getEnv("REPRO_MONITOR_COLLECTION_EVIDENCE")
+  if collection.len > 0 and collection != "full:" & runId:
+    emitEventLoss("invalid internal collection scope for active capture route")
   # LIBRARY-LOAD OBSERVATION — the first scan, and the one that does the most
   # work. `ld.so` maps the ENTIRE initial closure before running any ELF
   # constructor, so by the time this shim's constructor runs, every DT_NEEDED of
@@ -1633,6 +1645,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   # was initialised" is a covered case and not a hole: this design reads loader
   # STATE, and state includes everything that happened before it looked.
   scanLoadedLibraries("startup-closure")
+  registerCooperativeLibraryScan(observerLibraryScan)
   let rawStatus = installRawSyscallWrapperPatch()
   recordRawSyscallCoverage(rawStatus)
   let inlineStatus = installInlineSyscallPatches()
@@ -2569,7 +2582,7 @@ proc repro_hook_dlopen*(ctx: var DlopenContext) {.raises: [].} =
   # Establish the exact pre-call link map. If an object was unloaded after the
   # preceding call, a reload now appears as a normal transition instead of an
   # unidentifiable load/unload window.
-  scanLoadedLibraries("pre-dlopen")
+  cooperativeLibraryScan("pre-dlopen")
   callNext(ctx)
   let savedErrno = c_get_errno()
   if ctx.result != nil:
@@ -2578,7 +2591,7 @@ proc repro_hook_dlopen*(ctx: var DlopenContext) {.raises: [].} =
     # handle, so the dependency is published before the program can act on it
     # (the LF-7 publish-before-return discipline the read hooks follow), and the
     # object is still present so a later `dlclose` cannot make it unobservable.
-    scanLoadedLibraries("dlopen")
+    cooperativeLibraryScan("dlopen")
     let status = scanInlineSyscallPatchesForNewMappings()
     recordLateInlineSyscallScanCoverage(status, "dlopen")
     if ctx.path != nil and ($ctx.path == "linux-vdso.so.1" or
@@ -2591,11 +2604,11 @@ proc repro_hook_dlmopen*(ctx: var DlmopenContext) {.raises: [].} =
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
-  scanLoadedLibraries("pre-dlmopen")
+  cooperativeLibraryScan("pre-dlmopen")
   callNext(ctx)
   let savedErrno = c_get_errno()
   if ctx.result != nil:
-    scanLoadedLibraries("dlmopen")
+    cooperativeLibraryScan("dlmopen")
     let status = scanInlineSyscallPatchesForNewMappings()
     recordLateInlineSyscallScanCoverage(status, "dlmopen")
     if ctx.namespaceId != 0:
