@@ -11,7 +11,7 @@
       # source: captured-output lifetime, initialized injection permits and
       # one preparation per executable page. Match .github/sibling-repos,
       # the ordinary Windows checkout and the committed Repro lock.
-      url = "github:metacraft-labs/nim-stackable-hooks/a043a07f71a9b662c6ae9bae7837107e6c1ade67";
+      url = "github:metacraft-labs/nim-stackable-hooks/63d09347bb63aa39271c88a574dd0d70888c47b0";
       flake = false;
     };
     shm-queue-src = {
@@ -123,6 +123,10 @@
             STACKABLE_HOOKS_SRC = "${inputs.stackable-hooks-src}/src";
             SHM_QUEUE_SRC = "${inputs.shm-queue-src}/src";
             SHM_GSET_SRC = "${inputs.shm-gset-src}/src";
+
+            postPatch = ''
+              patchShebangs scripts/build_shim.sh
+            '';
 
             buildPhase = ''
               runHook preBuild
