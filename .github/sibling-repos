@@ -5,11 +5,13 @@
 # resolves for the plain `nim c` / `nimble` build.
 #
 # nim-stackable-hooks carries an ACKNOWLEDGED override ('!=') because the
-# workspace-lock pin is stale and cannot un-stale itself. The lock record
-# `clone-siblings` resolves for a mainline io-mon commit is produced by
-# `publish-workspace-lock.yml`, which is a FORWARD CARRY: it copies the
-# previous tip's sibling set verbatim onto the new HEAD and, in its own words,
-# "if a pushed commit BUMPED a sibling, the carried set predates that bump".
+# workspace-lock pin was stale and could not un-stale itself. The lock record
+# `clone-siblings` resolved for a mainline io-mon commit was produced by
+# `publish-workspace-lock.yml` (since retired: lock records are published by
+# the pushing workspace's pre-push gate), which was a FORWARD CARRY: it copied
+# the previous tip's sibling set verbatim onto the new HEAD and, in its own
+# words, "if a pushed commit BUMPED a sibling, the carried set predates that
+# bump".
 # Nothing in io-mon's normal merge flow ever re-resolves that set, so the
 # carried pin froze at nim-stackable-hooks 25bf49e4 ("windows: stop freeing the
 # remote path buffer under a live LoadLibraryW") and every io-mon commit since
