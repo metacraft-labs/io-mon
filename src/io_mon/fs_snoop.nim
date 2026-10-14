@@ -806,7 +806,7 @@ when defined(macosx):
       return command
     if not ct_propagation.isSipProtected(interpreter):
       return command
-    let sandboxInterpreter = ct_propagation.rewriteSipPath(interpreter,
+    let sandboxInterpreter = ct_propagation.resolveSipReplacement(interpreter,
       sandboxDir)
     if sandboxInterpreter == interpreter or
         not fileExists(sandboxInterpreter):

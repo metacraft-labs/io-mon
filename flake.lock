@@ -1693,6 +1693,24 @@
         "type": "github"
       }
     },
+    "flake-utils_9": {
+      "inputs": {
+        "systems": "systems_12"
+      },
+      "locked": {
+        "lastModified": 1731533236,
+        "narHash": "sha256-l0KFg5HjrsfsO/JpG+r7fRrqm12kzFHyUHqHCVpMMbI=",
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "rev": "11707dc2f618dd54ca8739b309ec4fc024de578b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "type": "github"
+      }
+    },
     "foundry-nix": {
       "inputs": {
         "flake-utils": [
@@ -4213,6 +4231,22 @@
         "url": "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz"
       }
     },
+    "nixpkgs_16": {
+      "locked": {
+        "lastModified": 1789006805,
+        "narHash": "sha256-xB8mKMOx1IA9vTDNLmJZ6n4wCMq/cuWBBOzGCRnqxrU=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "8ce4ef6cb6f871616146b9fe26d2a5ae594e94fe",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
     "nixpkgs_2": {
       "locked": {
         "lastModified": 1765186076,
@@ -4678,6 +4712,7 @@
         ],
         "shm-gset-src": "shm-gset-src",
         "shm-queue-src": "shm-queue-src",
+        "stackable-hooks-macos-tools": "stackable-hooks-macos-tools",
         "stackable-hooks-src": "stackable-hooks-src"
       }
     },
@@ -4910,20 +4945,40 @@
         "url": "https://spectrum-os.org/git/spectrum"
       }
     },
+    "stackable-hooks-macos-tools": {
+      "inputs": {
+        "flake-utils": "flake-utils_9",
+        "nixpkgs": "nixpkgs_16"
+      },
+      "locked": {
+        "lastModified": 1792013776,
+        "narHash": "sha256-l4rPNg0DzGmaNpBpCFGTM6qFAg2Og0HCA5X/yny0/R0=",
+        "owner": "metacraft-labs",
+        "repo": "stackable-hooks-macos-tools",
+        "rev": "1ad378d58776ec9b6cc73e1c27b8e53c15676f03",
+        "type": "github"
+      },
+      "original": {
+        "owner": "metacraft-labs",
+        "repo": "stackable-hooks-macos-tools",
+        "rev": "1ad378d58776ec9b6cc73e1c27b8e53c15676f03",
+        "type": "github"
+      }
+    },
     "stackable-hooks-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1791087532,
-        "narHash": "sha256-DFq0lyelwwEDeGs0+NdYLAhYvegAYooNw2Y3Tii+tpU=",
+        "lastModified": 1792014092,
+        "narHash": "sha256-QWpuPfJWEtNWv7JUugRkUBat7mUa/tPcbJqlhaSawlg=",
         "owner": "metacraft-labs",
         "repo": "nim-stackable-hooks",
-        "rev": "a043a07f71a9b662c6ae9bae7837107e6c1ade67",
+        "rev": "3af63afc5c0b55a27fc5e0a26f3a32833caf8873",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
         "repo": "nim-stackable-hooks",
-        "rev": "a043a07f71a9b662c6ae9bae7837107e6c1ade67",
+        "rev": "3af63afc5c0b55a27fc5e0a26f3a32833caf8873",
         "type": "github"
       }
     },
@@ -4959,6 +5014,21 @@
       }
     },
     "systems_11": {
+      "locked": {
+        "lastModified": 1681028828,
+        "narHash": "sha256-Vy1rq5AaRuLzOxct8nz4T6wlgyUR7zLU309k9mBC768=",
+        "owner": "nix-systems",
+        "repo": "default",
+        "rev": "da67096a3b9bf56a91d16901293e51ba5b49a27e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-systems",
+        "repo": "default",
+        "type": "github"
+      }
+    },
+    "systems_12": {
       "locked": {
         "lastModified": 1681028828,
         "narHash": "sha256-Vy1rq5AaRuLzOxct8nz4T6wlgyUR7zLU309k9mBC768=",
