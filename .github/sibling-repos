@@ -57,19 +57,24 @@ nim-shm-queue
 # steps pipe into `tee` and the default `run` shell has no pipefail; ci.yml
 # now sets `shell: bash` so the exit status survives.
 #
-# Pinned to an explicit revision rather than resolved from the workspace
-# lock: the io-mon locks published to metacraft-manifests (8b6d0b9b,
-# ea5fa77a) list only io-mon, nim-stackable-hooks and nim-shm-queue, so a
-# bare `nim-shm-gset` entry would fail resolution instead of cloning. The
-# durable fix is to add nim-shm-gset to the io-mon workspace manifest so it
-# is locked alongside its siblings; this pin should be dropped then.
+# Pinned to an explicit revision rather than resolved from the lock: the lock
+# CI reads, this commit's committed `repro.lock` (see above), pins only
+# io-mon, nim-shm-queue and nim-stackable-hooks — its `deps` are io-mon's
+# develop set, and nim-shm-gset is not in it — so a bare `nim-shm-gset` entry
+# would be a named refusal instead of a clone. (The io-mon records published
+# to metacraft-manifests, 8b6d0b9b and ea5fa77a, which CI read before, had the
+# same gap.) The durable fix is to add nim-shm-gset to io-mon's develop set
+# (its `depends` edges in the workspace manifest), so `repro lock refresh`
+# pins it alongside its siblings; this pin should be dropped then.
 # cf0adf2f is metacraft-labs/nim-shm-gset@dev, the revision io-mon's build
 # and full test suite are green against.
 #
-# Spelled '!=' rather than '=': the lock now DOES pin nim-shm-gset (at
-# 8a9f2f13), so a bare '=' entry is an unacknowledged override and
-# `clone-siblings` says so on every run. The revision is unchanged — only the
-# acknowledgement is added — which is what lets this repo eventually set
-# `on-lock-override: error` and have the stale-pin class above fail the job
-# instead of merely warning.
+# Spelled '!=' rather than '='. It was added when a record-store lock did pin
+# nim-shm-gset (at 8a9f2f13), which made a plain '=' an unacknowledged
+# override that `clone-siblings` warned about on every run. The committed
+# `repro.lock` pins nothing for nim-shm-gset, so today the '!=' acknowledges
+# nothing: `clone-siblings` reports this entry as `explicit` ("the lock does not
+# pin this repo"), and '!=' and '=' behave identically. Once the lock pins it,
+# drop this entry as the paragraph above says, rather than keep an
+# acknowledged override.
 nim-shm-gset!=cf0adf2f39647f5b203b2ab694414a3c50e93951
