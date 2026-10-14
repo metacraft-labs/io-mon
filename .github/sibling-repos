@@ -4,49 +4,25 @@
 # io-mon's compile); they are also the `--path` siblings config.nims
 # resolves for the plain `nim c` / `nimble` build.
 #
-# nim-stackable-hooks carries an ACKNOWLEDGED override ('!=') because the
-# workspace-lock pin was stale and could not un-stale itself. The lock record
-# `clone-siblings` resolved for a mainline io-mon commit was produced by
-# `publish-workspace-lock.yml` (since retired: lock records are published by
-# the pushing workspace's pre-push gate), which was a FORWARD CARRY: it copied
-# the previous tip's sibling set verbatim onto the new HEAD and, in its own
-# words, "if a pushed commit BUMPED a sibling, the carried set predates that
-# bump".
-# Nothing in io-mon's normal merge flow ever re-resolved that set, so the
-# carried pin froze at nim-stackable-hooks 25bf49e4 ("windows: stop freeing the
-# remote path buffer under a live LoadLibraryW") and every io-mon commit after
-# it inherited it.
+# nim-stackable-hooks is a bare name: `clone-siblings` resolves it from this
+# commit's own committed `repro.lock` (`lock-store: committed`, reprobuild-pm
+# Unified-Locking-And-Hooks.md §14.5), which pins a043a07 — the same revision
+# `flake.nix` pins `stackable-hooks-src` to. Keep the two in step: a `nim c` in
+# the dev shell resolves `stackable_hooks/...` through the sibling checkout,
+# while `nix build .#default` resolves it through the flake input, and a build
+# that disagrees about which nim-stackable-hooks it is compiling against is the
+# failure this file exists to prevent.
 #
-# That revision predates 6a53408 ("Windows injector: an explicit child
-# environment"), which is where `src/stackable_hooks/windows_env_block.nim` and
-# `runWithMonitorShim`'s `env` parameter arrived. So
-# `tests/portable/test_io_mon_windows_child_env_block.nim` — which imports
-# `stackable_hooks/windows_env_block` and is portable on purpose, see its
-# header — could not compile in CI at all:
-#
-#   tests/portable/test_io_mon_windows_child_env_block.nim(41, 23)
-#     Error: cannot open file: stackable_hooks/windows_env_block
-#
-# and `nimble test` aborts at the first failing file, so the whole host-OS
-# suite behind it never ran either. It passes on a developer machine because
-# the workspace sibling checkout there is a live `dev` tree that has the file;
-# the stale pin is only consulted in CI.
-#
-# a043a07 is the revision `flake.nix` pins `stackable-hooks-src` to, so this
-# entry names the SAME commit as the flake input rather than introducing a
-# third opinion. Keep the two in step: a `nim c` in the dev shell resolves
-# `stackable_hooks/...` through this checkout, while `nix build .#default`
-# resolves it through the flake input, and a build that disagrees about which
-# nim-stackable-hooks it is compiling against is the failure this file exists
-# to prevent.
-#
-# That record is no longer what CI reads. `clone-siblings` now resolves a bare
-# name from this commit's own committed `repro.lock` (`lock-store: committed`,
-# reprobuild-pm Unified-Locking-And-Hooks.md §14.5), which on 2026-10-14 pins
-# nim-stackable-hooks at bb01d793, a descendant of a043a07. Drop the '!=' back
-# to a bare name once `flake.nix`'s `stackable-hooks-src` and the committed
-# `repro.lock` pin agree, so the two builds above keep compiling one revision.
-nim-stackable-hooks!=a043a07f71a9b662c6ae9bae7837107e6c1ade67
+# It carried an acknowledged override ('!=a043a07') until the two locks agreed.
+# The record-store lock `clone-siblings` used to read had frozen the pin at
+# 25bf49e4 (a forward carry by the since-retired `publish-workspace-lock.yml`),
+# which predates 6a53408 ("Windows injector: an explicit child environment"),
+# where `src/stackable_hooks/windows_env_block.nim` arrived; so
+# `tests/portable/test_io_mon_windows_child_env_block.nim` could not compile in
+# CI ("cannot open file: stackable_hooks/windows_env_block") and `nimble test`
+# stopped there. The override was then kept while the committed `repro.lock`
+# pinned bb01d793, a descendant of a043a07, rather than the flake's revision.
+nim-stackable-hooks
 nim-shm-queue
 
 # nim-shm-gset is required by `src/io_mon/writer.nim` (`import
@@ -66,8 +42,9 @@ nim-shm-queue
 # same gap.) The durable fix is to add nim-shm-gset to io-mon's develop set
 # (its `depends` edges in the workspace manifest), so `repro lock refresh`
 # pins it alongside its siblings; this pin should be dropped then.
-# cf0adf2f is metacraft-labs/nim-shm-gset@dev, the revision io-mon's build
-# and full test suite are green against.
+# 43a61120 is the revision `flake.nix` pins `shm-gset-src` to, so the
+# ordinary checkout and `nix build .#default` compile the same nim-shm-gset
+# (keep the two in step, as for nim-stackable-hooks above).
 #
 # Spelled '!=' rather than '='. It was added when a record-store lock did pin
 # nim-shm-gset (at 8a9f2f13), which made a plain '=' an unacknowledged
@@ -77,4 +54,4 @@ nim-shm-queue
 # pin this repo"), and '!=' and '=' behave identically. Once the lock pins it,
 # drop this entry as the paragraph above says, rather than keep an
 # acknowledged override.
-nim-shm-gset!=cf0adf2f39647f5b203b2ab694414a3c50e93951
+nim-shm-gset!=43a61120ae54b542c3e3038453094cca707a6c05

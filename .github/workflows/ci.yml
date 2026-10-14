@@ -262,8 +262,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: metacraft-labs/nim-shm-gset
-          # Same revision as .github/sibling-repos.
-          ref: cf0adf2f39647f5b203b2ab694414a3c50e93951
+          # Same revision as .github/sibling-repos and shm-gset-src in flake.nix.
+          ref: 43a61120ae54b542c3e3038453094cca707a6c05
           path: nim-shm-gset
           token: ${{ steps.app-token.outputs.token }}
 
