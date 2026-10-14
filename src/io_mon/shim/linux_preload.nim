@@ -1865,7 +1865,14 @@ proc repro_hook_close*(ctx: var CloseContext) {.raises: [].} =
   # leaves FragmentSlot pointing at a descriptor number the shell can reuse.
   # Subsequent monitor frames then enter the shell pipe instead of the fragment
   # file. Close through the writer so it flushes and retires the slot first.
+  # Only when the descriptor is still the fragment, though: if the tracee
+  # replaced it (dup2 over the number), the close is the tracee's own and must
+  # reach the kernel; `fragmentSlotOwnsDescriptor` detaches the stale handle.
+  var ownsFragment = false
   if ctx.fd == sigSafeSlotFd():
+    withShimMuted:
+      ownsFragment = fragmentSlotOwnsDescriptor(ctx.fd)
+  if ownsFragment:
     var closed = false
     withShimMuted:
       closeFragmentSlot()

@@ -270,6 +270,7 @@ var
   fragmentOpenCount: Atomic[uint64]
   fragmentWriteCount: Atomic[uint64]
   fragmentFlushCount: Atomic[uint64]
+  fragmentHandleProbeCount: Atomic[uint64]
   # DEP-FLUSH-1 — the registry itself. Guarded by `registryLock`; entries
   # hold the address of a thread's `fragmentSlot` threadvar (nil == free).
   # `registryCount` is the high-water mark of used indices so the sweep
@@ -1044,6 +1045,19 @@ proc resetFragmentLogFlushCount*() =
   ## Test-only — reset the flush counter between scenarios.
   fragmentFlushCount.store(0, moRelaxed)
 
+proc fragmentLogHandleProbeCount*(): uint64 =
+  ## Return the lifetime number of descriptor-identity probes
+  ## (``fragmentHandleIsCurrent``, one ``fstat`` each) the fragment writer
+  ## issued. Every probe is a syscall, so tests assert it scales with the
+  ## number of flushes and markers, never with the number of appended
+  ## records: a per-record probe puts a syscall back on the batched hot path
+  ## that M9.R.15f.1 exists to keep syscall-free.
+  fragmentHandleProbeCount.load(moRelaxed)
+
+proc resetFragmentLogHandleProbeCount*() =
+  ## Test-only — reset the identity-probe counter between scenarios.
+  fragmentHandleProbeCount.store(0, moRelaxed)
+
 proc captureFragmentHandleIdentity(): bool {.raises: [].} =
   try:
     let info = getFileInfo(fragmentSlot.file)
@@ -1056,6 +1070,7 @@ proc captureFragmentHandleIdentity(): bool {.raises: [].} =
 proc fragmentHandleIsCurrent(): bool {.raises: [].} =
   if not fragmentSlot.isOpen or fragmentSlot.file.isNil:
     return false
+  discard fragmentHandleProbeCount.fetchAdd(1, moRelaxed)
   try:
     let info = getFileInfo(fragmentSlot.file.getFileHandle())
     result = uint64(info.id.device) == fragmentSlot.fileDevice and
@@ -1088,6 +1103,28 @@ proc reopenFragmentHandle(): bool {.raises: [].} =
     return false
   discard fragmentOpenCount.fetchAdd(1, moRelaxed)
   true
+
+proc fragmentSlotOwnsDescriptor*(fd: cint): bool {.raises: [].} =
+  ## True when ``fd`` is the calling thread's open fragment descriptor AND it
+  ## still refers to the fragment file. A shim ``close`` hook asks this before
+  ## routing a tracee's ``close(fd)`` through ``closeFragmentSlot``.
+  ##
+  ## The number alone is not ownership: the tracee can replace the descriptor
+  ## (``dup2`` over it, or a raw close followed by an open that reuses the
+  ## number) and later close ITS file under that number. The append path does
+  ## not probe identity per record, so the slot can still name a replaced
+  ## number when that close arrives. Here the stale handle is detached and the
+  ## fragment reopened on a fresh descriptor (never closed — the number is the
+  ## tracee's), and the answer is false, so the hook lets the tracee's close
+  ## proceed instead of swallowing it and leaking the tracee's descriptor.
+  if fd < 0 or not fragmentSlot.isOpen or fragmentSlot.file.isNil:
+    return false
+  if sigSafeSlotFd() != fd:
+    return false
+  if fragmentHandleIsCurrent():
+    return true
+  discard reopenFragmentHandle()
+  false
 
 proc accountFragmentBytes(written: int) =
   ## LEAK-GUARD — record `written` on-disk bytes against the calling thread's
@@ -1491,6 +1528,11 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   ## (d) the current batch has been open for longer than
   ## ``FragmentBatchMaxAgeNs`` (default 100 ms) — bounding the worst-
   ## case data-loss window on SIGKILL.
+  ##
+  ## Appending into the batch issues no syscall per record. The cached
+  ## descriptor's identity (it may have been replaced by the tracee) is
+  ## validated at every point that touches the descriptor — flush, marker
+  ## write, close, oversize direct write — not on every append.
   # io-mon-Lossless-Event-Capture M3 part 2a — PRIMARY path is the SET transport
   # (nim-shm-gset, the M1-winning Candidate-C channel). Part 2b removed the
   # superseded DEP-SHM ring, so the only channels are the SET (Linux) and the
@@ -1571,17 +1613,25 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
       fragmentSlot.threadId == record.threadId:
     return
 
-  if fragmentSlot.isOpen and not fragmentHandleIsCurrent() and
-      not reopenFragmentHandle():
-    raiseEnvelopeError(eeMalformed,
-      "cannot recover externally replaced iomon fragment handle")
-
+  # Descriptor identity (`fragmentHandleIsCurrent`, one `fstat`) is checked
+  # only where this path TOUCHES the descriptor — before closing it on a key
+  # change and before the oversize direct write below — never once per record.
+  # Appending into the batch buffer touches no descriptor, and every other
+  # descriptor use (`flushFragmentBatch`, `writeReadTailMarker`,
+  # `closeFragmentSlot`) validates it itself. A per-record probe here put a
+  # syscall back on the hot path batching exists to keep syscall-free: on
+  # macOS / APFS it held the batched writer to ~2.2x the unbatched one.
   let needsReopen = not fragmentSlot.isOpen or
     not slotFragmentDirEquals(fragmentSlot, fragmentDir) or
     fragmentSlot.osPid != record.osPid or
     fragmentSlot.threadId != record.threadId
   if needsReopen:
     if fragmentSlot.isOpen:
+      # The descriptor may have been replaced since the last flush; closing it
+      # unchecked would close a descriptor that now belongs to the tracee.
+      if not fragmentHandleIsCurrent() and not reopenFragmentHandle():
+        raiseEnvelopeError(eeMalformed,
+          "cannot recover externally replaced iomon fragment handle")
       # Flush the in-flight batch BEFORE we close — otherwise the
       # buffered frames belong to the previous (osPid, threadId)
       # fragment but the close path drops them on the floor.
@@ -1618,6 +1668,11 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
     # via the legacy ``encodeFrame`` path to keep the file's frame-
     # boundary invariant.
     flushFragmentBatch()
+    # `flushFragmentBatch` validates the descriptor only when it had bytes to
+    # write; this direct write must not reach a replaced descriptor either.
+    if not fragmentHandleIsCurrent() and not reopenFragmentHandle():
+      raiseEnvelopeError(eeMalformed,
+        "cannot recover externally replaced iomon fragment handle")
     let frame = encodeFrame(record)
     let n = fragmentSlot.file.writeBuffer(unsafeAddr frame[0], frame.len)
     if n != frame.len:
