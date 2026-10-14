@@ -90,7 +90,14 @@ type
     #    cardinal-sin defect): on every process startup /usr/lib/libobjc,
     #    /usr/lib/swift and libsystem_malloc/_trace call arc4random_buf and
     #    libcorecrypto calls getentropy, all CROSS-DYLIB, so they cross the
-    #    interpose stub and flagged EVERY real cc/clang/ld/bash run. Linux needs no
+    #    interpose stub and flagged EVERY real cc/clang/ld/bash run. A NON-SYSTEM
+    #    image is the main executable or ANY dylib/bundle outside /usr/lib,
+    #    /System and the dyld shared cache -- link-time or dlopen'd, under
+    #    /nix/store, /opt/homebrew, /usr/local, the Xcode trees or anywhere
+    #    else. No install prefix is exempt: a Nix clang's arc4random in
+    #    libLLVM (its temp-file name) is reported exactly as the Linux shim
+    #    reports it, and whether that tool's entropy is harmless is the
+    #    consumer's per-tool blessing, not the shim's. Linux needs no
     #    equivalent gate: LD_PRELOAD interposes the PUBLIC symbol, and glibc's own
     #    internal users reach entropy by routes that never pass through an
     #    interposed PLT entry — a LOCAL, non-exported symbol

@@ -1232,46 +1232,21 @@ static const void *repro_nonsys_text_start[REPRO_NONSYS_RANGE_CAP];
 static const void *repro_nonsys_text_end[REPRO_NONSYS_RANGE_CAP];
 static volatile uint32_t repro_nonsys_range_count = 0;
 
-/* ROUND-3 S3b — LINK-TIME vs DLOPEN discrimination for the entropy range set.
- *
- * The add-image callback fires SYNCHRONOUSLY for every image ALREADY loaded when
- * `_dyld_register_func_for_add_image` is called (the program's full LINK-TIME
- * dependency closure — dyld maps all static dependencies before our constructor),
- * and AGAIN for every later `dlopen`. The constructor sets this flag to 1 the
- * instant the register call returns, so a callback fired DURING the initial burst
- * (flag == 0) is a link-time dependency and a callback fired afterwards (flag == 1)
- * is a dlopen'd image.
- *
- * WHY this gates the entropy range set (but NOT recordLibraryLoad): on a real
- * toolchain the program's LINK-TIME runtime dylibs draw BENIGN entropy — a Nix/
- * Homebrew clang's libLLVM/libc++ call arc4random for a random TEMP-FILE NAME and
- * for hash-seed randomization, neither of which reaches the build OUTPUT (the same
- * benign pattern the /dev/urandom-for-mktemp cardinal-sin guard already exempts).
- * Those dylibs are NON-SYSTEM (they live in /nix/store, not /usr/lib or the shared
- * cache), so attributing their entropy would FALSE-DOWNGRADE every cc/clang compile
- * (the cardinal sin — observed: a real `cc -c` draws libLLVM temp-name entropy). A
- * DLOPEN'd image, by contrast, is an EXPLICITLY-loaded extension — a compiler
- * pass-plugin, the res1_dylib_entropy plugin — far more likely to bake entropy into
- * output, and NOT part of the trusted, pinned toolchain runtime. So we attribute
- * entropy to the MAIN EXECUTABLE (always) and to DLOPEN'd images, but NOT to
- * link-time dependency dylibs. recordLibraryLoad still records ALL non-system images
- * as content deps (break #4 unchanged); only the ENTROPY attribution is gated.
- *
- * DOCUMENTED RESIDUAL: a non-system dylib LINKED (not dlopen'd) into a build tool
- * that draws output-affecting entropy (res1's link-time `tool` variant) is NOT
- * flagged — it is structurally indistinguishable from the trusted toolchain runtime
- * (libLLVM/libc++), so the cardinal-sin guard wins. The structural endgame is the
- * EndpointSecurity backend (kernel-side accounting). */
-static volatile int repro_addimage_burst_done = 0;
-
-void repro_macos_mark_addimage_burst_done(void) {
-  __atomic_store_n(&repro_addimage_burst_done, 1, __ATOMIC_RELEASE);
-}
-
-int repro_macos_addimage_burst_done(void) {
-  return __atomic_load_n(&repro_addimage_burst_done, __ATOMIC_ACQUIRE);
-}
-
+/* Every non-system image is registered, LINK-TIME dependency and DLOPEN'd
+ * extension alike, and wherever it is installed. Rounds 3 and 4 gated this
+ * set: round 3 dropped the whole link-time add-image burst, round 4 narrowed
+ * that to link-time images under a "toolchain" prefix (/nix/store,
+ * /opt/homebrew, /usr/local, /Library/Developer, /Applications/Xcode.app,
+ * /Library/Apple), because a Nix clang's libLLVM draws arc4random for its
+ * temp-file name. That exemption made, by path and on macOS only, the
+ * decision the consumer makes per tool with a stated justification
+ * (reprobuild's entropy blessings, attributed through the pid's
+ * mrProcessExec): the draw was seen and DISCARDED, so no loss was reported and
+ * an edge with no blessing published over it, while the Linux preload shim
+ * reports the same draw. The startup baseline the cardinal-sin guard protects
+ * against is in /usr/lib and the dyld shared cache, which
+ * repro_macos_dyld_image_dep_path rejects before an image reaches this
+ * registry, so removing the exemption does not readmit it. */
 void repro_macos_register_nonsystem_image(void *mh_raw) {
   if (mh_raw == NULL) return;
   const struct mach_header *mh = (const struct mach_header *)mh_raw;
@@ -1287,39 +1262,6 @@ void repro_macos_register_nonsystem_image(void *mh_raw) {
   repro_nonsys_text_start[n] = (const void *)p;
   repro_nonsys_text_end[n] = (const void *)(p + size);
   __atomic_store_n(&repro_nonsys_range_count, n + 1, __ATOMIC_RELEASE);
-}
-
-/* ROUND-4 S3b: is path under a recognized TOOLCHAIN / installed-software prefix
- * whose LINK-TIME runtime dylibs draw BENIGN entropy (libLLVM/libc++ temp-name and
- * hash-seed randomness that never reaches build OUTPUT)? Such an image is EXEMPT
- * from link-time entropy attribution — flagging it would FALSE-DOWNGRADE every
- * cc/clang compile (the cardinal sin). A non-system dylib NOT under any of these
- * prefixes (a CUSTOM dylib in the BUILD/PROJECT tree) is the threat and IS attributed.
- *
- * The /usr/lib + /System + dyld-shared-cache system baseline is already excluded
- * upstream by repro_macos_dyld_image_dep_path, so this need only name the NON-system
- * toolchain stores: /nix/store (Nix), /opt/homebrew + /usr/local (Homebrew), and the
- * Xcode / Command-Line-Tools / Developer trees. The path is already realpath-
- * canonicalised by the caller, so a dot-dot or symlink path cannot dodge these
- * prefixes. Pure string compares — no dyld, no allocation, callable in the add-image
- * callback. */
-int repro_macos_path_is_toolchain(char *path) {
-  if (path == NULL) return 0;
-  static const char *const repro_toolchain_prefixes[] = {
-    "/nix/store/",
-    "/opt/homebrew/",
-    "/usr/local/",
-    "/Library/Developer/",
-    "/Applications/Xcode.app/",
-    "/Library/Apple/",
-  };
-  size_t count =
-    sizeof(repro_toolchain_prefixes) / sizeof(repro_toolchain_prefixes[0]);
-  for (size_t i = 0; i < count; i++) {
-    size_t n = strlen(repro_toolchain_prefixes[i]);
-    if (strncmp(path, repro_toolchain_prefixes[i], n) == 0) return 1;
-  }
-  return 0;
 }
 
 /* Return 1 iff `retaddr` lies in a NON-SYSTEM image's __TEXT — the main executable
@@ -3183,33 +3125,6 @@ proc ct_macos_register_nonsystem_image*(mh: pointer) =
   proc impl(mh: pointer)
     {.importc: "repro_macos_register_nonsystem_image", cdecl.}
   impl(mh)
-
-proc ct_macos_mark_addimage_burst_done*() =
-  ## ROUND-3 S3b — mark dyld's initial add-image burst (the link-time dependency
-  ## closure) complete, so subsequent add-image callbacks are dlopen'd images. The
-  ## constructor calls this the instant `_dyld_register_func_for_add_image` returns.
-  proc impl() {.importc: "repro_macos_mark_addimage_burst_done", cdecl.}
-  impl()
-
-proc ct_macos_addimage_burst_done*(): bool =
-  ## ROUND-3 S3b — true once the initial (link-time) add-image burst has finished,
-  ## i.e. the current add-image callback is for a DLOPEN'd image. Used to gate the
-  ## entropy range set to dlopen'd images (the toolchain's link-time runtime dylibs
-  ## draw benign entropy and must NOT be attributed — the cardinal-sin guard).
-  proc impl(): cint {.importc: "repro_macos_addimage_burst_done", cdecl.}
-  impl() != 0
-
-proc ct_macos_path_is_toolchain*(path: cstring): bool =
-  ## ROUND-4 S3b — true iff `path` is under a recognized toolchain/installed-software
-  ## prefix (/nix/store, /opt/homebrew, /usr/local, the Xcode/Developer trees) whose
-  ## LINK-TIME runtime dylibs draw BENIGN entropy. Such a link-time image is EXEMPT
-  ## from entropy attribution (the cardinal-sin guard: a Nix clang's libLLVM/libc++
-  ## must not downgrade a normal compile). A non-system dylib NOT under any of these
-  ## prefixes — a CUSTOM dylib in the build/project tree — is attributed instead.
-  ## Pure string compares; safe in the dyld add-image callback. See the C note.
-  proc impl(p: cstring): cint
-    {.importc: "repro_macos_path_is_toolchain", cdecl.}
-  impl(path) != 0
 
 proc ct_macos_addr_in_nonsystem*(caller: pointer): bool =
   ## ROUND-3 S3b — CALLER ATTRIBUTION for entropy observations, widened from

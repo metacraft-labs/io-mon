@@ -1371,25 +1371,25 @@ proc repro_hook_dyld_add_image*(mh: pointer; slide: int)
   dec disabled
   if recordable:
     recordLibraryLoad(cast[cstring](addr buf[0]))
-    # ROUND-4 S3b — this image is NON-SYSTEM (it passed the same /usr/lib + /System
-    # + shared-cache + shim filter the library-load record uses). Register its slid
-    # __TEXT range for entropy caller-attribution when:
-    #   * it is a DLOPEN'd image (the initial link-time burst is done) — an explicitly
-    #     loaded extension such as the res1 dlopen pass-plugin, the stronger threat
-    #     and never a trusted pinned runtime; OR
-    #   * it is a LINK-TIME image whose path is NOT under a recognized toolchain
-    #     prefix (ct_macos_path_is_toolchain) — a CUSTOM dylib in the build/project
-    #     tree (round-4 r4_residual/entropy_main_link: libentropy.dylib drawing
-    #     arc4random and baking it into output) that the round-3 blanket link-time
-    #     exemption let slip through → a false cache hit.
-    # The program's LINK-TIME TOOLCHAIN runtime dylibs (a Nix clang's libLLVM/libc++
-    # in /nix/store) draw BENIGN temp-name/hash entropy and stay EXEMPT, so a normal
-    # cc/clang compile is NOT downgraded (the cardinal-sin guard). recordLibraryLoad
-    # above still records EVERY non-system image as a content dep (break #4).
-    # getsegmentdata is a lock-free memory walk, safe in the dyld add-image callback.
-    if ct_macos_addimage_burst_done() or
-        not ct_macos_path_is_toolchain(cast[cstring](addr buf[0])):
-      ct_macos_register_nonsystem_image(mh)
+    # This image is NON-SYSTEM (it passed the same /usr/lib + /System +
+    # shared-cache + shim filter the library-load record uses), so its slid
+    # __TEXT range is registered for entropy caller-attribution -- whether it is
+    # a LINK-TIME dependency or a DLOPEN'd one, and wherever it is installed.
+    #
+    # Rounds 3 and 4 exempted link-time images under a "toolchain" prefix
+    # (/nix/store, /opt/homebrew, /usr/local, the Xcode trees), on the premise
+    # that a Nix clang's libLLVM/libc++ draw only benign temp-name entropy. That
+    # decided, by path and on macOS only, what the CONSUMER decides per tool
+    # with a stated justification (reprobuild's entropy blessings, attributed
+    # through the pid's `mrProcessExec`): clang's temp-file draw in libLLVM was
+    # seen and discarded, and an edge with no blessing published over it, while
+    # the Linux preload shim reports the very same draw. The startup baseline
+    # the cardinal-sin guard exists for lives in /usr/lib and the shared cache,
+    # never in a registered image, so it stays excluded. See
+    # reprobuild-pm `spec/MacOS-Monitoring.md` §"Entropy Caller Attribution".
+    # getsegmentdata is a lock-free memory walk, safe in the dyld add-image
+    # callback.
+    ct_macos_register_nonsystem_image(mh)
 
 proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
   if not locksReady:
@@ -4527,9 +4527,6 @@ extern long long repro_macos_real_time_call(void *tloc);
 extern int repro_macos_real_secrandom_call(void *rnd, size_t count,
     void *bytes);
 extern int repro_macos_real_ccrandom_call(void *bytes, size_t count);
-/* ROUND-3 S3b — defined in the runtime module's emit; the constructor calls it the
- * instant the add-image registration's initial (link-time) burst finishes. */
-extern void repro_macos_mark_addimage_burst_done(void);
 /* T3b: the dyld add-image callback `repro_hook_dyld_add_image` is a Nim exportc
  * proc whose prototype is already emitted (N_LIB_EXPORT) earlier in this same
  * translation unit, so no re-declaration is needed here; we cast its function
@@ -5916,13 +5913,6 @@ static void repro_monitor_shim_constructor(int argc, const char **argv, char **e
    */
   _dyld_register_func_for_add_image(
     (void (*)(const struct mach_header *, intptr_t))repro_hook_dyld_add_image);
-  /* ROUND-3 S3b — the register call above delivered the FULL link-time dependency
-   * closure synchronously (one callback per already-loaded image). Mark the initial
-   * burst done so every SUBSEQUENT callback is a dlopen'd image: the entropy
-   * caller-attribution registers a non-system image's __TEXT range ONLY for those
-   * dlopen'd extensions (a pass-plugin), never for the trusted link-time toolchain
-   * runtime (libLLVM/libc++), keeping a normal cc/clang compile mcComplete. */
-  repro_macos_mark_addimage_burst_done();
 }
 
 /*
