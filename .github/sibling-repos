@@ -12,10 +12,10 @@
 # the previous tip's sibling set verbatim onto the new HEAD and, in its own
 # words, "if a pushed commit BUMPED a sibling, the carried set predates that
 # bump".
-# Nothing in io-mon's normal merge flow ever re-resolves that set, so the
+# Nothing in io-mon's normal merge flow ever re-resolved that set, so the
 # carried pin froze at nim-stackable-hooks 25bf49e4 ("windows: stop freeing the
-# remote path buffer under a live LoadLibraryW") and every io-mon commit since
-# has inherited it.
+# remote path buffer under a live LoadLibraryW") and every io-mon commit after
+# it inherited it.
 #
 # That revision predates 6a53408 ("Windows injector: an explicit child
 # environment"), which is where `src/stackable_hooks/windows_env_block.nim` and
@@ -40,8 +40,12 @@
 # nim-stackable-hooks it is compiling against is the failure this file exists
 # to prevent.
 #
-# Drop the '!=' back to a bare name once a re-locked mainline commit pins
-# a043a07 or later; until then a bare name silently reinstates 25bf49e4.
+# That record is no longer what CI reads. `clone-siblings` now resolves a bare
+# name from this commit's own committed `repro.lock` (`lock-store: committed`,
+# reprobuild-pm Unified-Locking-And-Hooks.md §14.5), which on 2026-10-14 pins
+# nim-stackable-hooks at bb01d793, a descendant of a043a07. Drop the '!=' back
+# to a bare name once `flake.nix`'s `stackable-hooks-src` and the committed
+# `repro.lock` pin agree, so the two builds above keep compiling one revision.
 nim-stackable-hooks!=a043a07f71a9b662c6ae9bae7837107e6c1ade67
 nim-shm-queue
 
