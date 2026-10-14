@@ -11,7 +11,7 @@
       # source: captured-output lifetime, initialized injection permits and
       # one preparation per executable page. Match .github/sibling-repos,
       # the ordinary Windows checkout and the committed Repro lock.
-      url = "github:metacraft-labs/nim-stackable-hooks/f51e0ab3bb79b6bdf5fba0cecd57c30cf4edceff";
+      url = "github:metacraft-labs/nim-stackable-hooks/63d09347bb63aa39271c88a574dd0d70888c47b0";
       flake = false;
     };
     shm-queue-src = {

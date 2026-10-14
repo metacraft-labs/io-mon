@@ -40,7 +40,7 @@
 #
 # Drop the '!=' back to a bare name once a re-locked mainline commit pins
 # f51e0ab or later; until then a bare name silently reinstates 25bf49e4.
-nim-stackable-hooks!=f51e0ab3bb79b6bdf5fba0cecd57c30cf4edceff
+nim-stackable-hooks!=63d09347bb63aa39271c88a574dd0d70888c47b0
 nim-shm-queue
 
 # nim-shm-gset is required by `src/io_mon/writer.nim` (`import
