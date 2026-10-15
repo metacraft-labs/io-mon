@@ -671,8 +671,9 @@ static void repro_linux_monitor_destructor(void) {
 
 /* DEP-FLUSH-3 — per-thread exit flush via a pthread_key destructor.
  *
- * The FragmentSlot is a POD threadvar; Nim installs NO thread-exit
- * finalizer for it (that is deliberate, for --mm:orc fork safety), so a
+ * The FragmentSlot is POD per-thread state (heap-resident on Linux, reached
+ * through a threadvar pointer; see `fragmentSlotOnHeap` in writer.nim); Nim
+ * installs NO thread-exit finalizer for it (that is deliberate, for --mm:orc fork safety), so a
  * worker thread that emits a sub-64-KiB batch and returns before the
  * 100 ms staleness flush would lose its whole batch — and the process-exit
  * destructor (main thread) cannot reach an already-dead worker's TLS.
@@ -905,9 +906,18 @@ proc repro_linux_thread_exit_flush() {.exportc, cdecl, raises: [].} =
   ## thread exit. Flushes + closes + unregisters the calling thread's slot
   ## so a short-lived worker thread's buffered batch is durable before its
   ## TLS is torn down. Muted so the teardown emits no new records.
+  ##
+  ## `threadExitFlushSlot` also frees the thread's heap-resident slot (see
+  ## `fragmentSlotOnHeap` in writer.nim). libc cleared this key's value
+  ## before calling us, so drop `threadExitArmed` too: if a later TLS
+  ## destructor on this thread emits a record (allocating a fresh slot),
+  ## `emitRecord` re-arms the key and libc's destructor loop (up to
+  ## PTHREAD_DESTRUCTOR_ITERATIONS passes) calls us again to flush and free
+  ## it, instead of leaking it.
   withShimMuted:
     try: threadExitFlushSlot()
     except CatchableError: discard
+  threadExitArmed = false
 
 proc armThreadExitFlush() {.raises: [].} =
   ## DEP-FLUSH-3 — set the pthread key to a non-NULL sentinel so libc fires
@@ -1435,6 +1445,25 @@ proc recordLocalFdPair(fds: ptr cint) {.raises: [].} =
   recordLocalFdCreate(arr[0])
   recordLocalFdCreate(arr[1])
 
+proc hookScratchString(): string {.inline, raises: [].} =
+  ## A PATH_MAX-sized byte buffer for a C helper to write a path into, as a
+  ## heap-backed Nim string rather than a stack array.
+  ##
+  ## WHY. A hook runs on the stack of whatever HOST thread made the call, and a
+  ## host may legally create that thread with PTHREAD_STACK_MIN (16 KiB on
+  ## x86_64) — minus glibc's guard page, TCB and static TLS. Each 4 KiB path
+  ## array on the hook path was a quarter of that; together with the 16 KiB
+  ## dep-set key buffer in the writer they overflowed such a thread inside a
+  ## hooked `open` (SIGSEGV), which
+  ## `tests/linux/test_io_mon_shim_static_tls_small_stack_threads` now grades.
+  ##
+  ## SAFE HERE. Every caller already builds Nim strings from the result, so the
+  ## path allocates on the same thread either way (the shim's allocator is the
+  ## process C heap: `-d:useMalloc`, routed to glibc's own heap by
+  ## `linux_private_heap.c`). The string is a local, so it is neither shared
+  ## with a nested hook nor live after the call returns.
+  newString(4096)
+
 proc isLinuxDeletedProcFdTarget(path: string): bool {.raises: [].} =
   path.endsWith(" (deleted)")
 
@@ -1443,7 +1472,10 @@ proc recoverNamedFdRead(fd: cint; kind: FdKind): bool {.raises: [].} =
   ## untracked dup replaced the descriptor that carried the original path.
   if kind notin {fkRegular, fkOther}:
     return false
-  var buf: array[4096, char]
+  # Heap, not a stack array: this runs inside a hooked `read` on the HOST's
+  # thread, whose stack may be as small as PTHREAD_STACK_MIN. See
+  # `hookScratchString`.
+  var buf = hookScratchString()
   if c_fd_proc_path(fd, addr buf[0], csize_t(buf.len)) == 0:
     return false
   let resolved = $cast[cstring](addr buf[0])
@@ -1506,7 +1538,8 @@ proc pathForAt(dirfd: cint; path: cstring): string {.raises: [].} =
   if raw.len == 0 or raw.isAbsolute:
     return raw
   if dirfd == LinuxAtFdcwd:
-    var cwdBuf: array[4096, char]
+    # Heap, not a stack array — see `hookScratchString`.
+    var cwdBuf = hookScratchString()
     let n = c_raw_syscall6(LinuxSysGetcwd,
       cast[clong](addr cwdBuf[0]), clong(cwdBuf.len), 0, 0, 0, 0)
     if n > 0:
@@ -1610,7 +1643,10 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     # appended so that even a SAME-image re-exec (identical `/proc/self/exe`) stays
     # a distinct element.
     block:
-      var exeBuf: array[4096, char]
+      # Heap, not a stack array: the constructor normally runs on the main
+      # thread, but a hook that fires first initialises lazily on whatever
+      # thread made the call. See `hookScratchString`.
+      var exeBuf = hookScratchString()
       let n = c_self_exe_path(addr exeBuf[0], csize_t(exeBuf.len))
       var img = ""
       if n > 0:

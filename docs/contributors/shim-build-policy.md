@@ -199,6 +199,16 @@ fixtures retain their uncached execution isolation.
 4. Add a regression test that exercises the hook from inside a real allocator on
    multiple threads (a heavy multi-threaded toolchain like `rustc` is the reliable
    reproducer — see the mmap-reentrancy test).
+5. **Keep the hook path's stack frames small, and keep large state out of TLS.**
+   A hook runs on the stack of whatever host thread made the call, and a host
+   may legally create that thread with `PTHREAD_STACK_MIN` (16 KiB on x86_64).
+   On Linux every byte of the shim's static TLS is also subtracted from every
+   thread's stack (glibc's `allocate_stack`), so a large `{.threadvar.}` makes
+   `pthread_create` fail with EINVAL for small stacks. Use a heap buffer per call
+   (or a lock-guarded global, as the anonymous-range table does) for anything
+   over a few hundred bytes. `tests/linux/test_io_mon_shim_static_tls_small_stack_threads`
+   enforces both budgets: static TLS ≤ 4 KiB, and hook stack use ≤ 4 KiB above
+   what the same calls use without the shim.
 
 ### Child library propagation
 

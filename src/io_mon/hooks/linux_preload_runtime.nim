@@ -2206,16 +2206,30 @@ static const char *ct_dlopen_dyn_paths(struct link_map *lm,
   return strtab;
 }
 
-static int ct_dlopen_origin_dir(struct link_map *lm, char *out, size_t cap) {
+/* Working storage for one caller-relative dlopen resolution. It lives on the
+   C heap for the duration of one interposed dlopen/dlmopen call (see
+   ct_dlopen_scratch_new), not on the stack: as four PATH_MAX stack arrays
+   spread over the hook and three helpers it took ~16 KiB of the CALLING
+   thread's stack, which a host may legally have created with
+   PTHREAD_STACK_MIN (16 KiB on x86_64). */
+typedef struct {
+  char resolved[PATH_MAX]; /* the path handed to the real loader */
+  char origin[PATH_MAX];   /* $ORIGIN of the calling object */
+  char exe[PATH_MAX];      /* readlink("/proc/self/exe") for the main program */
+  char expanded[PATH_MAX]; /* one search-list entry with $ORIGIN expanded */
+} ct_dlopen_scratch;
+
+static int ct_dlopen_origin_dir(struct link_map *lm, char *out, size_t cap,
+                                char *path, size_t path_cap) {
   /* Directory used to expand $ORIGIN for object `lm`: dirname(l_name) for a
      normal library, or dirname(readlink("/proc/self/exe")) for the main
-     executable (l_name == ""). Returns 1 on success. */
-  char path[PATH_MAX];
+     executable (l_name == ""). `path` is working space for the latter.
+     Returns 1 on success. */
   const char *src = NULL;
   if (lm != NULL && lm->l_name != NULL && lm->l_name[0] != '\0') {
     src = lm->l_name;
   } else {
-    ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    ssize_t n = readlink("/proc/self/exe", path, path_cap - 1);
     if (n <= 0) return 0;
     path[n] = '\0';
     src = path;
@@ -2257,11 +2271,11 @@ static int ct_dlopen_has_other_elf_class(const char *path) {
 
 static int ct_dlopen_try_dir(const char *dir, size_t dirlen,
                              const char *soname, const char *origin,
-                             char *out, size_t cap) {
-  /* Expand $ORIGIN in `dir`; on an unsupported token ($LIB/$PLATFORM/unknown)
-     return 0 (skip). Then test "dir/soname" for existence; on a hit copy the
-     full path into `out` and return 1. */
-  char expanded[PATH_MAX];
+                             char *out, size_t cap, char *expanded,
+                             size_t expanded_cap) {
+  /* Expand $ORIGIN in `dir` into `expanded`; on an unsupported token
+     ($LIB/$PLATFORM/unknown) return 0 (skip). Then test "dir/soname" for
+     existence; on a hit copy the full path into `out` and return 1. */
   size_t pos = 0, i = 0;
   while (i < dirlen) {
     if (dir[i] == '$') {
@@ -2271,14 +2285,14 @@ static int ct_dlopen_try_dir(const char *dir, size_t dirlen,
       if (rem > 0 && *tok == '{') { brace = 1; tok++; rem--; }
       if (rem >= 6 && strncmp(tok, "ORIGIN", 6) == 0) {
         size_t olen = strlen(origin);
-        if (pos + olen >= sizeof(expanded)) return 0;
+        if (pos + olen >= expanded_cap) return 0;
         memcpy(expanded + pos, origin, olen); pos += olen;
         i += 1 + (brace ? 1 : 0) + 6 + (brace ? 1 : 0);
         continue;
       }
       return 0; /* $LIB / $PLATFORM / unknown — unsupported; skip this dir. */
     }
-    if (pos + 1 >= sizeof(expanded)) return 0;
+    if (pos + 1 >= expanded_cap) return 0;
     expanded[pos++] = dir[i++];
   }
   expanded[pos] = '\0';
@@ -2290,7 +2304,7 @@ static int ct_dlopen_try_dir(const char *dir, size_t dirlen,
 }
 
 static int ct_dlopen_search_list(const char *list, const char *soname,
-                                 const char *origin, char *out, size_t cap) {
+                                 const char *origin, ct_dlopen_scratch *s) {
   /* Preserve the loader's fallback past incompatible ELF classes. A malformed
      candidate still wins here so the real loader reports its genuine error. */
   if (list == NULL) return 0;
@@ -2298,8 +2312,11 @@ static int ct_dlopen_search_list(const char *list, const char *soname,
   while (*p) {
     const char *sep = strchr(p, ':');
     size_t len = sep ? (size_t)(sep - p) : strlen(p);
-    if (len > 0 && ct_dlopen_try_dir(p, len, soname, origin, out, cap) &&
-        !ct_dlopen_has_other_elf_class(out))
+    if (len > 0 &&
+        ct_dlopen_try_dir(p, len, soname, origin, s->resolved,
+                          sizeof(s->resolved), s->expanded,
+                          sizeof(s->expanded)) &&
+        !ct_dlopen_has_other_elf_class(s->resolved))
       return 1;
     if (!sep) break;
     p = sep + 1;
@@ -2307,10 +2324,36 @@ static int ct_dlopen_search_list(const char *list, const char *soname,
   return 0;
 }
 
+/* Scratch for one resolution, or NULL when `path` needs none (absolute or
+   relative-with-slash, which the loader opens as given) or when the
+   allocation fails. In the failure case the resolver returns `path`
+   unchanged, i.e. the loader searches with its own rules (this library's
+   RUNPATH instead of the caller's) — only under memory exhaustion, in which
+   case the dlopen that follows is unlikely to succeed either. The caller
+   frees it with ct_dlopen_scratch_free AFTER the real loader call, because
+   `resolved` is the path that call consumes.
+
+   malloc here goes to glibc's own heap (linux_private_heap.c wraps this
+   DSO's malloc/free), is per call and is freed on the same thread before the
+   hook returns, so there is no shared buffer a nested or concurrent dlopen
+   could clobber. */
+static ct_dlopen_scratch *ct_dlopen_scratch_new(const char *path) {
+  if (path == NULL || strchr(path, '/') != NULL) return NULL;
+  return (ct_dlopen_scratch *)malloc(sizeof(ct_dlopen_scratch));
+}
+
+static void ct_dlopen_scratch_free(ct_dlopen_scratch *s) {
+  int saved_errno = errno; /* dlopen/dlerror state must survive the free */
+  free(s);
+  errno = saved_errno;
+}
+
+/* Returns `path` itself, or `s->resolved` holding the caller-relative
+   resolution. */
 const char *ct_linux_preload_resolve_dlopen_caller_path(const char *path,
-                                                        void *caller) {
-  static __thread char resolved[PATH_MAX];
-  if (path == NULL || strchr(path, '/') != NULL || caller == NULL)
+                                                        void *caller,
+                                                        ct_dlopen_scratch *s) {
+  if (path == NULL || strchr(path, '/') != NULL || caller == NULL || s == NULL)
     return path;
   /* Suppress our own interposed hooks (getenv/access/readlink) during
      resolution so it neither recurses nor records spurious dependencies. */
@@ -2320,23 +2363,22 @@ const char *ct_linux_preload_resolve_dlopen_caller_path(const char *path,
   struct link_map *lm = NULL;
   if (dladdr1(caller, &info, (void **)&lm, RTLD_DL_LINKMAP) != 0 &&
       lm != NULL) {
-    char origin[PATH_MAX];
-    if (!ct_dlopen_origin_dir(lm, origin, sizeof(origin)))
-      origin[0] = '\0';
+    if (!ct_dlopen_origin_dir(lm, s->origin, sizeof(s->origin), s->exe,
+                              sizeof(s->exe)))
+      s->origin[0] = '\0';
     const char *rpath = NULL;
     const char *runpath = NULL;
     ct_dlopen_dyn_paths(lm, &rpath, &runpath);
     /* glibc honors DT_RPATH only when DT_RUNPATH is absent. */
     if (runpath == NULL && rpath != NULL &&
-        ct_dlopen_search_list(rpath, path, origin, resolved, sizeof(resolved)))
-      out = resolved;
-    else if (ct_dlopen_search_list(getenv("LD_LIBRARY_PATH"), path, origin,
-                                   resolved, sizeof(resolved)))
-      out = resolved;
+        ct_dlopen_search_list(rpath, path, s->origin, s))
+      out = s->resolved;
+    else if (ct_dlopen_search_list(getenv("LD_LIBRARY_PATH"), path, s->origin,
+                                   s))
+      out = s->resolved;
     else if (runpath != NULL &&
-             ct_dlopen_search_list(runpath, path, origin, resolved,
-                                   sizeof(resolved)))
-      out = resolved;
+             ct_dlopen_search_list(runpath, path, s->origin, s))
+      out = s->resolved;
   }
   stackable_linux_preload_exit_hook();
   return out;
@@ -2547,7 +2589,11 @@ int ct_linux_library_scan(ct_ll_sink_fn sink, char *reason,
    * environment values or captured file contents. Keep writes outside hooks. */
   const char *debug_scan = secure_getenv("IO_MON_DIAGNOSTIC_LIBRARY_SCAN");
   if (debug_scan != NULL && strcmp(debug_scan, "1") == 0) {
-    char line[4096];
+    /* static, not a stack array: even an untaken branch's array is part of
+       this function's frame, and scans run in the dlopen hook on the host's
+       thread. Scans are serialised by the caller's lock, so one buffer is
+       never in use twice. */
+    static char line[4096];
     Dl_info self;
     const char *image = dladdr((void *)ct_linux_library_scan, &self)
                           ? self.dli_fname : "unknown";
@@ -3122,21 +3168,33 @@ void *dlopen(const char *path, int flags) {
   /* Transparency: resolve a bare soname against the ORIGINAL caller's
      RPATH/RUNPATH (not the shim's) before the real dlopen. See
      ct_linux_preload_resolve_dlopen_caller_path. */
+  ct_dlopen_scratch *scratch = ct_dlopen_scratch_new(path);
   const char *rp = ct_linux_preload_resolve_dlopen_caller_path(
-      path, __builtin_return_address(0));
+      path, __builtin_return_address(0), scratch);
+  void *handle;
   if (CT_BYPASS() || ct_dlopen_hook == NULL)
-    return ct_linux_preload_real_dlopen((char *)rp, flags);
-  return CT_CALL_HOOK(ct_dlopen_hook((char *)rp, flags));
+    handle = ct_linux_preload_real_dlopen((char *)rp, flags);
+  else
+    handle = CT_CALL_HOOK(ct_dlopen_hook((char *)rp, flags));
+  ct_dlopen_scratch_free(scratch);
+  return handle;
 }
 
 void *dlmopen(Lmid_t namespace_id, const char *path, int flags)
     __attribute__((visibility("default")));
 void *dlmopen(Lmid_t namespace_id, const char *path, int flags) {
+  ct_dlopen_scratch *scratch = ct_dlopen_scratch_new(path);
   const char *rp = ct_linux_preload_resolve_dlopen_caller_path(
-      path, __builtin_return_address(0));
+      path, __builtin_return_address(0), scratch);
+  void *handle;
   if (CT_BYPASS() || ct_dlmopen_hook == NULL)
-    return ct_linux_preload_real_dlmopen((long)namespace_id, (char *)rp, flags);
-  return CT_CALL_HOOK(ct_dlmopen_hook((long)namespace_id, (char *)rp, flags));
+    handle = ct_linux_preload_real_dlmopen((long)namespace_id, (char *)rp,
+                                           flags);
+  else
+    handle = CT_CALL_HOOK(ct_dlmopen_hook((long)namespace_id, (char *)rp,
+                                          flags));
+  ct_dlopen_scratch_free(scratch);
+  return handle;
 }
 
 void *ct_linux_preload_public_dlsym(void *handle, const char *name)
@@ -4047,6 +4105,21 @@ var
   # never a crash and never a false dependency.
   anonymousExecutableRanges: array[anonymousRangeCap, AnonymousExecutableRange]
   anonymousExecutableRangeCount: int = 0
+  anonymousRangeScratch: array[anonymousRangeCap, AnonymousExecutableRange]
+    ## Working space for `removeAnonymousPrivateRange` (the compacted table)
+    ## and `rangeFullyTrackedLocked` (the sorted intersections). Both used to
+    ## declare this 64 KiB array ON THE STACK — inside the munmap / mprotect /
+    ## mremap hooks of whatever host thread made the call — so any monitored
+    ## thread with a stack of 64 KiB or less died with SIGSEGV on its first
+    ## munmap (`tests/linux/test_io_mon_shim_static_tls_small_stack_threads`).
+    ##
+    ## A process global (BSS, not TLS: TLS would put it back on every
+    ## thread's stack) is safe because it is touched ONLY while
+    ## `anonymousRangeLock` is held, and each user finishes with it before
+    ## releasing the lock. The lock is not recursive and neither user calls
+    ## the other or anything that re-acquires it, so the two can never be live
+    ## at once on any thread: a nested hook on the same thread would already
+    ## deadlock on the lock before it could reach the buffer.
 
 initLock(anonymousRangeLock)
 
@@ -4403,6 +4476,13 @@ proc rawSyscallEventAt*(index: int):
       0.clong, 0.clong, 0.cint, 0'u)
   (true, number, a1, a2, a3, a4, a5, a6, callResult, source, uint(address))
 
+proc c_calloc(count, size: csize_t): pointer
+  {.importc: "calloc", header: "<stdlib.h>", raises: [].}
+proc c_free(p: pointer) {.importc: "free", header: "<stdlib.h>", raises: [].}
+  # The C heap directly (in the shim, glibc's own heap past any allocator the
+  # host interposes — see `shim/linux_private_heap.c`), for scratch that is
+  # allocated and freed within one hook call.
+
 proc rangesIntersect(aStart, aStop, bStart, bStop: uint): bool {.inline, raises: [].} =
   aStart < bStop and bStart < aStop
 
@@ -4453,10 +4533,11 @@ proc removeAnonymousPrivateRange*(address: pointer; length: csize_t) {.raises: [
     return
   acquire(anonymousRangeLock)
   try:
-    # FUP-C — compact into a stack-local fixed array (no heap allocation) and
-    # copy back. A range that straddles the removed interval can split into two
-    # halves, so an over-cap output is truncated (safe: only under-reports).
-    var updated: array[anonymousRangeCap, AnonymousExecutableRange]
+    # FUP-C — compact into a fixed array (no heap allocation) and copy back. A
+    # range that straddles the removed interval can split into two halves, so
+    # an over-cap output is truncated (safe: only under-reports). The array is
+    # the lock-guarded `anonymousRangeScratch`, not a 64 KiB stack local.
+    template updated: untyped = anonymousRangeScratch
     var updatedCount = 0
     template pushRange(r: AnonymousExecutableRange) =
       if updatedCount < anonymousRangeCap:
@@ -4484,11 +4565,12 @@ proc removeAnonymousPrivateRange*(address: pointer; length: csize_t) {.raises: [
 proc rangeFullyTrackedLocked(start, stop: uint): bool {.raises: [].} =
   if stop <= start:
     return false
-  # FUP-C — collect intersections into a stack-local fixed array (no heap
-  # allocation) and insertion-sort by start. Over-cap intersections are
-  # ignored; the coverage check then conservatively returns "not fully
-  # tracked" for that range, which is the safe direction.
-  var intersections: array[anonymousRangeCap, AnonymousExecutableRange]
+  # FUP-C — collect intersections into a fixed array (no heap allocation) and
+  # insertion-sort by start. Over-cap intersections are ignored; the coverage
+  # check then conservatively returns "not fully tracked" for that range,
+  # which is the safe direction. The caller holds `anonymousRangeLock`, which
+  # is what makes the shared `anonymousRangeScratch` usable here (see it).
+  template intersections: untyped = anonymousRangeScratch
   var intersectionCount = 0
   for idx in 0 ..< anonymousExecutableRangeCount:
     let tracked = anonymousExecutableRanges[idx]
@@ -4781,24 +4863,72 @@ proc scanInlineSyscallPatchesForTrackedMprotectRange*(start: pointer;
     return status
   let requestedStart = cast[uint](start)
   let requestedStop = requestedStart + uint(length)
-  # FUP-C — snapshot the intersecting tracked ranges into a stack-local fixed
-  # array under the lock (no heap allocation), then release the lock before
-  # the (potentially slow, procfs-reading) mapping enumeration + patch loop.
-  var tracked: array[anonymousRangeCap, AnonymousExecutableRange]
-  var trackedCount = 0
+  # FUP-C — snapshot the intersecting tracked ranges under the lock, then
+  # release the lock before the (potentially slow, procfs-reading) mapping
+  # enumeration + patch loop.
+  #
+  # The snapshot used to be a 64 KiB stack array, which overflowed any host
+  # thread with a stack of 64 KiB or less inside its mprotect hook. It cannot
+  # use the lock-guarded `anonymousRangeScratch` either, because it must
+  # outlive the lock. So it is sized exactly and taken from the C heap:
+  # count under the lock, allocate OUTSIDE it (an allocation can mmap, and the
+  # mmap hook takes `anonymousRangeLock`), then fill under the lock again.
+  #
+  # The table may change in between, and the snapshot must still be ONE
+  # consistent view of it: a concurrent munmap of the middle of a tracked
+  # range splits it in two, so the count can GROW with no new mmap behind it,
+  # and a fill capped at the old count would silently skip the second half of
+  # a range this mprotect made executable. So the fill re-counts under the
+  # lock and, when the allocation is too small, retries with the new count. A
+  # table that keeps outgrowing the allocation (or an allocation failure) is
+  # reported as a scan failure for this call (the caller records the loss)
+  # without poisoning the cached status for later calls. This path already
+  # allocates (`enumerateLinuxExecutableMappings` returns a seq), so the heap
+  # adds no new hazard.
+  const maxSnapshotAttempts = 4
+  var wanted = 0
   acquire(anonymousRangeLock)
   try:
     for idx in 0 ..< anonymousExecutableRangeCount:
       let r = anonymousExecutableRanges[idx]
       if rangesIntersect(requestedStart, requestedStop, r.start, r.stop):
-        if trackedCount >= anonymousRangeCap:
-          break
-        tracked[trackedCount] = AnonymousExecutableRange(
-          start: max(requestedStart, r.start),
-          stop: min(requestedStop, r.stop))
-        inc trackedCount
+        inc wanted
   finally:
     release(anonymousRangeLock)
+  if wanted == 0:
+    return status
+  var tracked: ptr UncheckedArray[AnonymousExecutableRange] = nil
+  var trackedCount = 0
+  for _ in 0 ..< maxSnapshotAttempts:
+    tracked = cast[ptr UncheckedArray[AnonymousExecutableRange]](
+      c_calloc(csize_t(wanted), csize_t(sizeof(AnonymousExecutableRange))))
+    if tracked == nil:
+      break
+    var present = 0
+    trackedCount = 0
+    acquire(anonymousRangeLock)
+    try:
+      for idx in 0 ..< anonymousExecutableRangeCount:
+        let r = anonymousExecutableRanges[idx]
+        if rangesIntersect(requestedStart, requestedStop, r.start, r.stop):
+          if present < wanted:
+            tracked[present] = AnonymousExecutableRange(
+              start: max(requestedStart, r.start),
+              stop: min(requestedStop, r.stop))
+          inc present
+    finally:
+      release(anonymousRangeLock)
+    if present <= wanted:
+      trackedCount = present
+      break
+    # Outgrown since the count: free, resize, and take the snapshot again.
+    c_free(tracked)
+    tracked = nil
+    wanted = present
+  if tracked == nil:
+    status.scanDiagnostic = lrsInvalidArgument
+    return status
+  defer: c_free(tracked)
   if trackedCount == 0:
     return status
   let mappings =
