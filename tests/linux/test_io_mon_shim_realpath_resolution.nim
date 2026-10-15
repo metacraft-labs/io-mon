@@ -25,6 +25,19 @@
 ## realdir/f, realdir/flink, realdir/nolink), an ABSENT probe of `missing`
 ## and of `realdir/nolink`, and no probe claiming either exists.
 ##
+## It must also hold a probe of each DIRECTORY walked through on the way
+## (realdir, realdir/sub), and readlink's own link with its target
+## (realdir/flink -> f).
+##
+## `t_resolution_evidence_moves_when_the_answer_does` grades the two
+## transitions that evidence exists for. A directory on a resolved path
+## replaced by a link to another directory holding the same names leaves
+## every name reached through it present, yet realpath answers differently;
+## a link retargeted at another file leaves the link present, yet readlink
+## answers differently. The first capture must already name the directory
+## and the link's target, or a consumer has nothing to re-check, and the
+## second capture must record what changed.
+##
 ## Mocks: none. Real program, real shim, real symbolic links.
 
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
@@ -80,8 +93,78 @@ int main(int argc, char **argv) {
 }
 """
 
+const answerHostSource = """
+#define _GNU_SOURCE
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+  if (argc < 2) return 2;
+  char path[PATH_MAX], out[PATH_MAX];
+  snprintf(path, sizeof path, "%s/plain/f", argv[1]);
+  char *r = realpath(path, out);
+  printf("plain/f -> %s\n", r ? r : "(null)");
+  snprintf(path, sizeof path, "%s/lnk", argv[1]);
+  ssize_t n = readlink(path, out, sizeof out - 1);
+  if (n >= 0) out[n] = '\0';
+  printf("lnk -> %s\n", n >= 0 ? out : "(error)");
+  return 0;
+}
+"""
+
 proc probes(dep: MonitorDepFile; path: string): seq[MonitorRecord] =
   dep.records.filterIt(it.kind == mrPathProbe and it.path == path)
+
+proc linkRecorded(dep: MonitorDepFile; path, target: string): bool =
+  # The writer appends its own tokens (run=...) after the shim's detail.
+  let detail = "symlink target=" & target
+  probes(dep, path).anyIt(
+    it.detail == detail or it.detail.startsWith(detail & " "))
+
+proc recordedAsNonLink(dep: MonitorDepFile; path: string): bool =
+  let found = probes(dep, path)
+  found.len > 0 and found.allIt(it.probeResult != prAbsent and
+    not it.detail.startsWith("symlink target="))
+
+type Harness = object
+  work, snoopBin: string
+  env: StringTableRef
+
+proc setUpHarness(tag: string): Harness =
+  result.work = expandFilename(getTempDir()) /
+    ("io-mon-" & tag & "-" & $getCurrentProcessId())
+  createDir(result.work)
+  let built = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
+  checkpoint(built.output)
+  doAssert built.code == 0
+  result.snoopBin = result.work / "io-mon"
+  let cli = run("nim", @[
+    "c", "--hints:off", "--warnings:off", "--threads:on",
+    "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+    "--out:" & result.snoopBin, snoopSrc])
+  checkpoint(cli.output)
+  doAssert cli.code == 0
+  result.env = newStringTable(modeCaseSensitive)
+  for k, v in envPairs(): result.env[k] = v
+  result.env.del("LD_PRELOAD")
+  result.env["REPRO_MONITOR_SHIM_LIB"] = findShimLibrary()
+
+proc compileHost(h: Harness; name, source: string): string =
+  result = h.work / name
+  writeFile(result & ".c", source)
+  let cc = run(getEnv("CC", "cc"), @[result & ".c", "-o", result])
+  checkpoint(cc.output)
+  doAssert cc.code == 0
+
+proc capture(h: Harness; depfile: string; args: seq[string]):
+    tuple[output: string; dep: MonitorDepFile] =
+  let cap = run(h.snoopBin, @["run", "--depfile", depfile, "--"] & args,
+    h.env)
+  checkpoint(cap.output)
+  doAssert cap.code == 0
+  (cap.output, readMonitorDepFile(depfile))
 
 suite "io-mon Linux shim: path resolution evidence":
   test "t_realpath_records_every_link_it_follows":
@@ -160,4 +243,44 @@ suite "io-mon Linux shim: path resolution evidence":
     check linkRecorded("deep", "realdir/sub")
     check probes(dep, tree / "realdir" / "f").anyIt(
       it.probeResult != prAbsent)
+    # The directories walked through are part of the answer too: had either
+    # been a link, realpath would have answered differently.
+    check dep.recordedAsNonLink(tree / "realdir")
+    check dep.recordedAsNonLink(tree / "realdir" / "sub")
+    # readlink's answer is the target of the link it reads.
+    check dep.linkRecorded(tree / "realdir" / "flink", "f")
     removeDir(work)
+
+  test "t_resolution_evidence_moves_when_the_answer_does":
+    let h = setUpHarness("resolution-moves")
+    let host = h.compileHost("answer_host", answerHostSource)
+    let tree = h.work / "tree"
+    createDir(tree / "plain")
+    createDir(tree / "other")
+    writeFile(tree / "plain" / "f", "same\n")
+    writeFile(tree / "other" / "f", "same\n")
+    writeFile(tree / "x", "same\n")
+    writeFile(tree / "y", "same\n")
+    createSymlink("x", tree / "lnk")
+
+    let first = h.capture(h.work / "first.iomon", @[host, tree])
+    check ("plain/f -> " & tree / "plain" / "f") in first.output
+    check "lnk -> x" in first.output
+    # What a consumer re-checks: the directory itself, and the link's target.
+    check first.dep.recordedAsNonLink(tree / "plain")
+    check first.dep.linkRecorded(tree / "lnk", "x")
+
+    # Same names, same bytes; different answers.
+    removeDir(tree / "plain")
+    createSymlink("other", tree / "plain")
+    removeFile(tree / "lnk")
+    createSymlink("y", tree / "lnk")
+
+    let second = h.capture(h.work / "second.iomon", @[host, tree])
+    check ("plain/f -> " & tree / "other" / "f") in second.output
+    check "lnk -> y" in second.output
+    check second.dep.linkRecorded(tree / "plain", "other")
+    check not second.dep.recordedAsNonLink(tree / "plain")
+    check second.dep.linkRecorded(tree / "lnk", "y")
+    check not second.dep.linkRecorded(tree / "lnk", "x")
+    removeDir(h.work)

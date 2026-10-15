@@ -3911,13 +3911,24 @@ proc pushResolutionComponents(pending: var seq[string]; spelled: string)
 proc repro_linux_observe_resolution(dirfd: cint; path: cstring;
                                     followFinal: cint) {.cdecl, raises: [].} =
   ## realpath, canonicalize_file_name and the readlink family resolve their
-  ## path inside libc, so no interposition sees the symbolic links on the way.
+  ## path inside libc, so no interposition sees the components on the way.
   ## Replay that resolution (unrecorded lstat/readlink) and record what it
-  ## depends on: each link met, as a probe whose detail carries its target,
-  ## and the path the walk ends at, as a probe (absent when it is). The final
-  ## component is followed only when `followFinal` is set (realpath); readlink
-  ## reads the link itself, so for it only the directories before the last
-  ## component are resolved. See path_resolution(7).
+  ## depends on, as probes:
+  ##
+  ## * each component walked through that is NOT a link. The answer depends
+  ##   on that too: a directory later replaced by a link to another directory
+  ##   holding the same names changes what realpath returns, while every
+  ##   name probed through it still exists. The consumer records the probe's
+  ##   state (`lstat`), which tells a directory from a link to one;
+  ## * each link met, with detail `symlink target=<target>`;
+  ## * where the walk stops: the first absent component, or the path it
+  ##   ends at once a link was followed (absent when it is);
+  ## * for the readlink family, the link it reads, with its target.
+  ##
+  ## The final component is followed only when `followFinal` is set
+  ## (realpath); readlink reads the link itself, so for it only the
+  ## directories before the last component are resolved. The root is not
+  ## recorded: it cannot be replaced. See path_resolution(7).
   if shouldBypass() or path == nil or path[0] == '\0':
     return
   ensureInitializedPreservingErrno()
@@ -3940,16 +3951,33 @@ proc repro_linux_observe_resolution(dirfd: cint; path: cstring;
     let candidate = resolved & "/" & component
     let isFinal = pending.len == 0
     if isFinal and followFinal == 0:
-      # readlink reads this name itself rather than following it.
+      # readlink reads this name itself rather than following it. What it
+      # returns is the link's target, so record that, the same way a link met
+      # on the way is recorded. A name that is not a link (EINVAL) or is
+      # absent is already the probe the caller's call produced.
+      if linuxLstatKind(cstring(candidate)) == 1:
+        let n = linuxRealReadlink(cstring(candidate), addr target[0],
+          csize_t(target.len - 1))
+        if n > 0:
+          var record = baseRecord(mrPathProbe, moPathProbe)
+          record.result = 0
+          record.probeResult = probeFromResult(0)
+          record.path = candidate
+          record.detail = "symlink target=" & target[0 ..< int(n)]
+          emitRecord(record)
       resolved = candidate
       break
     let kind = linuxLstatKind(cstring(candidate))
     if kind < 0:
       # The walk stops where realpath fails: this name is part of the answer.
-      if sawLink:
-        emitProbe(cstring(candidate), -1.cint)
+      emitProbe(cstring(candidate), -1.cint)
       return
     if kind == 0:
+      # Not a link. The final component of a realpath walk is recorded once,
+      # below or by the caller's own probe; a component on the way is
+      # recorded here.
+      if not isFinal:
+        emitProbe(cstring(candidate), 0.cint)
       resolved = candidate
       continue
     inc hops
