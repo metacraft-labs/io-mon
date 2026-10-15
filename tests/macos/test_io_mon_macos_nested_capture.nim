@@ -141,7 +141,7 @@ suite "macOS nested capture handoff":
     let root = currentSourcePath().parentDir.parentDir.parentDir
     let shim = buildPrivateMacosShim(root)
     let second = work / "inner-shim.dylib"
-    copyFile(shim, second)
+    copyMacosShimAsDistinctImage(shim, second)
 
     test "buffered write failure retains the pending loss marker":
       let nested = expandFilename(work) / "flush-failure"
@@ -198,6 +198,10 @@ suite "macOS nested capture handoff":
           check inner.completeness == mcComplete
           check not inner.records.anyIt(it.kind == mrLibraryLoad and
             it.path in [shim, second, expandFilename(shim), expandFilename(second)])
+          # Two ACTIVE shims in the reader would each record its start: one
+          # process-start per pid means the earlier shim stood down.
+          check inner.records.countIt(it.kind == mrProcessStart) ==
+            inner.records.filterIt(it.kind == mrProcessStart).mapIt(it.osPid).deduplicate.len
           if mode in ["interest", "clean-env", "three-level"]:
             check not inner.records.anyIt(it.kind == mrFileRead and it.path == nested / "inner-input")
             check inner.observedInterest == {ecAmbientReads}

@@ -125,7 +125,7 @@ int main(int argc, char **argv) {
     doAssert built.exitCode == 0, built.output
     let shim = buildPrivateMacosShim(root)
     let second = work / "second.dylib"
-    copyFile(shim, second)
+    copyMacosShimAsDistinctImage(shim, second)
 
     test "real variadic syscalls retain arguments, wide results and failure errno":
       for libraries in ["", shim]:

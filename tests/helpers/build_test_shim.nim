@@ -3,7 +3,7 @@
 ## Private outputs and compiler caches prevent one fixture's relink from
 ## removing a dylib another fixture is about to load. Exit cleanup removes
 ## only this process's temporary tree, after its test children have finished.
-import std/[exitprocs, os, osproc, strtabs, tempfiles]
+import std/[exitprocs, os, osproc, strtabs, strutils, tempfiles]
 
 var shimWork: string
 var shimBuiltToolsDir: string
@@ -41,3 +41,20 @@ proc buildPrivateMacosShim*(repoRoot: string;
 
 proc buildPrivateLinuxShim*(repoRoot: string): string =
   buildPrivateShim(repoRoot, "librepro_monitor_shim.so", "")
+
+proc copyMacosShimAsDistinctImage*(shim, dest: string) =
+  ## Copy `shim` to `dest` as a second, separately identified shim image, the
+  ## way two monitors meet in production (a development build outside, an
+  ## installed package inside). A plain byte copy keeps the original's install
+  ## name, and with it nested two-shim fixtures did not reproduce the two-shim
+  ## failure they exist for: every case passed at io-mon 6e7d2cf, where the
+  ## same fixture with a renamed copy fails. The copy therefore gets its own
+  ## install name, and the ad-hoc signature arm64 requires after the edit.
+  copyFile(shim, dest)
+  for cmd in ["install_name_tool -id " & quoteShell(dest) & " " & quoteShell(dest),
+              "codesign --force --sign - " & quoteShell(dest)]:
+    let (output, code) = execCmdEx(cmd)
+    doAssert code == 0, cmd & ": " & output
+  let (id, idCode) = execCmdEx("otool -D " & quoteShell(dest))
+  doAssert idCode == 0 and id.splitLines().len >= 2 and
+    id.splitLines()[1] == dest, "install name of " & dest & ": " & id
