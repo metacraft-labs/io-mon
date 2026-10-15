@@ -949,8 +949,8 @@ static void repro_linux_monitor_constructor(void) {
    * dlsym frees/allocates through the HOST's allocator, which the host may be
    * holding the lock of at that moment (PartitionAlloc's syscall(SYS_mprotect)
    * under its lock). See ct_linux_preload_prime_real_functions. The private
-   * heap (linux_private_heap.c) has already been resolved by its own
-   * priority-101 constructor. */
+   * heap (linux_private_heap.c) needs no resolution: it is the shim's own
+   * mmap-backed allocator, set up by its priority-101 constructor. */
   ct_linux_preload_prime_real_functions();
   repro_linux_resolve_libc_syscall();
   repro_linux_prepare_thread_exit_key();
@@ -1808,7 +1808,7 @@ proc hookScratchString(): string {.inline, raises: [].} =
   ##
   ## SAFE HERE. Every caller already builds Nim strings from the result, so the
   ## path allocates on the same thread either way (the shim's allocator is the
-  ## process C heap: `-d:useMalloc`, routed to glibc's own heap by
+  ## C heap: `-d:useMalloc`, routed to the shim's own mmap-backed heap by
   ## `linux_private_heap.c`). The string is a local, so it is neither shared
   ## with a nested hook nor live after the call returns.
   newString(4096)
@@ -3686,6 +3686,45 @@ proc repro_hook_fork*(ctx: var ForkContext) {.raises: [].} =
       sampleKillDiag("fork-child-multi")
   c_set_errno(savedErrno)
 
+proc repro_linux_raw_fork_sample(): cint {.cdecl, raises: [].} =
+  ## Before a raw fork-like system call (syscall(SYS_clone), ...): whether
+  ## this process is single-threaded, exactly as `repro_hook_fork` samples it.
+  if processIsSingleThreaded(): 1 else: 0
+
+proc repro_linux_raw_fork_child(parentSingleThreaded: cint)
+    {.cdecl, raises: [].} =
+  ## In the child of a raw fork-like system call, which ran no atfork
+  ## handlers. A multi-threaded parent may have held any shim lock at that
+  ## instant, so the child skips monitor bookkeeping until exec, as the child
+  ## of a libc fork does (`repro_hook_fork`); recording the clone itself
+  ## would otherwise wait on such a lock forever. A single-threaded parent's
+  ## child keeps recording, as before.
+  if parentSingleThreaded == 0:
+    inForkChild = true
+    sampleKillDiag("raw-fork-child-multi")
+
+proc ct_linux_preload_register_raw_fork(sample, child: pointer)
+  {.importc, cdecl, raises: [].}
+ct_linux_preload_register_raw_fork(cast[pointer](repro_linux_raw_fork_sample),
+  cast[pointer](repro_linux_raw_fork_child))
+
+proc repro_linux_exec_env_for(envp: cstringArray): cstringArray
+    {.cdecl, raises: [].} =
+  ## The environment the PATH-searching exec family passes to glibc's execvpe:
+  ## `envp` plus LD_PRELOAD and the next exec generation, exactly as the execve
+  ## hook prepares it. See `ct_linux_preload_exec_with_prepared_env`.
+  envWithExecGen(envp, currentExecGen + 1)
+
+proc repro_linux_exec_env_release(prepared, envp: cstringArray)
+    {.cdecl, raises: [].} =
+  ## The exec failed: free what `repro_linux_exec_env_for` allocated.
+  freeOwnedEnv(prepared, envp)
+
+proc ct_linux_preload_register_exec_env(prepare, release: pointer)
+  {.importc, cdecl, raises: [].}
+ct_linux_preload_register_exec_env(cast[pointer](repro_linux_exec_env_for),
+  cast[pointer](repro_linux_exec_env_release))
+
 proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
   sampleKillDiag("execve-enter")
   if shouldBypass():
@@ -3702,8 +3741,9 @@ proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
   # pid, so without a per-exec generation a same-image re-exec (the Nix
   # gcc/rustc bash-wrapper) would emit a byte-identical post-exec process-start
   # that the SET source-dedup collapses → execs>=starts → mrEventLoss →
-  # mcIncomplete. `envWithExecGen` also bumps our own `environ` so the
-  # PATH-searching exec family (execvp/execlp) propagates the generation too.
+  # mcIncomplete. The PATH-searching exec family (execvp/execlp/execvpe) gets
+  # the same prepared environment through `repro_linux_exec_env_for`; the
+  # process's own `environ` is never replaced.
   let routeStatus = childCaptureRouteStatus(ctx.envp)
   if routeStatus != 0:
     emitEventLoss("linux child capture route invalid code=" & $routeStatus)

@@ -997,15 +997,27 @@ static void ct_raw_owner_after_fork_child(void) {
   __atomic_store_n(&ct_raw_subscriber_lock, 0, __ATOMIC_RELAXED);
 }
 
+/* The shim's private heap (shim/linux_private_heap.c) reclaims class locks a
+ * raw fork child inherited from threads that do not exist in it. Weak: the
+ * heap is linked only into glibc shim builds. */
+extern void repro_linux_private_heap_after_raw_fork_child(void)
+    __attribute__((weak));
+
+static void ct_raw_fork_child_reset(void) {
+  ct_raw_owner_after_fork_child();
+  if (repro_linux_private_heap_after_raw_fork_child != NULL)
+    repro_linux_private_heap_after_raw_fork_child();
+}
+
 static void ct_raw_owner_after_raw_fork(long nr, long a1, long result) {
   if (result != 0) return;
 #ifdef SYS_fork
-  if (nr == SYS_fork) ct_raw_owner_after_fork_child();
+  if (nr == SYS_fork) ct_raw_fork_child_reset();
 #endif
 #ifdef SYS_clone
   /* CLONE_VM children share the live parent lock, not an abandoned copy. */
   if (nr == SYS_clone && (a1 & CLONE_VM) == 0)
-    ct_raw_owner_after_fork_child();
+    ct_raw_fork_child_reset();
 #endif
 #ifdef SYS_clone3
   if (nr == SYS_clone3 && a1 != 0) {
@@ -1013,7 +1025,7 @@ static void ct_raw_owner_after_raw_fork(long nr, long a1, long result) {
      * first field is the 64-bit flags word, in this inherited address space. */
     unsigned long long flags;
     memcpy(&flags, (void *)a1, sizeof(flags));
-    if ((flags & CLONE_VM) == 0) ct_raw_owner_after_fork_child();
+    if ((flags & CLONE_VM) == 0) ct_raw_fork_child_reset();
   }
 #endif
 }
@@ -1429,64 +1441,16 @@ seed_failure:
  * mcIncomplete for every Nix-toolchain build. The child reads this value in
  * its preload constructor and appends it to its own set-element identity.
  *
- * Also bumps the CURRENT process's own `environ` (ct_set_own_exec_gen) so the
- * PATH-searching exec family (execvp/execlp/execvpe), which hands off to
- * glibc's real_execvp AFTER this hook returns and propagates env through the
- * LIVE `environ` (NOT the array we return here), carries the same generation.
+ * It does NOT touch the process's own `environ`: the PATH-searching exec
+ * family is handed the array this returns instead (see
+ * ct_linux_preload_dispatch_execvp). A previous version bumped `environ` with
+ * an array from the shim's private heap, which handed the host an `environ`
+ * its own allocator never allocated.
  *
  * Returns a freshly malloc'd, NULL-terminated array (leaked into the exec —
  * the kernel reclaims the pages when the image is replaced) or the plain
  * preload array on allocation failure. A stale generation can only ever cause
  * an over-conservative mcIncomplete, never a false mcComplete. */
-/* Set REPRO_MONITOR_EXEC_GEN in this process's own `environ`, like
- * setenv(name, value, 1) — but without setenv.
- *
- * WHY. This runs inside the exec hooks, and setenv allocates the new entry and
- * array with the process's malloc — the HOST's, if it replaces malloc. A host
- * that execs from a child it created with a raw clone (no atfork handlers)
- * while another thread held its allocator lock — or that execs while holding
- * the lock itself — would wait on that lock forever (see
- * shim/linux_private_heap.c). Building the array from the shim's private heap
- * and assigning `environ` touches no host allocator. Assigning `environ` is
- * sanctioned by POSIX
- * (https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/V1_chap08.html),
- * and glibc's setenv/unsetenv cope with an `environ` they did not allocate:
- * they copy it rather than realloc it.
- *
- * The replaced array and entry are not freed: another thread may be reading
- * them (getenv takes no lock), the same reason glibc keeps superseded
- * environment strings. It happens once per exec call. On allocation failure
- * the environment is left alone; a stale generation can only cause an
- * over-conservative mcIncomplete, never a false mcComplete. */
-static void ct_set_own_exec_gen(const char *genValue) {
-  static const char key[] = "REPRO_MONITOR_EXEC_GEN=";
-  char **env = environ;
-  size_t total = 0, keep = 0, current = 0;
-  if (env != NULL)
-    for (; env[total] != NULL; ++total) {
-      if (!ct_starts_with(env[total], key)) ++keep;
-      else if (strcmp(env[total] + strlen(key), genValue) == 0) ++current;
-    }
-  /* Already exactly this generation (a retried exec, an execvp walking PATH):
-   * nothing to change, and nothing to leak. */
-  if (current == 1 && keep + 1 == total) return;
-  size_t entryLen = strlen(key) + strlen(genValue) + 1;
-  char *entry = (char *)malloc(entryLen);
-  char **fresh = (char **)malloc((keep + 2) * sizeof(char *));
-  if (entry == NULL || fresh == NULL) {
-    free(entry);
-    free(fresh);
-    return;
-  }
-  snprintf(entry, entryLen, "%s%s", key, genValue);
-  size_t j = 0;
-  for (size_t i = 0; i < total; ++i)
-    if (!ct_starts_with(env[i], key)) fresh[j++] = env[i];
-  fresh[j++] = entry;
-  fresh[j] = NULL;
-  environ = fresh;
-}
-
 char **ct_linux_preload_env_with_exec_gen(char *const envp[], long nextGen) {
   /* A newly declared public capture root has a distinct complete route and
    * an explicit zero incarnation. Do not carry its enclosing observer's exec
@@ -1575,8 +1539,6 @@ char **ct_linux_preload_env_with_exec_gen(char *const envp[], long nextGen) {
   if (genEntry == NULL || (existingPreload != NULL && preloadEntry == NULL)) {
     free(preloadEntry);
     free(genEntry);
-    /* Best-effort: still bump our own environ for the execvp family. */
-    ct_set_own_exec_gen(genValue);
     return prepared;
   }
 
@@ -1586,7 +1548,6 @@ char **ct_linux_preload_env_with_exec_gen(char *const envp[], long nextGen) {
   if (result == NULL) {
     free(preloadEntry);
     free(genEntry);
-    ct_set_own_exec_gen(genValue);
     return prepared;
   }
   ct_owned_env *owner = ct_env_owner(result);
@@ -1595,9 +1556,9 @@ char **ct_linux_preload_env_with_exec_gen(char *const envp[], long nextGen) {
   if (prepared != NULL && prepared != envp) owner->parent = prepared;
   int index = 0;
   if (source != NULL) {
-    /* Copy the kept entries (pointers into `source`) BEFORE the environ bump
-     * below replaces the `environ` ARRAY container when source == environ.
-     * The bump never frees the entry STRINGS copied here. */
+    /* Kept entries are borrowed pointers into `source`; only the entries
+     * this function allocated are owned (and freed by
+     * ct_linux_preload_free_owned_env if the exec fails). */
     for (char *const *it = source; *it != NULL; it++) {
       if (ct_starts_with(*it, "LD_PRELOAD=")) continue;
       if (ct_starts_with(*it, "REPRO_MONITOR_EXEC_GEN=")) continue;
@@ -1607,11 +1568,6 @@ char **ct_linux_preload_env_with_exec_gen(char *const envp[], long nextGen) {
   if (preloadEntry != NULL) result[index++] = preloadEntry;
   result[index++] = genEntry;
   result[index] = NULL;
-
-  /* Bump our OWN environ last (after `source` is fully consumed) so the
-   * PATH-searching exec family propagates the same generation, and any
-   * environ reallocation cannot dangle the `source` we just read. */
-  ct_set_own_exec_gen(genValue);
   return result;
 }
 
@@ -1928,11 +1884,50 @@ int ct_linux_preload_raw_owner_join(void *target) {
 #endif
 }
 
+/* A raw fork-like call (fork, or clone/clone3 without CLONE_VM) creates a
+ * process that runs no atfork handlers: it inherits every shim lock another
+ * thread held at that instant, and recording anything there can wait on such
+ * a lock forever. The libc fork hook samples whether the parent is
+ * single-threaded and, when it is not, makes the child skip monitor
+ * bookkeeping until exec (repro_hook_fork). These callbacks, registered by
+ * linux_preload.nim, give the raw path the same treatment. */
+typedef int (*ct_raw_fork_sample_fn)(void);
+typedef void (*ct_raw_fork_child_fn)(int parentSingleThreaded);
+static ct_raw_fork_sample_fn ct_raw_fork_sample = NULL;
+static ct_raw_fork_child_fn ct_raw_fork_child = NULL;
+void ct_linux_preload_register_raw_fork(ct_raw_fork_sample_fn sample,
+                                        ct_raw_fork_child_fn child) {
+  ct_raw_fork_sample = sample;
+  ct_raw_fork_child = child;
+}
+
+static int ct_raw_call_forks_process(long nr, long a1) {
+#ifdef SYS_fork
+  if (nr == SYS_fork) return 1;
+#endif
+#ifdef SYS_clone
+  if (nr == SYS_clone) return (a1 & CLONE_VM) == 0;
+#endif
+#ifdef SYS_clone3
+  if (nr == SYS_clone3 && a1 != 0) {
+    unsigned long long flags;
+    memcpy(&flags, (void *)a1, sizeof(flags));
+    return (flags & CLONE_VM) == 0;
+  }
+#endif
+  (void)a1;
+  return 0;
+}
+
 long ct_linux_preload_syscall_replacement(long nr, long a1, long a2, long a3,
                                           long a4, long a5, long a6) {
   int saved_errno = errno;
+  int forks = ct_raw_call_forks_process(nr, a1) && !CT_BYPASS() &&
+              ct_raw_fork_sample != NULL && ct_raw_fork_child != NULL;
+  int parent_single = forks ? CT_CALL_HOOK(ct_raw_fork_sample()) : 1;
   long result = ct_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
   ct_raw_owner_after_raw_fork(nr, a1, result);
+  if (forks && result == 0) ct_raw_fork_child(parent_single);
   ct_raw_syscall_hook_fn primary = __atomic_load_n(&ct_raw_syscall_hook, __ATOMIC_ACQUIRE);
   if (!CT_BYPASS() && primary != NULL) {
     CT_CALL_HOOK((primary(nr, a1, a2, a3, a4, a5, a6, result,
@@ -2418,8 +2413,8 @@ static int ct_dlopen_search_list(const char *list, const char *soname,
    frees it with ct_dlopen_scratch_free AFTER the real loader call, because
    `resolved` is the path that call consumes.
 
-   malloc here goes to glibc's own heap (linux_private_heap.c wraps this
-   DSO's malloc/free), is per call and is freed on the same thread before the
+   malloc here goes to the shim's private heap (linux_private_heap.c wraps
+   this DSO's malloc/free), is per call and is freed on the same thread before the
    hook returns, so there is no shared buffer a nested or concurrent dlopen
    could clobber. */
 static ct_dlopen_scratch *ct_dlopen_scratch_new(const char *path) {
@@ -2907,7 +2902,21 @@ pid_t ct_linux_preload_real_fork(void) {
   return real_fork_ptr();
 }
 
+/* Set while the PATH-searching exec family runs the execve hook for a file
+ * name without a slash. The hook records the exec and then calls the real
+ * execve on the path it was given; for such a name that would resolve it
+ * against the CURRENT DIRECTORY, which execvp never does (it searches PATH
+ * only), and would run `./name` when one exists. The leaf below fails that
+ * call with ENOENT instead, which is what it does whenever no `./name`
+ * exists, and glibc's execvpe then runs the PATH search. See
+ * ct_linux_preload_dispatch_execvp. */
+static __thread int ct_exec_announce_only = 0;
+
 int ct_linux_preload_real_execve(char *path, char **argv, char **envp) {
+  if (ct_exec_announce_only) {
+    errno = ENOENT;
+    return -1;
+  }
   CT_REAL("execve", real_execve_ptr, ct_execve_real_fn);
   return real_execve_ptr(path, argv, envp);
 }
@@ -3916,15 +3925,63 @@ int execle(const char *path, const char *arg, ...) {
  * jumps into the exec.  The child inherits LD_PRELOAD via `environ`
  * (which glibc's execvp propagates), so the shim reloads correctly in
  * the new image. */
+/* The shim's exec-environment preparation (registered by linux_preload.nim;
+ * NULL when this runtime is used without it): `envp` plus LD_PRELOAD and the
+ * next exec generation, from the shim's private heap; and its release when
+ * the exec fails. */
+typedef char **(*ct_exec_env_for_fn)(char *const envp[]);
+typedef void (*ct_exec_env_release_fn)(char **prepared, char *const envp[]);
+static ct_exec_env_for_fn ct_exec_env_for = NULL;
+static ct_exec_env_release_fn ct_exec_env_release = NULL;
+void ct_linux_preload_register_exec_env(ct_exec_env_for_fn prepare,
+                                        ct_exec_env_release_fn release) {
+  ct_exec_env_for = prepare;
+  ct_exec_env_release = release;
+}
+
+/* glibc's PATH-searching execvpe with the prepared environment. Bracketed so
+ * the internal execve() calls glibc makes per PATH candidate see CT_BYPASS()
+ * (M9.R.66.2) and so the preparation's own libc calls (getenv) are not
+ * recorded. The prepared array is the shim's and is freed by the shim if the
+ * exec fails; the host's `environ` is never replaced. */
+static int ct_linux_preload_exec_with_prepared_env(const char *file,
+                                                   char *const argv[],
+                                                   char *const envp[]) {
+  char **prepared = NULL;
+  if (ct_exec_env_for != NULL) {
+    stackable_linux_preload_enter_hook();
+    prepared = ct_exec_env_for(envp);
+    stackable_linux_preload_exit_hook();
+  }
+  char **use = prepared != NULL ? prepared : (char **)envp;
+  int rc = CT_CALL_EXEC_HOOK(ct_linux_preload_real_execvpe((char *)file,
+                                                          (char **)argv, use));
+  int saved_errno = errno;
+  if (prepared != NULL && ct_exec_env_release != NULL)
+    ct_exec_env_release(prepared, envp);
+  errno = saved_errno;
+  return rc;
+}
+
+/* Run the execve hook for a PATH-searching exec (it records the exec and
+ * flushes). Its own real execve runs only for a name containing a slash,
+ * which execvp also executes directly; see ct_exec_announce_only. */
+static void ct_announce_exec(char *file, char **argv, char **envp) {
+  int bare = file != NULL && strchr(file, '/') == NULL;
+  if (bare) ct_exec_announce_only = 1;
+  CT_CALL_EXEC_HOOK(ct_execve_hook(file, argv, envp));
+  ct_exec_announce_only = 0;
+}
+
 static int ct_linux_preload_dispatch_execvp(const char *file,
                                             char *const argv[]) {
   if (CT_BYPASS() || ct_execve_hook == NULL)
     return ct_linux_preload_real_execvp((char *)file, (char **)argv);
   /* Invoke the execve hook to emit mrProcessExec + flush the fragment
-   * slot's committed marker.  Its chained real-execve call will fail
-   * with ENOENT for the common `execvp("sh", argv)` case (relative
-   * name), which is fine — we then fall through to the real execvp
-   * so glibc's PATH search runs and jumps into the actual image.
+   * slot's committed marker.  For a name without a slash (the common
+   * `execvp("sh", argv)`) its chained real-execve call fails with ENOENT
+   * without reaching the kernel (ct_announce_exec), and we then fall
+   * through to glibc's execvpe, whose PATH search jumps into the image.
    * The bracket bookkeeping (enter_hook / exit_hook) is done by
    * CT_CALL_HOOK.
    *
@@ -3940,8 +3997,11 @@ static int ct_linux_preload_dispatch_execvp(const char *file,
    * real_execvp call so those internal execve interposers see
    * CT_BYPASS() and delegate straight to real_execve without
    * re-emitting the hook. */
-  CT_CALL_EXEC_HOOK(ct_execve_hook((char *)file, (char **)argv, environ));
-  return CT_CALL_EXEC_HOOK(ct_linux_preload_real_execvp((char *)file, (char **)argv));
+  ct_announce_exec((char *)file, (char **)argv, environ);
+  /* Hand glibc's PATH search the prepared environment (LD_PRELOAD plus the
+   * next REPRO_MONITOR_EXEC_GEN) explicitly through execvpe, rather than
+   * rewriting the process's `environ` for execvp to pick up. */
+  return ct_linux_preload_exec_with_prepared_env(file, argv, environ);
 }
 
 static int ct_linux_preload_dispatch_execvpe(const char *file,
@@ -3950,11 +4010,9 @@ static int ct_linux_preload_dispatch_execvpe(const char *file,
   if (CT_BYPASS() || ct_execve_hook == NULL)
     return ct_linux_preload_real_execvpe((char *)file, (char **)argv,
                                           (char **)envp);
-  CT_CALL_EXEC_HOOK(ct_execve_hook((char *)file, (char **)argv,
-                              (char **)envp));
+  ct_announce_exec((char *)file, (char **)argv, (char **)envp);
   /* M9.R.66.2: same PATH-lookup double-count guard as dispatch_execvp. */
-  return CT_CALL_EXEC_HOOK(ct_linux_preload_real_execvpe((char *)file, (char **)argv,
-                                          (char **)envp));
+  return ct_linux_preload_exec_with_prepared_env(file, argv, envp);
 }
 
 static int ct_linux_preload_dispatch_fexecve(int fd,
@@ -4955,8 +5013,8 @@ proc rawSyscallEventAt*(index: int):
 proc c_calloc(count, size: csize_t): pointer
   {.importc: "calloc", header: "<stdlib.h>", raises: [].}
 proc c_free(p: pointer) {.importc: "free", header: "<stdlib.h>", raises: [].}
-  # The C heap directly (in the shim, glibc's own heap past any allocator the
-  # host interposes — see `shim/linux_private_heap.c`), for scratch that is
+  # The C heap directly (in the shim, its own mmap-backed heap, never the
+  # host's allocator — see `shim/linux_private_heap.c`), for scratch that is
   # allocated and freed within one hook call.
 
 proc rangesIntersect(aStart, aStop, bStart, bStop: uint): bool {.inline, raises: [].} =

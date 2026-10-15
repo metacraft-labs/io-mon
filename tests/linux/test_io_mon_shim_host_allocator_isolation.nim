@@ -30,15 +30,39 @@
 ## `syscall(SYS_mprotect)`, `mprotect`, `mmap`/`munmap`, `clock_gettime`,
 ## `open`/`read`/`close`.
 ##
+## THE SECOND DEFECT. Resolving glibc's allocator inside libc.so.6 fixed
+## Chromium and broke bash. glibc's main arena grows with sbrk, and bash 5.2
+## built with its bundled malloc — the stdenv bash behind every nixpkgs
+## gcc-wrapper — owns the program break: it grows it with sbrk(n) and gives
+## its top block back with sbrk(-n), assuming nobody else moved it. With both
+## in one process `gcc --version` died with SIGSEGV in bash's
+## internal_malloc. The shim's heap is now its own allocator over mmap, and
+## the exec hooks no longer replace the host's `environ` with an array from
+## that heap (a host that manages `environ` with its own allocator, as bash
+## does, would free or realloc it). See `shim/linux_private_heap.c`.
+##
+## THE SECOND HOST. A C program whose allocator, like bash's, IS the program
+## break, and which checks what bash does not: before every sbrk it verifies
+## the break is where it left it (`HOST-BREAK-MOVED`, exit 98), and it refuses
+## to free or realloc a pointer it did not allocate (`HOST-FOREIGN-FREE`,
+## exit 99). It interleaves its own allocations with hooked calls, frees
+## what scandir and realpath(NULL) hand it, installs its own `environ`, and
+## in a forked child lets an execvp PATH search fail, reallocs `environ`
+## (bash's pattern), then execs a monitored child that reads a marker.
+##
 ## WHAT THIS TEST GRADES — on a debug and a release shim:
-##   1. `t_private_heap_binds_to_libc` — the entry point the shim's private
-##      heap allocates through lives in libc.so.6 (`dladdr` from inside the
-##      host), not in the executable that exports the same name.
-##   2. `t_host_allocator_lock_never_reentered` — the host completes, without
+##   1. `t_private_heap_is_the_shims_own` — the entry point the shim's private
+##      heap allocates through lives in the shim itself (`dladdr` from inside
+##      the host): neither the executable's allocator nor glibc's.
+##   2. `t_break_owning_host_keeps_its_break_and_its_pointers` — the second
+##      host completes without either detector firing, preloaded and under
+##      `io-mon run` on both transports; the depfiles are `mcComplete` and
+##      contain the child's marker read.
+##   3. `t_host_allocator_lock_never_reentered` — the host completes, without
 ##      re-entering its allocator, preloaded and under `io-mon run` on both
 ##      transports; the monitored depfiles are `mcComplete` and contain the
 ##      marker read every thread made while holding the lock.
-##   3. `t_every_real_function_slot_is_primed` — every lazily resolved libc
+##   4. `t_every_real_function_slot_is_primed` — every lazily resolved libc
 ##      entry point the hooks forward to is resolved by the constructor, so no
 ##      hook calls dlsym (which frees and allocates through the host's
 ##      allocator) on the host's time.
@@ -46,8 +70,9 @@
 ## different lock, a different thread) into a failure rather than a stuck
 ## suite.
 ##
-## Mocks: the host's allocator is a deliberately minimal stand-in for
-## PartitionAlloc/tcmalloc/jemalloc-style replacements. It is justified: the
+## Mocks: the hosts' allocators are deliberately minimal stand-ins for
+## PartitionAlloc/tcmalloc/jemalloc-style replacements and for bash's bundled
+## malloc. They are justified: the
 ## property under test is "the shim never calls the executable's allocator
 ## from hook context", and only an allocator the test controls can detect a
 ## re-entry and fail loudly instead of deadlocking. Everything else — the shim,
@@ -320,9 +345,211 @@ int main(int argc, char **argv) {
 }
 """
 
-proc libcBasename(path: string): bool =
-  ## `libc.so.6` (or another `libc.so.*` soname), wherever the loader found it.
-  path.extractFilename.startsWith("libc.so")
+const breakHostSource = """
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+/* A host allocator in the style of bash 5.2's bundled malloc
+ * (lib/malloc/malloc.c), which the nixpkgs stdenv bash behind every
+ * gcc-wrapper uses: the program break IS its heap. It grows it with sbrk(n)
+ * and, when the block at the top of what it last allocated is freed, gives it
+ * back with sbrk(-n) ("lesscore") -- assuming nobody else moved the break.
+ * bash does not check; this host does, so the class fails by name instead of
+ * as a SIGSEGV somewhere later:
+ *   HOST-BREAK-MOVED  someone else (the shim) grew or shrank the break;
+ *   HOST-FOREIGN-FREE the host was handed memory its allocator never made
+ *                     (e.g. an `environ` array from the shim's heap) and
+ *                     freed or realloc'd it. */
+static long raw3(long nr, long a, long b, long c) {
+#if defined(__x86_64__)
+  long ret;
+  __asm__ volatile("syscall" : "=a"(ret) : "a"(nr), "D"(a), "S"(b), "d"(c)
+                   : "rcx", "r11", "memory");
+  return ret;
+#elif defined(__aarch64__)
+  register long x8 __asm__("x8") = nr;
+  register long x0 __asm__("x0") = a;
+  register long x1 __asm__("x1") = b;
+  register long x2 __asm__("x2") = c;
+  __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "memory");
+  return x0;
+#endif
+}
+static void die(const char *what, const char *where, int code) {
+  raw3(SYS_write, 2, (long)what, (long)strlen(what));
+  raw3(SYS_write, 2, (long)where, (long)strlen(where));
+  raw3(SYS_write, 2, (long)"\n", 1);
+  raw3(SYS_exit_group, code, 0, 0);
+}
+
+#define MAGIC 0x6261736862726b20ULL   /* low bit clear: it carries ALIGNED */
+#define ALIGNED 0x1ULL
+typedef struct { uint64_t magic; uint64_t size; } hdr;   /* 16 bytes */
+static char *memtop;     /* where THIS allocator last left the break */
+
+static void check_break(const char *where) {
+  if (memtop != NULL && (char *)sbrk(0) != memtop)
+    die("HOST-BREAK-MOVED by someone else before ", where, 98);
+}
+static size_t block_bytes(size_t n) { return (sizeof(hdr) + n + 15) & ~(size_t)15; }
+
+void *malloc(size_t n) {
+  check_break("malloc");
+  size_t total = block_bytes(n);
+  char *p = sbrk((intptr_t)total);
+  if (p == (char *)-1) return NULL;
+  memtop = p + total;
+  hdr *h = (hdr *)p;
+  h->magic = MAGIC;
+  h->size = n;
+  return h + 1;
+}
+static hdr *header_of(void *ptr, const char *who) {
+  hdr *h = (hdr *)ptr - 1;
+  if ((h->magic & ~ALIGNED) != MAGIC)
+    die("HOST-FOREIGN-FREE in ", who, 99);
+  return h;
+}
+void free(void *ptr) {
+  if (ptr == NULL) return;
+  hdr *h = header_of(ptr, "free");
+  int aligned = (h->magic & ALIGNED) != 0;
+  size_t total = block_bytes(h->size);
+  h->magic = 0;
+  if (!aligned && (char *)h + total == memtop) {   /* bash's lesscore */
+    check_break("free (giving the top back)");
+    sbrk(-(intptr_t)total);
+    memtop = (char *)h;
+  }
+}
+void *calloc(size_t a, size_t b) {
+  if (b != 0 && a > SIZE_MAX / b) return NULL;
+  void *p = malloc(a * b);
+  if (p) memset(p, 0, a * b);
+  return p;
+}
+void *realloc(void *old, size_t n) {
+  if (old == NULL) return malloc(n);
+  hdr *h = header_of(old, "realloc");
+  void *p = malloc(n);
+  if (p) memcpy(p, old, h->size < n ? h->size : n);
+  free(old);
+  return p;
+}
+static void *aligned_block(size_t align, size_t n) {
+  if (align < 16) align = 16;
+  check_break("memalign");
+  size_t total = sizeof(hdr) + n + align;
+  char *p = sbrk((intptr_t)total);
+  if (p == (char *)-1) return NULL;
+  memtop = p + total;
+  uintptr_t user = ((uintptr_t)p + sizeof(hdr) + align - 1) & ~(uintptr_t)(align - 1);
+  hdr *h = (hdr *)user - 1;
+  h->magic = MAGIC | ALIGNED;
+  h->size = n;
+  return (void *)user;
+}
+void *memalign(size_t al, size_t n) { return aligned_block(al, n); }
+void *aligned_alloc(size_t al, size_t n) { return aligned_block(al, n); }
+int posix_memalign(void **out, size_t al, size_t n) {
+  void *p = aligned_block(al, n);
+  if (!p) return 12;
+  *out = p;
+  return 0;
+}
+void *valloc(size_t n) { return aligned_block(4096, n); }
+void *pvalloc(size_t n) { return aligned_block(4096, (n + 4095) & ~(size_t)4095); }
+size_t malloc_usable_size(void *p) { return p ? ((hdr *)p - 1)->size : 0; }
+
+extern char **environ;
+
+static long read_marker(const char *path) {
+  char buf[64];
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) return -1;
+  long n = read(fd, buf, sizeof(buf));
+  close(fd);
+  return n;
+}
+
+int main(int argc, char **argv) {
+  if (argc >= 3 && strcmp(argv[1], "child") == 0)
+    return read_marker(argv[2]) > 0 ? 0 : 20;
+  if (argc < 3) return 2;
+  const char *marker = argv[1], *dir = argv[2];
+  struct stat st;
+
+  /* Interleave the host's own allocations with hooked calls the shim
+   * records, freeing at the top so the lesscore path runs. */
+  for (int i = 0; i < 300; ++i) {
+    char *p = malloc((size_t)(i * 37) % 3000 + 1);
+    if (p == NULL) return 3;
+    p[0] = 1;
+    if (read_marker(marker) <= 0) return 4;
+    if (stat(dir, &st) != 0) return 5;
+    free(p);
+  }
+
+  /* Memory the hooked libc APIs hand back is the host's to free. */
+  struct dirent **list;
+  int n = scandir(dir, &list, NULL, alphasort);
+  if (n < 0) return 6;
+  for (int i = 0; i < n; ++i) free(list[i]);
+  free(list);
+  char *rp = realpath(marker, NULL);
+  if (rp == NULL) return 7;
+  free(rp);
+  DIR *d = opendir(dir);
+  if (d == NULL || readdir(d) == NULL) return 8;
+  closedir(d);
+
+  /* bash's way with environ: its own array from its own malloc. */
+  char **original_environ = environ;
+  size_t count = 0;
+  while (environ[count] != NULL) count++;
+  char **own = malloc((count + 2) * sizeof(char *));
+  if (own == NULL) return 9;
+  memcpy(own, environ, count * sizeof(char *));
+  own[count] = "HOST_OWNED_ENVIRON=1";
+  own[count + 1] = NULL;
+  environ = own;
+
+  pid_t pid = fork();
+  if (pid < 0) return 10;
+  if (pid == 0) {
+    /* A PATH search that fails leaves this process running with whatever
+     * the exec path did to environ; the host then manages it again. */
+    char *none[] = {"io-mon-no-such-program", NULL};
+    execvp(none[0], none);
+    char **grown = realloc(environ, (count + 3) * sizeof(char *));
+    if (grown == NULL) _exit(11);
+    environ = grown;
+    char *again[] = {argv[0], "child", (char *)marker, NULL};
+    execvp(argv[0], again);
+    _exit(12);
+  }
+  int status = 0;
+  if (waitpid(pid, &status, 0) != pid) return 13;
+  if (!WIFEXITED(status)) return 14;
+  if (WEXITSTATUS(status) != 0) return 100 + WEXITSTATUS(status);
+  environ = original_environ;   /* never leave environ dangling */
+  free(own);
+  printf("host done\n");
+  return 0;
+}
+"""
+
+proc shimBasename(path: string): bool =
+  path.extractFilename == "librepro_monitor_shim.so"
 
 proc hostLine(output, key: string): string =
   for line in output.splitLines():
@@ -356,7 +583,7 @@ suite "io-mon shim never re-enters the host's allocator":
     check "host shim-loaded=0" in bare.output
     check "host done reads=5 of 5" in bare.output
 
-  test "t_private_heap_binds_to_libc":
+  test "t_private_heap_is_the_shims_own":
     for (mode, shimLib) in shims:
       var env = baseEnv()
       env["LD_PRELOAD"] = shimLib
@@ -365,9 +592,58 @@ suite "io-mon shim never re-enters the host's allocator":
       check "host shim-loaded=1" in r.output
       let heap = privateHeap(r.output)
       checkpoint(mode & ": the shim's private heap allocates through " & heap &
-        "; it must be glibc's libc.so.6, not the executable that exports " &
-        "the same __libc_malloc name")
-      check libcBasename(heap)
+        "; it must be the shim's own allocator — neither the executable's, " &
+        "which exports the same names, nor glibc's, whose main arena shares " &
+        "the program break with sbrk-based host allocators")
+      check shimBasename(heap)
+
+  test "t_break_owning_host_keeps_its_break_and_its_pointers":
+    # The bash class: a host whose allocator owns the program break and
+    # frees what the hooked libc APIs (and `environ`) hand it. The shim must
+    # neither move the break nor give the host memory from its own heap.
+    let snoopBin = ensureSnoop(work)
+    let breakHost = buildC(work, "break_host", breakHostSource, @["-O1"])
+    let dir = work / "break-host-dir"
+    createDir(dir)
+    writeFile(dir / "a.txt", "a")
+    writeFile(dir / "b.txt", "b")
+    let bare = runHost(@[breakHost, marker, dir], baseEnv())
+    checkpoint("without shim (exit " & $bare.code & "):\n" & bare.output)
+    check bare.code == 0
+    check "host done" in bare.output
+    for (mode, shimLib) in shims:
+      var preloadEnv = baseEnv()
+      preloadEnv["LD_PRELOAD"] = shimLib
+      let pre = runHost(@[breakHost, marker, dir], preloadEnv)
+      checkpoint(mode & ", LD_PRELOAD only (exit " & $pre.code & "):\n" &
+        pre.output)
+      check "HOST-BREAK-MOVED" notin pre.output
+      check "HOST-FOREIGN-FREE" notin pre.output
+      check pre.code == 0
+      for (transport, fileFallback) in [("shm set transport", false),
+                                        ("file transport", true)]:
+        let label = mode & ", monitored, " & transport
+        var env = baseEnv()
+        env["REPRO_MONITOR_SHIM_LIB"] = shimLib
+        if fileFallback:
+          env["REPRO_MONITOR_DEP_SHM_DISABLE"] = "1"
+        let depfile = work / ("break-host-" & mode & "-" & $fileFallback &
+          ".iomon")
+        let cap = runHost(@[snoopBin, "run", "--depfile", depfile, "--",
+          breakHost, marker, dir], env)
+        checkpoint(label & " (exit " & $cap.code & "):\n" & cap.output)
+        check "HOST-BREAK-MOVED" notin cap.output
+        check "HOST-FOREIGN-FREE" notin cap.output
+        check cap.code == 0
+        check "host done" in cap.output
+        if fileExists(depfile):
+          let dep = readMonitorDepFile(depfile)
+          checkpoint(label & ": completeness " & $dep.completeness & "; " &
+            $dep.records.filterIt(it.kind == mrEventLoss).mapIt(it.detail))
+          check dep.completeness == mcComplete
+          check dep.records.anyIt(it.kind == mrFileRead and marker in it.path)
+        else:
+          check fileExists(depfile)
 
   test "t_host_allocator_lock_never_reentered":
     let snoopBin = ensureSnoop(work)

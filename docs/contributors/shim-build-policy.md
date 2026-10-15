@@ -54,13 +54,20 @@ pointer through a test-only include immediately before and after vfork; this
 catches an abandoned frame even when later stack reuse does not crash. This is separate from allocation ownership and exception handling.
 
 On Linux/glibc, `-d:useMalloc` is paired with `ioMonGlibcPrivateHeap`. The
-shim's own malloc/calloc/realloc/free references are linked through private,
-hidden wrappers to glibc's allocator entry points. They do not resolve to an
-executable's replacement allocator. This retains process-lifetime ownership
-(including frees after the allocating host thread exits) without entering
-rustc's allocator from its clock hook. The wrappers do not interpose malloc
-for the host or change its allocation policy. Other platforms retain their
-existing allocation path.
+shim's own malloc/calloc/realloc/free references are linked (`--wrap`) to
+private, hidden wrappers over the shim's own allocator in
+`src/io_mon/shim/linux_private_heap.c`: size classes carved from anonymous
+`mmap` issued as raw system calls. It uses neither an executable's replacement
+allocator (rustc calls `clock_gettime` and Chromium's PartitionAlloc calls
+`syscall(SYS_mprotect)` under their allocator locks) nor glibc's (whose main
+arena grows the program break, which bash's bundled sbrk allocator assumes it
+owns). This retains process-lifetime ownership (including frees after the
+allocating host thread exits). The wrappers do not interpose malloc for the
+host or change its allocation policy. The allocator never waits forever: a call
+re-entered from a signal handler, or one facing a lock inherited from a thread
+that does not exist in the process, is served by its own mapping instead; see
+the file's header and `tests/linux/test_io_mon_shim_private_heap.nim`. Other
+platforms retain their existing allocation path.
 
 Linux builds also enable linker `--as-needed` before Nim's automatic system
 library arguments. The shim must not carry unused libc companion libraries:
@@ -87,7 +94,11 @@ This depends on an ownership boundary: only shim-owned pointers may reach the
 wrapped frees. The current callers are Nim's `useMalloc` runtime, the Linux POD
 tables, raw-syscall snapshots, and exec-environment construction. Each frees its
 own allocations. A future foreign API returning an allocated pointer must use
-that API's matching deallocator; it must not pass the pointer to the shim heap.
+that API's matching deallocator; it must not pass the pointer to the shim heap
+(the heap stops the process on a pointer it did not hand out). The boundary
+holds the other way too: shim-heap memory must never become the host's. Hooks
+return libc's own results untouched, and the exec hooks pass a prepared
+environment to the exec call instead of replacing the host's `environ`.
 
 We deliberately **keep `--exceptions:goto`** (the default) rather than
 `--exceptions:quirky`, even though `goto` injects the `nimInErrorMode` threadvar

@@ -464,8 +464,8 @@ proc c_free(p: pointer) {.importc: "free", header: "<stdlib.h>", raises: [].}
   # The C allocator directly, not Nim's: the block must not belong to a Nim
   # thread-local heap region (it can be reached from the process-exit sweep
   # on another thread), and in the Linux shim `calloc`/`free` are linked to
-  # glibc's own heap past any allocator the host interposes (see
-  # `shim/linux_private_heap.c`).
+  # the shim's own mmap-backed heap, which touches neither the host's
+  # allocator nor the program break (see `shim/linux_private_heap.c`).
 
 proc peekFragmentSlot(): ptr FragmentSlot {.inline, raises: [].} =
   ## The calling thread's slot, or nil when it has none yet (ELF arm only;
