@@ -884,6 +884,43 @@ static ct_fexecve_real_fn real_fexecve_ptr = NULL;
 static ct_posix_spawn_real_fn real_posix_spawn_ptr = NULL;
 static ct_posix_spawn_real_fn real_posix_spawnp_ptr = NULL;
 
+/* Entry points that are only OBSERVED (no hook chain): the real call runs,
+ * then one observer callback records what it means. See "OBSERVE-ONLY
+ * INTERPOSITIONS" below. */
+typedef int (*ct_access_real_fn)(const char *, int);
+typedef int (*ct_faccessat_real_fn)(int, const char *, int, int);
+typedef ssize_t (*ct_readlink_real_fn)(const char *, char *, size_t);
+typedef ssize_t (*ct_readlinkat_real_fn)(int, const char *, char *, size_t);
+typedef char *(*ct_realpath_real_fn)(const char *, char *);
+typedef int (*ct_scandir_real_fn)(const char *, void *, void *, void *);
+typedef DIR *(*ct_fdopendir_real_fn)(int);
+typedef int (*ct_statx_real_fn)(int, const char *, int, unsigned int, void *);
+typedef int (*ct_fstatat_real_fn)(int, const char *, void *, int);
+typedef int (*ct_pkey_mprotect_real_fn)(void *, size_t, int, int);
+typedef char *(*ct_realpath_chk_real_fn)(const char *, char *, size_t);
+typedef int (*ct_eventfd_real_fn)(unsigned int, int);
+typedef int (*ct_timerfd_create_real_fn)(int, int);
+typedef ssize_t (*ct_readlink_chk_real_fn)(const char *, char *, size_t, size_t);
+typedef ssize_t (*ct_readlinkat_chk_real_fn)(int, const char *, char *, size_t,
+                                             size_t);
+static ct_access_real_fn real_access_ptr = NULL;
+static ct_faccessat_real_fn real_faccessat_ptr = NULL;
+static ct_readlink_real_fn real_readlink_ptr = NULL;
+static ct_readlinkat_real_fn real_readlinkat_ptr = NULL;
+static ct_realpath_real_fn real_realpath_ptr = NULL;
+static ct_scandir_real_fn real_scandir_ptr = NULL;
+static ct_scandir_real_fn real_scandir64_ptr = NULL;
+static ct_fdopendir_real_fn real_fdopendir_ptr = NULL;
+static ct_statx_real_fn real_statx_ptr = NULL;
+static ct_fstatat_real_fn real_fstatat_ptr = NULL;
+static ct_fstatat_real_fn real_fstatat64_ptr = NULL;
+static ct_pkey_mprotect_real_fn real_pkey_mprotect_ptr = NULL;
+static ct_realpath_chk_real_fn real_realpath_chk_ptr = NULL;
+static ct_eventfd_real_fn real_eventfd_ptr = NULL;
+static ct_timerfd_create_real_fn real_timerfd_create_ptr = NULL;
+static ct_readlink_chk_real_fn real_readlink_chk_ptr = NULL;
+static ct_readlinkat_chk_real_fn real_readlinkat_chk_ptr = NULL;
+
 #define CT_INLINE_SYSCALL_SITE_CAP 4096
 static unsigned long ct_inline_syscall_sites[CT_INLINE_SYSCALL_SITE_CAP];
 static volatile sig_atomic_t ct_inline_syscall_site_count_value = 0;
@@ -1392,7 +1429,7 @@ seed_failure:
  * mcIncomplete for every Nix-toolchain build. The child reads this value in
  * its preload constructor and appends it to its own set-element identity.
  *
- * Also bumps the CURRENT process's own `environ` via setenv so the
+ * Also bumps the CURRENT process's own `environ` (ct_set_own_exec_gen) so the
  * PATH-searching exec family (execvp/execlp/execvpe), which hands off to
  * glibc's real_execvp AFTER this hook returns and propagates env through the
  * LIVE `environ` (NOT the array we return here), carries the same generation.
@@ -1401,6 +1438,55 @@ seed_failure:
  * the kernel reclaims the pages when the image is replaced) or the plain
  * preload array on allocation failure. A stale generation can only ever cause
  * an over-conservative mcIncomplete, never a false mcComplete. */
+/* Set REPRO_MONITOR_EXEC_GEN in this process's own `environ`, like
+ * setenv(name, value, 1) — but without setenv.
+ *
+ * WHY. This runs inside the exec hooks, and setenv allocates the new entry and
+ * array with the process's malloc — the HOST's, if it replaces malloc. A host
+ * that execs from a child it created with a raw clone (no atfork handlers)
+ * while another thread held its allocator lock — or that execs while holding
+ * the lock itself — would wait on that lock forever (see
+ * shim/linux_private_heap.c). Building the array from the shim's private heap
+ * and assigning `environ` touches no host allocator. Assigning `environ` is
+ * sanctioned by POSIX
+ * (https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/V1_chap08.html),
+ * and glibc's setenv/unsetenv cope with an `environ` they did not allocate:
+ * they copy it rather than realloc it.
+ *
+ * The replaced array and entry are not freed: another thread may be reading
+ * them (getenv takes no lock), the same reason glibc keeps superseded
+ * environment strings. It happens once per exec call. On allocation failure
+ * the environment is left alone; a stale generation can only cause an
+ * over-conservative mcIncomplete, never a false mcComplete. */
+static void ct_set_own_exec_gen(const char *genValue) {
+  static const char key[] = "REPRO_MONITOR_EXEC_GEN=";
+  char **env = environ;
+  size_t total = 0, keep = 0, current = 0;
+  if (env != NULL)
+    for (; env[total] != NULL; ++total) {
+      if (!ct_starts_with(env[total], key)) ++keep;
+      else if (strcmp(env[total] + strlen(key), genValue) == 0) ++current;
+    }
+  /* Already exactly this generation (a retried exec, an execvp walking PATH):
+   * nothing to change, and nothing to leak. */
+  if (current == 1 && keep + 1 == total) return;
+  size_t entryLen = strlen(key) + strlen(genValue) + 1;
+  char *entry = (char *)malloc(entryLen);
+  char **fresh = (char **)malloc((keep + 2) * sizeof(char *));
+  if (entry == NULL || fresh == NULL) {
+    free(entry);
+    free(fresh);
+    return;
+  }
+  snprintf(entry, entryLen, "%s%s", key, genValue);
+  size_t j = 0;
+  for (size_t i = 0; i < total; ++i)
+    if (!ct_starts_with(env[i], key)) fresh[j++] = env[i];
+  fresh[j++] = entry;
+  fresh[j] = NULL;
+  environ = fresh;
+}
+
 char **ct_linux_preload_env_with_exec_gen(char *const envp[], long nextGen) {
   /* A newly declared public capture root has a distinct complete route and
    * an explicit zero incarnation. Do not carry its enclosing observer's exec
@@ -1490,7 +1576,7 @@ char **ct_linux_preload_env_with_exec_gen(char *const envp[], long nextGen) {
     free(preloadEntry);
     free(genEntry);
     /* Best-effort: still bump our own environ for the execvp family. */
-    setenv("REPRO_MONITOR_EXEC_GEN", genValue, 1);
+    ct_set_own_exec_gen(genValue);
     return prepared;
   }
 
@@ -1500,7 +1586,7 @@ char **ct_linux_preload_env_with_exec_gen(char *const envp[], long nextGen) {
   if (result == NULL) {
     free(preloadEntry);
     free(genEntry);
-    setenv("REPRO_MONITOR_EXEC_GEN", genValue, 1);
+    ct_set_own_exec_gen(genValue);
     return prepared;
   }
   ct_owned_env *owner = ct_env_owner(result);
@@ -1509,10 +1595,9 @@ char **ct_linux_preload_env_with_exec_gen(char *const envp[], long nextGen) {
   if (prepared != NULL && prepared != envp) owner->parent = prepared;
   int index = 0;
   if (source != NULL) {
-    /* Copy the kept entries (pointers into `source`) BEFORE the setenv below,
-     * which may reallocate/free the `environ` ARRAY container when source ==
-     * environ. setenv never frees the individual entry STRINGS we copy here
-     * (and REPRO_MONITOR_EXEC_GEN, the only entry it may free, is skipped). */
+    /* Copy the kept entries (pointers into `source`) BEFORE the environ bump
+     * below replaces the `environ` ARRAY container when source == environ.
+     * The bump never frees the entry STRINGS copied here. */
     for (char *const *it = source; *it != NULL; it++) {
       if (ct_starts_with(*it, "LD_PRELOAD=")) continue;
       if (ct_starts_with(*it, "REPRO_MONITOR_EXEC_GEN=")) continue;
@@ -1526,7 +1611,7 @@ char **ct_linux_preload_env_with_exec_gen(char *const envp[], long nextGen) {
   /* Bump our OWN environ last (after `source` is fully consumed) so the
    * PATH-searching exec family propagates the same generation, and any
    * environ reallocation cannot dangle the `source` we just read. */
-  setenv("REPRO_MONITOR_EXEC_GEN", genValue, 1);
+  ct_set_own_exec_gen(genValue);
   return result;
 }
 
@@ -2856,6 +2941,119 @@ int ct_linux_preload_real_posix_spawnp(pid_t *pid, char *file,
   return real_posix_spawnp_ptr(pid, file, file_actions, attrp, argv, envp);
 }
 
+/* Resolve EVERY real_*_ptr slot now, from the shim's constructor, instead of
+ * on the first hooked call.
+ *
+ * WHY. Each slot is otherwise filled lazily by dlsym(RTLD_NEXT) the first
+ * time its hook runs — i.e. inside whatever the host was doing. dlsym is not
+ * allocation-free: glibc's _dlerror_run frees this thread's previous dlerror
+ * result through the process's free (the host's, if it replaces malloc), and a
+ * lookup that fails (__xstat on a modern glibc, arc4random on an old one)
+ * allocates its error string through the process's malloc. A host that makes
+ * its first mprotect or clock_gettime while holding its allocator lock — as
+ * PartitionAlloc does — then waits on that lock inside our dlsym. Resolving
+ * here, before any host code runs, leaves the hooks with nothing to resolve.
+ *
+ * The lazy paths stay as they are, as a fallback for a slot this list
+ * misses; tests/linux/test_io_mon_shim_host_allocator_isolation checks that
+ * every slot declared above is primed here. The fallback chains mirror the
+ * lazy ones exactly (pread64 -> pread, stat -> __xstat, ...). */
+#define CT_PRIME(slot, type, name) \
+  do { if ((slot) == NULL) (slot) = (type)ct_resolve(name); } while (0)
+void ct_linux_preload_prime_real_functions(void) {
+  CT_PRIME(real_open_ptr, ct_open_real_fn, "open");
+  CT_PRIME(real_open64_ptr, ct_open_real_fn, "open64");
+  CT_PRIME(real_open64_ptr, ct_open_real_fn, "open");
+  CT_PRIME(real_openat_ptr, ct_openat_real_fn, "openat");
+  CT_PRIME(real_openat64_ptr, ct_openat_real_fn, "openat64");
+  CT_PRIME(real_openat64_ptr, ct_openat_real_fn, "openat");
+  CT_PRIME(real_close_ptr, ct_close_real_fn, "close");
+  CT_PRIME(real_read_ptr, ct_read_real_fn, "read");
+  CT_PRIME(real_pread_ptr, ct_pread_real_fn, "pread");
+  CT_PRIME(real_pread64_ptr, ct_pread_real_fn, "pread64");
+  CT_PRIME(real_pread64_ptr, ct_pread_real_fn, "pread");
+  CT_PRIME(real_readv_ptr, ct_readv_real_fn, "readv");
+  CT_PRIME(real_preadv_ptr, ct_preadv_real_fn, "preadv");
+  CT_PRIME(real_preadv64_ptr, ct_preadv_real_fn, "preadv64");
+  CT_PRIME(real_preadv64_ptr, ct_preadv_real_fn, "preadv");
+  CT_PRIME(real_write_ptr, ct_write_real_fn, "write");
+  CT_PRIME(real_stat_ptr, ct_stat_real_fn, "stat");
+  if (real_stat_ptr == NULL)
+    CT_PRIME(real_xstat_ptr, ct_xstat_real_fn, "__xstat");
+  CT_PRIME(real_lstat_ptr, ct_stat_real_fn, "lstat");
+  if (real_lstat_ptr == NULL)
+    CT_PRIME(real_lxstat_ptr, ct_xstat_real_fn, "__lxstat");
+  CT_PRIME(real_opendir_ptr, ct_opendir_real_fn, "opendir");
+  CT_PRIME(real_readdir_ptr, ct_readdir_real_fn, "readdir");
+  CT_PRIME(real_closedir_ptr, ct_closedir_real_fn, "closedir");
+  CT_PRIME(real_fopen_ptr, ct_fopen_real_fn, "fopen");
+  CT_PRIME(real_fopen64_ptr, ct_fopen_real_fn, "fopen64");
+  CT_PRIME(real_fread_ptr, ct_fread_real_fn, "fread");
+  CT_PRIME(real_fclose_ptr, ct_fclose_real_fn, "fclose");
+  CT_PRIME(real_connect_ptr, ct_connect_real_fn, "connect");
+  CT_PRIME(real_pipe_ptr, ct_pipe_real_fn, "pipe");
+  CT_PRIME(real_pipe2_ptr, ct_pipe2_real_fn, "pipe2");
+  CT_PRIME(real_socketpair_ptr, ct_socketpair_real_fn, "socketpair");
+  CT_PRIME(real_sendfile_ptr, ct_sendfile_real_fn, "sendfile");
+  CT_PRIME(real_copy_file_range_ptr, ct_copy_file_range_real_fn,
+           "copy_file_range");
+  CT_PRIME(real_splice_ptr, ct_splice_real_fn, "splice");
+  CT_PRIME(real_link_ptr, ct_link_real_fn, "link");
+  CT_PRIME(real_linkat_ptr, ct_linkat_real_fn, "linkat");
+  CT_PRIME(real_rename_ptr, ct_rename_real_fn, "rename");
+  CT_PRIME(real_renameat_ptr, ct_renameat_real_fn, "renameat");
+  CT_PRIME(real_renameat2_ptr, ct_renameat2_real_fn, "renameat2");
+  CT_PRIME(real_dlopen_ptr, ct_dlopen_real_fn, "dlopen");
+  CT_PRIME(real_dlmopen_ptr, ct_dlmopen_real_fn, "dlmopen");
+  (void)ct_linux_preload_real_dlsym(RTLD_DEFAULT, "dlsym"); /* fills real_dlsym_ptr */
+  CT_PRIME(real_mmap_ptr, ct_mmap_real_fn, "mmap");
+  CT_PRIME(real_mprotect_ptr, ct_mprotect_real_fn, "mprotect");
+  CT_PRIME(real_munmap_ptr, ct_munmap_real_fn, "munmap");
+  CT_PRIME(real_mremap_ptr, ct_mremap_real_fn, "mremap");
+  CT_PRIME(real_getenv_ptr, ct_getenv_real_fn, "getenv");
+  CT_PRIME(real_uname_ptr, ct_uname_real_fn, "uname");
+  CT_PRIME(real_sysconf_ptr, ct_sysconf_real_fn, "sysconf");
+  CT_PRIME(real_clock_gettime_ptr, ct_clock_gettime_real_fn, "clock_gettime");
+  CT_PRIME(real_gettimeofday_ptr, ct_gettimeofday_real_fn, "gettimeofday");
+  CT_PRIME(real_time_ptr, ct_time_real_fn, "time");
+  CT_PRIME(real_getrandom_ptr, ct_getrandom_real_fn, "getrandom");
+  CT_PRIME(real_getentropy_ptr, ct_getentropy_real_fn, "getentropy");
+  CT_PRIME(real_arc4random_ptr, ct_arc4random_real_fn, "arc4random");
+  CT_PRIME(real_arc4random_buf_ptr, ct_arc4random_buf_real_fn, "arc4random_buf");
+  CT_PRIME(real_arc4random_uniform_ptr, ct_arc4random_uniform_real_fn,
+           "arc4random_uniform");
+  CT_PRIME(real_fork_ptr, ct_fork_real_fn, "fork");
+  CT_PRIME(real_execve_ptr, ct_execve_real_fn, "execve");
+  CT_PRIME(real_execvp_ptr, ct_execvp_real_fn, "execvp");
+  CT_PRIME(real_execvpe_ptr, ct_execvpe_real_fn, "execvpe");
+  CT_PRIME(real_fexecve_ptr, ct_fexecve_real_fn, "fexecve");
+  CT_PRIME(real_posix_spawn_ptr, ct_posix_spawn_real_fn, "posix_spawn");
+  CT_PRIME(real_posix_spawnp_ptr, ct_posix_spawn_real_fn, "posix_spawnp");
+  CT_PRIME(real_access_ptr, ct_access_real_fn, "access");
+  CT_PRIME(real_faccessat_ptr, ct_faccessat_real_fn, "faccessat");
+  CT_PRIME(real_readlink_ptr, ct_readlink_real_fn, "readlink");
+  CT_PRIME(real_readlinkat_ptr, ct_readlinkat_real_fn, "readlinkat");
+  CT_PRIME(real_realpath_ptr, ct_realpath_real_fn, "realpath");
+  CT_PRIME(real_scandir_ptr, ct_scandir_real_fn, "scandir");
+  CT_PRIME(real_scandir64_ptr, ct_scandir_real_fn, "scandir64");
+  CT_PRIME(real_fdopendir_ptr, ct_fdopendir_real_fn, "fdopendir");
+  CT_PRIME(real_statx_ptr, ct_statx_real_fn, "statx");
+  CT_PRIME(real_fstatat_ptr, ct_fstatat_real_fn, "fstatat");
+  CT_PRIME(real_fstatat64_ptr, ct_fstatat_real_fn, "fstatat64");
+  CT_PRIME(real_pkey_mprotect_ptr, ct_pkey_mprotect_real_fn, "pkey_mprotect");
+  CT_PRIME(real_realpath_chk_ptr, ct_realpath_chk_real_fn, "__realpath_chk");
+  CT_PRIME(real_eventfd_ptr, ct_eventfd_real_fn, "eventfd");
+  CT_PRIME(real_timerfd_create_ptr, ct_timerfd_create_real_fn, "timerfd_create");
+  CT_PRIME(real_readlink_chk_ptr, ct_readlink_chk_real_fn, "__readlink_chk");
+  CT_PRIME(real_readlinkat_chk_ptr, ct_readlinkat_chk_real_fn,
+           "__readlinkat_chk");
+  /* The lookups above that failed (symbols this glibc does not have) left
+   * an error on this thread; consume it so the host's next dlerror() does
+   * not report a lookup the shim made. */
+  (void)dlerror();
+}
+#undef CT_PRIME
+
 ssize_t read(int fd, void *buf, size_t count) __attribute__((visibility("default")));
 ssize_t read(int fd, void *buf, size_t count) {
   if (CT_BYPASS() || ct_read_hook == NULL)
@@ -3256,6 +3454,284 @@ void *mremap(void *old_addr, size_t old_size, size_t new_size, int flags, ...) {
   if (CT_BYPASS() || ct_mremap_hook == NULL)
     return ct_linux_preload_real_mremap(old_addr, old_size, new_size, flags, new_addr);
   return CT_CALL_HOOK(ct_mremap_hook(old_addr, old_size, new_size, flags, new_addr));
+}
+
+/* ---------------------------------------------------------------------------
+ * LARGE-FILE ALIASES AND OBSERVE-ONLY INTERPOSITIONS
+ *
+ * WHY. An LD_PRELOAD interposition only sees calls made through the symbol
+ * NAME it exports. Hosts import more names than the hook set covered: Node 24
+ * imports mmap64, stat64 and lstat64; its libuv imports scandir, access,
+ * readlink and realpath; Chromium also imports readdir64, fstatat64, statx
+ * and sendfile64. Measured with `nm -D --undefined-only` against the shim's
+ * exports on x86_64 glibc 2.42. A call through a name the shim does not
+ * export goes straight to libc and is invisible:
+ *   - V8 reserves its code range with mmap64, so the range never entered the
+ *     preload mmap lifecycle and V8's mprotect(PROT_EXEC) of it was reported
+ *     as an untracked executable mapping (a spurious mcIncomplete on every
+ *     Node run);
+ *   - worse, the reads behind fs.readdirSync (scandir), fs.existsSync
+ *     (access) or fs.realpathSync.native (realpath) were simply not recorded,
+ *     which can grade a run mcComplete with dependencies missing.
+ *
+ * LARGE-FILE ALIASES. On LP64 glibc each *64 function is the same function
+ * as its plain twin (off_t and struct stat are already 64-bit; glibc defines
+ * one as an alias of the other), so the shim exports the *64 names as
+ * aliases of its existing interpositions. The asm label gives the symbol its
+ * name without redeclaring the header's prototype.
+ *
+ * OBSERVE-ONLY. The other names need no hook chain: the real call runs
+ * unchanged, then one observer records what it means — a path probe, a
+ * directory enumeration, a DIR*-to-path association, or the mprotect
+ * lifecycle check. Observers are registered by the shim
+ * (ct_linux_preload_register_observers) and run inside the usual hook
+ * re-entrancy guard, with errno preserved.
+ * ------------------------------------------------------------------------- */
+#if defined(__LP64__) && defined(__GLIBC__)
+extern void *ct_mmap64_alias(void *, size_t, int, int, int, off_t)
+    __asm__("mmap64") __attribute__((alias("mmap"), visibility("default")));
+extern int ct_stat64_alias(const char *, struct stat *)
+    __asm__("stat64") __attribute__((alias("stat"), visibility("default")));
+extern int ct_lstat64_alias(const char *, struct stat *)
+    __asm__("lstat64") __attribute__((alias("lstat"), visibility("default")));
+extern struct dirent *ct_readdir64_alias(DIR *)
+    __asm__("readdir64") __attribute__((alias("readdir"), visibility("default")));
+extern ssize_t ct_sendfile64_alias(int, int, off_t *, size_t)
+    __asm__("sendfile64") __attribute__((alias("sendfile"), visibility("default")));
+#endif
+
+typedef void (*ct_probe_observer_fn)(int dirfd, const char *path, int rc);
+typedef void (*ct_enumerate_observer_fn)(int dirfd, const char *path, int rc);
+typedef void (*ct_fdopendir_observer_fn)(int fd, void *dirp);
+typedef void (*ct_mprotect_observer_fn)(void *addr, size_t len, int prot, int rc);
+typedef void (*ct_localfd_create_observer_fn)(int fd);
+static ct_probe_observer_fn ct_probe_observer = NULL;
+static ct_localfd_create_observer_fn ct_localfd_create_observer = NULL;
+static ct_enumerate_observer_fn ct_enumerate_observer = NULL;
+static ct_fdopendir_observer_fn ct_fdopendir_observer = NULL;
+static ct_mprotect_observer_fn ct_mprotect_observer = NULL;
+
+void ct_linux_preload_register_observers(ct_probe_observer_fn probe,
+                                         ct_enumerate_observer_fn enumerate,
+                                         ct_fdopendir_observer_fn fdopendir_fn,
+                                         ct_mprotect_observer_fn mprotect_fn,
+                                         ct_localfd_create_observer_fn create_fn) {
+  ct_localfd_create_observer = create_fn;
+  ct_probe_observer = probe;
+  ct_enumerate_observer = enumerate;
+  ct_fdopendir_observer = fdopendir_fn;
+  ct_mprotect_observer = mprotect_fn;
+}
+
+#define CT_OBSERVE(observer, ...) do { \
+  if (!CT_BYPASS() && (observer) != NULL) { \
+    int ct_saved_errno = errno; \
+    stackable_linux_preload_enter_hook(); \
+    (observer)(__VA_ARGS__); \
+    stackable_linux_preload_exit_hook(); \
+    errno = ct_saved_errno; \
+  } \
+} while (0)
+
+#define CT_OBSERVED_REAL(slot, type, name, fail) do { \
+  if ((slot) == NULL) (slot) = (type)ct_resolve(name); \
+  if ((slot) == NULL) { errno = ENOSYS; return fail; } \
+} while (0)
+
+int access(const char *path, int mode) __attribute__((visibility("default")));
+int access(const char *path, int mode) {
+  CT_OBSERVED_REAL(real_access_ptr, ct_access_real_fn, "access", -1);
+  int rc = real_access_ptr(path, mode);
+  CT_OBSERVE(ct_probe_observer, AT_FDCWD, path, rc);
+  return rc;
+}
+
+int faccessat(int dirfd, const char *path, int mode, int flags)
+    __attribute__((visibility("default")));
+int faccessat(int dirfd, const char *path, int mode, int flags) {
+  CT_OBSERVED_REAL(real_faccessat_ptr, ct_faccessat_real_fn, "faccessat", -1);
+  int rc = real_faccessat_ptr(dirfd, path, mode, flags);
+  CT_OBSERVE(ct_probe_observer, dirfd, path, rc);
+  return rc;
+}
+
+ssize_t readlink(const char *path, char *buf, size_t size)
+    __attribute__((visibility("default")));
+ssize_t readlink(const char *path, char *buf, size_t size) {
+  CT_OBSERVED_REAL(real_readlink_ptr, ct_readlink_real_fn, "readlink", -1);
+  ssize_t rc = real_readlink_ptr(path, buf, size);
+  CT_OBSERVE(ct_probe_observer, AT_FDCWD, path, rc < 0 ? -1 : 0);
+  return rc;
+}
+
+ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t size)
+    __attribute__((visibility("default")));
+ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t size) {
+  CT_OBSERVED_REAL(real_readlinkat_ptr, ct_readlinkat_real_fn, "readlinkat", -1);
+  ssize_t rc = real_readlinkat_ptr(dirfd, path, buf, size);
+  CT_OBSERVE(ct_probe_observer, dirfd, path, rc < 0 ? -1 : 0);
+  return rc;
+}
+
+/* realpath resolves every component inside libc; the observation is the
+ * probe of the path the caller asked about, which is what decides the
+ * result's existence. Its components are not recorded individually. */
+char *realpath(const char *path, char *resolved)
+    __attribute__((visibility("default")));
+char *realpath(const char *path, char *resolved) {
+  CT_OBSERVED_REAL(real_realpath_ptr, ct_realpath_real_fn, "realpath", NULL);
+  char *rc = real_realpath_ptr(path, resolved);
+  CT_OBSERVE(ct_probe_observer, AT_FDCWD, path, rc != NULL ? 0 : -1);
+  return rc;
+}
+
+/* The _FORTIFY_SOURCE spellings: a caller compiled with fortification (the
+ * default in nixpkgs' and most distributions' toolchains) calls these instead
+ * of realpath/readlink, so they need the same observation. */
+char *__realpath_chk(const char *path, char *resolved, size_t resolvedlen)
+    __attribute__((visibility("default")));
+char *__realpath_chk(const char *path, char *resolved, size_t resolvedlen) {
+  CT_OBSERVED_REAL(real_realpath_chk_ptr, ct_realpath_chk_real_fn,
+                   "__realpath_chk", NULL);
+  char *rc = real_realpath_chk_ptr(path, resolved, resolvedlen);
+  CT_OBSERVE(ct_probe_observer, AT_FDCWD, path, rc != NULL ? 0 : -1);
+  return rc;
+}
+
+ssize_t __readlink_chk(const char *path, char *buf, size_t len, size_t buflen)
+    __attribute__((visibility("default")));
+ssize_t __readlink_chk(const char *path, char *buf, size_t len, size_t buflen) {
+  CT_OBSERVED_REAL(real_readlink_chk_ptr, ct_readlink_chk_real_fn,
+                   "__readlink_chk", -1);
+  ssize_t rc = real_readlink_chk_ptr(path, buf, len, buflen);
+  CT_OBSERVE(ct_probe_observer, AT_FDCWD, path, rc < 0 ? -1 : 0);
+  return rc;
+}
+
+ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf, size_t len,
+                         size_t buflen) __attribute__((visibility("default")));
+ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf, size_t len,
+                         size_t buflen) {
+  CT_OBSERVED_REAL(real_readlinkat_chk_ptr, ct_readlinkat_chk_real_fn,
+                   "__readlinkat_chk", -1);
+  ssize_t rc = real_readlinkat_chk_ptr(dirfd, path, buf, len, buflen);
+  CT_OBSERVE(ct_probe_observer, dirfd, path, rc < 0 ? -1 : 0);
+  return rc;
+}
+
+/* scandir opens and reads the directory INSIDE libc (no PLT call reaches
+ * the opendir/readdir interpositions), so it is recorded here as one
+ * enumeration of the directory. */
+int scandir(const char *dir, struct dirent ***namelist,
+            int (*filter)(const struct dirent *),
+            int (*compar)(const struct dirent **, const struct dirent **))
+    __attribute__((visibility("default")));
+int scandir(const char *dir, struct dirent ***namelist,
+            int (*filter)(const struct dirent *),
+            int (*compar)(const struct dirent **, const struct dirent **)) {
+  CT_OBSERVED_REAL(real_scandir_ptr, ct_scandir_real_fn, "scandir", -1);
+  int rc = real_scandir_ptr(dir, (void *)namelist, (void *)filter, (void *)compar);
+  CT_OBSERVE(ct_enumerate_observer, AT_FDCWD, dir, rc);
+  return rc;
+}
+
+#if defined(__LP64__) && defined(__GLIBC__)
+int ct_scandir64_impl(const char *, void *, void *, void *)
+    __asm__("scandir64") __attribute__((visibility("default")));
+int ct_scandir64_impl(const char *dir, void *namelist, void *filter,
+                      void *compar) {
+  CT_OBSERVED_REAL(real_scandir64_ptr, ct_scandir_real_fn, "scandir64", -1);
+  int rc = real_scandir64_ptr(dir, namelist, filter, compar);
+  CT_OBSERVE(ct_enumerate_observer, AT_FDCWD, dir, rc);
+  return rc;
+}
+#endif
+
+/* fdopendir: the DIR* reads a directory the shim knows by its fd, so the
+ * readdir interposition can attribute later entries to that path. */
+DIR *fdopendir(int fd) __attribute__((visibility("default")));
+DIR *fdopendir(int fd) {
+  CT_OBSERVED_REAL(real_fdopendir_ptr, ct_fdopendir_real_fn, "fdopendir", NULL);
+  DIR *rc = real_fdopendir_ptr(fd);
+  if (rc != NULL) CT_OBSERVE(ct_fdopendir_observer, fd, (void *)rc);
+  return rc;
+}
+
+int statx(int dirfd, const char *path, int flags, unsigned int mask,
+          struct statx *buf) __attribute__((visibility("default")));
+int statx(int dirfd, const char *path, int flags, unsigned int mask,
+          struct statx *buf) {
+  CT_OBSERVED_REAL(real_statx_ptr, ct_statx_real_fn, "statx", -1);
+  int rc = real_statx_ptr(dirfd, path, flags, mask, (void *)buf);
+  CT_OBSERVE(ct_probe_observer, dirfd, path, rc);
+  return rc;
+}
+
+int fstatat(int dirfd, const char *path, struct stat *buf, int flags)
+    __attribute__((visibility("default")));
+int fstatat(int dirfd, const char *path, struct stat *buf, int flags) {
+  CT_OBSERVED_REAL(real_fstatat_ptr, ct_fstatat_real_fn, "fstatat", -1);
+  int rc = real_fstatat_ptr(dirfd, path, (void *)buf, flags);
+  CT_OBSERVE(ct_probe_observer, dirfd, path, rc);
+  return rc;
+}
+
+#if defined(__LP64__) && defined(__GLIBC__)
+int ct_fstatat64_impl(int, const char *, void *, int)
+    __asm__("fstatat64") __attribute__((visibility("default")));
+int ct_fstatat64_impl(int dirfd, const char *path, void *buf, int flags) {
+  CT_OBSERVED_REAL(real_fstatat64_ptr, ct_fstatat_real_fn, "fstatat64", -1);
+  int rc = real_fstatat64_ptr(dirfd, path, buf, flags);
+  CT_OBSERVE(ct_probe_observer, dirfd, path, rc);
+  return rc;
+}
+#endif
+
+/* In-tree creation of the anonymous local channels Chromium's message pump
+ * uses (eventfd, timerfd). A child that later reads such an fd it inherited
+ * is pairing with an object its own tree created, which is exactly what the
+ * IM-3 `localfd role=create` record is for (see recordLocalFdCreate in
+ * linux_preload.nim); without it every such read was an "out-of-tree content
+ * channel" downgrade.
+ *
+ * Known coarseness: Linux backs most anon_inode objects with ONE shared
+ * inode, so the localfd key (localFdChannelKey in linux_preload.nim) adds the
+ * kernel's type name (anon_inode:[eventfd], anon_inode:[timerfd]) to tell the
+ * classes apart — without it an in-tree eventfd would pair with an inherited
+ * inotify or fanotify fd, whose reads carry external input. Within one type
+ * the key still names the class, not the object: an in-tree eventfd pairs
+ * with an out-of-tree eventfd. Those carry counters and expirations, not file
+ * content, so this can hide an out-of-tree signalling peer but not a file
+ * dependency. Telling objects apart would need /proc/<pid>/fdinfo's
+ * per-object ids. */
+int eventfd(unsigned int initval, int flags) __attribute__((visibility("default")));
+int eventfd(unsigned int initval, int flags) {
+  CT_OBSERVED_REAL(real_eventfd_ptr, ct_eventfd_real_fn, "eventfd", -1);
+  int rc = real_eventfd_ptr(initval, flags);
+  if (rc >= 0) CT_OBSERVE(ct_localfd_create_observer, rc);
+  return rc;
+}
+
+int timerfd_create(int clockid, int flags) __attribute__((visibility("default")));
+int timerfd_create(int clockid, int flags) {
+  CT_OBSERVED_REAL(real_timerfd_create_ptr, ct_timerfd_create_real_fn,
+                   "timerfd_create", -1);
+  int rc = real_timerfd_create_ptr(clockid, flags);
+  if (rc >= 0) CT_OBSERVE(ct_localfd_create_observer, rc);
+  return rc;
+}
+
+/* pkey_mprotect is mprotect plus a protection key; V8 and PartitionAlloc
+ * use it for W^X. An executable transition through it gets the same
+ * lifecycle check as one through mprotect. */
+int pkey_mprotect(void *addr, size_t len, int prot, int pkey)
+    __attribute__((visibility("default")));
+int pkey_mprotect(void *addr, size_t len, int prot, int pkey) {
+  CT_OBSERVED_REAL(real_pkey_mprotect_ptr, ct_pkey_mprotect_real_fn,
+                   "pkey_mprotect", -1);
+  int rc = real_pkey_mprotect_ptr(addr, len, prot, pkey);
+  CT_OBSERVE(ct_mprotect_observer, addr, len, prot, rc);
+  return rc;
 }
 
 char *getenv(const char *name) __attribute__((visibility("default")));

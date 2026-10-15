@@ -25,6 +25,323 @@ import io_mon/hooks/linux_preload_runtime
 import io_mon/shim/linux_pod_tables
 import stackable_hooks/platform/linux_raw_syscalls
 
+# Raw syscall numbers used by the classifier, the vDSO replacements and the
+# raw-syscall helpers. They are PER ARCHITECTURE: x86_64 has its own table
+# and arm64 uses the asm-generic one, which also drops the legacy
+# open/stat/lstat/access/readlink/time calls entirely. (Before, the x86_64
+# numbers were used everywhere, so on arm64 e.g. nr 2 — io_submit — was
+# classified as open(2) and `getcwd` was issued as nr 79, which is fstatat
+# there.) A Nim `case` needs compile-time constants, so the numbers are
+# spelled out here, and the `_Static_assert`s emitted below compare every
+# one with `SYS_*` from <sys/syscall.h> when the shim's C is compiled: the
+# table cannot drift from the kernel headers of the architecture being
+# built. A syscall the architecture lacks gets a distinct negative sentinel
+# no kernel number can equal.
+when defined(amd64):
+  const
+    LinuxSysRead                  = 0.clong
+    LinuxSysOpen                  = 2.clong
+    LinuxSysClose                 = 3.clong
+    LinuxSysStat                  = 4.clong
+    LinuxSysLstat                 = 6.clong
+    LinuxSysMmap                  = 9.clong
+    LinuxSysMprotect              = 10.clong
+    LinuxSysMunmap                = 11.clong
+    LinuxSysAccess                = 21.clong
+    LinuxSysGetpid                = 39.clong
+    LinuxSysSendfile              = 40.clong
+    LinuxSysGetcwd                = 79.clong
+    LinuxSysReadlink              = 89.clong
+    LinuxSysGettimeofday          = 96.clong
+    LinuxSysCapget                = 125.clong
+    LinuxSysCapset                = 126.clong
+    LinuxSysGettid                = 186.clong
+    LinuxSysTime                  = 201.clong
+    LinuxSysFutex                 = 202.clong
+    LinuxSysGetdents64            = 217.clong
+    LinuxSysClockGettime          = 228.clong
+    LinuxSysClockGetres           = 229.clong
+    LinuxSysOpenat                = 257.clong
+    LinuxSysNewfstatat            = 262.clong
+    LinuxSysReadlinkat            = 267.clong
+    LinuxSysFaccessat             = 269.clong
+    LinuxSysSplice                = 275.clong
+    LinuxSysEventfd2              = 290.clong
+    LinuxSysGetcpu                = 309.clong
+    LinuxSysGetrandom             = 318.clong
+    LinuxSysMemfdCreate           = 319.clong
+    LinuxSysCopyFileRange         = 326.clong
+    LinuxSysPkeyMprotect          = 329.clong
+    LinuxSysPkeyAlloc             = 330.clong
+    LinuxSysPkeyFree              = 331.clong
+    LinuxSysStatx                 = 332.clong
+    LinuxSysIoUringSetup          = 425.clong
+    LinuxSysIoUringEnter          = 426.clong
+    LinuxSysOpenat2               = 437.clong
+    LinuxSysLandlockCreateRuleset = 444.clong
+    LinuxSysLandlockAddRule       = 445.clong
+    LinuxSysLandlockRestrictSelf  = 446.clong
+elif defined(arm64):
+  const
+    LinuxSysRead                  = 63.clong
+    LinuxSysOpen                  = -1001.clong  # no SYS_open on this architecture
+    LinuxSysClose                 = 57.clong
+    LinuxSysStat                  = -1002.clong  # no SYS_stat on this architecture
+    LinuxSysLstat                 = -1003.clong  # no SYS_lstat on this architecture
+    LinuxSysMmap                  = 222.clong
+    LinuxSysMprotect              = 226.clong
+    LinuxSysMunmap                = 215.clong
+    LinuxSysAccess                = -1004.clong  # no SYS_access on this architecture
+    LinuxSysGetpid                = 172.clong
+    LinuxSysSendfile              = 71.clong
+    LinuxSysGetcwd                = 17.clong
+    LinuxSysReadlink              = -1005.clong  # no SYS_readlink on this architecture
+    LinuxSysGettimeofday          = 169.clong
+    LinuxSysCapget                = 90.clong
+    LinuxSysCapset                = 91.clong
+    LinuxSysGettid                = 178.clong
+    LinuxSysTime                  = -1006.clong  # no SYS_time on this architecture
+    LinuxSysFutex                 = 98.clong
+    LinuxSysGetdents64            = 61.clong
+    LinuxSysClockGettime          = 113.clong
+    LinuxSysClockGetres           = 114.clong
+    LinuxSysOpenat                = 56.clong
+    LinuxSysNewfstatat            = 79.clong
+    LinuxSysReadlinkat            = 78.clong
+    LinuxSysFaccessat             = 48.clong
+    LinuxSysSplice                = 76.clong
+    LinuxSysEventfd2              = 19.clong
+    LinuxSysGetcpu                = 168.clong
+    LinuxSysGetrandom             = 278.clong
+    LinuxSysMemfdCreate           = 279.clong
+    LinuxSysCopyFileRange         = 285.clong
+    LinuxSysPkeyMprotect          = 288.clong
+    LinuxSysPkeyAlloc             = 289.clong
+    LinuxSysPkeyFree              = 290.clong
+    LinuxSysStatx                 = 291.clong
+    LinuxSysIoUringSetup          = 425.clong
+    LinuxSysIoUringEnter          = 426.clong
+    LinuxSysOpenat2               = 437.clong
+    LinuxSysLandlockCreateRuleset = 444.clong
+    LinuxSysLandlockAddRule       = 445.clong
+    LinuxSysLandlockRestrictSelf  = 446.clong
+else:
+  {.error: "io-mon's Linux shim needs this architecture's syscall numbers".}
+
+{.emit: ["""
+#include <sys/syscall.h>
+#ifdef SYS_read
+_Static_assert(""", LinuxSysRead, """ == SYS_read, "LinuxSysRead != SYS_read");
+#else
+_Static_assert(""", LinuxSysRead, """ < 0, "LinuxSysRead: SYS_read is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_open
+_Static_assert(""", LinuxSysOpen, """ == SYS_open, "LinuxSysOpen != SYS_open");
+#else
+_Static_assert(""", LinuxSysOpen, """ < 0, "LinuxSysOpen: SYS_open is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_close
+_Static_assert(""", LinuxSysClose, """ == SYS_close, "LinuxSysClose != SYS_close");
+#else
+_Static_assert(""", LinuxSysClose, """ < 0, "LinuxSysClose: SYS_close is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_stat
+_Static_assert(""", LinuxSysStat, """ == SYS_stat, "LinuxSysStat != SYS_stat");
+#else
+_Static_assert(""", LinuxSysStat, """ < 0, "LinuxSysStat: SYS_stat is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_lstat
+_Static_assert(""", LinuxSysLstat, """ == SYS_lstat, "LinuxSysLstat != SYS_lstat");
+#else
+_Static_assert(""", LinuxSysLstat, """ < 0, "LinuxSysLstat: SYS_lstat is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_mmap
+_Static_assert(""", LinuxSysMmap, """ == SYS_mmap, "LinuxSysMmap != SYS_mmap");
+#else
+_Static_assert(""", LinuxSysMmap, """ < 0, "LinuxSysMmap: SYS_mmap is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_mprotect
+_Static_assert(""", LinuxSysMprotect, """ == SYS_mprotect, "LinuxSysMprotect != SYS_mprotect");
+#else
+_Static_assert(""", LinuxSysMprotect, """ < 0, "LinuxSysMprotect: SYS_mprotect is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_munmap
+_Static_assert(""", LinuxSysMunmap, """ == SYS_munmap, "LinuxSysMunmap != SYS_munmap");
+#else
+_Static_assert(""", LinuxSysMunmap, """ < 0, "LinuxSysMunmap: SYS_munmap is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_access
+_Static_assert(""", LinuxSysAccess, """ == SYS_access, "LinuxSysAccess != SYS_access");
+#else
+_Static_assert(""", LinuxSysAccess, """ < 0, "LinuxSysAccess: SYS_access is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_getpid
+_Static_assert(""", LinuxSysGetpid, """ == SYS_getpid, "LinuxSysGetpid != SYS_getpid");
+#else
+_Static_assert(""", LinuxSysGetpid, """ < 0, "LinuxSysGetpid: SYS_getpid is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_sendfile
+_Static_assert(""", LinuxSysSendfile, """ == SYS_sendfile, "LinuxSysSendfile != SYS_sendfile");
+#else
+_Static_assert(""", LinuxSysSendfile, """ < 0, "LinuxSysSendfile: SYS_sendfile is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_getcwd
+_Static_assert(""", LinuxSysGetcwd, """ == SYS_getcwd, "LinuxSysGetcwd != SYS_getcwd");
+#else
+_Static_assert(""", LinuxSysGetcwd, """ < 0, "LinuxSysGetcwd: SYS_getcwd is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_readlink
+_Static_assert(""", LinuxSysReadlink, """ == SYS_readlink, "LinuxSysReadlink != SYS_readlink");
+#else
+_Static_assert(""", LinuxSysReadlink, """ < 0, "LinuxSysReadlink: SYS_readlink is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_gettimeofday
+_Static_assert(""", LinuxSysGettimeofday, """ == SYS_gettimeofday, "LinuxSysGettimeofday != SYS_gettimeofday");
+#else
+_Static_assert(""", LinuxSysGettimeofday, """ < 0, "LinuxSysGettimeofday: SYS_gettimeofday is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_capget
+_Static_assert(""", LinuxSysCapget, """ == SYS_capget, "LinuxSysCapget != SYS_capget");
+#else
+_Static_assert(""", LinuxSysCapget, """ < 0, "LinuxSysCapget: SYS_capget is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_capset
+_Static_assert(""", LinuxSysCapset, """ == SYS_capset, "LinuxSysCapset != SYS_capset");
+#else
+_Static_assert(""", LinuxSysCapset, """ < 0, "LinuxSysCapset: SYS_capset is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_gettid
+_Static_assert(""", LinuxSysGettid, """ == SYS_gettid, "LinuxSysGettid != SYS_gettid");
+#else
+_Static_assert(""", LinuxSysGettid, """ < 0, "LinuxSysGettid: SYS_gettid is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_time
+_Static_assert(""", LinuxSysTime, """ == SYS_time, "LinuxSysTime != SYS_time");
+#else
+_Static_assert(""", LinuxSysTime, """ < 0, "LinuxSysTime: SYS_time is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_futex
+_Static_assert(""", LinuxSysFutex, """ == SYS_futex, "LinuxSysFutex != SYS_futex");
+#else
+_Static_assert(""", LinuxSysFutex, """ < 0, "LinuxSysFutex: SYS_futex is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_getdents64
+_Static_assert(""", LinuxSysGetdents64, """ == SYS_getdents64, "LinuxSysGetdents64 != SYS_getdents64");
+#else
+_Static_assert(""", LinuxSysGetdents64, """ < 0, "LinuxSysGetdents64: SYS_getdents64 is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_clock_gettime
+_Static_assert(""", LinuxSysClockGettime, """ == SYS_clock_gettime, "LinuxSysClockGettime != SYS_clock_gettime");
+#else
+_Static_assert(""", LinuxSysClockGettime, """ < 0, "LinuxSysClockGettime: SYS_clock_gettime is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_clock_getres
+_Static_assert(""", LinuxSysClockGetres, """ == SYS_clock_getres, "LinuxSysClockGetres != SYS_clock_getres");
+#else
+_Static_assert(""", LinuxSysClockGetres, """ < 0, "LinuxSysClockGetres: SYS_clock_getres is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_openat
+_Static_assert(""", LinuxSysOpenat, """ == SYS_openat, "LinuxSysOpenat != SYS_openat");
+#else
+_Static_assert(""", LinuxSysOpenat, """ < 0, "LinuxSysOpenat: SYS_openat is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_newfstatat
+_Static_assert(""", LinuxSysNewfstatat, """ == SYS_newfstatat, "LinuxSysNewfstatat != SYS_newfstatat");
+#else
+_Static_assert(""", LinuxSysNewfstatat, """ < 0, "LinuxSysNewfstatat: SYS_newfstatat is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_readlinkat
+_Static_assert(""", LinuxSysReadlinkat, """ == SYS_readlinkat, "LinuxSysReadlinkat != SYS_readlinkat");
+#else
+_Static_assert(""", LinuxSysReadlinkat, """ < 0, "LinuxSysReadlinkat: SYS_readlinkat is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_faccessat
+_Static_assert(""", LinuxSysFaccessat, """ == SYS_faccessat, "LinuxSysFaccessat != SYS_faccessat");
+#else
+_Static_assert(""", LinuxSysFaccessat, """ < 0, "LinuxSysFaccessat: SYS_faccessat is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_splice
+_Static_assert(""", LinuxSysSplice, """ == SYS_splice, "LinuxSysSplice != SYS_splice");
+#else
+_Static_assert(""", LinuxSysSplice, """ < 0, "LinuxSysSplice: SYS_splice is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_eventfd2
+_Static_assert(""", LinuxSysEventfd2, """ == SYS_eventfd2, "LinuxSysEventfd2 != SYS_eventfd2");
+#else
+_Static_assert(""", LinuxSysEventfd2, """ < 0, "LinuxSysEventfd2: SYS_eventfd2 is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_getcpu
+_Static_assert(""", LinuxSysGetcpu, """ == SYS_getcpu, "LinuxSysGetcpu != SYS_getcpu");
+#else
+_Static_assert(""", LinuxSysGetcpu, """ < 0, "LinuxSysGetcpu: SYS_getcpu is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_getrandom
+_Static_assert(""", LinuxSysGetrandom, """ == SYS_getrandom, "LinuxSysGetrandom != SYS_getrandom");
+#else
+_Static_assert(""", LinuxSysGetrandom, """ < 0, "LinuxSysGetrandom: SYS_getrandom is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_memfd_create
+_Static_assert(""", LinuxSysMemfdCreate, """ == SYS_memfd_create, "LinuxSysMemfdCreate != SYS_memfd_create");
+#else
+_Static_assert(""", LinuxSysMemfdCreate, """ < 0, "LinuxSysMemfdCreate: SYS_memfd_create is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_copy_file_range
+_Static_assert(""", LinuxSysCopyFileRange, """ == SYS_copy_file_range, "LinuxSysCopyFileRange != SYS_copy_file_range");
+#else
+_Static_assert(""", LinuxSysCopyFileRange, """ < 0, "LinuxSysCopyFileRange: SYS_copy_file_range is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_pkey_mprotect
+_Static_assert(""", LinuxSysPkeyMprotect, """ == SYS_pkey_mprotect, "LinuxSysPkeyMprotect != SYS_pkey_mprotect");
+#else
+_Static_assert(""", LinuxSysPkeyMprotect, """ < 0, "LinuxSysPkeyMprotect: SYS_pkey_mprotect is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_pkey_alloc
+_Static_assert(""", LinuxSysPkeyAlloc, """ == SYS_pkey_alloc, "LinuxSysPkeyAlloc != SYS_pkey_alloc");
+#else
+_Static_assert(""", LinuxSysPkeyAlloc, """ < 0, "LinuxSysPkeyAlloc: SYS_pkey_alloc is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_pkey_free
+_Static_assert(""", LinuxSysPkeyFree, """ == SYS_pkey_free, "LinuxSysPkeyFree != SYS_pkey_free");
+#else
+_Static_assert(""", LinuxSysPkeyFree, """ < 0, "LinuxSysPkeyFree: SYS_pkey_free is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_statx
+_Static_assert(""", LinuxSysStatx, """ == SYS_statx, "LinuxSysStatx != SYS_statx");
+#else
+_Static_assert(""", LinuxSysStatx, """ < 0, "LinuxSysStatx: SYS_statx is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_io_uring_setup
+_Static_assert(""", LinuxSysIoUringSetup, """ == SYS_io_uring_setup, "LinuxSysIoUringSetup != SYS_io_uring_setup");
+#else
+_Static_assert(""", LinuxSysIoUringSetup, """ < 0, "LinuxSysIoUringSetup: SYS_io_uring_setup is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_io_uring_enter
+_Static_assert(""", LinuxSysIoUringEnter, """ == SYS_io_uring_enter, "LinuxSysIoUringEnter != SYS_io_uring_enter");
+#else
+_Static_assert(""", LinuxSysIoUringEnter, """ < 0, "LinuxSysIoUringEnter: SYS_io_uring_enter is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_openat2
+_Static_assert(""", LinuxSysOpenat2, """ == SYS_openat2, "LinuxSysOpenat2 != SYS_openat2");
+#else
+_Static_assert(""", LinuxSysOpenat2, """ < 0, "LinuxSysOpenat2: SYS_openat2 is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_landlock_create_ruleset
+_Static_assert(""", LinuxSysLandlockCreateRuleset, """ == SYS_landlock_create_ruleset, "LinuxSysLandlockCreateRuleset != SYS_landlock_create_ruleset");
+#else
+_Static_assert(""", LinuxSysLandlockCreateRuleset, """ < 0, "LinuxSysLandlockCreateRuleset: SYS_landlock_create_ruleset is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_landlock_add_rule
+_Static_assert(""", LinuxSysLandlockAddRule, """ == SYS_landlock_add_rule, "LinuxSysLandlockAddRule != SYS_landlock_add_rule");
+#else
+_Static_assert(""", LinuxSysLandlockAddRule, """ < 0, "LinuxSysLandlockAddRule: SYS_landlock_add_rule is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_landlock_restrict_self
+_Static_assert(""", LinuxSysLandlockRestrictSelf, """ == SYS_landlock_restrict_self, "LinuxSysLandlockRestrictSelf != SYS_landlock_restrict_self");
+#else
+_Static_assert(""", LinuxSysLandlockRestrictSelf, """ < 0, "LinuxSysLandlockRestrictSelf: SYS_landlock_restrict_self is absent, so the Nim value must be a negative sentinel");
+#endif
+"""].}
+
 const
   OAccMode = 0x0003.cint
   OWrOnly = 0x0001.cint
@@ -33,36 +350,6 @@ const
   OTrunc = 0x0200.cint
   OAppend = 0x0400.cint
   LinuxAtFdcwd = -100.cint
-  LinuxSysRead = 0.clong
-  LinuxSysOpen = 2.clong
-  LinuxSysClose = 3.clong
-  LinuxSysStat = 4.clong
-  LinuxSysLstat = 6.clong
-  LinuxSysAccess = 21.clong
-  LinuxSysSendfile = 40.clong
-  LinuxSysGettimeofday = 96.clong
-  LinuxSysTime = 201.clong
-  LinuxSysFutex = 202.clong
-  LinuxSysClockGettime = 228.clong
-  LinuxSysClockGetres = 229.clong
-  LinuxSysGettid = 186.clong
-  LinuxSysIoUringSetup = 425.clong
-  LinuxSysIoUringEnter = 426.clong
-  LinuxSysReadlink = 89.clong
-  LinuxSysGetcwd = 79.clong
-  LinuxSysOpenat = 257.clong
-  LinuxSysNewfstatat = 262.clong
-  LinuxSysReadlinkat = 267.clong
-  LinuxSysFaccessat = 269.clong
-  LinuxSysSplice = 275.clong
-  LinuxSysGetcpu = 309.clong
-  LinuxSysGetrandom = 318.clong
-  LinuxSysCopyFileRange = 326.clong
-  LinuxSysStatx = 332.clong
-  LinuxSysOpenat2 = 437.clong
-  LinuxSysLandlockCreateRuleset = 444.clong
-  LinuxSysLandlockAddRule = 445.clong
-  LinuxSysLandlockRestrictSelf = 446.clong
   LinuxEfault = 14.clong
   LinuxRenameExchange = 2'u32
 
@@ -652,9 +939,21 @@ long syscall(long number, ...) {
 }
 
 extern void ct_linux_preload_prepare_real_connect(void);
+extern void ct_linux_preload_prime_real_functions(void);
+extern void repro_linux_prepare_thread_exit_key(void);
 
 __attribute__((constructor))
 static void repro_linux_monitor_constructor(void) {
+  /* Resolve every "next" libc entry point the hooks forward to BEFORE any
+   * host code runs. Resolving lazily means calling dlsym inside a hook, and
+   * dlsym frees/allocates through the HOST's allocator, which the host may be
+   * holding the lock of at that moment (PartitionAlloc's syscall(SYS_mprotect)
+   * under its lock). See ct_linux_preload_prime_real_functions. The private
+   * heap (linux_private_heap.c) has already been resolved by its own
+   * priority-101 constructor. */
+  ct_linux_preload_prime_real_functions();
+  repro_linux_resolve_libc_syscall();
+  repro_linux_prepare_thread_exit_key();
   repro_monitor_shim_init(NULL);
   ct_linux_preload_prepare_real_connect();
 }
@@ -707,19 +1006,40 @@ static void repro_linux_thread_exit_destructor(void *value) {
   repro_linux_thread_exit_flush();
 }
 
+/* glibc keeps the values of the first PTHREAD_KEY_2NDLEVEL_SIZE (32) keys in
+ * the thread descriptor itself; for a higher key, a thread's FIRST
+ * pthread_setspecific callocs a second-level block — with the process's
+ * calloc, i.e. the HOST's if it replaces malloc
+ * (https://sourceware.org/git/?p=glibc.git;a=blob;f=nptl/pthread_setspecific.c).
+ * Arming happens inside emitRecord, inside a hook the host may have entered
+ * while holding its allocator lock (see linux_private_heap.c), so arming must
+ * not allocate. The key is therefore created from the shim's constructor —
+ * before the host's own code has created its keys, so it normally gets a low
+ * number — and arming is skipped when the key is nevertheless above the
+ * in-descriptor range. Skipping costs the batching win on that host's worker
+ * threads (emitRecord flushes a worker's batch after every record) and, on
+ * the file transport only, leaves an exited worker's heap fragment slot
+ * unfreed (writer.nim, fragmentSlotOnHeap). Neither loses a record. */
+#define REPRO_THREAD_EXIT_KEY_INLINE_LIMIT 32
+
 static void repro_linux_create_thread_exit_key(void) {
   if (pthread_key_create(&repro_thread_exit_key,
                          repro_linux_thread_exit_destructor) == 0)
     repro_thread_exit_key_ready = 1;
 }
 
+void repro_linux_prepare_thread_exit_key(void) {
+  pthread_once(&repro_thread_exit_key_once,
+               repro_linux_create_thread_exit_key);
+}
+
 /* Called (via the Nim bridge repro_linux_arm_thread_exit_flush) when a
  * thread first opens its fragment slot. Idempotent per thread: re-setting
  * the same non-NULL value is harmless. */
 void repro_linux_arm_thread_exit_flush_c(void) {
-  pthread_once(&repro_thread_exit_key_once,
-               repro_linux_create_thread_exit_key);
-  if (repro_thread_exit_key_ready)
+  repro_linux_prepare_thread_exit_key();
+  if (repro_thread_exit_key_ready &&
+      (unsigned long)repro_thread_exit_key < REPRO_THREAD_EXIT_KEY_INLINE_LIMIT)
     pthread_setspecific(repro_thread_exit_key,
                         (void *)&repro_thread_exit_sentinel);
 }
@@ -974,6 +1294,34 @@ proc sampleKillDiag(phase: string) {.raises: [].} =
   setKillDiagContext(buf)
   setKillDiagDeepLastHook(phase)
 
+proc readProcFile(path: cstring): string {.raises: [].} =
+  ## The contents of a small procfs file, or "" on any error. Replaces
+  ## `readFile` on the hook path: `readFile` goes through stdio, and glibc's
+  ## `fopen` allocates its `FILE` with the process's `malloc` — the HOST's, if
+  ## it replaces malloc — from inside a hook the host may have entered while
+  ## holding its allocator lock (see `shim/linux_private_heap.c`). This reads
+  ## with the real `open`/`read`/`close` into a Nim string, which the shim's
+  ## private heap backs.
+  const O_RDONLY_CLOEXEC = 0o2000000.cint   # O_RDONLY | O_CLOEXEC
+  let fd = realOpen(path, O_RDONLY_CLOEXEC, 0)
+  if fd < 0:
+    return ""
+  var used = 0
+  result = newString(4096)
+  while true:
+    if used == result.len:
+      result.setLen(result.len * 2)
+    let n = realRead(fd, addr result[used], csize_t(result.len - used))
+    if n < 0:
+      if c_get_errno() == 4: continue   # EINTR
+      used = 0
+      break
+    if n == 0:
+      break
+    used += int(n)
+  discard realClose(fd)
+  result.setLen(used)
+
 proc sampleKillDiagArgvOnce() {.raises: [].} =
   ## M9.R.64.1 — one-shot per-thread /proc/self/cmdline snapshot. The
   ## cmdline stays constant after the last execve, so subsequent calls
@@ -984,11 +1332,8 @@ proc sampleKillDiagArgvOnce() {.raises: [].} =
   if not killDiagDeepIsOn():
     return
   var content: string
-  try:
-    withShimMuted:
-      content = readFile("/proc/self/cmdline")
-  except CatchableError:
-    return
+  withShimMuted:
+    content = readProcFile("/proc/self/cmdline")
   if content.len == 0:
     return
   let bufPtr =
@@ -1408,6 +1753,9 @@ proc channelPeerPid(fd: cint; kind: FdKind): uint64 {.raises: [].} =
   let pid = c_socket_peer_pid(fd)
   if pid > 0: uint64(pid) else: 0
 
+proc localFdChannelKey(fd: cint; dev, ino: uint64; kind: FdKind): string
+    {.raises: [].}
+
 proc recordLocalFdCreate(fd: cint) {.raises: [].} =
   ## IoMon-Pipeline-Capture IM-3 — record that a monitored (in-tree) process
   ## CREATED a local IPC fd (`pipe`/`pipe2`/`socketpair`), stamping the kernel
@@ -1431,7 +1779,8 @@ proc recordLocalFdCreate(fd: cint) {.raises: [].} =
   var kind: cint
   if c_fd_identity_kind(fd, addr dev, addr ino, addr kind) == 0:
     return
-  recordExternalContent("localfd", "create", localFdKey(dev, ino), fd)
+  recordExternalContent("localfd", "create",
+    localFdChannelKey(fd, dev, ino, FdKind(kind)), fd)
 
 proc recordLocalFdPair(fds: ptr cint) {.raises: [].} =
   ## Record BOTH ends of a freshly created fd pair. On Linux the two ends of a
@@ -1466,6 +1815,36 @@ proc hookScratchString(): string {.inline, raises: [].} =
 
 proc isLinuxDeletedProcFdTarget(path: string): bool {.raises: [].} =
   path.endsWith(" (deleted)")
+
+proc localFdChannelKey(fd: cint; dev, ino: uint64; kind: FdKind): string
+    {.raises: [].} =
+  ## The pairing key of a local channel object: its kernel `(dev, ino)`, and
+  ## for an anonymous-inode object also its type as the kernel names it.
+  ##
+  ## WHY THE TYPE. Linux backs most anonymous-inode objects — eventfd, timerfd,
+  ## signalfd, inotify, epoll, fanotify, bpf maps, ... — with ONE shared inode,
+  ## so `(dev, ino)` alone names "some anonymous object", not this one. Keyed
+  ## that way, an in-tree `eventfd` create (Chromium makes many) would pair
+  ## with a read of ANY inherited anonymous-inode fd, including an inotify or
+  ## fanotify descriptor handed in from outside the tree, whose reads carry
+  ## external input. The `/proc/self/fd` link names the type
+  ## (`anon_inode:[eventfd]`, `anon_inode:inotify`, ...), so a create only
+  ## pairs with reads of the same kind of object. What remains coarse is
+  ## within one type: an in-tree eventfd still pairs with an out-of-tree
+  ## eventfd, which carries a counter, not content.
+  ##
+  ## Only `fkOther` fds are anonymous inodes; pipes, sockets and files keep
+  ## the plain key (their inodes are per object). If the link cannot be read
+  ## the plain key is used on both sides alike, which is the old behaviour.
+  result = localFdKey(dev, ino)
+  if kind != fkOther:
+    return
+  var buf = hookScratchString()
+  if c_fd_proc_path(fd, addr buf[0], csize_t(buf.len)) == 0:
+    return
+  let target = $cast[cstring](addr buf[0])
+  if target.startsWith("anon_inode:"):
+    result.add ":" & target
 
 proc recoverNamedFdRead(fd: cint; kind: FdKind): bool {.raises: [].} =
   ## Recover regular files and named devices after an inherited fd or an
@@ -1519,15 +1898,15 @@ proc classifyEmptyFdRead(fd: cint): bool {.raises: [].} =
       # the recorded dependency set is byte-identical.
       markEmptyFdClassified(fd)
       return false
-    recordExternalContent("opaque", "read", localFdKey(dev, ino), fd,
-      channelPeerPid(fd, kind))
+    recordExternalContent("opaque", "read",
+      localFdChannelKey(fd, dev, ino, kind), fd, channelPeerPid(fd, kind))
     markEmptyFdClassified(fd)
   else:
     if not inheritedFd(fd):
       markEmptyFdClassified(fd)  # FUP-K — see the fifo/socket branch above.
       return false
-    recordExternalContent("opaque", "read", localFdKey(dev, ino), fd,
-      channelPeerPid(fd, kind))
+    recordExternalContent("opaque", "read",
+      localFdChannelKey(fd, dev, ino, kind), fd, channelPeerPid(fd, kind))
     markEmptyFdClassified(fd)
   false
 
@@ -2025,18 +2404,108 @@ proc rawSyscallSourceName(inlineTrap: cint): string {.raises: [].} =
   else:
     "libc raw syscall"
 
+# The memory-mapping lifecycle a call changed, observed AFTER the call, as the
+# libc-symbol hooks (`repro_hook_mmap` & co.) record it. `observeMunmapResult`
+# is shared with the raw-syscall classifier (see `LinuxSysMmap` there).
+proc observeMmapResult(result: pointer; length: csize_t; prot, flags, fd: cint)
+    {.raises: [].} =
+  if isAnonymousPrivateMmap(flags, fd):
+    recordAnonymousPrivateMmap(result, length)
+    if protIncludesExec(prot):
+      if protIncludesWrite(prot):
+        emitEventLoss("linux anonymous executable mmap is writable; " &
+          "raw syscall scan requires a later mprotect transition " &
+          "source=mmap-anonymous-exec")
+      let status = scanInlineSyscallPatchesForOwnedAnonymousRange(
+        result, length)
+      recordLateInlineSyscallScanCoverage(status, "mmap-anonymous-exec")
+
+proc observeMprotectResult(address: pointer; length: csize_t; prot: cint;
+                           result: cint) {.raises: [].} =
+  if result == 0 and protIncludesExec(prot) and protIncludesWrite(prot):
+    # Writable AND executable: the inline raw-syscall scan reads the code that
+    # is there NOW, and a region that stays writable gets its code later — a
+    # JIT writing in place (Node 24's V8 makes its whole 512 MiB code range
+    # RWX this way). Nothing written after this point is ever scanned, so a
+    # raw syscall in it would go unobserved. Fail closed, exactly as the mmap
+    # hook already does for a writable executable mapping; scanning once and
+    # trusting the result (what this path used to do for small ranges) is
+    # unsound. A W^X JIT (RW -> RX transitions) is scanned at each RX
+    # transition and stays complete; `node --jitless` makes no executable
+    # anonymous memory at all.
+    emitEventLoss("linux anonymous executable mprotect is writable; code " &
+      "written into it later cannot be scanned for inline syscalls " &
+      "source=mprotect-anonymous-writable-exec")
+    return
+  if result == 0 and protIncludesExec(prot):
+    let coverage = liveAnonymousExecutableCoverage(address, length)
+    if coverage.liveIntersects and coverage.mapsAvailable and
+        coverage.fullyTracked:
+      let status = scanInlineSyscallPatchesForTrackedMprotectRange(
+        address, length)
+      recordLateInlineSyscallScanCoverage(status, "mprotect-anonymous-exec")
+    elif coverage.liveIntersects:
+      emitEventLoss("linux anonymous executable mprotect is not owned by " &
+        "the preload mmap lifecycle source=mprotect-anonymous-untracked")
+
+proc observeMunmapResult(address: pointer; length: csize_t; result: cint)
+    {.raises: [].} =
+  if result == 0:
+    removeAnonymousPrivateRange(address, length)
+
+proc intArg(raw: clong): cint {.inline, raises: [].} =
+  ## A raw syscall's `int`-typed argument, as the kernel reads it: the low 32
+  ## bits of the register. A caller that passes an `int` through
+  ## `syscall(2)`'s varargs leaves the upper half unspecified (a 32-bit move
+  ## zero-extends, so `-1` arrives as 0xFFFFFFFF), and a checked `cint(raw)`
+  ## then raises a RangeDefect inside the hook, which leaves the thread's Nim
+  ## error state set and makes every later hook on that thread return without
+  ## calling through.
+  cast[cint](uint32(raw and 0xFFFF_FFFF'i64))
+
+proc recordRawGetdents(fd: cint; callResult: clong): bool {.raises: [].} =
+  ## `getdents64(fd, ...)` classification; see `LinuxSysGetdents64`.
+  if callResult <= 0:
+    # Error, or end of directory: nothing was enumerated by this call.
+    return true
+  var path = pathForFd(fd)
+  if path.len == 0:
+    # Not opened through a hook (inherited across exec, or opened before the
+    # shim initialised): ask the kernel which directory the fd names, as
+    # `recoverNamedFdRead` does for reads. A deleted directory, or anything
+    # that is not an absolute path, cannot be attributed: loss.
+    var buf = hookScratchString()
+    if c_fd_proc_path(fd, addr buf[0], csize_t(buf.len)) != 0:
+      let resolved = $cast[cstring](addr buf[0])
+      if resolved.isAbsolute and not isLinuxDeletedProcFdTarget(resolved):
+        path = resolved
+        updateFdPath(fd, cstring(resolved))
+  if path.len == 0:
+    return false
+  var record = baseRecord(mrDirectoryEnumerate, moDirectoryEnumerate)
+  record.path = path
+  record.result = 1
+  record.detail = "getdents64"
+  emitRecord(record)
+  true
+
+proc rawSyscallFailed(callResult: clong): bool {.inline, raises: [].} =
+  ## A raw syscall's -errno return (-4095 .. -1), as opposed to a value such
+  ## as an mmap address that merely has the top bit set.
+  callResult < 0 and callResult >= -4095
+
 proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
                             inlineTrap: cint): bool {.raises: [].} =
   case number
   of LinuxSysOpen:
     if callResult < 0 or resultLooksFaulted(callResult):
       return true
-    recordOpen(cstringArg(a1), cint(a2), cint(a3), cint(callResult))
+    recordOpen(cstringArg(a1), intArg(a2), intArg(a3), cint(callResult))
     true
   of LinuxSysOpenat:
     if callResult < 0 or resultLooksFaulted(callResult):
       return true
-    recordOpen(cstringArg(a2), cint(a3), cint(a4), cint(callResult))
+    recordOpen(cstringArg(a2), intArg(a3), intArg(a4), cint(callResult))
     true
   of LinuxSysOpenat2:
     var flags, mode: cint
@@ -2045,16 +2514,16 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
     recordOpen(cstringArg(a2), flags, mode, cint(callResult))
     true
   of LinuxSysRead:
-    recordRawRead(cint(a1), callResult)
+    recordRawRead(intArg(a1), callResult)
   of LinuxSysSendfile:
-    recordRawFileCopy(cint(a2), cint(a1), callResult)
+    recordRawFileCopy(intArg(a2), intArg(a1), callResult)
   of LinuxSysCopyFileRange:
-    recordRawFileCopy(cint(a1), cint(a3), callResult)
+    recordRawFileCopy(intArg(a1), intArg(a3), callResult)
   of LinuxSysSplice:
-    recordRawSplice(cint(a1), cint(a3), callResult)
+    recordRawSplice(intArg(a1), intArg(a3), callResult)
   of LinuxSysClose:
     if callResult >= 0:
-      removeFdPath(cint(a1))
+      removeFdPath(intArg(a1))
     true
   of LinuxSysStat, LinuxSysLstat, LinuxSysAccess, LinuxSysReadlink:
     if resultLooksFaulted(callResult):
@@ -2097,6 +2566,81 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
     if callResult >= 0:
       recordNonDeterministic("getrandom")
     true
+  of LinuxSysMmap:
+    # `syscall(SYS_mmap|SYS_mprotect|SYS_munmap, ...)`: allocators issue the
+    # memory syscalls directly — Chromium's PartitionAlloc calls
+    # `syscall(SYS_mprotect)` under its lock — and these were all
+    # `unsupported` event-loss, so every such host was permanently
+    # mcIncomplete. What makes them matter is EXECUTABLE memory: the inline
+    # raw-syscall scanner only trusts executable anonymous memory created
+    # through the preload mmap lifecycle (the libc-symbol hooks), and a raw
+    # syscall stays outside that lifecycle by design (the fail-closed cases in
+    # `tests/linux/test_io_mon_linux_stdio_ipc`). So:
+    #   * a mapping or protection change that does not grant PROT_EXEC reads
+    #     no file and creates no code: supported, recorded as nothing, and the
+    #     mapping stays UNTRACKED — if it is made executable later, the
+    #     mprotect hook finds it untracked and fails closed exactly as before;
+    #   * one that grants PROT_EXEC stays `unsupported` (fail closed);
+    #   * munmap removes the range from the lifecycle table — the same update
+    #     the munmap hook makes. Dropping ownership can only make a later
+    #     check fail closed, so this is sound even on the inline-trap path,
+    #     whose events are classified after the fact.
+    # A file mapping without PROT_EXEC adds nothing the libc mmap hook would
+    # record either: the descriptor's open was observed.
+    not protIncludesExec(intArg(a3))
+  of LinuxSysMprotect, LinuxSysPkeyMprotect:
+    # pkey_mprotect is mprotect plus a protection key (V8/PartitionAlloc use
+    # it for W^X): the same rule applies to its prot argument.
+    not protIncludesExec(intArg(a3))
+  of LinuxSysMunmap:
+    observeMunmapResult(cast[pointer](a1), cast[csize_t](a2),
+      (if rawSyscallFailed(callResult): -1.cint else: 0.cint))
+    true
+  of LinuxSysGetpid, LinuxSysCapget, LinuxSysPkeyAlloc, LinuxSysPkeyFree:
+    # Pure queries of the calling process's own state (its pid; its
+    # capability sets) or management of its own protection-key slots. None
+    # reads the filesystem or any external input, so there is no dependency
+    # to record and nothing to lose. Node 24 calls capget at startup and
+    # Chromium calls getpid/pkey_* through syscall(2); each used to make the
+    # whole run mcIncomplete.
+    true
+  of LinuxSysCapset:
+    # Changes the calling thread's capability sets (Chromium drops
+    # capabilities at startup). It reads nothing; it can only change what
+    # LATER calls are allowed to do, and those calls are observed through
+    # their own hooks, failures included (a denied open is recorded as a
+    # probe). So there is no dependency here either.
+    true
+  of LinuxSysEventfd2, LinuxSysMemfdCreate:
+    # Create anonymous kernel objects — an event counter, or an anonymous
+    # file that has no name in any filesystem. Neither depends on filesystem
+    # state. The creation is recorded as an in-tree `localfd role=create`
+    # (IM-3), as pipe/socketpair are, so a descendant that reads the fd it
+    # inherited pairs with it instead of reporting an out-of-tree channel.
+    # An executable mapping of a memfd is covered where mappings are.
+    #
+    # Not for an INLINE trap: those events are classified only at shutdown
+    # (`drainInlineRawSyscallEvents`), when the descriptor number may name a
+    # different object — possibly one received from outside the tree — and an
+    # extra create would pair it. A missing create can only leave a later
+    # read unpaired (a conservative re-run), so skipping is the safe side.
+    if inlineTrap == 0 and callResult >= 0 and
+        not rawSyscallFailed(callResult):
+      recordLocalFdCreate(cint(callResult))
+    true
+  of LinuxSysGetdents64:
+    # Directory enumeration through the raw syscall (Chromium's file
+    # enumerator issues it directly). Recorded exactly as the libc readdir
+    # hook records it: a directory-enumerate of the directory the fd names
+    # (from the shim's fd table, else the kernel's /proc/self/fd link). An fd
+    # that names no attributable directory stays a loss (fail closed).
+    # An INLINE trap is classified only at shutdown, when the fd may have been
+    # closed and reused for another directory: attributing it then could
+    # record the wrong directory and miss the real one, so an inline
+    # enumeration that returned entries stays a loss.
+    if inlineTrap != 0 and callResult > 0:
+      return false
+    recordRawGetdents(intArg(a1), callResult)
   of LinuxSysFutex:
     # SYS_futex only coordinates threads through caller-owned memory. It does
     # not access filesystem state or introduce an external input, so treating
@@ -2702,16 +3246,7 @@ proc repro_hook_mmap*(ctx: var MmapContext) {.raises: [].} =
   ensureInitializedPreservingErrno()
   callNext(ctx)
   let savedErrno = c_get_errno()
-  if isAnonymousPrivateMmap(ctx.flags, ctx.fd):
-    recordAnonymousPrivateMmap(ctx.result, ctx.length)
-    if protIncludesExec(ctx.prot):
-      if protIncludesWrite(ctx.prot):
-        emitEventLoss("linux anonymous executable mmap is writable; " &
-          "raw syscall scan requires a later mprotect transition " &
-          "source=mmap-anonymous-exec")
-      let status = scanInlineSyscallPatchesForOwnedAnonymousRange(
-        ctx.result, ctx.length)
-      recordLateInlineSyscallScanCoverage(status, "mmap-anonymous-exec")
+  observeMmapResult(ctx.result, ctx.length, ctx.prot, ctx.flags, ctx.fd)
   c_set_errno(savedErrno)
 
 proc repro_hook_mprotect*(ctx: var MprotectContext) {.raises: [].} =
@@ -2721,16 +3256,7 @@ proc repro_hook_mprotect*(ctx: var MprotectContext) {.raises: [].} =
   ensureInitializedPreservingErrno()
   callNext(ctx)
   let savedErrno = c_get_errno()
-  if ctx.result == 0 and protIncludesExec(ctx.prot):
-    let coverage = liveAnonymousExecutableCoverage(ctx.address, ctx.length)
-    if coverage.liveIntersects and coverage.mapsAvailable and
-        coverage.fullyTracked:
-      let status = scanInlineSyscallPatchesForTrackedMprotectRange(
-        ctx.address, ctx.length)
-      recordLateInlineSyscallScanCoverage(status, "mprotect-anonymous-exec")
-    elif coverage.liveIntersects:
-      emitEventLoss("linux anonymous executable mprotect is not owned by " &
-        "the preload mmap lifecycle source=mprotect-anonymous-untracked")
+  observeMprotectResult(ctx.address, ctx.length, ctx.prot, ctx.result)
   c_set_errno(savedErrno)
 
 proc repro_hook_munmap*(ctx: var MunmapContext) {.raises: [].} =
@@ -2740,8 +3266,7 @@ proc repro_hook_munmap*(ctx: var MunmapContext) {.raises: [].} =
   ensureInitializedPreservingErrno()
   callNext(ctx)
   let savedErrno = c_get_errno()
-  if ctx.result == 0:
-    removeAnonymousPrivateRange(ctx.address, ctx.length)
+  observeMunmapResult(ctx.address, ctx.length, ctx.result)
   c_set_errno(savedErrno)
 
 proc repro_hook_mremap*(ctx: var MremapContext) {.raises: [].} =
@@ -3090,10 +3615,9 @@ proc processIsSingleThreaded(): bool {.raises: [].} =
   ## deadlock. Conservatively returns false (treat as multi-threaded) on any
   ## read error.
   var content: string
-  try:
-    withShimMuted:
-      content = readFile("/proc/self/status")
-  except CatchableError:
+  withShimMuted:
+    content = readProcFile("/proc/self/status")
+  if content.len == 0:
     return false
   const key = "Threads:"
   let idx = content.find(key)
@@ -3277,6 +3801,71 @@ proc repro_hook_exit*(ctx: var ExitContext) {.raises: [].} =
   callNext(ctx)
 
 setPreloadShimEnvVar("REPRO_MONITOR_SHIM_LIB")
+# Observe-only interpositions (access, readlink, realpath, scandir, statx,
+# fstatat, fdopendir, pkey_mprotect and the LFS aliases) — see "LARGE-FILE
+# ALIASES AND OBSERVE-ONLY INTERPOSITIONS" in linux_preload_runtime.nim.
+proc repro_linux_observe_probe(dirfd: cint; path: cstring; rc: cint)
+    {.cdecl, raises: [].} =
+  ## A path-probing call (access, readlink, realpath, statx, fstatat, ...)
+  ## returned `rc`: record it as a path probe, like the stat hook does. An
+  ## empty path with a dirfd (AT_EMPTY_PATH) inspects the descriptor, not a
+  ## path, and is not a probe.
+  if shouldBypass() or path == nil or path[0] == '\0':
+    return
+  ensureInitializedPreservingErrno()
+  emitProbe(path, (if rc >= 0: 0.cint else: -1.cint), dirfd)
+
+proc repro_linux_observe_enumerate(dirfd: cint; path: cstring; rc: cint)
+    {.cdecl, raises: [].} =
+  ## scandir(path) returned `rc` entries (or -1): a successful one enumerated
+  ## the directory, exactly what the readdir hook records per entry; a failed
+  ## one is a probe of a path that is absent or unreadable.
+  if shouldBypass() or path == nil or path[0] == '\0':
+    return
+  ensureInitializedPreservingErrno()
+  if rc < 0:
+    emitProbe(path, -1.cint, dirfd)
+    return
+  var record = baseRecord(mrDirectoryEnumerate, moDirectoryEnumerate)
+  record.path = pathForAt(dirfd, path)
+  record.result = 1
+  record.detail = "scandir"
+  emitRecord(record)
+
+proc repro_linux_observe_fdopendir(fd: cint; dirp: pointer)
+    {.cdecl, raises: [].} =
+  ## A DIR* now reads the directory `fd` names; let the readdir hook
+  ## attribute its entries to that path.
+  if shouldBypass():
+    return
+  let path = pathForFd(fd)
+  if path.len > 0:
+    updateDirPath(dirp, cstring(path))
+
+proc repro_linux_observe_mprotect(address: pointer; length: csize_t;
+                                  prot: cint; rc: cint) {.cdecl, raises: [].} =
+  ## pkey_mprotect: the same executable-lifecycle check as mprotect.
+  if shouldBypass():
+    return
+  ensureInitializedPreservingErrno()
+  observeMprotectResult(address, length, prot, rc)
+
+proc repro_linux_observe_localfd_create(fd: cint) {.cdecl, raises: [].} =
+  ## eventfd/timerfd_create created a local channel in-tree (IM-3 create).
+  if shouldBypass():
+    return
+  ensureInitializedPreservingErrno()
+  recordLocalFdCreate(fd)
+
+proc ct_linux_preload_register_observers(probe, enumerate, fdopendirFn,
+                                         mprotectFn, createFn: pointer)
+  {.importc, cdecl, raises: [].}
+
+ct_linux_preload_register_observers(cast[pointer](repro_linux_observe_probe),
+  cast[pointer](repro_linux_observe_enumerate),
+  cast[pointer](repro_linux_observe_fdopendir),
+  cast[pointer](repro_linux_observe_mprotect),
+  cast[pointer](repro_linux_observe_localfd_create))
 registerOpenHook(repro_hook_open)
 registerOpen64Hook(repro_hook_open64)
 registerOpenatHook(repro_hook_openat)

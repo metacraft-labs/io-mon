@@ -172,6 +172,83 @@ const
     ## `mrEventLoss`, forcing `mcIncomplete` (fail-incomplete): the capped run is
     ## honestly reported as needing a re-run rather than a false `mcComplete`.
 
+const fragmentFileIsFd = not (defined(macosx) or defined(windows))
+  ## HOW THE FRAGMENT WRITER TALKS TO ITS FILE — and why not through stdio on
+  ## Linux.
+  ##
+  ## The fragment writer runs inside a hook, i.e. inside whatever the host was
+  ## doing when it made the observed call — possibly while holding its own
+  ## allocator's lock (PartitionAlloc calls `syscall(SYS_mprotect)` under its
+  ## lock; rustc's allocator calls `clock_gettime` under its lock). The shim's
+  ## OWN allocations are kept off the host's allocator by
+  ## `shim/linux_private_heap.c`, but stdio is not the shim's code: glibc's
+  ## `fopen` allocates the `FILE` with `malloc`, and glibc routes its internal
+  ## `malloc` calls to whatever `malloc` the executable interposes. Opening a
+  ## fragment with `open(File)` from such a hook therefore re-entered the host's
+  ## allocator and deadlocked it
+  ## (`tests/linux/test_io_mon_shim_host_allocator_isolation`).
+  ##
+  ## So on Linux the fragment handle is a plain file descriptor written with
+  ## `write(2)`; nothing on the path allocates outside the shim. Flushing is a
+  ## no-op there because nothing is buffered in user space: `write` has
+  ## already handed the bytes to the kernel, which is the durability point the
+  ## stdio `flushFile` reached (a SIGKILL after it loses nothing). The macOS
+  ## and Windows shims keep `File`: their writers do not have this hazard
+  ## under the hosts they monitor today, and their file arms are being
+  ## retired in favour of the shared-memory set (`hostUsesFileFallback`).
+
+when fragmentFileIsFd:
+  from std/posix import nil
+
+  type FragFile = distinct cint
+    ## An open fragment descriptor, or -1. Same verbs as `File` below, so the
+    ## writer's call sites read the same on every platform.
+
+  template noFragFile(): FragFile = FragFile(-1)
+
+  proc isNil(f: FragFile): bool {.inline, raises: [].} = cint(f) < 0
+
+  proc getFileHandle(f: FragFile): cint {.inline, raises: [].} = cint(f)
+
+  proc open(f: var FragFile; path: string; mode: FileMode): bool
+      {.raises: [].} =
+    ## Append-only open, matching `fopen(path, "a")` plus Nim's default of
+    ## not leaking the descriptor into exec'd children (O_CLOEXEC).
+    doAssert mode == fmAppend
+    let fd = posix.open(cstring(path),
+      posix.O_WRONLY or posix.O_CREAT or posix.O_APPEND or posix.O_CLOEXEC,
+      posix.Mode(0o666))
+    f = FragFile(fd)
+    fd >= 0
+
+  proc writeBuffer(f: FragFile; buffer: pointer; len: Natural): int
+      {.raises: [].} =
+    ## Write all of `buffer`, retrying on EINTR and short writes; returns the
+    ## bytes written (less than `len` only on an error), like `fwrite`.
+    var done = 0
+    while done < len:
+      let n = posix.write(cint(f),
+        cast[pointer](cast[uint](buffer) + uint(done)), len - done)
+      if n < 0:
+        if posix.errno == posix.EINTR: continue
+        break
+      if n == 0: break
+      done += n
+    done
+
+  proc flushFile(f: FragFile) {.inline, raises: [].} =
+    ## Nothing is buffered in user space; see `fragmentFileIsFd`.
+    discard f
+
+  proc close(f: FragFile) {.raises: [].} =
+    discard posix.close(cint(f))
+
+  proc getFileInfo(f: FragFile): FileInfo {.raises: [OSError].} =
+    getFileInfo(FileHandle(cint(f)))
+else:
+  type FragFile = File
+  template noFragFile(): FragFile = nil
+
 type
   FragmentSlot = object
     # M9.R.15c.3 — the slot is per-thread state; with ``--mm:orc`` + the
@@ -190,7 +267,10 @@ type
     # (see `fragmentSlotOnHeap`): `calloc` yields a valid all-default slot and
     # `free` needs no destructor.
     isOpen: bool
-    file: File
+    file: FragFile
+      ## A descriptor on Linux, a `File` elsewhere — see `fragmentFileIsFd`.
+      ## Zero-filled memory is NOT "no file" on Linux (fd 0); `isOpen` is
+      ## what says whether `file` is meaningful.
     fileDevice: uint64
     fileId: uint64
     fragmentDirLen: int
@@ -1259,7 +1339,7 @@ proc reopenFragmentHandle(): bool {.raises: [].} =
     return false
   let path = fragmentPath(slotFragmentDir(slot[]),
     slot.osPid, slot.threadId)
-  slot.file = nil
+  slot.file = noFragFile()
   try:
     if not open(slot.file, extendedPath(path), fmAppend):
       slot.isOpen = false
@@ -1272,7 +1352,7 @@ proc reopenFragmentHandle(): bool {.raises: [].} =
   if not captureFragmentHandleIdentity():
     try: close(slot.file)
     except IOError, OSError: discard
-    slot.file = nil
+    slot.file = noFragFile()
     slot.isOpen = false
     unregisterFragmentSlot()
     return false
@@ -1689,7 +1769,7 @@ proc openFragmentSlot(slot: ptr FragmentSlot; fragmentDir: string;
   if not captureFragmentHandleIdentity():
     try: close(slot.file)
     except IOError, OSError: discard
-    slot.file = nil
+    slot.file = noFragFile()
     return false
   if not slotFragmentDirAssign(slot[], fragmentDir):
     # fragmentDir overflows the fixed-size buffer — close and bail out;
@@ -1736,7 +1816,7 @@ proc appendFragmentRecordUnbuffered(path: string; record: MonitorRecord) =
   ## a thread only takes this path while allocation keeps failing. A failure
   ## here raises exactly like a failed fragment open on the normal path.
   let frame = encodeFrame(record)
-  var f: File
+  var f: FragFile
   if not open(f, extendedPath(path), fmAppend):
     raiseEnvelopeError(eeMalformed,
       "cannot open iomon fragment for append: " & path)
