@@ -157,6 +157,10 @@ int main(int argc, char **argv) {
         require fileExists(depfile)
         let dep = readMonitorDepFile(depfile)
         check dep.records.anyIt(it.kind == mrFileRead and it.path == input)
+        check dep.completeness == mcComplete
+        check not dep.records.anyIt(it.kind == mrEventLoss)
+        check not dep.records.anyIt(it.kind == mrLibraryLoad and
+          it.path in [shim, second])
 
     test "independent sessions retain their own reads and nested child evidence":
       let nested = expandFilename(work) / "nested"

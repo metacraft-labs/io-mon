@@ -4476,6 +4476,32 @@ proc installBodypatchHooks(envp: ptr cstring) {.exportc: "repro_monitor_install_
 #include <xpc/xpc.h>
 
 static int repro_monitor_runtime_ready = 0;
+static int repro_macos_this_shim_constructed = 0;
+
+__attribute__((visibility("default")))
+int repro_macos_shim_is_constructed(void) {
+  return repro_macos_this_shim_constructed;
+}
+
+static int repro_macos_later_shim_is_pending(void) {
+  Dl_info self_di;
+  const struct mach_header *self_mh = NULL;
+  if (dladdr((const void *)&repro_macos_shim_is_constructed, &self_di)) {
+    self_mh = (const struct mach_header *)self_di.dli_fbase;
+  }
+  uint32_t count = _dyld_image_count();
+  for (uint32_t i = 0; i < count; i++) {
+    const struct mach_header *mh = _dyld_get_image_header(i);
+    if (mh == NULL || mh == self_mh) continue;
+    NSSymbol sym = NSLookupSymbolInImage(mh, "_repro_macos_shim_is_constructed",
+      NSLOOKUPSYMBOLINIMAGE_OPTION_BIND |
+      NSLOOKUPSYMBOLINIMAGE_OPTION_RETURN_ON_ERROR);
+    if (!sym) continue;
+    int (*fn)(void) = (int (*)(void))NSAddressOfSymbol(sym);
+    if (fn && fn != &repro_macos_shim_is_constructed && !fn()) return 1;
+  }
+  return 0;
+}
 
 /* The launch forwarders call this AFTER environment/path rewriting, which
  * can emit new sandbox path probes after the exec hook's first flush. Never
@@ -4488,6 +4514,13 @@ extern void NimMain(void);
 extern void repro_monitor_install_bodypatch(char **envp);
 extern int repro_monitor_shim_flush(void);
 extern void *repro_macos_resolve_libsystem_symbol(const char *symbol);
+extern void *repro_macos_real_opendir(char *path);
+extern void *repro_macos_real_readdir(void *dirp);
+extern int repro_macos_real_closedir(void *dirp);
+extern int repro_macos_real_copyfile_call(char *from, char *to, void *state,
+    uint32_t flags);
+extern int repro_macos_real_fcopyfile_call(int from, int to, void *state,
+    uint32_t flags);
 /* R-C: forwarders to the genuine libsystem bootstrap/XPC entries (defined in the
  * macos_interpose_runtime translation unit), used by the not-ready interpose
  * thunks below before the recording runtime is live. */
@@ -4665,7 +4698,8 @@ static int repro_wrap_open(const char *path, int flags, ...) {
     va_end(ap);
   }
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_open, path, flags, mode);
+    return (int)repro_macos_real_syscall(SYS_open, (long)path, flags, mode,
+                                         0, 0, 0, 0);
   }
   /* Interpose disabled (debug A/B): forward to the libsystem open entry (which
    * body-patch may have replaced) WITHOUT recording here. Pass `mode` as a
@@ -4692,7 +4726,8 @@ static int repro_wrap_openat(int dirfd, const char *path, int flags, ...) {
     va_end(ap);
   }
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_openat, dirfd, path, flags, mode);
+    return (int)repro_macos_real_syscall(SYS_openat, dirfd, (long)path, flags,
+                                         mode, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     repro_wrap_reentry++;
@@ -4705,7 +4740,8 @@ static int repro_wrap_openat(int dirfd, const char *path, int flags, ...) {
 
 static ssize_t repro_wrap_read(int fd, void *buf, size_t count) {
   if (!repro_monitor_runtime_ready) {
-    return syscall(SYS_read, fd, buf, count);
+    return (ssize_t)repro_macos_real_syscall(SYS_read, fd, (long)buf,
+                                             (long)count, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     repro_rw_fn fn = repro_libsystem_read();
@@ -4721,7 +4757,8 @@ static ssize_t repro_wrap_read(int fd, void *buf, size_t count) {
 
 static ssize_t repro_wrap_write(int fd, const void *buf, size_t count) {
   if (!repro_monitor_runtime_ready) {
-    return syscall(SYS_write, fd, buf, count);
+    return (ssize_t)repro_macos_real_syscall(SYS_write, fd, (long)buf,
+                                             (long)count, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     repro_rw_fn fn = repro_libsystem_write();
@@ -4737,7 +4774,7 @@ static ssize_t repro_wrap_write(int fd, const void *buf, size_t count) {
 
 static int repro_wrap_close(int fd) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_close, fd);
+    return (int)repro_macos_real_syscall(SYS_close, fd, 0, 0, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     repro_close_fn fn = repro_libsystem_close();
@@ -4761,14 +4798,14 @@ static int repro_wrap_close(int fd) {
  */
 static int repro_wrap_dup(int fd) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_dup, fd);
+    return (int)repro_macos_real_syscall(SYS_dup, fd, 0, 0, 0, 0, 0, 0);
   }
   return repro_hook_dup(fd);
 }
 
 static int repro_wrap_dup2(int oldfd, int newfd) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_dup2, oldfd, newfd);
+    return (int)repro_macos_real_syscall(SYS_dup2, oldfd, newfd, 0, 0, 0, 0, 0);
   }
   return repro_hook_dup2(oldfd, newfd);
 }
@@ -4788,7 +4825,8 @@ static int repro_wrap_fcntl(int fd, int cmd, ...) {
   void *arg = va_arg(ap, void *);
   va_end(ap);
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_fcntl, fd, cmd, arg);
+    return (int)repro_macos_real_syscall(SYS_fcntl, fd, cmd, (long)arg,
+                                         0, 0, 0, 0);
   }
   return repro_hook_fcntl(fd, cmd, arg);
 }
@@ -4868,9 +4906,10 @@ static void *repro_wrap_mmap(void *addr, size_t len, int prot, int flags,
  * intersects a file-backed MAP_SHARED mapping recorded by repro_hook_mmap.
  */
 static int repro_wrap_mprotect(void *addr, size_t len, int prot) {
-  int r = (int)syscall(SYS_mprotect, addr, len, prot);
+  int r = (int)repro_macos_real_syscall(SYS_mprotect, (long)addr, (long)len,
+                                        prot, 0, 0, 0, 0);
   int saved_errno = errno;
-  if (r == 0 && (prot & PROT_WRITE) != 0 &&
+  if (repro_monitor_runtime_ready && r == 0 && (prot & PROT_WRITE) != 0 &&
       repro_shared_mmap_overlaps(addr, len)) {
     repro_hook_mprotect_promote(addr, len, prot);
   }
@@ -4885,9 +4924,11 @@ static int repro_wrap_mprotect(void *addr, size_t len, int prot) {
  * prevents same-address reuse from inheriting stale path attribution.
  */
 static int repro_wrap_munmap(void *addr, size_t len) {
-  int r = (int)syscall(SYS_munmap, addr, len);
+  int r = (int)repro_macos_real_syscall(SYS_munmap, (long)addr, (long)len,
+                                        0, 0, 0, 0, 0);
   int saved_errno = errno;
-  if (r == 0 && repro_shared_mmap_overlaps(addr, len)) {
+  if (repro_monitor_runtime_ready && r == 0 &&
+      repro_shared_mmap_overlaps(addr, len)) {
     repro_shared_mmap_remove_overlaps(addr, len);
     repro_hook_munmap_cleanup(addr, len);
   }
@@ -4925,8 +4966,7 @@ static int (*repro_libsystem_execve_fn)(const char *, char *const [],
 
 static DIR *repro_wrap_opendir(const char *path) {
   if (!repro_monitor_runtime_ready) {
-    repro_real_opendir_fn real_fn = (repro_real_opendir_fn)dlsym(RTLD_NEXT, "opendir");
-    return real_fn(path);
+    return (DIR *)repro_macos_real_opendir((char *)path);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_opendir_fn)
@@ -4944,8 +4984,7 @@ static DIR *repro_wrap_opendir(const char *path) {
 
 static struct dirent *repro_wrap_readdir(DIR *dirp) {
   if (!repro_monitor_runtime_ready) {
-    repro_real_readdir_fn real_fn = (repro_real_readdir_fn)dlsym(RTLD_NEXT, "readdir");
-    return real_fn(dirp);
+    return (struct dirent *)repro_macos_real_readdir((void *)dirp);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_readdir_fn)
@@ -4963,8 +5002,7 @@ static struct dirent *repro_wrap_readdir(DIR *dirp) {
 
 static int repro_wrap_closedir(DIR *dirp) {
   if (!repro_monitor_runtime_ready) {
-    repro_real_closedir_fn real_fn = (repro_real_closedir_fn)dlsym(RTLD_NEXT, "closedir");
-    return real_fn(dirp);
+    return repro_macos_real_closedir((void *)dirp);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_closedir_fn)
@@ -4983,9 +5021,11 @@ static int repro_wrap_closedir(DIR *dirp) {
 static int repro_wrap_stat(const char *path, struct stat *buf) {
   if (!repro_monitor_runtime_ready) {
 #ifdef SYS_stat64
-    return (int)syscall(SYS_stat64, path, buf);
+    return (int)repro_macos_real_syscall(SYS_stat64, (long)path, (long)buf,
+                                         0, 0, 0, 0, 0);
 #else
-    return (int)syscall(SYS_stat, path, buf);
+    return (int)repro_macos_real_syscall(SYS_stat, (long)path, (long)buf,
+                                         0, 0, 0, 0, 0);
 #endif
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
@@ -5005,9 +5045,11 @@ static int repro_wrap_stat(const char *path, struct stat *buf) {
 static int repro_wrap_lstat(const char *path, struct stat *buf) {
   if (!repro_monitor_runtime_ready) {
 #ifdef SYS_lstat64
-    return (int)syscall(SYS_lstat64, path, buf);
+    return (int)repro_macos_real_syscall(SYS_lstat64, (long)path, (long)buf,
+                                         0, 0, 0, 0, 0);
 #else
-    return (int)syscall(SYS_lstat, path, buf);
+    return (int)repro_macos_real_syscall(SYS_lstat, (long)path, (long)buf,
+                                         0, 0, 0, 0, 0);
 #endif
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
@@ -5026,8 +5068,10 @@ static int repro_wrap_lstat(const char *path, struct stat *buf) {
 
 static pid_t repro_wrap_fork(void) {
   if (!repro_monitor_runtime_ready) {
-    repro_real_fork_fn real_fn = (repro_real_fork_fn)dlsym(RTLD_NEXT, "fork");
-    return real_fn();
+    if (!repro_libsystem_fork_fn)
+      repro_libsystem_fork_fn = (pid_t (*)(void))
+        repro_macos_resolve_libsystem_symbol("_fork");
+    return repro_libsystem_fork_fn ? repro_libsystem_fork_fn() : -1;
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_fork_fn)
@@ -5045,7 +5089,8 @@ static pid_t repro_wrap_fork(void) {
 
 static int repro_wrap_rename(const char *from, const char *to) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_rename, from, to);
+    return (int)repro_macos_real_syscall(SYS_rename, (long)from, (long)to,
+                                         0, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_rename_fn)
@@ -5064,7 +5109,8 @@ static int repro_wrap_rename(const char *from, const char *to) {
 static int repro_wrap_renameat(int fromfd, const char *from, int tofd,
                                const char *to) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_renameat, fromfd, from, tofd, to);
+    return (int)repro_macos_real_syscall(SYS_renameat, fromfd, (long)from,
+                                         tofd, (long)to, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_renameat_fn)
@@ -5087,7 +5133,8 @@ static int repro_wrap_renameat(int fromfd, const char *from, int tofd,
  * recording repro_hook_*, which forwards via the raw syscall. */
 static int repro_wrap_mkdir(const char *path, mode_t mode) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_mkdir, path, mode);
+    return (int)repro_macos_real_syscall(SYS_mkdir, (long)path, mode,
+                                         0, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_mkdir_fn)
@@ -5105,7 +5152,8 @@ static int repro_wrap_mkdir(const char *path, mode_t mode) {
 
 static int repro_wrap_mkdirat(int dirfd, const char *path, mode_t mode) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_mkdirat, dirfd, path, mode);
+    return (int)repro_macos_real_syscall(SYS_mkdirat, dirfd, (long)path, mode,
+                                         0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_mkdirat_fn)
@@ -5123,7 +5171,8 @@ static int repro_wrap_mkdirat(int dirfd, const char *path, mode_t mode) {
 
 static int repro_wrap_rmdir(const char *path) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_rmdir, path);
+    return (int)repro_macos_real_syscall(SYS_rmdir, (long)path,
+                                         0, 0, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_rmdir_fn)
@@ -5141,7 +5190,8 @@ static int repro_wrap_rmdir(const char *path) {
 
 static int repro_wrap_unlink(const char *path) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_unlink, path);
+    return (int)repro_macos_real_syscall(SYS_unlink, (long)path,
+                                         0, 0, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_unlink_fn)
@@ -5159,7 +5209,8 @@ static int repro_wrap_unlink(const char *path) {
 
 static int repro_wrap_unlinkat(int dirfd, const char *path, int flags) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_unlinkat, dirfd, path, flags);
+    return (int)repro_macos_real_syscall(SYS_unlinkat, dirfd, (long)path,
+                                         flags, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_unlinkat_fn)
@@ -5177,7 +5228,8 @@ static int repro_wrap_unlinkat(int dirfd, const char *path, int flags) {
 
 static int repro_wrap_symlink(const char *target, const char *linkpath) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_symlink, target, linkpath);
+    return (int)repro_macos_real_syscall(SYS_symlink, (long)target,
+                                         (long)linkpath, 0, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_symlink_fn)
@@ -5196,7 +5248,8 @@ static int repro_wrap_symlink(const char *target, const char *linkpath) {
 static int repro_wrap_symlinkat(const char *target, int dirfd,
                                 const char *linkpath) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_symlinkat, target, dirfd, linkpath);
+    return (int)repro_macos_real_syscall(SYS_symlinkat, (long)target, dirfd,
+                                         (long)linkpath, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_symlinkat_fn)
@@ -5214,7 +5267,8 @@ static int repro_wrap_symlinkat(const char *target, int dirfd,
 
 static int repro_wrap_execve(const char *path, char *const argv[], char *const envp[]) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_execve, path, argv, envp);
+    return (int)repro_macos_real_syscall(SYS_execve, (long)path, (long)argv,
+                                         (long)envp, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_execve_fn)
@@ -5246,7 +5300,7 @@ static void repro_wrap_exit_(int status) {
   if (repro_monitor_runtime_ready) {
     repro_hook_exit(status); /* flushes, then raw SYS_exit — never returns */
   }
-  syscall(SYS_exit, status);
+  (void)repro_macos_real_syscall(SYS_exit, status, 0, 0, 0, 0, 0, 0);
   __builtin_unreachable();
 }
 
@@ -5258,9 +5312,12 @@ static int repro_wrap_posix_spawn(pid_t *pid, const char *path,
   const posix_spawnattr_t *attrp,
   char *const argv[], char *const envp[]) {
   if (!repro_monitor_runtime_ready) {
-    repro_real_posix_spawn_fn real_fn =
-      (repro_real_posix_spawn_fn)dlsym(RTLD_NEXT, "posix_spawn");
-    return real_fn(pid, path, file_actions, attrp, argv, envp);
+    if (!repro_libsystem_posix_spawn_fn)
+      repro_libsystem_posix_spawn_fn = (repro_real_posix_spawn_fn)
+        repro_macos_resolve_libsystem_symbol("_posix_spawn");
+    return repro_libsystem_posix_spawn_fn
+      ? repro_libsystem_posix_spawn_fn(pid, path, file_actions, attrp, argv, envp)
+      : -1;
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_posix_spawn_fn)
@@ -5283,9 +5340,12 @@ static int repro_wrap_posix_spawnp(pid_t *pid, const char *path,
   const posix_spawnattr_t *attrp,
   char *const argv[], char *const envp[]) {
   if (!repro_monitor_runtime_ready) {
-    repro_real_posix_spawn_fn real_fn =
-      (repro_real_posix_spawn_fn)dlsym(RTLD_NEXT, "posix_spawnp");
-    return real_fn(pid, path, file_actions, attrp, argv, envp);
+    if (!repro_libsystem_posix_spawnp_fn)
+      repro_libsystem_posix_spawnp_fn = (repro_real_posix_spawn_fn)
+        repro_macos_resolve_libsystem_symbol("_posix_spawnp");
+    return repro_libsystem_posix_spawnp_fn
+      ? repro_libsystem_posix_spawnp_fn(pid, path, file_actions, attrp, argv, envp)
+      : -1;
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_posix_spawnp_fn)
@@ -5319,7 +5379,8 @@ static int repro_wrap_posix_spawnp(pid_t *pid, const char *path,
  */
 static int repro_wrap_clonefile(const char *src, const char *dst, int flags) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_clonefileat, AT_FDCWD, src, AT_FDCWD, dst, flags);
+    return (int)repro_macos_real_syscall(SYS_clonefileat, AT_FDCWD, (long)src,
+                                         AT_FDCWD, (long)dst, flags, 0, 0);
   }
   return repro_hook_clonefile((char *)src, (char *)dst, flags);
 }
@@ -5327,7 +5388,8 @@ static int repro_wrap_clonefile(const char *src, const char *dst, int flags) {
 static int repro_wrap_clonefileat(int srcfd, const char *src, int dstfd,
                                   const char *dst, int flags) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_clonefileat, srcfd, src, dstfd, dst, flags);
+    return (int)repro_macos_real_syscall(SYS_clonefileat, srcfd, (long)src,
+                                         dstfd, (long)dst, flags, 0, 0);
   }
   return repro_hook_clonefileat(srcfd, (char *)src, dstfd, (char *)dst, flags);
 }
@@ -5335,14 +5397,16 @@ static int repro_wrap_clonefileat(int srcfd, const char *src, int dstfd,
 static int repro_wrap_fclonefileat(int srcfd, int dstfd, const char *dst,
                                    int flags) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_fclonefileat, srcfd, dstfd, dst, flags);
+    return (int)repro_macos_real_syscall(SYS_fclonefileat, srcfd, dstfd,
+                                         (long)dst, flags, 0, 0, 0);
   }
   return repro_hook_fclonefileat(srcfd, dstfd, (char *)dst, flags);
 }
 
 static int repro_wrap_link(const char *src, const char *dst) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_link, src, dst);
+    return (int)repro_macos_real_syscall(SYS_link, (long)src, (long)dst,
+                                         0, 0, 0, 0, 0);
   }
   return repro_hook_link((char *)src, (char *)dst);
 }
@@ -5350,7 +5414,8 @@ static int repro_wrap_link(const char *src, const char *dst) {
 static int repro_wrap_linkat(int fd1, const char *src, int fd2,
                              const char *dst, int flag) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_linkat, fd1, src, fd2, dst, flag);
+    return (int)repro_macos_real_syscall(SYS_linkat, fd1, (long)src, fd2,
+                                         (long)dst, flag, 0, 0);
   }
   return repro_hook_linkat(fd1, (char *)src, fd2, (char *)dst, flag);
 }
@@ -5358,10 +5423,8 @@ static int repro_wrap_linkat(int fd1, const char *src, int fd2,
 static int repro_wrap_copyfile(const char *from, const char *to,
                                copyfile_state_t state, copyfile_flags_t flags) {
   if (!repro_monitor_runtime_ready) {
-    int (*real)(const char *, const char *, copyfile_state_t, copyfile_flags_t)
-      = (int (*)(const char *, const char *, copyfile_state_t,
-                 copyfile_flags_t))dlsym(RTLD_NEXT, "copyfile");
-    return real ? real(from, to, state, flags) : -1;
+    return repro_macos_real_copyfile_call((char *)from, (char *)to,
+                                          (void *)state, (uint32_t)flags);
   }
   return repro_hook_copyfile((char *)from, (char *)to, (void *)state,
     (uint32_t)flags);
@@ -5370,10 +5433,8 @@ static int repro_wrap_copyfile(const char *from, const char *to,
 static int repro_wrap_fcopyfile(int from, int to, copyfile_state_t state,
                                 copyfile_flags_t flags) {
   if (!repro_monitor_runtime_ready) {
-    int (*real)(int, int, copyfile_state_t, copyfile_flags_t)
-      = (int (*)(int, int, copyfile_state_t, copyfile_flags_t))
-          dlsym(RTLD_NEXT, "fcopyfile");
-    return real ? real(from, to, state, flags) : -1;
+    return repro_macos_real_fcopyfile_call(from, to, (void *)state,
+                                           (uint32_t)flags);
   }
   return repro_hook_fcopyfile(from, to, (void *)state, (uint32_t)flags);
 }
@@ -5381,7 +5442,8 @@ static int repro_wrap_fcopyfile(int from, int to, copyfile_state_t state,
 static int repro_wrap_getattrlist(const char *path, void *al, void *buf,
                                   size_t size, unsigned long opts) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_getattrlist, path, al, buf, size, opts);
+    return (int)repro_macos_real_syscall(SYS_getattrlist, (long)path, (long)al,
+                                         (long)buf, (long)size, (long)opts, 0, 0);
   }
   return repro_hook_getattrlist((char *)path, al, buf, size, opts);
 }
@@ -5389,7 +5451,9 @@ static int repro_wrap_getattrlist(const char *path, void *al, void *buf,
 static int repro_wrap_getattrlistat(int fd, const char *path, void *al,
                                     void *buf, size_t size, unsigned long opts) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_getattrlistat, fd, path, al, buf, size, opts);
+    return (int)repro_macos_real_syscall(SYS_getattrlistat, fd, (long)path,
+                                         (long)al, (long)buf, (long)size,
+                                         (long)opts, 0);
   }
   return repro_hook_getattrlistat(fd, (char *)path, al, buf, size, opts);
 }
@@ -5397,7 +5461,8 @@ static int repro_wrap_getattrlistat(int fd, const char *path, void *al,
 static int repro_wrap_fgetattrlist(int fd, void *al, void *buf, size_t size,
                                    unsigned long opts) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_fgetattrlist, fd, al, buf, size, opts);
+    return (int)repro_macos_real_syscall(SYS_fgetattrlist, fd, (long)al,
+                                         (long)buf, (long)size, (long)opts, 0, 0);
   }
   return repro_hook_fgetattrlist(fd, al, buf, size, opts);
 }
@@ -5405,7 +5470,8 @@ static int repro_wrap_fgetattrlist(int fd, void *al, void *buf, size_t size,
 static int repro_wrap_getattrlistbulk(int dirfd, void *al, void *buf,
                                       size_t size, uint64_t opts) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_getattrlistbulk, dirfd, al, buf, size, opts);
+    return (int)repro_macos_real_syscall(SYS_getattrlistbulk, dirfd, (long)al,
+                                         (long)buf, (long)size, (long)opts, 0, 0);
   }
   return repro_hook_getattrlistbulk(dirfd, al, buf, size, opts);
 }
@@ -5423,7 +5489,8 @@ static int repro_wrap_getattrlistbulk(int dirfd, void *al, void *buf,
 static int repro_wrap_connect(int fd, const struct sockaddr *addr,
                               socklen_t addrlen) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_connect, fd, addr, addrlen);
+    return (int)repro_macos_real_syscall(SYS_connect, fd, (long)addr,
+                                         addrlen, 0, 0, 0, 0);
   }
   return repro_hook_connect(fd, (void *)addr, (unsigned int)addrlen);
 }
@@ -5446,19 +5513,22 @@ static int repro_wrap_pipe(int fds[2]) {
 static int repro_wrap_socketpair(int domain, int type, int protocol,
                                  int sv[2]) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_socketpair, domain, type, protocol, sv);
+    return (int)repro_macos_real_syscall(SYS_socketpair, domain, type, protocol,
+                                         (long)sv, 0, 0, 0);
   }
   return repro_hook_socketpair(domain, type, protocol, sv);
 }
 static int repro_wrap_socket(int domain, int type, int protocol) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_socket, domain, type, protocol);
+    return (int)repro_macos_real_syscall(SYS_socket, domain, type, protocol,
+                                         0, 0, 0, 0);
   }
   return repro_hook_socket(domain, type, protocol);
 }
 static int repro_wrap_accept(int s, struct sockaddr *addr, socklen_t *addrlen) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_accept, s, addr, addrlen);
+    return (int)repro_macos_real_syscall(SYS_accept, s, (long)addr,
+                                         (long)addrlen, 0, 0, 0, 0);
   }
   return repro_hook_accept(s, (void *)addr, (unsigned int *)addrlen);
 }
@@ -5469,8 +5539,7 @@ static int repro_wrap_accept(int s, struct sockaddr *addr, socklen_t *addrlen) {
  * runtime is live, then branch to the recording repro_hook_*. These are
  * INTERPOSE-ONLY (bootstrap_look_up / xpc_connection_create_mach_service are not
  * thin syscall wrappers and are not body-patched), so the not-ready forward uses
- * the shim-skipping genuine-entry forwarder (which itself falls back to
- * dlsym(RTLD_NEXT) so the program never breaks). Like the other hardening thunks
+ * the shim-skipping genuine-entry forwarder. Like the other hardening thunks
  * they omit the debug-only interpose-DISABLE A/B forward.
  */
 static kern_return_t repro_wrap_bootstrap_look_up(mach_port_t bp,
@@ -5488,7 +5557,7 @@ static xpc_connection_t repro_wrap_xpc_connection_create_mach_service(
       (char *)name, (void *)targetq, (unsigned long long)flags);
   }
   return (xpc_connection_t)repro_hook_xpc_connection_create_mach_service(
-    (char *)name, (void *)targetq, (unsigned long long)flags);
+     (char *)name, (void *)targetq, (unsigned long long)flags);
 }
 
 /*
@@ -5648,7 +5717,7 @@ static time_t repro_wrap_time(time_t *tloc) {
 static int repro_wrap_secrandom(const void *rnd, size_t count, void *bytes) {
   void *ra = __builtin_return_address(0);
   if (!repro_monitor_runtime_ready)
-    return repro_macos_real_secrandom_call(rnd, count, bytes);
+    return repro_macos_real_secrandom_call((void *)rnd, count, bytes);
   return repro_hook_secrandom((void *)rnd, count, bytes, ra);
 }
 
@@ -5666,7 +5735,8 @@ static int repro_wrap_ccrandom(void *bytes, size_t count) {
  * (interpose + body-patch) share the recording hook. */
 static int repro_wrap_statfs(const char *path, struct statfs *buf) {
   if (!repro_monitor_runtime_ready)
-    return (int)syscall(SYS_statfs64, path, buf);
+    return (int)repro_macos_real_syscall(SYS_statfs64, (long)path, (long)buf,
+                                         0, 0, 0, 0, 0);
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_statfs_fn)
       repro_libsystem_statfs_fn = (int (*)(const char *, struct statfs *))
@@ -5686,7 +5756,8 @@ static int repro_wrap_statfs(const char *path, struct statfs *buf) {
 
 static int repro_wrap_fstatfs(int fd, struct statfs *buf) {
   if (!repro_monitor_runtime_ready)
-    return (int)syscall(SYS_fstatfs64, fd, buf);
+    return (int)repro_macos_real_syscall(SYS_fstatfs64, fd, (long)buf,
+                                         0, 0, 0, 0, 0);
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_fstatfs_fn)
       repro_libsystem_fstatfs_fn = (int (*)(int, struct statfs *))
@@ -5714,53 +5785,58 @@ static int repro_wrap_fstatfs(int fd, struct statfs *buf) {
 static ssize_t repro_wrap_getxattr(const char *path, const char *name,
     void *value, size_t size, uint32_t position, int options) {
   if (!repro_monitor_runtime_ready)
-    return (ssize_t)syscall(SYS_getxattr, path, name, value, size, position,
-      options);
+    return (ssize_t)repro_macos_real_syscall(SYS_getxattr, (long)path,
+      (long)name, (long)value, (long)size, position, options, 0);
   return repro_hook_getxattr((char *)path, (char *)name, value, size, position,
     options);
 }
 static ssize_t repro_wrap_fgetxattr(int fd, const char *name, void *value,
     size_t size, uint32_t position, int options) {
   if (!repro_monitor_runtime_ready)
-    return (ssize_t)syscall(SYS_fgetxattr, fd, name, value, size, position,
-      options);
+    return (ssize_t)repro_macos_real_syscall(SYS_fgetxattr, fd, (long)name,
+      (long)value, (long)size, position, options, 0);
   return repro_hook_fgetxattr(fd, (char *)name, value, size, position, options);
 }
 static ssize_t repro_wrap_listxattr(const char *path, char *namebuf,
     size_t size, int options) {
   if (!repro_monitor_runtime_ready)
-    return (ssize_t)syscall(SYS_listxattr, path, namebuf, size, options);
+    return (ssize_t)repro_macos_real_syscall(SYS_listxattr, (long)path,
+      (long)namebuf, (long)size, options, 0, 0, 0);
   return repro_hook_listxattr((char *)path, namebuf, size, options);
 }
 static ssize_t repro_wrap_flistxattr(int fd, char *namebuf, size_t size,
     int options) {
   if (!repro_monitor_runtime_ready)
-    return (ssize_t)syscall(SYS_flistxattr, fd, namebuf, size, options);
+    return (ssize_t)repro_macos_real_syscall(SYS_flistxattr, fd,
+      (long)namebuf, (long)size, options, 0, 0, 0);
   return repro_hook_flistxattr(fd, namebuf, size, options);
 }
 static int repro_wrap_setxattr(const char *path, const char *name, void *value,
     size_t size, uint32_t position, int options) {
   if (!repro_monitor_runtime_ready)
-    return (int)syscall(SYS_setxattr, path, name, value, size, position,
-      options);
+    return (int)repro_macos_real_syscall(SYS_setxattr, (long)path, (long)name,
+      (long)value, (long)size, position, options, 0);
   return repro_hook_setxattr((char *)path, (char *)name, value, size, position,
     options);
 }
 static int repro_wrap_fsetxattr(int fd, const char *name, void *value,
     size_t size, uint32_t position, int options) {
   if (!repro_monitor_runtime_ready)
-    return (int)syscall(SYS_fsetxattr, fd, name, value, size, position, options);
+    return (int)repro_macos_real_syscall(SYS_fsetxattr, fd, (long)name,
+      (long)value, (long)size, position, options, 0);
   return repro_hook_fsetxattr(fd, (char *)name, value, size, position, options);
 }
 static int repro_wrap_removexattr(const char *path, const char *name,
     int options) {
   if (!repro_monitor_runtime_ready)
-    return (int)syscall(SYS_removexattr, path, name, options);
+    return (int)repro_macos_real_syscall(SYS_removexattr, (long)path,
+      (long)name, options, 0, 0, 0, 0);
   return repro_hook_removexattr((char *)path, (char *)name, options);
 }
 static int repro_wrap_fremovexattr(int fd, const char *name, int options) {
   if (!repro_monitor_runtime_ready)
-    return (int)syscall(SYS_fremovexattr, fd, name, options);
+    return (int)repro_macos_real_syscall(SYS_fremovexattr, fd, (long)name,
+      options, 0, 0, 0, 0);
   return repro_hook_fremovexattr(fd, (char *)name, options);
 }
 
@@ -5776,31 +5852,36 @@ static int repro_wrap_shm_open(const char *name, int oflag, ...) {
     va_end(ap);
   }
   if (!repro_monitor_runtime_ready)
-    return (int)syscall(SYS_shm_open, name, oflag, mode);
+    return (int)repro_macos_real_syscall(SYS_shm_open, (long)name, oflag,
+      mode, 0, 0, 0, 0);
   return repro_hook_shm_open((char *)name, oflag, mode);
 }
 
 static int repro_wrap_sendfile(int fd, int s, off_t offset, off_t *len,
     void *hdtr, int flags) {
   if (!repro_monitor_runtime_ready)
-    return (int)syscall(SYS_sendfile, fd, s, offset, len, hdtr, flags);
+    return (int)repro_macos_real_syscall(SYS_sendfile, fd, s, (long)offset,
+      (long)len, (long)hdtr, flags, 0);
   return repro_hook_sendfile(fd, s, (long long)offset, (long long *)len, hdtr,
     flags);
 }
 static ssize_t repro_wrap_pread(int fd, void *buf, size_t count, off_t offset) {
   if (!repro_monitor_runtime_ready)
-    return (ssize_t)syscall(SYS_pread, fd, buf, count, offset);
+    return (ssize_t)repro_macos_real_syscall(SYS_pread, fd, (long)buf,
+      (long)count, (long)offset, 0, 0, 0);
   return repro_hook_pread(fd, buf, count, (long long)offset);
 }
 static ssize_t repro_wrap_preadv(int fd, const struct iovec *iov, int iovcnt,
     off_t offset) {
   if (!repro_monitor_runtime_ready)
-    return (ssize_t)syscall(SYS_preadv, fd, iov, iovcnt, offset);
+    return (ssize_t)repro_macos_real_syscall(SYS_preadv, fd, (long)iov,
+      iovcnt, (long)offset, 0, 0, 0);
   return repro_hook_preadv(fd, (void *)iov, iovcnt, (long long)offset);
 }
 static ssize_t repro_wrap_readv(int fd, const struct iovec *iov, int iovcnt) {
   if (!repro_monitor_runtime_ready)
-    return (ssize_t)syscall(SYS_readv, fd, iov, iovcnt);
+    return (ssize_t)repro_macos_real_syscall(SYS_readv, fd, (long)iov,
+      iovcnt, 0, 0, 0, 0);
   return repro_hook_readv(fd, (void *)iov, iovcnt);
 }
 
@@ -5810,28 +5891,33 @@ static ssize_t repro_wrap_readv(int fd, const struct iovec *iov, int iovcnt) {
 static ssize_t repro_wrap_pwrite(int fd, const void *buf, size_t count,
     off_t offset) {
   if (!repro_monitor_runtime_ready)
-    return (ssize_t)syscall(SYS_pwrite, fd, buf, count, offset);
+    return (ssize_t)repro_macos_real_syscall(SYS_pwrite, fd, (long)buf,
+      (long)count, (long)offset, 0, 0, 0);
   return repro_hook_pwrite(fd, (void *)buf, count, (long long)offset);
 }
 static ssize_t repro_wrap_pwritev(int fd, const struct iovec *iov, int iovcnt,
     off_t offset) {
   if (!repro_monitor_runtime_ready)
-    return (ssize_t)syscall(SYS_pwritev, fd, iov, iovcnt, offset);
+    return (ssize_t)repro_macos_real_syscall(SYS_pwritev, fd, (long)iov,
+      iovcnt, (long)offset, 0, 0, 0);
   return repro_hook_pwritev(fd, (void *)iov, iovcnt, (long long)offset);
 }
 static ssize_t repro_wrap_writev(int fd, const struct iovec *iov, int iovcnt) {
   if (!repro_monitor_runtime_ready)
-    return (ssize_t)syscall(SYS_writev, fd, iov, iovcnt);
+    return (ssize_t)repro_macos_real_syscall(SYS_writev, fd, (long)iov,
+      iovcnt, 0, 0, 0, 0);
   return repro_hook_writev(fd, (void *)iov, iovcnt);
 }
 static int repro_wrap_ftruncate(int fd, off_t length) {
   if (!repro_monitor_runtime_ready)
-    return (int)syscall(SYS_ftruncate, fd, length);
+    return (int)repro_macos_real_syscall(SYS_ftruncate, fd, (long)length,
+      0, 0, 0, 0, 0);
   return repro_hook_ftruncate(fd, (long long)length);
 }
 static int repro_wrap_truncate(const char *path, off_t length) {
   if (!repro_monitor_runtime_ready)
-    return (int)syscall(SYS_truncate, path, length);
+    return (int)repro_macos_real_syscall(SYS_truncate, (long)path, (long)length,
+      0, 0, 0, 0, 0);
   return repro_hook_truncate((char *)path, (long long)length);
 }
 
@@ -5882,6 +5968,23 @@ extern void reproRuntimeInit(char **envp);
 
 __attribute__((constructor))
 static void repro_monitor_shim_constructor(int argc, const char **argv, char **envp) {
+  /*
+   * When nested monitoring loads multiple distinct shim images via
+   * DYLD_INSERT_LIBRARIES=<shimA>:<shimB>, dyld applies each image's
+   * __DATA,__interpose table in order so the LAST shim image (`shimB`) wins the
+   * monitored program's Mach-O import stubs, while dyld runs constructors in
+   * load order (`shimA` first, `shimB` last). If both shims initialised their
+   * Nim runtime, fragment writer, and body-patch hooks, both would open the same
+   * `<pid>-<tid>.iomon-frag` file and overwrite each other's libSystem
+   * prologues. Mark this image constructed and yield if another loaded shim
+   * image has not run its constructor yet, so only the last shim image (`shimB`,
+   * which owns the program's interpose bindings) activates while earlier shim
+   * images remain pure pass-throughs (`repro_monitor_runtime_ready == 0`).
+   */
+  repro_macos_this_shim_constructed = 1;
+  if (repro_macos_later_shim_is_pending()) {
+    return;
+  }
   NimMain();
   reproRuntimeInit(envp);
   repro_monitor_runtime_ready = 1;
