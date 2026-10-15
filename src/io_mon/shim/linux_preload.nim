@@ -3693,8 +3693,9 @@ proc repro_linux_raw_fork_sample(): cint {.cdecl, raises: [].} =
 
 proc repro_linux_raw_fork_child(parentSingleThreaded: cint)
     {.cdecl, raises: [].} =
-  ## In the child of a raw fork-like system call, which ran no atfork
-  ## handlers. A multi-threaded parent may have held any shim lock at that
+  ## In the child of a raw fork-like system call (through syscall(2), an
+  ## inline `syscall` the trap handler replays, or glibc's clone(3) without
+  ## CLONE_VM), which ran no atfork handlers. A multi-threaded parent may have held any shim lock at that
   ## instant, so the child skips monitor bookkeeping until exec, as the child
   ## of a libc fork does (`repro_hook_fork`); recording the clone itself
   ## would otherwise wait on such a lock forever. A single-threaded parent's
@@ -3725,6 +3726,20 @@ proc ct_linux_preload_register_exec_env(prepare, release: pointer)
 ct_linux_preload_register_exec_env(cast[pointer](repro_linux_exec_env_for),
   cast[pointer](repro_linux_exec_env_release))
 
+proc emitExecAttempt(path: cstring; envp: cstringArray) {.raises: [].} =
+  ## The exec record, and a loss when the child's capture route is invalid.
+  ## A proc of its own so that everything it allocates is freed before the
+  ## exec: a successful exec never returns to the hook, and after vfork the
+  ## hook's frame and heap are the suspended parent's, so anything still live
+  ## across the exec would be leaked into the parent once per exec.
+  var record = baseRecord(mrProcessExec, moExecute)
+  if path != nil:
+    record.path = $path
+  emitRecord(record)
+  let routeStatus = childCaptureRouteStatus(envp)
+  if routeStatus != 0:
+    emitEventLoss("linux child capture route invalid code=" & $routeStatus)
+
 proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
   sampleKillDiag("execve-enter")
   if shouldBypass():
@@ -3732,10 +3747,7 @@ proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
-  var record = baseRecord(mrProcessExec, moExecute)
-  if ctx.path != nil:
-    record.path = $ctx.path
-  emitRecord(record)
+  emitExecAttempt(ctx.path, ctx.envp)
   # io-mon-Lossless-Event-Capture M3 — inject LD_PRELOAD AND an INCREMENTED exec
   # generation into the child env. exec replaces the address space in the SAME
   # pid, so without a per-exec generation a same-image re-exec (the Nix
@@ -3743,10 +3755,10 @@ proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
   # that the SET source-dedup collapses → execs>=starts → mrEventLoss →
   # mcIncomplete. The PATH-searching exec family (execvp/execlp/execvpe) gets
   # the same prepared environment through `repro_linux_exec_env_for`; the
-  # process's own `environ` is never replaced.
-  let routeStatus = childCaptureRouteStatus(ctx.envp)
-  if routeStatus != 0:
-    emitEventLoss("linux child capture route invalid code=" & $routeStatus)
+  # process's own `environ` is never replaced. Nothing allocated here may
+  # stay live across `callNext` (see `emitExecAttempt`); the prepared
+  # environment is released by the resuming parent after a vfork child's
+  # successful exec (`ct_exec_env_pending`).
   let originalEnv = ctx.envp
   let preparedEnv = envWithExecGen(ctx.envp, currentExecGen + 1)
   ctx.envp = preparedEnv
@@ -3854,6 +3866,122 @@ proc repro_linux_observe_probe(dirfd: cint; path: cstring; rc: cint)
     return
   ensureInitializedPreservingErrno()
   emitProbe(path, (if rc >= 0: 0.cint else: -1.cint), dirfd)
+
+proc linuxLstatKind(path: cstring): cint
+  {.importc: "ct_linux_preload_lstat_kind", raises: [].}
+proc linuxRealReadlink(path: cstring; buf: pointer; size: csize_t): clong
+  {.importc: "ct_linux_preload_real_readlink", raises: [].}
+
+const LinuxMaxSymlinkHops = 40
+  ## glibc's MAXSYMLINKS / the kernel's limit; a walk past it is a loop that
+  ## realpath itself reports as ELOOP.
+
+proc unnormalizedPathForAt(dirfd: cint; path: cstring): string
+    {.raises: [].} =
+  ## `path` made absolute against `dirfd` (or the working directory) by plain
+  ## concatenation, "" when the base is unknown. Unlike `pathForAt`, whose
+  ## `os./` collapses `..` lexically, this keeps every component as spelled:
+  ## in `link/../x` the kernel resolves `..` against where `link` POINTS, so
+  ## dropping `link` before the walk would resolve a different path.
+  let raw = $path
+  if raw.isAbsolute:
+    return raw
+  var base = ""
+  if dirfd == LinuxAtFdcwd:
+    # Heap, not a stack array — see `hookScratchString`.
+    var cwdBuf = hookScratchString()
+    let n = c_raw_syscall6(LinuxSysGetcwd,
+      cast[clong](addr cwdBuf[0]), clong(cwdBuf.len), 0, 0, 0, 0)
+    if n > 0:
+      base = $cast[cstring](addr cwdBuf[0])
+  else:
+    base = pathForFd(dirfd)
+  if not base.isAbsolute:
+    return ""
+  base & "/" & raw
+
+proc pushResolutionComponents(pending: var seq[string]; spelled: string)
+    {.raises: [].} =
+  ## Queue the components of `spelled` so that the first is popped next.
+  let parts = spelled.split('/')
+  for i in countdown(parts.high, 0):
+    if parts[i].len > 0 and parts[i] != ".":
+      pending.add parts[i]
+
+proc repro_linux_observe_resolution(dirfd: cint; path: cstring;
+                                    followFinal: cint) {.cdecl, raises: [].} =
+  ## realpath, canonicalize_file_name and the readlink family resolve their
+  ## path inside libc, so no interposition sees the symbolic links on the way.
+  ## Replay that resolution (unrecorded lstat/readlink) and record what it
+  ## depends on: each link met, as a probe whose detail carries its target,
+  ## and the path the walk ends at, as a probe (absent when it is). The final
+  ## component is followed only when `followFinal` is set (realpath); readlink
+  ## reads the link itself, so for it only the directories before the last
+  ## component are resolved. See path_resolution(7).
+  if shouldBypass() or path == nil or path[0] == '\0':
+    return
+  ensureInitializedPreservingErrno()
+  let start = unnormalizedPathForAt(dirfd, path)
+  if start.len == 0:
+    return
+  # Components still to resolve, last one first, so `pop` takes the next.
+  var pending: seq[string] = @[]
+  pushResolutionComponents(pending, start)
+  var resolved = ""   # "" is the root directory
+  var hops = 0
+  var sawLink = false
+  var target = hookScratchString()
+  while pending.len > 0:
+    let component = pending.pop()
+    if component == "..":
+      let cut = resolved.rfind('/')
+      resolved = if cut <= 0: "" else: resolved[0 ..< cut]
+      continue
+    let candidate = resolved & "/" & component
+    let isFinal = pending.len == 0
+    if isFinal and followFinal == 0:
+      # readlink reads this name itself rather than following it.
+      resolved = candidate
+      break
+    let kind = linuxLstatKind(cstring(candidate))
+    if kind < 0:
+      # The walk stops where realpath fails: this name is part of the answer.
+      if sawLink:
+        emitProbe(cstring(candidate), -1.cint)
+      return
+    if kind == 0:
+      resolved = candidate
+      continue
+    inc hops
+    if hops > LinuxMaxSymlinkHops:
+      return
+    let n = linuxRealReadlink(cstring(candidate), addr target[0],
+      csize_t(target.len - 1))
+    if n <= 0:
+      return
+    let link = target[0 ..< int(n)]
+    sawLink = true
+    var record = baseRecord(mrPathProbe, moPathProbe)
+    record.result = 0
+    record.probeResult = probeFromResult(0)
+    record.path = candidate
+    record.detail = "symlink target=" & link
+    emitRecord(record)
+    if link.startsWith("/"):
+      resolved = ""
+    pushResolutionComponents(pending, link)
+  if sawLink:
+    # The walk's end: realpath's answer, or the name readlink reads. Its
+    # existence is looked up rather than assumed, because readlink's last
+    # component is never examined above and may well be absent.
+    let final = if resolved.len == 0: "/" else: resolved
+    let finalKind = linuxLstatKind(cstring(final))
+    emitProbe(cstring(final), (if finalKind >= 0: 0.cint else: -1.cint))
+
+proc ct_linux_preload_register_resolution_observer(observer: pointer)
+  {.importc, cdecl, raises: [].}
+ct_linux_preload_register_resolution_observer(
+  cast[pointer](repro_linux_observe_resolution))
 
 proc repro_linux_observe_enumerate(dirfd: cint; path: cstring; rc: cint)
     {.cdecl, raises: [].} =

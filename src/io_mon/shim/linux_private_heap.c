@@ -54,9 +54,10 @@
  *     clone() that runs no atfork handlers. fork() is covered by
  *     pthread_atfork (prepare takes every class lock, parent and child
  *     release them, and the child then reclaims any lock still held). The
- *     raw clone()s the shim observes (its syscall(2) replacement and the
- *     inline-syscall trap) call repro_linux_private_heap_after_raw_fork_child
- *     in the child, which reclaims every held lock. A reclaimed class's free
+ *     clone()s the shim observes (its syscall(2) replacement, the
+ *     inline-syscall trap and its interposition of glibc's clone(3)) call
+ *     repro_linux_private_heap_after_raw_fork_child in the child, which
+ *     reclaims every held lock. A reclaimed class's free
  *     list and bump region are abandoned (leaked), never trusted: the vanished
  *     holder may have been halfway through updating them;
  *   - anything else, for instance a raw clone() the shim cannot see: a waiter

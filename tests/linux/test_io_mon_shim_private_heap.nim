@@ -24,10 +24,13 @@
 ##      caller by a bounded time and none after it.
 ##   2. `t_private_heap_survives_signals_forks_and_raw_clones` — a host whose
 ##      threads make hooked calls in a loop while a profiling timer runs a
-##      signal handler making hooked calls, one thread forks and another
-##      raw-clones (syscall(SYS_clone)) children that make hooked calls. It
-##      must finish, preloaded and under `io-mon run`, with every child
-##      exiting, within its time limit.
+##      signal handler making hooked calls, and other threads create children
+##      that make hooked calls, by every route a process can be created
+##      without CLONE_VM: fork(), syscall(SYS_clone), an inline `syscall`
+##      instruction issuing clone (which the shim reaches only through its
+##      inline-syscall trap; x86_64), and glibc's clone(3) wrapper (whose
+##      system call is made inside libc). It must finish, preloaded and under
+##      `io-mon run`, with every child exiting, within its time limit.
 ##
 ## Mocks: none. The hosts are real programs and the shim is the built
 ## library; the selftest forges lock states because the races it stands in
@@ -111,6 +114,7 @@ const stressHostSource = """
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -125,7 +129,8 @@ const stressHostSource = """
 
 static const char *file;
 static atomic_int stop, failed;
-static atomic_long calls, signals_seen, forks, clones;
+static atomic_long calls, signals_seen, forks, clones, inline_clones,
+    libc_clones;
 
 /* Hooked calls the shim records, and nothing that allocates from the host's
  * allocator: they also run in raw-clone children, where glibc's own malloc
@@ -215,6 +220,63 @@ static void *cloner(void *arg) {
   return NULL;
 }
 
+#if defined(__x86_64__)
+/* clone(SIGCHLD) issued by a `syscall` instruction in this program, not by
+ * libc: the shim sees it only by trapping the instruction. With no new stack
+ * the child resumes here on its copy of this stack, like fork(). */
+static long inline_clone(void) {
+  register long rax __asm__("rax") = SYS_clone;
+  register long rdi __asm__("rdi") = SIGCHLD;
+  register long rsi __asm__("rsi") = 0;
+  register long rdx __asm__("rdx") = 0;
+  register long r10 __asm__("r10") = 0;
+  register long r8 __asm__("r8") = 0;
+  __asm__ volatile("syscall"
+                   : "+r"(rax)
+                   : "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10), "r"(r8)
+                   : "rcx", "r11", "memory");
+  return rax;
+}
+
+static void *inline_cloner(void *arg) {
+  (void)arg;
+  while (!atomic_load(&stop)) {
+    long pid = inline_clone();
+    if (pid == 0) {
+      for (int i = 0; i < 3; ++i) hooked_calls();
+      syscall(SYS_exit_group, 0);
+    }
+    if (pid < 0) { atomic_store(&failed, 1); return NULL; }
+    reap((pid_t)pid, "inline clone");
+    atomic_fetch_add(&inline_clones, 1);
+  }
+  return NULL;
+}
+#endif
+
+/* glibc's clone(3) without CLONE_VM: a process whose clone system call is
+ * made inside libc. Each child gets a copy of this stack area to run on. */
+static char libc_clone_stack[64 * 1024] __attribute__((aligned(16)));
+
+static int libc_clone_child(void *arg) {
+  (void)arg;
+  for (int i = 0; i < 3; ++i) hooked_calls();
+  return 0;
+}
+
+static void *libc_cloner(void *arg) {
+  (void)arg;
+  while (!atomic_load(&stop)) {
+    int pid = clone(libc_clone_child,
+                    libc_clone_stack + sizeof(libc_clone_stack), SIGCHLD,
+                    NULL);
+    if (pid < 0) { atomic_store(&failed, 1); return NULL; }
+    reap((pid_t)pid, "libc clone");
+    atomic_fetch_add(&libc_clones, 1);
+  }
+  return NULL;
+}
+
 int main(int argc, char **argv) {
   if (argc < 3) return 2;
   file = argv[1];
@@ -228,11 +290,16 @@ int main(int argc, char **argv) {
   setitimer(ITIMER_PROF, &tv, NULL);
 
   enum { WORKERS = 6 };
-  pthread_t threads[WORKERS + 2];
+  pthread_t threads[WORKERS + 4];
+  int nthreads = 0;
   for (int i = 0; i < WORKERS; ++i)
-    pthread_create(&threads[i], NULL, worker, NULL);
-  pthread_create(&threads[WORKERS], NULL, forker, NULL);
-  pthread_create(&threads[WORKERS + 1], NULL, cloner, NULL);
+    pthread_create(&threads[nthreads++], NULL, worker, NULL);
+  pthread_create(&threads[nthreads++], NULL, forker, NULL);
+  pthread_create(&threads[nthreads++], NULL, cloner, NULL);
+#if defined(__x86_64__)
+  pthread_create(&threads[nthreads++], NULL, inline_cloner, NULL);
+#endif
+  pthread_create(&threads[nthreads++], NULL, libc_cloner, NULL);
 
   struct timespec end, now;
   clock_gettime(CLOCK_MONOTONIC, &end);
@@ -244,13 +311,15 @@ int main(int argc, char **argv) {
   } while (now.tv_sec < end.tv_sec ||
            (now.tv_sec == end.tv_sec && now.tv_nsec < end.tv_nsec));
   atomic_store(&stop, 1);
-  for (int i = 0; i < WORKERS + 2; ++i) pthread_join(threads[i], NULL);
+  for (int i = 0; i < nthreads; ++i) pthread_join(threads[i], NULL);
   struct itimerval off = {{0, 0}, {0, 0}};
   setitimer(ITIMER_PROF, &off, NULL);
 
-  printf("stress done calls=%ld signals=%ld forks=%ld clones=%ld failed=%d\n",
+  printf("stress done calls=%ld signals=%ld forks=%ld clones=%ld "
+         "inline_clones=%ld libc_clones=%ld failed=%d\n",
          atomic_load(&calls), atomic_load(&signals_seen), atomic_load(&forks),
-         atomic_load(&clones), atomic_load(&failed));
+         atomic_load(&clones), atomic_load(&inline_clones),
+         atomic_load(&libc_clones), atomic_load(&failed));
   return atomic_load(&failed) ? 1 : 0;
 }
 """
@@ -317,7 +386,10 @@ suite "io-mon shim's private heap stays live":
       # forks and raw clones.
       check countAfter(cap.output, "signals=") > 0
       check countAfter(cap.output, "forks=") > 0
-      check countAfter(cap.output, "clones=") > 0
+      check countAfter(cap.output, " clones=") > 0
+      check countAfter(cap.output, "libc_clones=") > 0
+      when defined(amd64):
+        check countAfter(cap.output, "inline_clones=") > 0
       check fileExists(depfile)
 
   removeDir(work)

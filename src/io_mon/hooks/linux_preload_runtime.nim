@@ -892,6 +892,7 @@ typedef int (*ct_faccessat_real_fn)(int, const char *, int, int);
 typedef ssize_t (*ct_readlink_real_fn)(const char *, char *, size_t);
 typedef ssize_t (*ct_readlinkat_real_fn)(int, const char *, char *, size_t);
 typedef char *(*ct_realpath_real_fn)(const char *, char *);
+typedef char *(*ct_canonicalize_real_fn)(const char *);
 typedef int (*ct_scandir_real_fn)(const char *, void *, void *, void *);
 typedef DIR *(*ct_fdopendir_real_fn)(int);
 typedef int (*ct_statx_real_fn)(int, const char *, int, unsigned int, void *);
@@ -908,6 +909,7 @@ static ct_faccessat_real_fn real_faccessat_ptr = NULL;
 static ct_readlink_real_fn real_readlink_ptr = NULL;
 static ct_readlinkat_real_fn real_readlinkat_ptr = NULL;
 static ct_realpath_real_fn real_realpath_ptr = NULL;
+static ct_canonicalize_real_fn real_canonicalize_file_name_ptr = NULL;
 static ct_scandir_real_fn real_scandir_ptr = NULL;
 static ct_scandir_real_fn real_scandir64_ptr = NULL;
 static ct_fdopendir_real_fn real_fdopendir_ptr = NULL;
@@ -989,6 +991,41 @@ extern int stackable_linux_chain_sigtrap(int signum, void *siginfo_ptr,
  * is not open (e.g. shim not initialised) so the handler stays safe on
  * every code path. */
 extern void repro_linux_sig_safe_flush(void);
+
+/* A raw fork-like call (fork, or clone/clone3 without CLONE_VM) creates a
+ * process that runs no atfork handlers: it inherits every shim lock another
+ * thread held at that instant, and recording anything there can wait on such
+ * a lock forever. The libc fork hook samples whether the parent is
+ * single-threaded and, when it is not, makes the child skip monitor
+ * bookkeeping until exec (repro_hook_fork). These callbacks, registered by
+ * linux_preload.nim, give the raw path the same treatment. */
+typedef int (*ct_raw_fork_sample_fn)(void);
+typedef void (*ct_raw_fork_child_fn)(int parentSingleThreaded);
+static ct_raw_fork_sample_fn ct_raw_fork_sample = NULL;
+static ct_raw_fork_child_fn ct_raw_fork_child = NULL;
+void ct_linux_preload_register_raw_fork(ct_raw_fork_sample_fn sample,
+                                        ct_raw_fork_child_fn child) {
+  ct_raw_fork_sample = sample;
+  ct_raw_fork_child = child;
+}
+
+static int ct_raw_call_forks_process(long nr, long a1) {
+#ifdef SYS_fork
+  if (nr == SYS_fork) return 1;
+#endif
+#ifdef SYS_clone
+  if (nr == SYS_clone) return (a1 & CLONE_VM) == 0;
+#endif
+#ifdef SYS_clone3
+  if (nr == SYS_clone3 && a1 != 0) {
+    unsigned long long flags;
+    memcpy(&flags, (void *)a1, sizeof(flags));
+    return (flags & CLONE_VM) == 0;
+  }
+#endif
+  (void)a1;
+  return 0;
+}
 
 /* A child cannot inherit a registration lock held by a vanished thread.
  * No loader call runs under the lock; unpublished POD slots remain invisible.
@@ -1131,6 +1168,35 @@ int ct_linux_inline_syscall_record_site(unsigned long address) {
 }
 
 #if defined(__x86_64__)
+/* Whether this process has exactly one thread, from field 20 (num_threads) of
+ * /proc/self/stat. The inline-syscall trap handler runs in signal context, so
+ * it cannot use the Nim sampler the syscall(2) replacement uses (that one
+ * allocates); this reads with raw system calls into a stack buffer. Field 20
+ * sits within the first ~420 bytes whatever the command name, because comm is
+ * at most 16 bytes and the 17 fields before it are numbers. Any failure answers
+ * "not single-threaded", the safe side. See proc(5). */
+static int ct_raw_process_is_single_threaded(void) {
+  char buf[512];
+  long fd = stackable_linux_raw_syscall6(SYS_openat, AT_FDCWD,
+                                         (long)"/proc/self/stat",
+                                         O_RDONLY | O_CLOEXEC, 0, 0, 0);
+  if (fd < 0) return 0;
+  long n = stackable_linux_raw_syscall6(SYS_read, fd, (long)buf,
+                                        (long)sizeof(buf) - 1, 0, 0, 0);
+  stackable_linux_raw_syscall6(SYS_close, fd, 0, 0, 0, 0, 0);
+  if (n <= 0) return 0;
+  buf[n] = '\0';
+  /* comm may contain spaces and parentheses; the fields resume after the
+   * last ')'. That is field 2, so field 20 is the 18th field after it. */
+  char *p = strrchr(buf, ')');
+  if (p == NULL) return 0;
+  for (int field = 2; field < 20; ++field) {
+    p = strchr(p + 1, ' ');
+    if (p == NULL) return 0;
+  }
+  return p[1] == '1' && p[2] == ' ';
+}
+
 static void ct_linux_inline_syscall_sigtrap_handler(
     int signum, siginfo_t *info, void *ucontext) {
   struct stackable_linux_syscall_regs regs;
@@ -1173,8 +1239,16 @@ static void ct_linux_inline_syscall_sigtrap_handler(
   }
 #endif
 
+  /* A trapped fork-like call (an inline `syscall` issuing clone/clone3
+   * without CLONE_VM, or fork) gets what the syscall(2) replacement gives the
+   * same call: the child reclaims the locks it inherited and, when the parent
+   * had other threads, skips monitor bookkeeping until exec. */
+  int forks = ct_raw_call_forks_process(regs.nr, regs.args[0]) &&
+              ct_raw_fork_child != NULL;
+  int parent_single = forks ? ct_raw_process_is_single_threaded() : 1;
   long result = stackable_linux_replay_syscall_regs(&regs);
   ct_raw_owner_after_raw_fork(regs.nr, regs.args[0], result);
+  if (forks && result == 0) ct_raw_fork_child(parent_single);
   ct_record_raw_syscall_event(regs.nr, regs.args, result,
                               CT_RAW_SYSCALL_SOURCE_INLINE,
                               regs.syscall_address);
@@ -1232,7 +1306,28 @@ int ct_linux_inline_syscall_overflowed(void) {
 static __thread pid_t ct_exec_guard_pid = 0;
 static __thread int ct_exec_guard_resume_depth = 0;
 
+/* The same holds for the environment an exec hook prepares on the shim's heap
+ * (ct_linux_preload_exec_env_prepare): the hook frees it when the exec fails,
+ * but after a successful exec in a vfork child nothing returns to free it, and
+ * the child's heap is the suspended parent's. So the preparation is remembered
+ * here, per thread, with the pid that made it; when the parent resumes it sees
+ * a different pid and releases the orphan. At most one is outstanding per
+ * thread, so a host looping vfork + exec does not grow. */
+static __thread char **ct_exec_env_pending = NULL;
+static __thread pid_t ct_exec_env_pending_pid = 0;
+void ct_linux_preload_free_owned_env(char **entries, char *const original[]);
+
+static void ct_release_orphaned_exec_env(void) {
+  if (ct_exec_env_pending != NULL && ct_exec_env_pending_pid != getpid()) {
+    char **orphan = ct_exec_env_pending;
+    ct_exec_env_pending = NULL;
+    ct_exec_env_pending_pid = 0;
+    ct_linux_preload_free_owned_env(orphan, NULL);
+  }
+}
+
 static void ct_restore_vfork_exec_guard(void) {
+  if (ct_exec_env_pending != NULL) ct_release_orphaned_exec_env();
   if (ct_exec_guard_pid != 0 && ct_exec_guard_pid != getpid()) {
     while (stackable_linux_preload_current_depth() > ct_exec_guard_resume_depth)
       stackable_linux_preload_exit_hook();
@@ -1299,6 +1394,10 @@ static ct_owned_env *ct_env_owner(char **entries) {
 }
 void ct_linux_preload_free_owned_env(char **entries, char *const original[]) {
   if (entries == NULL || entries == original) return;
+  if (entries == ct_exec_env_pending) {
+    ct_exec_env_pending = NULL;
+    ct_exec_env_pending_pid = 0;
+  }
   ct_owned_env *owner = ct_env_owner(entries);
   for (size_t i = 0; i < owner->ownedCount; ++i) free(owner->owned[i]);
   if (owner->parent != NULL) ct_linux_preload_free_owned_env(owner->parent, NULL);
@@ -1569,6 +1668,19 @@ char **ct_linux_preload_env_with_exec_gen(char *const envp[], long nextGen) {
   result[index++] = genEntry;
   result[index] = NULL;
   return result;
+}
+
+/* ct_linux_preload_env_with_exec_gen for an exec hook: the preparation is
+ * also remembered as outstanding until the hook frees it (exec failed) or the
+ * process image is replaced; see ct_exec_env_pending. */
+char **ct_linux_preload_exec_env_prepare(char *const envp[], long nextGen) {
+  ct_release_orphaned_exec_env();
+  char **prepared = ct_linux_preload_env_with_exec_gen(envp, nextGen);
+  if (prepared != NULL && prepared != (char **)envp) {
+    ct_exec_env_pending = prepared;
+    ct_exec_env_pending_pid = getpid();
+  }
+  return prepared;
 }
 
 void ct_linux_preload_register_open_hook(ct_open_hook_fn hook) { ct_open_hook = hook; }
@@ -1884,41 +1996,6 @@ int ct_linux_preload_raw_owner_join(void *target) {
 #endif
 }
 
-/* A raw fork-like call (fork, or clone/clone3 without CLONE_VM) creates a
- * process that runs no atfork handlers: it inherits every shim lock another
- * thread held at that instant, and recording anything there can wait on such
- * a lock forever. The libc fork hook samples whether the parent is
- * single-threaded and, when it is not, makes the child skip monitor
- * bookkeeping until exec (repro_hook_fork). These callbacks, registered by
- * linux_preload.nim, give the raw path the same treatment. */
-typedef int (*ct_raw_fork_sample_fn)(void);
-typedef void (*ct_raw_fork_child_fn)(int parentSingleThreaded);
-static ct_raw_fork_sample_fn ct_raw_fork_sample = NULL;
-static ct_raw_fork_child_fn ct_raw_fork_child = NULL;
-void ct_linux_preload_register_raw_fork(ct_raw_fork_sample_fn sample,
-                                        ct_raw_fork_child_fn child) {
-  ct_raw_fork_sample = sample;
-  ct_raw_fork_child = child;
-}
-
-static int ct_raw_call_forks_process(long nr, long a1) {
-#ifdef SYS_fork
-  if (nr == SYS_fork) return 1;
-#endif
-#ifdef SYS_clone
-  if (nr == SYS_clone) return (a1 & CLONE_VM) == 0;
-#endif
-#ifdef SYS_clone3
-  if (nr == SYS_clone3 && a1 != 0) {
-    unsigned long long flags;
-    memcpy(&flags, (void *)a1, sizeof(flags));
-    return (flags & CLONE_VM) == 0;
-  }
-#endif
-  (void)a1;
-  return 0;
-}
-
 long ct_linux_preload_syscall_replacement(long nr, long a1, long a2, long a3,
                                           long a4, long a5, long a6) {
   int saved_errno = errno;
@@ -1946,6 +2023,57 @@ long ct_linux_preload_syscall_replacement(long nr, long a1, long a2, long a3,
   }
   errno = saved_errno;
   return result;
+}
+
+/* glibc's clone(3) wrapper issues the clone system call from inside libc,
+ * where neither the syscall(2) replacement nor the inline-syscall trap sees it.
+ * A child created without CLONE_VM is a process, not a thread, and is in the
+ * position the raw paths above handle: it ran no atfork handlers and inherits
+ * every shim lock another thread held at that instant. So the interposition
+ * runs the child's function through a trampoline that first gives the child
+ * the same treatment (reclaim inherited locks; skip monitor bookkeeping until
+ * exec when the parent had other threads). The trampoline's argument lives in
+ * the caller's frame, which the child receives a copy of. A CLONE_VM child
+ * shares the parent's memory and live locks, so it is passed through as is.
+ * glibc passes the three optional arguments to the kernel unconditionally
+ * (sysdeps/unix/sysv/linux/x86_64/clone.S), so forwarding them is exact. See
+ * clone(2). */
+typedef int (*ct_clone_fn)(int (*)(void *), void *, int, void *, ...);
+static ct_clone_fn real_clone_ptr = NULL;
+
+struct ct_clone_trampoline {
+  int (*fn)(void *);
+  void *arg;
+  int parent_single;
+};
+
+static int ct_clone_child_entry(void *opaque) {
+  struct ct_clone_trampoline call = *(struct ct_clone_trampoline *)opaque;
+  ct_raw_fork_child_reset();
+  if (ct_raw_fork_child != NULL) ct_raw_fork_child(call.parent_single);
+  return call.fn(call.arg);
+}
+
+int clone(int (*fn)(void *), void *stack, int flags, void *arg, ...)
+    __attribute__((visibility("default")));
+int clone(int (*fn)(void *), void *stack, int flags, void *arg, ...) {
+  va_list ap;
+  va_start(ap, arg);
+  pid_t *parent_tid = va_arg(ap, pid_t *);
+  void *tls = va_arg(ap, void *);
+  pid_t *child_tid = va_arg(ap, pid_t *);
+  va_end(ap);
+  if (real_clone_ptr == NULL) real_clone_ptr = (ct_clone_fn)ct_resolve("clone");
+  if (real_clone_ptr == NULL) { errno = ENOSYS; return -1; }
+  if ((flags & CLONE_VM) != 0 || fn == NULL)
+    return real_clone_ptr(fn, stack, flags, arg, parent_tid, tls, child_tid);
+  int saved_errno = errno;
+  struct ct_clone_trampoline call = {fn, arg, 1};
+  if (!CT_BYPASS() && ct_raw_fork_sample != NULL)
+    call.parent_single = CT_CALL_HOOK(ct_raw_fork_sample());
+  errno = saved_errno;
+  return real_clone_ptr(ct_clone_child_entry, stack, flags, &call,
+                        parent_tid, tls, child_tid);
 }
 
 static int ct_open_flags_need_mode(int flags) {
@@ -3043,6 +3171,9 @@ void ct_linux_preload_prime_real_functions(void) {
   CT_PRIME(real_readlink_ptr, ct_readlink_real_fn, "readlink");
   CT_PRIME(real_readlinkat_ptr, ct_readlinkat_real_fn, "readlinkat");
   CT_PRIME(real_realpath_ptr, ct_realpath_real_fn, "realpath");
+  CT_PRIME(real_canonicalize_file_name_ptr, ct_canonicalize_real_fn,
+           "canonicalize_file_name");
+  CT_PRIME(real_clone_ptr, ct_clone_fn, "clone");
   CT_PRIME(real_scandir_ptr, ct_scandir_real_fn, "scandir");
   CT_PRIME(real_scandir64_ptr, ct_scandir_real_fn, "scandir64");
   CT_PRIME(real_fdopendir_ptr, ct_fdopendir_real_fn, "fdopendir");
@@ -3520,6 +3651,34 @@ static ct_enumerate_observer_fn ct_enumerate_observer = NULL;
 static ct_fdopendir_observer_fn ct_fdopendir_observer = NULL;
 static ct_mprotect_observer_fn ct_mprotect_observer = NULL;
 
+/* Records the resolution of `path` (relative to `dirfd`) the way the kernel
+ * and realpath(3) perform it: every symbolic link met on the way, with its
+ * target, and the path it leads to. `follow_final` says whether the last
+ * component is itself followed (realpath) or only read (readlink). */
+typedef void (*ct_resolution_observer_fn)(int dirfd, const char *path,
+                                          int follow_final);
+static ct_resolution_observer_fn ct_resolution_observer = NULL;
+void ct_linux_preload_register_resolution_observer(
+    ct_resolution_observer_fn observer) {
+  ct_resolution_observer = observer;
+}
+
+/* The resolution walk's primitives, unrecorded: what lstat(2) says the path
+ * is (1 a symbolic link, 0 anything else, -1 absent or unreadable), and
+ * readlink(2) through the real function. */
+int ct_linux_preload_lstat_kind(const char *path) {
+  struct stat st;
+  if (ct_linux_preload_real_lstat((char *)path, &st) != 0) return -1;
+  return S_ISLNK(st.st_mode) ? 1 : 0;
+}
+
+long ct_linux_preload_real_readlink(const char *path, char *buf, size_t size) {
+  if (real_readlink_ptr == NULL)
+    real_readlink_ptr = (ct_readlink_real_fn)ct_resolve("readlink");
+  if (real_readlink_ptr == NULL) { errno = ENOSYS; return -1; }
+  return (long)real_readlink_ptr(path, buf, size);
+}
+
 void ct_linux_preload_register_observers(ct_probe_observer_fn probe,
                                          ct_enumerate_observer_fn enumerate,
                                          ct_fdopendir_observer_fn fdopendir_fn,
@@ -3570,6 +3729,7 @@ ssize_t readlink(const char *path, char *buf, size_t size) {
   CT_OBSERVED_REAL(real_readlink_ptr, ct_readlink_real_fn, "readlink", -1);
   ssize_t rc = real_readlink_ptr(path, buf, size);
   CT_OBSERVE(ct_probe_observer, AT_FDCWD, path, rc < 0 ? -1 : 0);
+  CT_OBSERVE(ct_resolution_observer, AT_FDCWD, path, 0);
   return rc;
 }
 
@@ -3579,18 +3739,35 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t size) {
   CT_OBSERVED_REAL(real_readlinkat_ptr, ct_readlinkat_real_fn, "readlinkat", -1);
   ssize_t rc = real_readlinkat_ptr(dirfd, path, buf, size);
   CT_OBSERVE(ct_probe_observer, dirfd, path, rc < 0 ? -1 : 0);
+  CT_OBSERVE(ct_resolution_observer, dirfd, path, 0);
   return rc;
 }
 
-/* realpath resolves every component inside libc; the observation is the
- * probe of the path the caller asked about, which is what decides the
- * result's existence. Its components are not recorded individually. */
+/* realpath resolves every component inside libc, through calls no
+ * interposition sees. Its result depends on more than the path the caller
+ * named: on every symbolic link it follows and on where each one points
+ * (a -> b -> c resolves to c, and retargeting b changes the answer while a
+ * stays as it was). So besides the probe of the path asked about, the
+ * resolution observer replays the walk and records each link it meets, with
+ * its target, and the path it leads to, absent or not. */
 char *realpath(const char *path, char *resolved)
     __attribute__((visibility("default")));
 char *realpath(const char *path, char *resolved) {
   CT_OBSERVED_REAL(real_realpath_ptr, ct_realpath_real_fn, "realpath", NULL);
   char *rc = real_realpath_ptr(path, resolved);
   CT_OBSERVE(ct_probe_observer, AT_FDCWD, path, rc != NULL ? 0 : -1);
+  CT_OBSERVE(ct_resolution_observer, AT_FDCWD, path, 1);
+  return rc;
+}
+
+char *canonicalize_file_name(const char *path)
+    __attribute__((visibility("default")));
+char *canonicalize_file_name(const char *path) {
+  CT_OBSERVED_REAL(real_canonicalize_file_name_ptr, ct_canonicalize_real_fn,
+                   "canonicalize_file_name", NULL);
+  char *rc = real_canonicalize_file_name_ptr(path);
+  CT_OBSERVE(ct_probe_observer, AT_FDCWD, path, rc != NULL ? 0 : -1);
+  CT_OBSERVE(ct_resolution_observer, AT_FDCWD, path, 1);
   return rc;
 }
 
@@ -3604,6 +3781,7 @@ char *__realpath_chk(const char *path, char *resolved, size_t resolvedlen) {
                    "__realpath_chk", NULL);
   char *rc = real_realpath_chk_ptr(path, resolved, resolvedlen);
   CT_OBSERVE(ct_probe_observer, AT_FDCWD, path, rc != NULL ? 0 : -1);
+  CT_OBSERVE(ct_resolution_observer, AT_FDCWD, path, 1);
   return rc;
 }
 
@@ -3614,6 +3792,7 @@ ssize_t __readlink_chk(const char *path, char *buf, size_t len, size_t buflen) {
                    "__readlink_chk", -1);
   ssize_t rc = real_readlink_chk_ptr(path, buf, len, buflen);
   CT_OBSERVE(ct_probe_observer, AT_FDCWD, path, rc < 0 ? -1 : 0);
+  CT_OBSERVE(ct_resolution_observer, AT_FDCWD, path, 0);
   return rc;
 }
 
@@ -3625,6 +3804,7 @@ ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf, size_t len,
                    "__readlinkat_chk", -1);
   ssize_t rc = real_readlinkat_chk_ptr(dirfd, path, buf, len, buflen);
   CT_OBSERVE(ct_probe_observer, dirfd, path, rc < 0 ? -1 : 0);
+  CT_OBSERVE(ct_resolution_observer, dirfd, path, 0);
   return rc;
 }
 
@@ -4163,7 +4343,10 @@ proc freeOwnedEnv*(envp: cstringArray; original: cstringArray)
 proc envWithPreload*(envp: cstringArray): cstringArray
   {.importc: "ct_linux_preload_env_with_preload", raises: [].}
 proc envWithExecGen*(envp: cstringArray; nextGen: clong): cstringArray
-  {.importc: "ct_linux_preload_env_with_exec_gen", raises: [].}
+  {.importc: "ct_linux_preload_exec_env_prepare", raises: [].}
+  ## The exec hooks' environment: freed with `freeOwnedEnv` when the exec
+  ## fails, and released by the resuming parent when a vfork child's exec
+  ## succeeds.
 
 proc realOpen*(path: cstring; flags, mode: cint): cint
   {.importc: "ct_linux_preload_real_open", raises: [].}
