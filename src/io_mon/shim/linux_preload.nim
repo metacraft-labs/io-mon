@@ -1035,6 +1035,8 @@ static void repro_linux_monitor_constructor(void) {
   ct_linux_preload_prepare_real_connect();
 }
 
+extern void ct_linux_note_final_inline_drain(void);
+
 __attribute__((destructor))
 static void repro_linux_monitor_destructor(void) {
   /* DEP-FLUSH-2 — flush EVERY registered thread's buffered fragment batch
@@ -1043,6 +1045,10 @@ static void repro_linux_monitor_destructor(void) {
      not drop its records — which would otherwise make a fast child look
      un-injected and downgrade completeness to mcIncomplete. */
   repro_monitor_shim_shutdown();
+  /* Report trapped events the shutdown drain could not classify, and from
+   * now on any event trapped after it (other threads still running, later
+   * finalisers): nothing is guaranteed to drain them before the image ends. */
+  ct_linux_note_final_inline_drain();
 }
 
 /* DEP-FLUSH-3 — per-thread exit flush via a pthread_key destructor.
@@ -2057,6 +2063,59 @@ proc probeFromResult(callResult: cint): ProbeResult =
   else:
     prAbsent
 
+const
+  UnclassifiedInlineLossDetail =
+    "inline raw syscall events unclassified at image end"
+  LossFramePidMarker = 0x5A17C0DE5A17C0DE'u64
+  LossFrameTidMarker = 0x7E1DC0DE7E1DC0DE'u64
+
+proc leU64Offset(frame: openArray[byte]; value: uint64): int =
+  ## The one offset at which `frame` holds `value` little-endian, or -1.
+  result = -1
+  for start in 0 .. frame.len - 8:
+    var matches = true
+    for k in 0 ..< 8:
+      if frame[start + k] != byte((value shr (8 * k)) and 0xFF'u64):
+        matches = false
+        break
+    if matches:
+      if result >= 0:
+        return -1
+      result = start
+
+var inlineLossReportArmed = true
+
+proc armUnclassifiedInlineLossReport(): bool {.raises: [].} =
+  ## Pre-encode the event-loss frame the runtime writes, with raw syscalls,
+  ## when trapped inline syscalls cannot be classified before the image ends
+  ## (see `ct_report_unclassified_inline_events`). Encoded here, outside any
+  ## signal context, with placeholder pid and thread id the runtime fills in;
+  ## run-stamped so the merge scopes it to this run. False when the report
+  ## could not be armed (a fragment directory or frame longer than the
+  ## runtime's fixed buffers), in which case the caller reports that.
+  if fragmentDir.len == 0:
+    return true
+  try:
+    let dir = absolutePath(fragmentDir)
+    var record = MonitorRecord(kind: mrEventLoss,
+      observationKind: moEventLoss, osPid: LossFramePidMarker,
+      threadId: LossFrameTidMarker, detail: UnclassifiedInlineLossDetail)
+    stampRunId(record)
+    var frame = encodeFrame(record)
+    var pidOffset = leU64Offset(frame, LossFramePidMarker)
+    var tidOffset = leU64Offset(frame, LossFrameTidMarker)
+    if pidOffset < 0 or tidOffset < 0:
+      # The encoding moved the ids somewhere the markers cannot locate: a
+      # frame without them still reports the loss.
+      record.osPid = 0
+      record.threadId = 0
+      frame = encodeFrame(record)
+      pidOffset = -1
+      tidOffset = -1
+    result = armInlineLossReport(dir, frame, pidOffset, tidOffset)
+  except CatchableError:
+    result = false
+
 proc repro_monitor_shim_init*(configPath: cstring): cint
     {.exportc, dynlib, raises: [].} =
   if not locksReady:
@@ -2085,6 +2144,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
       gEvidenceScope = esFull
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))
+    inlineLossReportArmed = armUnclassifiedInlineLossReport()
     # DEP-SHM-2 — attach the process to the edge's shared-memory dependency
     # queue (the FAST PATH in front of the file fragments). The engine created
     # the segment before launching us and named it via REPRO_MONITOR_DEP_SHM;
@@ -2141,6 +2201,10 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   sampleKillDiagArgvOnce()
   sampleKillDiag("init")
   recordProcessStart()
+  if not inlineLossReportArmed:
+    # Nothing could report trapped events that end up unclassified, so this
+    # capture cannot claim it would have noticed losing them.
+    emitEventLoss("inline raw syscall loss report unavailable")
   let collection = getEnv("REPRO_MONITOR_COLLECTION_EVIDENCE")
   if collection.len > 0 and collection != "full:" & runId:
     emitEventLoss("invalid internal collection scope for active capture route")
@@ -4085,6 +4149,9 @@ proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
   sampleKillDiag("execve-enter")
   if shouldBypass():
     sampleKillDiag("execve-bypassed")
+    # No drain runs here (a fork child skips bookkeeping until exec): report
+    # trapped events a successful exec would discard unclassified.
+    reportInlineEventsIfPending()
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()

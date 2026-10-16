@@ -716,6 +716,8 @@ typedef int (*ct_execve_real_fn)(const char *, char *const [], char *const []);
 typedef int (*ct_execvp_real_fn)(const char *, char *const []);
 typedef int (*ct_execvpe_real_fn)(const char *, char *const [], char *const []);
 typedef int (*ct_fexecve_real_fn)(int, char *const [], char *const []);
+typedef int (*ct_execveat_real_fn)(int, const char *, char *const [],
+                                   char *const [], int);
 typedef int (*ct_posix_spawn_real_fn)(pid_t *, const char *,
                                       const posix_spawn_file_actions_t *,
                                       const posix_spawnattr_t *,
@@ -927,6 +929,7 @@ static ct_execve_real_fn real_execve_ptr = NULL;
 static ct_execvp_real_fn real_execvp_ptr = NULL;
 static ct_execvpe_real_fn real_execvpe_ptr = NULL;
 static ct_fexecve_real_fn real_fexecve_ptr = NULL;
+static ct_execveat_real_fn real_execveat_ptr = NULL;
 static ct_posix_spawn_real_fn real_posix_spawn_ptr = NULL;
 static ct_posix_spawn_real_fn real_posix_spawnp_ptr = NULL;
 
@@ -1362,6 +1365,174 @@ static void ct_raw_capture_event(struct ct_raw_syscall_event *event) {
     event->capture = ok ? CT_RAW_CAPTURE_OK : CT_RAW_CAPTURE_FAILED;
 }
 
+/* UNCLASSIFIED EVENTS ARE REPORTED, NEVER DROPPED SILENTLY.
+ *
+ * A trapped event is classified later, outside signal context, by a drain
+ * that takes the shim's locks. Some image ends cannot run that drain: the
+ * thread is inside a hook (a host signal handler interrupted one, so the
+ * locks may be held), the process is a fork child skipping monitor
+ * bookkeeping until exec, or the event arrived after the process's final
+ * drain. Withholding a fragment's commit marker shows nothing on the
+ * shared-memory transport, which has no such marker, so those paths used to
+ * end with a capture that was complete in name and silently lacked the
+ * events.
+ *
+ * Instead they write one pre-encoded event-loss frame to a fragment file of
+ * their own, with raw syscalls only (openat, writev, close), so the merge
+ * downgrades the capture to incomplete. The frame is encoded once by the
+ * shim at init (`ct_linux_preload_arm_inline_loss_report`); only the pid and
+ * thread id are filled in here. Async-signal-safe, lock-free, no
+ * allocation, a few hundred bytes of stack, errno preserved. */
+#define CT_INLINE_LOSS_DIR_CAP 4096
+#define CT_INLINE_LOSS_FRAME_CAP 4096
+static char ct_inline_loss_dir[CT_INLINE_LOSS_DIR_CAP];
+static unsigned char ct_inline_loss_frame[CT_INLINE_LOSS_FRAME_CAP];
+static long ct_inline_loss_frame_len = 0;   /* 0: not armed */
+static long ct_inline_loss_pid_offset = -1;
+static long ct_inline_loss_tid_offset = -1;
+static int ct_inline_final_drain_pid = 0;
+/* The last (pid, reserved-count) reported, so the paths that can report
+ * more than once for the same events (glibc's PATH search tries one execve
+ * per candidate) write one frame. A race only duplicates a frame. */
+static int ct_inline_loss_reported_pid = 0;
+static long ct_inline_loss_reported_count = -1;
+static void ct_report_unclassified_inline_events(void);
+
+/* Arm the report. `dir` must be absolute (a host may chdir before it ends);
+ * `pid_offset`/`tid_offset` locate the frame's little-endian u64 pid and
+ * thread id, or are -1 when the frame carries none. Returns 1 when armed;
+ * the shim reports a failure to arm as event-loss itself, since nothing
+ * could report a later unclassified event. */
+int ct_linux_preload_arm_inline_loss_report(const char *dir,
+                                            const unsigned char *frame,
+                                            long frame_len, long pid_offset,
+                                            long tid_offset)
+    __attribute__((visibility("default")));
+int ct_linux_preload_arm_inline_loss_report(const char *dir,
+                                            const unsigned char *frame,
+                                            long frame_len, long pid_offset,
+                                            long tid_offset) {
+  __atomic_store_n(&ct_inline_loss_frame_len, 0, __ATOMIC_RELEASE);
+  if (dir == NULL || dir[0] != '/' || frame == NULL || frame_len <= 0 ||
+      frame_len > CT_INLINE_LOSS_FRAME_CAP)
+    return 0;
+  size_t dir_len = strlen(dir);
+  if (dir_len >= CT_INLINE_LOSS_DIR_CAP) return 0;
+  if (pid_offset < 0 || pid_offset + 8 > frame_len ||
+      tid_offset < 0 || tid_offset + 8 > frame_len ||
+      (pid_offset < tid_offset ? pid_offset + 8 > tid_offset
+                               : tid_offset + 8 > pid_offset)) {
+    pid_offset = -1;
+    tid_offset = -1;
+  }
+  memcpy(ct_inline_loss_dir, dir, dir_len + 1);
+  memcpy(ct_inline_loss_frame, frame, (size_t)frame_len);
+  ct_inline_loss_pid_offset = pid_offset;
+  ct_inline_loss_tid_offset = tid_offset;
+  __atomic_store_n(&ct_inline_loss_frame_len, frame_len, __ATOMIC_RELEASE);
+  return 1;
+}
+
+static long ct_inline_loss_append_decimal(char *out, long at, long cap,
+                                          unsigned long value) {
+  char digits[24];
+  int n = 0;
+  do {
+    digits[n++] = (char)('0' + value % 10);
+    value /= 10;
+  } while (value != 0 && n < (int)sizeof(digits));
+  while (n > 0 && at < cap) out[at++] = digits[--n];
+  return at;
+}
+
+static long ct_inline_loss_append_text(char *out, long at, long cap,
+                                       const char *text) {
+  while (*text != '\0' && at < cap) out[at++] = *text++;
+  return at;
+}
+
+static void ct_report_unclassified_inline_events(void) {
+  long frame_len = __atomic_load_n(&ct_inline_loss_frame_len,
+                                   __ATOMIC_ACQUIRE);
+  if (frame_len <= 0) return;
+  int saved_errno = errno;
+  long pid = ct_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
+  long tid = ct_raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
+  long reserved = __atomic_load_n(&ct_raw_syscall_event_reserved,
+                                  __ATOMIC_ACQUIRE);
+  if (__atomic_load_n(&ct_inline_loss_reported_pid, __ATOMIC_ACQUIRE) ==
+          (int)pid &&
+      __atomic_load_n(&ct_inline_loss_reported_count, __ATOMIC_ACQUIRE) ==
+          reserved) {
+    errno = saved_errno;
+    return;
+  }
+  /* The directory is opened first and the file created relative to it, so
+   * only the short file name is built here, whatever the directory's
+   * length: "repro-monitor-<pid>-<tid>-inline-loss.iomon-frag". The name
+   * differs from the thread's ordinary fragment by its suffix, and a reused
+   * pid/tid appends another whole frame to it (O_APPEND), which the merge
+   * reads like any other. */
+  char name[96];
+  const long cap = (long)sizeof(name) - 1;
+  long at = 0;
+  at = ct_inline_loss_append_text(name, at, cap, "repro-monitor-");
+  at = ct_inline_loss_append_decimal(name, at, cap, (unsigned long)pid);
+  at = ct_inline_loss_append_text(name, at, cap, "-");
+  at = ct_inline_loss_append_decimal(name, at, cap, (unsigned long)tid);
+  at = ct_inline_loss_append_text(name, at, cap, "-inline-loss.iomon-frag");
+  name[at] = '\0';
+  long dirfd = ct_raw_syscall6(SYS_openat, AT_FDCWD, (long)ct_inline_loss_dir,
+                               O_PATH | O_DIRECTORY | O_CLOEXEC, 0, 0, 0);
+  long fd = -1;
+  if (dirfd >= 0) {
+    fd = ct_raw_syscall6(SYS_openat, dirfd, (long)name,
+                         O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
+                             O_NOFOLLOW,
+                         0600, 0, 0);
+    ct_raw_syscall6(SYS_close, dirfd, 0, 0, 0, 0, 0);
+  }
+  if (fd >= 0) {
+    unsigned char pid_bytes[8], tid_bytes[8];
+    for (int i = 0; i < 8; ++i) {
+      pid_bytes[i] = (unsigned char)((unsigned long)pid >> (8 * i));
+      tid_bytes[i] = (unsigned char)((unsigned long)tid >> (8 * i));
+    }
+    /* One writev, so the frame lands whole even if another thread appends
+     * to the same file (O_APPEND). */
+    struct iovec parts[5];
+    int count = 0;
+    long po = ct_inline_loss_pid_offset, to = ct_inline_loss_tid_offset;
+    if (po < 0) {
+      parts[count].iov_base = ct_inline_loss_frame;
+      parts[count++].iov_len = (size_t)frame_len;
+    } else {
+      long first = po < to ? po : to, second = po < to ? to : po;
+      unsigned char *first_bytes = po < to ? pid_bytes : tid_bytes;
+      unsigned char *second_bytes = po < to ? tid_bytes : pid_bytes;
+      parts[count].iov_base = ct_inline_loss_frame;
+      parts[count++].iov_len = (size_t)first;
+      parts[count].iov_base = first_bytes;
+      parts[count++].iov_len = 8;
+      parts[count].iov_base = ct_inline_loss_frame + first + 8;
+      parts[count++].iov_len = (size_t)(second - first - 8);
+      parts[count].iov_base = second_bytes;
+      parts[count++].iov_len = 8;
+      parts[count].iov_base = ct_inline_loss_frame + second + 8;
+      parts[count++].iov_len = (size_t)(frame_len - second - 8);
+    }
+    long written = ct_raw_syscall6(SYS_writev, fd, (long)parts, count, 0, 0, 0);
+    ct_raw_syscall6(SYS_close, fd, 0, 0, 0, 0, 0);
+    if (written == frame_len) {
+      __atomic_store_n(&ct_inline_loss_reported_count, reserved,
+                       __ATOMIC_RELEASE);
+      __atomic_store_n(&ct_inline_loss_reported_pid, (int)pid,
+                       __ATOMIC_RELEASE);
+    }
+  }
+  errno = saved_errno;
+}
+
 static void ct_record_raw_syscall_event(long nr, const long args[6],
                                         long result, int source,
                                         unsigned long address) {
@@ -1389,6 +1560,16 @@ static void ct_record_raw_syscall_event(long nr, const long args[6],
   event->address = address;
   ct_raw_capture_event(event);
   __atomic_store_n(&event->state, CT_RAW_EVENT_READY, __ATOMIC_RELEASE);
+  /* Trapped after this process's final drain (another thread still running
+   * while the main thread exits, or a later finaliser): no drain is
+   * guaranteed to run before the image ends, so report it now. The fence
+   * pairs with the one in ct_linux_note_final_inline_drain: either this
+   * load sees the final-drain pid, or that function's scan sees this event
+   * (store-load ordering needs a full fence on both sides). */
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  if (__atomic_load_n(&ct_inline_final_drain_pid, __ATOMIC_RELAXED) ==
+      event->pid)
+    ct_report_unclassified_inline_events();
 }
 
 void ct_linux_preload_raw_enqueue_v1(long nr, const long *args,
@@ -1407,15 +1588,48 @@ void ct_linux_preload_raw_enqueue_v1(long nr, const long *args,
  *
  * Only when this thread is not inside a hook: the classification takes the
  * shim's locks, and a thread already inside a hook (a host signal handler
- * that interrupted one) may hold them. Returns 0 when events stay pending for
- * that reason, so an exit_group caller can withhold its commit marker and
- * leave the loss visible; 1 when nothing is pending any more. */
+ * that interrupted one) may hold them. Whenever events stay pending -- for
+ * that reason, or because the drain itself skipped them (a fork child before
+ * exec) -- they are reported as event-loss (see
+ * ct_report_unclassified_inline_events) and this returns 0, so an exit_group
+ * caller also withholds its commit marker; 1 when nothing is pending. */
 static int ct_linux_raw_syscall_events_pending(int pid);
 int ct_linux_raw_current_pid(void);
 typedef void (*ct_inline_drain_fn)(void);
 static ct_inline_drain_fn ct_inline_drain_observer = NULL;
 void ct_linux_preload_register_inline_drain(ct_inline_drain_fn observer) {
   __atomic_store_n(&ct_inline_drain_observer, observer, __ATOMIC_RELEASE);
+}
+
+/* Events this process trapped and nobody classified, including any that did
+ * not fit the buffer. */
+static int ct_linux_inline_events_unclassified(int pid) {
+  return ct_raw_syscall_event_overflow_value != 0 ||
+         ct_linux_raw_syscall_events_pending(pid);
+}
+
+/* For an image end that runs no drain at all (a libc exec made from inside a
+ * hook, or by a fork child skipping bookkeeping): report what is pending. */
+void ct_linux_report_inline_events_if_pending(void)
+    __attribute__((visibility("default")));
+void ct_linux_report_inline_events_if_pending(void) {
+  if (__atomic_load_n(&ct_inline_drain_observer, __ATOMIC_ACQUIRE) == NULL)
+    return;
+  if (ct_linux_inline_events_unclassified(ct_linux_raw_current_pid()))
+    ct_report_unclassified_inline_events();
+}
+
+/* The process-exit destructor has run its drain: report anything it left,
+ * and anything trapped from now on (ct_record_raw_syscall_event). */
+void ct_linux_note_final_inline_drain(void)
+    __attribute__((visibility("default")));
+void ct_linux_note_final_inline_drain(void) {
+  /* Mark first, then scan: an event recorded concurrently is either seen by
+   * the scan or reports itself (see ct_record_raw_syscall_event). */
+  __atomic_store_n(&ct_inline_final_drain_pid, ct_linux_raw_current_pid(),
+                   __ATOMIC_RELAXED);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  ct_linux_report_inline_events_if_pending();
 }
 
 int ct_linux_drain_inline_events_before_image_end(void)
@@ -1426,13 +1640,16 @@ int ct_linux_drain_inline_events_before_image_end(void) {
   int pid = ct_linux_raw_current_pid();
   if (observer == NULL || !ct_linux_raw_syscall_events_pending(pid))
     return 1;
-  if (stackable_linux_preload_current_depth() != 0) return 0;
-  int saved_errno = errno;
-  stackable_linux_preload_enter_hook();
-  observer();
-  stackable_linux_preload_exit_hook();
-  errno = saved_errno;
-  return !ct_linux_raw_syscall_events_pending(pid);
+  if (stackable_linux_preload_current_depth() == 0) {
+    int saved_errno = errno;
+    stackable_linux_preload_enter_hook();
+    observer();
+    stackable_linux_preload_exit_hook();
+    errno = saved_errno;
+    if (!ct_linux_raw_syscall_events_pending(pid)) return 1;
+  }
+  ct_report_unclassified_inline_events();
+  return 0;
 }
 
 static void ct_raw_flush_observers(void) {
@@ -3479,10 +3696,42 @@ pid_t ct_linux_preload_real_fork(void) {
  * ct_linux_preload_dispatch_execvp. */
 static __thread int ct_exec_announce_only = 0;
 
+/* Set while fexecve or execveat runs the execve hook (see
+ * ct_linux_preload_dispatch_execveat). The hook records the exec, prepares
+ * the environment, drains and flushes like for any execve, and its real
+ * execve then performs THIS call, with the prepared environment, instead of
+ * an execve of the path it was given (which only names the image for the
+ * record). Matched on the identity of that path buffer, which only the
+ * dispatcher has, and on the pid, so neither an execve from a signal handler
+ * nor a parent resuming after a vfork child's exec can take it. Kept by
+ * value: after vfork the thread's TLS is shared with the child. */
+struct ct_exec_redirect {
+  int active;
+  pid_t pid;
+  const char *announced;
+  int fd;
+  const char *path;
+  int flags;
+  int fexecve;
+};
+static __thread struct ct_exec_redirect ct_exec_redirect_state;
+int ct_linux_preload_real_fexecve(int fd, char **argv, char **envp);
+int ct_linux_preload_real_execveat(int dirfd, const char *path, char **argv,
+                                   char **envp, int flags);
+
 int ct_linux_preload_real_execve(char *path, char **argv, char **envp) {
   if (ct_exec_announce_only) {
     errno = ENOENT;
     return -1;
+  }
+  if (ct_exec_redirect_state.active &&
+      ct_exec_redirect_state.announced == path &&
+      ct_exec_redirect_state.pid == getpid()) {
+    struct ct_exec_redirect redirect = ct_exec_redirect_state;
+    if (redirect.fexecve)
+      return ct_linux_preload_real_fexecve(redirect.fd, argv, envp);
+    return ct_linux_preload_real_execveat(redirect.fd, redirect.path, argv,
+                                          envp, redirect.flags);
   }
   CT_REAL("execve", real_execve_ptr, ct_execve_real_fn);
   return real_execve_ptr(path, argv, envp);
@@ -3501,6 +3750,28 @@ int ct_linux_preload_real_execvpe(char *file, char **argv, char **envp) {
 int ct_linux_preload_real_fexecve(int fd, char **argv, char **envp) {
   CT_REAL("fexecve", real_fexecve_ptr, ct_fexecve_real_fn);
   return real_fexecve_ptr(fd, argv, envp);
+}
+
+/* glibc has an execveat wrapper only since 2.34; before that, and in a libc
+ * without one, the system call itself (execveat(2), Linux 3.19+). */
+int ct_linux_preload_real_execveat(int dirfd, const char *path, char **argv,
+                                   char **envp, int flags) {
+  if (real_execveat_ptr == NULL)
+    real_execveat_ptr = (ct_execveat_real_fn)ct_resolve("execveat");
+  if (real_execveat_ptr != NULL)
+    return real_execveat_ptr(dirfd, path, argv, envp, flags);
+#ifdef SYS_execveat
+  long rc = ct_raw_syscall6(SYS_execveat, dirfd, (long)path, (long)argv,
+                            (long)envp, flags, 0);
+  if (rc < 0 && rc > -4096) {
+    errno = (int)-rc;
+    return -1;
+  }
+  return (int)rc;
+#else
+  errno = ENOSYS;
+  return -1;
+#endif
 }
 
 int ct_linux_preload_real_posix_spawn(pid_t *pid, char *path,
@@ -3603,6 +3874,7 @@ void ct_linux_preload_prime_real_functions(void) {
   CT_PRIME(real_execvp_ptr, ct_execvp_real_fn, "execvp");
   CT_PRIME(real_execvpe_ptr, ct_execvpe_real_fn, "execvpe");
   CT_PRIME(real_fexecve_ptr, ct_fexecve_real_fn, "fexecve");
+  CT_PRIME(real_execveat_ptr, ct_execveat_real_fn, "execveat");
   CT_PRIME(real_posix_spawn_ptr, ct_posix_spawn_real_fn, "posix_spawn");
   CT_PRIME(real_posix_spawnp_ptr, ct_posix_spawn_real_fn, "posix_spawnp");
   CT_PRIME(real_access_ptr, ct_access_real_fn, "access");
@@ -4792,8 +5064,12 @@ pid_t fork(void) {
 static int ct_linux_preload_dispatch_execve(const char *path,
                                             char *const argv[],
                                             char *const envp[]) {
-  if (CT_BYPASS() || ct_execve_hook == NULL)
+  if (CT_BYPASS() || ct_execve_hook == NULL) {
+    /* No hook runs, so no drain either: a successful exec would take any
+     * unclassified trapped event with it. */
+    ct_linux_report_inline_events_if_pending();
     return ct_linux_preload_real_execve((char *)path, (char **)argv, (char **)envp);
+  }
   return CT_CALL_EXEC_HOOK(ct_execve_hook((char *)path, (char **)argv, (char **)envp));
 }
 
@@ -4866,8 +5142,8 @@ int execle(const char *path, const char *arg, ...) {
   return ct_linux_preload_dispatch_execve(path, argv, envp);
 }
 
-/* M9.R.65.2 — the path-searching exec family (execvp / execvpe / execlp)
- * and fexecve.  glibc's execvp/execvpe/execlp perform PATH lookup then
+/* M9.R.65.2 — the path-searching exec family (execvp / execvpe / execlp);
+ * fexecve and execveat are below (ct_linux_preload_dispatch_execveat).  glibc's execvp/execvpe/execlp perform PATH lookup then
  * internally call execve via a hidden reference that BYPASSES the
  * LD_PRELOAD PLT.  Callers on this route therefore missed the shim's
  * execve hook entirely — the M9.R.65 kill-before-flush residual on
@@ -4928,8 +5204,10 @@ static void ct_announce_exec(char *file, char **argv, char **envp) {
 
 static int ct_linux_preload_dispatch_execvp(const char *file,
                                             char *const argv[]) {
-  if (CT_BYPASS() || ct_execve_hook == NULL)
+  if (CT_BYPASS() || ct_execve_hook == NULL) {
+    ct_linux_report_inline_events_if_pending();
     return ct_linux_preload_real_execvp((char *)file, (char **)argv);
+  }
   /* Invoke the execve hook to emit mrProcessExec + flush the fragment
    * slot's committed marker.  For a name without a slash (the common
    * `execvp("sh", argv)`) its chained real-execve call fails with ENOENT
@@ -4960,30 +5238,88 @@ static int ct_linux_preload_dispatch_execvp(const char *file,
 static int ct_linux_preload_dispatch_execvpe(const char *file,
                                              char *const argv[],
                                              char *const envp[]) {
-  if (CT_BYPASS() || ct_execve_hook == NULL)
+  if (CT_BYPASS() || ct_execve_hook == NULL) {
+    ct_linux_report_inline_events_if_pending();
     return ct_linux_preload_real_execvpe((char *)file, (char **)argv,
                                           (char **)envp);
+  }
   ct_announce_exec((char *)file, (char **)argv, (char **)envp);
   /* M9.R.66.2: same PATH-lookup double-count guard as dispatch_execvp. */
   return ct_linux_preload_exec_with_prepared_env(file, argv, envp);
 }
 
+/* The image an execveat or fexecve runs, for its exec record: the path
+ * itself when it is absolute or relative to the working directory, else the
+ * descriptor's path (/proc/self/fd, read with a raw syscall so the shim does
+ * not record its own lookup) joined with it. Falls back to the path as
+ * given. */
+static void ct_exec_image_label(char *out, size_t cap, int dirfd,
+                                const char *path) {
+  out[0] = '\0';
+  if (path == NULL) path = "";
+  size_t at = 0;
+  if (path[0] != '/' && dirfd != AT_FDCWD) {
+    char link[48];
+    long l = ct_inline_loss_append_text(link, 0, sizeof(link) - 1,
+                                        "/proc/self/fd/");
+    l = ct_inline_loss_append_decimal(link, l, sizeof(link) - 1,
+                                      (unsigned long)(unsigned int)dirfd);
+    link[l] = '\0';
+    long n = ct_raw_syscall6(SYS_readlinkat, AT_FDCWD, (long)link, (long)out,
+                             (long)cap - 1, 0, 0);
+    if (n > 0 && out[0] == '/') {
+      at = (size_t)n;
+      if (path[0] != '\0' && at + 1 < cap) out[at++] = '/';
+    }
+  }
+  size_t len = strlen(path);
+  if (at + len >= cap) len = cap - 1 - at;
+  memcpy(out + at, path, len);
+  out[at + len] = '\0';
+}
+
+/* execveat and fexecve: through the execve hook, like every other exec, so
+ * the exec is recorded, the child gets LD_PRELOAD and the next exec
+ * generation, and buffered and trapped events are drained and flushed before
+ * the image is replaced. The hook's real execve performs the actual call
+ * (ct_exec_redirect_state). glibc's own wrappers would make the system call
+ * directly and run none of that. */
+static int ct_linux_preload_dispatch_execveat(int dirfd, const char *path,
+                                              char *const argv[],
+                                              char *const envp[], int flags,
+                                              int is_fexecve) {
+  if (CT_BYPASS() || ct_execve_hook == NULL) {
+    ct_linux_report_inline_events_if_pending();
+    if (is_fexecve)
+      return ct_linux_preload_real_fexecve(dirfd, (char **)argv,
+                                            (char **)envp);
+    return ct_linux_preload_real_execveat(dirfd, path, (char **)argv,
+                                          (char **)envp, flags);
+  }
+  char image[PATH_MAX];
+  ct_exec_image_label(image, sizeof(image), dirfd, path);
+  struct ct_exec_redirect redirect;
+  redirect.active = 1;
+  redirect.pid = getpid();
+  redirect.announced = image;
+  redirect.fd = dirfd;
+  redirect.path = path;
+  redirect.flags = flags;
+  redirect.fexecve = is_fexecve;
+  ct_exec_redirect_state = redirect;
+  /* The bracket also keeps glibc's fallback for an old kernel, an execve of
+   * /proc/self/fd/<fd>, from running the hook a second time (M9.R.66.2). */
+  int rc = CT_CALL_EXEC_HOOK(ct_execve_hook(image, (char **)argv,
+                                            (char **)envp));
+  ct_exec_redirect_state.active = 0;
+  return rc;
+}
+
 static int ct_linux_preload_dispatch_fexecve(int fd,
                                              char *const argv[],
                                              char *const envp[]) {
-  if (CT_BYPASS() || ct_execve_hook == NULL)
-    return ct_linux_preload_real_fexecve(fd, (char **)argv,
-                                          (char **)envp);
-  /* We don't have a path for fexecve — pass an empty string so the
-   * emit path records the exec transition with an empty path
-   * (better than skipping the flush entirely).  The child image is
-   * determined by the fd, so callers using fexecve accept the same
-   * ambiguity. */
-  CT_CALL_EXEC_HOOK(ct_execve_hook("", (char **)argv, (char **)envp));
-  /* M9.R.66.2: same double-count guard.  glibc's fexecve is a thin
-   * wrapper around execve on /proc/self/fd/<fd>, so the same
-   * PATH-lookup double-emission would happen without the bracket. */
-  return CT_CALL_EXEC_HOOK(ct_linux_preload_real_fexecve(fd, (char **)argv, (char **)envp));
+  return ct_linux_preload_dispatch_execveat(fd, "", argv, envp, AT_EMPTY_PATH,
+                                            1);
 }
 
 int execvp(const char *file, char *const argv[])
@@ -5030,6 +5366,14 @@ int fexecve(int fd, char *const argv[], char *const envp[])
     __attribute__((visibility("default")));
 int fexecve(int fd, char *const argv[], char *const envp[]) {
   return ct_linux_preload_dispatch_fexecve(fd, argv, envp);
+}
+
+int execveat(int dirfd, const char *path, char *const argv[],
+             char *const envp[], int flags)
+    __attribute__((visibility("default")));
+int execveat(int dirfd, const char *path, char *const argv[],
+             char *const envp[], int flags) {
+  return ct_linux_preload_dispatch_execveat(dirfd, path, argv, envp, flags, 0);
 }
 
 int posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *file_actions,
@@ -5405,6 +5749,11 @@ proc cRawSyscallEventOpenHow(index: clong; flags, mode: ptr culonglong): cint
   {.importc: "ct_linux_raw_syscall_event_open_how", raises: [].}
 proc cRegisterInlineDrain(observer: proc() {.cdecl, raises: [].})
   {.importc: "ct_linux_preload_register_inline_drain", raises: [].}
+proc cArmInlineLossReport(dir: cstring; frame: pointer; frameLen: clong;
+                          pidOffset, tidOffset: clong): cint
+  {.importc: "ct_linux_preload_arm_inline_loss_report", nodecl, raises: [].}
+proc cReportInlineEventsIfPending()
+  {.importc: "ct_linux_report_inline_events_if_pending", raises: [].}
 
 proc installOpenDispatcher(dispatch: OpenDispatch)
   {.importc: "ct_linux_preload_register_open_hook", raises: [].}
@@ -6016,6 +6365,22 @@ proc registerInlineRawSyscallDrain*(observer: proc() {.cdecl, raises: [].})
   ## The classification `ct_linux_drain_inline_events_before_image_end` runs
   ## before an exit or exec that bypasses the destructor and the exec hooks.
   cRegisterInlineDrain(observer)
+
+proc armInlineLossReport*(fragmentDir: string; frame: openArray[byte];
+                          pidOffset, tidOffset: int): bool {.raises: [].} =
+  ## Hand the runtime the pre-encoded event-loss frame it writes, with raw
+  ## syscalls, when trapped events cannot be classified before the image
+  ## ends (`ct_report_unclassified_inline_events`). `fragmentDir` must be
+  ## absolute; the offsets locate the frame's pid and thread id (-1: none).
+  if frame.len == 0:
+    return false
+  cArmInlineLossReport(cstring(fragmentDir), unsafeAddr frame[0],
+    clong(frame.len), clong(pidOffset), clong(tidOffset)) == 1
+
+proc reportInlineEventsIfPending*() {.raises: [].} =
+  ## Report unclassified trapped events of this process as event-loss, for
+  ## an image end that runs no drain (see `armInlineLossReport`).
+  cReportInlineEventsIfPending()
 
 proc rawSyscallEventAt*(index: int):
     tuple[ok: bool, number, a1, a2, a3, a4, a5, a6, result: clong,
