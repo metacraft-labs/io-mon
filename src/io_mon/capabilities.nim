@@ -151,8 +151,9 @@ const
     mcapIpcConnect,
     # PATH MUTATIONS. unlink/unlinkat/rmdir/remove/mkdir/mkdirat/symlink/
     # symlinkat are interposed and recorded as `mrPathMutation` output facts,
-    # truncate/truncate64 as content writes and creat/creat64 as the open they
-    # are, whether called through libc, `syscall(2)` or a trapped inline
+    # truncate/truncate64 as content writes, creat/creat64 and the
+    # mkstemp/mkostemp/mkstemps/mkostemps family as the opens they are, and
+    # mkdtemp as a created directory, whether called through libc, `syscall(2)` or a trapped inline
     # `syscall` instruction (classified from the paths captured when it
     # trapped); link/linkat and the rename family already were. As on macOS
     # (ROUND-4 RW2), this is the whole common mutation surface, so it is
@@ -1012,7 +1013,9 @@ proc linuxPreloadMonitorProfile*(
       "destination writes; libc-visible link/linkat and rename/renameat/" &
       "renameat2 record hardlink source/alias and final rename destinations; " &
       "unlink/unlinkat/rmdir/remove/mkdir/mkdirat/symlink/symlinkat record " &
-      "path mutations and truncate records a content write, through libc, " &
+      "path mutations, mkstemp-family and mkdtemp record the file or " &
+      "directory they create, and truncate records a content write, " &
+      "through libc, " &
       "syscall(2) or a trapped inline syscall; " &
       "libc-visible getenv/uname/sysconf are observed inputs, " &
       "clock_gettime/gettimeofday/time are time-read evidence, and " &

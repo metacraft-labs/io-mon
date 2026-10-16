@@ -992,6 +992,16 @@ static ct_symlink_real_fn real_symlink_ptr = NULL;
 static ct_symlinkat_real_fn real_symlinkat_ptr = NULL;
 static ct_truncate_real_fn real_truncate_ptr = NULL;
 static ct_creat_real_fn real_creat_ptr = NULL;
+typedef int (*ct_mkstemp_real_fn)(char *);
+typedef int (*ct_mkostemp_real_fn)(char *, int);
+typedef int (*ct_mkstemps_real_fn)(char *, int);
+typedef int (*ct_mkostemps_real_fn)(char *, int, int);
+typedef char *(*ct_mkdtemp_real_fn)(char *);
+static ct_mkstemp_real_fn real_mkstemp_ptr = NULL;
+static ct_mkostemp_real_fn real_mkostemp_ptr = NULL;
+static ct_mkstemps_real_fn real_mkstemps_ptr = NULL;
+static ct_mkostemps_real_fn real_mkostemps_ptr = NULL;
+static ct_mkdtemp_real_fn real_mkdtemp_ptr = NULL;
 
 #define CT_INLINE_SYSCALL_SITE_CAP 4096
 static unsigned long ct_inline_syscall_sites[CT_INLINE_SYSCALL_SITE_CAP];
@@ -3628,6 +3638,11 @@ void ct_linux_preload_prime_real_functions(void) {
   CT_PRIME(real_symlinkat_ptr, ct_symlinkat_real_fn, "symlinkat");
   CT_PRIME(real_truncate_ptr, ct_truncate_real_fn, "truncate");
   CT_PRIME(real_creat_ptr, ct_creat_real_fn, "creat");
+  CT_PRIME(real_mkstemp_ptr, ct_mkstemp_real_fn, "mkstemp");
+  CT_PRIME(real_mkostemp_ptr, ct_mkostemp_real_fn, "mkostemp");
+  CT_PRIME(real_mkstemps_ptr, ct_mkstemps_real_fn, "mkstemps");
+  CT_PRIME(real_mkostemps_ptr, ct_mkostemps_real_fn, "mkostemps");
+  CT_PRIME(real_mkdtemp_ptr, ct_mkdtemp_real_fn, "mkdtemp");
   /* The lookups above that failed (symbols this glibc does not have) left
    * an error on this thread; consume it so the host's next dlerror() does
    * not report a lookup the shim made. */
@@ -4447,6 +4462,8 @@ int ct_fstatat64_impl(int dirfd, const char *path, void *buf, int flags) {
 #define CT_MUTATION_SYMLINKAT 7
 #define CT_MUTATION_REMOVE 8
 #define CT_MUTATION_TRUNCATE 9
+#define CT_MUTATION_MKDTEMP 10
+#define CT_MUTATION_MKSTEMP 11
 
 typedef void (*ct_mutation_observer_fn)(int op, int dirfd, const char *path,
                                         const char *target, long arg, int rc);
@@ -4559,6 +4576,62 @@ int creat(const char *path, mode_t mode) {
                                    (int)mode));
 }
 
+/* TEMPORARY FILES AND DIRECTORIES. mkstemp and its variants create and open
+ * a file, and mkdtemp creates a directory, through libc's internal open and
+ * mkdir, where none of the hooks above see them: a build's temporary file,
+ * written and left behind or renamed into place, had no record at all. Each
+ * runs the real call and reports the name it chose (the template, filled
+ * in): a file as the O_CREAT|O_EXCL|O_RDWR open it is, with the descriptor
+ * entered in the table so later writes are attributed, a directory as a
+ * created directory. `arg` carries the descriptor and `dirfd` the extra open
+ * flags (mkostemp's), since the observer's `rc` is only success or failure.
+ * tmpfile(3) is not interposed: its file never has a name. */
+static int ct_report_mkstemp(char *template_name, int fd, int flags) {
+  CT_OBSERVE(ct_mutation_observer, CT_MUTATION_MKSTEMP, flags, template_name,
+             NULL, (long)fd, fd >= 0 ? 0 : -1);
+  return fd;
+}
+
+int mkstemp(char *template_name) __attribute__((visibility("default")));
+int mkstemp(char *template_name) {
+  CT_OBSERVED_REAL(real_mkstemp_ptr, ct_mkstemp_real_fn, "mkstemp", -1);
+  return ct_report_mkstemp(template_name, real_mkstemp_ptr(template_name), 0);
+}
+
+int mkostemp(char *template_name, int flags)
+    __attribute__((visibility("default")));
+int mkostemp(char *template_name, int flags) {
+  CT_OBSERVED_REAL(real_mkostemp_ptr, ct_mkostemp_real_fn, "mkostemp", -1);
+  return ct_report_mkstemp(template_name,
+                           real_mkostemp_ptr(template_name, flags), flags);
+}
+
+int mkstemps(char *template_name, int suffixlen)
+    __attribute__((visibility("default")));
+int mkstemps(char *template_name, int suffixlen) {
+  CT_OBSERVED_REAL(real_mkstemps_ptr, ct_mkstemps_real_fn, "mkstemps", -1);
+  return ct_report_mkstemp(template_name,
+                           real_mkstemps_ptr(template_name, suffixlen), 0);
+}
+
+int mkostemps(char *template_name, int suffixlen, int flags)
+    __attribute__((visibility("default")));
+int mkostemps(char *template_name, int suffixlen, int flags) {
+  CT_OBSERVED_REAL(real_mkostemps_ptr, ct_mkostemps_real_fn, "mkostemps", -1);
+  return ct_report_mkstemp(
+      template_name, real_mkostemps_ptr(template_name, suffixlen, flags),
+      flags);
+}
+
+char *mkdtemp(char *template_name) __attribute__((visibility("default")));
+char *mkdtemp(char *template_name) {
+  CT_OBSERVED_REAL(real_mkdtemp_ptr, ct_mkdtemp_real_fn, "mkdtemp", NULL);
+  char *result = real_mkdtemp_ptr(template_name);
+  CT_OBSERVE(ct_mutation_observer, CT_MUTATION_MKDTEMP, AT_FDCWD, result,
+             NULL, 0L, result != NULL ? 0 : -1);
+  return result;
+}
+
 /* On LP64 glibc each *64 name is the same function as its plain twin (see
  * LARGE-FILE ALIASES above). */
 #if defined(__LP64__) && defined(__GLIBC__)
@@ -4566,6 +4639,14 @@ extern int ct_truncate64_alias(const char *, off_t)
     __asm__("truncate64") __attribute__((alias("truncate"), visibility("default")));
 extern int ct_creat64_alias(const char *, mode_t)
     __asm__("creat64") __attribute__((alias("creat"), visibility("default")));
+extern int ct_mkstemp64_alias(char *)
+    __asm__("mkstemp64") __attribute__((alias("mkstemp"), visibility("default")));
+extern int ct_mkostemp64_alias(char *, int)
+    __asm__("mkostemp64") __attribute__((alias("mkostemp"), visibility("default")));
+extern int ct_mkstemps64_alias(char *, int)
+    __asm__("mkstemps64") __attribute__((alias("mkstemps"), visibility("default")));
+extern int ct_mkostemps64_alias(char *, int, int)
+    __asm__("mkostemps64") __attribute__((alias("mkostemps"), visibility("default")));
 #endif
 
 /* In-tree creation of the anonymous local channels Chromium's message pump

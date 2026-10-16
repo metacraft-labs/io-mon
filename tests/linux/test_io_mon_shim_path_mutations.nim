@@ -109,6 +109,24 @@ int main(int argc, char **argv) {
   EXPECT_OK(remove("A/f2"));
   EXPECT_ERRNO(remove("A/f2"), ENOENT);
 
+  /* Temporary files and directories, which libc creates with its own
+     internal open and mkdir. */
+  {
+    char t1[] = "A/tmpXXXXXX";
+    char t2[] = "A/otmpXXXXXX";
+    char t3[] = "A/stmpXXXXXX.sfx";
+    char t4[] = "A/dtmpXXXXXX";
+    char bad[] = "nodir/tmpXXXXXX";
+    int fd;
+    EXPECT_OK(write_file(mkstemp(t1)));
+    EXPECT_OK(write_file(mkostemp(t2, O_CLOEXEC)));
+    EXPECT_OK(write_file(mkstemps(t3, 4)));
+    ++step; if (mkdtemp(t4) == NULL) return 10 + step;
+    EXPECT_ERRNO(mkstemp(bad), ENOENT);
+    (void)fd;
+    printf("TEMPS %s %s %s %s\n", t1, t2, t3, t4);
+  }
+
   /* A directory fd the shim never saw opened: opendir opens it inside libc. */
   EXPECT_OK(mkdir("D", 0755));
   EXPECT_OK(write_file(creat("D/u", 0644)));
@@ -247,6 +265,22 @@ suite "io-mon Linux shim: path mutations":
     check dep.mutations(tree / "C").hasDetail("mkdir")
     check dep.mutations(tree / "C").hasDetail("rmdir")
     check dep.mutations(tree / "C").len == 2        # not the ENOENT retry
+    # mkstemp & co. and mkdtemp: the names they chose, from the host's output.
+    var temps: seq[string]
+    for line in cap.output.splitLines:
+      if line.startsWith("TEMPS "):
+        temps = line.split(' ')[1 .. ^1]
+    check temps.len == 4
+    if temps.len == 4:
+      for name in temps[0 .. 2]:
+        check dep.records.anyIt(it.kind == mrFileOpen and
+          it.path == tree / name and it.observationKind == moFileWrite)
+        # The write through the descriptor it returned is attributed too.
+        check dep.records.anyIt(it.kind == mrFileWrite and
+          it.path == tree / name)
+      check dep.mutations(tree / temps[3]).hasDetail("mkdir mkdtemp")
+    check not dep.records.anyIt(it.path.startsWith(tree / "nodir" / "tmp") and
+      it.kind != mrFileOpen)
     check dep.mutations(tree / "D" / "u").anyIt(
       it.detail.startsWith("unlinkat dirfd="))
     check dep.mutations(tree / "D" / "sub").anyIt(

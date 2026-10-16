@@ -410,6 +410,7 @@ const
   OWrOnly = 0x0001.cint
   ORdWr = 0x0002.cint
   OCreat = 0x0040.cint
+  OExcl = 0x0080.cint
   OTrunc = 0x0200.cint
   OAppend = 0x0400.cint
   LinuxAtFdcwd = -100.cint
@@ -4427,6 +4428,8 @@ const
   MutationSymlinkat = 7.cint
   MutationRemove = 8.cint
   MutationTruncate = 9.cint
+  MutationMkdtemp = 10.cint
+  MutationMkstemp = 11.cint
 
 proc repro_linux_observe_mutation(op, dirfd: cint; path, target: cstring;
                                   arg: clong; rc: cint) {.cdecl, raises: [].} =
@@ -4460,6 +4463,12 @@ proc repro_linux_observe_mutation(op, dirfd: cint; path, target: cstring;
     recordPathMutation(LinuxAtFdcwd, path, "remove")
   of MutationTruncate:
     recordPathTruncate(path, int64(arg), "truncate")
+  of MutationMkdtemp:
+    recordPathMutation(LinuxAtFdcwd, path, "mkdir mkdtemp")
+  of MutationMkstemp:
+    # The file mkstemp created and opened: `arg` is its descriptor, `dirfd`
+    # mkostemp's extra flags (see `ct_report_mkstemp`).
+    recordOpen(path, OCreat or OExcl or ORdWr or dirfd, 0o600, cint(arg))
   else:
     discard
 
