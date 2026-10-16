@@ -576,6 +576,7 @@ type
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <glob.h>
 #include <limits.h>
 #include <link.h>
 #include <signal.h>
@@ -957,6 +958,12 @@ static ct_realpath_real_fn real_realpath_ptr = NULL;
 static ct_canonicalize_real_fn real_canonicalize_file_name_ptr = NULL;
 static ct_scandir_real_fn real_scandir_ptr = NULL;
 static ct_scandir_real_fn real_scandir64_ptr = NULL;
+/* glob/glob64 (see the glob interposition below). On LP64 glibc glob_t and
+ * glob64_t share one layout, so one pointer type serves both. */
+typedef int (*ct_glob_real_fn)(const char *, int, int (*)(const char *, int),
+                               glob_t *);
+static ct_glob_real_fn real_glob_ptr = NULL;
+static ct_glob_real_fn real_glob64_ptr = NULL;
 static ct_fdopendir_real_fn real_fdopendir_ptr = NULL;
 static ct_statx_real_fn real_statx_ptr = NULL;
 static ct_fstatat_real_fn real_fstatat_ptr = NULL;
@@ -3598,6 +3605,8 @@ void ct_linux_preload_prime_real_functions(void) {
   CT_PRIME(real_clone_ptr, ct_clone_fn, "clone");
   CT_PRIME(real_scandir_ptr, ct_scandir_real_fn, "scandir");
   CT_PRIME(real_scandir64_ptr, ct_scandir_real_fn, "scandir64");
+  CT_PRIME(real_glob_ptr, ct_glob_real_fn, "glob");
+  CT_PRIME(real_glob64_ptr, ct_glob_real_fn, "glob64");
   CT_PRIME(real_fdopendir_ptr, ct_fdopendir_real_fn, "fdopendir");
   CT_PRIME(real_statx_ptr, ct_statx_real_fn, "statx");
   CT_PRIME(real_fstatat_ptr, ct_fstatat_real_fn, "fstatat");
@@ -4265,6 +4274,118 @@ int ct_scandir64_impl(const char *dir, void *namelist, void *filter,
   int rc = real_scandir64_ptr(dir, namelist, filter, compar);
   CT_OBSERVE(ct_enumerate_observer, AT_FDCWD, dir, rc);
   return rc;
+}
+#endif
+
+/* glob(3) opens, reads and stats directories INSIDE libc (glibc calls
+ * __opendir, __readdir64 and __fstatat64), so a scan made through it reaches
+ * none of the interpositions: a pattern such as "<dir>/*.nimble" left no
+ * evidence that <dir> was listed, although whether anything matches decides
+ * the caller's outcome (Nim's walkFiles is glob on POSIX, and the compiler
+ * finds a project's .nimble file with it). Darwin's glob calls the public
+ * opendir, so the macOS backend already records these scans.
+ *
+ * glibc's GLOB_ALTDIRFUNC extension makes glob do all of its directory and
+ * stat access through function pointers in the caller's glob_t
+ * (https://sourceware.org/glibc/manual/latest/html_node/More-Flags-for-Globbing.html).
+ * The interposition passes its own: each calls the real function and records
+ * what the call means. Every directory glob scans is a directory enumeration
+ * (one it cannot open is a probe of whether the name exists), and every name
+ * it looks up with stat/lstat is a probe. The caller's glob_t fields and the
+ * GLOB_ALTDIRFUNC bit of gl_flags are restored afterwards, so the caller sees
+ * what an unmonitored glob returns.
+ *
+ * A caller that passes GLOB_ALTDIRFUNC itself does its own directory access,
+ * observed through whatever its callbacks call; its glob runs unchanged.
+ * On LP64 glibc struct dirent/stat are their *64 twins, so one set of
+ * callbacks serves both glob and glob64. */
+typedef void (*ct_glob_scan_observer_fn)(const char *path);
+static ct_glob_scan_observer_fn ct_glob_scan_observer = NULL;
+void ct_linux_preload_register_glob_scan_observer(
+    ct_glob_scan_observer_fn observer) {
+  ct_glob_scan_observer = observer;
+}
+
+#if defined(__LP64__) && defined(__GLIBC__) && defined(GLOB_ALTDIRFUNC)
+static void *ct_glob_opendir(const char *path) {
+  void *dir = ct_linux_preload_real_opendir((char *)path);
+  if (dir != NULL) {
+    CT_OBSERVE(ct_glob_scan_observer, path);
+  } else {
+    /* glob skips a directory it cannot open (an absent name, a file, no
+     * permission), so the outcome depends on whether the name exists. Keep
+     * opendir's errno: glob hands it to the caller's errfunc. */
+    int saved_errno = errno;
+    struct stat st;
+    int rc = ct_linux_preload_real_stat((char *)path, &st) == 0 ? 0 : -1;
+    errno = saved_errno;
+    CT_OBSERVE(ct_probe_observer, AT_FDCWD, path, rc);
+  }
+  return dir;
+}
+
+static struct dirent *ct_glob_readdir(void *dir) {
+  return (struct dirent *)ct_linux_preload_real_readdir(dir);
+}
+
+static void ct_glob_closedir(void *dir) {
+  ct_linux_preload_real_closedir(dir);
+}
+
+static int ct_glob_stat(const char *path, struct stat *buf) {
+  int rc = ct_linux_preload_real_stat((char *)path, buf);
+  CT_OBSERVE(ct_probe_observer, AT_FDCWD, path, rc);
+  return rc;
+}
+
+static int ct_glob_lstat(const char *path, struct stat *buf) {
+  int rc = ct_linux_preload_real_lstat((char *)path, buf);
+  CT_OBSERVE(ct_probe_observer, AT_FDCWD, path, rc);
+  return rc;
+}
+
+static int ct_glob_observed(ct_glob_real_fn real, const char *pattern,
+                            int flags, int (*errfunc)(const char *, int),
+                            glob_t *pglob) {
+  if (CT_BYPASS() || ct_glob_scan_observer == NULL || pglob == NULL ||
+      (flags & GLOB_ALTDIRFUNC) != 0)
+    return real(pattern, flags, errfunc, pglob);
+  void (*saved_closedir)(void *) = pglob->gl_closedir;
+  struct dirent *(*saved_readdir)(void *) = pglob->gl_readdir;
+  void *(*saved_opendir)(const char *) = pglob->gl_opendir;
+  int (*saved_lstat)(const char *, struct stat *) = pglob->gl_lstat;
+  int (*saved_stat)(const char *, struct stat *) = pglob->gl_stat;
+  pglob->gl_closedir = ct_glob_closedir;
+  pglob->gl_readdir = ct_glob_readdir;
+  pglob->gl_opendir = ct_glob_opendir;
+  pglob->gl_lstat = ct_glob_lstat;
+  pglob->gl_stat = ct_glob_stat;
+  int rc = real(pattern, flags | GLOB_ALTDIRFUNC, errfunc, pglob);
+  int saved_errno = errno;
+  pglob->gl_closedir = saved_closedir;
+  pglob->gl_readdir = saved_readdir;
+  pglob->gl_opendir = saved_opendir;
+  pglob->gl_lstat = saved_lstat;
+  pglob->gl_stat = saved_stat;
+  pglob->gl_flags &= ~GLOB_ALTDIRFUNC;
+  errno = saved_errno;
+  return rc;
+}
+
+int glob(const char *pattern, int flags, int (*errfunc)(const char *, int),
+         glob_t *pglob) __attribute__((visibility("default")));
+int glob(const char *pattern, int flags, int (*errfunc)(const char *, int),
+         glob_t *pglob) {
+  CT_OBSERVED_REAL(real_glob_ptr, ct_glob_real_fn, "glob", GLOB_ABORTED);
+  return ct_glob_observed(real_glob_ptr, pattern, flags, errfunc, pglob);
+}
+
+int ct_glob64_impl(const char *, int, int (*)(const char *, int), glob_t *)
+    __asm__("glob64") __attribute__((visibility("default")));
+int ct_glob64_impl(const char *pattern, int flags,
+                   int (*errfunc)(const char *, int), glob_t *pglob) {
+  CT_OBSERVED_REAL(real_glob64_ptr, ct_glob_real_fn, "glob64", GLOB_ABORTED);
+  return ct_glob_observed(real_glob64_ptr, pattern, flags, errfunc, pglob);
 }
 #endif
 
