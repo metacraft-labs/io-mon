@@ -395,6 +395,7 @@ else:
 
 var
   fragmentOpenCount: Atomic[uint64]
+  fragmentCloseCount: Atomic[uint64]
   fragmentWriteCount: Atomic[uint64]
   fragmentFlushCount: Atomic[uint64]
   fragmentHandleProbeCount: Atomic[uint64]
@@ -1271,6 +1272,20 @@ proc resetFragmentLogOpenCount*() =
   ## Test-only — reset the open counter between scenarios.
   fragmentOpenCount.store(0, moRelaxed)
 
+proc fragmentLogCloseCount*(): uint64 =
+  ## Return the lifetime number of times the writer closed a fragment handle
+  ## that `fragmentLogOpenCount` counted as opened. Each handle is closed
+  ## exactly once, so the close count never exceeds the open count; a close
+  ## count above it is a second close of a descriptor number the tracee may
+  ## already have reused. It can fall below: `reopenFragmentHandle` detaches a
+  ## replaced handle without closing it, and the signal handler's raw
+  ## `close(2)` (`sigSafeMarkSlotClosed`) is not counted.
+  fragmentCloseCount.load(moRelaxed)
+
+proc resetFragmentLogCloseCount*() =
+  ## Test-only — reset the close counter between scenarios.
+  fragmentCloseCount.store(0, moRelaxed)
+
 proc fragmentLogWriteCount*(): uint64 =
   ## DSL-port M9.R.15f.1 — return the lifetime number of underlying
   ## ``writeBuffer`` calls the batched fragment writer issued. Tests
@@ -1411,6 +1426,7 @@ proc accountFragmentBytes(written: int) =
     close(slot.file)
   except IOError, OSError:
     discard
+  discard fragmentCloseCount.fetchAdd(1, moRelaxed)
   slot.isOpen = false
   slot.batchLen = 0
   slot.batchOpenedAtNs = 0
@@ -1485,6 +1501,7 @@ proc closeFragmentSlot*(retainIdentity = false) =
         close(slot.file)
       except IOError, OSError:
         discard
+      discard fragmentCloseCount.fetchAdd(1, moRelaxed)
     slot.isOpen = false
     if not retainIdentity:
       slot.fragmentDirLen = 0
@@ -1526,6 +1543,7 @@ proc discardFragmentSlotAfterFork*() =
         close(slot.file)
       except IOError, OSError:
         discard
+      discard fragmentCloseCount.fetchAdd(1, moRelaxed)
     slot.isOpen = false
     slot.fragmentDirLen = 0
     slot.fragmentDirBuf[0] = '\0'
@@ -1953,8 +1971,14 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
       # fragment but the close path drops them on the floor.
       try: flushFragmentBatch()
       except EnvelopeError, IOError, OSError: discard
-      try: close(slot.file)
-      except IOError, OSError: discard
+      # A flush that reaches the byte cap has already closed this handle
+      # (`accountFragmentBytes`), as has a failed recovery inside the flush.
+      # Closing it again would close a descriptor number the tracee may have
+      # reused since, which is the hazard the identity check above prevents.
+      if slot.isOpen:
+        try: close(slot.file)
+        except IOError, OSError: discard
+        discard fragmentCloseCount.fetchAdd(1, moRelaxed)
       slot.isOpen = false
     createDir(extendedPath(fragmentDir))
     let path = fragmentPath(fragmentDir, record.osPid, record.threadId)
