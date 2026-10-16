@@ -42,6 +42,28 @@ proc buildPrivateMacosShim*(repoRoot: string;
 proc buildPrivateLinuxShim*(repoRoot: string): string =
   buildPrivateShim(repoRoot, "librepro_monitor_shim.so", "")
 
+proc buildPrivateLinuxShimWithFlags*(repoRoot: string;
+                                     flags: openArray[string]): string =
+  ## The production Linux shim built with extra compiler flags (a test-only
+  ## `-d:` define), in its own private tree so it never replaces the plain
+  ## shim another fixture of this process loads.
+  let work = createTempDir("io-mon-fixture-shim-flags-", "")
+  addExitProc(proc() =
+    try: removeDir(work)
+    except OSError: discard)
+  var buildEnv = newStringTable(modeCaseSensitive)
+  for key, value in envPairs(): buildEnv[key] = value
+  buildEnv["STACKABLE_HOOKS_BUILT_TOOLS_DIR"] = ""
+  buildEnv["IO_MON_SHIM_OUT_DIR"] = work / "lib"
+  buildEnv["IO_MON_SHIM_NIMCACHE_DIR"] = work / "nimcache"
+  var cmd = "bash " & quoteShell(repoRoot / "scripts/build_shim.sh")
+  for flag in flags: cmd.add " " & quoteShell(flag)
+  let built = execCmdEx(cmd, env = buildEnv)
+  if built.exitCode != 0:
+    raise newException(IOError, "private build_shim.sh failed: " & built.output)
+  result = work / "lib" / "librepro_monitor_shim.so"
+  doAssert fileExists(result), "shim not produced at " & result
+
 proc copyMacosShimAsDistinctImage*(shim, dest: string) =
   ## Copy `shim` to `dest` as a second, separately identified shim image, the
   ## way two monitors meet in production (a development build outside, an

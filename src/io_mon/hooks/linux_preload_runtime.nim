@@ -1451,6 +1451,70 @@ static long ct_inline_loss_append_text(char *out, long at, long cap,
   return at;
 }
 
+/* Append one pre-encoded loss frame, with `pid`/`tid` filled in at the
+ * offsets given (-1: none), to "repro-monitor-<pid>-<tid><suffix>" in the
+ * armed fragment directory. Raw syscalls only; async-signal-safe, no locks,
+ * no allocation. Returns 1 when the whole frame was written. */
+static int ct_write_loss_frame(const unsigned char *frame, long frame_len,
+                               long po, long to, const char *suffix,
+                               long pid, long tid) {
+  /* The directory is opened first and the file created relative to it, so
+   * only the short file name is built here, whatever the directory's
+   * length. The name differs from the thread's ordinary fragment by its
+   * suffix, and a reused pid/tid appends another whole frame to it
+   * (O_APPEND), which the merge reads like any other. */
+  char name[96];
+  const long cap = (long)sizeof(name) - 1;
+  long at = 0;
+  at = ct_inline_loss_append_text(name, at, cap, "repro-monitor-");
+  at = ct_inline_loss_append_decimal(name, at, cap, (unsigned long)pid);
+  at = ct_inline_loss_append_text(name, at, cap, "-");
+  at = ct_inline_loss_append_decimal(name, at, cap, (unsigned long)tid);
+  at = ct_inline_loss_append_text(name, at, cap, suffix);
+  name[at] = '\0';
+  long dirfd = ct_raw_syscall6(SYS_openat, AT_FDCWD, (long)ct_inline_loss_dir,
+                               O_PATH | O_DIRECTORY | O_CLOEXEC, 0, 0, 0);
+  long fd = -1;
+  if (dirfd >= 0) {
+    fd = ct_raw_syscall6(SYS_openat, dirfd, (long)name,
+                         O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
+                             O_NOFOLLOW,
+                         0600, 0, 0);
+    ct_raw_syscall6(SYS_close, dirfd, 0, 0, 0, 0, 0);
+  }
+  if (fd < 0) return 0;
+  unsigned char pid_bytes[8], tid_bytes[8];
+  for (int i = 0; i < 8; ++i) {
+    pid_bytes[i] = (unsigned char)((unsigned long)pid >> (8 * i));
+    tid_bytes[i] = (unsigned char)((unsigned long)tid >> (8 * i));
+  }
+  /* One writev, so the frame lands whole even if another thread appends
+   * to the same file (O_APPEND). */
+  struct iovec parts[5];
+  int count = 0;
+  if (po < 0) {
+    parts[count].iov_base = (void *)frame;
+    parts[count++].iov_len = (size_t)frame_len;
+  } else {
+    long first = po < to ? po : to, second = po < to ? to : po;
+    unsigned char *first_bytes = po < to ? pid_bytes : tid_bytes;
+    unsigned char *second_bytes = po < to ? tid_bytes : pid_bytes;
+    parts[count].iov_base = (void *)frame;
+    parts[count++].iov_len = (size_t)first;
+    parts[count].iov_base = first_bytes;
+    parts[count++].iov_len = 8;
+    parts[count].iov_base = (void *)(frame + first + 8);
+    parts[count++].iov_len = (size_t)(second - first - 8);
+    parts[count].iov_base = second_bytes;
+    parts[count++].iov_len = 8;
+    parts[count].iov_base = (void *)(frame + second + 8);
+    parts[count++].iov_len = (size_t)(frame_len - second - 8);
+  }
+  long written = ct_raw_syscall6(SYS_writev, fd, (long)parts, count, 0, 0, 0);
+  ct_raw_syscall6(SYS_close, fd, 0, 0, 0, 0, 0);
+  return written == frame_len;
+}
+
 static void ct_report_unclassified_inline_events(void) {
   long frame_len = __atomic_load_n(&ct_inline_loss_frame_len,
                                    __ATOMIC_ACQUIRE);
@@ -1467,68 +1531,77 @@ static void ct_report_unclassified_inline_events(void) {
     errno = saved_errno;
     return;
   }
-  /* The directory is opened first and the file created relative to it, so
-   * only the short file name is built here, whatever the directory's
-   * length: "repro-monitor-<pid>-<tid>-inline-loss.iomon-frag". The name
-   * differs from the thread's ordinary fragment by its suffix, and a reused
-   * pid/tid appends another whole frame to it (O_APPEND), which the merge
-   * reads like any other. */
-  char name[96];
-  const long cap = (long)sizeof(name) - 1;
-  long at = 0;
-  at = ct_inline_loss_append_text(name, at, cap, "repro-monitor-");
-  at = ct_inline_loss_append_decimal(name, at, cap, (unsigned long)pid);
-  at = ct_inline_loss_append_text(name, at, cap, "-");
-  at = ct_inline_loss_append_decimal(name, at, cap, (unsigned long)tid);
-  at = ct_inline_loss_append_text(name, at, cap, "-inline-loss.iomon-frag");
-  name[at] = '\0';
-  long dirfd = ct_raw_syscall6(SYS_openat, AT_FDCWD, (long)ct_inline_loss_dir,
-                               O_PATH | O_DIRECTORY | O_CLOEXEC, 0, 0, 0);
-  long fd = -1;
-  if (dirfd >= 0) {
-    fd = ct_raw_syscall6(SYS_openat, dirfd, (long)name,
-                         O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
-                             O_NOFOLLOW,
-                         0600, 0, 0);
-    ct_raw_syscall6(SYS_close, dirfd, 0, 0, 0, 0, 0);
+  if (ct_write_loss_frame(ct_inline_loss_frame, frame_len,
+                          ct_inline_loss_pid_offset, ct_inline_loss_tid_offset,
+                          "-inline-loss.iomon-frag", pid, tid)) {
+    __atomic_store_n(&ct_inline_loss_reported_count, reserved,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&ct_inline_loss_reported_pid, (int)pid,
+                     __ATOMIC_RELEASE);
   }
-  if (fd >= 0) {
-    unsigned char pid_bytes[8], tid_bytes[8];
-    for (int i = 0; i < 8; ++i) {
-      pid_bytes[i] = (unsigned char)((unsigned long)pid >> (8 * i));
-      tid_bytes[i] = (unsigned char)((unsigned long)tid >> (8 * i));
-    }
-    /* One writev, so the frame lands whole even if another thread appends
-     * to the same file (O_APPEND). */
-    struct iovec parts[5];
-    int count = 0;
-    long po = ct_inline_loss_pid_offset, to = ct_inline_loss_tid_offset;
-    if (po < 0) {
-      parts[count].iov_base = ct_inline_loss_frame;
-      parts[count++].iov_len = (size_t)frame_len;
-    } else {
-      long first = po < to ? po : to, second = po < to ? to : po;
-      unsigned char *first_bytes = po < to ? pid_bytes : tid_bytes;
-      unsigned char *second_bytes = po < to ? tid_bytes : pid_bytes;
-      parts[count].iov_base = ct_inline_loss_frame;
-      parts[count++].iov_len = (size_t)first;
-      parts[count].iov_base = first_bytes;
-      parts[count++].iov_len = 8;
-      parts[count].iov_base = ct_inline_loss_frame + first + 8;
-      parts[count++].iov_len = (size_t)(second - first - 8);
-      parts[count].iov_base = second_bytes;
-      parts[count++].iov_len = 8;
-      parts[count].iov_base = ct_inline_loss_frame + second + 8;
-      parts[count++].iov_len = (size_t)(frame_len - second - 8);
-    }
-    long written = ct_raw_syscall6(SYS_writev, fd, (long)parts, count, 0, 0, 0);
-    ct_raw_syscall6(SYS_close, fd, 0, 0, 0, 0, 0);
-    if (written == frame_len) {
-      __atomic_store_n(&ct_inline_loss_reported_count, reserved,
+  errno = saved_errno;
+}
+
+/* EVIDENCE A FORK CHILD SKIPPED IS REPORTED, NEVER DROPPED SILENTLY.
+ *
+ * A child forked from a multi-threaded process whose shim state another
+ * thread was updating at the fork instant (or created by a raw fork-like
+ * system call, which resets no libc state at all) skips monitor bookkeeping
+ * until it execs: recording could wait forever on a lock held by a thread
+ * that does not exist in the child. A hook that would have produced
+ * evidence there reports, once per process, a pre-encoded event-loss frame
+ * through the same raw-syscall writer as the inline report, so the capture
+ * is incomplete rather than complete without the child's reads. Armed by the
+ * shim at init (`ct_linux_preload_arm_fork_skip_loss_report`), after the
+ * inline report, whose fragment directory it shares. */
+static unsigned char ct_fork_skip_loss_frame[CT_INLINE_LOSS_FRAME_CAP];
+static long ct_fork_skip_loss_frame_len = 0;   /* 0: not armed */
+static long ct_fork_skip_loss_pid_offset = -1;
+static long ct_fork_skip_loss_tid_offset = -1;
+static int ct_fork_skip_loss_reported_pid = 0;
+
+int ct_linux_preload_arm_fork_skip_loss_report(const unsigned char *frame,
+                                               long frame_len, long pid_offset,
+                                               long tid_offset)
+    __attribute__((visibility("default")));
+int ct_linux_preload_arm_fork_skip_loss_report(const unsigned char *frame,
+                                               long frame_len, long pid_offset,
+                                               long tid_offset) {
+  __atomic_store_n(&ct_fork_skip_loss_frame_len, 0, __ATOMIC_RELEASE);
+  if (ct_inline_loss_dir[0] != '/' || frame == NULL || frame_len <= 0 ||
+      frame_len > CT_INLINE_LOSS_FRAME_CAP)
+    return 0;
+  if (pid_offset < 0 || pid_offset + 8 > frame_len ||
+      tid_offset < 0 || tid_offset + 8 > frame_len ||
+      (pid_offset < tid_offset ? pid_offset + 8 > tid_offset
+                               : tid_offset + 8 > pid_offset)) {
+    pid_offset = -1;
+    tid_offset = -1;
+  }
+  memcpy(ct_fork_skip_loss_frame, frame, (size_t)frame_len);
+  ct_fork_skip_loss_pid_offset = pid_offset;
+  ct_fork_skip_loss_tid_offset = tid_offset;
+  __atomic_store_n(&ct_fork_skip_loss_frame_len, frame_len, __ATOMIC_RELEASE);
+  return 1;
+}
+
+void ct_linux_report_fork_child_skipped_evidence(void)
+    __attribute__((visibility("default")));
+void ct_linux_report_fork_child_skipped_evidence(void) {
+  long frame_len = __atomic_load_n(&ct_fork_skip_loss_frame_len,
+                                   __ATOMIC_ACQUIRE);
+  if (frame_len <= 0) return;
+  int saved_errno = errno;
+  long pid = ct_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
+  if (__atomic_load_n(&ct_fork_skip_loss_reported_pid, __ATOMIC_ACQUIRE) !=
+      (int)pid) {
+    long tid = ct_raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
+    if (ct_write_loss_frame(ct_fork_skip_loss_frame, frame_len,
+                            ct_fork_skip_loss_pid_offset,
+                            ct_fork_skip_loss_tid_offset,
+                            "-fork-loss.iomon-frag", pid, tid))
+      __atomic_store_n(&ct_fork_skip_loss_reported_pid, (int)pid,
                        __ATOMIC_RELEASE);
-      __atomic_store_n(&ct_inline_loss_reported_pid, (int)pid,
-                       __ATOMIC_RELEASE);
-    }
   }
   errno = saved_errno;
 }
@@ -2730,6 +2803,44 @@ int clone(int (*fn)(void *), void *stack, int flags, void *arg, ...) {
   errno = saved_errno;
   return real_clone_ptr(ct_clone_child_entry, stack, flags, &call,
                         parent_tid, tls, child_tid);
+}
+
+/* glibc 2.34's _Fork(3) is fork(2) without the atfork handlers, for code
+ * that must fork from a signal handler. glibc's own fork() calls it
+ * internally, never through this symbol, so only a program's direct call
+ * lands here. Its child is in the position of a raw clone's: no atfork
+ * handler ran, so neither the shim's nor the private heap's state was made
+ * consistent, and a multi-threaded parent's other threads may have held any
+ * shim lock. It gets the same treatment as glibc's clone(3) above (reclaim
+ * the private heap's locks; skip monitor bookkeeping until exec, reporting
+ * what it skips, when the parent had other threads). Without this, such a
+ * child recorded straight through whatever state the fork caught. See
+ * _Fork(3). */
+typedef pid_t (*ct_underscore_fork_fn)(void);
+static ct_underscore_fork_fn real_underscore_fork_ptr = NULL;
+
+pid_t _Fork(void) __attribute__((visibility("default")));
+pid_t _Fork(void) {
+  ct_underscore_fork_fn real = __atomic_load_n(&real_underscore_fork_ptr,
+                                               __ATOMIC_ACQUIRE);
+  if (real == NULL) {
+    real = (ct_underscore_fork_fn)ct_resolve("_Fork");
+    __atomic_store_n(&real_underscore_fork_ptr, real, __ATOMIC_RELEASE);
+  }
+  if (real == NULL) { errno = ENOSYS; return -1; }
+  int saved_errno = errno;
+  int parent_single = 1;
+  if (!CT_BYPASS() && ct_raw_fork_sample != NULL)
+    parent_single = CT_CALL_HOOK(ct_raw_fork_sample());
+  errno = saved_errno;
+  pid_t pid = real();
+  if (pid == 0) {
+    saved_errno = errno;
+    ct_raw_fork_child_reset();
+    if (ct_raw_fork_child != NULL) ct_raw_fork_child(parent_single);
+    errno = saved_errno;
+  }
+  return pid;
 }
 
 static int ct_open_flags_need_mode(int flags) {
@@ -5754,6 +5865,13 @@ proc cArmInlineLossReport(dir: cstring; frame: pointer; frameLen: clong;
   {.importc: "ct_linux_preload_arm_inline_loss_report", nodecl, raises: [].}
 proc cReportInlineEventsIfPending()
   {.importc: "ct_linux_report_inline_events_if_pending", raises: [].}
+proc cArmForkSkipLossReport(frame: pointer; frameLen: clong;
+                            pidOffset, tidOffset: clong): cint
+  {.importc: "ct_linux_preload_arm_fork_skip_loss_report", nodecl,
+    raises: [].}
+proc cReportForkChildSkippedEvidence()
+  {.importc: "ct_linux_report_fork_child_skipped_evidence", nodecl,
+    raises: [].}
 
 proc installOpenDispatcher(dispatch: OpenDispatch)
   {.importc: "ct_linux_preload_register_open_hook", raises: [].}
@@ -5974,6 +6092,21 @@ var
     ## deadlock on the lock before it could reach the buffer.
 
 initLock(anonymousRangeLock)
+
+proc anonymousRangeLockFree*(): bool {.raises: [].} =
+  ## In a fork child, the only thread of its process: whether no parent
+  ## thread held `anonymousRangeLock` at the fork, so the range table is in
+  ## a state some complete update left it in.
+  if not tryAcquire(anonymousRangeLock):
+    return false
+  release(anonymousRangeLock)
+  true
+
+when defined(ioMonShimForkLockTest):
+  proc anonymousRangeTestHoldLock*(hold: bool) {.raises: [].} =
+    ## Test-only (`-d:ioMonShimForkLockTest`): take or give back
+    ## `anonymousRangeLock` on the calling thread.
+    if hold: acquire(anonymousRangeLock) else: release(anonymousRangeLock)
 
 proc registerOpenHook*(hook: OpenHook; priority = 100) {.raises: [].} =
   if hook == nil:
@@ -6376,6 +6509,22 @@ proc armInlineLossReport*(fragmentDir: string; frame: openArray[byte];
     return false
   cArmInlineLossReport(cstring(fragmentDir), unsafeAddr frame[0],
     clong(frame.len), clong(pidOffset), clong(tidOffset)) == 1
+
+proc armForkSkipLossReport*(frame: openArray[byte];
+                            pidOffset, tidOffset: int): bool {.raises: [].} =
+  ## Hand the runtime the pre-encoded event-loss frame a fork child writes,
+  ## with raw syscalls, when it skips a hook that would have produced
+  ## evidence (`ct_linux_report_fork_child_skipped_evidence`). Call after
+  ## `armInlineLossReport`, whose fragment directory it shares.
+  if frame.len == 0:
+    return false
+  cArmForkSkipLossReport(unsafeAddr frame[0], clong(frame.len),
+    clong(pidOffset), clong(tidOffset)) == 1
+
+proc reportForkChildSkippedEvidence*() {.raises: [].} =
+  ## Report, once per process, that this fork child skipped a hook that
+  ## would have produced evidence (see `armForkSkipLossReport`).
+  cReportForkChildSkippedEvidence()
 
 proc reportInlineEventsIfPending*() {.raises: [].} =
   ## Report unclassified trapped events of this process as event-loss, for

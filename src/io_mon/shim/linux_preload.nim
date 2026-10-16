@@ -55,6 +55,8 @@ when defined(amd64):
     LinuxSysGettimeofday          = 96.clong
     LinuxSysCapget                = 125.clong
     LinuxSysCapset                = 126.clong
+    LinuxSysRtSigaction           = 13.clong
+    LinuxSysRtSigprocmask         = 14.clong
     LinuxSysGettid                = 186.clong
     LinuxSysTime                  = 201.clong
     LinuxSysFutex                 = 202.clong
@@ -108,6 +110,8 @@ elif defined(arm64):
     LinuxSysGettimeofday          = 169.clong
     LinuxSysCapget                = 90.clong
     LinuxSysCapset                = 91.clong
+    LinuxSysRtSigaction           = 134.clong
+    LinuxSysRtSigprocmask         = 135.clong
     LinuxSysGettid                = 178.clong
     LinuxSysTime                  = -1006.clong  # no SYS_time on this architecture
     LinuxSysFutex                 = 98.clong
@@ -272,6 +276,16 @@ _Static_assert(""", LinuxSysCapget, """ < 0, "LinuxSysCapget: SYS_capget is abse
 _Static_assert(""", LinuxSysCapset, """ == SYS_capset, "LinuxSysCapset != SYS_capset");
 #else
 _Static_assert(""", LinuxSysCapset, """ < 0, "LinuxSysCapset: SYS_capset is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_rt_sigaction
+_Static_assert(""", LinuxSysRtSigaction, """ == SYS_rt_sigaction, "LinuxSysRtSigaction != SYS_rt_sigaction");
+#else
+_Static_assert(""", LinuxSysRtSigaction, """ < 0, "LinuxSysRtSigaction: SYS_rt_sigaction is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_rt_sigprocmask
+_Static_assert(""", LinuxSysRtSigprocmask, """ == SYS_rt_sigprocmask, "LinuxSysRtSigprocmask != SYS_rt_sigprocmask");
+#else
+_Static_assert(""", LinuxSysRtSigprocmask, """ < 0, "LinuxSysRtSigprocmask: SYS_rt_sigprocmask is absent, so the Nim value must be a negative sentinel");
 #endif
 #ifdef SYS_gettid
 _Static_assert(""", LinuxSysGettid, """ == SYS_gettid, "LinuxSysGettid != SYS_gettid");
@@ -480,6 +494,12 @@ var
 var
   disabled {.threadvar.}: int
   inForkChild {.threadvar.}: bool
+  # Set by the pthread_atfork child handler: no parent thread held any shim
+  # lock at the fork, so every shim table is in a state some complete update
+  # left it in, and the child can record like the child of a single-threaded
+  # parent (`repro_hook_fork`). The forking thread is the child's only
+  # thread, so a threadvar carries it from the handler to the hook.
+  forkChildLocksFree {.threadvar.}: bool
   # DEP-FLUSH-3 — set once per thread after it first arms the pthread-key
   # thread-exit flush, so the arming call stays off the steady-state hot
   # path (one branch on a threadvar bool per emit).
@@ -1304,6 +1324,20 @@ template withShimMuted(body: untyped) =
 proc shouldBypass(): bool {.inline, raises: [].} =
   disabled > 0 or inForkChild
 
+proc bypassEvidence(): bool {.inline, raises: [].} =
+  ## `shouldBypass` for a hook that produces evidence. A fork child skipping
+  ## monitor bookkeeping (see `repro_hook_fork`) drops that evidence, so it
+  ## reports event-loss, once per process, with raw syscalls only; nothing
+  ## here takes a shim lock. Hooks that only maintain bookkeeping (close,
+  ## munmap) and the process hooks (fork, exec, spawn, exit) keep the plain
+  ## `shouldBypass`: the exec'd image records itself.
+  if disabled > 0:
+    return true
+  if inForkChild:
+    reportForkChildSkippedEvidence()
+    return true
+  false
+
 proc repro_linux_thread_exit_flush() {.exportc, cdecl, raises: [].} =
   ## DEP-FLUSH-3 — invoked by libc from the pthread-key value-destructor on
   ## thread exit. Flushes + closes + unregisters the calling thread's slot
@@ -1336,6 +1370,8 @@ proc repro_linux_atfork_prepare() {.cdecl, raises: [].} =
 proc repro_linux_atfork_parent() {.cdecl, raises: [].} =
   release(recordLock)
 
+proc shimLocksFreeInForkChild(): bool {.raises: [].}
+
 proc repro_linux_atfork_child() {.exportc, cdecl, raises: [].} =
   ## DEP-FLUSH-4 — reset the child's inherited slot + registry so it never
   ## replays the parent's buffered frames or writes through the COW-shared
@@ -1346,6 +1382,16 @@ proc repro_linux_atfork_child() {.exportc, cdecl, raises: [].} =
   # prepare acquired this lock on the forking thread. Release the child's
   # copy before detaching/re-attaching its private producer view.
   release(recordLock)
+  # Sampled before anything below can take a lock: the memory is the
+  # parent's at the fork instant, so a lock found held here was held by a
+  # parent thread that does not exist in the child.
+  forkChildLocksFree = shimLocksFreeInForkChild()
+  if not forkChildLocksFree:
+    # Whatever called fork -- the hooked `fork`, or a libc-internal one such
+    # as daemon(3)'s that never reaches `repro_hook_fork` -- this child must
+    # not touch shim state a vanished thread was updating. It skips monitor
+    # bookkeeping until exec and reports evidence it skips (`bypassEvidence`).
+    inForkChild = true
   resetIdentityCaches()
   withShimMuted:
     try: discardFragmentSlotAfterFork()
@@ -2066,6 +2112,8 @@ proc probeFromResult(callResult: cint): ProbeResult =
 const
   UnclassifiedInlineLossDetail =
     "inline raw syscall events unclassified at image end"
+  ForkChildSkippedEvidenceDetail =
+    "linux fork child skipped evidence before exec"
   LossFramePidMarker = 0x5A17C0DE5A17C0DE'u64
   LossFrameTidMarker = 0x7E1DC0DE7E1DC0DE'u64
 
@@ -2083,7 +2131,42 @@ proc leU64Offset(frame: openArray[byte]; value: uint64): int =
         return -1
       result = start
 
-var inlineLossReportArmed = true
+var
+  inlineLossReportArmed = true
+  forkSkipLossReportArmed = true
+
+proc encodeLossFrame(detail: string): tuple[frame: seq[byte];
+                                            pidOffset, tidOffset: int] =
+  ## A run-stamped event-loss frame with placeholder pid and thread id, and
+  ## where the runtime must write the real ones (-1: the frame carries none).
+  var record = MonitorRecord(kind: mrEventLoss,
+    observationKind: moEventLoss, osPid: LossFramePidMarker,
+    threadId: LossFrameTidMarker, detail: detail)
+  stampRunId(record)
+  result.frame = encodeFrame(record)
+  result.pidOffset = leU64Offset(result.frame, LossFramePidMarker)
+  result.tidOffset = leU64Offset(result.frame, LossFrameTidMarker)
+  if result.pidOffset < 0 or result.tidOffset < 0:
+    # The encoding moved the ids somewhere the markers cannot locate: a
+    # frame without them still reports the loss.
+    record.osPid = 0
+    record.threadId = 0
+    result.frame = encodeFrame(record)
+    result.pidOffset = -1
+    result.tidOffset = -1
+
+proc armForkChildSkipLossReport(): bool {.raises: [].} =
+  ## Pre-encode the event-loss frame a fork child skipping monitor
+  ## bookkeeping writes when it skips evidence (`bypassEvidence`). False when
+  ## it could not be armed; the caller reports that.
+  if fragmentDir.len == 0:
+    return true
+  try:
+    let encoded = encodeLossFrame(ForkChildSkippedEvidenceDetail)
+    result = armForkSkipLossReport(encoded.frame, encoded.pidOffset,
+      encoded.tidOffset)
+  except CatchableError:
+    result = false
 
 proc armUnclassifiedInlineLossReport(): bool {.raises: [].} =
   ## Pre-encode the event-loss frame the runtime writes, with raw syscalls,
@@ -2097,22 +2180,9 @@ proc armUnclassifiedInlineLossReport(): bool {.raises: [].} =
     return true
   try:
     let dir = absolutePath(fragmentDir)
-    var record = MonitorRecord(kind: mrEventLoss,
-      observationKind: moEventLoss, osPid: LossFramePidMarker,
-      threadId: LossFrameTidMarker, detail: UnclassifiedInlineLossDetail)
-    stampRunId(record)
-    var frame = encodeFrame(record)
-    var pidOffset = leU64Offset(frame, LossFramePidMarker)
-    var tidOffset = leU64Offset(frame, LossFrameTidMarker)
-    if pidOffset < 0 or tidOffset < 0:
-      # The encoding moved the ids somewhere the markers cannot locate: a
-      # frame without them still reports the loss.
-      record.osPid = 0
-      record.threadId = 0
-      frame = encodeFrame(record)
-      pidOffset = -1
-      tidOffset = -1
-    result = armInlineLossReport(dir, frame, pidOffset, tidOffset)
+    let encoded = encodeLossFrame(UnclassifiedInlineLossDetail)
+    result = armInlineLossReport(dir, encoded.frame, encoded.pidOffset,
+      encoded.tidOffset)
   except CatchableError:
     result = false
 
@@ -2145,6 +2215,8 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))
     inlineLossReportArmed = armUnclassifiedInlineLossReport()
+    forkSkipLossReportArmed =
+      inlineLossReportArmed and armForkChildSkipLossReport()
     # DEP-SHM-2 — attach the process to the edge's shared-memory dependency
     # queue (the FAST PATH in front of the file fragments). The engine created
     # the segment before launching us and named it via REPRO_MONITOR_DEP_SHM;
@@ -2205,6 +2277,9 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     # Nothing could report trapped events that end up unclassified, so this
     # capture cannot claim it would have noticed losing them.
     emitEventLoss("inline raw syscall loss report unavailable")
+  if not forkSkipLossReportArmed:
+    # Likewise, a fork child could not report the evidence it skips.
+    emitEventLoss("fork child skipped-evidence loss report unavailable")
   let collection = getEnv("REPRO_MONITOR_COLLECTION_EVIDENCE")
   if collection.len > 0 and collection != "full:" & runId:
     emitEventLoss("invalid internal collection scope for active capture route")
@@ -2307,7 +2382,7 @@ proc recordOpen(path: cstring; flags, mode, fd: cint;
   emitRecord(record)
 
 proc repro_hook_open*(ctx: var OpenContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -2317,7 +2392,7 @@ proc repro_hook_open*(ctx: var OpenContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_open64*(ctx: var OpenContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -2327,7 +2402,7 @@ proc repro_hook_open64*(ctx: var OpenContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_openat*(ctx: var OpenatContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -2337,7 +2412,7 @@ proc repro_hook_openat*(ctx: var OpenatContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_openat64*(ctx: var OpenatContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -2380,7 +2455,7 @@ proc recordFdWrite(fd: cint; bytes: clong) {.raises: [].} =
     emitRecord(record)
 
 proc repro_hook_read*(ctx: var ReadContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -2390,7 +2465,7 @@ proc repro_hook_read*(ctx: var ReadContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_pread*(ctx: var PreadContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -2400,7 +2475,7 @@ proc repro_hook_pread*(ctx: var PreadContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_readv*(ctx: var ReadvContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -2410,7 +2485,7 @@ proc repro_hook_readv*(ctx: var ReadvContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_preadv*(ctx: var PreadvContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -2420,7 +2495,7 @@ proc repro_hook_preadv*(ctx: var PreadvContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_write*(ctx: var WriteContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -2899,6 +2974,13 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
     # Chromium calls getpid/pkey_* through syscall(2); each used to make the
     # whole run mcIncomplete.
     true
+  of LinuxSysRtSigaction, LinuxSysRtSigprocmask:
+    # Change or query the calling process's signal dispositions or the
+    # calling thread's signal mask. Chromium's process launcher resets every
+    # handler this way in the child between fork and exec. Neither reads the
+    # filesystem or any external input, so there is no dependency to record
+    # and nothing to lose.
+    true
   of LinuxSysCapset:
     # Changes the calling thread's capability sets (Chromium drops
     # capabilities at startup). It reads nothing; it can only change what
@@ -3114,7 +3196,7 @@ proc repro_linux_drain_inline_events() {.cdecl, raises: [].} =
   drainInlineRawSyscallEvents()
 
 proc repro_hook_stat*(ctx: var StatContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3124,7 +3206,7 @@ proc repro_hook_stat*(ctx: var StatContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_lstat*(ctx: var StatContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3134,7 +3216,7 @@ proc repro_hook_lstat*(ctx: var StatContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_opendir*(ctx: var OpendirContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3144,7 +3226,7 @@ proc repro_hook_opendir*(ctx: var OpendirContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_readdir*(ctx: var ReaddirContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3275,7 +3357,7 @@ proc recordFopen(path, mode: cstring; stream: pointer) {.raises: [].} =
     emitRecord(record)
 
 proc repro_hook_fopen*(ctx: var FopenContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3285,7 +3367,7 @@ proc repro_hook_fopen*(ctx: var FopenContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_fopen64*(ctx: var FopenContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3295,7 +3377,7 @@ proc repro_hook_fopen64*(ctx: var FopenContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_fread*(ctx: var FreadContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3366,7 +3448,7 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32) {.raises: [].
   emitRecord(record)
 
 proc repro_hook_connect*(ctx: var ConnectContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3380,7 +3462,7 @@ proc repro_hook_pipe*(ctx: var PipeContext) {.raises: [].} =
   ## IM-3 — `pipe(2)`. Both fds are recorded as in-tree local-fd creates so a
   ## downstream in-tree consumer's inherited opaque read pairs and does not
   ## downgrade. Reads `ctx.fds` only after the real call reported success.
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3393,7 +3475,7 @@ proc repro_hook_pipe*(ctx: var PipeContext) {.raises: [].} =
 proc repro_hook_pipe2*(ctx: var Pipe2Context) {.raises: [].} =
   ## IM-3 — `pipe2(2)`. Same as `pipe`; `O_CLOEXEC`/`O_NONBLOCK` in `ctx.flags`
   ## do not change the channel identity, so the flags are not consulted.
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3406,7 +3488,7 @@ proc repro_hook_pipe2*(ctx: var Pipe2Context) {.raises: [].} =
 proc repro_hook_socketpair*(ctx: var SocketpairContext) {.raises: [].} =
   ## IM-3 — `socketpair(2)`. The two ends have DISTINCT inodes, so both must be
   ## recorded for either end's inherited read to pair.
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3417,7 +3499,7 @@ proc repro_hook_socketpair*(ctx: var SocketpairContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_sendfile*(ctx: var SendfileContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3429,7 +3511,7 @@ proc repro_hook_sendfile*(ctx: var SendfileContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_copy_file_range*(ctx: var CopyFileRangeContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3441,7 +3523,7 @@ proc repro_hook_copy_file_range*(ctx: var CopyFileRangeContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_splice*(ctx: var SpliceContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3495,7 +3577,7 @@ proc recordRenameMutation(resultCode: cint; oldPath, newPath: cstring;
   recordPathWrite(newPath, detail & " destination")
 
 proc repro_hook_link*(ctx: var LinkContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3505,7 +3587,7 @@ proc repro_hook_link*(ctx: var LinkContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_linkat*(ctx: var LinkatContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3521,7 +3603,7 @@ proc repro_hook_linkat*(ctx: var LinkatContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_rename*(ctx: var RenameContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3531,7 +3613,7 @@ proc repro_hook_rename*(ctx: var RenameContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_renameat*(ctx: var RenameatContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3547,7 +3629,7 @@ proc repro_hook_renameat*(ctx: var RenameatContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_renameat2*(ctx: var RenameatContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3567,7 +3649,7 @@ proc repro_hook_renameat2*(ctx: var RenameatContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_dlopen*(ctx: var DlopenContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3592,7 +3674,7 @@ proc repro_hook_dlopen*(ctx: var DlopenContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_dlmopen*(ctx: var DlmopenContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3645,7 +3727,7 @@ proc repro_hook_dlsym*(ctx: var DlsymContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_mmap*(ctx: var MmapContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3655,7 +3737,7 @@ proc repro_hook_mmap*(ctx: var MmapContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_mprotect*(ctx: var MprotectContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3832,7 +3914,7 @@ proc repro_vdso_clock_gettime*(clockId: cint; tp: pointer): cint
     0, 0, 0, 0)
   result = syscallResultToCint(ret)
   let savedErrno = c_get_errno()
-  if not shouldBypass() and result == 0:
+  if not bypassEvidence() and result == 0:
     recordTimeRead("clock_gettime:" & $clockId)
   c_set_errno(savedErrno)
 
@@ -3842,7 +3924,7 @@ proc repro_vdso_gettimeofday*(tv, tz: pointer): cint
     0, 0, 0, 0)
   result = syscallResultToCint(ret)
   let savedErrno = c_get_errno()
-  if not shouldBypass() and result == 0:
+  if not bypassEvidence() and result == 0:
     recordTimeRead("gettimeofday")
   c_set_errno(savedErrno)
 
@@ -3851,7 +3933,7 @@ proc repro_vdso_time*(tloc: ptr clong): clong
   result = syscallResultToClong(c_raw_syscall6(LinuxSysTime, ptrArg(tloc),
     0, 0, 0, 0, 0))
   let savedErrno = c_get_errno()
-  if not shouldBypass() and result != -1:
+  if not bypassEvidence() and result != -1:
     recordTimeRead("time")
   c_set_errno(savedErrno)
 
@@ -3871,7 +3953,7 @@ proc repro_vdso_getcpu*(cpu, node: ptr cuint; unused: pointer): cint
     ptrArg(unused), 0, 0, 0)
   result = syscallResultToCint(ret)
   let savedErrno = c_get_errno()
-  if not shouldBypass() and result == 0:
+  if not bypassEvidence() and result == 0:
     recordObservedNonFile(mrSysctlRead, moSysctlRead, "getcpu",
       "linux vdso getcpu")
   c_set_errno(savedErrno)
@@ -3881,12 +3963,12 @@ proc repro_vdso_getrandom*(buf: pointer; buflen: csize_t; flags: cuint): clong
   result = syscallResultToClong(c_raw_syscall6(LinuxSysGetrandom, ptrArg(buf),
     clong(buflen), clong(flags), 0, 0, 0))
   let savedErrno = c_get_errno()
-  if not shouldBypass() and result >= 0:
+  if not bypassEvidence() and result >= 0:
     recordNonDeterministic("getrandom")
   c_set_errno(savedErrno)
 
 proc repro_hook_getenv*(ctx: var GetenvContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3896,7 +3978,7 @@ proc repro_hook_getenv*(ctx: var GetenvContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_uname*(ctx: var UnameContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3907,7 +3989,7 @@ proc repro_hook_uname*(ctx: var UnameContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_sysconf*(ctx: var SysconfContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3917,7 +3999,7 @@ proc repro_hook_sysconf*(ctx: var SysconfContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_clock_gettime*(ctx: var ClockGettimeContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3928,7 +4010,7 @@ proc repro_hook_clock_gettime*(ctx: var ClockGettimeContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_gettimeofday*(ctx: var GettimeofdayContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3939,7 +4021,7 @@ proc repro_hook_gettimeofday*(ctx: var GettimeofdayContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_time*(ctx: var TimeContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3950,7 +4032,7 @@ proc repro_hook_time*(ctx: var TimeContext) {.raises: [].} =
   c_set_errno(savedErrno)
 
 proc repro_hook_getrandom*(ctx: var GetrandomContext) {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -3989,7 +4071,7 @@ proc repro_hook_entropy*(ctx: var EntropyContext) {.raises: [].} =
   ## observes. No caller attribution: LD_PRELOAD interposes the PUBLIC symbol,
   ## which libc's own internal users bypass, so what arrives here is the
   ## program's own call (see `io_mon/types.nim`, record 16).
-  if shouldBypass():
+  if bypassEvidence():
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -4004,7 +4086,7 @@ proc repro_hook_entropy*(ctx: var EntropyContext) {.raises: [].} =
 proc repro_hook_raw_syscall*(number, a1, a2, a3, a4, a5, a6,
                              callResult: clong; inlineTrap: cint)
     {.raises: [].} =
-  if shouldBypass():
+  if bypassEvidence():
     return
   let savedErrno = c_get_errno()
   recordRawSyscallClassification(number, a1, a2, a3, a4, a5, a6, callResult,
@@ -4039,6 +4121,50 @@ proc processIsSingleThreaded(): bool {.raises: [].} =
     inc i
   result = sawDigit and n == 1
 
+proc shimLocksFreeInForkChild(): bool {.raises: [].} =
+  ## In a fork child, whose only thread is the one that forked: whether no
+  ## parent thread held any shim lock at the fork instant. Every shim table
+  ## is guarded by one of these locks, so when all are free the child sees
+  ## each table as some complete update left it. The registry lock is not
+  ## checked: the child resets the registry (`discardFragmentSlotAfterFork`).
+  ## The private heap's class locks are taken by its own atfork handlers, and
+  ## glibc resets its malloc, stdio and loader locks in a fork child. Every
+  ## other piece of shim state a recording child touches is either the
+  ## forking thread's own (its fragment slot, reset by the atfork child
+  ## handler), written only before the process starts threads (hook tables,
+  ## configuration), a monotonic once-only flag, or lock-free shared memory
+  ## whose writers are complete in the parent (the inline-event ring and
+  ## capture arena, whose entries the child claims only under its own pid).
+  ## `tests/linux/test_io_mon_shim_fork_child_evidence` forks with each lock
+  ## held in turn (`repro_test_fork_hold_lock`).
+  lockIsFree(initLockVar) and lockIsFree(recordLock) and
+    lockIsFree(libScanLock) and podTablesLocksFree() and
+    anonymousRangeLockFree()
+
+when defined(ioMonShimForkLockTest):
+  proc repro_test_fork_hold_lock(which, hold: cint): cint
+      {.exportc, cdecl, dynlib, raises: [].} =
+    ## Test-only (`-d:ioMonShimForkLockTest`): take (`hold` != 0) or give
+    ## back shim lock `which` on the calling thread, so a test can fork while
+    ## another thread holds it: 0 init, 1 library scan, 2..6 the POD tables'
+    ## locks (`podTablesTestHoldLock` 0..4), 7 the anonymous executable range
+    ## table. The record lock has no index: the atfork prepare handler takes
+    ## it, so no thread can hold it across a libc fork. 1 on success, 0 for
+    ## an unknown index.
+    let take = hold != 0
+    case which
+    of 0:
+      if take: acquire(initLockVar) else: release(initLockVar)
+    of 1:
+      if take: acquire(libScanLock) else: release(libScanLock)
+    of 2 .. 6:
+      if not podTablesTestHoldLock(int(which) - 2, take): return 0
+    of 7:
+      anonymousRangeTestHoldLock(take)
+    else:
+      return 0
+    1
+
 proc repro_hook_fork*(ctx: var ForkContext) {.raises: [].} =
   sampleKillDiag("fork-enter")
   if shouldBypass():
@@ -4057,6 +4183,7 @@ proc repro_hook_fork*(ctx: var ForkContext) {.raises: [].} =
   withShimMuted:
     try: flushFragmentBatch()
     except CatchableError: discard
+  forkChildLocksFree = false
   callNext(ctx)
   let savedErrno = c_get_errno()
   if ctx.result > 0:
@@ -4066,9 +4193,18 @@ proc repro_hook_fork*(ctx: var ForkContext) {.raises: [].} =
     record.detail = "fork"
     emitRecord(record)
   elif ctx.result == 0:
-    if parentSingleThreaded:
+    let locksFree = forkChildLocksFree
+    forkChildLocksFree = false
+    # `inForkChild` is already set when the atfork child handler found a lock
+    # held, even by the forking thread itself in a single-threaded parent.
+    if (parentSingleThreaded or locksFree) and not inForkChild:
       # Single-threaded parent ⇒ no sibling thread could hold a Nim lock across
-      # the fork, so the child can safely keep recording. Reset the inherited
+      # the fork, so the child can safely keep recording. A multi-threaded
+      # parent's child can too when no thread held a shim lock at the fork
+      # instant (sampled by the atfork child handler): libc fork ran every
+      # atfork handler, so glibc's and the private heap's own state is
+      # consistent, and every shim table is as a complete update left it.
+      # Reset the inherited
       # (copy-on-write) fragment slot so the child writes its OWN fragment, then
       # emit the child's process-start. This stops a fork-WITHOUT-exec child
       # (e.g. a nix cc/clang-wrapper command-substitution subshell) from being
@@ -4084,9 +4220,10 @@ proc repro_hook_fork*(ctx: var ForkContext) {.raises: [].} =
       sampleKillDiag("fork-child-single")
       recordProcessStart()
     else:
-      # Multi-threaded parent: another thread may have held a Nim lock at fork,
-      # so the child must avoid monitor bookkeeping until exec loads a fresh
-      # image and re-runs the preload constructor.
+      # Multi-threaded parent and another thread held a shim lock at the fork:
+      # the child must avoid monitor bookkeeping until exec loads a fresh
+      # image and re-runs the preload constructor. A hook that would have
+      # produced evidence meanwhile reports the loss (`bypassEvidence`).
       inForkChild = true
       sampleKillDiag("fork-child-multi")
   c_set_errno(savedErrno)
@@ -4099,10 +4236,13 @@ proc repro_linux_raw_fork_sample(): cint {.cdecl, raises: [].} =
 proc repro_linux_raw_fork_child(parentSingleThreaded: cint)
     {.cdecl, raises: [].} =
   ## In the child of a raw fork-like system call (through syscall(2), an
-  ## inline `syscall` the trap handler replays, or glibc's clone(3) without
-  ## CLONE_VM), which ran no atfork handlers. A multi-threaded parent may have held any shim lock at that
-  ## instant, so the child skips monitor bookkeeping until exec, as the child
-  ## of a libc fork does (`repro_hook_fork`); recording the clone itself
+  ## inline `syscall` the trap handler replays, glibc's clone(3) without
+  ## CLONE_VM, or glibc's _Fork(3)), which ran no atfork handlers. A multi-threaded parent may have held any shim lock at that
+  ## instant, and no libc atfork reset ran either (glibc's malloc and stdio
+  ## locks may be held by vanished threads too), so the child skips monitor
+  ## bookkeeping until exec, as the child of a libc fork does when a lock was
+  ## held (`repro_hook_fork`), and reports any evidence it skips
+  ## (`bypassEvidence`); recording the clone itself
   ## would otherwise wait on such a lock forever. A single-threaded parent's
   ## child keeps recording, as before.
   if parentSingleThreaded == 0:
@@ -4273,7 +4413,7 @@ proc repro_linux_observe_probe(dirfd: cint; path: cstring; rc: cint)
   ## returned `rc`: record it as a path probe, like the stat hook does. An
   ## empty path with a dirfd (AT_EMPTY_PATH) inspects the descriptor, not a
   ## path, and is not a probe.
-  if shouldBypass() or path == nil or path[0] == '\0':
+  if bypassEvidence() or path == nil or path[0] == '\0':
     return
   ensureInitializedPreservingErrno()
   emitProbe(path, (if rc >= 0: 0.cint else: -1.cint), dirfd)
@@ -4340,7 +4480,7 @@ proc repro_linux_observe_resolution(dirfd: cint; path: cstring;
   ## (realpath); readlink reads the link itself, so for it only the
   ## directories before the last component are resolved. The root is not
   ## recorded: it cannot be replaced. See path_resolution(7).
-  if shouldBypass() or path == nil or path[0] == '\0':
+  if bypassEvidence() or path == nil or path[0] == '\0':
     return
   ensureInitializedPreservingErrno()
   let start = unnormalizedPathForAt(dirfd, path)
@@ -4427,7 +4567,7 @@ proc repro_linux_observe_enumerate(dirfd: cint; path: cstring; rc: cint)
   ## scandir(path) returned `rc` entries (or -1): a successful one enumerated
   ## the directory, exactly what the readdir hook records per entry; a failed
   ## one is a probe of a path that is absent or unreadable.
-  if shouldBypass() or path == nil or path[0] == '\0':
+  if bypassEvidence() or path == nil or path[0] == '\0':
     return
   ensureInitializedPreservingErrno()
   if rc < 0:
@@ -4444,7 +4584,7 @@ proc repro_linux_observe_glob_scan(path: cstring) {.cdecl, raises: [].} =
   ## an enumeration of the directory, whatever the pattern then matched
   ## (`glob` in linux_preload_runtime.nim). A relative path is glob's own
   ## spelling of a directory under the working directory.
-  if shouldBypass() or path == nil or path[0] == '\0':
+  if bypassEvidence() or path == nil or path[0] == '\0':
     return
   ensureInitializedPreservingErrno()
   var record = baseRecord(mrDirectoryEnumerate, moDirectoryEnumerate)
@@ -4462,7 +4602,7 @@ proc repro_linux_observe_fdopendir(fd: cint; dirp: pointer)
     {.cdecl, raises: [].} =
   ## A DIR* now reads the directory `fd` names; let the readdir hook
   ## attribute its entries to that path.
-  if shouldBypass():
+  if bypassEvidence():
     return
   let path = pathForFd(fd)
   if path.len > 0:
@@ -4471,14 +4611,14 @@ proc repro_linux_observe_fdopendir(fd: cint; dirp: pointer)
 proc repro_linux_observe_mprotect(address: pointer; length: csize_t;
                                   prot: cint; rc: cint) {.cdecl, raises: [].} =
   ## pkey_mprotect: the same executable-lifecycle check as mprotect.
-  if shouldBypass():
+  if bypassEvidence():
     return
   ensureInitializedPreservingErrno()
   observeMprotectResult(address, length, prot, rc)
 
 proc repro_linux_observe_localfd_create(fd: cint) {.cdecl, raises: [].} =
   ## eventfd/timerfd_create created a local channel in-tree (IM-3 create).
-  if shouldBypass():
+  if bypassEvidence():
     return
   ensureInitializedPreservingErrno()
   recordLocalFdCreate(fd)
@@ -4504,7 +4644,7 @@ proc repro_linux_observe_mutation(op, dirfd: cint; path, target: cstring;
   ## their *at forms) returned `rc`. `arg` is unlinkat's flags or truncate's
   ## length; `target` is a symlink's contents. See the path-mutation block
   ## above `classifyRawPathMutation` for what is recorded and why.
-  if shouldBypass() or rc != 0:
+  if bypassEvidence() or rc != 0:
     return
   ensureInitializedPreservingErrno()
   case op
