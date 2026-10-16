@@ -812,16 +812,61 @@ char *ct_linux_preload_raw_owner_join_image(void) {
 #define CT_RAW_SYSCALL_EVENT_CAP 4096
 #define CT_RAW_SYSCALL_SOURCE_LIBC 0
 #define CT_RAW_SYSCALL_SOURCE_INLINE 1
+/* TRAP-TIME CAPTURE. A trapped inline syscall is CLASSIFIED later, outside
+ * signal context (`drainInlineRawSyscallEvents` in linux_preload.nim), but
+ * everything the classification reads through a pointer or a descriptor is
+ * taken HERE, while the trapped call's arguments still mean what they meant
+ * to the kernel: the path strings, the directory a relative path was resolved
+ * against (the working directory, or the directory fd's /proc/self/fd link),
+ * a symbolic link's target, openat2's open_how, and the file each descriptor
+ * of a read/copy named. Read later, a path pointer may name freed or reused
+ * memory, or unmapped memory (a crash at exit); the working directory and the
+ * descriptors may have changed. Each capture is a raw syscall or a memcpy of
+ * memory the kernel just read for the same call, so it is async-signal-safe
+ * and touches no allocator. The strings go to a static bump arena; one that
+ * does not fit marks the event CT_RAW_CAPTURE_FAILED, which the classifier
+ * reports as event-loss.
+ *
+ * Slots are reserved atomically and published with a release store of
+ * `state`, so concurrent traps on several threads never share a slot and the
+ * drain never reads a half-written one. `pid` scopes an event to the process
+ * that trapped it: a fork child inherits a copy of the buffer, and a vfork
+ * child shares it, and neither may classify (or claim) the parent's events. */
+#define CT_RAW_ARENA_CAP (2ul << 20)
+#define CT_RAW_CAPTURE_PATH_MAX 4096
+#define CT_RAW_CAP_BASE 0   /* directory a relative path was resolved against */
+#define CT_RAW_CAP_PATH 1   /* the pathname argument, as passed */
+#define CT_RAW_CAP_TARGET 2 /* symlink(at)'s target */
+#define CT_RAW_CAP_FD0 3    /* /proc/self/fd link of the first descriptor */
+#define CT_RAW_CAP_FD1 4    /* ... of the second (sendfile/copy/splice) */
+#define CT_RAW_CAP_SLOTS 5
+#define CT_RAW_CAPTURE_NONE 0
+#define CT_RAW_CAPTURE_OK 1
+#define CT_RAW_CAPTURE_FAILED 2
+#define CT_RAW_EVENT_FREE 0
+#define CT_RAW_EVENT_READY 1
+#define CT_RAW_EVENT_DRAINED 2
 struct ct_raw_syscall_event {
   long nr;
   long args[6];
   long result;
   int source;
   unsigned long address;
+  int pid;
+  int state;
+  int capture;
+  int cap_mask;
+  unsigned long cap_off[CT_RAW_CAP_SLOTS];
+  unsigned long cap_len[CT_RAW_CAP_SLOTS];
+  int how_set;
+  unsigned long long how_flags;
+  unsigned long long how_mode;
 };
 static struct ct_raw_syscall_event ct_raw_syscall_events[CT_RAW_SYSCALL_EVENT_CAP];
-static volatile sig_atomic_t ct_raw_syscall_event_count_value = 0;
+static long ct_raw_syscall_event_reserved = 0;
 static volatile sig_atomic_t ct_raw_syscall_event_overflow_value = 0;
+static char ct_raw_capture_arena[CT_RAW_ARENA_CAP];
+static unsigned long ct_raw_capture_arena_used = 0;
 
 static ct_open_real_fn real_open_ptr = NULL;
 static ct_open_real_fn real_open64_ptr = NULL;
@@ -922,6 +967,24 @@ static ct_eventfd_real_fn real_eventfd_ptr = NULL;
 static ct_timerfd_create_real_fn real_timerfd_create_ptr = NULL;
 static ct_readlink_chk_real_fn real_readlink_chk_ptr = NULL;
 static ct_readlinkat_chk_real_fn real_readlinkat_chk_ptr = NULL;
+typedef int (*ct_unlink_real_fn)(const char *);
+typedef int (*ct_unlinkat_real_fn)(int, const char *, int);
+typedef int (*ct_mkdir_real_fn)(const char *, mode_t);
+typedef int (*ct_mkdirat_real_fn)(int, const char *, mode_t);
+typedef int (*ct_symlink_real_fn)(const char *, const char *);
+typedef int (*ct_symlinkat_real_fn)(const char *, int, const char *);
+typedef int (*ct_truncate_real_fn)(const char *, off_t);
+typedef int (*ct_creat_real_fn)(const char *, mode_t);
+static ct_unlink_real_fn real_unlink_ptr = NULL;
+static ct_unlinkat_real_fn real_unlinkat_ptr = NULL;
+static ct_unlink_real_fn real_rmdir_ptr = NULL;
+static ct_unlink_real_fn real_remove_ptr = NULL;
+static ct_mkdir_real_fn real_mkdir_ptr = NULL;
+static ct_mkdirat_real_fn real_mkdirat_ptr = NULL;
+static ct_symlink_real_fn real_symlink_ptr = NULL;
+static ct_symlinkat_real_fn real_symlinkat_ptr = NULL;
+static ct_truncate_real_fn real_truncate_ptr = NULL;
+static ct_creat_real_fn real_creat_ptr = NULL;
 
 #define CT_INLINE_SYSCALL_SITE_CAP 4096
 static unsigned long ct_inline_syscall_sites[CT_INLINE_SYSCALL_SITE_CAP];
@@ -1071,6 +1134,217 @@ static void *ct_resolve(const char *name) {
   return stackable_linux_preload_resolve_next(name);
 }
 
+static long ct_raw_syscall6(long nr, long a1, long a2, long a3, long a4,
+                            long a5, long a6);
+
+/* Reserve `max` bytes of the capture arena; -1 when they do not fit. */
+static long ct_raw_arena_reserve(unsigned long max) {
+  unsigned long off = __atomic_load_n(&ct_raw_capture_arena_used,
+                                      __ATOMIC_RELAXED);
+  for (;;) {
+    if (off > CT_RAW_ARENA_CAP || max > CT_RAW_ARENA_CAP - off) return -1;
+    if (__atomic_compare_exchange_n(&ct_raw_capture_arena_used, &off,
+                                    off + max, 1, __ATOMIC_ACQ_REL,
+                                    __ATOMIC_RELAXED))
+      return (long)off;
+  }
+}
+
+/* Give back the unused tail of a reservation when nothing was reserved after
+ * it (the common case); otherwise the tail is simply not reused. */
+static void ct_raw_arena_shrink(unsigned long off, unsigned long max,
+                                unsigned long used) {
+  unsigned long expected = off + max;
+  __atomic_compare_exchange_n(&ct_raw_capture_arena_used, &expected,
+                              off + used, 0, __ATOMIC_ACQ_REL,
+                              __ATOMIC_RELAXED);
+}
+
+static void ct_raw_capture_set(struct ct_raw_syscall_event *event, int slot,
+                               unsigned long off, unsigned long len) {
+  event->cap_off[slot] = off;
+  event->cap_len[slot] = len;
+  event->cap_mask |= 1 << slot;
+}
+
+/* Copy a NUL-terminated argument the kernel just accepted. */
+static int ct_raw_capture_string(struct ct_raw_syscall_event *event, int slot,
+                                 long value) {
+  const char *text = (const char *)value;
+  if (text == NULL) return 0;
+  size_t len = strnlen(text, CT_RAW_CAPTURE_PATH_MAX);
+  if (len >= CT_RAW_CAPTURE_PATH_MAX) return 0;
+  long off = ct_raw_arena_reserve(len + 1);
+  if (off < 0) return 0;
+  memcpy(ct_raw_capture_arena + off, text, len);
+  ct_raw_capture_arena[off + len] = '\0';
+  ct_raw_capture_set(event, slot, (unsigned long)off, len);
+  return 1;
+}
+
+/* What a descriptor names, from its /proc/self/fd link (AT_FDCWD: the working
+ * directory). `require_path`: the answer must be a live absolute path (a
+ * directory relative paths were resolved against); otherwise a link that is
+ * not one -- pipe:[N], socket:[N], a deleted file -- is captured as EMPTY,
+ * which tells the classifier the descriptor names no path. */
+static int ct_raw_capture_fd(struct ct_raw_syscall_event *event, int slot,
+                             long fd, int require_path) {
+  long off = ct_raw_arena_reserve(CT_RAW_CAPTURE_PATH_MAX);
+  if (off < 0) return 0;
+  char *dst = ct_raw_capture_arena + off;
+  long n;
+  if ((int)fd == AT_FDCWD) {
+    n = ct_raw_syscall6(SYS_getcwd, (long)dst, CT_RAW_CAPTURE_PATH_MAX, 0, 0,
+                        0, 0);
+    if (n > 0) n = (long)strnlen(dst, CT_RAW_CAPTURE_PATH_MAX);
+  } else {
+    char link[32] = "/proc/self/fd/";
+    char digits[16];
+    int nd = 0;
+    unsigned long v = (unsigned long)(unsigned int)fd;
+    if ((int)fd < 0) {
+      ct_raw_arena_shrink((unsigned long)off, CT_RAW_CAPTURE_PATH_MAX, 0);
+      return 0;
+    }
+    do { digits[nd++] = (char)('0' + v % 10); v /= 10; } while (v != 0);
+    size_t at = strlen(link);
+    while (nd > 0) link[at++] = digits[--nd];
+    link[at] = '\0';
+    n = ct_raw_syscall6(SYS_readlinkat, AT_FDCWD, (long)link, (long)dst,
+                        CT_RAW_CAPTURE_PATH_MAX - 1, 0, 0);
+    if (n > 0) dst[n] = '\0';
+  }
+  static const char deleted[] = " (deleted)";
+  const size_t deleted_len = sizeof(deleted) - 1;
+  int is_path = n > 0 && dst[0] == '/' &&
+    !((size_t)n >= deleted_len &&
+      memcmp(dst + n - deleted_len, deleted, deleted_len) == 0);
+  if (n <= 0 || (!is_path && require_path)) {
+    ct_raw_arena_shrink((unsigned long)off, CT_RAW_CAPTURE_PATH_MAX, 0);
+    return 0;
+  }
+  if (!is_path) n = 0;
+  dst[n] = '\0';
+  ct_raw_arena_shrink((unsigned long)off, CT_RAW_CAPTURE_PATH_MAX,
+                      (unsigned long)n + 1);
+  ct_raw_capture_set(event, slot, (unsigned long)off, (unsigned long)n);
+  return 1;
+}
+
+/* A pathname argument, and for a relative one the directory it was resolved
+ * against (an empty pathname needs none: it is AT_EMPTY_PATH or ENOENT). */
+static int ct_raw_capture_at(struct ct_raw_syscall_event *event, long dirfd,
+                             long path) {
+  if (!ct_raw_capture_string(event, CT_RAW_CAP_PATH, path)) return 0;
+  const char *text = (const char *)path;
+  if (text[0] == '\0' || text[0] == '/') return 1;
+  return ct_raw_capture_fd(event, CT_RAW_CAP_BASE, dirfd, 1);
+}
+
+/* Everything the deferred classification of `event` reads indirectly. The
+ * set of syscalls here is exactly the set `classifyRawFileSyscall` reads a
+ * pointer or a descriptor's path for; anything else needs no capture. */
+static void ct_raw_capture_event(struct ct_raw_syscall_event *event) {
+  const long *a = event->args;
+  long r = event->result;
+  int needed = 1;
+  int ok = 1;
+  event->capture = CT_RAW_CAPTURE_NONE;
+  event->cap_mask = 0;
+  event->how_set = 0;
+  if (r == -EFAULT) return; /* the classifier treats a fault as loss */
+  switch (event->nr) {
+#ifdef SYS_open
+  case SYS_open:
+#endif
+#ifdef SYS_creat
+  case SYS_creat:
+#endif
+#ifdef SYS_unlink
+  case SYS_unlink:
+#endif
+#ifdef SYS_rmdir
+  case SYS_rmdir:
+#endif
+#ifdef SYS_mkdir
+  case SYS_mkdir:
+#endif
+#ifdef SYS_stat
+  case SYS_stat:
+#endif
+#ifdef SYS_lstat
+  case SYS_lstat:
+#endif
+#ifdef SYS_access
+  case SYS_access:
+#endif
+#ifdef SYS_readlink
+  case SYS_readlink:
+#endif
+  case SYS_truncate:
+    ok = ct_raw_capture_at(event, AT_FDCWD, a[0]);
+    break;
+  case SYS_openat:
+  case SYS_unlinkat:
+  case SYS_mkdirat:
+#ifdef SYS_newfstatat
+  case SYS_newfstatat:
+#endif
+  case SYS_faccessat:
+  case SYS_readlinkat:
+#ifdef SYS_statx
+  case SYS_statx:
+#endif
+    ok = ct_raw_capture_at(event, a[0], a[1]);
+    break;
+#ifdef SYS_openat2
+  case SYS_openat2:
+    ok = ct_raw_capture_at(event, a[0], a[1]);
+    if (ok && r >= 0 && a[2] != 0) {
+      /* struct open_how { u64 flags; u64 mode; u64 resolve; } (openat2(2)) */
+      memcpy(&event->how_flags, (const void *)a[2], sizeof(event->how_flags));
+      memcpy(&event->how_mode, (const char *)a[2] + 8,
+             sizeof(event->how_mode));
+      event->how_set = 1;
+    }
+    break;
+#endif
+#ifdef SYS_symlink
+  case SYS_symlink:
+    ok = ct_raw_capture_string(event, CT_RAW_CAP_TARGET, a[0]) &&
+         ct_raw_capture_at(event, AT_FDCWD, a[1]);
+    break;
+#endif
+  case SYS_symlinkat:
+    ok = ct_raw_capture_string(event, CT_RAW_CAP_TARGET, a[0]) &&
+         ct_raw_capture_at(event, a[1], a[2]);
+    break;
+  /* Descriptors: whenever the call succeeded, even with 0 bytes, so the
+   * classifier never falls back to the live descriptor table, which by then
+   * may map the number to another file. */
+  case SYS_read:
+  case SYS_getdents64:
+    if (r >= 0) ok = ct_raw_capture_fd(event, CT_RAW_CAP_FD0, a[0], 0);
+    break;
+  case SYS_sendfile: /* sendfile(out_fd, in_fd, ...) */
+    if (r >= 0)
+      ok = ct_raw_capture_fd(event, CT_RAW_CAP_FD0, a[1], 0) &&
+           ct_raw_capture_fd(event, CT_RAW_CAP_FD1, a[0], 0);
+    break;
+  case SYS_copy_file_range: /* (fd_in, off_in, fd_out, ...) */
+  case SYS_splice:
+    if (r >= 0)
+      ok = ct_raw_capture_fd(event, CT_RAW_CAP_FD0, a[0], 0) &&
+           ct_raw_capture_fd(event, CT_RAW_CAP_FD1, a[2], 0);
+    break;
+  default:
+    needed = 0;
+    break;
+  }
+  if (needed)
+    event->capture = ok ? CT_RAW_CAPTURE_OK : CT_RAW_CAPTURE_FAILED;
+}
+
 static void ct_record_raw_syscall_event(long nr, const long args[6],
                                         long result, int source,
                                         unsigned long address) {
@@ -1078,18 +1352,26 @@ static void ct_record_raw_syscall_event(long nr, const long args[6],
     if (__atomic_load_n(&ct_raw_subscribers[i], __ATOMIC_ACQUIRE) != NULL)
       ct_raw_subscriber_enqueue[i](nr, args, result, source, address);
   }
-  sig_atomic_t count = ct_raw_syscall_event_count_value;
-  if (count >= CT_RAW_SYSCALL_EVENT_CAP) {
+  long index = __atomic_fetch_add(&ct_raw_syscall_event_reserved, 1,
+                                  __ATOMIC_ACQ_REL);
+  if (index >= CT_RAW_SYSCALL_EVENT_CAP) {
     ct_raw_syscall_event_overflow_value = 1;
     return;
   }
-  struct ct_raw_syscall_event *event = &ct_raw_syscall_events[count];
+  struct ct_raw_syscall_event *event = &ct_raw_syscall_events[index];
+  /* Slots are never reused (reset happens only before any trap), so this one
+   * is still FREE; its pid goes first so a drain in this process can tell an
+   * event still being written here from one another process left behind. */
+  __atomic_store_n(&event->pid,
+                   (int)ct_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0),
+                   __ATOMIC_RELAXED);
   event->nr = nr;
   for (int i = 0; i < 6; i++) event->args[i] = args[i];
   event->result = result;
   event->source = source;
   event->address = address;
-  ct_raw_syscall_event_count_value = count + 1;
+  ct_raw_capture_event(event);
+  __atomic_store_n(&event->state, CT_RAW_EVENT_READY, __ATOMIC_RELEASE);
 }
 
 void ct_linux_preload_raw_enqueue_v1(long nr, const long *args,
@@ -1098,6 +1380,42 @@ void ct_linux_preload_raw_enqueue_v1(long nr, const long *args,
 void ct_linux_preload_raw_enqueue_v1(long nr, const long *args,
     long result, int source, unsigned long address) {
   ct_record_raw_syscall_event(nr, args, result, source, address);
+}
+
+/* CLASSIFY BEFORE THE IMAGE ENDS. Trapped events are classified at the
+ * process-exit destructor and before a libc exec; an exit or exec that goes
+ * around both (an inline or syscall(2) exit_group, execve or execveat) would
+ * take every still-pending event with it, with no record and no loss. So
+ * those paths drain first, through the observer linux_preload.nim registers.
+ *
+ * Only when this thread is not inside a hook: the classification takes the
+ * shim's locks, and a thread already inside a hook (a host signal handler
+ * that interrupted one) may hold them. Returns 0 when events stay pending for
+ * that reason, so an exit_group caller can withhold its commit marker and
+ * leave the loss visible; 1 when nothing is pending any more. */
+static int ct_linux_raw_syscall_events_pending(int pid);
+int ct_linux_raw_current_pid(void);
+typedef void (*ct_inline_drain_fn)(void);
+static ct_inline_drain_fn ct_inline_drain_observer = NULL;
+void ct_linux_preload_register_inline_drain(ct_inline_drain_fn observer) {
+  __atomic_store_n(&ct_inline_drain_observer, observer, __ATOMIC_RELEASE);
+}
+
+int ct_linux_drain_inline_events_before_image_end(void)
+    __attribute__((visibility("default")));
+int ct_linux_drain_inline_events_before_image_end(void) {
+  ct_inline_drain_fn observer =
+      __atomic_load_n(&ct_inline_drain_observer, __ATOMIC_ACQUIRE);
+  int pid = ct_linux_raw_current_pid();
+  if (observer == NULL || !ct_linux_raw_syscall_events_pending(pid))
+    return 1;
+  if (stackable_linux_preload_current_depth() != 0) return 0;
+  int saved_errno = errno;
+  stackable_linux_preload_enter_hook();
+  observer();
+  stackable_linux_preload_exit_hook();
+  errno = saved_errno;
+  return !ct_linux_raw_syscall_events_pending(pid);
 }
 
 static void ct_raw_flush_observers(void) {
@@ -1109,7 +1427,74 @@ static void ct_raw_flush_observers(void) {
 }
 
 long ct_linux_raw_syscall_event_count(void) {
-  return (long)ct_raw_syscall_event_count_value;
+  long reserved = __atomic_load_n(&ct_raw_syscall_event_reserved,
+                                  __ATOMIC_ACQUIRE);
+  return reserved < CT_RAW_SYSCALL_EVENT_CAP ? reserved
+                                             : CT_RAW_SYSCALL_EVENT_CAP;
+}
+
+int ct_linux_raw_current_pid(void) {
+  return (int)ct_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
+}
+
+/* Take event `index` for classification by process `pid`: 1 when it is
+ * ready, belongs to `pid` and nobody took it before; 0 when it belongs to
+ * another process or was already taken; -1 when it is still being written. */
+int ct_linux_raw_syscall_event_claim(long index, int pid) {
+  if (index < 0 || index >= ct_linux_raw_syscall_event_count()) return 0;
+  struct ct_raw_syscall_event *event = &ct_raw_syscall_events[index];
+  int state = __atomic_load_n(&event->state, __ATOMIC_ACQUIRE);
+  if (__atomic_load_n(&event->pid, __ATOMIC_RELAXED) != pid) return 0;
+  if (state == CT_RAW_EVENT_FREE) return -1;
+  if (state != CT_RAW_EVENT_READY) return 0;
+  int expected = CT_RAW_EVENT_READY;
+  return __atomic_compare_exchange_n(&event->state, &expected,
+                                     CT_RAW_EVENT_DRAINED, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
+           ? 1 : 0;
+}
+
+/* Whether any event of `pid` is still waiting to be classified, or still
+ * being written. */
+static int ct_linux_raw_syscall_events_pending(int pid) {
+  long count = ct_linux_raw_syscall_event_count();
+  for (long i = 0; i < count; ++i) {
+    struct ct_raw_syscall_event *event = &ct_raw_syscall_events[i];
+    int state = __atomic_load_n(&event->state, __ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&event->pid, __ATOMIC_RELAXED) == pid &&
+        state != CT_RAW_EVENT_DRAINED)
+      return 1;
+  }
+  return 0;
+}
+
+int ct_linux_raw_syscall_event_capture_state(long index) {
+  if (index < 0 || index >= ct_linux_raw_syscall_event_count()) return 0;
+  return ct_raw_syscall_events[index].capture;
+}
+
+/* Captured string `slot` of event `index` (see CT_RAW_CAP_*): 1 and its bytes
+ * when it was captured, 0 otherwise. */
+int ct_linux_raw_syscall_event_capture(long index, int slot, char **text,
+                                       long *len) {
+  if (index < 0 || index >= ct_linux_raw_syscall_event_count() || slot < 0 ||
+      slot >= CT_RAW_CAP_SLOTS)
+    return 0;
+  struct ct_raw_syscall_event *event = &ct_raw_syscall_events[index];
+  if ((event->cap_mask & (1 << slot)) == 0) return 0;
+  *text = ct_raw_capture_arena + event->cap_off[slot];
+  *len = (long)event->cap_len[slot];
+  return 1;
+}
+
+int ct_linux_raw_syscall_event_open_how(long index, unsigned long long *flags,
+                                        unsigned long long *mode) {
+  if (index < 0 || index >= ct_linux_raw_syscall_event_count()) return 0;
+  struct ct_raw_syscall_event *event = &ct_raw_syscall_events[index];
+  if (!event->how_set) return 0;
+  *flags = event->how_flags;
+  *mode = event->how_mode;
+  return 1;
 }
 
 int ct_linux_raw_syscall_event_overflowed(void) {
@@ -1120,7 +1505,7 @@ int ct_linux_raw_syscall_event_at(long index, long *nr, long *a1, long *a2,
                                   long *a3, long *a4, long *a5, long *a6,
                                   long *result, int *source,
                                   unsigned long *address) {
-  if (index < 0 || index >= ct_raw_syscall_event_count_value) return -1;
+  if (index < 0 || index >= ct_linux_raw_syscall_event_count()) return -1;
   struct ct_raw_syscall_event *event = &ct_raw_syscall_events[index];
   if (nr) *nr = event->nr;
   if (a1) *a1 = event->args[0];
@@ -1150,7 +1535,11 @@ void ct_linux_inline_syscall_reset(void) {
   ct_inline_syscall_last_nr_value = -1;
   ct_inline_syscall_overflow_value = 0;
   ct_inline_syscall_last_address_value = 0;
-  ct_raw_syscall_event_count_value = 0;
+  for (int i = 0; i < CT_RAW_SYSCALL_EVENT_CAP; ++i)
+    __atomic_store_n(&ct_raw_syscall_events[i].state, CT_RAW_EVENT_FREE,
+                     __ATOMIC_RELAXED);
+  __atomic_store_n(&ct_raw_syscall_event_reserved, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&ct_raw_capture_arena_used, 0, __ATOMIC_RELEASE);
   ct_raw_syscall_event_overflow_value = 0;
 }
 
@@ -1230,7 +1619,11 @@ static void ct_linux_inline_syscall_sigtrap_handler(
    * so the handler is safe from all pre-init trap paths too. */
 #ifdef SYS_exit_group
   if (regs.nr == SYS_exit_group) {
-    ct_raw_flush_observers();
+    /* Events that could not be classified must not be covered by a commit
+     * marker: leaving this thread's batch uncommitted makes the merge report
+     * the loss instead of a capture that silently lacks them. */
+    if (ct_linux_drain_inline_events_before_image_end())
+      ct_raw_flush_observers();
   }
 #endif
 #ifdef SYS_exit
@@ -1238,6 +1631,14 @@ static void ct_linux_inline_syscall_sigtrap_handler(
     ct_raw_flush_observers();
   }
 #endif
+  /* A successful execve replaces this image and its event buffer. */
+  if (regs.nr == SYS_execve
+#ifdef SYS_execveat
+      || regs.nr == SYS_execveat
+#endif
+      ) {
+    ct_linux_drain_inline_events_before_image_end();
+  }
 
   /* A trapped fork-like call (an inline `syscall` issuing clone/clone3
    * without CLONE_VM, or fork) gets what the syscall(2) replacement gives the
@@ -1999,6 +2400,27 @@ int ct_linux_preload_raw_owner_join(void *target) {
 long ct_linux_preload_syscall_replacement(long nr, long a1, long a2, long a3,
                                           long a4, long a5, long a6) {
   int saved_errno = errno;
+  /* Once installed, this replacement is what libc's syscall(2) -- and the
+   * shim's own `syscall` interposer, whose body the same patch redirects --
+   * runs, so the end-of-image work the interposer and the inline trap do
+   * belongs here too: classify pending trapped events before an exit or
+   * exec that bypasses the destructor and the exec hooks, and flush this
+   * thread's batch before it exits (see the trap handler). */
+#ifdef SYS_exit_group
+  if (nr == SYS_exit_group) {
+    if (ct_linux_drain_inline_events_before_image_end())
+      ct_raw_flush_observers();
+  }
+#endif
+#ifdef SYS_exit
+  if (nr == SYS_exit) ct_raw_flush_observers();
+#endif
+  if (nr == SYS_execve
+#ifdef SYS_execveat
+      || nr == SYS_execveat
+#endif
+      )
+    ct_linux_drain_inline_events_before_image_end();
   int forks = ct_raw_call_forks_process(nr, a1) && !CT_BYPASS() &&
               ct_raw_fork_sample != NULL && ct_raw_fork_child != NULL;
   int parent_single = forks ? CT_CALL_HOOK(ct_raw_fork_sample()) : 1;
@@ -3187,6 +3609,16 @@ void ct_linux_preload_prime_real_functions(void) {
   CT_PRIME(real_readlink_chk_ptr, ct_readlink_chk_real_fn, "__readlink_chk");
   CT_PRIME(real_readlinkat_chk_ptr, ct_readlinkat_chk_real_fn,
            "__readlinkat_chk");
+  CT_PRIME(real_unlink_ptr, ct_unlink_real_fn, "unlink");
+  CT_PRIME(real_unlinkat_ptr, ct_unlinkat_real_fn, "unlinkat");
+  CT_PRIME(real_rmdir_ptr, ct_unlink_real_fn, "rmdir");
+  CT_PRIME(real_remove_ptr, ct_unlink_real_fn, "remove");
+  CT_PRIME(real_mkdir_ptr, ct_mkdir_real_fn, "mkdir");
+  CT_PRIME(real_mkdirat_ptr, ct_mkdirat_real_fn, "mkdirat");
+  CT_PRIME(real_symlink_ptr, ct_symlink_real_fn, "symlink");
+  CT_PRIME(real_symlinkat_ptr, ct_symlinkat_real_fn, "symlinkat");
+  CT_PRIME(real_truncate_ptr, ct_truncate_real_fn, "truncate");
+  CT_PRIME(real_creat_ptr, ct_creat_real_fn, "creat");
   /* The lookups above that failed (symbols this glibc does not have) left
    * an error on this thread; consume it so the host's next dlerror() does
    * not report a lookup the shim made. */
@@ -3874,6 +4306,145 @@ int ct_fstatat64_impl(int dirfd, const char *path, void *buf, int flags) {
   CT_OBSERVE(ct_probe_observer, dirfd, path, rc);
   return rc;
 }
+#endif
+
+/* PATH MUTATIONS. unlink, mkdir, rmdir, symlink, remove and truncate change
+ * the namespace or a file's size without an open, so no other interposition
+ * sees them; Node's libuv and Chromium import all of them. Each runs the real
+ * call unchanged and then reports it to the mutation observer
+ * (repro_linux_observe_mutation in linux_preload.nim), which records only a
+ * successful call. The op codes match the Mutation* constants there.
+ *
+ * ftruncate is not interposed: it needs a descriptor open for writing, and
+ * that open is already recorded as a write of the same path. */
+#define CT_MUTATION_UNLINK 1
+#define CT_MUTATION_UNLINKAT 2
+#define CT_MUTATION_RMDIR 3
+#define CT_MUTATION_MKDIR 4
+#define CT_MUTATION_MKDIRAT 5
+#define CT_MUTATION_SYMLINK 6
+#define CT_MUTATION_SYMLINKAT 7
+#define CT_MUTATION_REMOVE 8
+#define CT_MUTATION_TRUNCATE 9
+
+typedef void (*ct_mutation_observer_fn)(int op, int dirfd, const char *path,
+                                        const char *target, long arg, int rc);
+static ct_mutation_observer_fn ct_mutation_observer = NULL;
+void ct_linux_preload_register_mutation_observer(
+    ct_mutation_observer_fn observer) {
+  ct_mutation_observer = observer;
+}
+
+int unlink(const char *path) __attribute__((visibility("default")));
+int unlink(const char *path) {
+  CT_OBSERVED_REAL(real_unlink_ptr, ct_unlink_real_fn, "unlink", -1);
+  int rc = real_unlink_ptr(path);
+  CT_OBSERVE(ct_mutation_observer, CT_MUTATION_UNLINK, AT_FDCWD, path, NULL,
+             0L, rc);
+  return rc;
+}
+
+int unlinkat(int dirfd, const char *path, int flags)
+    __attribute__((visibility("default")));
+int unlinkat(int dirfd, const char *path, int flags) {
+  CT_OBSERVED_REAL(real_unlinkat_ptr, ct_unlinkat_real_fn, "unlinkat", -1);
+  int rc = real_unlinkat_ptr(dirfd, path, flags);
+  CT_OBSERVE(ct_mutation_observer, CT_MUTATION_UNLINKAT, dirfd, path, NULL,
+             (long)flags, rc);
+  return rc;
+}
+
+int rmdir(const char *path) __attribute__((visibility("default")));
+int rmdir(const char *path) {
+  CT_OBSERVED_REAL(real_rmdir_ptr, ct_unlink_real_fn, "rmdir", -1);
+  int rc = real_rmdir_ptr(path);
+  CT_OBSERVE(ct_mutation_observer, CT_MUTATION_RMDIR, AT_FDCWD, path, NULL,
+             0L, rc);
+  return rc;
+}
+
+/* remove(3) calls unlink, then rmdir for a directory, inside libc where no
+ * interposition sees either. */
+int remove(const char *path) __attribute__((visibility("default")));
+int remove(const char *path) {
+  CT_OBSERVED_REAL(real_remove_ptr, ct_unlink_real_fn, "remove", -1);
+  int rc = real_remove_ptr(path);
+  CT_OBSERVE(ct_mutation_observer, CT_MUTATION_REMOVE, AT_FDCWD, path, NULL,
+             0L, rc);
+  return rc;
+}
+
+int mkdir(const char *path, mode_t mode) __attribute__((visibility("default")));
+int mkdir(const char *path, mode_t mode) {
+  CT_OBSERVED_REAL(real_mkdir_ptr, ct_mkdir_real_fn, "mkdir", -1);
+  int rc = real_mkdir_ptr(path, mode);
+  CT_OBSERVE(ct_mutation_observer, CT_MUTATION_MKDIR, AT_FDCWD, path, NULL,
+             0L, rc);
+  return rc;
+}
+
+int mkdirat(int dirfd, const char *path, mode_t mode)
+    __attribute__((visibility("default")));
+int mkdirat(int dirfd, const char *path, mode_t mode) {
+  CT_OBSERVED_REAL(real_mkdirat_ptr, ct_mkdirat_real_fn, "mkdirat", -1);
+  int rc = real_mkdirat_ptr(dirfd, path, mode);
+  CT_OBSERVE(ct_mutation_observer, CT_MUTATION_MKDIRAT, dirfd, path, NULL,
+             0L, rc);
+  return rc;
+}
+
+/* The mutation is the new LINK; `target` is its contents, recorded for
+ * provenance. */
+int symlink(const char *target, const char *linkpath)
+    __attribute__((visibility("default")));
+int symlink(const char *target, const char *linkpath) {
+  CT_OBSERVED_REAL(real_symlink_ptr, ct_symlink_real_fn, "symlink", -1);
+  int rc = real_symlink_ptr(target, linkpath);
+  CT_OBSERVE(ct_mutation_observer, CT_MUTATION_SYMLINK, AT_FDCWD, linkpath,
+             target, 0L, rc);
+  return rc;
+}
+
+int symlinkat(const char *target, int newdirfd, const char *linkpath)
+    __attribute__((visibility("default")));
+int symlinkat(const char *target, int newdirfd, const char *linkpath) {
+  CT_OBSERVED_REAL(real_symlinkat_ptr, ct_symlinkat_real_fn, "symlinkat", -1);
+  int rc = real_symlinkat_ptr(target, newdirfd, linkpath);
+  CT_OBSERVE(ct_mutation_observer, CT_MUTATION_SYMLINKAT, newdirfd, linkpath,
+             target, 0L, rc);
+  return rc;
+}
+
+int truncate(const char *path, off_t length)
+    __attribute__((visibility("default")));
+int truncate(const char *path, off_t length) {
+  CT_OBSERVED_REAL(real_truncate_ptr, ct_truncate_real_fn, "truncate", -1);
+  int rc = real_truncate_ptr(path, length);
+  CT_OBSERVE(ct_mutation_observer, CT_MUTATION_TRUNCATE, AT_FDCWD, path, NULL,
+             (long)length, rc);
+  return rc;
+}
+
+/* creat(path, mode) is open(path, O_CREAT|O_WRONLY|O_TRUNC, mode) (POSIX), so
+ * it goes through the open hook chain and is recorded, and its descriptor
+ * tracked, exactly as that open would be. */
+int creat(const char *path, mode_t mode) __attribute__((visibility("default")));
+int creat(const char *path, mode_t mode) {
+  if (CT_BYPASS() || ct_open_hook == NULL) {
+    CT_OBSERVED_REAL(real_creat_ptr, ct_creat_real_fn, "creat", -1);
+    return real_creat_ptr(path, mode);
+  }
+  return CT_CALL_HOOK(ct_open_hook((char *)path, O_CREAT | O_WRONLY | O_TRUNC,
+                                   (int)mode));
+}
+
+/* On LP64 glibc each *64 name is the same function as its plain twin (see
+ * LARGE-FILE ALIASES above). */
+#if defined(__LP64__) && defined(__GLIBC__)
+extern int ct_truncate64_alias(const char *, off_t)
+    __asm__("truncate64") __attribute__((alias("truncate"), visibility("default")));
+extern int ct_creat64_alias(const char *, mode_t)
+    __asm__("creat64") __attribute__((alias("creat"), visibility("default")));
 #endif
 
 /* In-tree creation of the anonymous local channels Chromium's message pump
@@ -4619,6 +5190,19 @@ proc cRawSyscallEventAt(index: clong; number, a1, a2, a3, a4, a5, a6,
                         result: ptr clong; source: ptr cint;
                         address: ptr culong): cint
   {.importc: "ct_linux_raw_syscall_event_at", raises: [].}
+proc cRawCurrentPid(): cint
+  {.importc: "ct_linux_raw_current_pid", raises: [].}
+proc cRawSyscallEventClaim(index: clong; pid: cint): cint
+  {.importc: "ct_linux_raw_syscall_event_claim", raises: [].}
+proc cRawSyscallEventCaptureState(index: clong): cint
+  {.importc: "ct_linux_raw_syscall_event_capture_state", raises: [].}
+proc cRawSyscallEventCapture(index: clong; slot: cint; text: ptr cstring;
+                             len: ptr clong): cint
+  {.importc: "ct_linux_raw_syscall_event_capture", raises: [].}
+proc cRawSyscallEventOpenHow(index: clong; flags, mode: ptr culonglong): cint
+  {.importc: "ct_linux_raw_syscall_event_open_how", raises: [].}
+proc cRegisterInlineDrain(observer: proc() {.cdecl, raises: [].})
+  {.importc: "ct_linux_preload_register_inline_drain", raises: [].}
 
 proc installOpenDispatcher(dispatch: OpenDispatch)
   {.importc: "ct_linux_preload_register_open_hook", raises: [].}
@@ -5177,6 +5761,59 @@ proc rawSyscallEventCount*(): int {.raises: [].} =
 
 proc rawSyscallEventOverflowed*(): bool {.raises: [].} =
   cRawSyscallEventOverflowed() != 0
+
+type
+  RawSyscallCaptureSlot* = enum
+    ## The strings captured with a trapped event (CT_RAW_CAP_* in the C half).
+    rcsBase,   ## directory a relative pathname was resolved against
+    rcsPath,   ## the pathname argument as passed
+    rcsTarget, ## symlink(at)'s target
+    rcsFd0,    ## what the first descriptor named ("" = no path)
+    rcsFd1     ## what the second descriptor named ("" = no path)
+  RawSyscallCaptureState* = enum
+    rcsNone,   ## the classification reads nothing indirectly
+    rcsCaptured,
+    rcsFailed  ## needed, but could not be captured: classify as loss
+
+proc rawCurrentPid*(): cint {.raises: [].} =
+  cRawCurrentPid()
+
+proc rawSyscallEventClaim*(index: int; pid: cint): int {.raises: [].} =
+  ## 1: taken for classification; 0: another process's or already taken;
+  ## -1: still being written.
+  int(cRawSyscallEventClaim(clong(index), pid))
+
+proc rawSyscallEventCaptureState*(index: int): RawSyscallCaptureState
+    {.raises: [].} =
+  case cRawSyscallEventCaptureState(clong(index))
+  of 1: rcsCaptured
+  of 2: rcsFailed
+  else: rcsNone
+
+proc rawSyscallEventCapture*(index: int; slot: RawSyscallCaptureSlot):
+    tuple[ok: bool, text: string] {.raises: [].} =
+  var text: cstring
+  var len: clong
+  if cRawSyscallEventCapture(clong(index), cint(ord(slot)), addr text,
+                             addr len) == 0:
+    return (false, "")
+  var copy = newString(int(len))
+  if len > 0:
+    copyMem(addr copy[0], text, int(len))
+  (true, copy)
+
+proc rawSyscallEventOpenHow*(index: int):
+    tuple[ok: bool, flags, mode: uint64] {.raises: [].} =
+  var flags, mode: culonglong
+  if cRawSyscallEventOpenHow(clong(index), addr flags, addr mode) == 0:
+    return (false, 0'u64, 0'u64)
+  (true, uint64(flags), uint64(mode))
+
+proc registerInlineRawSyscallDrain*(observer: proc() {.cdecl, raises: [].})
+    {.raises: [].} =
+  ## The classification `ct_linux_drain_inline_events_before_image_end` runs
+  ## before an exit or exec that bypasses the destructor and the exec hooks.
+  cRegisterInlineDrain(observer)
 
 proc rawSyscallEventAt*(index: int):
     tuple[ok: bool, number, a1, a2, a3, a4, a5, a6, result: clong,

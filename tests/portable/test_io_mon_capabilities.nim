@@ -17,7 +17,6 @@ suite "io-mon capability profiles":
       mcapAdversarialRawSyscall,
       mcapExecutableMappingLifecycle,
       mcapExternalContent,
-      mcapPathMutation,
       mcapPathIdentity
     }
 
@@ -25,6 +24,12 @@ suite "io-mon capability profiles":
 
     check profile.backendFamily == mbfLinuxPreloadHooks
     check profile.evidenceComplete == false
+    # `mcapPathMutation` left this set when the Linux shim began recording
+    # unlink/mkdir/rmdir/symlink/remove/truncate: it is advertised now, and
+    # requiring it is no gap.
+    check mcapPathMutation in profile.supportedCapabilities
+    check not profile.gaps.anyIt(it.capability == mcapPathMutation)
+    check linuxPreloadMonitorProfile({mcapPathMutation}).evidenceComplete
     for capability in required:
       check capability notin profile.supportedCapabilities
       check profile.gaps.anyIt(
@@ -39,7 +44,6 @@ suite "io-mon capability profiles":
       mcapAdversarialRawSyscall,
       mcapExecutableMappingLifecycle,
       mcapExternalContent,
-      mcapPathMutation,
       mcapPathIdentity
     }
     var records = profileRecords(linuxPreloadMonitorProfile(required))

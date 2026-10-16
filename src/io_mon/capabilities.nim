@@ -149,6 +149,15 @@ const
     mcapFileAppend,
     mcapRename,
     mcapIpcConnect,
+    # PATH MUTATIONS. unlink/unlinkat/rmdir/remove/mkdir/mkdirat/symlink/
+    # symlinkat are interposed and recorded as `mrPathMutation` output facts,
+    # truncate/truncate64 as content writes and creat/creat64 as the open they
+    # are, whether called through libc, `syscall(2)` or a trapped inline
+    # `syscall` instruction (classified from the paths captured when it
+    # trapped); link/linkat and the rename family already were. As on macOS
+    # (ROUND-4 RW2), this is the whole common mutation surface, so it is
+    # advertised rather than declared a gap.
+    mcapPathMutation,
     # LIBRARY-LOAD OBSERVATION. The runtime shared-library closure is captured
     # by asking the LOADER for its link map (`dl_iterate_phdr`) rather than by
     # hooking the calls that populate it — the Linux counterpart of the macOS
@@ -299,7 +308,6 @@ const
     mcapHybrid,
     mcapSymlink,
     mcapAuthorizationEnforcement,
-    mcapPathMutation,
     mcapAdversarialRawSyscall,
     mcapExecutableMappingLifecycle,
     mcapPathIdentity,
@@ -763,9 +771,10 @@ proc linuxUnsupportedReason(capability: MonitorCapability): string =
   of mcapAuthorizationEnforcement:
     "Linux preload shim observes only and cannot authorize or deny operations"
   of mcapPathMutation:
-    "Linux preload shim records libc-visible link/linkat and " &
-      "rename/renameat/renameat2 path mutations, but does not cover the full " &
-      "raw mutation surface yet"
+    "Linux preload shim records unlink/unlinkat/rmdir/remove/mkdir/mkdirat/" &
+      "symlink/symlinkat/truncate/creat, link/linkat and rename/renameat/" &
+      "renameat2 path mutations; this reason applies only where path-mutation " &
+      "is not advertised"
   of mcapAdversarialRawSyscall:
     "Linux LD_PRELOAD covers libc syscall(2), selected application inline " &
       "syscall sites, and tracked anonymous executable mappings, but does " &
@@ -1002,6 +1011,9 @@ proc linuxPreloadMonitorProfile*(
       "copy_file_range/splice content movers record source reads and " &
       "destination writes; libc-visible link/linkat and rename/renameat/" &
       "renameat2 record hardlink source/alias and final rename destinations; " &
+      "unlink/unlinkat/rmdir/remove/mkdir/mkdirat/symlink/symlinkat record " &
+      "path mutations and truncate records a content write, through libc, " &
+      "syscall(2) or a trapped inline syscall; " &
       "libc-visible getenv/uname/sysconf are observed inputs, " &
       "clock_gettime/gettimeofday/time are time-read evidence, and " &
       "getrandom/getentropy/arc4random/arc4random_buf/arc4random_uniform are " &
@@ -1016,7 +1028,7 @@ proc linuxPreloadMonitorProfile*(
     message: "Linux LD_PRELOAD completeness excludes adversarial residuals " &
       "unless they are represented by event-loss at runtime: excluded-prefix " &
       "startup DSOs, executable mappings outside the preload mmap lifecycle, " &
-      "direct raw zero-copy/mutation syscalls, pre-existing hardlink/inode " &
+      "direct raw zero-copy syscalls, pre-existing hardlink/inode " &
       "aliases, direct raw/vDSO non-file determinism paths, and broader Linux " &
       "non-file APIs beyond getenv/uname/sysconf/clock/gettimeofday/time/" &
       "getrandom/getentropy/arc4random(_buf|_uniform). " &

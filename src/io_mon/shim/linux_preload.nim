@@ -81,6 +81,15 @@ when defined(amd64):
     LinuxSysLandlockCreateRuleset = 444.clong
     LinuxSysLandlockAddRule       = 445.clong
     LinuxSysLandlockRestrictSelf  = 446.clong
+    LinuxSysTruncate              = 76.clong
+    LinuxSysMkdir                 = 83.clong
+    LinuxSysRmdir                 = 84.clong
+    LinuxSysCreat                 = 85.clong
+    LinuxSysUnlink                = 87.clong
+    LinuxSysSymlink               = 88.clong
+    LinuxSysMkdirat               = 258.clong
+    LinuxSysUnlinkat              = 263.clong
+    LinuxSysSymlinkat             = 266.clong
 elif defined(arm64):
   const
     LinuxSysRead                  = 63.clong
@@ -125,11 +134,65 @@ elif defined(arm64):
     LinuxSysLandlockCreateRuleset = 444.clong
     LinuxSysLandlockAddRule       = 445.clong
     LinuxSysLandlockRestrictSelf  = 446.clong
+    LinuxSysTruncate              = 45.clong
+    LinuxSysMkdir                 = -1007.clong  # no SYS_mkdir on this architecture
+    LinuxSysRmdir                 = -1008.clong  # no SYS_rmdir on this architecture
+    LinuxSysCreat                 = -1009.clong  # no SYS_creat on this architecture
+    LinuxSysUnlink                = -1010.clong  # no SYS_unlink on this architecture
+    LinuxSysSymlink               = -1011.clong  # no SYS_symlink on this architecture
+    LinuxSysMkdirat               = 34.clong
+    LinuxSysUnlinkat              = 35.clong
+    LinuxSysSymlinkat             = 36.clong
 else:
   {.error: "io-mon's Linux shim needs this architecture's syscall numbers".}
 
 {.emit: ["""
 #include <sys/syscall.h>
+#ifdef SYS_truncate
+_Static_assert(""", LinuxSysTruncate, """ == SYS_truncate, "LinuxSysTruncate != SYS_truncate");
+#else
+_Static_assert(""", LinuxSysTruncate, """ < 0, "LinuxSysTruncate: SYS_truncate is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_mkdir
+_Static_assert(""", LinuxSysMkdir, """ == SYS_mkdir, "LinuxSysMkdir != SYS_mkdir");
+#else
+_Static_assert(""", LinuxSysMkdir, """ < 0, "LinuxSysMkdir: SYS_mkdir is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_rmdir
+_Static_assert(""", LinuxSysRmdir, """ == SYS_rmdir, "LinuxSysRmdir != SYS_rmdir");
+#else
+_Static_assert(""", LinuxSysRmdir, """ < 0, "LinuxSysRmdir: SYS_rmdir is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_creat
+_Static_assert(""", LinuxSysCreat, """ == SYS_creat, "LinuxSysCreat != SYS_creat");
+#else
+_Static_assert(""", LinuxSysCreat, """ < 0, "LinuxSysCreat: SYS_creat is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_unlink
+_Static_assert(""", LinuxSysUnlink, """ == SYS_unlink, "LinuxSysUnlink != SYS_unlink");
+#else
+_Static_assert(""", LinuxSysUnlink, """ < 0, "LinuxSysUnlink: SYS_unlink is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_symlink
+_Static_assert(""", LinuxSysSymlink, """ == SYS_symlink, "LinuxSysSymlink != SYS_symlink");
+#else
+_Static_assert(""", LinuxSysSymlink, """ < 0, "LinuxSysSymlink: SYS_symlink is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_mkdirat
+_Static_assert(""", LinuxSysMkdirat, """ == SYS_mkdirat, "LinuxSysMkdirat != SYS_mkdirat");
+#else
+_Static_assert(""", LinuxSysMkdirat, """ < 0, "LinuxSysMkdirat: SYS_mkdirat is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_unlinkat
+_Static_assert(""", LinuxSysUnlinkat, """ == SYS_unlinkat, "LinuxSysUnlinkat != SYS_unlinkat");
+#else
+_Static_assert(""", LinuxSysUnlinkat, """ < 0, "LinuxSysUnlinkat: SYS_unlinkat is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_symlinkat
+_Static_assert(""", LinuxSysSymlinkat, """ == SYS_symlinkat, "LinuxSysSymlinkat != SYS_symlinkat");
+#else
+_Static_assert(""", LinuxSysSymlinkat, """ < 0, "LinuxSysSymlinkat: SYS_symlinkat is absent, so the Nim value must be a negative sentinel");
+#endif
 #ifdef SYS_read
 _Static_assert(""", LinuxSysRead, """ == SYS_read, "LinuxSysRead != SYS_read");
 #else
@@ -350,6 +413,7 @@ const
   OTrunc = 0x0200.cint
   OAppend = 0x0400.cint
   LinuxAtFdcwd = -100.cint
+  LinuxAtRemovedir = 0x200.cint
   LinuxEfault = 14.clong
   LinuxRenameExchange = 2'u32
 
@@ -897,6 +961,8 @@ int repro_linux_install_terminating_signal_handlers(void) {
 #include <stdarg.h>
 #include <stdint.h>
 
+extern int ct_linux_drain_inline_events_before_image_end(void);
+
 typedef long (*repro_libc_syscall_fn)(long, ...);
 static repro_libc_syscall_fn repro_real_libc_syscall = NULL;
 
@@ -922,7 +988,10 @@ long syscall(long number, ...) {
   va_end(ap);
 #ifdef SYS_exit_group
   if (number == SYS_exit_group) {
-    repro_linux_sig_safe_flush();
+    /* Classify trapped inline syscalls first; when some cannot be (this
+     * thread is inside a hook), withhold the commit so the loss shows. */
+    if (ct_linux_drain_inline_events_before_image_end())
+      repro_linux_sig_safe_flush();
   }
 #endif
 #ifdef SYS_exit
@@ -930,6 +999,13 @@ long syscall(long number, ...) {
     repro_linux_sig_safe_flush();
   }
 #endif
+  if (number == SYS_execve
+#ifdef SYS_execveat
+      || number == SYS_execveat
+#endif
+      ) {
+    ct_linux_drain_inline_events_before_image_end();
+  }
   if (repro_real_libc_syscall != NULL)
     return repro_real_libc_syscall(number, a0, a1, a2, a3, a4, a5);
   /* Fall back to the raw wrapper if libc's syscall wasn't dlsym-able
@@ -1645,6 +1721,11 @@ proc recordLateInlineSyscallScanCoverage(status: InlineSyscallPatchStatus;
     " errno=" & $status.firstPatchErrno)
 
 proc recordInlineSyscallTrapCoverage() {.raises: [].} =
+  # Drained whatever the trap count says: an event can also arrive from
+  # another loaded io-mon shim that owns the trap and forwards it here
+  # (`ct_linux_preload_raw_enqueue_v1`), and this shim's own count does not
+  # include those.
+  drainInlineRawSyscallEvents()
   if inlineSyscallTrapCoverageRecorded:
     return
   let traps = inlineSyscallTrapCount()
@@ -1652,7 +1733,6 @@ proc recordInlineSyscallTrapCoverage() {.raises: [].} =
   if traps == 0 and failures == 0:
     return
   inlineSyscallTrapCoverageRecorded = true
-  drainInlineRawSyscallEvents()
   if failures != 0:
     emitEventLoss("linux inline raw syscall replay failed nr=" &
       $inlineSyscallLastNumber() & " address=0x" &
@@ -1926,7 +2006,18 @@ proc pathForAt(dirfd: cint; path: cstring): string {.raises: [].} =
       if cwd.len > 0:
         return cwd / raw
     return raw
-  let base = pathForFd(dirfd)
+  var base = pathForFd(dirfd)
+  if base.len == 0:
+    # A directory fd the shim did not see opened (inherited, opened inside
+    # libc, or before the shim initialised): ask the kernel what it names, as
+    # `recordRawGetdents` does. Joining the relative path onto nothing would
+    # leave it relative, and a consumer resolves a relative path against the
+    # action's working directory -- a different file.
+    var buf = hookScratchString()
+    if c_fd_proc_path(dirfd, addr buf[0], csize_t(buf.len)) != 0:
+      let resolved = $cast[cstring](addr buf[0])
+      if resolved.isAbsolute and not isLinuxDeletedProcFdTarget(resolved):
+        base = resolved
   if base.len == 0:
     return raw
   result = base / raw
@@ -2137,9 +2228,12 @@ proc repro_monitor_shim_version*(): cstring {.exportc, dynlib, raises: [].} =
   "repro_monitor_shim_m11"
 
 proc recordOpen(path: cstring; flags, mode, fd: cint;
-                dirfd = LinuxAtFdcwd) {.raises: [].} =
+                dirfd = LinuxAtFdcwd; trackFd = true) {.raises: [].} =
+  ## `trackFd` false: the open is classified after the fact (a trapped inline
+  ## syscall), when `fd` may already name another file; record it without
+  ## entering it into the live descriptor table.
   let resolved = pathForAt(dirfd, path)
-  if resolved.len > 0:
+  if resolved.len > 0 and trackFd:
     updateFdPath(fd, cstring(resolved))
   var record = baseRecord(mrFileOpen, observationForOpen(flags))
   record.result = fd.int64
@@ -2308,6 +2402,58 @@ proc emitProbe(path: cstring; callResult: cint;
   record.path = pathForAt(dirfd, path)
   emitRecord(record)
 
+# --- Path mutations: unlink, mkdir, rmdir, symlink, remove, truncate ---------
+#
+# These change the namespace or a file's size without opening anything, so no
+# open/write record reaches the path. Each SUCCESSFUL call is recorded the way
+# the macOS shim records it (`macos_interpose.nim`, the ROUND-4 RW2 block): a
+# namespace change — a directory created or removed, an entry unlinked, a
+# symbolic link created — is an `mrPathMutation` output fact on the path that
+# changed; a `truncate` changes the bytes of an existing file, so it is a
+# content write (`mrFileWrite`), as an `O_TRUNC` open is.
+#
+# A FAILED call is not recorded: it changed nothing, so an output record would
+# be false, and the `rm -f` idiom would turn every absent temporary into one.
+# What a build learns from a failure is read through stat/access/open probes,
+# which are recorded. Neither kind downgrades completeness: a normal build
+# creates directories and removes temporaries.
+
+proc recordPathMutation(dirfd: cint; path: cstring; detail: string)
+    {.raises: [].} =
+  if path == nil or path[0] == '\0':
+    return
+  let resolved = pathForAt(dirfd, path)
+  if not resolved.isAbsolute:
+    # The directory it is relative to could not be named; a relative record
+    # would be read as relative to the action's directory. Fail closed.
+    emitEventLoss("path mutation relative to an unresolvable directory: " &
+      detail)
+    return
+  var record = baseRecord(mrPathMutation, moPathMutation)
+  record.path = resolved
+  record.result = 0
+  record.detail = detail
+  emitRecord(record)
+
+proc recordPathTruncate(path: cstring; length: int64; detail: string)
+    {.raises: [].} =
+  if path == nil or path[0] == '\0':
+    return
+  let resolved = pathForAt(LinuxAtFdcwd, path)
+  if not resolved.isAbsolute:
+    emitEventLoss("truncate relative to an unresolvable directory")
+    return
+  var record = baseRecord(mrFileWrite, moFileWrite)
+  record.path = resolved
+  record.result = length
+  record.detail = detail
+  emitRecord(record)
+
+proc unlinkatDetail(dirfd, flags: cint): string {.raises: [].} =
+  ## `unlinkat(..., AT_REMOVEDIR)` is rmdir; say which, for provenance.
+  (if (flags and LinuxAtRemovedir) != 0: "rmdir " else: "") &
+    "unlinkat dirfd=" & $dirfd & " flags=" & $flags
+
 proc cstringArg(value: clong): cstring {.inline, raises: [].} =
   if value == 0:
     nil
@@ -2323,15 +2469,39 @@ proc probeResultFromRaw(callResult: clong): cint {.inline, raises: [].} =
   else:
     (-1).cint
 
-proc recordRawRead(fd: cint; callResult: clong): bool {.raises: [].} =
+type
+  RawFdPaths = object
+    ## What up to two descriptors of a TRAPPED inline syscall named when it
+    ## ran (`ct_raw_capture_fd`), in place of the shim's descriptor table,
+    ## which by classification time may map those numbers to other files.
+    ## `path` "" means the descriptor named no path (a pipe, a socket, a
+    ## deleted file). An overridden descriptor is never looked up in, or
+    ## written to, the live table.
+    known0, known1: bool
+    fd0, fd1: cint
+    path0, path1: string
+
+proc overridden(paths: RawFdPaths; fd: cint): bool {.inline, raises: [].} =
+  (paths.known0 and fd == paths.fd0) or (paths.known1 and fd == paths.fd1)
+
+proc rawFdPath(fd: cint; paths: RawFdPaths): string {.raises: [].} =
+  if paths.known0 and fd == paths.fd0:
+    paths.path0
+  elif paths.known1 and fd == paths.fd1:
+    paths.path1
+  else:
+    pathForFd(fd)
+
+proc recordRawRead(fd: cint; callResult: clong;
+                   paths = RawFdPaths()): bool {.raises: [].} =
   if callResult < 0:
     return true
   if fd <= 2:
     return true
-  let path = pathForFd(fd)
+  let path = rawFdPath(fd, paths)
   if path.len == 0:
     return false
-  if not podFileReadMarkIsNew(fd):
+  if not paths.overridden(fd) and not podFileReadMarkIsNew(fd):
     return true
   var record = baseRecord(mrFileRead, moFileRead)
   record.path = path
@@ -2340,12 +2510,13 @@ proc recordRawRead(fd: cint; callResult: clong): bool {.raises: [].} =
   emitRecord(record)
   true
 
-proc recordRawWrite(fd: cint; callResult: clong): bool {.raises: [].} =
+proc recordRawWrite(fd: cint; callResult: clong;
+                    paths = RawFdPaths()): bool {.raises: [].} =
   if callResult < 0:
     return true
   if fd <= 2:
     return true
-  let path = pathForFd(fd)
+  let path = rawFdPath(fd, paths)
   if path.len == 0:
     return false
   var record = baseRecord(mrFileWrite, moFileWrite)
@@ -2355,31 +2526,31 @@ proc recordRawWrite(fd: cint; callResult: clong): bool {.raises: [].} =
   emitRecord(record)
   true
 
-proc recordRawFileCopy(inFd, outFd: cint; callResult: clong): bool
-    {.raises: [].} =
+proc recordRawFileCopy(inFd, outFd: cint; callResult: clong;
+                       paths = RawFdPaths()): bool {.raises: [].} =
   if callResult <= 0:
     return callResult >= 0
-  let readOk = recordRawRead(inFd, callResult)
-  let writeOk = recordRawWrite(outFd, callResult)
+  let readOk = recordRawRead(inFd, callResult, paths)
+  let writeOk = recordRawWrite(outFd, callResult, paths)
   readOk and writeOk
 
-proc recordRawSplice(fdIn, fdOut: cint; callResult: clong): bool
-    {.raises: [].} =
+proc recordRawSplice(fdIn, fdOut: cint; callResult: clong;
+                     paths = RawFdPaths()): bool {.raises: [].} =
   if callResult <= 0:
     return callResult >= 0
   var recorded = false
   if fdIn > 2:
-    let inPath = pathForFd(fdIn)
+    let inPath = rawFdPath(fdIn, paths)
     if inPath.len > 0:
       recorded = true
-      if podFileReadMarkIsNew(fdIn):
+      if paths.overridden(fdIn) or podFileReadMarkIsNew(fdIn):
         var record = baseRecord(mrFileRead, moFileRead)
         record.path = inPath
         record.result = callResult.int64
         record.flags = uint32(fdIn)
         emitRecord(record)
   if fdOut > 2:
-    let outPath = pathForFd(fdOut)
+    let outPath = rawFdPath(fdOut, paths)
     if outPath.len > 0:
       var record = baseRecord(mrFileWrite, moFileWrite)
       record.path = outPath
@@ -2463,13 +2634,14 @@ proc intArg(raw: clong): cint {.inline, raises: [].} =
   ## calling through.
   cast[cint](uint32(raw and 0xFFFF_FFFF'i64))
 
-proc recordRawGetdents(fd: cint; callResult: clong): bool {.raises: [].} =
+proc recordRawGetdents(fd: cint; callResult: clong;
+                       paths = RawFdPaths()): bool {.raises: [].} =
   ## `getdents64(fd, ...)` classification; see `LinuxSysGetdents64`.
   if callResult <= 0:
     # Error, or end of directory: nothing was enumerated by this call.
     return true
-  var path = pathForFd(fd)
-  if path.len == 0:
+  var path = rawFdPath(fd, paths)
+  if path.len == 0 and not paths.overridden(fd):
     # Not opened through a hook (inherited across exec, or opened before the
     # shim initialised): ask the kernel which directory the fd names, as
     # `recoverNamedFdRead` does for reads. A deleted directory, or anything
@@ -2494,35 +2666,87 @@ proc rawSyscallFailed(callResult: clong): bool {.inline, raises: [].} =
   ## as an mmap address that merely has the top bit set.
   callResult < 0 and callResult >= -4095
 
+proc classifyRawPathMutation(number, a1, a2, a3, callResult: clong;
+                             inlineTrap: cint): bool {.raises: [].} =
+  ## The path-mutation syscalls reached through `syscall(2)` or an inline
+  ## `syscall` instruction rather than the libc symbols, recorded exactly as
+  ## the libc interpositions record them (`repro_linux_observe_mutation`).
+  ## `creat` is `open(path, O_CREAT | O_WRONLY | O_TRUNC, mode)` and is
+  ## recorded as that open. For an inline trap the path arguments are the
+  ## strings captured when it trapped (`classifyTrappedInlineEvent`).
+  if resultLooksFaulted(callResult):
+    return false
+  if rawSyscallFailed(callResult):
+    # It changed nothing; see the path-mutation block above.
+    return true
+  case number
+  of LinuxSysCreat:
+    recordOpen(cstringArg(a1), OCreat or OWrOnly or OTrunc, intArg(a2),
+      cint(callResult), trackFd = inlineTrap == 0)
+  of LinuxSysUnlink:
+    recordPathMutation(LinuxAtFdcwd, cstringArg(a1), "unlink")
+  of LinuxSysUnlinkat:
+    recordPathMutation(intArg(a1), cstringArg(a2),
+      unlinkatDetail(intArg(a1), intArg(a3)))
+  of LinuxSysRmdir:
+    recordPathMutation(LinuxAtFdcwd, cstringArg(a1), "rmdir")
+  of LinuxSysMkdir:
+    recordPathMutation(LinuxAtFdcwd, cstringArg(a1), "mkdir")
+  of LinuxSysMkdirat:
+    recordPathMutation(intArg(a1), cstringArg(a2),
+      "mkdirat dirfd=" & $intArg(a1))
+  of LinuxSysSymlink:
+    recordPathMutation(LinuxAtFdcwd, cstringArg(a2),
+      "symlink target=" & $cstringArg(a1))
+  of LinuxSysSymlinkat:
+    recordPathMutation(intArg(a2), cstringArg(a3),
+      "symlinkat dirfd=" & $intArg(a2) & " target=" & $cstringArg(a1))
+  of LinuxSysTruncate:
+    recordPathTruncate(cstringArg(a1), int64(a2), "truncate")
+  else:
+    return false
+  true
+
 proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
-                            inlineTrap: cint): bool {.raises: [].} =
+                            inlineTrap: cint;
+                            fdPaths = RawFdPaths()): bool {.raises: [].} =
+  ## Classify one raw syscall. `inlineTrap` != 0: a trapped inline syscall,
+  ## classified after the fact from what was captured when it trapped (see
+  ## `classifyTrappedInlineEvent`), so its pathname arguments are already
+  ## absolute and `fdPaths` says what its descriptors named. Such an event
+  ## must not touch the live descriptor table: it describes descriptors as
+  ## they were, and the numbers may name other files by now.
+  let trackFd = inlineTrap == 0
   case number
   of LinuxSysOpen:
     if callResult < 0 or resultLooksFaulted(callResult):
       return true
-    recordOpen(cstringArg(a1), intArg(a2), intArg(a3), cint(callResult))
+    recordOpen(cstringArg(a1), intArg(a2), intArg(a3), cint(callResult),
+      trackFd = trackFd)
     true
   of LinuxSysOpenat:
     if callResult < 0 or resultLooksFaulted(callResult):
       return true
-    recordOpen(cstringArg(a2), intArg(a3), intArg(a4), cint(callResult))
+    recordOpen(cstringArg(a2), intArg(a3), intArg(a4), cint(callResult),
+      intArg(a1), trackFd)
     true
   of LinuxSysOpenat2:
     var flags, mode: cint
     if not openHowFlags(a3, callResult, flags, mode):
       return false
-    recordOpen(cstringArg(a2), flags, mode, cint(callResult))
+    recordOpen(cstringArg(a2), flags, mode, cint(callResult), intArg(a1),
+      trackFd)
     true
   of LinuxSysRead:
-    recordRawRead(intArg(a1), callResult)
+    recordRawRead(intArg(a1), callResult, fdPaths)
   of LinuxSysSendfile:
-    recordRawFileCopy(intArg(a2), intArg(a1), callResult)
+    recordRawFileCopy(intArg(a2), intArg(a1), callResult, fdPaths)
   of LinuxSysCopyFileRange:
-    recordRawFileCopy(intArg(a1), intArg(a3), callResult)
+    recordRawFileCopy(intArg(a1), intArg(a3), callResult, fdPaths)
   of LinuxSysSplice:
-    recordRawSplice(intArg(a1), intArg(a3), callResult)
+    recordRawSplice(intArg(a1), intArg(a3), callResult, fdPaths)
   of LinuxSysClose:
-    if callResult >= 0:
+    if callResult >= 0 and trackFd:
       removeFdPath(intArg(a1))
     true
   of LinuxSysStat, LinuxSysLstat, LinuxSysAccess, LinuxSysReadlink:
@@ -2531,10 +2755,16 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
     emitProbe(cstringArg(a1), probeResultFromRaw(callResult))
     true
   of LinuxSysNewfstatat, LinuxSysFaccessat, LinuxSysReadlinkat, LinuxSysStatx:
+    # A relative pathname is resolved against the directory fd (a1), as the
+    # libc probe hooks resolve it, not against the working directory.
     if resultLooksFaulted(callResult):
       return false
-    emitProbe(cstringArg(a2), probeResultFromRaw(callResult))
+    emitProbe(cstringArg(a2), probeResultFromRaw(callResult), intArg(a1))
     true
+  of LinuxSysCreat, LinuxSysUnlink, LinuxSysUnlinkat, LinuxSysRmdir,
+      LinuxSysMkdir, LinuxSysMkdirat, LinuxSysSymlink, LinuxSysSymlinkat,
+      LinuxSysTruncate:
+    classifyRawPathMutation(number, a1, a2, a3, callResult, inlineTrap)
   of LinuxSysGettid:
     # SYS_gettid (nr=186) returns the calling thread's tid: no I/O side
     # effects, no filesystem interaction, no observation to record. Classify
@@ -2634,13 +2864,14 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
     # hook records it: a directory-enumerate of the directory the fd names
     # (from the shim's fd table, else the kernel's /proc/self/fd link). An fd
     # that names no attributable directory stays a loss (fail closed).
-    # An INLINE trap is classified only at shutdown, when the fd may have been
-    # closed and reused for another directory: attributing it then could
-    # record the wrong directory and miss the real one, so an inline
-    # enumeration that returned entries stays a loss.
-    if inlineTrap != 0 and callResult > 0:
+    # An INLINE trap is classified after the fact, when the fd may have been
+    # closed and reused for another directory, so it is attributed to the
+    # directory captured when it trapped (`fdPaths`), never to the live
+    # table; without that capture an enumeration that returned entries stays
+    # a loss.
+    if inlineTrap != 0 and callResult > 0 and not fdPaths.overridden(intArg(a1)):
       return false
-    recordRawGetdents(intArg(a1), callResult)
+    recordRawGetdents(intArg(a1), callResult, fdPaths)
   of LinuxSysFutex:
     # SYS_futex only coordinates threads through caller-owned memory. It does
     # not access filesystem state or introduce an external input, so treating
@@ -2696,17 +2927,126 @@ proc recordRawSyscallClassification(number, a1, a2, a3, a4, a5, a6,
   emitEventLoss(rawSyscallSourceName(inlineTrap) &
     " unsupported nr=" & $number, int64(number))
 
+proc classifyTrappedInlineEvent(index: int; number: clong;
+                                args: array[6, clong]; callResult: clong;
+                                source: cint) {.raises: [].} =
+  ## Classify trapped event `index` from what `ct_raw_capture_event` captured
+  ## when it trapped, never from its raw arguments: by now a pathname pointer
+  ## may name freed, reused or unmapped memory, the working directory may have
+  ## changed, and a descriptor number may name another file. Each pathname is
+  ## made absolute against the directory captured with it and passed in place
+  ## of the pointer (with AT_FDCWD in place of the directory fd); a symlink
+  ## target and openat2's open_how are passed the same way; what each
+  ## descriptor named is passed as `RawFdPaths`. A capture the event needed
+  ## but could not get is event-loss.
+  var a = args
+  case rawSyscallEventCaptureState(index)
+  of rcsFailed:
+    emitEventLoss(rawSyscallSourceName(source) & " nr=" & $number &
+      " arguments not captured when it trapped", int64(number))
+    return
+  of rcsNone:
+    recordRawSyscallClassification(number, a[0], a[1], a[2], a[3], a[4], a[5],
+      callResult, source)
+    return
+  of rcsCaptured:
+    discard
+  let raw = rawSyscallEventCapture(index, rcsPath)
+  let base = rawSyscallEventCapture(index, rcsBase)
+  let target = rawSyscallEventCapture(index, rcsTarget)
+  let absolute =
+    if raw.ok and base.ok and raw.text.len > 0 and not raw.text.isAbsolute:
+      base.text / raw.text
+    else:
+      raw.text
+  var how: LinuxOpenHow
+  var fdPaths: RawFdPaths
+  let fd0 = rawSyscallEventCapture(index, rcsFd0)
+  let fd1 = rawSyscallEventCapture(index, rcsFd1)
+  template pathArg(): clong = cast[clong](cstring(absolute))
+  template targetArg(): clong = cast[clong](cstring(target.text))
+  template overrideFds(first, second: clong) =
+    fdPaths.known0 = fd0.ok
+    fdPaths.fd0 = cint(first)
+    fdPaths.path0 = fd0.text
+    fdPaths.known1 = fd1.ok
+    fdPaths.fd1 = cint(second)
+    fdPaths.path1 = fd1.text
+  case number
+  of LinuxSysOpen, LinuxSysCreat, LinuxSysUnlink, LinuxSysRmdir, LinuxSysMkdir,
+      LinuxSysStat, LinuxSysLstat, LinuxSysAccess, LinuxSysReadlink,
+      LinuxSysTruncate:
+    a[0] = pathArg()
+  of LinuxSysOpenat, LinuxSysUnlinkat, LinuxSysMkdirat, LinuxSysNewfstatat,
+      LinuxSysFaccessat, LinuxSysReadlinkat, LinuxSysStatx:
+    a[0] = clong(LinuxAtFdcwd)
+    a[1] = pathArg()
+  of LinuxSysOpenat2:
+    a[0] = clong(LinuxAtFdcwd)
+    a[1] = pathArg()
+    let captured = rawSyscallEventOpenHow(index)
+    if captured.ok:
+      how.flags = captured.flags
+      how.mode = captured.mode
+      a[2] = cast[clong](addr how)
+    else:
+      a[2] = 0
+  of LinuxSysSymlink:
+    a[0] = targetArg()
+    a[1] = pathArg()
+  of LinuxSysSymlinkat:
+    a[0] = targetArg()
+    a[1] = clong(LinuxAtFdcwd)
+    a[2] = pathArg()
+  of LinuxSysRead, LinuxSysGetdents64:
+    overrideFds(a[0], -1)
+  of LinuxSysSendfile:
+    overrideFds(a[1], a[0])   # sendfile(out_fd, in_fd, ...)
+  of LinuxSysCopyFileRange, LinuxSysSplice:
+    overrideFds(a[0], a[2])
+  else:
+    discard
+  if classifyRawFileSyscall(number, a[0], a[1], a[2], a[3], a[4], a[5],
+                            callResult, source, fdPaths):
+    return
+  emitEventLoss(rawSyscallSourceName(source) & " unsupported nr=" & $number,
+    int64(number))
+
 proc drainInlineRawSyscallEvents() {.raises: [].} =
+  ## Classify every trapped inline syscall of THIS process not classified
+  ## yet. Runs at process exit, before an exec, and before an exit or exec
+  ## that would go around both (`ct_linux_drain_inline_events_before_image_end`).
+  ## Events are taken one at a time (`rawSyscallEventClaim`), so two threads
+  ## draining at once classify each event once; an event another process
+  ## trapped (the copy a fork child inherits, or a vfork child's in the
+  ## shared buffer) is left to that process.
+  if shouldBypass():
+    return
   if rawSyscallEventOverflowed():
     emitEventLoss("inline raw syscall event buffer overflow")
+  let pid = rawCurrentPid()
   let count = rawSyscallEventCount()
   for i in 0 ..< count:
-    let event = rawSyscallEventAt(i)
-    if not event.ok:
-      emitEventLoss("inline raw syscall event read failed index=" & $i)
-      continue
-    recordRawSyscallClassification(event.number, event.a1, event.a2, event.a3,
-      event.a4, event.a5, event.a6, event.result, event.source)
+    case rawSyscallEventClaim(i, pid)
+    of 1:
+      let event = rawSyscallEventAt(i)
+      if not event.ok:
+        emitEventLoss("inline raw syscall event read failed index=" & $i)
+        continue
+      classifyTrappedInlineEvent(i, event.number,
+        [event.a1, event.a2, event.a3, event.a4, event.a5, event.a6],
+        event.result, event.source)
+    of -1:
+      # Another thread of this process is still writing it; whatever drain
+      # this is, nothing later is guaranteed to see it.
+      emitEventLoss("inline raw syscall event still being written index=" & $i)
+    else:
+      discard
+
+proc repro_linux_drain_inline_events() {.cdecl, raises: [].} =
+  ## Registered with the runtime as the drain the exit/exec trap paths run.
+  ensureInitializedPreservingErrno()
+  drainInlineRawSyscallEvents()
 
 proc repro_hook_stat*(ctx: var StatContext) {.raises: [].} =
   if shouldBypass():
@@ -3763,6 +4103,9 @@ proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
   let preparedEnv = envWithExecGen(ctx.envp, currentExecGen + 1)
   ctx.envp = preparedEnv
   sampleKillDiag("execve-pre-flush")
+  # A successful exec discards this image with every trapped inline syscall
+  # not classified yet.
+  drainInlineRawSyscallEvents()
   discard repro_monitor_shim_flush()
   sampleKillDiag("execve-post-flush")
   callNext(ctx)
@@ -4053,6 +4396,59 @@ proc repro_linux_observe_localfd_create(fd: cint) {.cdecl, raises: [].} =
   ensureInitializedPreservingErrno()
   recordLocalFdCreate(fd)
 
+# The operation codes `ct_mutation_observer_fn` passes; they must match the
+# CT_MUTATION_* values in linux_preload_runtime.nim.
+const
+  MutationUnlink = 1.cint
+  MutationUnlinkat = 2.cint
+  MutationRmdir = 3.cint
+  MutationMkdir = 4.cint
+  MutationMkdirat = 5.cint
+  MutationSymlink = 6.cint
+  MutationSymlinkat = 7.cint
+  MutationRemove = 8.cint
+  MutationTruncate = 9.cint
+
+proc repro_linux_observe_mutation(op, dirfd: cint; path, target: cstring;
+                                  arg: clong; rc: cint) {.cdecl, raises: [].} =
+  ## A path-mutation call (unlink, mkdir, rmdir, symlink, remove, truncate and
+  ## their *at forms) returned `rc`. `arg` is unlinkat's flags or truncate's
+  ## length; `target` is a symlink's contents. See the path-mutation block
+  ## above `classifyRawPathMutation` for what is recorded and why.
+  if shouldBypass() or rc != 0:
+    return
+  ensureInitializedPreservingErrno()
+  case op
+  of MutationUnlink:
+    recordPathMutation(LinuxAtFdcwd, path, "unlink")
+  of MutationUnlinkat:
+    recordPathMutation(dirfd, path, unlinkatDetail(dirfd, cint(arg)))
+  of MutationRmdir:
+    recordPathMutation(LinuxAtFdcwd, path, "rmdir")
+  of MutationMkdir:
+    recordPathMutation(LinuxAtFdcwd, path, "mkdir")
+  of MutationMkdirat:
+    recordPathMutation(dirfd, path, "mkdirat dirfd=" & $dirfd)
+  of MutationSymlink:
+    recordPathMutation(LinuxAtFdcwd, path,
+      "symlink target=" & (if target == nil: "" else: $target))
+  of MutationSymlinkat:
+    recordPathMutation(dirfd, path, "symlinkat dirfd=" & $dirfd &
+      " target=" & (if target == nil: "" else: $target))
+  of MutationRemove:
+    # remove(3) is unlink, or rmdir for a directory; libc decides inside, so
+    # the detail cannot say which.
+    recordPathMutation(LinuxAtFdcwd, path, "remove")
+  of MutationTruncate:
+    recordPathTruncate(path, int64(arg), "truncate")
+  else:
+    discard
+
+proc ct_linux_preload_register_mutation_observer(observer: pointer)
+  {.importc, cdecl, raises: [].}
+ct_linux_preload_register_mutation_observer(
+  cast[pointer](repro_linux_observe_mutation))
+
 proc ct_linux_preload_register_observers(probe, enumerate, fdopendirFn,
                                          mprotectFn, createFn: pointer)
   {.importc, cdecl, raises: [].}
@@ -4114,3 +4510,4 @@ registerPosixSpawnHook(repro_hook_posix_spawn)
 registerPosixSpawnpHook(repro_hook_posix_spawnp)
 registerExitHook(repro_hook_exit)
 registerRawSyscallHook(repro_hook_raw_syscall)
+registerInlineRawSyscallDrain(repro_linux_drain_inline_events)
