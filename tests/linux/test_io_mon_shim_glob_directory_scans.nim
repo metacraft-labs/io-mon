@@ -11,13 +11,31 @@
 ## made-through-glob). The macOS backend already records these scans, because
 ## Darwin's glob reaches the interposed `opendir`.
 ##
+## A scan is PATTERN-SCOPED: glob keeps only the entries that match one
+## component of the pattern, so the enumeration carries that component
+## (detail `GlobPatternDetailPrefix & <component>`) and a consumer can key on
+## the matching entries alone. Without it, every unrelated file created beside
+## a project's sources would invalidate each Nim compile in the project
+## (reprobuild-pm issue 2026-10-17-nimble-glob-keys-nim-edges-on-the-full-
+## membership-of-tracked-directories). Where the component cannot be named
+## with certainty the scan must stay a FULL enumeration, because a pattern
+## narrower than glob's would drop a dependency.
+##
 ## WHAT THIS TEST GRADES.
 ##   * `t_glob_records_the_directories_its_pattern_scans`: absolute patterns
 ##     through `glob` and `glob64` — a wildcard in the last component, one in
 ##     a middle component (every directory it walks into is scanned), and a
 ##     wildcard that matches nothing — record a directory enumeration of each
-##     directory scanned. The no-match case is the one Nim's `.nimble` search
-##     depends on: the ABSENCE of a match is the input.
+##     directory scanned, scoped to the component matched there. The no-match
+##     case is the one Nim's `.nimble` search depends on: the ABSENCE of a
+##     match is the input.
+##   * `t_uncertain_patterns_stay_full_enumerations`: brace expansion, a
+##     bracket expression and a backslash escape each record a full
+##     enumeration, never a pattern.
+##   * `t_the_working_directory_is_scoped_only_when_spelled_literally`: the
+##     working directory opened as "." is scoped for a literal `./` prefix
+##     and stays full where "." is matched against a wildcard first
+##     component, or was itself the match of one.
 ##   * `t_glob_records_lookups_of_literal_components`: a pattern without a
 ##     wildcard is resolved by lstat inside glob; both an existing and an
 ##     absent name must be recorded as probes.
@@ -76,6 +94,16 @@ proc enumerated(dep: MonitorDepFile): seq[string] =
   result.sort()
   result = result.deduplicate(isSorted = true)
 
+proc scopes(dep: MonitorDepFile; path: string): seq[string] =
+  ## How each enumeration of `path` was scoped: the pattern component of a
+  ## pattern-scoped one, "full" for any other. Sorted and deduplicated.
+  for r in dep.records:
+    if r.kind == mrDirectoryEnumerate and r.path == path:
+      let pattern = globScanPattern(r.detail)
+      result.add(if pattern.len > 0: pattern else: "full")
+  result.sort()
+  result = result.deduplicate(isSorted = true)
+
 proc probes(dep: MonitorDepFile; path: string): seq[ProbeResult] =
   for r in dep.records:
     if r.kind == mrPathProbe and r.path == path:
@@ -94,6 +122,7 @@ int main(int argc, char **argv) {
   int flags = 0;
   if (strstr(mode, "mark")) flags |= GLOB_MARK;
   if (strstr(mode, "onlydir")) flags |= GLOB_ONLYDIR;
+  if (strstr(mode, "brace")) flags |= GLOB_BRACE;
   for (int i = 2; i < argc; i++) {
     int rc;
     if (strstr(mode, "glob64")) {
@@ -231,7 +260,34 @@ suite "io-mon Linux shim records directory scans made through glob":
         check d in dirs
       # glob never opens a directory the pattern does not name.
       check (project / "src" / "sub") notin dirs
+      # Each scan names the component matched in that directory: `project`
+      # is matched against `*.nimble` by the first pattern and against the
+      # middle `*` by the second, its subdirectories against `*.txt`.
+      check r.dep.scopes(project) == @["*", "*.nimble"]
+      check r.dep.scopes(project / "docs") == @["*.txt"]
+      check r.dep.scopes(project / "src") == @["*.txt"]
+      check r.dep.scopes(tree / "empty") == @["*.nimble"]
       check r.dep.completeness == mcComplete
+
+  test "t_uncertain_patterns_stay_full_enumerations":
+    # Brace expansion rewrites the pattern before glob opens anything; a
+    # bracket expression and a backslash escape need fnmatch's own rules to
+    # match. None may be reported as a pattern, but each scan is recorded.
+    let brace = monitor("brace", @[globber, "glob-brace",
+      project / "{a,notes}*", tree / "empty" / "x{1,2}*"])
+    check brace.code == 0
+    check brace.output.contains(project / "a.nimble")
+    check brace.output.contains(project / "notes.txt")
+    check brace.dep.scopes(project) == @["full"]
+    check brace.dep.scopes(tree / "empty") == @["full"]
+    let classes = monitor("classes", @[globber, "glob",
+      project / "[a]*.nimble", project / "docs" / "\\x*"])
+    check classes.code == 0
+    check classes.output.contains(project / "a.nimble")
+    check classes.output.contains(project / "docs" / "x.txt")
+    check classes.dep.scopes(project) == @["full"]
+    check classes.dep.scopes(project / "docs") == @["full"]
+    check classes.dep.completeness == mcComplete
 
   test "t_glob_records_lookups_of_literal_components":
     let r = monitor("literal", @[globber, "glob",
@@ -277,6 +333,8 @@ for dir in [paramStr(1), paramStr(2)]:
     let dirs = enumerated(r.dep)
     check project in dirs
     check (tree / "empty") in dirs
+    check r.dep.scopes(project) == @["*.nimble"]
+    check r.dep.scopes(tree / "empty") == @["*.nimble"]
     check r.dep.completeness == mcComplete
 
   test "t_relative_glob_is_attributed_to_the_working_directory":
@@ -288,6 +346,26 @@ for dir in [paramStr(1), paramStr(2)]:
     let dirs = enumerated(r.dep)
     check project in dirs
     check (project / "src") in dirs
+    check r.dep.scopes(project) == @["*.txt"]
+    check r.dep.scopes(project / "src") == @["*.nim"]
+    check r.dep.completeness == mcComplete
+
+  test "t_the_working_directory_is_scoped_only_when_spelled_literally":
+    # glob opens the working directory as "." in three situations: for a
+    # relative pattern's literal "./" prefix, as the implicit start of a
+    # relative pattern whose FIRST component is a wildcard, and when a
+    # wildcard such as `.*` matched the entry "." itself. In the last two
+    # "." is matched against a different component than its spelling
+    # suggests (`*` for `*/*.nim`, not `*.nim`), so only the first may be
+    # scoped. Reporting `*.nim` there would ignore a new subdirectory that
+    # holds a `.nim` file: a false cache hit.
+    let r = monitor("relative-wildcard", @[globber, "glob", "*/*.nim",
+      ".*/*.txt", "./*.nimble"], workingDir = project)
+    check r.code == 0
+    check r.output.contains("  src/m.nim")
+    check r.output.contains("  ./a.nimble")
+    check r.dep.scopes(project) == @["*.nimble", "full"]
+    check r.dep.scopes(project / "src") == @["*.nim"]
     check r.dep.completeness == mcComplete
 
   test "t_glob_results_are_unchanged":

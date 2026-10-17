@@ -829,6 +829,53 @@ const
     ## observation. One definition means the two cannot drift apart again.
     ## The record's `path` carries WHICH source (see `mrNonDeterministic`).
 
+  GlobPatternDetailPrefix* = "glob pattern="
+    ## How a backend writes the `detail` of a PATTERN-SCOPED
+    ## `mrDirectoryEnumerate`: this prefix, then the one pattern component
+    ## glob(3) matched against the directory's entries. The caller's outcome
+    ## depends only on which entries match that component, so a consumer may
+    ## key the record on the matching entries alone instead of the whole
+    ## listing.
+    ##
+    ## The component holds only literal characters, `*` (any run, including
+    ## empty) and `?` (any one character), and never a `/` or whitespace, so
+    ## it stays one whitespace-separated `key=value` token: the writer appends
+    ## further tokens (`run=<id>`) to every detail. A backend that cannot name
+    ## the component with that certainty records a full enumeration instead.
+    ## glob's rule that a leading `.` must be matched explicitly is
+    ## deliberately not part of the contract: a consumer that ignores it keys
+    ## on a superset of the names glob could have matched, which is safe.
+    ## Read it back with `globScanPattern`, never by prefix: the text after
+    ## the prefix is not the pattern alone.
+
+func globScanPattern*(detail: string): string =
+  ## The pattern component of a pattern-scoped enumeration's `detail`, or ""
+  ## when `detail` describes a full enumeration: its first token is not
+  ## `glob`, it has no non-empty `pattern=` token, it has more than one (an
+  ## ambiguous record must not narrow what it depends on), or the pattern
+  ## holds a character outside the contract of `GlobPatternDetailPrefix`. A
+  ## `/`, a bracket or a backslash would make a consumer's matcher reject
+  ## names glob accepted, so such a record is read as the full listing it
+  ## would otherwise narrow.
+  const spaces = {' ', '\t', '\n', '\r', '\v', '\f'}
+  const outsideContract = {'/', '[', '\\', '\0'}
+  const key = "pattern="
+  var first = true
+  for token in detail.split(spaces):
+    if token.len == 0:
+      continue
+    if first:
+      if token != "glob":
+        return ""
+      first = false
+    elif token.startsWith(key):
+      if result.len > 0 or token.len == key.len:
+        return ""
+      result = token[key.len .. ^1]
+  for c in result:
+    if c in outsideContract:
+      return ""
+
 proc defaultMonitorDepFileReaderOptions*(): MonitorDepFileReaderOptions =
   MonitorDepFileReaderOptions(
     allowUnknownOptionalRecords: false,

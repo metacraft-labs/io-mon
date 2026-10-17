@@ -4696,8 +4696,18 @@ int ct_scandir64_impl(const char *dir, void *namelist, void *filter,
  * A caller that passes GLOB_ALTDIRFUNC itself does its own directory access,
  * observed through whatever its callbacks call; its glob runs unchanged.
  * On LP64 glibc struct dirent/stat are their *64 twins, so one set of
- * callbacks serves both glob and glob64. */
-typedef void (*ct_glob_scan_observer_fn)(const char *path);
+ * callbacks serves both glob and glob64.
+ *
+ * A scan is PATTERN-SCOPED: glob keeps only the entries that match one
+ * component of the pattern, so the caller's outcome depends on which names
+ * match it and on nothing else in the directory. The observer receives that
+ * component whenever it can be named with certainty (see
+ * ct_glob_scan_component), and NULL otherwise, in which case the scan is
+ * reported as an ordinary full enumeration. Reporting a pattern that
+ * matches fewer names than glob's would lose a dependency, so every
+ * uncertain case falls back to the full listing. */
+typedef void (*ct_glob_scan_observer_fn)(const char *path,
+                                         const char *pattern);
 static ct_glob_scan_observer_fn ct_glob_scan_observer = NULL;
 void ct_linux_preload_register_glob_scan_observer(
     ct_glob_scan_observer_fn observer) {
@@ -4705,10 +4715,107 @@ void ct_linux_preload_register_glob_scan_observer(
 }
 
 #if defined(__LP64__) && defined(__GLIBC__) && defined(GLOB_ALTDIRFUNC)
+/* The pattern of the glob call running on this thread, or NULL when its
+ * components cannot be mapped onto the directories glob opens. Saved and
+ * restored around each call, so a glob made from inside an errfunc does not
+ * clobber the outer call's. */
+static __thread const char *ct_glob_active_pattern = NULL;
+
+/* Advance past one '/'-separated component of `s`, skipping repeated
+ * slashes first. Returns the component's start and stores its length. */
+static const char *ct_glob_next_component(const char *s, size_t *len) {
+  while (*s == '/') s++;
+  const char *start = s;
+  while (*s != '\0' && *s != '/') s++;
+  *len = (size_t)(s - start);
+  return start;
+}
+
+/* The pattern component glob matches against the entries of `dir`, copied
+ * into `out` (NUL-terminated), or 0 when it cannot be named with certainty.
+ *
+ * glob builds every directory it opens by appending matched names to the
+ * pattern's leading components, one name per component
+ * (https://sourceware.org/git/?p=glibc.git;a=blob;f=posix/glob.c, glob and
+ * glob_in_dir; its recursive scan of a wildcard dirname copies the
+ * GLOB_ALTDIRFUNC callbacks into the inner glob_t, so intermediate levels
+ * arrive here too). So the directory's component count is the index of the
+ * component being matched: "<a>/x" under the pattern "<a>/ * /c*" (spaces
+ * only to keep this comment closed) is matched against "c*". A pattern with
+ * no '/' is matched against the working directory, which glob opens as ""
+ * or ".".
+ *
+ * The one name this counting cannot place is a bare ".". glob opens the
+ * working directory under it for a pattern's literal "./" prefix, but also
+ * as the implicit start of a relative pattern whose FIRST component is a
+ * wildcard (the "*" of "* /x*" is matched in "."), and when a wildcard such
+ * as ".*" matched the entry "." itself. Only the literal prefix places the
+ * component, so under a pattern with a '/' a bare "." is scoped only when
+ * the pattern's first component is a literal ".".
+ *
+ * Certainty requires, and this returns 0 unless:
+ * - the opened path is rooted exactly when the pattern is;
+ * - each literal component of the pattern equals the opened path's
+ *   component at that position (a wildcard component is the name glob
+ *   matched, which this does not re-match);
+ * - the component exists and uses only literals, '*' and '?'. Bracket
+ *   expressions and backslash escapes are left to the full listing, so a
+ *   consumer can match the reported pattern without reproducing fnmatch's
+ *   locale-dependent classes;
+ * - the component holds no whitespace, so it stays a single token in the
+ *   record's whitespace-separated detail (GlobPatternDetailPrefix in
+ *   io_mon/types.nim). */
+static int ct_glob_scan_component(const char *pattern, const char *dir,
+                                  char *out, size_t out_len) {
+  if (pattern == NULL || dir == NULL) return 0;
+  const char *component;
+  size_t component_len;
+  if (strchr(pattern, '/') == NULL) {
+    if (!(dir[0] == '\0' || strcmp(dir, ".") == 0)) return 0;
+    component = pattern;
+    component_len = strlen(pattern);
+  } else {
+    if ((pattern[0] == '/') != (dir[0] == '/')) return 0;
+    if (dir[0] == '\0') return 0;
+    if (strcmp(dir, ".") == 0) {
+      size_t first_len;
+      const char *first = ct_glob_next_component(pattern, &first_len);
+      if (first_len != 1 || first[0] != '.') return 0;
+    }
+    const char *p = pattern;
+    const char *d = dir;
+    for (;;) {
+      size_t dir_len;
+      const char *dir_part = ct_glob_next_component(d, &dir_len);
+      component = ct_glob_next_component(p, &component_len);
+      if (dir_len == 0) break;
+      if (component_len == 0) return 0;
+      if (strcspn(component, "*?[\\") >= component_len &&
+          (component_len != dir_len ||
+           memcmp(component, dir_part, dir_len) != 0))
+        return 0;
+      d = dir_part + dir_len;
+      p = component + component_len;
+    }
+  }
+  if (component_len == 0 || component_len >= out_len) return 0;
+  for (size_t i = 0; i < component_len; i++)
+    if (strchr("[\\ \t\n\r\v\f", component[i]) != NULL) return 0;
+  memcpy(out, component, component_len);
+  out[component_len] = '\0';
+  return 1;
+}
+
 static void *ct_glob_opendir(const char *path) {
   void *dir = ct_linux_preload_real_opendir((char *)path);
   if (dir != NULL) {
-    CT_OBSERVE(ct_glob_scan_observer, path);
+    char component[256];
+    const char *pattern =
+        ct_glob_scan_component(ct_glob_active_pattern, path, component,
+                               sizeof component)
+            ? component
+            : NULL;
+    CT_OBSERVE(ct_glob_scan_observer, path, pattern);
   } else {
     /* glob skips a directory it cannot open (an absent name, a file, no
      * permission), so the outcome depends on whether the name exists. Keep
@@ -4758,8 +4865,19 @@ static int ct_glob_observed(ct_glob_real_fn real, const char *pattern,
   pglob->gl_opendir = ct_glob_opendir;
   pglob->gl_lstat = ct_glob_lstat;
   pglob->gl_stat = ct_glob_stat;
+  /* Brace and tilde expansion rewrite the pattern before any directory is
+   * opened, so its components no longer line up with what glob opens: such
+   * a call reports full enumerations. A backslash may escape a '/', which
+   * would shift every component after it, so it is treated the same way. */
+  const char *outer_pattern = ct_glob_active_pattern;
+  int expands = ((flags & GLOB_BRACE) != 0 && strchr(pattern, '{') != NULL) ||
+                ((flags & (GLOB_TILDE | GLOB_TILDE_CHECK)) != 0 &&
+                 pattern[0] == '~') ||
+                strchr(pattern, '\\') != NULL;
+  ct_glob_active_pattern = expands ? NULL : pattern;
   int rc = real(pattern, flags | GLOB_ALTDIRFUNC, errfunc, pglob);
   int saved_errno = errno;
+  ct_glob_active_pattern = outer_pattern;
   pglob->gl_closedir = saved_closedir;
   pglob->gl_readdir = saved_readdir;
   pglob->gl_opendir = saved_opendir;

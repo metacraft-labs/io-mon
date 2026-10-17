@@ -4579,18 +4579,29 @@ proc repro_linux_observe_enumerate(dirfd: cint; path: cstring; rc: cint)
   record.detail = "scandir"
   emitRecord(record)
 
-proc repro_linux_observe_glob_scan(path: cstring) {.cdecl, raises: [].} =
-  ## glob(3) opened `path` to match a pattern component against its entries:
-  ## an enumeration of the directory, whatever the pattern then matched
+proc repro_linux_observe_glob_scan(path, pattern: cstring)
+    {.cdecl, raises: [].} =
+  ## glob(3) opened `path` to match a pattern component against its entries
   ## (`glob` in linux_preload_runtime.nim). A relative path is glob's own
   ## spelling of a directory under the working directory.
+  ##
+  ## `pattern` is that component when the runtime could name it with
+  ## certainty, and the record is then a PATTERN-SCOPED enumeration (detail
+  ## `GlobPatternDetailPrefix & <component>`): the outcome depends only on
+  ## which entries match the component. It holds only literals, `*` and `?`,
+  ## and never a `/`. A nil `pattern` is a full enumeration, detail `glob`,
+  ## which is what `opendir`/`readdir` would have recorded.
   if bypassEvidence() or path == nil or path[0] == '\0':
     return
   ensureInitializedPreservingErrno()
   var record = baseRecord(mrDirectoryEnumerate, moDirectoryEnumerate)
   record.path = pathForAt(LinuxAtFdcwd, path)
   record.result = 1
-  record.detail = "glob"
+  record.detail =
+    if pattern != nil and pattern[0] != '\0':
+      GlobPatternDetailPrefix & $pattern
+    else:
+      "glob"
   emitRecord(record)
 
 proc ct_linux_preload_register_glob_scan_observer(observer: pointer)
