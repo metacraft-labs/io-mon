@@ -2,7 +2,7 @@
 
 |             |                                                                                                                            |
 | ----------- | -------------------------------------------------------------------------------------------------------------------------- |
-| Status      | open                                                                                                                       |
+| Status | in-progress (nixos-ci-bare-002:fix-linux-underscore-fork-slot-is-not-primed) |
 | Recorded    | 2026-10-17                                                                                                                 |
 | Observed in | io-mon @ f33311e (the commit that added the slot) and @ 3f8788c, x86_64 NixOS                                              |
 | Area        | `src/io_mon/hooks/linux_preload_runtime.nim`: `_Fork`, `real_underscore_fork_ptr`, `ct_linux_preload_prime_real_functions` |
