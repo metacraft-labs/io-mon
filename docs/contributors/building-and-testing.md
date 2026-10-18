@@ -107,7 +107,9 @@ just test-dev-shell
 ```
 
 These tests run `nix develop` themselves, so start them from a shell that has
-`nix` and `bash`; they are not part of `just test`.
+`nix` and `bash`; they are not part of `just test`. CI runs them after
+`just test` in the Nix-flavoured _Test_ jobs on Linux and macOS
+(`.github/workflows/ci.yml`, step _Run dev-shell tests_).
 
 - `tests/test_dev_shell_writes_nothing_elsewhere.sh`: entering the dev shell
   from another git repository writes no files or git hooks there.

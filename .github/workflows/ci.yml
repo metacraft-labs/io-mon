@@ -206,6 +206,16 @@ jobs:
             dev-exec just test 2>&1 | tee test.log
           fi
 
+      - name: Run dev-shell tests
+        # The dev shell itself is under test here: its nimble must run a task
+        # (tests/test_dev_shell_nimble_runs_tasks.sh; on Darwin an unpinned TLS
+        # lookup made it SIGSEGV before any task) and entering it from another
+        # repository must write nothing there. Both scripts run `nix develop`,
+        # so they are not part of `just test` and only the Nix flavour has them.
+        if: matrix.env == 'nix'
+        shell: bash
+        run: dev-exec just test-dev-shell 2>&1 | tee -a test.log
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
