@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | open |
+| Status | in-progress (m1:fix-macos-grades-a-live-detached-descendant) |
 | Recorded | 2026-10-17 |
 | Observed in | io-mon @ f33311e, consumed from the sibling checkout by reprobuild `agents` @ 8a61fb6963, aarch64-darwin (m1) |
 | Area | `src/io_mon/fs_snoop.nim` `settleMonitorDescendants`, `waitForLinuxInjectedDescendants`, `liveInjectedDescendants` |
