@@ -2,7 +2,7 @@
 
 |             |                                             |
 | ----------- | ------------------------------------------- |
-| Status      | open                                        |
+| Status | in-progress (m1:fix-macos-nimble-test-crashes-before-running) |
 | Recorded    | 2026-09-28                                  |
 | Observed in | io-mon @ `0d636e2`                          |
 | Area        | `just test`, pinned macOS development shell |
