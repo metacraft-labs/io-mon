@@ -57,12 +57,14 @@ alias t := test
 alias fmt := format
 
 # Dev-shell properties: entering the shell from another git repository writes
-# nothing there, and the shell's `nimble` runs a package task instead of
-# crashing in its TLS setup (Darwin). Both run `nix develop`, so they are not
-# part of the in-shell test recipes.
+# nothing there, the shell's `nimble` runs a package task instead of crashing
+# in its TLS setup (Darwin), and an ASan+UBSan program built by the shell's
+# compiler reaches main (the compiler-rt startup hang on macOS 26). All run
+# `nix develop`, so they are not part of the in-shell test recipes.
 test-dev-shell:
     bash tests/test_dev_shell_writes_nothing_elsewhere.sh
     bash tests/test_dev_shell_nimble_runs_tasks.sh
+    bash tests/test_dev_shell_asan_program_reaches_main.sh
 
 # Documentation-site recipes (delegating to docs/site)
 dev-docs *args:

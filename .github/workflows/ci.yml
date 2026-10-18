@@ -209,8 +209,10 @@ jobs:
       - name: Run dev-shell tests
         # The dev shell itself is under test here: its nimble must run a task
         # (tests/test_dev_shell_nimble_runs_tasks.sh; on Darwin an unpinned TLS
-        # lookup made it SIGSEGV before any task) and entering it from another
-        # repository must write nothing there. Both scripts run `nix develop`,
+        # lookup made it SIGSEGV before any task), entering it from another
+        # repository must write nothing there, and its compiler's ASan+UBSan
+        # programs must reach main (tests/test_dev_shell_asan_program_reaches_main.sh;
+        # on macOS 26 compiler-rt 21's ASan hung before main). The scripts run `nix develop`,
         # so they are not part of `just test` and only the Nix flavour has them.
         if: matrix.env == 'nix'
         shell: bash
