@@ -25,6 +25,7 @@
 ##     `mrProcessStart`, and a `mrProcessSpawn` names it as a child. A read
 ##     the root shell made would satisfy neither.
 
+import descendant_guard_expectations
 import std/[os, osproc, strutils, tempfiles, unittest, widestrs]
 
 import io_mon
@@ -167,7 +168,7 @@ proc runMsysReadProbe(): int =
 
   # And the run must grade honestly complete over that evidence: every child
   # reported, and nothing was rescued without being netted.
-  if monitored.completeness != mcComplete:
+  if subsystemEvidence(monitored).completeness != mcComplete:
     return 6
   0
 

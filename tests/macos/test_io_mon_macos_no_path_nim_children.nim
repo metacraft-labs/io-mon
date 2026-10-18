@@ -2,6 +2,7 @@
 ## No mocks: Nim, clang, the production shim and filesystem evidence all run
 ## normally. The host PATH is also emptied, so sandbox population cannot hide
 ## the missing packaged replacement by finding the development shell's sh.
+import descendant_guard_expectations
 import std/[os, osproc, strutils, tempfiles, unittest]
 import io_mon
 when defined(macosx):
@@ -71,7 +72,7 @@ when defined(macosx):
     for record in evidence.records:
       if record.kind == mrEventLoss: checkpoint(record.detail)
     doAssert captured.exitCode == 0
-    doAssert evidence.completeness == expected
+    doAssert subsystemEvidence(evidence).completeness == expected
     var compilerRead = false
     var shellStarted = false
     for record in evidence.records:

@@ -446,7 +446,7 @@ while remaining > 0:
 
 **The §4.1 descendant guard is not yours to remember** (DH-3). A monitored tree
 can leave a DETACHED DESCENDANT behind — the root exits, but a daemonized child
-keeps reading and writing files outside the evidence. io-mon detects that by
+keeps reading and writing files outside the evidence. On Linux, io-mon detects that by
 scanning `/proc/*/environ` for this run's injection needles and, past a grace
 window (`IO_MON_LINUX_DESCENDANT_GRACE_MS`, default 500), publishing an
 event-loss marker that downgrades the edge to `mcIncomplete`. Reporting
@@ -458,6 +458,23 @@ marked. A decomposed host therefore grades an edge exactly as `runMonitored`
 does, and cannot opt out. Pinned by
 `tests/linux/test_io_mon_external_host_descendant_guard.nim`, which runs a real
 detached descendant past a real grace window down both launch paths.
+
+**macOS and Windows limitation (normative).** Root exit alone does not
+prove that the process tree is empty. These backends have neither a complete
+kernel descendant census nor a tree-lifetime primitive. Every finished capture
+MUST therefore publish an `mrEventLoss` / `moEventLoss` record with detail
+`detached-descendant quiescence cannot be established: <platform> backend has no complete tree-lifetime guard run=<id>`
+(`<platform>` is `macos` or `windows`) before evidence is merged. This applies
+even when no spawn was observed, to batch and decomposed hosts, every interest
+set and evidence scope, and both in-memory and on-disk depfiles. Such captures
+MUST grade `mcIncomplete`; consumers must conservatively rebuild. The marker
+states uncertainty, not proof that a descendant exists. Process and file
+evidence remains available for diagnosis. Linux retains its real descendant
+scan and grace window; `IO_MON_LINUX_DESCENDANT_GRACE_MS` and
+`IO_MON_LINUX_DESCENDANT_POLL_MS` have no effect on the macOS/Windows limitation.
+There is no override that promotes these captures to complete. The real gated
+macOS regression also checks a fully quiesced control, which fails closed for
+the same reason.
 
 **The two launch paths produce the same evidence, and that is measured** (DH-4).
 `runMonitored` and a host driving `startMonitor` → `pollMonitor` →

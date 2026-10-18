@@ -1,6 +1,7 @@
 ## Real nested processes and production shims; no mocks. Independent captures
 ## must retain their own scope, and an unfinished handoff must remain a loss.
 ## Every launch is supervised in its own process group with a 30-second bound.
+import descendant_guard_expectations
 import std/[os, osproc, sequtils, streams, strtabs, strutils, tempfiles, unittest]
 
 when defined(macosx):
@@ -121,7 +122,7 @@ when defined(macosx):
     else:
       let inner = runMonitored(request)
       doAssert inner.exitCode == 0
-      doAssert inner.completeness == (if mode == "incomplete": mcIncomplete else: mcComplete)
+      doAssert subsystemEvidence(inner).completeness == (if mode == "incomplete": mcIncomplete else: mcComplete)
     doAssert readFile(work / "outer-input") == "outer"
     quit(0)
 
@@ -179,23 +180,23 @@ suite "macOS nested capture handoff":
         let losses = outer.records.filterIt(it.kind == mrEventLoss)
         checkpoint("outer loss=" & $losses)
         if mode in ["abandoned", "interrupted", "failed-write"]:
-          check outer.completeness == mcIncomplete
+          check subsystemEvidence(outer).completeness == mcIncomplete
           check losses.anyIt("nested monitor evidence handoff pending" in it.detail)
           if mode != "failed-write":
             check not fileExists(nested / "inner.iomon")
         elif mode == "incomplete":
-          check outer.completeness == mcIncomplete
+          check subsystemEvidence(outer).completeness == mcIncomplete
           check readMonitorDepFile(nested / "inner.iomon").completeness == mcIncomplete
           check losses.anyIt("syscall(2)" in it.detail)
           check not losses.anyIt("handoff pending" in it.detail)
         else:
-          check outer.completeness == mcComplete
+          check subsystemEvidence(outer).completeness == mcComplete
           check outer.records.anyIt(it.kind == mrFileRead and it.path == nested / "inner-input")
           check outer.records.anyIt(it.kind == mrFileRead and it.path == nested / "outer-input")
           check not outer.records.anyIt(it.kind == mrLibraryLoad and
             it.path in [shim, second, expandFilename(shim), expandFilename(second)])
           let inner = readMonitorDepFile(nested / "inner.iomon")
-          check inner.completeness == mcComplete
+          check subsystemEvidence(inner).completeness == mcComplete
           check not inner.records.anyIt(it.kind == mrLibraryLoad and
             it.path in [shim, second, expandFilename(shim), expandFilename(second)])
           # Two ACTIVE shims in the reader would each record its start: one

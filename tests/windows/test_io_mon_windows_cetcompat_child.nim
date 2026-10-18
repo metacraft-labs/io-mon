@@ -35,6 +35,7 @@
 when not defined(windows):
   {.error: "windows-only test".}
 
+import descendant_guard_expectations
 import std/[os, strutils, tempfiles, unittest]
 
 import io_mon
@@ -69,7 +70,7 @@ suite "Windows: a /CETCOMPAT child survives injection":
     # Surviving is not enough: the child must also have been MONITORED. A
     # monitoring failure looks like a process with no dependencies, so the
     # grade is what is asserted (see tests/windows/README.md).
-    check result.completeness == mcComplete
+    check subsystemEvidence(result).completeness == mcComplete
     var rootStarted = false
     for r in result.records:
       if r.kind == mrProcessStart:
@@ -101,7 +102,7 @@ suite "Windows: a /CETCOMPAT child survives injection":
     # whose borrowed `LoadLibraryW` is forced to time out leaves `curl`
     # running uninjected (exit 0, `inject=ioInjectFailed`, `mcIncomplete`),
     # and only these assertions catch it.
-    check result.completeness == mcComplete
+    check subsystemEvidence(result).completeness == mcComplete
     var curlPid = 0'u64
     for r in result.records:
       if r.kind == mrProcessSpawn and r.childOsPid != 0 and
