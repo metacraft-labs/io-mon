@@ -29,6 +29,7 @@ const detachedDescendantSrc = """
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static _Atomic int *ready = NULL;
@@ -84,6 +85,13 @@ int main(int argc, char **argv) {
       while (read(rp[0], &b, 1) > 0) { /* drain until EOF */ }
     }
     close(rp[0]);
+    /* The grandchild's readiness does not order the intermediate parent's
+       shim shutdown. Reap our direct child before root exit, so only the
+       signal-blocked detached grandchild can outlive the monitor root. */
+    int status;
+    pid_t reaped;
+    do { reaped = waitpid(pid, &status, 0); } while (reaped < 0 && errno == EINTR);
+    if (reaped != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return 16;
     return 0;
   }
   close(rp[0]);
