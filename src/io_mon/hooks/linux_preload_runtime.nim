@@ -2824,6 +2824,8 @@ pid_t _Fork(void) {
   ct_underscore_fork_fn real = __atomic_load_n(&real_underscore_fork_ptr,
                                                __ATOMIC_ACQUIRE);
   if (real == NULL) {
+    /* Normally primed by ct_linux_preload_prime_real_functions; this lookup
+     * covers a call made before the constructor ran. */
     real = (ct_underscore_fork_fn)ct_resolve("_Fork");
     __atomic_store_n(&real_underscore_fork_ptr, real, __ATOMIC_RELEASE);
   }
@@ -3996,6 +3998,10 @@ void ct_linux_preload_prime_real_functions(void) {
   CT_PRIME(real_canonicalize_file_name_ptr, ct_canonicalize_real_fn,
            "canonicalize_file_name");
   CT_PRIME(real_clone_ptr, ct_clone_fn, "clone");
+  /* _Fork exists only in glibc 2.34 and later, so on an older glibc this
+   * slot stays NULL and the hook returns ENOSYS. The hook's own lazy lookup
+   * stays as the fallback for a call made before this constructor ran. */
+  CT_PRIME(real_underscore_fork_ptr, ct_underscore_fork_fn, "_Fork");
   CT_PRIME(real_scandir_ptr, ct_scandir_real_fn, "scandir");
   CT_PRIME(real_scandir64_ptr, ct_scandir_real_fn, "scandir64");
   CT_PRIME(real_glob_ptr, ct_glob_real_fn, "glob");
