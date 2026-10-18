@@ -2,7 +2,7 @@
 
 |             |                                                            |
 | ----------- | ---------------------------------------------------------- |
-| Status      | open                                                       |
+| Status | in-progress (eli-pc:fix-windows-complete-suite-exposes-fixture-a) |
 | Recorded    | 2026-09-28                                                 |
 | Observed in | io-mon `73e4792`, Reprobuild `0d69de55`, Windows x64       |
 | Area        | portable tests, Windows injection tests, nested monitoring |
