@@ -100,6 +100,22 @@ just test-portable
 just test-platform
 ```
 
+### Check the dev shell itself
+
+```sh
+just test-dev-shell
+```
+
+These tests run `nix develop` themselves, so start them from a shell that has
+`nix` and `bash`; they are not part of `just test`.
+
+- `tests/test_dev_shell_writes_nothing_elsewhere.sh`: entering the dev shell
+  from another git repository writes no files or git hooks there.
+- `tests/test_dev_shell_nimble_runs_tasks.sh`: the dev shell's `nimble` runs a
+  package task. Stock nixpkgs nimble 0.20.1 crashes with SIGSEGV on Darwin
+  before running any task, because it passes a system LibreSSL TLS method to
+  Nix OpenSSL 3; `flake.nix` builds it with `-d:sslVersion=3`.
+
 ---
 
 ## 4. Memory safety: the sanitizer arm

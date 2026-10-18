@@ -56,10 +56,13 @@ format-nix:
 alias t := test
 alias fmt := format
 
-# Entering the dev shell from another git repository must write nothing there.
-# Runs `nix develop`, so it is not part of the in-shell test recipes.
+# Dev-shell properties: entering the shell from another git repository writes
+# nothing there, and the shell's `nimble` runs a package task instead of
+# crashing in its TLS setup (Darwin). Both run `nix develop`, so they are not
+# part of the in-shell test recipes.
 test-dev-shell:
     bash tests/test_dev_shell_writes_nothing_elsewhere.sh
+    bash tests/test_dev_shell_nimble_runs_tasks.sh
 
 # Documentation-site recipes (delegating to docs/site)
 dev-docs *args:
