@@ -19,7 +19,7 @@
       flake = false;
     };
     shm-queue-src = {
-      url = "github:metacraft-labs/nim-shm-queue/02f442ac12ce2587d9c053c527041097af38609f";
+      url = "github:metacraft-labs/nim-shm-queue/a3564c13e0b7d0c6a092c19c998cd3faee5ce20a";
       flake = false;
     };
     shm-gset-src = {

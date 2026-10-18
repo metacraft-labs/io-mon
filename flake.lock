@@ -3953,11 +3953,9 @@
         "vscode-server": "vscode-server_2"
       },
       "locked": {
-        "lastModified": 1791500872,
-        "narHash": "sha256-7mVUoFnyrBsdT7uJqEXIaRUPOESwFp+aRznQRGgEd4o=",
         "owner": "metacraft-labs",
         "repo": "devops-modules",
-        "rev": "073f57599af78eef3afbcb72c78555a78612311c",
+        "rev": "57398883e91b0ddae96770edbbf0bda6e8ec5d5d",
         "type": "github"
       },
       "original": {
@@ -4899,17 +4897,17 @@
     "shm-queue-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1790426264,
-        "narHash": "sha256-xR/SAr44PknBCOFS+jRapVCP3VGo6/ZY+Hz56DFmyQM=",
+        "lastModified": 1790569352,
+        "narHash": "sha256-vsqb2Ibe+4VqVug6oGJVZqX4d+z4oOY0oWZMHKc2pLk=",
         "owner": "metacraft-labs",
         "repo": "nim-shm-queue",
-        "rev": "02f442ac12ce2587d9c053c527041097af38609f",
+        "rev": "a3564c13e0b7d0c6a092c19c998cd3faee5ce20a",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
         "repo": "nim-shm-queue",
-        "rev": "02f442ac12ce2587d9c053c527041097af38609f",
+        "rev": "a3564c13e0b7d0c6a092c19c998cd3faee5ce20a",
         "type": "github"
       }
     },
