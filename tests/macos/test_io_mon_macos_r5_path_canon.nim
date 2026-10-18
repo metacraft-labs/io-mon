@@ -187,27 +187,38 @@ suite "io-mon macOS R5 P1 path canonicalisation (ENOENT / failed-open, live)":
     # --- (a) relative ENOENT stat is now FULLY ANCHORED -----------------------
 
     test "(a) ENOENT stat of a relative path after chdir is anchored + firmlinked":
-      # `chdir(state); stat("nope.h")` recorded a bare unanchored `path=nope.h`. The
-      # lexical companion now anchors it against the cwd AND firmlink-resolves it, to
-      # the SAME directory spelling F_GETPATH gives for an EXISTENT sibling opened in
-      # the same run (there.txt) — so absent and present key identically.
+      # `chdir(state); stat("nope.h")` recorded a bare unanchored `path=nope.h`.
+      # The shim now anchors every relative path on the cwd at call time
+      # (anchoredPath), naming that cwd by its F_GETPATH spelling — which is
+      # already firmlink-resolved — so the as-passed probe record itself is the
+      # canonical absolute path. The lexical companion would repeat it
+      # verbatim and is therefore not emitted. Either way the absent probe must
+      # land in the SAME directory spelling F_GETPATH gives for an EXISTENT
+      # sibling opened in the same run (there.txt), so absent and present key
+      # identically.
       let state = tmpStateDir("rel")
       writeFile(state / "there.txt", "present\n")
       let cap = runProbe(shim, prober,
         @["chdir:" & state, "stat:nope.h", "open:there.txt"], "/")
       let dep = cap.dep
 
-      # raw record preserved (round-4 negative dep still caught)
+      # The negative dependency is caught, and no record of it is relative.
       check rawAbsentProbe(dep, "nope.h")
-
-      let anchored = lexicalAbsentProbe(dep, "nope.h")
-      check anchored.len > 0                       # a canonical companion exists
-      check anchored.startsWith("/")               # ABSOLUTE, not the bare leaf
+      var anchored = ""
+      for r in dep.records:
+        if r.observationKind == moPathProbe and r.probeResult == prAbsent and
+            r.path.endsWith("nope.h"):
+          check r.path.startsWith("/")
+          anchored = r.path
       check anchored.startsWith("/private/tmp/")   # firmlink-resolved
       check anchored.endsWith("/nope.h")
 
       # It anchors to the SAME directory F_GETPATH yields for an existent sibling.
-      let existentDir = existentOpenTarget(dep, "there.txt")
+      var existentDir = ""
+      for r in dep.records:
+        if r.kind == mrFileOpen and r.result >= 0 and
+            r.path.endsWith("/there.txt"):
+          existentDir = r.path
       check existentDir.startsWith("/private/tmp/")
       check anchored.parentDir == existentDir.parentDir
       removeDir(state)

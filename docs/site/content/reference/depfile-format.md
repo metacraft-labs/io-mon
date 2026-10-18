@@ -73,6 +73,8 @@ type
 All recorded file paths are normalized and canonicalized:
 
 - Symlinks are resolved to their target destinations.
-- Relative paths are converted to absolute paths using the process's working directory at the moment of the call.
+- Relative paths are converted to absolute paths using the process's working directory at the moment of the call
+  (or, for a `*at` call, the directory its descriptor names). On macOS, when that directory cannot be named, the path is
+  kept as passed and the capture is graded incomplete, so a consumer never anchors it on a guessed directory.
 - Redundant `/./` and `/../` segments are removed.
 - On Windows, paths are normalized to uppercase drive letters and backslash delimiters.

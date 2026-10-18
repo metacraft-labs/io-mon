@@ -653,6 +653,108 @@ int repro_macos_canonical_path(char *path, void *out, size_t outlen) {
 }
 
 /*
+ * The directory a RELATIVE path resolves against at this moment: the cwd for
+ * AT_FDCWD (the calling thread's own cwd if it set one with pthread_chdir_np,
+ * else the process cwd), otherwise the directory open on `dirfd`. Writes its
+ * F_GETPATH spelling into `base` (>= MAXPATHLEN bytes) and returns 1, or
+ * returns 0 when it cannot be named (a cwd that cannot be opened -- EMFILE, a
+ * removed directory --, a dirfd that is not open).
+ *
+ * This is libc getcwd()'s own fast path (open(".") + fcntl(F_GETPATH)), issued
+ * as RAW syscalls. getcwd() itself is not safe here: its fallback walks the
+ * tree with stat()/opendir(), which the shim hooks, and a hook calling this to
+ * anchor a relative path would re-enter itself. The raw open never reaches the
+ * open hook, so the transient fd is neither recorded nor entered in the fd
+ * table, and nothing here allocates.
+ */
+static int repro_macos_anchor_base(int dirfd, char *base) {
+  if (dirfd != AT_FDCWD)
+    return REPRO_RAW_SYSCALL3(SYS_fcntl, dirfd, F_GETPATH, base) == 0;
+  int fd = (int)REPRO_RAW_SYSCALL3(SYS_open, ".",
+                                   O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+#ifdef O_SEARCH
+  /* A cwd the process may search but not read (mode --x) still resolves. */
+  if (fd < 0)
+    fd = (int)REPRO_RAW_SYSCALL3(SYS_open, ".", O_SEARCH | O_CLOEXEC, 0);
+#endif
+  if (fd < 0) return 0;
+  long r = REPRO_RAW_SYSCALL3(SYS_fcntl, fd, F_GETPATH, base);
+  (void)REPRO_RAW_SYSCALL1(SYS_close, fd);
+  return r == 0;
+}
+
+/*
+ * The path a hooked call named, made ABSOLUTE as the kernel resolved it at the
+ * time of the call -- the macOS counterpart of the Linux shim's `pathForAt`.
+ * Spec: reprobuild-pm/spec/Monitor-Hook-Shim.md § CWD And Path Context ("CWD
+ * tracking is required for relative path normalization").
+ *
+ * A relative path is joined onto the directory it resolved against
+ * (repro_macos_anchor_base: the cwd for AT_FDCWD, else `dirfd`'s directory);
+ * an absolute path is taken as is (dirfd is ignored, as the kernel does).
+ * While joining, "//" and "." are squeezed out, and each LEADING ".." of the
+ * relative part removes one component of the base. That is exact, not merely
+ * lexical: the base is an F_GETPATH spelling, which names a real directory
+ * with no symlink in it, so its ".." is its parent. A ".." that FOLLOWS a
+ * component of the caller's path is kept: `link/../x` names a file beside the
+ * link's TARGET, which only realpath may decide (the realpath companion of a
+ * successful call is computed from this string). So `git -C ../repo` opening
+ * `../repo/.git/HEAD` from `<root>/work` is recorded `<root>/repo/.git/HEAD`.
+ *
+ * Without this the caller's relative string was recorded verbatim, and a
+ * consumer could only re-anchor it on a cwd the process might already have
+ * left (reprobuild-pm issue 2026-10-18,
+ * "macos-shim-records-relative-paths-the-engine-anchors-on-the-action-cwd").
+ *
+ * The result is built directly in `out` (>= MAXPATHLEN bytes; a larger buffer
+ * admits a deep cwd plus a long relative path), so a hook pays no stack
+ * buffer for it. No firmlink rewrite is applied to an ABSOLUTE input: this is
+ * the as-passed record; the canonical companions (F_GETPATH, realpath, the
+ * lexical form below) carry the canonical spelling.
+ *
+ * Returns 1 + the absolute path, or 0 when the anchor directory cannot be
+ * named or the result does not fit -- the caller must then treat the record
+ * as unanchored, never guess a directory.
+ */
+int repro_macos_anchored_path(int dirfd, char *path, void *out,
+                              size_t outlen) {
+  if (!path || !out || outlen < 1024 || path[0] == '\0') return 0;
+  char *o = (char *)out;
+  size_t n = 0;
+  if (path[0] != '/') {
+    if (!repro_macos_anchor_base(dirfd, o)) return 0;
+    n = strnlen(o, outlen);
+    if (n == 0 || n >= outlen || o[0] != '/') return 0;
+    if (n == 1) n = 0;                   /* base "/": avoid a "//" join */
+  }
+  int leading = path[0] != '/';          /* still in the relative part's ".." run */
+  const char *s = path;
+  while (*s) {
+    while (*s == '/') s++;
+    if (!*s) break;
+    const char *c = s;
+    size_t clen = 0;
+    while (c[clen] && c[clen] != '/') clen++;
+    s = c + clen;
+    if (clen == 1 && c[0] == '.') continue;          /* "." -- drop */
+    if (leading && clen == 2 && c[0] == '.' && c[1] == '.') {
+      /* pop one base component; ".." at "/" stays at "/" (as the kernel does) */
+      while (n > 0 && o[n - 1] != '/') n--;
+      if (n > 0) n--;
+      continue;
+    }
+    leading = 0;
+    if (n + 1 + clen + 1 > outlen) return 0;
+    o[n++] = '/';
+    memcpy(o + n, c, clen);
+    n += clen;
+  }
+  if (n == 0) o[n++] = '/';              /* everything collapsed to root */
+  o[n] = '\0';
+  return 1;
+}
+
+/*
  * ROUND-5 P1 (path fidelity, negative-existence deps): LEXICAL canonicalisation
  * for a path recorded WITHOUT a live fd — the ENOENT stat/lstat/access/fstatat
  * probe path and the failed-open path. For an EXISTENT file the shim canonicalises
@@ -661,33 +763,29 @@ int repro_macos_canonical_path(char *path, void *out, size_t outlen) {
  * no fd and realpath(3) would itself ENOENT, so we reproduce the SAME spelling
  * purely lexically, matching what F_GETPATH would have produced once the file
  * appears:
- *   1. anchor a RELATIVE path against the process cwd (getcwd), so a bare
- *      `stat("nope.h")` after chdir("/build") is anchored, not left unresolvable;
+ *   1. anchor a RELATIVE path on the cwd at call time (repro_macos_anchored_path;
+ *      the hooks already pass anchored paths, so this is a fallback);
  *   2. collapse "." segments, resolve ".." lexically, and squeeze "//";
  *   3. resolve the standard macOS firmlink prefixes /tmp,/var,/etc -> /private/...
  *      (the ones a build actually hits, incl. $TMPDIR=/var/folders/...). These are
  *      the top-level synthetic firmlinks in /usr/share/firmlinks; hardcoding the
  *      three a build touches keeps this filesystem-free.
- * This is a PURELY LEXICAL transform + cwd anchor: it NEVER touches the filesystem
- * (no realpath, no lstat), so unlike realpath it cannot ENOENT and is cheap enough
- * for the ENOENT probe hot path. getcwd is not a hooked function (no reentrancy)
- * and, given a caller buffer, does not allocate. Returns 1 and fills `out`
- * (>= 1024 bytes) on success, 0 otherwise.
+ * Apart from naming the cwd it NEVER touches the filesystem (no realpath, no
+ * lstat), so unlike realpath it cannot ENOENT and is cheap enough for the ENOENT
+ * probe hot path. Returns 1 and fills `out` (>= 1024 bytes) on success, 0
+ * otherwise.
  */
 int repro_macos_lexical_canonical_path(char *path, void *out, size_t outlen) {
   if (!path || !out || outlen < 1024) return 0;
   if (path[0] == '\0') return 0;
-  /* Step 1: build an ABSOLUTE path (anchor relatives against the cwd). */
+  /* Step 1: build an ABSOLUTE path. */
   char absbuf[1024]; /* MAXPATHLEN */
   if (path[0] == '/') {
     size_t pl = strlen(path);
     if (pl + 1 > sizeof absbuf) return 0;
     memcpy(absbuf, path, pl + 1);
-  } else {
-    char cwd[1024];
-    if (getcwd(cwd, sizeof cwd) == NULL) return 0;
-    int n = snprintf(absbuf, sizeof absbuf, "%s/%s", cwd, path);
-    if (n < 0 || (size_t)n >= sizeof absbuf) return 0;
+  } else if (!repro_macos_anchored_path(AT_FDCWD, path, absbuf, sizeof absbuf)) {
+    return 0;
   }
   /* Step 2: collapse lexically into `norm`. comp_off[] records the start offset
    * (the leading '/') of each KEPT component so ".." can pop the previous one. */
@@ -721,10 +819,11 @@ int repro_macos_lexical_canonical_path(char *path, void *out, size_t outlen) {
   norm[ni] = '\0';
   /* Step 3: apply the macOS firmlink prefix (/tmp,/var,/etc -> /private/<same>).
    * norm is now clean+absolute, so a component-boundary prefix test is exact. */
-  static const char *firmlinks[3] = { "/tmp", "/var", "/etc" };
+  static const char *firmlink_prefixes[3] = { "/tmp", "/var", "/etc" };
   for (int i = 0; i < 3; i++) {
-    size_t l = strlen(firmlinks[i]);
-    if (strncmp(norm, firmlinks[i], l) == 0 && (norm[l] == '/' || norm[l] == '\0')) {
+    size_t l = strlen(firmlink_prefixes[i]);
+    if (strncmp(norm, firmlink_prefixes[i], l) == 0 &&
+        (norm[l] == '/' || norm[l] == '\0')) {
       char tmp[1024];
       int n = snprintf(tmp, sizeof tmp, "/private%s", norm);
       if (n < 0 || (size_t)n >= sizeof tmp) return 0;
@@ -2995,6 +3094,20 @@ proc ct_macos_lexical_canonical_path*(path: cstring; outBuf: pointer;
   proc lexCanon(path: cstring; outBuf: pointer; outLen: csize_t): cint
     {.importc: "repro_macos_lexical_canonical_path", cdecl.}
   lexCanon(path, outBuf, outLen)
+
+proc ct_macos_anchored_path*(dirfd: cint; path: cstring; outBuf: pointer;
+    outLen: csize_t): cint =
+  ## The as-passed `path` made ABSOLUTE against the directory it resolved
+  ## against at call time — the cwd for AT_FDCWD, else `dirfd`'s directory —
+  ## with "//" and "." squeezed, LEADING ".." applied to that directory, any
+  ## later ".." kept (symlink-sensitive) and NO firmlink rewrite (the canonical
+  ## companions keep that job). Raw syscalls only: no hook re-entry, no
+  ## allocation, no stack buffer (built in `outBuf`, >= 1024 bytes). Returns
+  ## non-zero + the path on success; 0 when the anchor cannot be named or the
+  ## result does not fit.
+  proc anchored(dirfd: cint; path: cstring; outBuf: pointer;
+      outLen: csize_t): cint {.importc: "repro_macos_anchored_path", cdecl.}
+  anchored(dirfd, path, outBuf, outLen)
 
 proc ct_macos_spawnattr_has_setexec*(attrp: pointer): bool =
   ## True if the spawn attributes set POSIX_SPAWN_SETEXEC (break #2). A SETEXEC

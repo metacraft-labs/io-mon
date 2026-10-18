@@ -80,7 +80,7 @@ after a task exception.
 `repro build .#test-monitor-isolation --write-report=build/monitor-isolation-repeat.json`
 reruns the programs whose fixture must own its monitor environment. Their
 compilation stays monitored and their execution stays uncached. CI requires
-all selected programs to launch and succeed on the repeat: 47 on macOS, nine
+all selected programs to launch and succeed on the repeat: 48 on macOS, nine
 on Linux and eight on Windows. Update that explicit inventory when adding an
 isolated program; keep the complete report among failure artifacts.
 
