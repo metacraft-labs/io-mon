@@ -820,12 +820,12 @@ proc lexicalCanonicalPathFor(rawPath: string): string {.raises: [].} =
   ## two key strings depending on existence ⇒ a realpath-keying consumer could not
   ## match ⇒ a false cache hit once the absent file appears (research/.../pathfidelity).
   ##
-  ## This anchors relatives against the cwd, resolves the /tmp,/var,/etc firmlinks,
-  ## and collapses "."/".."/"//" — purely lexically (no filesystem access), so it is
-  ## safe and cheap on the ENOENT probe storm. Returns "" when unresolvable OR already
-  ## canonical (== rawPath), so a clean absolute probe (the common case) emits NO
-  ## companion. NOT memoised: the lexical pass is far cheaper than realpath and the
-  ## cwd can change under us (chdir), which a memo keyed on the raw path would miss.
+  ## The hooks already anchor relatives. Resolve the prefix through the last
+  ## ".." with a directory fd (a link changes its meaning), then normalise the suffix
+  ## and the /tmp,/var,/etc prefixes. Omit the companion when that prefix cannot
+  ## be resolved; the raw failed observation remains. Paths without ".." keep
+  ## the filesystem-free lexical fast path. Never memoised: a link may change
+  ## between failed probes, including from dangling to resolvable.
   ##
   ## Like `canonicalPathFor`, it refuses a RELATIVE input: the hooks pass
   ## anchored paths, and a path still relative is one whose directory could not
@@ -1669,7 +1669,7 @@ proc recordFailedOpenCanonical(callResult: cint; path: cstring;
   ## the RAW failed open (result < 0), but — with no fd — the F_GETPATH companion
   ## (recordCanonicalTarget, live-fd only) never runs, so the raw string is recorded
   ## verbatim: unanchored (relative) or un-firmlinked (/tmp vs /private/tmp). We add a
-  ## LEXICAL-canonical companion matching the F_GETPATH spelling the file would get
+  ## canonical companion matching the F_GETPATH spelling the file would get
   ## once it exists, so a realpath-keying consumer matches the SAME key across the
   ## absent-open → present-read transition. The hook passes the path already
   ## anchored (anchoredPath: on the cwd, or on the dirfd's directory for openat).
@@ -1729,8 +1729,10 @@ proc recordCanonicalPathProbe(callResult: cint; path: cstring; mode: cint;
   ##
   ## ROUND-5 P1 — a FAILED probe (ENOENT: stat/lstat/access of a MISSING file — a
   ## real negative-existence dependency, universal in compiler include-path search)
-  ## has no fd and realpath would itself ENOENT, so we canonicalise it LEXICALLY
-  ## (cwd anchor + firmlink + dot-collapse) to the SAME spelling F_GETPATH yields for
+  ## has no fd and realpath would itself ENOENT, so lexicalCanonicalPathFor
+  ## canonicalises the missing path
+  ## (firmlink + dot-collapse, after resolving the directory through any "..")
+  ## to the SAME spelling F_GETPATH yields for
   ## the file once it appears. Without this the raw string was recorded verbatim —
   ## unanchored (relative) or un-firmlinked (/tmp vs /private/tmp) — so the absent
   ## probe and a later existent read keyed differently ⇒ false cache hit. Tagged

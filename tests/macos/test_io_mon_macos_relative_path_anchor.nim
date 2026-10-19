@@ -261,6 +261,84 @@ suite "macOS shim anchors relative paths on the cwd at call time":
         if rec.path.startsWith(oldDir & "/"):
           check rec.path == oldDir / "a-before.txt"
 
+    test "negative companions resolve symlinks before dotdot, or are omitted":
+      # Real filesystem operations, not a normalizer-only oracle: require the
+      # raw failed call AND a canonical negative key that a later open shares.
+      # The driver also requires the real calls to return -1 with ENOENT or
+      # ENOTDIR as appropriate: internal resolution must preserve caller errno.
+      # Exercise each mechanism independently as well as production's pair.
+      createDir(dirDir / "sub" / "inner")
+      createSymlink(dirDir / "sub" / "inner", dirDir / "sub" / "again")
+      createSymlink(root / "never-created", newDir / "dangling")
+      writeFile(newDir / "plain-file", "not a directory")
+      for backend in ["interpose", "bodypatch", "both"]:
+        var absentOps = @["chdir:" & newDir, "dirfd:" & newDir]
+        var leaves: seq[string]
+        var spellings: seq[string]
+        for op in ["stat", "open", "openatd", "fstatatd"]:
+          # Interpose alone cannot see libc's fstatat entry on this host.
+          if backend == "interpose" and op == "fstatatd": continue
+          for form in ["relative", "absolute", "repeated"]:
+            let leaf = "negative-" & backend & "-" & op & "-" & form
+            let tail = if form == "repeated": "sl/again/../../" & leaf
+                       else: "sl/../" & leaf
+            let spelling = if form == "absolute": newDir & "/" & tail
+                           else: tail
+            leaves.add leaf
+            spellings.add newDir & "/" & tail
+            absentOps.add op & "!ENOENT:" & spelling
+        let absent = runMonitored(shim, fixture, absentOps, oldDir, root,
+          backend, "negative-" & backend)
+        for i, leaf in leaves:
+          var rawSeen, canonicalSeen: bool
+          for rec in absent.recordsNaming(leaf):
+            checkpoint(backend & " absent " & rec.path & " " & rec.detail)
+            check rec.result < 0
+            check rec.path != newDir / leaf
+            if rec.path == spellings[i]: rawSeen = true
+            if rec.path == dirDir / leaf:
+              canonicalSeen = true
+              check "canon=lexical" in rec.detail
+          check rawSeen
+          check canonicalSeen
+
+        var presentOps = @["chdir:" & newDir]
+        for leaf in leaves:
+          writeFile(dirDir / leaf, "now present")
+          presentOps.add "open:sl/../" & leaf
+        let present = runMonitored(shim, fixture, presentOps, oldDir, root,
+          backend, "present-" & backend)
+        for leaf in leaves:
+          var canonicalSeen = false
+          for rec in present.recordsNaming(leaf):
+            check rec.path != newDir / leaf
+            if rec.path == dirDir / leaf and rec.kind == mrFileOpen:
+              check rec.result >= 0
+              canonicalSeen = true
+          check canonicalSeen
+
+        # Missing, dangling and non-directory prefixes cannot be walked through
+        # '..'. A lexical guess would invent a negative probe on new/<leaf>.
+        var failedOps = @["chdir:" & newDir]
+        var failedPaths: seq[string]
+        for prefix in ["missing-prefix", "dangling", "plain-file"]:
+          for op in ["stat", "open"]:
+            let leaf = "unresolvable-" & backend & "-" & prefix & "-" & op
+            let tail = prefix & "/../" & leaf
+            failedPaths.add newDir & "/" & tail
+            let expectedErrno = if prefix == "plain-file": "ENOTDIR"
+                                else: "ENOENT"
+            failedOps.add op & "!" & expectedErrno & ":" & tail
+        let failed = runMonitored(shim, fixture, failedOps, oldDir, root,
+          backend, "unresolvable-" & backend)
+        for path in failedPaths:
+          let recs = failed.recordsNaming(path.extractFilename)
+          check recs.len > 0
+          for rec in recs:
+            check rec.path == path
+            check rec.result < 0
+            check "canon=lexical" notin rec.detail
+
     test "a relative path whose directory cannot be named is not guessed, " &
         "and downgrades the capture":
       # 6 x 200-byte components take the cwd past MAXPATHLEN (1024), so

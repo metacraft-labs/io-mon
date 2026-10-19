@@ -7,6 +7,9 @@
  * a failing call is part of the experiment (a negative-existence probe), so
  * only a malformed argument or an unusable dirfd makes the driver fail.
  *
+ * Append !ENOENT or !ENOTDIR to an op to require result -1 and that errno.
+ * The errno snapshot is taken before driver bookkeeping (including close).
+ *
  *   chdir:D       chdir(D)
  *   dirfd:D       open D as the directory fd used by the *at "d" ops below
  *   open:P        open(P, O_RDONLY)
@@ -32,6 +35,7 @@
  * driver does nothing and exits 0. A failed child counts as a failed op.
  */
 #include <dirent.h>
+#include <errno.h>
 #include <spawn.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -70,9 +74,21 @@ int main(int argc, char **argv) {
     }
     *sep = '\0';
     const char *op = argv[i];
+    int expected_errno = 0;
+    char *expect = strchr(argv[i], '!');
+    if (expect) {
+      *expect++ = '\0';
+      if (!strcmp(expect, "ENOENT")) expected_errno = ENOENT;
+      else if (!strcmp(expect, "ENOTDIR")) expected_errno = ENOTDIR;
+      else {
+        fprintf(stderr, "unknown expected errno %s\n", expect);
+        return 64;
+      }
+    }
     char *p = sep + 1;
     struct stat st;
     long r = -1;
+    int operation_errno = -1;
     if (!strcmp(op, "chdir")) {
       r = chdir(p);
     } else if (!strcmp(op, "dirfd")) {
@@ -91,6 +107,7 @@ int main(int argc, char **argv) {
         fd = openat(AT_FDCWD, p, O_RDONLY);
       else
         fd = openat(dfd, p, O_RDONLY);
+      operation_errno = errno;
       r = fd;
       if (fd >= 0) close(fd);
     } else if (!strcmp(op, "create")) {
@@ -164,7 +181,13 @@ int main(int argc, char **argv) {
       fprintf(stderr, "unknown op %s\n", op);
       return 64;
     }
-    fprintf(stderr, "%s(%s)=%ld\n", op, p, r);
+    if (operation_errno < 0) operation_errno = errno;
+    if (expected_errno && (r != -1 || operation_errno != expected_errno)) {
+      fprintf(stderr, "%s(%s): result=%ld errno=%d, expected -1 errno=%d\n",
+              op, p, r, operation_errno, expected_errno);
+      return 66;
+    }
+    fprintf(stderr, "%s(%s)=%ld errno=%d\n", op, p, r, operation_errno);
   }
   if (dfd >= 0) close(dfd);
   return 0;

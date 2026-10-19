@@ -760,20 +760,17 @@ int repro_macos_anchored_path(int dirfd, char *path, void *out,
  * probe path and the failed-open path. For an EXISTENT file the shim canonicalises
  * via fcntl(F_GETPATH) (repro_macos_fd_real_path), which yields an ABSOLUTE,
  * firmlink-resolved path (e.g. /tmp/x -> /private/tmp/x). A NON-existent target has
- * no fd and realpath(3) would itself ENOENT, so we reproduce the SAME spelling
- * purely lexically, matching what F_GETPATH would have produced once the file
- * appears:
- *   1. anchor a RELATIVE path on the cwd at call time (repro_macos_anchored_path;
- *      the hooks already pass anchored paths, so this is a fallback);
- *   2. collapse "." segments, resolve ".." lexically, and squeeze "//";
- *   3. resolve the standard macOS firmlink prefixes /tmp,/var,/etc -> /private/...
- *      (the ones a build actually hits, incl. $TMPDIR=/var/folders/...). These are
- *      the top-level synthetic firmlinks in /usr/share/firmlinks; hardcoding the
- *      three a build touches keeps this filesystem-free.
- * Apart from naming the cwd it NEVER touches the filesystem (no realpath, no
- * lstat), so unlike realpath it cannot ENOENT and is cheap enough for the ENOENT
- * probe hot path. Returns 1 and fills `out` (>= 1024 bytes) on success, 0
- * otherwise.
+ * no fd and realpath(3) would itself ENOENT. Keep the filesystem-free lexical
+ * fast path except when ".." occurs: resolve THROUGH the last ".." with
+ * a directory fd first, since a symlink changes the directory ".." names. An
+ * absent, dangling or non-directory prefix cannot be resolved, so emit no
+ * companion rather than inventing a negative dependency on another path.
+ * The remaining suffix has no ".." and can be joined and normalised lexically.
+ * Standard macOS /tmp,/var,/etc prefixes map to /private/<same> as before.
+ *
+ * Raw open/fcntl/close avoid hooked libc calls and preserve errno.
+ * Returns 1 + a canonical path in out (>= 1024 bytes), or 0 on failure. The
+ * existing as-passed record is independent of this optional companion.
  */
 int repro_macos_lexical_canonical_path(char *path, void *out, size_t outlen) {
   if (!path || !out || outlen < 1024) return 0;
@@ -787,11 +784,47 @@ int repro_macos_lexical_canonical_path(char *path, void *out, size_t outlen) {
   } else if (!repro_macos_anchored_path(AT_FDCWD, path, absbuf, sizeof absbuf)) {
     return 0;
   }
-  /* Step 2: collapse lexically into `norm`. comp_off[] records the start offset
-   * (the leading '/') of each KEPT component so ".." can pop the previous one. */
   char norm[1024];
-  size_t comp_off[256];
-  size_t ncomp = 0;
+  /* Resolve the prefix INCLUDING the last "..". Resolving only the component
+   * before it and popping text would accept a regular-file/.. prefix, which
+   * the kernel rejects (Darwin realpath accepts it too). A raw directory open
+   * enforces kernel traversal; F_GETPATH supplies its canonical spelling.
+   * Do not memoise: a link can be retargeted between calls.
+   * Reuse the two existing buffers so this adds no MAXPATHLEN stack buffer. */
+  char *last_dotdot_end = NULL;
+  for (char *c = absbuf; *c;) {
+    while (*c == '/') c++;
+    if (!*c) break;
+    char *end = c;
+    while (*end && *end != '/') end++;
+    if (end - c == 2 && c[0] == '.' && c[1] == '.')
+      last_dotdot_end = end;
+    c = end;
+  }
+  if (last_dotdot_end) {
+    char saved = *last_dotdot_end;
+    *last_dotdot_end = '\0';
+    int saved_errno = errno;
+    int fd = (int)REPRO_RAW_SYSCALL3(SYS_open, absbuf,
+                                     O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+#ifdef O_SEARCH
+    if (fd < 0)
+      fd = (int)REPRO_RAW_SYSCALL3(SYS_open, absbuf,
+                                  O_SEARCH | O_DIRECTORY | O_CLOEXEC, 0);
+#endif
+    int resolved = fd >= 0 && repro_macos_anchor_base(fd, norm);
+    if (fd >= 0) (void)REPRO_RAW_SYSCALL1(SYS_close, fd);
+    errno = saved_errno;
+    *last_dotdot_end = saved;
+    if (!resolved) return 0;
+    size_t prefix_len = strlen(norm);
+    size_t suffix_len = strlen(last_dotdot_end);
+    if (prefix_len + suffix_len + 1 > sizeof absbuf) return 0;
+    /* memmove the suffix first: it still points inside absbuf. */
+    memmove(absbuf + prefix_len, last_dotdot_end, suffix_len + 1);
+    memcpy(absbuf, norm, prefix_len);
+  }
+  /* Step 2: collapse the remaining dot/separator segments into norm. */
   size_t ni = 0;
   const char *s = absbuf;
   while (*s) {
@@ -803,14 +836,8 @@ int repro_macos_lexical_canonical_path(char *path, void *out, size_t outlen) {
     s = c + clen;
     if (clen == 1 && c[0] == '.') {
       continue;                          /* "." — drop */
-    } else if (clen == 2 && c[0] == '.' && c[1] == '.') {
-      if (ncomp > 0) { ncomp--; ni = comp_off[ncomp]; }
-      /* at root, a leading ".." is a no-op (matches realpath/F_GETPATH) */
-      continue;
     }
-    if (ncomp >= 256) return 0;
     if (ni + 1 + clen + 1 > sizeof norm) return 0;
-    comp_off[ncomp++] = ni;
     norm[ni++] = '/';
     memcpy(norm + ni, c, clen);
     ni += clen;
@@ -3083,14 +3110,12 @@ proc ct_macos_canonical_path*(path: cstring; outBuf: pointer;
 
 proc ct_macos_lexical_canonical_path*(path: cstring; outBuf: pointer;
     outLen: csize_t): cint =
-  ## ROUND-5 P1 — purely LEXICAL canonicalisation (cwd anchor for relatives +
-  ## "."/".."/"//" collapse + /tmp,/var,/etc firmlink prefix) for a path recorded
-  ## WITHOUT a live fd (the ENOENT stat/lstat/access/fstatat probe and the failed
-  ## open). Unlike ct_macos_canonical_path it NEVER touches the filesystem (no
-  ## realpath/lstat), so it cannot ENOENT and needs NO shim muting — safe and cheap
-  ## on the negative-existence probe hot path. Reproduces the spelling F_GETPATH
-  ## would yield for the same file once it exists (symlink-free common case).
-  ## Returns non-zero + canonical path on success.
+  ## Canonical companion for failed probes/opens. Paths containing ".." use
+  ## a raw directory open through the last ".." and F_GETPATH before
+  ## normalising the remaining suffix;
+  ## an unresolvable prefix returns zero. Other paths retain the cheap lexical
+  ## dot/separator and firmlink pass. Raw syscalls avoid recursive capture and
+  ## preserve errno; no shim muting is required.
   proc lexCanon(path: cstring; outBuf: pointer; outLen: csize_t): cint
     {.importc: "repro_macos_lexical_canonical_path", cdecl.}
   lexCanon(path, outBuf, outLen)
