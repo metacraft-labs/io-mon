@@ -773,7 +773,12 @@ proc canonicalPathFor(rawPath: string): string {.raises: [].} =
   ## then O(1); the first touch of a distinct successful path pays one realpath.
   ## (Failed/ENOENT probes never reach here — see recordCanonicalPathProbe — so the
   ## configure/find_program probe storm, dominated by absent paths, costs nothing.)
-  if rawPath.len == 0:
+  # A RELATIVE path reaches here only when the hook could not anchor it
+  # (anchoredPath has already downgraded the capture). realpath would resolve
+  # it against the cwd NOW — the wrong directory for a dirfd-relative call —
+  # and the memo, keyed on the raw string, would serve that answer after any
+  # later chdir. Name nothing rather than guess.
+  if rawPath.len == 0 or rawPath[0] != '/':
     return ""
   # Cache representation: the stored value is the realpath when it DIFFERS from the
   # raw path, otherwise `rawPath` itself — a self-sentinel meaning "already
@@ -821,7 +826,12 @@ proc lexicalCanonicalPathFor(rawPath: string): string {.raises: [].} =
   ## canonical (== rawPath), so a clean absolute probe (the common case) emits NO
   ## companion. NOT memoised: the lexical pass is far cheaper than realpath and the
   ## cwd can change under us (chdir), which a memo keyed on the raw path would miss.
-  if rawPath.len == 0:
+  ##
+  ## Like `canonicalPathFor`, it refuses a RELATIVE input: the hooks pass
+  ## anchored paths, and a path still relative is one whose directory could not
+  ## be named (anchoredPath) — anchoring it on the cwd now could name the wrong
+  ## directory (a dirfd-relative call).
+  if rawPath.len == 0 or rawPath[0] != '/':
     return ""
   var buf: array[1024, char]
   if ct_macos_lexical_canonical_path(cstring(rawPath), addr buf[0],
@@ -829,6 +839,74 @@ proc lexicalCanonicalPathFor(rawPath: string): string {.raises: [].} =
     return ""
   let canonical = $cast[cstring](addr buf[0])
   if canonical.len == 0 or canonical == rawPath: "" else: canonical
+
+var unanchoredPathFlagged {.threadvar.}: bool
+  ## Once-per-thread guard for the unanchored-path downgrade in `anchoredPath`
+  ## (one event-loss already forces mcIncomplete; repeating it only grows the
+  ## depfile), as `rawSyscallFileOpFlagged` does for the syscall(2) hatch.
+
+proc anchoredPath(dirfd: cint; path: cstring): string {.raises: [].} =
+  ## The path a hooked call named, as every recorder must store it: ABSOLUTE,
+  ## anchored on the directory the kernel resolved it against AT THE TIME OF
+  ## THE CALL — the cwd for AT_FDCWD and the plain-path calls, else `dirfd`'s
+  ## directory — with "//" and "." squeezed out and leading ".." applied to
+  ## that directory (see `repro_macos_anchored_path` for why a later ".." is
+  ## kept). An absolute path is returned as is (no syscall), so the common case
+  ## costs nothing.
+  ##
+  ## Spec: reprobuild-pm/spec/Monitor-Hook-Shim.md § CWD And Path Context
+  ## ("CWD tracking is required for relative path normalization"); the Linux
+  ## shim does the same in `pathForAt`. A relative string recorded verbatim
+  ## can only be re-anchored later on a cwd the process may have LEFT: after
+  ## `git -C repo` chdir()s and opens `.git/HEAD`, a consumer joining that
+  ## onto the action's cwd keys on a phantom `<cwd>/.git/HEAD` (reprobuild-pm
+  ## issue 2026-10-18-macos-shim-records-relative-paths-the-engine-anchors-on-
+  ## the-action-cwd). It also keeps `canonicalPathFor`'s memo, keyed on the
+  ## raw string, from serving a realpath computed under an earlier cwd.
+  ##
+  ## No firmlink rewrite: this is the as-passed record. The canonical
+  ## companions (F_GETPATH, realpath, the lexical form) keep that job.
+  ##
+  ## FAIL-SAFE: when the anchor directory cannot be named (the cwd cannot be
+  ## opened — EMFILE, a removed directory —, a dirfd that is not open, or a
+  ## deep cwd plus a long relative path that does not fit) the record keeps
+  ## the caller's RELATIVE string, which no consumer can resolve correctly,
+  ## and the capture is downgraded with an event-loss (architecture.md: every
+  ## uncertainty downgrades to mcIncomplete). The canonical companions refuse
+  ## a relative input (`canonicalPathFor`, `lexicalCanonicalPathFor`), so no
+  ## record guesses a directory either.
+  if path == nil:
+    return ""
+  result = $path
+  if result.len == 0 or result[0] == '/':
+    return
+  # Twice MAXPATHLEN: the kernel limits the relative argument, not the cwd
+  # plus it. Built in place by the C helper, which needs no buffer of its own.
+  var buf: array[2048, char]
+  if ct_macos_anchored_path(dirfd, path, addr buf[0], csize_t(buf.len)) != 0:
+    result = $cast[cstring](addr buf[0])
+  elif not unanchoredPathFlagged:
+    unanchoredPathFlagged = true
+    var loss = baseRecord(mrEventLoss, moEventLoss)
+    loss.path = result
+    loss.detail = "relative path could not be anchored on its directory " &
+      "at call time (dirfd=" & $dirfd & "); its records cannot be resolved"
+    emitRecord(loss)
+
+proc anchoredExecPath(path: cstring; pathSearched: bool): string {.raises: [].} =
+  ## `anchoredPath` for an exec/spawn target. execve(2) and posix_spawn(2)
+  ## never search PATH: any relative name, a bare `tool` included, resolves
+  ## against the cwd, so it is anchored. Only a PATH-SEARCHING call
+  ## (`pathSearched`: posix_spawnp) given a name WITHOUT a slash looks the name
+  ## up on PATH instead, and that name is kept as spelled — anchoring it would
+  ## invent a `<cwd>/tool` the kernel never opened. (execvp and friends search
+  ## PATH inside libc and reach the execve hook with each candidate's full
+  ## path, so they need no case here.)
+  if path == nil:
+    return ""
+  result = $path
+  if not pathSearched or '/' in result:
+    result = anchoredPath(AtFdCwd, path)
 
 proc recordExternalContent(chan, role, path: string; fd: cint) {.raises: [].} =
   ## ROUND-3 S1 — emit one `mrExternalContent` describing a content-channel event.
@@ -974,14 +1052,18 @@ proc recordPathProbe(callResult: cint; path: cstring; mode: cint; detail: string
     record.detail = detail
   emitRecord(record)
 
-proc recordSpawn(childPid: PidT; callResult: cint; path: cstring; detail: string) {.raises: [].} =
+proc recordSpawn(childPid: PidT; callResult: cint; path: cstring; detail: string;
+    pathSearched = false) {.raises: [].} =
   ## Record an mrProcessSpawn (moExecute) observation for fork/posix_spawn(p).
   ## Single source of truth for the spawn record body.
   var record = baseRecord(mrProcessSpawn, moExecute)
   record.childOsPid = uint64(childPid)
   record.result = callResult.int64
+  # posix_spawn has returned, but the caller's cwd is still the one the child
+  # was launched from, so a relative program path anchors correctly here.
+  let spawnPath = anchoredExecPath(path, pathSearched)
   if path != nil:
-    record.path = $path
+    record.path = spawnPath
   var d = detail
   # ROUND-2 R7 — stamp the CHILD's kernel start time so the merge matches the
   # spawn against the child's own process-start by (pid, start-time), not bare
@@ -1000,9 +1082,9 @@ proc recordSpawn(childPid: PidT; callResult: cint; path: cstring; detail: string
   # launched binary's BYTES as a CONTENT read (the same path-fidelity hole as
   # execve): the verbatim `path` may name a wrapper symlink whose real target's
   # bytes the build truly depends on. canonicalPathFor realpath-resolves it (returns
-  # "" for a nil path — fork —, an already-canonical path, or a PATH-searched bare
-  # name realpath cannot resolve from the CWD, so posix_spawnp's PATH search is never
-  # mis-resolved here).
+  # "" for a nil path — fork —, an already-canonical path, or a path still
+  # RELATIVE: posix_spawnp's PATH-searched bare name, which realpath would
+  # otherwise resolve against the CWD and so name a `./tool` the spawn never ran).
   #
   # Recorded as mrFileRead/moFileRead (a CONTENT dependency, like recordLibraryLoad),
   # DELIBERATELY NOT a second mrProcessSpawn: a duplicate spawn naming the same
@@ -1013,7 +1095,7 @@ proc recordSpawn(childPid: PidT; callResult: cint; path: cstring; detail: string
   # check, so completeness is unchanged while the binary bytes bust the cache on a
   # content swap.
   if path != nil:
-    let canonical = canonicalPathFor($path)
+    let canonical = canonicalPathFor(spawnPath)
     if canonical.len > 0:
       var resolved = baseRecord(mrFileRead, moFileRead)
       resolved.result = 0
@@ -1079,6 +1161,11 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32;
   record.flags = uint32(family)
   record.childOsPid = uint64(peerPid)        # peer pid (0 ⇒ unobtainable)
   record.path = $cast[cstring](addr dest[0]) # socket path or "ip:port"
+  # A relative AF_UNIX sun_path is resolved against the cwd at connect time,
+  # exactly like a relative open, so it is anchored the same way (see
+  # anchoredPath). sun_path is capped at 104 bytes; the anchored record is not.
+  if family == AfUnix and record.path.len > 0 and record.path[0] != '/':
+    record.path = anchoredPath(AtFdCwd, cstring(record.path))
   # ROUND-2 R7 — stamp the PEER's (pid, start-time) so the merge matches an
   # in-tree peer by identity, not bare pid (a recycled peer pid with a different
   # start time is correctly out-of-tree). ROUND-2 R8 — stamp the run id (report
@@ -1371,25 +1458,25 @@ proc repro_hook_dyld_add_image*(mh: pointer; slide: int)
   dec disabled
   if recordable:
     recordLibraryLoad(cast[cstring](addr buf[0]))
-    # ROUND-4 S3b — this image is NON-SYSTEM (it passed the same /usr/lib + /System
-    # + shared-cache + shim filter the library-load record uses). Register its slid
-    # __TEXT range for entropy caller-attribution when:
-    #   * it is a DLOPEN'd image (the initial link-time burst is done) — an explicitly
-    #     loaded extension such as the res1 dlopen pass-plugin, the stronger threat
-    #     and never a trusted pinned runtime; OR
-    #   * it is a LINK-TIME image whose path is NOT under a recognized toolchain
-    #     prefix (ct_macos_path_is_toolchain) — a CUSTOM dylib in the build/project
-    #     tree (round-4 r4_residual/entropy_main_link: libentropy.dylib drawing
-    #     arc4random and baking it into output) that the round-3 blanket link-time
-    #     exemption let slip through → a false cache hit.
-    # The program's LINK-TIME TOOLCHAIN runtime dylibs (a Nix clang's libLLVM/libc++
-    # in /nix/store) draw BENIGN temp-name/hash entropy and stay EXEMPT, so a normal
-    # cc/clang compile is NOT downgraded (the cardinal-sin guard). recordLibraryLoad
-    # above still records EVERY non-system image as a content dep (break #4).
-    # getsegmentdata is a lock-free memory walk, safe in the dyld add-image callback.
-    if ct_macos_addimage_burst_done() or
-        not ct_macos_path_is_toolchain(cast[cstring](addr buf[0])):
-      ct_macos_register_nonsystem_image(mh)
+    # This image is NON-SYSTEM (it passed the same /usr/lib + /System +
+    # shared-cache + shim filter the library-load record uses), so its slid
+    # __TEXT range is registered for entropy caller-attribution -- whether it is
+    # a LINK-TIME dependency or a DLOPEN'd one, and wherever it is installed.
+    #
+    # Rounds 3 and 4 exempted link-time images under a "toolchain" prefix
+    # (/nix/store, /opt/homebrew, /usr/local, the Xcode trees), on the premise
+    # that a Nix clang's libLLVM/libc++ draw only benign temp-name entropy. That
+    # decided, by path and on macOS only, what the CONSUMER decides per tool
+    # with a stated justification (reprobuild's entropy blessings, attributed
+    # through the pid's `mrProcessExec`): clang's temp-file draw in libLLVM was
+    # seen and discarded, and an edge with no blessing published over it, while
+    # the Linux preload shim reports the very same draw. The startup baseline
+    # the cardinal-sin guard exists for lives in /usr/lib and the shared cache,
+    # never in a registered image, so it stays excluded. See
+    # reprobuild-pm `spec/MacOS-Monitoring.md` §"Entropy Caller Attribution".
+    # getsegmentdata is a lock-free memory walk, safe in the dyld add-image
+    # callback.
+    ct_macos_register_nonsystem_image(mh)
 
 proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
   if not locksReady:
@@ -1574,7 +1661,7 @@ proc recordCanonicalTarget(fd: cint; original: cstring;
   record.detail = "resolved-target"
   emitRecord(record)
 
-proc recordFailedOpenCanonical(callResult: cint; dirfd: cint; path: cstring;
+proc recordFailedOpenCanonical(callResult: cint; path: cstring;
     flags: cint) {.raises: [].} =
   ## ROUND-5 P1 — a FAILED open (ENOENT) is a negative-existence dependency: an
   ## `open("foo.h")` that misses now, but whose later appearance changes the build
@@ -1584,24 +1671,14 @@ proc recordFailedOpenCanonical(callResult: cint; dirfd: cint; path: cstring;
   ## verbatim: unanchored (relative) or un-firmlinked (/tmp vs /private/tmp). We add a
   ## LEXICAL-canonical companion matching the F_GETPATH spelling the file would get
   ## once it exists, so a realpath-keying consumer matches the SAME key across the
-  ## absent-open → present-read transition. Absolute/AT_FDCWD anchors against the cwd;
-  ## a dirfd-relative miss recovers the dir via F_GETPATH (the dirfd is still open).
+  ## absent-open → present-read transition. The hook passes the path already
+  ## anchored (anchoredPath: on the cwd, or on the dirfd's directory for openat).
   if callResult >= 0 or path == nil:
     return
   let raw = $path
   if raw.len == 0:
     return
-  var target = raw
-  if not (raw[0] == '/' or dirfd == AtFdCwd):
-    # dirfd-relative failed openat: resolve the directory, then join the leaf.
-    var dbuf: array[1024, char]
-    if ct_macos_fd_real_path(dirfd, addr dbuf[0], csize_t(dbuf.len)) == 0:
-      return
-    let dir = $cast[cstring](addr dbuf[0])
-    if dir.len == 0:
-      return
-    target = dir & "/" & raw
-  let canonical = lexicalCanonicalPathFor(target)
+  let canonical = lexicalCanonicalPathFor(raw)
   if canonical.len == 0 or canonical == raw:
     return
   var record = baseRecord(mrFileOpen, observationForOpen(flags))
@@ -1676,57 +1753,6 @@ proc recordCanonicalPathProbe(callResult: cint; path: cstring; mode: cint;
       return
     recordPathProbe(callResult, cstring(canonical), mode,
       (if detail.len > 0: detail & " canon=lexical" else: "canon=lexical"))
-
-proc recordCanonicalAtProbe(callResult: cint; dirfd: cint; path: cstring;
-    mode: cint; detail: string) {.raises: [].} =
-  ## ROUND-3 S2a — canonical companion for the `*at` PROBE family (fstatat,
-  ## getattrlistat). Closes the round-2 dirfd-relative residual: round 2 only
-  ## canonicalised a probe whose path was ABSOLUTE or relative to AT_FDCWD (realpath
-  ## resolves against the CWD, not an arbitrary `dirfd`), so `fstatat(dirfd,
-  ## "rel/file", …)` with a REAL dirfd recorded only the BARE RELATIVE component —
-  ## unmatchable against a consumer's canonical cache key, and (unlike an open)
-  ## there is no fd to F_GETPATH and no open fallback, so a changed metadata
-  ## dependency was INVISIBLE → a false skip (r3_fd p_fstat).
-  ##
-  ##  * ABSOLUTE path or AT_FDCWD → defer to recordCanonicalPathProbe (realpath
-  ##    against the CWD is correct), exactly as round 2.
-  ##  * dirfd-RELATIVE → resolve the dirfd to its real directory via F_GETPATH (a
-  ##    raw fcntl, reentrancy-free), join the relative component, and record the
-  ##    realpath-canonical ABSOLUTE companion (memoised via canonicalPathFor, so the
-  ##    realpath cost is bounded on a probe storm).
-  ##
-  ## ROUND-5 P1 — the ENOENT case (a MISSING `*at` target — a negative-existence dep)
-  ## now flows through the SAME two branches: an absolute/AT_FDCWD miss defers to
-  ## recordCanonicalPathProbe (which canonicalises a failed probe LEXICALLY), and a
-  ## dirfd-relative miss recovers the dir via F_GETPATH (the dirfd is still open even
-  ## though the leaf is absent), joins, and canonicalises LEXICALLY — matching the
-  ## F_GETPATH spelling the file would get once it appears.
-  if path == nil:
-    return
-  let raw = $path
-  if raw.len == 0:
-    return
-  if raw[0] == '/' or dirfd == AtFdCwd:
-    recordCanonicalPathProbe(callResult, path, mode, detail)
-    return
-  # dirfd-relative: recover the directory's real path, then canonicalise the join.
-  var dbuf: array[1024, char]
-  if ct_macos_fd_real_path(dirfd, addr dbuf[0], csize_t(dbuf.len)) == 0:
-    return
-  let dir = $cast[cstring](addr dbuf[0])
-  if dir.len == 0:
-    return
-  let joined = dir & "/" & raw
-  # A SUCCESSFUL probe realpath-resolves the join (symlink-aware); a FAILED probe
-  # (absent leaf) resolves it LEXICALLY (realpath would ENOENT). Both fall back to
-  # the absolute join so the companion is at worst absolute, never the bare relative
-  # component.
-  let canonical = if callResult == 0: canonicalPathFor(joined)
-                  else: lexicalCanonicalPathFor(joined)
-  let p = if canonical.len > 0: canonical else: joined
-  let tag = if callResult == 0: "resolved-target" else: "canon=lexical"
-  recordPathProbe(callResult, cstring(p), mode,
-    (if detail.len > 0: detail & " " & tag else: tag))
 
 proc recoverNamedFdFile(fd: cint; kind: FdKind; detail: string): bool
     {.raises: [].} =
@@ -1924,7 +1950,8 @@ proc repro_hook_munmap_cleanup*(adr: pointer; length: csize_t)
     return
   forgetSharedMmaps(adr, length)
 
-proc recordSetexecExec(attrp: pointer; path: cstring) {.raises: [].} =
+proc recordSetexecExec(attrp: pointer; path: cstring;
+    pathSearched: bool) {.raises: [].} =
   ## If a posix_spawn(p) sets POSIX_SPAWN_SETEXEC it REPLACES the calling
   ## process image and NEVER returns on success — so (mirroring repro_hook_execve
   ## exactly) emit the exec record AND FLUSH it BEFORE the forward, else the
@@ -1938,7 +1965,7 @@ proc recordSetexecExec(attrp: pointer; path: cstring) {.raises: [].} =
     return
   var record = baseRecord(mrProcessExec, moExecute)
   if path != nil:
-    record.path = $path
+    record.path = anchoredExecPath(path, pathSearched)
   record.childOsPid = uint64(c_getpid())
   record.detail = "posix_spawn-setexec"
   emitRecord(record)
@@ -2195,9 +2222,10 @@ proc canonicalChildPath(raw: string): string {.raises: [].} =
     return raw
   let slash = raw.rfind('/')
   if slash < 0:
-    # A bare name resolved against the CWD: canonicalise "." and join.
-    let dir = canonicalPathFor(".")
-    return (if dir.len > 0: dir & "/" & raw else: raw)
+    # Still a bare name: the hook could not anchor it (anchoredPath found no
+    # nameable cwd), so nothing here can either. Resolving "." through the
+    # realpath memo would answer with whatever cwd first filled that entry.
+    return raw
   if slash == 0:
     return raw                       # "/leaf" — parent is root, already absolute
   let parent = raw[0 ..< slash]
@@ -2219,8 +2247,10 @@ proc emitPathMutation(absOrRaw: string; callResult: cint;
 
 proc recordPathMutation(callResult: cint; path: cstring;
     detail: string) {.raises: [].} =
-  ## Record a mkdir/rmdir/unlink output mutation (path form). Only a SUCCESSFUL
-  ## call (result == 0) actually mutates the output tree.
+  ## Record a mkdir/rmdir/unlink/symlink output mutation and their `*at` forms.
+  ## The hook passes the path already anchored (anchoredPath: on the cwd, or on
+  ## the dirfd's directory). Only a SUCCESSFUL call (result == 0) actually
+  ## mutates the output tree.
   ##
   ## ROUND-5 P1 (deliberate) — a FAILED mutation against an absent target (an
   ## `unlink`/`rmdir` returning ENOENT) is NOT recorded. It mutated nothing, so an
@@ -2235,31 +2265,6 @@ proc recordPathMutation(callResult: cint; path: cstring;
   if path == nil or callResult != 0:
     return
   emitPathMutation($path, callResult, detail)
-
-proc recordPathMutationAt(callResult: cint; dirfd: cint; path: cstring;
-    detail: string) {.raises: [].} =
-  ## Record a mkdirat/unlinkat output mutation (`*at` form). An ABSOLUTE path or
-  ## AT_FDCWD resolves against the CWD; a dirfd-relative path is joined onto the
-  ## dirfd's real directory (recovered via F_GETPATH — a raw fcntl, reentrancy-free
-  ## — and still open at the call), mirroring recordCanonicalAtProbe. Only a
-  ## successful call mutates the tree.
-  if path == nil or callResult != 0:
-    return
-  let raw = $path
-  if raw.len == 0:
-    return
-  if raw[0] == '/' or dirfd == AtFdCwd:
-    emitPathMutation(raw, callResult, detail)
-    return
-  var dbuf: array[1024, char]
-  if ct_macos_fd_real_path(dirfd, addr dbuf[0], csize_t(dbuf.len)) != 0:
-    let dir = $cast[cstring](addr dbuf[0])
-    if dir.len > 0:
-      emitPathMutation(dir & "/" & raw, callResult, detail)
-      return
-  # Could not resolve the dirfd — record the bare relative leaf rather than drop
-  # the mutation entirely (fail-safe: a less-canonical record beats none).
-  emitPathMutation(raw, callResult, detail)
 
 # --- ROUND-2 R-D (break R10) non-file determinism recorders -----------------
 #
@@ -2378,6 +2383,10 @@ proc repro_hook_open*(path: cstring; flags, mode: cint): cint {.exportc, cdecl, 
     return ct_macos_interpose_real_open(path, flags, mode)
   result = ct_macos_interpose_real_open(path, flags, mode)
   let savedErrno = getErrno()
+  # Every record and the fd table name the ABSOLUTE path, anchored on the cwd
+  # the open resolved against (see anchoredPath).
+  let anchored = anchoredPath(AtFdCwd, path)
+  let path = cstring(anchored)
   updateFdPath(result, path)
   recordOpen(result, path, flags, "")
   if result >= 0:
@@ -2391,7 +2400,7 @@ proc repro_hook_open*(path: cstring; flags, mode: cint): cint {.exportc, cdecl, 
   else:
     # ROUND-5 P1 — a FAILED open (ENOENT) is a negative-existence dep; with no fd the
     # F_GETPATH companion cannot run, so add the LEXICAL-canonical companion.
-    recordFailedOpenCanonical(result, AtFdCwd, path, flags)
+    recordFailedOpenCanonical(result, path, flags)
   setErrno(savedErrno)
 
 proc repro_hook_openat*(dirfd: cint; path: cstring; flags, mode: cint): cint
@@ -2400,6 +2409,10 @@ proc repro_hook_openat*(dirfd: cint; path: cstring; flags, mode: cint): cint
     return ct_macos_interpose_real_openat(dirfd, path, flags, mode)
   result = ct_macos_interpose_real_openat(dirfd, path, flags, mode)
   let savedErrno = getErrno()
+  # A dirfd-relative path is anchored on the dirfd's directory, an AT_FDCWD
+  # one on the cwd (see anchoredPath).
+  let anchored = anchoredPath(dirfd, path)
+  let path = cstring(anchored)
   updateFdPath(result, path)
   recordOpen(result, path, flags, "dirfd=" & $dirfd)
   if result >= 0:
@@ -2411,8 +2424,8 @@ proc repro_hook_openat*(dirfd: cint; path: cstring; flags, mode: cint): cint
     recordCanonicalTarget(result, path, observationForOpen(flags))
   else:
     # ROUND-5 P1 — a FAILED openat (ENOENT) is a negative-existence dep; with no fd,
-    # canonicalise LEXICALLY (dirfd resolved via F_GETPATH when dirfd-relative).
-    recordFailedOpenCanonical(result, dirfd, path, flags)
+    # canonicalise LEXICALLY (the path is already anchored on the dirfd above).
+    recordFailedOpenCanonical(result, path, flags)
   setErrno(savedErrno)
 
 proc repro_hook_read*(fd: cint; buf: pointer; count: csize_t): int {.exportc, cdecl, dynlib.} =
@@ -2501,6 +2514,8 @@ proc repro_hook_getxattr*(path, name: cstring; value: pointer; size: csize_t;
     return ct_macos_real_getxattr(path, name, value, size, position, options)
   result = ct_macos_real_getxattr(path, name, value, size, position, options)
   let savedErrno = getErrno()
+  let anchored = anchoredPath(AtFdCwd, path)
+  let path = cstring(anchored)
   recordXattr(result, path, name, (if result >= 0: result else: -1),
     isList = false, isWrite = false, detail = "")
   setErrno(savedErrno)
@@ -2532,6 +2547,8 @@ proc repro_hook_listxattr*(path: cstring; namebuf: pointer; size: csize_t;
     return ct_macos_real_listxattr(path, namebuf, size, options)
   result = ct_macos_real_listxattr(path, namebuf, size, options)
   let savedErrno = getErrno()
+  let anchored = anchoredPath(AtFdCwd, path)
+  let path = cstring(anchored)
   recordXattr(result, path, nil, (if result >= 0: result else: -1),
     isList = true, isWrite = false, detail = "")
   setErrno(savedErrno)
@@ -2562,6 +2579,8 @@ proc repro_hook_setxattr*(path, name: cstring; value: pointer; size: csize_t;
     return ct_macos_real_setxattr(path, name, value, size, position, options)
   result = ct_macos_real_setxattr(path, name, value, size, position, options)
   let savedErrno = getErrno()
+  let anchored = anchoredPath(AtFdCwd, path)
+  let path = cstring(anchored)
   recordXattr(int(result), path, name, int(size), isList = false,
     isWrite = true, detail = "xattr-set")
   setErrno(savedErrno)
@@ -2591,6 +2610,8 @@ proc repro_hook_removexattr*(path, name: cstring; options: cint): cint
     return ct_macos_real_removexattr(path, name, options)
   result = ct_macos_real_removexattr(path, name, options)
   let savedErrno = getErrno()
+  let anchored = anchoredPath(AtFdCwd, path)
+  let path = cstring(anchored)
   recordXattr(int(result), path, name, -1, isList = false, isWrite = true,
     detail = "xattr-remove")
   setErrno(savedErrno)
@@ -2754,6 +2775,8 @@ proc repro_hook_truncate*(path: cstring; length: int64): cint
     return ct_macos_real_truncate(path, length)
   result = ct_macos_real_truncate(path, length)
   let savedErrno = getErrno()
+  let anchored = anchoredPath(AtFdCwd, path)
+  let path = cstring(anchored)
   if result == 0:
     recordPathWrite(path, length, "truncate")
   setErrno(savedErrno)
@@ -2808,10 +2831,15 @@ proc repro_hook_opendir*(path: cstring): pointer {.exportc, cdecl, dynlib.} =
   finally:
     dec disabled
   if result != nil:
-    updateDirPath(result, path)
+    # Remember the ABSOLUTE directory (anchored on the cwd at opendir time):
+    # every readdir record of this DIR* names it, possibly after a chdir.
+    let savedErrno = getErrno()
+    let anchored = anchoredPath(AtFdCwd, path)
+    updateDirPath(result, cstring(anchored))
     # ROUND-4 RW2 (break D1) — snapshot the directory's mtime+size ONCE here so
     # every readdir record can carry it without a per-entry stat.
-    updateDirMeta(result, path)
+    updateDirMeta(result, cstring(anchored))
+    setErrno(savedErrno)
 
 proc repro_hook_readdir*(dirp: pointer): pointer {.exportc, cdecl, dynlib.} =
   if not initialized or disabled > 0:
@@ -2866,6 +2894,8 @@ proc repro_hook_stat*(path: cstring; buf: pointer): cint {.exportc, cdecl, dynli
     return ct_macos_bodypatch_real_stat(path, buf)
   result = ct_macos_bodypatch_real_stat(path, buf)
   let savedErrno = getErrno()
+  let anchored = anchoredPath(AtFdCwd, path)
+  let path = cstring(anchored)
   # ROUND-2 R4 — record the as-passed probe (with (dev, ino)) AND, when the raw
   # path is non-canonical, a companion probe on the realpath form. stat()'s path
   # resolves against the CWD, exactly as realpath does, so both absolute and
@@ -2880,6 +2910,8 @@ proc repro_hook_lstat*(path: cstring; buf: pointer): cint {.exportc, cdecl, dynl
     return ct_macos_bodypatch_real_lstat(path, buf)
   result = ct_macos_bodypatch_real_lstat(path, buf)
   let savedErrno = getErrno()
+  let anchored = anchoredPath(AtFdCwd, path)
+  let path = cstring(anchored)
   let dino = statDetail("", buf, result == 0)
   recordPathProbe(result, path, 0, dino)
   # If the lstat'd object IS a symlink, also record its resolved target so
@@ -2901,13 +2933,16 @@ proc repro_hook_fstatat*(dirfd: cint; path: cstring; buf: pointer;
     return ct_macos_bodypatch_real_fstatat(dirfd, path, buf, flag)
   result = ct_macos_bodypatch_real_fstatat(dirfd, path, buf, flag)
   let savedErrno = getErrno()
+  let anchored = anchoredPath(dirfd, path)
+  let path = cstring(anchored)
   let dino = statDetail("fstatat dirfd=" & $dirfd, buf, result == 0)
   recordPathProbe(result, path, 0, dino)
-  # ROUND-3 S2a — canonicalise for ABSOLUTE / AT_FDCWD paths (realpath against the
-  # CWD) AND for the dirfd-RELATIVE case (resolve the dirfd via F_GETPATH, join,
-  # realpath), closing the round-2 residual where a dirfd-relative fstatat recorded
-  # only the bare relative component.
-  recordCanonicalAtProbe(result, dirfd, path, 0, dino)
+  # ROUND-3 S2a — the canonical companion. `path` is already anchored on the
+  # dirfd's directory (or the cwd for AT_FDCWD) above, which closes the round-2
+  # residual where a dirfd-relative fstatat recorded only the bare relative
+  # component; realpath (or the lexical form for a miss) then canonicalises it
+  # exactly as for stat.
+  recordCanonicalPathProbe(result, path, 0, dino)
   setErrno(savedErrno)
 
 proc repro_hook_access*(path: cstring; mode: cint): cint
@@ -2916,6 +2951,8 @@ proc repro_hook_access*(path: cstring; mode: cint): cint
     return ct_macos_bodypatch_real_access(path, mode)
   result = ct_macos_bodypatch_real_access(path, mode)
   let savedErrno = getErrno()
+  let anchored = anchoredPath(AtFdCwd, path)
+  let path = cstring(anchored)
   # access has no stat buffer, so no (dev, ino) is available. ROUND-4 RW2 (break
   # D2): on SUCCESS, raw-stat the path (reentrancy-free, bounded — only on success,
   # so the ENOENT probe storm is skipped) to fold in the same mtime+size signal a
@@ -2947,6 +2984,8 @@ proc repro_hook_statfs*(path: cstring; buf: pointer): cint
     return ct_macos_bodypatch_real_statfs(path, buf)
   result = ct_macos_bodypatch_real_statfs(path, buf)
   let savedErrno = getErrno()
+  let anchored = anchoredPath(AtFdCwd, path)
+  let path = cstring(anchored)
   recordPathProbe(result, path, 0, "statfs")
   recordCanonicalPathProbe(result, path, 0, "statfs")
   setErrno(savedErrno)
@@ -2986,6 +3025,10 @@ proc repro_hook_rename*(fromPath, toPath: cstring): cint
     return ct_macos_real_rename(fromPath, toPath)
   result = ct_macos_real_rename(fromPath, toPath)
   let savedErrno = getErrno()
+  let anchoredFrom = anchoredPath(AtFdCwd, fromPath)
+  let anchoredTo = anchoredPath(AtFdCwd, toPath)
+  let fromPath = cstring(anchoredFrom)
+  let toPath = cstring(anchoredTo)
   recordRename(result, fromPath, toPath, "rename")
   setErrno(savedErrno)
 
@@ -2995,6 +3038,10 @@ proc repro_hook_renameat*(fromfd: cint; fromPath: cstring; tofd: cint;
     return ct_macos_real_renameat(fromfd, fromPath, tofd, toPath)
   result = ct_macos_real_renameat(fromfd, fromPath, tofd, toPath)
   let savedErrno = getErrno()
+  let anchoredFrom = anchoredPath(fromfd, fromPath)
+  let anchoredTo = anchoredPath(tofd, toPath)
+  let fromPath = cstring(anchoredFrom)
+  let toPath = cstring(anchoredTo)
   recordRename(result, fromPath, toPath,
     "renameat fromfd=" & $fromfd & " tofd=" & $tofd)
   setErrno(savedErrno)
@@ -3018,6 +3065,8 @@ proc repro_hook_mkdir*(path: cstring; mode: cint): cint
     return ct_macos_real_mkdir(path, mode)
   result = ct_macos_real_mkdir(path, mode)
   let savedErrno = getErrno()
+  let anchored = anchoredPath(AtFdCwd, path)
+  let path = cstring(anchored)
   recordPathMutation(result, path, "mkdir")
   setErrno(savedErrno)
 
@@ -3027,7 +3076,9 @@ proc repro_hook_mkdirat*(dirfd: cint; path: cstring; mode: cint): cint
     return ct_macos_real_mkdirat(dirfd, path, mode)
   result = ct_macos_real_mkdirat(dirfd, path, mode)
   let savedErrno = getErrno()
-  recordPathMutationAt(result, dirfd, path, "mkdirat dirfd=" & $dirfd)
+  let anchored = anchoredPath(dirfd, path)
+  let path = cstring(anchored)
+  recordPathMutation(result, path, "mkdirat dirfd=" & $dirfd)
   setErrno(savedErrno)
 
 proc repro_hook_rmdir*(path: cstring): cint {.exportc, cdecl, dynlib.} =
@@ -3035,6 +3086,8 @@ proc repro_hook_rmdir*(path: cstring): cint {.exportc, cdecl, dynlib.} =
     return ct_macos_real_rmdir(path)
   result = ct_macos_real_rmdir(path)
   let savedErrno = getErrno()
+  let anchored = anchoredPath(AtFdCwd, path)
+  let path = cstring(anchored)
   recordPathMutation(result, path, "rmdir")
   setErrno(savedErrno)
 
@@ -3043,6 +3096,8 @@ proc repro_hook_unlink*(path: cstring): cint {.exportc, cdecl, dynlib.} =
     return ct_macos_real_unlink(path)
   result = ct_macos_real_unlink(path)
   let savedErrno = getErrno()
+  let anchored = anchoredPath(AtFdCwd, path)
+  let path = cstring(anchored)
   recordPathMutation(result, path, "unlink")
   setErrno(savedErrno)
 
@@ -3052,9 +3107,11 @@ proc repro_hook_unlinkat*(dirfd: cint; path: cstring; flags: cint): cint
     return ct_macos_real_unlinkat(dirfd, path, flags)
   result = ct_macos_real_unlinkat(dirfd, path, flags)
   let savedErrno = getErrno()
+  let anchored = anchoredPath(dirfd, path)
+  let path = cstring(anchored)
   # AT_REMOVEDIR (flags & 0x80 on Darwin) makes unlinkat behave like rmdir; the
   # detail records the flags for provenance either way.
-  recordPathMutationAt(result, dirfd, path,
+  recordPathMutation(result, path,
     "unlinkat dirfd=" & $dirfd & " flags=" & $flags)
   setErrno(savedErrno)
 
@@ -3076,6 +3133,8 @@ proc repro_hook_symlink*(target, linkpath: cstring): cint
     return ct_macos_real_symlink(target, linkpath)
   result = ct_macos_real_symlink(target, linkpath)
   let savedErrno = getErrno()
+  let anchored = anchoredPath(AtFdCwd, linkpath)
+  let linkpath = cstring(anchored)
   recordPathMutation(result, linkpath, "symlink target=" & $target)
   setErrno(savedErrno)
 
@@ -3085,7 +3144,9 @@ proc repro_hook_symlinkat*(target: cstring; dirfd: cint; linkpath: cstring): cin
     return ct_macos_real_symlinkat(target, dirfd, linkpath)
   result = ct_macos_real_symlinkat(target, dirfd, linkpath)
   let savedErrno = getErrno()
-  recordPathMutationAt(result, dirfd, linkpath,
+  let anchored = anchoredPath(dirfd, linkpath)
+  let linkpath = cstring(anchored)
+  recordPathMutation(result, linkpath,
     "symlinkat dirfd=" & $dirfd & " target=" & $target)
   setErrno(savedErrno)
 
@@ -3102,7 +3163,8 @@ proc repro_hook_clonefile*(src, dst: cstring; flags: cint): cint
     return ct_macos_real_clonefile(src, dst, flags)
   result = ct_macos_real_clonefile(src, dst, flags)
   let savedErrno = getErrno()
-  recordContentCopy(result, $src, $dst, "clonefile")
+  recordContentCopy(result, anchoredPath(AtFdCwd, src),
+    anchoredPath(AtFdCwd, dst), "clonefile")
   setErrno(savedErrno)
 
 proc repro_hook_clonefileat*(srcfd: cint; src: cstring; dstfd: cint;
@@ -3111,7 +3173,7 @@ proc repro_hook_clonefileat*(srcfd: cint; src: cstring; dstfd: cint;
     return ct_macos_real_clonefileat(srcfd, src, dstfd, dst, flags)
   result = ct_macos_real_clonefileat(srcfd, src, dstfd, dst, flags)
   let savedErrno = getErrno()
-  recordContentCopy(result, $src, $dst,
+  recordContentCopy(result, anchoredPath(srcfd, src), anchoredPath(dstfd, dst),
     "clonefileat srcfd=" & $srcfd & " dstfd=" & $dstfd)
   setErrno(savedErrno)
 
@@ -3122,7 +3184,8 @@ proc repro_hook_fclonefileat*(srcfd, dstfd: cint; dst: cstring;
   result = ct_macos_real_fclonefileat(srcfd, dstfd, dst, flags)
   let savedErrno = getErrno()
   # The source is named only by fd; record its mapped path (empty ⇒ skipped).
-  recordContentCopy(result, pathForFd(srcfd), $dst, "fclonefileat srcfd=" & $srcfd)
+  recordContentCopy(result, pathForFd(srcfd), anchoredPath(dstfd, dst),
+    "fclonefileat srcfd=" & $srcfd)
   setErrno(savedErrno)
 
 proc repro_hook_link*(src, dst: cstring): cint {.exportc, cdecl, dynlib.} =
@@ -3130,7 +3193,8 @@ proc repro_hook_link*(src, dst: cstring): cint {.exportc, cdecl, dynlib.} =
     return ct_macos_real_link(src, dst)
   result = ct_macos_real_link(src, dst)
   let savedErrno = getErrno()
-  recordContentCopy(result, $src, $dst, "link")
+  recordContentCopy(result, anchoredPath(AtFdCwd, src),
+    anchoredPath(AtFdCwd, dst), "link")
   setErrno(savedErrno)
 
 proc repro_hook_linkat*(fd1: cint; src: cstring; fd2: cint; dst: cstring;
@@ -3139,7 +3203,8 @@ proc repro_hook_linkat*(fd1: cint; src: cstring; fd2: cint; dst: cstring;
     return ct_macos_real_linkat(fd1, src, fd2, dst, flag)
   result = ct_macos_real_linkat(fd1, src, fd2, dst, flag)
   let savedErrno = getErrno()
-  recordContentCopy(result, $src, $dst, "linkat fd1=" & $fd1 & " fd2=" & $fd2)
+  recordContentCopy(result, anchoredPath(fd1, src), anchoredPath(fd2, dst),
+    "linkat fd1=" & $fd1 & " fd2=" & $fd2)
   setErrno(savedErrno)
 
 proc repro_hook_copyfile*(src, dst: cstring; state: pointer;
@@ -3149,7 +3214,8 @@ proc repro_hook_copyfile*(src, dst: cstring; state: pointer;
   result = ct_macos_real_copyfile(src, dst, state, flags)
   let savedErrno = getErrno()
   if (flags and (CopyfileClone or CopyfileCloneForce)) != 0:
-    recordContentCopy(result, $src, $dst, "copyfile-clone")
+    recordContentCopy(result, anchoredPath(AtFdCwd, src),
+      anchoredPath(AtFdCwd, dst), "copyfile-clone")
   setErrno(savedErrno)
 
 proc repro_hook_fcopyfile*(srcfd, dstfd: cint; state: pointer;
@@ -3175,6 +3241,8 @@ proc repro_hook_getattrlist*(path: cstring; al, buf: pointer; size: csize_t;
     return ct_macos_real_getattrlist(path, al, buf, size, opts)
   result = ct_macos_real_getattrlist(path, al, buf, size, opts)
   let savedErrno = getErrno()
+  let anchored = anchoredPath(AtFdCwd, path)
+  let path = cstring(anchored)
   recordPathProbe(result, path, 0, "getattrlist")
   setErrno(savedErrno)
 
@@ -3184,12 +3252,14 @@ proc repro_hook_getattrlistat*(fd: cint; path: cstring; al, buf: pointer;
     return ct_macos_real_getattrlistat(fd, path, al, buf, size, opts)
   result = ct_macos_real_getattrlistat(fd, path, al, buf, size, opts)
   let savedErrno = getErrno()
+  let anchored = anchoredPath(fd, path)
+  let path = cstring(anchored)
   let d = "getattrlistat dirfd=" & $fd
   recordPathProbe(result, path, 0, d)
-  # ROUND-3 S2a — same canonical companion as fstatat (absolute/AT_FDCWD via the
-  # CWD, dirfd-relative via F_GETPATH+realpath), so a dirfd-relative getattrlistat
-  # metadata probe is matchable against a canonical cache key.
-  recordCanonicalAtProbe(result, fd, path, 0, d)
+  # ROUND-3 S2a — same canonical companion as fstatat (the path is anchored on the
+  # dirfd above), so a dirfd-relative getattrlistat metadata probe is matchable
+  # against a canonical cache key.
+  recordCanonicalPathProbe(result, path, 0, d)
   setErrno(savedErrno)
 
 proc repro_hook_fgetattrlist*(fd: cint; al, buf: pointer; size: csize_t;
@@ -3790,8 +3860,10 @@ proc repro_hook_execve*(path: cstring; argv, envp: cstringArray): cint
   if not initialized or disabled > 0:
     return ct_macos_interpose_real_execve(path, argv, envp)
   var record = baseRecord(mrProcessExec, moExecute)
+  # A relative program path is resolved against the cwd now; record it so.
+  let execPath = anchoredExecPath(path, pathSearched = false)
   if path != nil:
-    record.path = $path
+    record.path = execPath
   record.detail = "execve"
   emitRecord(record)
   # ROUND-3 S2c — ALSO record the SYMLINK/realpath-RESOLVED launched binary's BYTES
@@ -3813,7 +3885,7 @@ proc repro_hook_execve*(path: cstring; argv, envp: cstringArray): cint
   # exist on macOS and /dev/fd/N exec fails natively, so the symlink is the live
   # Darwin vector.)
   if path != nil:
-    let canonical = canonicalPathFor($path)
+    let canonical = canonicalPathFor(execPath)
     if canonical.len > 0:
       var resolved = baseRecord(mrFileRead, moFileRead)
       resolved.result = 0
@@ -3911,8 +3983,10 @@ proc spawnForward(tramp: pointer; pid: ptr PidT; path: cstring;
     fileActions, attrp: pointer; argv, envp: cstringArray;
     byName: proc(pid: ptr PidT; path: cstring; fileActions, attrp: pointer;
                  argv, envp: cstringArray): cint {.nimcall.};
-    detail: string): cint =
+    detail: string; pathSearched: bool): cint =
   ## Shared posix_spawn(p) forwarding core (DRY between the two variants).
+  ## `pathSearched` is true for posix_spawnp, whose slash-less `path` is a PATH
+  ## lookup rather than a cwd-relative name (see anchoredExecPath).
   ##
   ## Apply env-propagation + SIP-rewrite EXACTLY ONCE, forward to the real
   ## implementation via a path that bypasses the possibly body-patched named
@@ -3965,7 +4039,7 @@ proc spawnForward(tramp: pointer; pid: ptr PidT; path: cstring;
     finally:
       dec inSpawnForward
   if outermost and result == 0 and pid != nil:
-    recordSpawn(pid[], result, path, detail)
+    recordSpawn(pid[], result, path, detail, pathSearched)
 
 proc spawnForwardMuted(tramp: pointer; pid: ptr PidT; path: cstring;
     fileActions, attrp: pointer; argv, envp: cstringArray;
@@ -4021,14 +4095,15 @@ proc repro_hook_posix_spawn*(pid: ptr PidT; path: cstring;
   # `arch -arch arm64 prog` chain came out as execs=3 starts=3 and was reported
   # as a loss. The subtree was captured; only the arithmetic said otherwise.
   if inSpawnForward == 0:
-    recordSetexecExec(attrp, path)
+    recordSetexecExec(attrp, path, pathSearched = false)
   let detail =
     if bodypatchPosixSpawnTramp != nil and inSpawnForward == 0:
       "bodypatch-posix_spawn"
     else:
       "posix_spawn"
   spawnForward(bodypatchPosixSpawnTramp, pid, path, fileActions, attrp,
-    argv, envp, ct_macos_interpose_real_posix_spawn, detail)
+    argv, envp, ct_macos_interpose_real_posix_spawn, detail,
+    pathSearched = false)
 
 proc repro_hook_posix_spawnp*(pid: ptr PidT; path: cstring;
     fileActions, attrp: pointer; argv, envp: cstringArray): cint
@@ -4042,14 +4117,15 @@ proc repro_hook_posix_spawnp*(pid: ptr PidT; path: cstring;
       attrp, argv, envp, ct_macos_interpose_real_posix_spawnp)
   # Outermost only — see the note in `repro_hook_posix_spawn`.
   if inSpawnForward == 0:
-    recordSetexecExec(attrp, path)
+    recordSetexecExec(attrp, path, pathSearched = true)
   let detail =
     if bodypatchPosixSpawnpTramp != nil and inSpawnForward == 0:
       "bodypatch-posix_spawnp"
     else:
       "posix_spawnp"
   spawnForward(bodypatchPosixSpawnpTramp, pid, path, fileActions, attrp,
-    argv, envp, ct_macos_interpose_real_posix_spawnp, detail)
+    argv, envp, ct_macos_interpose_real_posix_spawnp, detail,
+    pathSearched = true)
 
 proc reproRuntimeInit(envp: ptr cstring) {.exportc, raises: [].} =
   globalEnvp = envp
@@ -4476,6 +4552,32 @@ proc installBodypatchHooks(envp: ptr cstring) {.exportc: "repro_monitor_install_
 #include <xpc/xpc.h>
 
 static int repro_monitor_runtime_ready = 0;
+static int repro_macos_this_shim_constructed = 0;
+
+__attribute__((visibility("default")))
+int repro_macos_shim_is_constructed(void) {
+  return repro_macos_this_shim_constructed;
+}
+
+static int repro_macos_later_shim_is_pending(void) {
+  Dl_info self_di;
+  const struct mach_header *self_mh = NULL;
+  if (dladdr((const void *)&repro_macos_shim_is_constructed, &self_di)) {
+    self_mh = (const struct mach_header *)self_di.dli_fbase;
+  }
+  uint32_t count = _dyld_image_count();
+  for (uint32_t i = 0; i < count; i++) {
+    const struct mach_header *mh = _dyld_get_image_header(i);
+    if (mh == NULL || mh == self_mh) continue;
+    NSSymbol sym = NSLookupSymbolInImage(mh, "_repro_macos_shim_is_constructed",
+      NSLOOKUPSYMBOLINIMAGE_OPTION_BIND |
+      NSLOOKUPSYMBOLINIMAGE_OPTION_RETURN_ON_ERROR);
+    if (!sym) continue;
+    int (*fn)(void) = (int (*)(void))NSAddressOfSymbol(sym);
+    if (fn && fn != &repro_macos_shim_is_constructed && !fn()) return 1;
+  }
+  return 0;
+}
 
 /* The launch forwarders call this AFTER environment/path rewriting, which
  * can emit new sandbox path probes after the exec hook's first flush. Never
@@ -4488,6 +4590,13 @@ extern void NimMain(void);
 extern void repro_monitor_install_bodypatch(char **envp);
 extern int repro_monitor_shim_flush(void);
 extern void *repro_macos_resolve_libsystem_symbol(const char *symbol);
+extern void *repro_macos_real_opendir(char *path);
+extern void *repro_macos_real_readdir(void *dirp);
+extern int repro_macos_real_closedir(void *dirp);
+extern int repro_macos_real_copyfile_call(char *from, char *to, void *state,
+    uint32_t flags);
+extern int repro_macos_real_fcopyfile_call(int from, int to, void *state,
+    uint32_t flags);
 /* R-C: forwarders to the genuine libsystem bootstrap/XPC entries (defined in the
  * macos_interpose_runtime translation unit), used by the not-ready interpose
  * thunks below before the recording runtime is live. */
@@ -4527,9 +4636,6 @@ extern long long repro_macos_real_time_call(void *tloc);
 extern int repro_macos_real_secrandom_call(void *rnd, size_t count,
     void *bytes);
 extern int repro_macos_real_ccrandom_call(void *bytes, size_t count);
-/* ROUND-3 S3b — defined in the runtime module's emit; the constructor calls it the
- * instant the add-image registration's initial (link-time) burst finishes. */
-extern void repro_macos_mark_addimage_burst_done(void);
 /* T3b: the dyld add-image callback `repro_hook_dyld_add_image` is a Nim exportc
  * proc whose prototype is already emitted (N_LIB_EXPORT) earlier in this same
  * translation unit, so no re-declaration is needed here; we cast its function
@@ -4668,7 +4774,8 @@ static int repro_wrap_open(const char *path, int flags, ...) {
     va_end(ap);
   }
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_open, path, flags, mode);
+    return (int)repro_macos_real_syscall(SYS_open, (long)path, flags, mode,
+                                         0, 0, 0, 0);
   }
   /* Interpose disabled (debug A/B): forward to the libsystem open entry (which
    * body-patch may have replaced) WITHOUT recording here. Pass `mode` as a
@@ -4695,7 +4802,8 @@ static int repro_wrap_openat(int dirfd, const char *path, int flags, ...) {
     va_end(ap);
   }
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_openat, dirfd, path, flags, mode);
+    return (int)repro_macos_real_syscall(SYS_openat, dirfd, (long)path, flags,
+                                         mode, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     repro_wrap_reentry++;
@@ -4708,7 +4816,8 @@ static int repro_wrap_openat(int dirfd, const char *path, int flags, ...) {
 
 static ssize_t repro_wrap_read(int fd, void *buf, size_t count) {
   if (!repro_monitor_runtime_ready) {
-    return syscall(SYS_read, fd, buf, count);
+    return (ssize_t)repro_macos_real_syscall(SYS_read, fd, (long)buf,
+                                             (long)count, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     repro_rw_fn fn = repro_libsystem_read();
@@ -4724,7 +4833,8 @@ static ssize_t repro_wrap_read(int fd, void *buf, size_t count) {
 
 static ssize_t repro_wrap_write(int fd, const void *buf, size_t count) {
   if (!repro_monitor_runtime_ready) {
-    return syscall(SYS_write, fd, buf, count);
+    return (ssize_t)repro_macos_real_syscall(SYS_write, fd, (long)buf,
+                                             (long)count, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     repro_rw_fn fn = repro_libsystem_write();
@@ -4740,7 +4850,7 @@ static ssize_t repro_wrap_write(int fd, const void *buf, size_t count) {
 
 static int repro_wrap_close(int fd) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_close, fd);
+    return (int)repro_macos_real_syscall(SYS_close, fd, 0, 0, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     repro_close_fn fn = repro_libsystem_close();
@@ -4764,14 +4874,14 @@ static int repro_wrap_close(int fd) {
  */
 static int repro_wrap_dup(int fd) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_dup, fd);
+    return (int)repro_macos_real_syscall(SYS_dup, fd, 0, 0, 0, 0, 0, 0);
   }
   return repro_hook_dup(fd);
 }
 
 static int repro_wrap_dup2(int oldfd, int newfd) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_dup2, oldfd, newfd);
+    return (int)repro_macos_real_syscall(SYS_dup2, oldfd, newfd, 0, 0, 0, 0, 0);
   }
   return repro_hook_dup2(oldfd, newfd);
 }
@@ -4791,7 +4901,8 @@ static int repro_wrap_fcntl(int fd, int cmd, ...) {
   void *arg = va_arg(ap, void *);
   va_end(ap);
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_fcntl, fd, cmd, arg);
+    return (int)repro_macos_real_syscall(SYS_fcntl, fd, cmd, (long)arg,
+                                         0, 0, 0, 0);
   }
   return repro_hook_fcntl(fd, cmd, arg);
 }
@@ -4871,9 +4982,10 @@ static void *repro_wrap_mmap(void *addr, size_t len, int prot, int flags,
  * intersects a file-backed MAP_SHARED mapping recorded by repro_hook_mmap.
  */
 static int repro_wrap_mprotect(void *addr, size_t len, int prot) {
-  int r = (int)syscall(SYS_mprotect, addr, len, prot);
+  int r = (int)repro_macos_real_syscall(SYS_mprotect, (long)addr, (long)len,
+                                        prot, 0, 0, 0, 0);
   int saved_errno = errno;
-  if (r == 0 && (prot & PROT_WRITE) != 0 &&
+  if (repro_monitor_runtime_ready && r == 0 && (prot & PROT_WRITE) != 0 &&
       repro_shared_mmap_overlaps(addr, len)) {
     repro_hook_mprotect_promote(addr, len, prot);
   }
@@ -4888,9 +5000,11 @@ static int repro_wrap_mprotect(void *addr, size_t len, int prot) {
  * prevents same-address reuse from inheriting stale path attribution.
  */
 static int repro_wrap_munmap(void *addr, size_t len) {
-  int r = (int)syscall(SYS_munmap, addr, len);
+  int r = (int)repro_macos_real_syscall(SYS_munmap, (long)addr, (long)len,
+                                        0, 0, 0, 0, 0);
   int saved_errno = errno;
-  if (r == 0 && repro_shared_mmap_overlaps(addr, len)) {
+  if (repro_monitor_runtime_ready && r == 0 &&
+      repro_shared_mmap_overlaps(addr, len)) {
     repro_shared_mmap_remove_overlaps(addr, len);
     repro_hook_munmap_cleanup(addr, len);
   }
@@ -4928,8 +5042,7 @@ static int (*repro_libsystem_execve_fn)(const char *, char *const [],
 
 static DIR *repro_wrap_opendir(const char *path) {
   if (!repro_monitor_runtime_ready) {
-    repro_real_opendir_fn real_fn = (repro_real_opendir_fn)dlsym(RTLD_NEXT, "opendir");
-    return real_fn(path);
+    return (DIR *)repro_macos_real_opendir((char *)path);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_opendir_fn)
@@ -4947,8 +5060,7 @@ static DIR *repro_wrap_opendir(const char *path) {
 
 static struct dirent *repro_wrap_readdir(DIR *dirp) {
   if (!repro_monitor_runtime_ready) {
-    repro_real_readdir_fn real_fn = (repro_real_readdir_fn)dlsym(RTLD_NEXT, "readdir");
-    return real_fn(dirp);
+    return (struct dirent *)repro_macos_real_readdir((void *)dirp);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_readdir_fn)
@@ -4966,8 +5078,7 @@ static struct dirent *repro_wrap_readdir(DIR *dirp) {
 
 static int repro_wrap_closedir(DIR *dirp) {
   if (!repro_monitor_runtime_ready) {
-    repro_real_closedir_fn real_fn = (repro_real_closedir_fn)dlsym(RTLD_NEXT, "closedir");
-    return real_fn(dirp);
+    return repro_macos_real_closedir((void *)dirp);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_closedir_fn)
@@ -4986,9 +5097,11 @@ static int repro_wrap_closedir(DIR *dirp) {
 static int repro_wrap_stat(const char *path, struct stat *buf) {
   if (!repro_monitor_runtime_ready) {
 #ifdef SYS_stat64
-    return (int)syscall(SYS_stat64, path, buf);
+    return (int)repro_macos_real_syscall(SYS_stat64, (long)path, (long)buf,
+                                         0, 0, 0, 0, 0);
 #else
-    return (int)syscall(SYS_stat, path, buf);
+    return (int)repro_macos_real_syscall(SYS_stat, (long)path, (long)buf,
+                                         0, 0, 0, 0, 0);
 #endif
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
@@ -5008,9 +5121,11 @@ static int repro_wrap_stat(const char *path, struct stat *buf) {
 static int repro_wrap_lstat(const char *path, struct stat *buf) {
   if (!repro_monitor_runtime_ready) {
 #ifdef SYS_lstat64
-    return (int)syscall(SYS_lstat64, path, buf);
+    return (int)repro_macos_real_syscall(SYS_lstat64, (long)path, (long)buf,
+                                         0, 0, 0, 0, 0);
 #else
-    return (int)syscall(SYS_lstat, path, buf);
+    return (int)repro_macos_real_syscall(SYS_lstat, (long)path, (long)buf,
+                                         0, 0, 0, 0, 0);
 #endif
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
@@ -5029,8 +5144,10 @@ static int repro_wrap_lstat(const char *path, struct stat *buf) {
 
 static pid_t repro_wrap_fork(void) {
   if (!repro_monitor_runtime_ready) {
-    repro_real_fork_fn real_fn = (repro_real_fork_fn)dlsym(RTLD_NEXT, "fork");
-    return real_fn();
+    if (!repro_libsystem_fork_fn)
+      repro_libsystem_fork_fn = (pid_t (*)(void))
+        repro_macos_resolve_libsystem_symbol("_fork");
+    return repro_libsystem_fork_fn ? repro_libsystem_fork_fn() : -1;
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_fork_fn)
@@ -5048,7 +5165,8 @@ static pid_t repro_wrap_fork(void) {
 
 static int repro_wrap_rename(const char *from, const char *to) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_rename, from, to);
+    return (int)repro_macos_real_syscall(SYS_rename, (long)from, (long)to,
+                                         0, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_rename_fn)
@@ -5067,7 +5185,8 @@ static int repro_wrap_rename(const char *from, const char *to) {
 static int repro_wrap_renameat(int fromfd, const char *from, int tofd,
                                const char *to) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_renameat, fromfd, from, tofd, to);
+    return (int)repro_macos_real_syscall(SYS_renameat, fromfd, (long)from,
+                                         tofd, (long)to, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_renameat_fn)
@@ -5090,7 +5209,8 @@ static int repro_wrap_renameat(int fromfd, const char *from, int tofd,
  * recording repro_hook_*, which forwards via the raw syscall. */
 static int repro_wrap_mkdir(const char *path, mode_t mode) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_mkdir, path, mode);
+    return (int)repro_macos_real_syscall(SYS_mkdir, (long)path, mode,
+                                         0, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_mkdir_fn)
@@ -5108,7 +5228,8 @@ static int repro_wrap_mkdir(const char *path, mode_t mode) {
 
 static int repro_wrap_mkdirat(int dirfd, const char *path, mode_t mode) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_mkdirat, dirfd, path, mode);
+    return (int)repro_macos_real_syscall(SYS_mkdirat, dirfd, (long)path, mode,
+                                         0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_mkdirat_fn)
@@ -5126,7 +5247,8 @@ static int repro_wrap_mkdirat(int dirfd, const char *path, mode_t mode) {
 
 static int repro_wrap_rmdir(const char *path) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_rmdir, path);
+    return (int)repro_macos_real_syscall(SYS_rmdir, (long)path,
+                                         0, 0, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_rmdir_fn)
@@ -5144,7 +5266,8 @@ static int repro_wrap_rmdir(const char *path) {
 
 static int repro_wrap_unlink(const char *path) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_unlink, path);
+    return (int)repro_macos_real_syscall(SYS_unlink, (long)path,
+                                         0, 0, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_unlink_fn)
@@ -5162,7 +5285,8 @@ static int repro_wrap_unlink(const char *path) {
 
 static int repro_wrap_unlinkat(int dirfd, const char *path, int flags) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_unlinkat, dirfd, path, flags);
+    return (int)repro_macos_real_syscall(SYS_unlinkat, dirfd, (long)path,
+                                         flags, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_unlinkat_fn)
@@ -5180,7 +5304,8 @@ static int repro_wrap_unlinkat(int dirfd, const char *path, int flags) {
 
 static int repro_wrap_symlink(const char *target, const char *linkpath) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_symlink, target, linkpath);
+    return (int)repro_macos_real_syscall(SYS_symlink, (long)target,
+                                         (long)linkpath, 0, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_symlink_fn)
@@ -5199,7 +5324,8 @@ static int repro_wrap_symlink(const char *target, const char *linkpath) {
 static int repro_wrap_symlinkat(const char *target, int dirfd,
                                 const char *linkpath) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_symlinkat, target, dirfd, linkpath);
+    return (int)repro_macos_real_syscall(SYS_symlinkat, (long)target, dirfd,
+                                         (long)linkpath, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_symlinkat_fn)
@@ -5217,7 +5343,8 @@ static int repro_wrap_symlinkat(const char *target, int dirfd,
 
 static int repro_wrap_execve(const char *path, char *const argv[], char *const envp[]) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_execve, path, argv, envp);
+    return (int)repro_macos_real_syscall(SYS_execve, (long)path, (long)argv,
+                                         (long)envp, 0, 0, 0, 0);
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_execve_fn)
@@ -5249,7 +5376,7 @@ static void repro_wrap_exit_(int status) {
   if (repro_monitor_runtime_ready) {
     repro_hook_exit(status); /* flushes, then raw SYS_exit — never returns */
   }
-  syscall(SYS_exit, status);
+  (void)repro_macos_real_syscall(SYS_exit, status, 0, 0, 0, 0, 0, 0);
   __builtin_unreachable();
 }
 
@@ -5261,9 +5388,12 @@ static int repro_wrap_posix_spawn(pid_t *pid, const char *path,
   const posix_spawnattr_t *attrp,
   char *const argv[], char *const envp[]) {
   if (!repro_monitor_runtime_ready) {
-    repro_real_posix_spawn_fn real_fn =
-      (repro_real_posix_spawn_fn)dlsym(RTLD_NEXT, "posix_spawn");
-    return real_fn(pid, path, file_actions, attrp, argv, envp);
+    if (!repro_libsystem_posix_spawn_fn)
+      repro_libsystem_posix_spawn_fn = (repro_real_posix_spawn_fn)
+        repro_macos_resolve_libsystem_symbol("_posix_spawn");
+    return repro_libsystem_posix_spawn_fn
+      ? repro_libsystem_posix_spawn_fn(pid, path, file_actions, attrp, argv, envp)
+      : -1;
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_posix_spawn_fn)
@@ -5286,9 +5416,12 @@ static int repro_wrap_posix_spawnp(pid_t *pid, const char *path,
   const posix_spawnattr_t *attrp,
   char *const argv[], char *const envp[]) {
   if (!repro_monitor_runtime_ready) {
-    repro_real_posix_spawn_fn real_fn =
-      (repro_real_posix_spawn_fn)dlsym(RTLD_NEXT, "posix_spawnp");
-    return real_fn(pid, path, file_actions, attrp, argv, envp);
+    if (!repro_libsystem_posix_spawnp_fn)
+      repro_libsystem_posix_spawnp_fn = (repro_real_posix_spawn_fn)
+        repro_macos_resolve_libsystem_symbol("_posix_spawnp");
+    return repro_libsystem_posix_spawnp_fn
+      ? repro_libsystem_posix_spawnp_fn(pid, path, file_actions, attrp, argv, envp)
+      : -1;
   }
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_posix_spawnp_fn)
@@ -5322,7 +5455,8 @@ static int repro_wrap_posix_spawnp(pid_t *pid, const char *path,
  */
 static int repro_wrap_clonefile(const char *src, const char *dst, int flags) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_clonefileat, AT_FDCWD, src, AT_FDCWD, dst, flags);
+    return (int)repro_macos_real_syscall(SYS_clonefileat, AT_FDCWD, (long)src,
+                                         AT_FDCWD, (long)dst, flags, 0, 0);
   }
   return repro_hook_clonefile((char *)src, (char *)dst, flags);
 }
@@ -5330,7 +5464,8 @@ static int repro_wrap_clonefile(const char *src, const char *dst, int flags) {
 static int repro_wrap_clonefileat(int srcfd, const char *src, int dstfd,
                                   const char *dst, int flags) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_clonefileat, srcfd, src, dstfd, dst, flags);
+    return (int)repro_macos_real_syscall(SYS_clonefileat, srcfd, (long)src,
+                                         dstfd, (long)dst, flags, 0, 0);
   }
   return repro_hook_clonefileat(srcfd, (char *)src, dstfd, (char *)dst, flags);
 }
@@ -5338,14 +5473,16 @@ static int repro_wrap_clonefileat(int srcfd, const char *src, int dstfd,
 static int repro_wrap_fclonefileat(int srcfd, int dstfd, const char *dst,
                                    int flags) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_fclonefileat, srcfd, dstfd, dst, flags);
+    return (int)repro_macos_real_syscall(SYS_fclonefileat, srcfd, dstfd,
+                                         (long)dst, flags, 0, 0, 0);
   }
   return repro_hook_fclonefileat(srcfd, dstfd, (char *)dst, flags);
 }
 
 static int repro_wrap_link(const char *src, const char *dst) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_link, src, dst);
+    return (int)repro_macos_real_syscall(SYS_link, (long)src, (long)dst,
+                                         0, 0, 0, 0, 0);
   }
   return repro_hook_link((char *)src, (char *)dst);
 }
@@ -5353,7 +5490,8 @@ static int repro_wrap_link(const char *src, const char *dst) {
 static int repro_wrap_linkat(int fd1, const char *src, int fd2,
                              const char *dst, int flag) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_linkat, fd1, src, fd2, dst, flag);
+    return (int)repro_macos_real_syscall(SYS_linkat, fd1, (long)src, fd2,
+                                         (long)dst, flag, 0, 0);
   }
   return repro_hook_linkat(fd1, (char *)src, fd2, (char *)dst, flag);
 }
@@ -5361,10 +5499,8 @@ static int repro_wrap_linkat(int fd1, const char *src, int fd2,
 static int repro_wrap_copyfile(const char *from, const char *to,
                                copyfile_state_t state, copyfile_flags_t flags) {
   if (!repro_monitor_runtime_ready) {
-    int (*real)(const char *, const char *, copyfile_state_t, copyfile_flags_t)
-      = (int (*)(const char *, const char *, copyfile_state_t,
-                 copyfile_flags_t))dlsym(RTLD_NEXT, "copyfile");
-    return real ? real(from, to, state, flags) : -1;
+    return repro_macos_real_copyfile_call((char *)from, (char *)to,
+                                          (void *)state, (uint32_t)flags);
   }
   return repro_hook_copyfile((char *)from, (char *)to, (void *)state,
     (uint32_t)flags);
@@ -5373,10 +5509,8 @@ static int repro_wrap_copyfile(const char *from, const char *to,
 static int repro_wrap_fcopyfile(int from, int to, copyfile_state_t state,
                                 copyfile_flags_t flags) {
   if (!repro_monitor_runtime_ready) {
-    int (*real)(int, int, copyfile_state_t, copyfile_flags_t)
-      = (int (*)(int, int, copyfile_state_t, copyfile_flags_t))
-          dlsym(RTLD_NEXT, "fcopyfile");
-    return real ? real(from, to, state, flags) : -1;
+    return repro_macos_real_fcopyfile_call(from, to, (void *)state,
+                                           (uint32_t)flags);
   }
   return repro_hook_fcopyfile(from, to, (void *)state, (uint32_t)flags);
 }
@@ -5384,7 +5518,8 @@ static int repro_wrap_fcopyfile(int from, int to, copyfile_state_t state,
 static int repro_wrap_getattrlist(const char *path, void *al, void *buf,
                                   size_t size, unsigned long opts) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_getattrlist, path, al, buf, size, opts);
+    return (int)repro_macos_real_syscall(SYS_getattrlist, (long)path, (long)al,
+                                         (long)buf, (long)size, (long)opts, 0, 0);
   }
   return repro_hook_getattrlist((char *)path, al, buf, size, opts);
 }
@@ -5392,7 +5527,9 @@ static int repro_wrap_getattrlist(const char *path, void *al, void *buf,
 static int repro_wrap_getattrlistat(int fd, const char *path, void *al,
                                     void *buf, size_t size, unsigned long opts) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_getattrlistat, fd, path, al, buf, size, opts);
+    return (int)repro_macos_real_syscall(SYS_getattrlistat, fd, (long)path,
+                                         (long)al, (long)buf, (long)size,
+                                         (long)opts, 0);
   }
   return repro_hook_getattrlistat(fd, (char *)path, al, buf, size, opts);
 }
@@ -5400,7 +5537,8 @@ static int repro_wrap_getattrlistat(int fd, const char *path, void *al,
 static int repro_wrap_fgetattrlist(int fd, void *al, void *buf, size_t size,
                                    unsigned long opts) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_fgetattrlist, fd, al, buf, size, opts);
+    return (int)repro_macos_real_syscall(SYS_fgetattrlist, fd, (long)al,
+                                         (long)buf, (long)size, (long)opts, 0, 0);
   }
   return repro_hook_fgetattrlist(fd, al, buf, size, opts);
 }
@@ -5408,7 +5546,8 @@ static int repro_wrap_fgetattrlist(int fd, void *al, void *buf, size_t size,
 static int repro_wrap_getattrlistbulk(int dirfd, void *al, void *buf,
                                       size_t size, uint64_t opts) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_getattrlistbulk, dirfd, al, buf, size, opts);
+    return (int)repro_macos_real_syscall(SYS_getattrlistbulk, dirfd, (long)al,
+                                         (long)buf, (long)size, (long)opts, 0, 0);
   }
   return repro_hook_getattrlistbulk(dirfd, al, buf, size, opts);
 }
@@ -5426,7 +5565,8 @@ static int repro_wrap_getattrlistbulk(int dirfd, void *al, void *buf,
 static int repro_wrap_connect(int fd, const struct sockaddr *addr,
                               socklen_t addrlen) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_connect, fd, addr, addrlen);
+    return (int)repro_macos_real_syscall(SYS_connect, fd, (long)addr,
+                                         addrlen, 0, 0, 0, 0);
   }
   return repro_hook_connect(fd, (void *)addr, (unsigned int)addrlen);
 }
@@ -5449,19 +5589,22 @@ static int repro_wrap_pipe(int fds[2]) {
 static int repro_wrap_socketpair(int domain, int type, int protocol,
                                  int sv[2]) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_socketpair, domain, type, protocol, sv);
+    return (int)repro_macos_real_syscall(SYS_socketpair, domain, type, protocol,
+                                         (long)sv, 0, 0, 0);
   }
   return repro_hook_socketpair(domain, type, protocol, sv);
 }
 static int repro_wrap_socket(int domain, int type, int protocol) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_socket, domain, type, protocol);
+    return (int)repro_macos_real_syscall(SYS_socket, domain, type, protocol,
+                                         0, 0, 0, 0);
   }
   return repro_hook_socket(domain, type, protocol);
 }
 static int repro_wrap_accept(int s, struct sockaddr *addr, socklen_t *addrlen) {
   if (!repro_monitor_runtime_ready) {
-    return (int)syscall(SYS_accept, s, addr, addrlen);
+    return (int)repro_macos_real_syscall(SYS_accept, s, (long)addr,
+                                         (long)addrlen, 0, 0, 0, 0);
   }
   return repro_hook_accept(s, (void *)addr, (unsigned int *)addrlen);
 }
@@ -5472,8 +5615,7 @@ static int repro_wrap_accept(int s, struct sockaddr *addr, socklen_t *addrlen) {
  * runtime is live, then branch to the recording repro_hook_*. These are
  * INTERPOSE-ONLY (bootstrap_look_up / xpc_connection_create_mach_service are not
  * thin syscall wrappers and are not body-patched), so the not-ready forward uses
- * the shim-skipping genuine-entry forwarder (which itself falls back to
- * dlsym(RTLD_NEXT) so the program never breaks). Like the other hardening thunks
+ * the shim-skipping genuine-entry forwarder. Like the other hardening thunks
  * they omit the debug-only interpose-DISABLE A/B forward.
  */
 static kern_return_t repro_wrap_bootstrap_look_up(mach_port_t bp,
@@ -5491,7 +5633,7 @@ static xpc_connection_t repro_wrap_xpc_connection_create_mach_service(
       (char *)name, (void *)targetq, (unsigned long long)flags);
   }
   return (xpc_connection_t)repro_hook_xpc_connection_create_mach_service(
-    (char *)name, (void *)targetq, (unsigned long long)flags);
+     (char *)name, (void *)targetq, (unsigned long long)flags);
 }
 
 /*
@@ -5651,7 +5793,7 @@ static time_t repro_wrap_time(time_t *tloc) {
 static int repro_wrap_secrandom(const void *rnd, size_t count, void *bytes) {
   void *ra = __builtin_return_address(0);
   if (!repro_monitor_runtime_ready)
-    return repro_macos_real_secrandom_call(rnd, count, bytes);
+    return repro_macos_real_secrandom_call((void *)rnd, count, bytes);
   return repro_hook_secrandom((void *)rnd, count, bytes, ra);
 }
 
@@ -5669,7 +5811,8 @@ static int repro_wrap_ccrandom(void *bytes, size_t count) {
  * (interpose + body-patch) share the recording hook. */
 static int repro_wrap_statfs(const char *path, struct statfs *buf) {
   if (!repro_monitor_runtime_ready)
-    return (int)syscall(SYS_statfs64, path, buf);
+    return (int)repro_macos_real_syscall(SYS_statfs64, (long)path, (long)buf,
+                                         0, 0, 0, 0, 0);
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_statfs_fn)
       repro_libsystem_statfs_fn = (int (*)(const char *, struct statfs *))
@@ -5689,7 +5832,8 @@ static int repro_wrap_statfs(const char *path, struct statfs *buf) {
 
 static int repro_wrap_fstatfs(int fd, struct statfs *buf) {
   if (!repro_monitor_runtime_ready)
-    return (int)syscall(SYS_fstatfs64, fd, buf);
+    return (int)repro_macos_real_syscall(SYS_fstatfs64, fd, (long)buf,
+                                         0, 0, 0, 0, 0);
   if (REPRO_INTERPOSE_FORWARD_BEGIN) {
     if (!repro_libsystem_fstatfs_fn)
       repro_libsystem_fstatfs_fn = (int (*)(int, struct statfs *))
@@ -5717,53 +5861,58 @@ static int repro_wrap_fstatfs(int fd, struct statfs *buf) {
 static ssize_t repro_wrap_getxattr(const char *path, const char *name,
     void *value, size_t size, uint32_t position, int options) {
   if (!repro_monitor_runtime_ready)
-    return (ssize_t)syscall(SYS_getxattr, path, name, value, size, position,
-      options);
+    return (ssize_t)repro_macos_real_syscall(SYS_getxattr, (long)path,
+      (long)name, (long)value, (long)size, position, options, 0);
   return repro_hook_getxattr((char *)path, (char *)name, value, size, position,
     options);
 }
 static ssize_t repro_wrap_fgetxattr(int fd, const char *name, void *value,
     size_t size, uint32_t position, int options) {
   if (!repro_monitor_runtime_ready)
-    return (ssize_t)syscall(SYS_fgetxattr, fd, name, value, size, position,
-      options);
+    return (ssize_t)repro_macos_real_syscall(SYS_fgetxattr, fd, (long)name,
+      (long)value, (long)size, position, options, 0);
   return repro_hook_fgetxattr(fd, (char *)name, value, size, position, options);
 }
 static ssize_t repro_wrap_listxattr(const char *path, char *namebuf,
     size_t size, int options) {
   if (!repro_monitor_runtime_ready)
-    return (ssize_t)syscall(SYS_listxattr, path, namebuf, size, options);
+    return (ssize_t)repro_macos_real_syscall(SYS_listxattr, (long)path,
+      (long)namebuf, (long)size, options, 0, 0, 0);
   return repro_hook_listxattr((char *)path, namebuf, size, options);
 }
 static ssize_t repro_wrap_flistxattr(int fd, char *namebuf, size_t size,
     int options) {
   if (!repro_monitor_runtime_ready)
-    return (ssize_t)syscall(SYS_flistxattr, fd, namebuf, size, options);
+    return (ssize_t)repro_macos_real_syscall(SYS_flistxattr, fd,
+      (long)namebuf, (long)size, options, 0, 0, 0);
   return repro_hook_flistxattr(fd, namebuf, size, options);
 }
 static int repro_wrap_setxattr(const char *path, const char *name, void *value,
     size_t size, uint32_t position, int options) {
   if (!repro_monitor_runtime_ready)
-    return (int)syscall(SYS_setxattr, path, name, value, size, position,
-      options);
+    return (int)repro_macos_real_syscall(SYS_setxattr, (long)path, (long)name,
+      (long)value, (long)size, position, options, 0);
   return repro_hook_setxattr((char *)path, (char *)name, value, size, position,
     options);
 }
 static int repro_wrap_fsetxattr(int fd, const char *name, void *value,
     size_t size, uint32_t position, int options) {
   if (!repro_monitor_runtime_ready)
-    return (int)syscall(SYS_fsetxattr, fd, name, value, size, position, options);
+    return (int)repro_macos_real_syscall(SYS_fsetxattr, fd, (long)name,
+      (long)value, (long)size, position, options, 0);
   return repro_hook_fsetxattr(fd, (char *)name, value, size, position, options);
 }
 static int repro_wrap_removexattr(const char *path, const char *name,
     int options) {
   if (!repro_monitor_runtime_ready)
-    return (int)syscall(SYS_removexattr, path, name, options);
+    return (int)repro_macos_real_syscall(SYS_removexattr, (long)path,
+      (long)name, options, 0, 0, 0, 0);
   return repro_hook_removexattr((char *)path, (char *)name, options);
 }
 static int repro_wrap_fremovexattr(int fd, const char *name, int options) {
   if (!repro_monitor_runtime_ready)
-    return (int)syscall(SYS_fremovexattr, fd, name, options);
+    return (int)repro_macos_real_syscall(SYS_fremovexattr, fd, (long)name,
+      options, 0, 0, 0, 0);
   return repro_hook_fremovexattr(fd, (char *)name, options);
 }
 
@@ -5779,31 +5928,36 @@ static int repro_wrap_shm_open(const char *name, int oflag, ...) {
     va_end(ap);
   }
   if (!repro_monitor_runtime_ready)
-    return (int)syscall(SYS_shm_open, name, oflag, mode);
+    return (int)repro_macos_real_syscall(SYS_shm_open, (long)name, oflag,
+      mode, 0, 0, 0, 0);
   return repro_hook_shm_open((char *)name, oflag, mode);
 }
 
 static int repro_wrap_sendfile(int fd, int s, off_t offset, off_t *len,
     void *hdtr, int flags) {
   if (!repro_monitor_runtime_ready)
-    return (int)syscall(SYS_sendfile, fd, s, offset, len, hdtr, flags);
+    return (int)repro_macos_real_syscall(SYS_sendfile, fd, s, (long)offset,
+      (long)len, (long)hdtr, flags, 0);
   return repro_hook_sendfile(fd, s, (long long)offset, (long long *)len, hdtr,
     flags);
 }
 static ssize_t repro_wrap_pread(int fd, void *buf, size_t count, off_t offset) {
   if (!repro_monitor_runtime_ready)
-    return (ssize_t)syscall(SYS_pread, fd, buf, count, offset);
+    return (ssize_t)repro_macos_real_syscall(SYS_pread, fd, (long)buf,
+      (long)count, (long)offset, 0, 0, 0);
   return repro_hook_pread(fd, buf, count, (long long)offset);
 }
 static ssize_t repro_wrap_preadv(int fd, const struct iovec *iov, int iovcnt,
     off_t offset) {
   if (!repro_monitor_runtime_ready)
-    return (ssize_t)syscall(SYS_preadv, fd, iov, iovcnt, offset);
+    return (ssize_t)repro_macos_real_syscall(SYS_preadv, fd, (long)iov,
+      iovcnt, (long)offset, 0, 0, 0);
   return repro_hook_preadv(fd, (void *)iov, iovcnt, (long long)offset);
 }
 static ssize_t repro_wrap_readv(int fd, const struct iovec *iov, int iovcnt) {
   if (!repro_monitor_runtime_ready)
-    return (ssize_t)syscall(SYS_readv, fd, iov, iovcnt);
+    return (ssize_t)repro_macos_real_syscall(SYS_readv, fd, (long)iov,
+      iovcnt, 0, 0, 0, 0);
   return repro_hook_readv(fd, (void *)iov, iovcnt);
 }
 
@@ -5813,28 +5967,33 @@ static ssize_t repro_wrap_readv(int fd, const struct iovec *iov, int iovcnt) {
 static ssize_t repro_wrap_pwrite(int fd, const void *buf, size_t count,
     off_t offset) {
   if (!repro_monitor_runtime_ready)
-    return (ssize_t)syscall(SYS_pwrite, fd, buf, count, offset);
+    return (ssize_t)repro_macos_real_syscall(SYS_pwrite, fd, (long)buf,
+      (long)count, (long)offset, 0, 0, 0);
   return repro_hook_pwrite(fd, (void *)buf, count, (long long)offset);
 }
 static ssize_t repro_wrap_pwritev(int fd, const struct iovec *iov, int iovcnt,
     off_t offset) {
   if (!repro_monitor_runtime_ready)
-    return (ssize_t)syscall(SYS_pwritev, fd, iov, iovcnt, offset);
+    return (ssize_t)repro_macos_real_syscall(SYS_pwritev, fd, (long)iov,
+      iovcnt, (long)offset, 0, 0, 0);
   return repro_hook_pwritev(fd, (void *)iov, iovcnt, (long long)offset);
 }
 static ssize_t repro_wrap_writev(int fd, const struct iovec *iov, int iovcnt) {
   if (!repro_monitor_runtime_ready)
-    return (ssize_t)syscall(SYS_writev, fd, iov, iovcnt);
+    return (ssize_t)repro_macos_real_syscall(SYS_writev, fd, (long)iov,
+      iovcnt, 0, 0, 0, 0);
   return repro_hook_writev(fd, (void *)iov, iovcnt);
 }
 static int repro_wrap_ftruncate(int fd, off_t length) {
   if (!repro_monitor_runtime_ready)
-    return (int)syscall(SYS_ftruncate, fd, length);
+    return (int)repro_macos_real_syscall(SYS_ftruncate, fd, (long)length,
+      0, 0, 0, 0, 0);
   return repro_hook_ftruncate(fd, (long long)length);
 }
 static int repro_wrap_truncate(const char *path, off_t length) {
   if (!repro_monitor_runtime_ready)
-    return (int)syscall(SYS_truncate, path, length);
+    return (int)repro_macos_real_syscall(SYS_truncate, (long)path, (long)length,
+      0, 0, 0, 0, 0);
   return repro_hook_truncate((char *)path, (long long)length);
 }
 
@@ -5885,6 +6044,23 @@ extern void reproRuntimeInit(char **envp);
 
 __attribute__((constructor))
 static void repro_monitor_shim_constructor(int argc, const char **argv, char **envp) {
+  /*
+   * When nested monitoring loads multiple distinct shim images via
+   * DYLD_INSERT_LIBRARIES=<shimA>:<shimB>, dyld applies each image's
+   * __DATA,__interpose table in order so the LAST shim image (`shimB`) wins the
+   * monitored program's Mach-O import stubs, while dyld runs constructors in
+   * load order (`shimA` first, `shimB` last). If both shims initialised their
+   * Nim runtime, fragment writer, and body-patch hooks, both would open the same
+   * `<pid>-<tid>.iomon-frag` file and overwrite each other's libSystem
+   * prologues. Mark this image constructed and yield if another loaded shim
+   * image has not run its constructor yet, so only the last shim image (`shimB`,
+   * which owns the program's interpose bindings) activates while earlier shim
+   * images remain pure pass-throughs (`repro_monitor_runtime_ready == 0`).
+   */
+  repro_macos_this_shim_constructed = 1;
+  if (repro_macos_later_shim_is_pending()) {
+    return;
+  }
   NimMain();
   reproRuntimeInit(envp);
   repro_monitor_runtime_ready = 1;
@@ -5916,13 +6092,6 @@ static void repro_monitor_shim_constructor(int argc, const char **argv, char **e
    */
   _dyld_register_func_for_add_image(
     (void (*)(const struct mach_header *, intptr_t))repro_hook_dyld_add_image);
-  /* ROUND-3 S3b — the register call above delivered the FULL link-time dependency
-   * closure synchronously (one callback per already-loaded image). Mark the initial
-   * burst done so every SUBSEQUENT callback is a dlopen'd image: the entropy
-   * caller-attribution registers a non-system image's __TEXT range ONLY for those
-   * dlopen'd extensions (a pass-plugin), never for the trusted link-time toolchain
-   * runtime (libLLVM/libc++), keeping a normal cc/clang compile mcComplete. */
-  repro_macos_mark_addimage_burst_done();
 }
 
 /*

@@ -2,6 +2,10 @@
   description = "Filesystem and process monitoring library and tools";
 
   inputs = {
+    # Keep the shipped SIP replacements available when a child has an empty PATH.
+    stackable-hooks-macos-tools = {
+      url = "github:metacraft-labs/stackable-hooks-macos-tools/1ad378d58776ec9b6cc73e1c27b8e53c15676f03";
+    };
     nixos-modules.url = "github:metacraft-labs/devops-modules";
     nixpkgs.follows = "nixos-modules/nixpkgs-unstable";
     flake-parts.follows = "nixos-modules/flake-parts";
@@ -11,11 +15,11 @@
       # source: captured-output lifetime, initialized injection permits and
       # one preparation per executable page. Match .github/sibling-repos,
       # the ordinary Windows checkout and the committed Repro lock.
-      url = "github:metacraft-labs/nim-stackable-hooks/a043a07f71a9b662c6ae9bae7837107e6c1ade67";
+      url = "github:metacraft-labs/nim-stackable-hooks/3af63afc5c0b55a27fc5e0a26f3a32833caf8873";
       flake = false;
     };
     shm-queue-src = {
-      url = "github:metacraft-labs/nim-shm-queue/02f442ac12ce2587d9c053c527041097af38609f";
+      url = "github:metacraft-labs/nim-shm-queue/a3564c13e0b7d0c6a092c19c998cd3faee5ce20a";
       flake = false;
     };
     shm-gset-src = {
@@ -39,7 +43,12 @@
       ];
 
       perSystem =
-        { pkgs, config, ... }:
+        {
+          pkgs,
+          config,
+          system,
+          ...
+        }:
         let
           version = builtins.replaceStrings [ "\n" "\r" ] [ "" "" ] (builtins.readFile ./version.txt);
           # git-hooks.nix installs `.pre-commit-config.yaml` and git hooks into
@@ -96,6 +105,66 @@
           nimble = pkgs.nimble.overrideAttrs (old: {
             nimFlags = (old.nimFlags or [ ]) ++ [ "-d:sslVersion=3" ];
           });
+          # On macOS 26 the ASan runtime of nixpkgs' compiler-rt 21.1.8 hangs
+          # every instrumented program before main: InitializeShadowMemory ->
+          # get_dyld_hdr walks the shared cache with
+          # dyld_shared_cache_iterate_text, whose _Block_copy mallocs, and that
+          # malloc re-enters AsanInitFromRtl and spins on the init mutex it
+          # holds. scripts/run_sanitizer_tests.sh then never runs a test
+          # (metacraft-pm issues/2026-10-01-nix-compiler-rt-asan-startup-hangs-on-macos-26.md).
+          # Upstream LLVM 2e7d07a33725 ("Adopt _dyld_get_dyld_header", first
+          # released in 22.1.3) asks dyld for its header instead; this is that
+          # change backported to 21.x, minus its lib/tsan/go/buildgo.sh hunk
+          # (the Go race runtime, which this CMake build does not produce).
+          # Darwin only: on Linux the dev shell's derivation changes only by
+          # the flake.nix hash its git-hook guard embeds.
+          #
+          # The patched runtime must replace the one the stdenv's wrapper
+          # links into its resource-root, which is NOT
+          # `pkgs.llvmPackages.compiler-rt` (a different derivation), so it is
+          # taken from the wrapper's own arguments. Evaluation fails rather
+          # than silently shipping the hang if the wrapper stops having
+          # exactly one compiler-rt, if the replacement does not take, or once
+          # compiler-rt leaves 21.x: at 22.1.3+ the fix is upstream and this
+          # whole override should be deleted.
+          # tests/test_dev_shell_asan_program_reaches_main.sh
+          darwinSanitizerCc = pkgs.stdenv.cc.override (
+            old:
+            let
+              inherit (pkgs) lib;
+              crts = builtins.filter (p: lib.hasPrefix "compiler-rt" (p.pname or "")) old.extraPackages;
+              crt =
+                if builtins.length crts == 1 then
+                  builtins.head crts
+                else
+                  throw "io-mon flake.nix: expected exactly one compiler-rt in stdenv.cc's extraPackages, found ${toString (builtins.length crts)}; re-derive the ASan startup-hang override";
+              patched =
+                if lib.versions.major crt.version == "21" then
+                  crt.overrideAttrs (a: {
+                    patches = (a.patches or [ ]) ++ [ ./nix/patches/compiler-rt-21-darwin-dyld-get-dyld-header.patch ];
+                  })
+                else
+                  throw "io-mon flake.nix: stdenv.cc's compiler-rt is ${crt.version}, not 21.x. 22.1.3+ carries the _dyld_get_dyld_header fix upstream: drop darwinSanitizerCc and its patch; otherwise port the patch.";
+              extraBuildCommands = builtins.replaceStrings [ "${crt}" ] [ "${patched}" ] old.extraBuildCommands;
+            in
+            if
+              extraBuildCommands == old.extraBuildCommands
+              || lib.hasInfix (builtins.unsafeDiscardStringContext "${crt}") extraBuildCommands
+            then
+              throw "io-mon flake.nix: stdenv.cc's resource-root no longer links ${crt}; re-derive the ASan startup-hang override"
+            else
+              {
+                inherit extraBuildCommands;
+                extraPackages = map (p: if p.outPath == crt.outPath then patched else p) old.extraPackages;
+              }
+          );
+          # The dev shell's `cc`/`clang`, and so the sanitizer arm's, is
+          # darwinSanitizerCc on Darwin.
+          mkDevShell =
+            if pkgs.stdenv.isDarwin then
+              pkgs.mkShell.override { stdenv = pkgs.overrideCC pkgs.stdenv darwinSanitizerCc; }
+            else
+              pkgs.mkShell;
         in
         {
           pre-commit.settings.hooks = {
@@ -120,9 +189,18 @@
               pkgs.nim2
             ];
 
+            STACKABLE_HOOKS_BUILT_TOOLS_DIR =
+              if pkgs.stdenv.isDarwin then
+                "${inputs.stackable-hooks-macos-tools.packages.${system}.default}"
+              else
+                "";
             STACKABLE_HOOKS_SRC = "${inputs.stackable-hooks-src}/src";
             SHM_QUEUE_SRC = "${inputs.shm-queue-src}/src";
             SHM_GSET_SRC = "${inputs.shm-gset-src}/src";
+
+            postPatch = ''
+              patchShebangs scripts/build_shim.sh
+            '';
 
             buildPhase = ''
               runHook preBuild
@@ -144,7 +222,12 @@
             '';
           };
 
-          devShells.default = pkgs.mkShell {
+          devShells.default = mkDevShell {
+            STACKABLE_HOOKS_BUILT_TOOLS_DIR =
+              if pkgs.stdenv.isDarwin then
+                "${inputs.stackable-hooks-macos-tools.packages.${system}.default}"
+              else
+                "";
             RELEASE_STACKABLE_HOOKS_SRC = "${inputs.stackable-hooks-src}/src";
             RELEASE_SHM_QUEUE_SRC = "${inputs.shm-queue-src}/src";
             RELEASE_SHM_GSET_SRC = "${inputs.shm-gset-src}/src";

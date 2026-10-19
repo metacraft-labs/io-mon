@@ -80,7 +80,7 @@ after a task exception.
 `repro build .#test-monitor-isolation --write-report=build/monitor-isolation-repeat.json`
 reruns the programs whose fixture must own its monitor environment. Their
 compilation stays monitored and their execution stays uncached. CI requires
-all selected programs to launch and succeed on the repeat: 45 on macOS, nine
+all selected programs to launch and succeed on the repeat: 48 on macOS, nine
 on Linux and eight on Windows. Update that explicit inventory when adding an
 isolated program; keep the complete report among failure artifacts.
 
@@ -100,6 +100,29 @@ just test-portable
 just test-platform
 ```
 
+### Check the dev shell itself
+
+```sh
+just test-dev-shell
+```
+
+These tests run `nix develop` themselves, so start them from a shell that has
+`nix` and `bash`; they are not part of `just test`. CI runs them after
+`just test` in the Nix-flavoured _Test_ jobs on Linux and macOS
+(`.github/workflows/ci.yml`, step _Run dev-shell tests_).
+
+- `tests/test_dev_shell_writes_nothing_elsewhere.sh`: entering the dev shell
+  from another git repository writes no files or git hooks there.
+- `tests/test_dev_shell_nimble_runs_tasks.sh`: the dev shell's `nimble` runs a
+  package task. Stock nixpkgs nimble 0.20.1 crashes with SIGSEGV on Darwin
+  before running any task, because it passes a system LibreSSL TLS method to
+  Nix OpenSSL 3; `flake.nix` builds it with `-d:sslVersion=3`.
+- `tests/test_dev_shell_asan_program_reaches_main.sh`: a C program built by
+  the dev shell's `cc` and `clang` with `-fsanitize=address,undefined` reaches
+  main and exits 0, and ASan reports a control heap overflow. On macOS 26
+  nixpkgs' compiler-rt 21.1.8 hangs every such program before main; a timeout
+  fails the test and names that hang (see §4).
+
 ---
 
 ## 4. Memory safety: the sanitizer arm
@@ -116,6 +139,22 @@ UndefinedBehaviorSanitizer**. CI runs it on every push and pull request to
 arm rather than a flag on `just test` because the instrumented builds are
 slower, and because it grades a class of defect the ordinary suite
 structurally cannot.
+
+**On macOS the dev shell's compiler carries a patched compiler-rt.** The ASan
+runtime of nixpkgs' compiler-rt 21.1.8 hangs every instrumented program before
+main on macOS 26: `get_dyld_hdr` walks the dyld shared cache, the walk's
+`_Block_copy` mallocs, and the malloc re-enters ASan's initializer, which
+spins on its own init mutex. The arm then never runs a test. `flake.nix`
+rebuilds the Darwin stdenv's compiler-rt with a backport of LLVM
+`2e7d07a33725` ("Adopt `_dyld_get_dyld_header`", upstream from 22.1.3) and
+makes that the shell's `cc`/`clang`; evaluation fails once compiler-rt is no
+longer 21.x, when the patch should be dropped.
+`tests/test_dev_shell_asan_program_reaches_main.sh` is the regression test.
+Measured 2026-10-18 on macOS 26.5.2 arm64: run against the dev shell of
+io-mon `4e988af` (before this change, runtime
+`3ph0blg…-compiler-rt-libc-21.1.8`), the test fails because its program did
+not reach main within 30 s; against `4e988af` plus this change it passes, and
+this arm is **rc=0, 29 files, 0 failed** in 186 s.
 
 **What it is for.** `src/io_mon/codec.nim` moves string bodies and
 fixed-width header fields with `copyMem`. A wrong _size_ on one of those

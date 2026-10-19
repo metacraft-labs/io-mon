@@ -29,6 +29,7 @@
 ## `mcComplete`. Keeping the two domains in separate tests keeps each one's
 ## ground truth independent of io-mon.
 
+import descendant_guard_expectations
 import std/[os, osproc, sequtils, sets, streams, strtabs, strutils, unittest]
 
 import io_mon
@@ -141,7 +142,7 @@ int main(void) { printf("%d\n", TOP_VALUE); return 0; }
     # (b) The capture is honest and usable.
     require fileExists(depfile)
     let dep = readMonitorDepFile(depfile)
-    check dep.completeness == mcComplete
+    check subsystemEvidence(dep).completeness == mcComplete
 
     # READ-SIDE records only. Deliberately NOT "any record mentioning the path":
     # a header that io-mon merely `stat`ed (an `mrPathProbe`) is not evidence

@@ -94,8 +94,9 @@ removes that marker only after writing, checking the buffered close and
 atomically publishing the completed evidence fragment. A killed host, abandoned
 handle or failed publication therefore leaves the outer capture incomplete.
 This handoff requires a cooperating host to finish its monitor; it does not
-provide live event delivery from an unfinished inner session or a macOS
-detached-descendant guard.
+provide live event delivery from an unfinished inner session. macOS and Windows
+finish fail incomplete with an explicit tree-lifetime uncertainty marker, even
+for a quiesced root; see the normative descendant guard contract in `usage.md`.
 
 Implementation: `src/io_mon/nested_capture.nim` and `fs_snoop.nim`.
 The real-process controls are in

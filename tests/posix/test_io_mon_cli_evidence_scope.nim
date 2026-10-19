@@ -44,6 +44,7 @@ import std/[options, os, osproc, sequtils, sets, streams, strtabs, strutils,
             unittest]
 
 import io_mon
+import descendant_guard_expectations
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
@@ -212,10 +213,12 @@ suite "io-mon CLI evidence scope (DA-1i, live)":
     # category removes the records a loss is derived from. This axis cannot:
     # no completeness-bearing record is an existence lookup, so the grade is
     # invariant under the narrowing, and DA-1i's withdrawn first draft — which
-    # forced `mcIncomplete` — would redden here.
+    # forced `mcIncomplete` — would redden here on Linux. On platforms that
+    # already fail closed, compare the remaining evidence grade as well.
     checkpoint("completeness: full=" & $full.completeness &
       " narrow=" & $narrow.completeness)
     check narrow.completeness == full.completeness
+    check subsystemEvidence(narrow).completeness == subsystemEvidence(full).completeness
 
     # ── THE STAMPS ──────────────────────────────────────────────────────────
     # The two files are now distinguishable by a consumer. Deleting the stamp

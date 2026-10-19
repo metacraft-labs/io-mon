@@ -212,9 +212,11 @@ suite "io-mon macOS ROUND-3 S2 fd/path fidelity":
     test "S2a fstatat(dirfd, rel) records the canonical absolute path (p_fstat)":
       let bin = compileProbe(work, fdCorpus / "p_fstat.c", "p_fstat")
       let res = runProbe(shim, bin)
-      # The bare relative component is still recorded (additive)…
-      check hasObs(res.records, "marker_fstat.txt", {moPathProbe})
-      # …AND the canonical absolute companion is now present (the round-2 residual).
+      # The bare relative component is no longer recorded: the probe itself is
+      # anchored on the dirfd's directory at call time (anchoredPath), so no
+      # consumer has to guess what it was relative to…
+      check not hasObs(res.records, "marker_fstat.txt", {moPathProbe})
+      # …and the canonical absolute path is present (the round-2 residual).
       check hasObs(res.records, canonFstat, {moPathProbe})
 
     # --- S2b — every open canonicalised (reads AND writes) ---------------------

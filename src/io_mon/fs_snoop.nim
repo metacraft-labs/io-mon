@@ -806,7 +806,7 @@ when defined(macosx):
       return command
     if not ct_propagation.isSipProtected(interpreter):
       return command
-    let sandboxInterpreter = ct_propagation.rewriteSipPath(interpreter,
+    let sandboxInterpreter = ct_propagation.resolveSipReplacement(interpreter,
       sandboxDir)
     if sandboxInterpreter == interpreter or
         not fileExists(sandboxInterpreter):
@@ -1717,7 +1717,7 @@ proc waitForMonitorRoot(h: var MonitorHandle) =
       recordRootExit(h, h.injection.exitCode)
 
 proc settleMonitorDescendants(h: var MonitorHandle) =
-  ## The §4.1 detached-descendant grace (Linux). Idempotent.
+  ## The §4.1 detached-descendant guard. Idempotent.
   ##
   ## This is an EVIDENCE step, not a safety step, which is why the evidence
   ## funnel runs it and a dropped handle's destructor does not: what it produces
@@ -1750,12 +1750,17 @@ proc settleMonitorDescendants(h: var MonitorHandle) =
       if h.depSetLive and h.depSet.available: h.depSet.path0 else: ""
     waitForLinuxInjectedDescendants(h.fragmentDir, h.runId, h.rootPid,
       h.rootStartTicks, launcherLossPath0)
-  else:
-    # macOS and Windows have no §4.1 equivalent yet — the detached-descendant
-    # scan is a `/proc` walk. The STEP still runs (and still marks the handle),
-    # so an arm that grows a real guard later inherits the gate below for free
-    # rather than having to remember to re-add it.
-    discard
+  elif defined(macosx) or defined(windows):
+    # Root exit proves nothing about a detached descendant. Neither backend
+    # owns a kernel tree-lifetime primitive or a complete descendant census;
+    # even a run with no observed spawn cannot prove that no child escaped.
+    # Publish before the merge, so every finish path fails incomplete.
+    appendFragmentRecord(h.fragmentDir, MonitorRecord(
+      kind: mrEventLoss, observationKind: moEventLoss,
+      osPid: uint64(getCurrentProcessId()),
+      detail: "detached-descendant quiescence cannot be established: " &
+        (when defined(macosx): "macos" else: "windows") &
+        " backend has no complete tree-lifetime guard run=" & h.runId))
 
 proc releaseMonitor(h: var MonitorHandle) =
   ## Release everything the monitor owns: mark the consumer gone and unmap it,

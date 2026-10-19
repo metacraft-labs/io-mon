@@ -206,6 +206,18 @@ jobs:
             dev-exec just test 2>&1 | tee test.log
           fi
 
+      - name: Run dev-shell tests
+        # The dev shell itself is under test here: its nimble must run a task
+        # (tests/test_dev_shell_nimble_runs_tasks.sh; on Darwin an unpinned TLS
+        # lookup made it SIGSEGV before any task), entering it from another
+        # repository must write nothing there, and its compiler's ASan+UBSan
+        # programs must reach main (tests/test_dev_shell_asan_program_reaches_main.sh;
+        # on macOS 26 compiler-rt 21's ASan hung before main). The scripts run `nix develop`,
+        # so they are not part of `just test` and only the Nix flavour has them.
+        if: matrix.env == 'nix'
+        shell: bash
+        run: dev-exec just test-dev-shell 2>&1 | tee -a test.log
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -250,7 +262,7 @@ jobs:
         with:
           repository: metacraft-labs/nim-stackable-hooks
           # Keep in lockstep with stackable-hooks-src in flake.nix.
-          ref: a043a07f71a9b662c6ae9bae7837107e6c1ade67
+          ref: 3af63afc5c0b55a27fc5e0a26f3a32833caf8873
           path: nim-stackable-hooks
           token: ${{ steps.app-token.outputs.token }}
       - uses: actions/checkout@v4
@@ -262,8 +274,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: metacraft-labs/nim-shm-gset
-          # Same revision as .github/sibling-repos.
-          ref: cf0adf2f39647f5b203b2ab694414a3c50e93951
+          # Same revision as .github/sibling-repos and shm-gset-src in flake.nix.
+          ref: 43a61120ae54b542c3e3038453094cca707a6c05
           path: nim-shm-gset
           token: ${{ steps.app-token.outputs.token }}
 

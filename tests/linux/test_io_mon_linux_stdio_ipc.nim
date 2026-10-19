@@ -2249,12 +2249,14 @@ int main(void) {
       check cli.code == 0
     let shimLib = buildPrivateLinuxShim(repoRoot)
 
+    # sched_yield, not getpid: getpid is now classified (a pure query of the
+    # caller's own pid). The point is a syscall the classifier has no entry
+    # for, which must still fail closed.
     let probe = buildC(work, "raw_unknown_syscall", """
 #include <sys/syscall.h>
 #include <unistd.h>
 int main(void) {
-  long pid = syscall(SYS_getpid);
-  return pid > 0 ? 0 : 2;
+  return syscall(SYS_sched_yield) == 0 ? 0 : 2;
 }
 """)
     let depfile = work / "raw-unknown.iomon"
