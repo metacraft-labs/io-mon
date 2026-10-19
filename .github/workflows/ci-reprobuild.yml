@@ -123,11 +123,13 @@ jobs:
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
         with:
           env-flavor: reprobuild
-          # Exercise the published bootstrap repairs before a new CLI release.
+          # macOS needs the corrected Nim producer source selection and the
+          # RunQuota revision declared by that engine; its POSIX bootstrap
+          # retains the engine's own io-mon source pin.
           # Windows ARM64 keeps the existing emulated x64 Reprobuild tools.
           repro-from-source: true
-          repro-build-pin: 1f85ace0037d0a70e966fe8eee645d766522b1ab
-          repro-runquota-pin: 292e578d57eb85d6037f9e2d3a03f0bcb0489dbb
+          repro-build-pin: ${{ matrix.os == 'macos' && 'e679fa157604097bdb306fa80b2683a977648480' || '1f85ace0037d0a70e966fe8eee645d766522b1ab' }}
+          repro-runquota-pin: ${{ matrix.os == 'macos' && '416274abe4cda8ec9aef7dca9165cfb8c25a1846' || '292e578d57eb85d6037f9e2d3a03f0bcb0489dbb' }}
           repro-io-mon-pin: 5e71adf033b860c0fdbe13dda4320cf4a580f632
           repro-posix-io-mon-pin: ${{ matrix.os == 'linux' && '004b8fc3eb0a6c31f78622272ba323c221b79b28' || '' }}
           gh-token: ${{ steps.ci_token.outputs.token }}
