@@ -143,10 +143,9 @@ package io_mon:
     # Naming the two workspace repos here makes reprobuild build each from
     # source (their ``library stackable_hooks`` / ``library shm_queue``) and
     # thread their ``src/`` roots onto this repo's ``nim c --path:`` via the
-    # ``nimPathDirs`` aux channel — replacing ``config.nims``'s hardcoded
-    # ``--path:../nim-stackable-hooks/src`` + ``$SHM_QUEUE_SRC`` for the
-    # engine-driven compile (``config.nims`` is not read by the engine's build
-    # edges, only by a plain ``nimble``/``nim c`` invocation). The scripted
+    # ``nimPathDirs`` aux channel. The engine restores these selected roots
+    # ahead of fallback paths configured by ``config.nims``, which Nim also
+    # reads for engine-driven compiles. The scripted
     # shim edge still resolves ``$STACKABLE_HOOKS_SRC`` itself.
     "nim-stackable-hooks"
     "nim-shm-queue"
@@ -235,9 +234,9 @@ package io_mon:
       source = "cmd/io_mon_snoop.nim",
       binary = cliOutput,
       threadsOn = true,
-      # ``src`` reproduces ``config.nims``'s ``switch("path", "src")`` for the
-      # engine compile (which does not read ``config.nims``). The sibling
-      # ``stackable_hooks`` / ``shm_queue`` ``src`` roots ride in automatically
+      # Keep the consumer's own source path explicit. The sibling
+      # ``stackable_hooks`` / ``shm_queue`` roots take precedence over
+      # configured fallbacks and ride in automatically
       # via the ``uses:`` ``nimPathDirs`` channel.
       paths = @["src"],
       extraInputs = @["src", "io_mon.nimble"],
