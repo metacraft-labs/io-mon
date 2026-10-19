@@ -198,6 +198,10 @@
             SHM_QUEUE_SRC = "${inputs.shm-queue-src}/src";
             SHM_GSET_SRC = "${inputs.shm-gset-src}/src";
 
+            postPatch = ''
+              patchShebangs scripts/build_shim.sh
+            '';
+
             buildPhase = ''
               runHook preBuild
               just build
