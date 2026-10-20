@@ -31,12 +31,17 @@
 ##      inline-syscall trap; x86_64), and glibc's clone(3) wrapper (whose
 ##      system call is made inside libc). It must finish, preloaded and under
 ##      `io-mon run`, with every child exiting, within its time limit.
+##   3. A mismatched `REPRO_MONITOR_SHIM_LIB` on the preloaded timeout
+##      wrapper injects a second distinct shim at exec. Both images must let
+##      the stress host's raw-clone children finish. The host reports its
+##      actual loaded-image count so this cannot silently become a one-image
+##      test. Same-path, unset and nonexistent overrides are controls.
 ##
 ## Mocks: none. The hosts are real programs and the shim is the built
 ## library; the selftest forges lock states because the races it stands in
 ## for cannot be scheduled from outside.
 
-import std/[os, osproc, streams, strtabs, strutils, unittest]
+import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon
 import unmonitored_env
@@ -115,6 +120,7 @@ const stressHostSource = """
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <link.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -133,6 +139,13 @@ static const char *file;
 static atomic_int stop, failed;
 static atomic_long calls, signals_seen, forks, clones, inline_clones,
     libc_clones;
+
+static int count_shim(struct dl_phdr_info *info, size_t size, void *data) {
+  (void)size;
+  if (strstr(info->dlpi_name, "librepro_monitor_shim.so") != NULL)
+    ++*(int *)data;
+  return 0;
+}
 
 /* Hooked calls the shim records, and nothing that allocates from the host's
  * allocator: they also run in raw-clone children, where glibc's own malloc
@@ -281,6 +294,10 @@ static void *libc_cloner(void *arg) {
 
 int main(int argc, char **argv) {
   if (argc < 3) return 2;
+  int shim_images = 0;
+  dl_iterate_phdr(count_shim, &shim_images);
+  printf("shim_images=%d\n", shim_images);
+  fflush(stdout);
   file = argv[1];
   int seconds = atoi(argv[2]);
   struct sigaction sa;
@@ -359,6 +376,46 @@ suite "io-mon shim's private heap stays live":
       checkpoint(mode & " (exit " & $r.code & "):\n" & r.output)
       check "selftest result=0" in r.output
       check r.code == 0
+
+  test "t_raw_clone_children_survive_a_mismatched_shim_override":
+    let snoopBin = ensureSnoop(work)
+    for i, (mode, shimLib) in shims:
+      for overrideKind in ["different", "same", "unset", "missing"]:
+        var env = baseEnv()
+        env["LD_PRELOAD"] = shimLib
+        case overrideKind
+        of "different": env["REPRO_MONITOR_SHIM_LIB"] = shims[1 - i][1]
+        of "same": env["REPRO_MONITOR_SHIM_LIB"] = shimLib
+        of "missing": env["REPRO_MONITOR_SHIM_LIB"] = work / "nonexistent.so"
+        else: discard
+        # timeout is intentionally injected too: its exec is the boundary
+        # that propagates the mismatched override into a second loaded image.
+        let r = runHost(@[stressHost, marker, "3"], env)
+        checkpoint(mode & ", override=" & overrideKind & " (exit " &
+          $r.code & "):\n" & r.output)
+        check r.code == 0
+        check "HANG" notin r.output
+        check "stress done" in r.output
+        check countAfter(r.output, "shim_images=") ==
+          (if overrideKind == "different": 2 else: 1)
+        check countAfter(r.output, "clones=") > 0
+        when defined(amd64):
+          check countAfter(r.output, "inline_clones=") > 0
+      var monitoredEnv = baseEnv()
+      monitoredEnv["LD_PRELOAD"] = shimLib
+      monitoredEnv["REPRO_MONITOR_SHIM_LIB"] = shims[1 - i][1]
+      let depfile = work / ("mismatched-" & mode & ".iomon")
+      let captured = runHost(@[snoopBin, "run", "--depfile", depfile, "--",
+        stressHost, marker, "3"], monitoredEnv)
+      checkpoint(mode & ", monitored mismatch (exit " & $captured.code &
+        "):\n" & captured.output)
+      check captured.code == 0
+      check countAfter(captured.output, "shim_images=") == 2
+      let dep = readMonitorDepFile(depfile)
+      check dep.completeness == mcIncomplete
+      check dep.records.anyIt(it.kind == mrEventLoss and
+        "distinct loaded shim subscriber" in it.detail and
+        "REPRO_MONITOR_SHIM_LIB mismatch" in it.detail)
 
   test "t_private_heap_survives_signals_forks_and_raw_clones":
     let bare = runHost(@[stressHost, marker, "2"], baseEnv())

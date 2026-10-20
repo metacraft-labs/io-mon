@@ -1086,6 +1086,10 @@ typedef int (*ct_raw_fork_sample_fn)(void);
 typedef void (*ct_raw_fork_child_fn)(int parentSingleThreaded);
 static ct_raw_fork_sample_fn ct_raw_fork_sample = NULL;
 static ct_raw_fork_child_fn ct_raw_fork_child = NULL;
+static long ct_raw_syscall6(long nr, long a1, long a2, long a3, long a4,
+                            long a5, long a6);
+static int ct_raw_fork_reset_pid = 0;
+static int ct_raw_subscriber_fork_pid = 0;
 void ct_linux_preload_register_raw_fork(ct_raw_fork_sample_fn sample,
                                         ct_raw_fork_child_fn child) {
   ct_raw_fork_sample = sample;
@@ -1127,6 +1131,39 @@ static void ct_raw_fork_child_reset(void) {
   ct_raw_owner_after_fork_child();
   if (repro_linux_private_heap_after_raw_fork_child != NULL)
     repro_linux_private_heap_after_raw_fork_child();
+  ct_raw_fork_reset_pid = (int)ct_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
+}
+
+/* The process-wide syscall owner already notifies its own image, but V2
+ * subscribers receive only the completed syscall. Its successful child
+ * return is also a lifecycle notification: reset THIS image before its first
+ * Nim callback or queued event can touch an inherited lock. The owner sampled
+ * its parent's thread count, not ours, so an unnotified subscriber uses the
+ * conservative multi-threaded path and reports any skipped evidence.
+ *
+ * PID is only a deduplication key after a proven private-address-space fork;
+ * a new PID alone is not sufficient (vfork/CLONE_VM share the parent's heap).
+ * This also works when the process-wide owner is an older V2 image. */
+void ct_linux_preload_after_raw_fork_syscall(long nr, long a1, long result)
+    __attribute__((visibility("hidden")));
+void ct_linux_preload_after_raw_fork_syscall(long nr, long a1, long result) {
+  if (result != 0 || !ct_raw_call_forks_process(nr, a1)) return;
+  int saved_errno = errno;
+  int pid = (int)ct_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
+  if (ct_raw_fork_reset_pid == pid) return;
+  ct_raw_fork_child_reset();
+  ct_raw_subscriber_fork_pid = pid;
+  if (ct_raw_fork_child != NULL) ct_raw_fork_child(0);
+  errno = saved_errno;
+}
+
+static ct_raw_syscall_hook_fn ct_raw_user_hook = NULL;
+static void ct_raw_dispatch(long nr, long a1, long a2, long a3, long a4,
+                            long a5, long a6, long result, int source) {
+  ct_linux_preload_after_raw_fork_syscall(nr, a1, result);
+  ct_raw_syscall_hook_fn hook = __atomic_load_n(&ct_raw_user_hook,
+                                               __ATOMIC_ACQUIRE);
+  if (hook != NULL) hook(nr, a1, a2, a3, a4, a5, a6, result, source);
 }
 
 static void ct_raw_owner_after_raw_fork(long nr, long a1, long result) {
@@ -1153,9 +1190,6 @@ static void ct_raw_owner_after_raw_fork(long nr, long a1, long result) {
 static void *ct_resolve(const char *name) {
   return stackable_linux_preload_resolve_next(name);
 }
-
-static long ct_raw_syscall6(long nr, long a1, long a2, long a3, long a4,
-                            long a5, long a6);
 
 /* Reserve `max` bytes of the capture arena; -1 when they do not fit. */
 static long ct_raw_arena_reserve(unsigned long max) {
@@ -1554,20 +1588,22 @@ static void ct_report_unclassified_inline_events(void) {
  * is incomplete rather than complete without the child's reads. Armed by the
  * shim at init (`ct_linux_preload_arm_fork_skip_loss_report`), after the
  * inline report, whose fragment directory it shares. */
-static unsigned char ct_fork_skip_loss_frame[CT_INLINE_LOSS_FRAME_CAP];
-static long ct_fork_skip_loss_frame_len = 0;   /* 0: not armed */
-static long ct_fork_skip_loss_pid_offset = -1;
-static long ct_fork_skip_loss_tid_offset = -1;
+typedef struct ct_fork_loss_frame {
+  unsigned char bytes[CT_INLINE_LOSS_FRAME_CAP];
+  long len;   /* 0: not armed */
+  long pid_offset, tid_offset;
+} ct_fork_loss_frame;
+static ct_fork_loss_frame ct_fork_skip_loss[2];
 static int ct_fork_skip_loss_reported_pid = 0;
 
 int ct_linux_preload_arm_fork_skip_loss_report(const unsigned char *frame,
                                                long frame_len, long pid_offset,
                                                long tid_offset)
     __attribute__((visibility("default")));
-int ct_linux_preload_arm_fork_skip_loss_report(const unsigned char *frame,
-                                               long frame_len, long pid_offset,
-                                               long tid_offset) {
-  __atomic_store_n(&ct_fork_skip_loss_frame_len, 0, __ATOMIC_RELEASE);
+static int ct_arm_fork_skip_loss_report(int subscriber,
+    const unsigned char *frame, long frame_len, long pid_offset, long tid_offset) {
+  ct_fork_loss_frame *slot = &ct_fork_skip_loss[subscriber];
+  __atomic_store_n(&slot->len, 0, __ATOMIC_RELEASE);
   if (ct_inline_loss_dir[0] != '/' || frame == NULL || frame_len <= 0 ||
       frame_len > CT_INLINE_LOSS_FRAME_CAP)
     return 0;
@@ -1578,27 +1614,37 @@ int ct_linux_preload_arm_fork_skip_loss_report(const unsigned char *frame,
     pid_offset = -1;
     tid_offset = -1;
   }
-  memcpy(ct_fork_skip_loss_frame, frame, (size_t)frame_len);
-  ct_fork_skip_loss_pid_offset = pid_offset;
-  ct_fork_skip_loss_tid_offset = tid_offset;
-  __atomic_store_n(&ct_fork_skip_loss_frame_len, frame_len, __ATOMIC_RELEASE);
+  memcpy(slot->bytes, frame, (size_t)frame_len);
+  slot->pid_offset = pid_offset;
+  slot->tid_offset = tid_offset;
+  __atomic_store_n(&slot->len, frame_len, __ATOMIC_RELEASE);
   return 1;
+}
+int ct_linux_preload_arm_fork_skip_loss_report(const unsigned char *frame,
+    long frame_len, long pid_offset, long tid_offset) {
+  return ct_arm_fork_skip_loss_report(0, frame, frame_len, pid_offset, tid_offset);
+}
+int ct_linux_preload_arm_subscriber_fork_skip_loss_report(const unsigned char *frame,
+    long frame_len, long pid_offset, long tid_offset)
+    __attribute__((visibility("hidden")));
+int ct_linux_preload_arm_subscriber_fork_skip_loss_report(const unsigned char *frame,
+    long frame_len, long pid_offset, long tid_offset) {
+  return ct_arm_fork_skip_loss_report(1, frame, frame_len, pid_offset, tid_offset);
 }
 
 void ct_linux_report_fork_child_skipped_evidence(void)
     __attribute__((visibility("default")));
 void ct_linux_report_fork_child_skipped_evidence(void) {
-  long frame_len = __atomic_load_n(&ct_fork_skip_loss_frame_len,
-                                   __ATOMIC_ACQUIRE);
-  if (frame_len <= 0) return;
   int saved_errno = errno;
   long pid = ct_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
+  ct_fork_loss_frame *slot = &ct_fork_skip_loss[ct_raw_subscriber_fork_pid == pid];
+  long frame_len = __atomic_load_n(&slot->len, __ATOMIC_ACQUIRE);
+  if (frame_len <= 0) { errno = saved_errno; return; }
   if (__atomic_load_n(&ct_fork_skip_loss_reported_pid, __ATOMIC_ACQUIRE) !=
       (int)pid) {
     long tid = ct_raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
-    if (ct_write_loss_frame(ct_fork_skip_loss_frame, frame_len,
-                            ct_fork_skip_loss_pid_offset,
-                            ct_fork_skip_loss_tid_offset,
+    if (ct_write_loss_frame(slot->bytes, frame_len,
+                            slot->pid_offset, slot->tid_offset,
                             "-fork-loss.iomon-frag", pid, tid))
       __atomic_store_n(&ct_fork_skip_loss_reported_pid, (int)pid,
                        __ATOMIC_RELEASE);
@@ -1650,6 +1696,7 @@ void ct_linux_preload_raw_enqueue_v1(long nr, const long *args,
     __attribute__((visibility("default")));
 void ct_linux_preload_raw_enqueue_v1(long nr, const long *args,
     long result, int source, unsigned long address) {
+  ct_linux_preload_after_raw_fork_syscall(nr, args[0], result);
   ct_record_raw_syscall_event(nr, args, result, source, address);
 }
 
@@ -2445,7 +2492,11 @@ void ct_linux_preload_register_execve_hook(ct_execve_hook_fn hook) { ct_execve_h
 void ct_linux_preload_register_posix_spawn_hook(ct_posix_spawn_hook_fn hook) { ct_posix_spawn_hook = hook; }
 void ct_linux_preload_register_posix_spawnp_hook(ct_posix_spawn_hook_fn hook) { ct_posix_spawnp_hook = hook; }
 void ct_linux_preload_register_exit_hook(ct_exit_hook_fn hook) { ct_exit_hook = hook; }
-void ct_linux_preload_register_raw_syscall_hook(ct_raw_syscall_hook_fn hook) { __atomic_store_n(&ct_raw_syscall_hook, hook, __ATOMIC_RELEASE); }
+void ct_linux_preload_register_raw_syscall_hook(ct_raw_syscall_hook_fn hook) {
+  __atomic_store_n(&ct_raw_user_hook, hook, __ATOMIC_RELEASE);
+  __atomic_store_n(&ct_raw_syscall_hook, hook != NULL ? ct_raw_dispatch : NULL,
+                    __ATOMIC_RELEASE);
+}
 
 void ct_linux_preload_real_exit(int status) __attribute__((noreturn));
 void ct_linux_preload_real_exit(int status) {
@@ -5993,6 +6044,10 @@ proc cArmForkSkipLossReport(frame: pointer; frameLen: clong;
                             pidOffset, tidOffset: clong): cint
   {.importc: "ct_linux_preload_arm_fork_skip_loss_report", nodecl,
     raises: [].}
+proc cArmSubscriberForkSkipLossReport(frame: pointer; frameLen: clong;
+                            pidOffset, tidOffset: clong): cint
+  {.importc: "ct_linux_preload_arm_subscriber_fork_skip_loss_report", nodecl,
+    raises: [].}
 proc cReportForkChildSkippedEvidence()
   {.importc: "ct_linux_report_fork_child_skipped_evidence", nodecl,
     raises: [].}
@@ -6635,15 +6690,20 @@ proc armInlineLossReport*(fragmentDir: string; frame: openArray[byte];
     clong(frame.len), clong(pidOffset), clong(tidOffset)) == 1
 
 proc armForkSkipLossReport*(frame: openArray[byte];
-                            pidOffset, tidOffset: int): bool {.raises: [].} =
+                            pidOffset, tidOffset: int;
+                            subscriber = false): bool {.raises: [].} =
   ## Hand the runtime the pre-encoded event-loss frame a fork child writes,
   ## with raw syscalls, when it skips a hook that would have produced
   ## evidence (`ct_linux_report_fork_child_skipped_evidence`). Call after
   ## `armInlineLossReport`, whose fragment directory it shares.
   if frame.len == 0:
     return false
-  cArmForkSkipLossReport(unsafeAddr frame[0], clong(frame.len),
-    clong(pidOffset), clong(tidOffset)) == 1
+  if subscriber:
+    cArmSubscriberForkSkipLossReport(unsafeAddr frame[0], clong(frame.len),
+      clong(pidOffset), clong(tidOffset)) == 1
+  else:
+    cArmForkSkipLossReport(unsafeAddr frame[0], clong(frame.len),
+      clong(pidOffset), clong(tidOffset)) == 1
 
 proc reportForkChildSkippedEvidence*() {.raises: [].} =
   ## Report, once per process, that this fork child skipped a hook that

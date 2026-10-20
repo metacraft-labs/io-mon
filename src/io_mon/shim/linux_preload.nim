@@ -983,6 +983,7 @@ int repro_linux_install_terminating_signal_handlers(void) {
 #include <stdint.h>
 
 extern int ct_linux_drain_inline_events_before_image_end(void);
+extern void ct_linux_preload_after_raw_fork_syscall(long, long, long);
 
 typedef long (*repro_libc_syscall_fn)(long, ...);
 static repro_libc_syscall_fn repro_real_libc_syscall = NULL;
@@ -1027,12 +1028,20 @@ long syscall(long number, ...) {
       ) {
     ct_linux_drain_inline_events_before_image_end();
   }
-  if (repro_real_libc_syscall != NULL)
-    return repro_real_libc_syscall(number, a0, a1, a2, a3, a4, a5);
+  if (repro_real_libc_syscall != NULL) {
+    long result = repro_real_libc_syscall(number, a0, a1, a2, a3, a4, a5);
+    /* An earlier image can own the libc patch while this entry point merely
+     * forwards. It still must recognize its own raw-fork child before the
+     * application resumes and reaches this image's other interposers. */
+    ct_linux_preload_after_raw_fork_syscall(number, a0, result);
+    return result;
+  }
   /* Fall back to the raw wrapper if libc's syscall wasn't dlsym-able
    * (extremely unusual — implies a statically-linked host or a stripped
    * libc). */
-  return repro_raw_syscall6(number, a0, a1, a2, a3, a4, a5);
+  long result = repro_raw_syscall6(number, a0, a1, a2, a3, a4, a5);
+  ct_linux_preload_after_raw_fork_syscall(number, a0, result);
+  return result;
 }
 
 extern void ct_linux_preload_prepare_real_connect(void);
@@ -2165,6 +2174,11 @@ proc armForkChildSkipLossReport(): bool {.raises: [].} =
     let encoded = encodeLossFrame(ForkChildSkippedEvidenceDetail)
     result = armForkSkipLossReport(encoded.frame, encoded.pidOffset,
       encoded.tidOffset)
+    let subscriber = encodeLossFrame(ForkChildSkippedEvidenceDetail &
+      ": distinct loaded shim subscriber (REPRO_MONITOR_SHIM_LIB mismatch)" &
+      " override=" & getEnv("REPRO_MONITOR_SHIM_LIB"))
+    result = armForkSkipLossReport(subscriber.frame, subscriber.pidOffset,
+      subscriber.tidOffset, subscriber = true) and result
   except CatchableError:
     result = false
 
@@ -4247,7 +4261,10 @@ proc repro_linux_raw_fork_child(parentSingleThreaded: cint)
   ## child keeps recording, as before.
   if parentSingleThreaded == 0:
     inForkChild = true
-    sampleKillDiag("raw-fork-child-multi")
+    # Keep this transition allocation-free and out of libc: another loaded
+    # shim has not necessarily received its own child notification yet.
+    # Diagnostics here could enter that image through an interposed helper
+    # before it knows to avoid the parent's inherited locks.
 
 proc ct_linux_preload_register_raw_fork(sample, child: pointer)
   {.importc, cdecl, raises: [].}
