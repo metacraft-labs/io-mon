@@ -47,6 +47,7 @@
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon
+import unmonitored_env
 import build_test_shim
 
 const
@@ -300,9 +301,7 @@ proc setUpFixture(tag: string; shimFlags: openArray[string] = []): Fixture =
   writeFile(result.noop & ".c", "int main(void) { return 0; }\n")
   let noopCc = run(cc, @[result.noop & ".c", "-o", result.noop])
   doAssert noopCc.code == 0, "noop build failed"
-  result.env = newStringTable(modeCaseSensitive)
-  for k, v in envPairs(): result.env[k] = v
-  result.env.del("LD_PRELOAD")
+  result.env = unmonitoredEnv()
   result.env["REPRO_MONITOR_SHIM_LIB"] = shimLib
 
 type Outcome = object

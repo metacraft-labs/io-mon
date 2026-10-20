@@ -58,7 +58,9 @@
 ##   4. `t_node_starts_under_preload_and_monitoring` — the reported symptom
 ##      on the real runtime: `node -e` must start without printing
 ##      `pthread_create: Invalid argument`, preloaded and monitored. Node is
-##      a declared dev-shell package; no network or Playwright is involved.
+##      a declared dev-shell package and a declared Linux tool of `repro.nim`,
+##      so a missing `node` fails the case; no network or Playwright is
+##      involved.
 ##
 ## Mocks: none. The real shim is built from source by `scripts/build_shim.sh`
 ## and injected into a real C program by the real `io-mon run` CLI; the only
@@ -70,6 +72,7 @@ import std/[os, osproc, sequtils, streams, strtabs, strutils, tables,
             unittest]
 
 import io_mon
+import unmonitored_env
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
@@ -117,11 +120,10 @@ proc ensureShim(): string =
   findShimLibrary()
 
 proc baseEnv(): StringTableRef =
-  result = newStringTable(modeCaseSensitive)
-  for k, v in envPairs(): result[k] = v
-  # A preload inherited from the test's own environment would make the
-  # "without the shim" baseline meaningless.
-  result.del("LD_PRELOAD")
+  ## A preload or monitor setting inherited from the test's own environment
+  ## would make the "without the shim" baseline meaningless (see
+  ## `unmonitored_env`). Monitored arms set `REPRO_MONITOR_SHIM_LIB` themselves.
+  unmonitoredEnv()
 
 proc readLe(data: string; off, width: int): uint64 =
   for i in countdown(width - 1, 0):
@@ -471,12 +473,14 @@ suite "io-mon shim static TLS vs small-stack host threads":
     # The reported symptom itself, on the real runtime: Node 24 sizes some of
     # its own threads explicitly and printed `pthread_create: Invalid
     # argument` under the shim. `nodejs` is a declared package of io-mon's dev
-    # shell (flake.nix), so its absence fails here rather than skipping.
+    # shell (flake.nix) and `node` a declared Linux tool of repro.nim, so its
+    # absence fails here rather than skipping. `require`, not `check`: running
+    # an empty path would raise OSError and abort the whole program.
     let shimLib = shims[1][1]   # the release build, the one that ships
     let snoopBin = ensureSnoop(work)
     let node = findExe("node")
     checkpoint("node: " & node)
-    check node.len > 0
+    require node.len > 0
     const okMarker = "io-mon-node-started"
     let script = "console.log('" & okMarker & "')"
 

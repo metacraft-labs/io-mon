@@ -80,9 +80,22 @@ after a task exception.
 `repro build .#test-monitor-isolation --write-report=build/monitor-isolation-repeat.json`
 reruns the programs whose fixture must own its monitor environment. Their
 compilation stays monitored and their execution stays uncached. CI requires
-all selected programs to launch and succeed on the repeat: 48 on macOS, nine
+all selected programs to launch and succeed on the repeat: 48 on macOS, 15
 on Linux and eight on Windows. Update that explicit inventory when adding an
 isolated program; keep the complete report among failure artifacts.
+
+A Linux test that runs a bare (shim-free) control, or loads a shim under test
+into its own children, must be in the isolation list (`isolatesMonitor` in
+`repro.nim`). Under `repro test` the test process itself runs under the outer
+monitor shim, which re-injects itself across `exec`, so removing `LD_PRELOAD`
+from a child's environment does not make that child bare: the control reports
+a shim loaded, and the shim under test loads beside the outer one. Such a test
+passes under `just test` and fails under `repro test`. Its bare and
+`LD_PRELOAD`-only children must also not inherit the outer monitor's exported
+`REPRO_MONITOR_*` settings: build their environment with `unmonitoredEnv()`
+(`tests/helpers/unmonitored_env.nim`), which drops `LD_PRELOAD` and every
+`REPRO_MONITOR_*` variable, and set `REPRO_MONITOR_SHIM_LIB` explicitly in each
+monitored arm.
 
 At `40a0adc` plus the workflow inventory repair, the macOS repeat passes all
 137 actions and launches all 45 isolated programs. The previous expectation

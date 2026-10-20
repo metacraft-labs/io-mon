@@ -50,6 +50,7 @@
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon
+import unmonitored_env
 import build_test_shim
 
 const
@@ -120,8 +121,7 @@ suite "io-mon Linux shim covers the entry points Node and Chromium use":
 
   proc monitor(depName: string; args: seq[string]; shellCmd = ""):
       tuple[dep: MonitorDepFile; output: string; code: int] =
-    var env = newStringTable(modeCaseSensitive)
-    for k, v in envPairs(): env[k] = v
+    var env = unmonitoredEnv()
     env["REPRO_MONITOR_SHIM_LIB"] = shimLib
     let depfile = work / (depName & ".iomon")
     let cap = run(snoopBin, @["run", "--depfile", depfile, "--"] & args, env)
@@ -250,8 +250,7 @@ int main(int argc, char **argv) {
 """)
     # The launcher runs OUTSIDE the monitor and execs `io-mon run`, so fd 9
     # reaches the monitored root from an out-of-tree creator.
-    var env = newStringTable(modeCaseSensitive)
-    for k, v in envPairs(): env[k] = v
+    var env = unmonitoredEnv()
     env["REPRO_MONITOR_SHIM_LIB"] = shimLib
     let innerDep = work / "anon-inotify.iomon"
     let outside = run(launcher, @[watched, snoopBin, "run", "--depfile",

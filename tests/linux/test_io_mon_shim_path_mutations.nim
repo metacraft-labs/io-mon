@@ -33,6 +33,7 @@
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon
+import unmonitored_env
 import build_test_shim
 
 const
@@ -217,9 +218,7 @@ suite "io-mon Linux shim: path mutations":
     checkpoint(cc.output)
     check cc.code == 0
 
-    var plainEnv = newStringTable(modeCaseSensitive)
-    for k, v in envPairs(): plainEnv[k] = v
-    plainEnv.del("LD_PRELOAD")
+    var plainEnv = unmonitoredEnv()
 
     # Results first: the same host, unmonitored and preloaded, must see the
     # same return values and errno.

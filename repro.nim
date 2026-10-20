@@ -122,6 +122,11 @@ package io_mon:
       "cctools"
       "python3"
     when defined(linux):
+      # tests/linux/test_io_mon_shim_static_tls_small_stack_threads.nim starts
+      # real Node under the shim. The dev shell (flake.nix) provides it for
+      # ``just test``; this entry is what puts it on the action's PATH under
+      # ``repro test``, where an undeclared tool is simply not found.
+      "node"
       "getconf"
       "grep"
       "nm"
@@ -330,7 +335,23 @@ package io_mon:
           # This suite builds and selects a private current shim. The same
           # fixture exits 139 with an enclosing shim and passes all 39 cases
           # under this policy (diagnostic e13a98f, Linux job 110498730972).
-          "test_io_mon_linux_stdio_ipc.nim"]) or
+          "test_io_mon_linux_stdio_ipc.nim",
+          # These build their own shim and compare a bare (shim-free) or
+          # LD_PRELOAD-only child with an io-mon-monitored one. Deleting
+          # LD_PRELOAD from the child environment does not make it bare: the
+          # outer monitor re-injects itself across exec, so the "bare" control
+          # of test_io_mon_shim_host_allocator_isolation reports
+          # `host shim-loaded=1`, and the shim under test loads beside the
+          # outer one (wrong completeness, missing records, exit 1). At io-mon
+          # 82061e82 with repro 0.2.6 all six fail under `repro test`, and
+          # all six pass when `repro build .#test-monitor-isolation` reruns
+          # them under this policy.
+          "test_io_mon_linux_host_entry_points.nim",
+          "test_io_mon_shim_fork_child_evidence.nim",
+          "test_io_mon_shim_host_allocator_isolation.nim",
+          "test_io_mon_shim_path_mutations.nim",
+          "test_io_mon_shim_private_heap.nim",
+          "test_io_mon_shim_static_tls_small_stack_threads.nim"]) or
         (defined(windows) and source.extractFilename in [
         "test_io_mon_cli_exit_status.nim",
         "test_io_mon_windows_exit_status.nim",
@@ -378,6 +399,8 @@ package io_mon:
       when defined(linux):
         appendRegisteredActionToolIdentityRefs(executeEdge.id,
           ["strace", "nm", "getconf", "grep", "mv", "rmdir"])
+        if stem == "test_io_mon_shim_static_tls_small_stack_threads":
+          appendRegisteredActionToolIdentityRefs(executeEdge.id, ["node"])
       testExecuteActions.add(executeEdge)
 
     # Portable tests — always in the graph.

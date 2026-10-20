@@ -84,6 +84,7 @@
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon
+import unmonitored_env
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
@@ -123,9 +124,10 @@ proc ensureSnoop(work: string): string =
     check cli.code == 0
 
 proc baseEnv(): StringTableRef =
-  result = newStringTable(modeCaseSensitive)
-  for k, v in envPairs(): result[k] = v
-  result.del("LD_PRELOAD")
+  ## The children's base environment: no preload and no inherited
+  ## `REPRO_MONITOR_*` setting of an enclosing monitor (see
+  ## `unmonitored_env`). Monitored arms set `REPRO_MONITOR_SHIM_LIB` themselves.
+  unmonitoredEnv()
 
 proc ensureShim(): string =
   let built = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
