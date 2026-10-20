@@ -1,5 +1,6 @@
-/* Relative-path operation driver for the relative-path anchoring test
- * (tests/macos/test_io_mon_macos_relative_path_anchor.nim).
+/* Relative-path operation driver for the relative-path anchoring tests
+ * (tests/macos/test_io_mon_macos_relative_path_anchor.nim and
+ * tests/linux/test_io_mon_linux_relative_directory_enumeration_anchor.nim).
  *
  * Each argument is "op:path" and is executed in order, so a test can chdir()
  * between operations and then name files by a path RELATIVE to the new cwd,
@@ -22,6 +23,12 @@
  *   openatd:P     openat(dirfd, P, O_RDONLY)
  *   fstatatd:P    fstatat(dirfd, P, 0)
  *   opendir:P     opendir(P) + readdir until the end + closedir
+ *   fdopendir:P   open(P, O_RDONLY|O_DIRECTORY) + fdopendir + readdir until
+ *                 the end + closedir
+ *   fdopendirdup:P  as fdopendir:P, but fdopendir reads a dup() of that fd
+ *                 and the original is closed first, so the DIR* reads a
+ *                 descriptor no open call returned (dup is not interposed:
+ *                 the shim never learns what it names)
  *   mkdir:P       mkdir(P, 0755)
  *   unlink:P      unlink(P)
  *   rename:A>B    rename(A, B)
@@ -133,6 +140,21 @@ int main(int argc, char **argv) {
         r = 0;
         while (readdir(d) != NULL) r++;
         closedir(d);
+      }
+    } else if (!strcmp(op, "fdopendir") || !strcmp(op, "fdopendirdup")) {
+      int fd = open(p, O_RDONLY | O_DIRECTORY);
+      if (fd >= 0 && !strcmp(op, "fdopendirdup")) {
+        int copy = dup(fd);
+        close(fd);
+        fd = copy;
+      }
+      DIR *d = fd >= 0 ? fdopendir(fd) : NULL;
+      if (d) {
+        r = 0;
+        while (readdir(d) != NULL) r++;
+        closedir(d); /* also closes fd */
+      } else if (fd >= 0) {
+        close(fd);
       }
     } else if (!strcmp(op, "mkdir")) {
       r = mkdir(p, 0755);

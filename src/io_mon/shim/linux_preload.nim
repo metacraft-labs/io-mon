@@ -2052,6 +2052,22 @@ proc classifyEmptyFdRead(fd: cint): bool {.raises: [].} =
     markEmptyFdClassified(fd)
   false
 
+proc kernelPathForFd(fd: cint): string {.raises: [].} =
+  ## The absolute path the kernel's `/proc/self/fd/<fd>` link names, or ""
+  ## when it names nothing attributable (no such fd, a deleted directory, a
+  ## pipe/socket/anon inode, or a path too long for the link to carry). For
+  ## a descriptor the shim did not see opened — inherited, opened inside
+  ## libc, a `dup` (not interposed), or opened before the shim initialised —
+  ## this is the only way to name it. The readlink is a raw syscall, so it
+  ## leaves `errno` alone.
+  # Heap, not a stack array — see `hookScratchString`.
+  var buf = hookScratchString()
+  if c_fd_proc_path(fd, addr buf[0], csize_t(buf.len)) == 0:
+    return ""
+  let resolved = $cast[cstring](addr buf[0])
+  if resolved.isAbsolute and not isLinuxDeletedProcFdTarget(resolved):
+    result = resolved
+
 proc pathForAt(dirfd: cint; path: cstring): string {.raises: [].} =
   if path == nil:
     return ""
@@ -2075,11 +2091,7 @@ proc pathForAt(dirfd: cint; path: cstring): string {.raises: [].} =
     # `recordRawGetdents` does. Joining the relative path onto nothing would
     # leave it relative, and a consumer resolves a relative path against the
     # action's working directory -- a different file.
-    var buf = hookScratchString()
-    if c_fd_proc_path(dirfd, addr buf[0], csize_t(buf.len)) != 0:
-      let resolved = $cast[cstring](addr buf[0])
-      if resolved.isAbsolute and not isLinuxDeletedProcFdTarget(resolved):
-        base = resolved
+    base = kernelPathForFd(dirfd)
   if base.len == 0:
     return raw
   result = base / raw
@@ -2800,12 +2812,9 @@ proc recordRawGetdents(fd: cint; callResult: clong;
     # shim initialised): ask the kernel which directory the fd names, as
     # `recoverNamedFdRead` does for reads. A deleted directory, or anything
     # that is not an absolute path, cannot be attributed: loss.
-    var buf = hookScratchString()
-    if c_fd_proc_path(fd, addr buf[0], csize_t(buf.len)) != 0:
-      let resolved = $cast[cstring](addr buf[0])
-      if resolved.isAbsolute and not isLinuxDeletedProcFdTarget(resolved):
-        path = resolved
-        updateFdPath(fd, cstring(resolved))
+    path = kernelPathForFd(fd)
+    if path.len > 0:
+      updateFdPath(fd, cstring(path))
   if path.len == 0:
     return false
   var record = baseRecord(mrDirectoryEnumerate, moDirectoryEnumerate)
@@ -3229,6 +3238,12 @@ proc repro_hook_lstat*(ctx: var StatContext) {.raises: [].} =
   emitProbe(ctx.path, ctx.result)
   c_set_errno(savedErrno)
 
+proc c_dirfd(dirp: pointer): cint
+  {.importc: "dirfd", header: "<dirent.h>", raises: [].}
+  ## dirfd(3): the descriptor a DIR* reads. A field access in glibc and musl
+  ## with no syscall; for an open DIR* it leaves errno alone (glibc sets
+  ## EINVAL only for a DIR* whose fd is -1). Not interposed by the shim.
+
 proc repro_hook_opendir*(ctx: var OpendirContext) {.raises: [].} =
   if bypassEvidence():
     callNext(ctx)
@@ -3236,7 +3251,24 @@ proc repro_hook_opendir*(ctx: var OpendirContext) {.raises: [].} =
   ensureInitializedPreservingErrno()
   callNext(ctx)
   let savedErrno = c_get_errno()
-  updateDirPath(ctx.result, ctx.path)
+  if ctx.result != nil:
+    # The stored path is what `repro_hook_readdir` records as the enumerated
+    # directory, so it must be anchored NOW, on the cwd the process has at
+    # the time of the call, exactly as `recordOpen` anchors a relative open.
+    # Storing the caller's spelling left `chdir("repo");
+    # opendir(".git/objects/pack")` (what `git -C repo` does) recorded as a
+    # relative path, which a consumer can only resolve against the action's
+    # cwd: a directory the process never looked at (reprobuild-pm issue
+    # 2026-10-20-linux-shim-anchors-relative-directory-enumerations-on-the-
+    # action-cwd). `pathForAt` keeps the spelling relative when getcwd cannot
+    # name the cwd; the kernel's name for the DIR*'s descriptor is the
+    # fallback then, and only a directory nothing can name stays as spelled.
+    var anchored = pathForAt(LinuxAtFdcwd, ctx.path)
+    if anchored.len > 0 and not anchored.isAbsolute:
+      let named = kernelPathForFd(c_dirfd(ctx.result))
+      if named.len > 0:
+        anchored = named
+    updateDirPath(ctx.result, cstring(anchored))
   c_set_errno(savedErrno)
 
 proc repro_hook_readdir*(ctx: var ReaddirContext) {.raises: [].} =
@@ -3244,7 +3276,16 @@ proc repro_hook_readdir*(ctx: var ReaddirContext) {.raises: [].} =
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
-  let dirPath = pathForDir(ctx.dirp)
+  var dirPath = pathForDir(ctx.dirp)
+  if dirPath.len == 0 and ctx.dirp != nil:
+    # A DIR* neither the opendir hook nor the fdopendir observer named (one
+    # opened while the shim bypassed evidence, or over a descriptor nothing
+    # can name at that point): name it by its descriptor now, and remember it
+    # so later entries do not ask again. Without this the enumeration is
+    # recorded with an empty path, which names no directory at all.
+    dirPath = kernelPathForFd(c_dirfd(ctx.dirp))
+    if dirPath.len > 0:
+      updateDirPath(ctx.dirp, cstring(dirPath))
   callNext(ctx)
   let savedErrno = c_get_errno()
   if ctx.result != nil:
@@ -4632,7 +4673,15 @@ proc repro_linux_observe_fdopendir(fd: cint; dirp: pointer)
   ## attribute its entries to that path.
   if bypassEvidence():
     return
-  let path = pathForFd(fd)
+  # The fd table holds the anchored path of every directory the shim saw
+  # opened. A descriptor it did not see opened (a `dup`, which is not
+  # interposed; an inherited fd; one opened inside libc) has no entry, and
+  # leaving the DIR* without a path made every later `readdir` record an
+  # EMPTY enumerated directory. Ask the kernel what the fd names instead, as
+  # `pathForAt`'s dirfd branch and `recordRawGetdents` do.
+  var path = pathForFd(fd)
+  if path.len == 0:
+    path = kernelPathForFd(fd)
   if path.len > 0:
     updateDirPath(dirp, cstring(path))
 
