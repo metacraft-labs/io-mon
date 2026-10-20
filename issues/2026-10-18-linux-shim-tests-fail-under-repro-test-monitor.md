@@ -2,7 +2,7 @@
 
 |             |                                                                                         |
 | ----------- | --------------------------------------------------------------------------------------- |
-| Status      | open                                                                                    |
+| Status | in-progress (nixos-ci-bare-002:fix-linux-shim-tests-fail-under-repro-test-m) |
 | Recorded    | 2026-10-18                                                                              |
 | Observed in | io-mon @ `0d7a07d` (`agents`), CI `Test (reprobuild, linux-x64)`                        |
 | Area        | `tests/linux/test_io_mon_shim_*`, `tests/linux/test_io_mon_linux_host_entry_points.nim` |
