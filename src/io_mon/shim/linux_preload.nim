@@ -17,7 +17,8 @@ when defined(ioMonGlibcPrivateHeap):
   {.passL: "-Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free".}
 
 import std/[locks, os, strutils]
-from io_mon/paths import extendedPath
+from io_mon/paths import anchoredRelativePath, extendedPath,
+  startsWithParentRef
 
 import io_mon/types
 import io_mon/writer
@@ -2069,6 +2070,31 @@ proc kernelPathForFd(fd: cint): string {.raises: [].} =
     result = resolved
 
 proc pathForAt(dirfd: cint; path: cstring): string {.raises: [].} =
+  ## `path` made absolute against the directory it resolved against at the
+  ## time of the call -- the working directory for `AT_FDCWD`, else
+  ## `dirfd`'s directory -- as the kernel resolved it. Spec: reprobuild-pm/
+  ## spec/Monitor-Hook-Shim.md § CWD And Path Context and § "Metadata, Probe,
+  ## And Symlink APIs". An absolute path is returned as is (the kernel
+  ## ignores `dirfd` for it); a relative one stays relative only when
+  ## nothing can name the anchor directory.
+  ##
+  ## The join is `anchoredRelativePath`: a LEADING `..` pops a component of
+  ## the anchor, and a `..` after a component of `path` is kept, because in
+  ## `link/../x` it applies to where `link` points. Nim's `os./` folded that
+  ## one too, and recorded `<cwd>/x` for a process that read the file beside
+  ## the link's target (reprobuild-pm issue 2026-10-21-linux-shim-folds-
+  ## dotdot-after-a-symlink-lexically). The macOS shim's
+  ## `repro_macos_anchored_path` records the same string.
+  ##
+  ## Popping is exact only on a symlink-free anchor. `getcwd` is one. For a
+  ## dirfd, the shim's recorded spelling (`pathForFd`) is the path the
+  ## process opened it by, and may end in a symlink or keep a `..` (a
+  ## directory opened as `link` or `link/../d`): popping it would be the
+  ## same fold. So when `path` starts with `..` the anchor is the kernel's
+  ## `/proc/self/fd` name for the descriptor. Otherwise nothing is popped
+  ## and the recorded spelling stays the base: it is exact as spelled, and a
+  ## file opened through a directory fd keeps the spelling that directory
+  ## was opened by.
   if path == nil:
     return ""
   let raw = $path
@@ -2081,9 +2107,16 @@ proc pathForAt(dirfd: cint; path: cstring): string {.raises: [].} =
       cast[clong](addr cwdBuf[0]), clong(cwdBuf.len), 0, 0, 0, 0)
     if n > 0:
       let cwd = $cast[cstring](addr cwdBuf[0])
+      # A getcwd answer that is not absolute ("(unreachable)/…", a cwd
+      # outside the process's root) names no directory to pop components
+      # off; `anchoredRelativePath` then keeps every `..` as spelled.
       if cwd.len > 0:
-        return cwd / raw
+        return anchoredRelativePath(cwd, raw)
     return raw
+  if raw.startsWithParentRef:
+    let named = kernelPathForFd(dirfd)
+    if named.len > 0:
+      return anchoredRelativePath(named, raw)
   var base = pathForFd(dirfd)
   if base.len == 0:
     # A directory fd the shim did not see opened (inherited, opened inside
@@ -2094,7 +2127,10 @@ proc pathForAt(dirfd: cint; path: cstring): string {.raises: [].} =
     base = kernelPathForFd(dirfd)
   if base.len == 0:
     return raw
-  result = base / raw
+  # Reached with a leading `..` only when the kernel could not name the
+  # directory (a deleted one): keep every `..` as spelled rather than pop a
+  # spelling that may end in a symlink.
+  result = anchoredRelativePath(base, raw, popLeadingParents = false)
 
 proc dirKey(dirp: pointer): uint =
   cast[uint](dirp)
@@ -3124,9 +3160,16 @@ proc classifyTrappedInlineEvent(index: int; number: clong;
   let raw = rawSyscallEventCapture(index, rcsPath)
   let base = rawSyscallEventCapture(index, rcsBase)
   let target = rawSyscallEventCapture(index, rcsTarget)
+  # The base is what `ct_raw_capture_fd` read when the call trapped: getcwd
+  # or the kernel's `/proc/self/fd` name, an absolute spelling with no
+  # symlink in it, so `anchoredRelativePath` may pop a leading `..` off it.
+  # It keeps a `..` that follows a component of the caller's path, which
+  # `os./` folded (`link/../x` recorded as `<base>/x`; reprobuild-pm issue
+  # 2026-10-21-linux-shim-folds-dotdot-after-a-symlink-lexically), exactly
+  # as `pathForAt` does for an interposed call.
   let absolute =
     if raw.ok and base.ok and raw.text.len > 0 and not raw.text.isAbsolute:
-      base.text / raw.text
+      anchoredRelativePath(base.text, raw.text)
     else:
       raw.text
   var how: LinuxOpenHow
@@ -4488,10 +4531,15 @@ const LinuxMaxSymlinkHops = 40
 proc unnormalizedPathForAt(dirfd: cint; path: cstring): string
     {.raises: [].} =
   ## `path` made absolute against `dirfd` (or the working directory) by plain
-  ## concatenation, "" when the base is unknown. Unlike `pathForAt`, whose
-  ## `os./` collapses `..` lexically, this keeps every component as spelled:
-  ## in `link/../x` the kernel resolves `..` against where `link` POINTS, so
-  ## dropping `link` before the walk would resolve a different path.
+  ## concatenation, "" when the base is unknown. It keeps every component as
+  ## spelled: in `link/../x` the kernel resolves `..` against where `link`
+  ## POINTS, so dropping `link` before the walk would resolve a different
+  ## path. `pathForAt` keeps that `..` too, but pops a LEADING `..` off its
+  ## anchor; the walk below starts at the base instead, so the base's own
+  ## components are walked (and probed) before a leading `..` leaves them.
+  ## The dirfd base is the shim's recorded spelling, which may itself hold a
+  ## symlink or a kept `..`; walked as spelled, it resolves as the kernel
+  ## did.
   let raw = $path
   if raw.isAbsolute:
     return raw

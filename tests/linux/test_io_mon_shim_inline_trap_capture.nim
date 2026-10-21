@@ -25,7 +25,9 @@
 ## file through a descriptor number it then closes and reuses for another file
 ## with libc. It ends four ways: by returning from `main`, by a libc `execv`,
 ## by an inline `exit_group` and by `syscall(SYS_exit_group)`. Each run must record every call on the path
-## the call used (absolute, under the host's tree), the symlink's target, the
+## the call used (absolute, under the host's tree; a `..` that follows a
+## symlink kept as spelled, never folded onto the text before it), the
+## symlink's target, the
 ## read on the file the descriptor named then, nothing under the overwritten
 ## or post-chdir names, no event-loss, and a complete capture.
 ##
@@ -118,6 +120,13 @@ int main(int argc, char **argv) {
            0) != 0)
     return 21;
   SPOIL();
+  /* `link` -> `sub/target`: the kernel opens `sub/input-e.txt`, beside the
+   * link's target, not the decoy `input-e.txt` beside the link. */
+  long efd = raw6(SYS_openat, AT_FDCWD, NAME("link/../input-e.txt"), O_RDONLY,
+                  0, 0, 0);
+  if (efd < 0) return 27;
+  raw6(SYS_close, efd, 0, 0, 0, 0, 0);
+  SPOIL();
   /* A descriptor libc opened, read inline, then closed and reused by libc
    * for another file that stays open until the end. */
   int cfd2 = open("input-c.txt", O_RDONLY);
@@ -183,6 +192,12 @@ suite "io-mon Linux shim: trapped inline syscalls are captured when they trap":
         createDir(tree)
         for name in ["a", "c", "d"]:
           writeFile(tree / ("input-" & name & ".txt"), "input " & name & "\n")
+        # `link/../input-e.txt` names `sub/input-e.txt`; the copy beside the
+        # link is the decoy a lexical fold of the `..` would record.
+        createDir(tree / "sub" / "target")
+        createSymlink("sub/target", tree / "link")
+        writeFile(tree / "sub" / "input-e.txt", "input e\n")
+        writeFile(tree / "input-e.txt", "decoy e\n")
         let depfile = work / (ending & ".iomon")
         let cap = run(snoopBin, @["run", "--depfile", depfile, "--", host,
           tree, ending, noop], env)
@@ -216,6 +231,13 @@ suite "io-mon Linux shim: trapped inline syscalls are captured when they trap":
           it.path == tree / "input-a.txt")
         check dep.records.anyIt(it.kind == mrPathProbe and
           it.path == tree / "input-a.txt")
+        # A `..` after a symlink is kept as spelled: `os./` folded it and
+        # named the decoy (reprobuild-pm issue 2026-10-21-linux-shim-folds-
+        # dotdot-after-a-symlink-lexically). Spelled with `&`, not `/`,
+        # which would fold it here too.
+        check dep.records.anyIt(it.kind == mrFileOpen and
+          it.path == tree & "/link/../input-e.txt")
+        check not dep.records.anyIt(it.path == tree / "input-e.txt")
         # The inline read of the descriptor libc closed and reused: the file
         # it named when it ran, not the one the number names at exit.
         check dep.records.anyIt(it.kind == mrFileRead and
