@@ -9,10 +9,9 @@ suite "descendant limitation oracle keeps unrelated losses":
       observationKind: moFileRead, path: "/input")])
     check subsystemEvidence(dep) == dep
 
-  when defined(macosx) or defined(windows):
-    const platform = when defined(macosx): "macos" else: "windows"
+  when defined(macosx):
     const detail = "detached-descendant quiescence cannot be established: " &
-      platform & " backend has no complete tree-lifetime guard run=test-run"
+      "macos backend has no complete tree-lifetime guard run=test-run"
     let guard = MonitorRecord(kind: mrEventLoss, observationKind: moEventLoss,
       osPid: 1, detail: detail)
 
@@ -57,3 +56,31 @@ suite "descendant limitation oracle keeps unrelated losses":
     test "a duplicate run marker is rejected":
       expect AssertionDefect:
         discard subsystemEvidence(depFileFromRecords(@[guard, guard]))
+
+  when defined(windows):
+    # Windows has a real tree-lifetime guard, so the oracle must normalize
+    # NOTHING there. In particular the retired blanket marker, and every one of
+    # the guard's own losses, must keep a capture incomplete: a Windows suite
+    # that grades through `subsystemEvidence` asserts the real verdict.
+    const retired = "detached-descendant quiescence cannot be established: " &
+      "windows backend has no complete tree-lifetime guard run=test-run"
+
+    test "the retired Windows marker is not a limitation":
+      let marker = MonitorRecord(kind: mrEventLoss, observationKind: moEventLoss,
+        osPid: 1, detail: retired)
+      check not isDescendantLimitation(marker)
+      let dep = depFileFromRecords(@[marker])
+      check subsystemEvidence(dep) == dep
+      check subsystemEvidence(dep).completeness == mcIncomplete
+
+    test "a Windows guard loss is never normalized away":
+      for detail in [
+          "windows job descendants still live after root exit active=1 " &
+            "pids=4242 images=sleeper.exe run=test-run",
+          "windows tree-lifetime guard unavailable: CreateJobObjectW " &
+            "failed err=6 run=test-run"]:
+        let loss = MonitorRecord(kind: mrEventLoss,
+          observationKind: moEventLoss, osPid: 1, detail: detail)
+        check not isDescendantLimitation(loss)
+        check subsystemEvidence(depFileFromRecords(@[loss])).completeness ==
+          mcIncomplete
