@@ -94,9 +94,11 @@ removes that marker only after writing, checking the buffered close and
 atomically publishing the completed evidence fragment. A killed host, abandoned
 handle or failed publication therefore leaves the outer capture incomplete.
 This handoff requires a cooperating host to finish its monitor; it does not
-provide live event delivery from an unfinished inner session. macOS and Windows
-finish fail incomplete with an explicit tree-lifetime uncertainty marker, even
-for a quiesced root; see the normative descendant guard contract in `usage.md`.
+provide live event delivery from an unfinished inner session. macOS finishes
+fail incomplete with an explicit tree-lifetime uncertainty marker, even for a
+quiesced root; Windows proves quiescence with a Job Object, and a nested
+monitor's job nests inside its enclosing one. See the normative descendant
+guard contracts in `usage.md`.
 
 Implementation: `src/io_mon/nested_capture.nim` and `fs_snoop.nim`.
 The real-process controls are in
@@ -130,6 +132,7 @@ three nesting levels, inner loss, interruption and real filesystem failures.
 ### Windows
 
 - **Hook Injection**: Hooks APIs using `CreateRemoteThread` and `LoadLibraryW` to inject shims into child processes, mirroring macOS environment variables.
+- **Tree-lifetime guard (Job Object)**: the root is assigned, still suspended, to a fresh job that refuses breakaway (`stackable_hooks.runWithMonitorShim(job = …)`), and a capture is complete only once the job's active-process count reaches zero after the root exits (`src/io_mon/windows_job_guard.nim`, decided in `fs_snoop.settleMonitorDescendants`). Normative contract: `docs/usage.md`, "The Windows tree-lifetime guard (normative)".
 - **Child architecture**: The x86 shim queries
   `GetProcessInformation(ProcessMachineTypeInfo)` before child propagation,
   with `IsWow64Process2` as the older-OS fallback. The explicit query

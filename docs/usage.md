@@ -457,24 +457,93 @@ is produced by, and that funnel refuses to merge for a monitor the guard has not
 marked. A decomposed host therefore grades an edge exactly as `runMonitored`
 does, and cannot opt out. Pinned by
 `tests/linux/test_io_mon_external_host_descendant_guard.nim`, which runs a real
-detached descendant past a real grace window down both launch paths.
+detached descendant past a real grace window down both launch paths. Windows
+has the same guarantee through its Job Object guard (the next paragraph),
+which runs at the same point of the same funnel.
 
-**macOS and Windows limitation (normative).** Root exit alone does not
-prove that the process tree is empty. These backends have neither a complete
-kernel descendant census nor a tree-lifetime primitive. Every finished capture
+**The Windows tree-lifetime guard (normative).** Windows has the primitive
+the macOS backend lacks: the Job Object. The full design, with its failure
+modes and interactions, is reprobuild-pm
+`spec/io-mon-Windows-Tree-Lifetime-Guard.md`. What a host can rely on:
+
+- Every monitored root gets a fresh job. The launcher assigns the root to it
+  while the root is still suspended, before the loader, the shim or the
+  program has run an instruction. Every process the tree creates is then
+  created by a member, and joins the job.
+- The job permits no breakaway: neither `JOB_OBJECT_LIMIT_BREAKAWAY_OK` nor
+  `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK` is set, and the launcher verifies
+  that before the root runs. **Behaviour change:** a monitored program that
+  calls `CreateProcess` with `CREATE_BREAKAWAY_FROM_JOB` now gets
+  `ERROR_ACCESS_DENIED`. The job is the root's immediate job, so a host or CI
+  job that does permit breakaway cannot let a descendant out either
+  ([Nested Jobs](https://learn.microsoft.com/en-us/windows/win32/procthread/nested-jobs)).
+- After the root exits, the capture is `mcComplete` only if the job's
+  `ActiveProcesses`
+  ([JOBOBJECT_BASIC_ACCOUNTING_INFORMATION](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_accounting_information))
+  reaches 0 within a grace window: `IO_MON_WINDOWS_DESCENDANT_GRACE_MS`
+  (default 500) and `IO_MON_WINDOWS_DESCENDANT_POLL_MS` (default 25). They
+  are read like the Linux knobs. The count is the proof, not the job's
+  completion-port messages, whose delivery Microsoft documents as not
+  guaranteed.
+- If members are still alive when the window ends, the capture publishes
+  `windows job descendants still live after root exit active=<n> pids=<p,...> images=<i,...> run=<id>`
+  and grades `mcIncomplete`, as Linux does for a detached descendant. Those
+  members are **left running**: the job has no
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and closing it does not end them. A
+  long-lived server a step leaves behind (`mspdbsrv.exe`, MSBuild nodes,
+  `VBCSCompiler.exe`) makes the step incomplete by design. Keep such servers
+  out of steps you want cached.
+- If the guard cannot be established, the command still runs and the capture
+  publishes one specific `mrEventLoss` saying why. Every such detail starts
+  with `windows tree-lifetime guard`. The cases are: the job cannot be
+  created; its limits cannot be read or permit breakaway; the root cannot be
+  assigned (and whether it already belonged to a job that refused nesting); or
+  the active-process census fails. None of them is silently complete, and
+  none is reported as the macOS marker below.
+- The guard covers the job's members and nothing else. Processes that a
+  member gets an already-running process or an OS service to start are not
+  descendants and are not in the job: COM out-of-process servers, Task
+  Scheduler tasks, WMI `Win32_Process.Create`, services, a `ShellExecuteEx`
+  handled by a running Explorer, elevation, work handed to a process already
+  running inside WSL, and a `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` child of an
+  outside process. For descendants the job is at least as strong as the Linux
+  scan, because it contains every process a member creates, injected or not.
+  For this out-of-tree work it is weaker in **detection**. On Linux such a
+  request usually travels over a recorded `AF_UNIX` connect, which downgrades
+  the capture. On Windows, ipc-connect records Winsock connects and
+  named-pipe client opens only, while COM, WMI, the Task Scheduler and the
+  Service Control Manager are reached over ALPC, which is not recorded. Such a
+  capture is graded complete with no evidence of the request. That is a gap in
+  ipc-connect, not in tree lifetime, and Windows captures had it before the
+  guard as well; see the spec's §4.5.
+- Like the Linux scan, the guard runs inside `collectMonitorEvidence` (DH-3),
+  for `runMonitored` and for `startMonitor` / `pollMonitor` / `finishMonitor`
+  alike. No exported proc creates, assigns, polls or skips it.
+
+Pinned by `tests/windows/test_io_mon_windows_tree_lifetime_guard.nim` (a
+quiesced control, a detached descendant, one that exits inside the window, a
+refused breakaway, a real nesting refusal, byte-identical evidence across both
+launch paths, a nested monitor) and
+`tests/windows/test_io_mon_windows_tree_lifetime_guard_faults.nim` (the
+failure modes with no honest trigger, through a compile-gated seam).
+
+**macOS limitation (normative).** Root exit alone does not prove that the
+process tree is empty. The macOS backend has neither a complete kernel
+descendant census nor a tree-lifetime primitive. Every finished macOS capture
 MUST therefore publish an `mrEventLoss` / `moEventLoss` record with detail
-`detached-descendant quiescence cannot be established: <platform> backend has no complete tree-lifetime guard run=<id>`
-(`<platform>` is `macos` or `windows`) before evidence is merged. This applies
-even when no spawn was observed, to batch and decomposed hosts, every interest
-set and evidence scope, and both in-memory and on-disk depfiles. Such captures
-MUST grade `mcIncomplete`; consumers must conservatively rebuild. The marker
-states uncertainty, not proof that a descendant exists. Process and file
-evidence remains available for diagnosis. Linux retains its real descendant
-scan and grace window; `IO_MON_LINUX_DESCENDANT_GRACE_MS` and
-`IO_MON_LINUX_DESCENDANT_POLL_MS` have no effect on the macOS/Windows limitation.
-There is no override that promotes these captures to complete. The real gated
-macOS regression also checks a fully quiesced control, which fails closed for
-the same reason.
+`detached-descendant quiescence cannot be established: macos backend has no complete tree-lifetime guard run=<id>`
+before evidence is merged. This applies even when no spawn was observed, to
+batch and decomposed hosts, every interest set and evidence scope, and both
+in-memory and on-disk depfiles. Such captures MUST grade `mcIncomplete`;
+consumers must conservatively rebuild. The marker states uncertainty, not
+proof that a descendant exists. Process and file evidence remains available
+for diagnosis. Linux retains its real descendant scan and grace window, and
+Windows its job guard (above). Neither platform's knobs have any effect on the
+macOS limitation. There is no override that promotes these captures to
+complete. The real gated macOS regression also checks a fully quiesced
+control, which fails closed for the same reason. (Until the Windows guard
+landed, Windows published the same marker with `windows` in place of
+`macos`. That marker is retired, and a Windows capture never carries it.)
 
 **The two launch paths produce the same evidence, and that is measured** (DH-4).
 `runMonitored` and a host driving `startMonitor` → `pollMonitor` →
@@ -482,7 +551,13 @@ the same reason.
 same records, the same completeness, the same loss markers, the same backend
 diagnostics — down to the detached-descendant case, not just the happy path.
 Pinned by `tests/linux/test_io_mon_evidence_identical_across_launch_paths.nim`,
-which renders every field of both edges and compares them byte for byte.
+which renders every field of both edges and compares them byte for byte. On
+Windows the same comparison, for a quiesced control and a detached descendant,
+is case 6 of `tests/windows/test_io_mon_windows_tree_lifetime_guard.nim`.
+Windows pids and thread ids are not allocated in increasing order, so that test
+names processes by their role in the spawn tree rather than by first appearance,
+and it leaves out `seq`, the record's index in a canonical order keyed on pid
+values.
 
 Two things a host should know about that guarantee, because they bound it:
 

@@ -6,7 +6,7 @@
 #
 # nim-stackable-hooks is a bare name: `clone-siblings` resolves it from this
 # commit's own committed `repro.lock` (`lock-store: committed`, reprobuild-pm
-# Unified-Locking-And-Hooks.md §14.5), which pins 3af63af — the same revision
+# Unified-Locking-And-Hooks.md §14.5), which pins 059c549 — the same revision
 # `flake.nix` pins `stackable-hooks-src` to. Keep the two in step: a `nim c` in
 # the dev shell resolves `stackable_hooks/...` through the sibling checkout,
 # while `nix build .#default` resolves it through the flake input, and a build

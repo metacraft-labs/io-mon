@@ -553,22 +553,32 @@ library API**, not only a CLI:
   the source; and LF-4's `markConsumerGone` pinned by a real producer whose
   late `emit` must answer `emConsumerGone`.
 
-**macOS and Windows limitation (normative).** Root exit alone does not
-prove that the process tree is empty. These backends have neither a complete
-kernel descendant census nor a tree-lifetime primitive. Every finished capture
+**Windows: a Job Object guard, in the same funnel.** Windows proves the same
+property with a kernel primitive instead of a scan. The launcher assigns the
+root, still suspended, to a fresh job that refuses breakaway, and the guard
+waits for the job's `ActiveProcesses` to reach zero. The job is created at the
+module's only Windows spawn site and waited on inside
+`settleMonitorDescendants`, so the DH-3 argument above holds unchanged: no
+exported proc creates, assigns, polls or skips it. Its contract (knobs, the
+named-survivor loss, the failure diagnostics, what it does not cover) is
+normative in `docs/usage.md`, "The Windows tree-lifetime guard (normative)";
+the design is reprobuild-pm `spec/io-mon-Windows-Tree-Lifetime-Guard.md`.
+
+**macOS limitation (normative).** Root exit alone does not prove that the
+process tree is empty. The macOS backend has neither a complete kernel
+descendant census nor a tree-lifetime primitive. Every finished macOS capture
 MUST therefore publish an `mrEventLoss` / `moEventLoss` record with detail
-`detached-descendant quiescence cannot be established: <platform> backend has no complete tree-lifetime guard run=<id>`
-(`<platform>` is `macos` or `windows`) before evidence is merged. This applies
-even when no spawn was observed, to batch and decomposed hosts, every interest
-set and evidence scope, and both in-memory and on-disk depfiles. Such captures
-MUST grade `mcIncomplete`; consumers must conservatively rebuild. The marker
-states uncertainty, not proof that a descendant exists. Process and file
-evidence remains available for diagnosis. Linux retains its real descendant
-scan and grace window; `IO_MON_LINUX_DESCENDANT_GRACE_MS` and
-`IO_MON_LINUX_DESCENDANT_POLL_MS` have no effect on the macOS/Windows limitation.
-There is no override that promotes these captures to complete. The real gated
-macOS regression also checks a fully quiesced control, which fails closed for
-the same reason.
+`detached-descendant quiescence cannot be established: macos backend has no complete tree-lifetime guard run=<id>`
+before evidence is merged. This applies even when no spawn was observed, to
+batch and decomposed hosts, every interest set and evidence scope, and both
+in-memory and on-disk depfiles. Such captures MUST grade `mcIncomplete`;
+consumers must conservatively rebuild. The marker states uncertainty, not
+proof that a descendant exists. Process and file evidence remains available
+for diagnosis. Linux retains its real descendant scan and grace window, and
+Windows its job guard; neither platform's knobs have any effect on the macOS
+limitation. There is no override that promotes these captures to complete.
+The real gated macOS regression also checks a fully quiesced control, which
+fails closed for the same reason.
 
 A DROPPED handle deliberately does NOT run the guard: it is an evidence step
 and a dropped handle publishes no edge for a loss marker to downgrade. That

@@ -22,6 +22,21 @@ export shim_discovery  ## `findShimLibrary`/`ShimLibOverrideEnv` moved to their
 import shm_gset as shmset_core
 import shm_gset/transport as shmset
 
+when defined(linux) or defined(windows):
+  proc envInt(name: string; defaultValue, minValue: int): int =
+    ## A §4.1 descendant-guard knob: unset or unparsable -> `defaultValue`,
+    ## below `minValue` -> `minValue`. Shared by the Linux scan and the Windows
+    ## job guard so both platforms read their knobs by one rule.
+    let raw = getEnv(name)
+    if raw.len == 0:
+      return defaultValue
+    try:
+      result = parseInt(raw)
+      if result < minValue:
+        result = minValue
+    except ValueError:
+      result = defaultValue
+
 when defined(linux):
   import std/[algorithm, monotimes, posix]
   from io_mon/proc_start_time import predatesRoot
@@ -67,17 +82,6 @@ when defined(linux):
   let AT_FDCWD {.importc, header: "<fcntl.h>".}: cint
   proc dirfd(dirp: ptr DIR): cint
     {.importc, header: "<dirent.h>", sideEffect.}
-
-  proc envInt(name: string; defaultValue, minValue: int): int =
-    let raw = getEnv(name)
-    if raw.len == 0:
-      return defaultValue
-    try:
-      result = parseInt(raw)
-      if result < minValue:
-        result = minValue
-    except ValueError:
-      result = defaultValue
 
   proc readProcFileAt(dirfd: cint; relPath: cstring; buf: var openArray[char]):
       int =
@@ -452,6 +456,17 @@ when defined(linux):
 # substitutes for the macOS DYLD_INSERT_LIBRARIES env-var injection.
 when defined(windows):
   import stackable_hooks/windows_injector
+  # The Windows tree-lifetime guard's Job Object mechanics. Its DECISIONS stay
+  # in this module, private, inside the evidence funnel (DH-3): see
+  # `settleMonitorDescendants` and reprobuild-pm
+  # spec/io-mon-Windows-Tree-Lifetime-Guard.md.
+  import io_mon/windows_job_guard
+
+  const
+    ## WG-6: the same defaults as the Linux §4.1 window, so a descendant gets
+    ## the same chance to exit on both platforms.
+    WindowsDescendantGraceMsDefault = 500
+    WindowsDescendantPollMsDefault = 25
 
 # macOS: prepare a sandbox-tools directory holding non-SIP drop-ins for the
 # common system binaries that show up in monitored subprocess trees. The
@@ -1629,6 +1644,12 @@ type
       spawnEnv: StringTableRef
       injection: WindowsInjectionResult
       spawned: bool
+      treeJob: TreeJob         ## The root's Job Object (spec WG-1..WG-4).
+                               ## Created at the spawn, read by the §4.1
+                               ## guard, closed by `releaseMonitor`.
+      treeJobFailure: string   ## Why the tree has no usable job (F1..F6),
+                               ## without `run=`; empty when it has one.
+                               ## Written only at the spawn.
 
 proc `=copy`*(dst: var MonitorHandle; src: MonitorHandle) {.error:
   "a MonitorHandle exclusively owns one live monitor: `move` it (or take it by " &
@@ -1707,6 +1728,17 @@ proc waitForMonitorRoot(h: var MonitorHandle) =
     # that costs and why it is still the honest shape.
     if not h.spawned:
       h.spawned = true
+      # THE TREE-LIFETIME JOB (spec WG-1..WG-4). One fresh job per spawn,
+      # created here because this is the module's only Windows spawn site, so
+      # no launch path can reach a root that was not offered one. The launcher
+      # assigns the root while it is still suspended — before the loader, the
+      # shim or the program has run a single instruction — so every process
+      # the tree creates is created by a member. A job that cannot be
+      # established does NOT stop the run: it is recorded here and turned into
+      # a specific loss by `settleMonitorDescendants`, so the capture fails
+      # closed while the command still does its work.
+      h.treeJob = openTreeJob()
+      h.treeJobFailure = h.treeJob.failure
       # onBorrowTimeout is NAMED here, not left to the library default: when a
       # call borrowed on the root's parked main thread outlives the deadline,
       # io-mon's policy is to TERMINATE and let runWithMonitorShim raise, never
@@ -1717,7 +1749,11 @@ proc waitForMonitorRoot(h: var MonitorHandle) =
                                        captureStdio = h.request.captureChildStdio,
                                        captureStdioPath = h.request.captureStdioPath,
                                        env = h.spawnEnv,
+                                       job = h.treeJob.handle,
                                        onBorrowTimeout = btpTerminate)
+      if h.treeJob.handle != nil and not h.injection.jobAssigned:
+        h.treeJobFailure = assignmentFailure(h.injection.jobAssignError,
+          h.injection.jobAssignRootMembership)
       h.rootPid =
         if h.injection.monitoringSkipped: 0'u64 else: h.injection.rootPid
       recordRootExit(h, h.injection.exitCode)
@@ -1747,6 +1783,13 @@ proc settleMonitorDescendants(h: var MonitorHandle) =
   ## `h.settled` is the flag the funnel's gate reads, and this proc is its ONLY
   ## writer — which is what makes the gate a check on the guard rather than a
   ## restatement of it.
+  ##
+  ## Per platform: Linux scans `/proc` for this run's injected descendants;
+  ## Windows waits for the root's Job Object to report no active process (the
+  ## job is created and the root assigned at the module's only Windows spawn
+  ## site, `waitForMonitorRoot`); macOS has no primitive and publishes its
+  ## normative limitation marker. Only Linux and Windows can ever publish no
+  ## loss here, and only on a measured, empty tree.
   if h.settled:
     return
   h.settled = true
@@ -1756,17 +1799,48 @@ proc settleMonitorDescendants(h: var MonitorHandle) =
       if h.depSetLive and h.depSet.available: h.depSet.path0 else: ""
     waitForLinuxInjectedDescendants(h.fragmentDir, h.runId, h.rootPid,
       h.rootStartTicks, launcherLossPath0)
-  elif defined(macosx) or defined(windows):
-    # Root exit proves nothing about a detached descendant. Neither backend
-    # owns a kernel tree-lifetime primitive or a complete descendant census;
+  elif defined(windows):
+    # THE WINDOWS TREE-LIFETIME GUARD (reprobuild-pm
+    # spec/io-mon-Windows-Tree-Lifetime-Guard.md). The root was assigned,
+    # suspended, to a fresh job that refuses breakaway, so the job holds every
+    # process the tree created; `ActiveProcesses == 0` after the root exited
+    # is therefore a PROOF that nothing is still working outside the evidence.
+    # It is the only outcome that publishes no loss. Everything else — no job
+    # (F1..F6), a failed census (F7), members still alive when the window
+    # closes (F9) — records its own specific loss before the merge, so the
+    # capture fails closed with a diagnostic that says WHICH proof is missing.
+    var lossDetail = h.treeJobFailure
+    if lossDetail.len == 0:
+      if h.treeJob.handle == nil:
+        # F8: no job and no recorded reason. Unreachable while the spawn site
+        # above is the only writer of both fields; fail closed regardless
+        # rather than treat "no guard" as "nothing to guard".
+        lossDetail = "windows tree-lifetime guard unavailable: the root was " &
+          "never assigned to a job"
+      else:
+        let graceMs = envInt("IO_MON_WINDOWS_DESCENDANT_GRACE_MS",
+          WindowsDescendantGraceMsDefault, 0)
+        let pollMs = envInt("IO_MON_WINDOWS_DESCENDANT_POLL_MS",
+          WindowsDescendantPollMsDefault, 1)
+        let settled = waitForTreeJobQuiescence(h.treeJob.handle, graceMs,
+          pollMs)
+        if not settled.quiesced:
+          lossDetail = settled.lossDetail
+    if lossDetail.len > 0:
+      appendFragmentRecord(h.fragmentDir, MonitorRecord(
+        kind: mrEventLoss, observationKind: moEventLoss,
+        osPid: uint64(getCurrentProcessId()),
+        detail: lossDetail & " run=" & h.runId))
+  elif defined(macosx):
+    # Root exit proves nothing about a detached descendant. This backend owns
+    # no kernel tree-lifetime primitive and no complete descendant census;
     # even a run with no observed spawn cannot prove that no child escaped.
     # Publish before the merge, so every finish path fails incomplete.
     appendFragmentRecord(h.fragmentDir, MonitorRecord(
       kind: mrEventLoss, observationKind: moEventLoss,
       osPid: uint64(getCurrentProcessId()),
       detail: "detached-descendant quiescence cannot be established: " &
-        (when defined(macosx): "macos" else: "windows") &
-        " backend has no complete tree-lifetime guard run=" & h.runId))
+        "macos backend has no complete tree-lifetime guard run=" & h.runId))
 
 proc releaseMonitor(h: var MonitorHandle) =
   ## Release everything the monitor owns: mark the consumer gone and unmap it,
@@ -1793,6 +1867,12 @@ proc releaseMonitor(h: var MonitorHandle) =
       removeLocalTempDir(h.sandboxDir)
       h.sandboxDir = ""
       h.ownsSandboxDir = false
+  when defined(windows):
+    # Release the tree-lifetime job (WG-11). Closing the handle does NOT
+    # terminate a surviving descendant: the job has no KILL_ON_JOB_CLOSE, so
+    # it lives on for as long as members remain and they keep running (WG-8),
+    # exactly as a Linux descendant outlives its scan.
+    closeTreeJob(h.treeJob)
   if h.fragmentDir.len > 0:
     removeLocalTempDir(h.fragmentDir)
     h.fragmentDir = ""

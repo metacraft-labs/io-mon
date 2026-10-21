@@ -2,14 +2,19 @@
 ## platform-wide tree-lifetime limitation. This helper first grades the REAL
 ## capture, then rebuilds its grade with only that exact diagnostic removed.
 ## It is for tests only; consumers must always honor the original verdict.
+##
+## Only macOS carries the limitation. Windows has a real tree-lifetime guard
+## (the Job Object guard, reprobuild-pm spec/io-mon-Windows-Tree-Lifetime-Guard.md),
+## so on Windows this helper removes NOTHING: a Windows suite that grades
+## through it asserts the real, un-normalized completeness, and a healthy
+## Windows fixture must be complete on its own.
 import std/[sets, strutils]
 import io_mon
 
 proc isDescendantLimitation*(record: MonitorRecord): bool =
-  when defined(macosx) or defined(windows):
-    const platform = when defined(macosx): "macos" else: "windows"
+  when defined(macosx):
     const description = "detached-descendant quiescence cannot be established: " &
-      platform & " backend has no complete tree-lifetime guard"
+      "macos backend has no complete tree-lifetime guard"
     if record.kind != mrEventLoss or record.observationKind != moEventLoss or
         not record.detail.startsWith(description): return false
     if record.detail.len <= description.len or
@@ -32,7 +37,7 @@ proc isDescendantLimitation*(record: MonitorRecord): bool =
     false
 
 proc subsystemEvidence*(dep: MonitorDepFile): MonitorDepFile =
-  when defined(macosx) or defined(windows):
+  when defined(macosx):
     var records: seq[MonitorRecord]
     var runMarkers = initHashSet[string]()
     for record in dep.records:
