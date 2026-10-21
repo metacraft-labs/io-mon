@@ -3451,8 +3451,11 @@ proc environmentWithMonitorConfigA(lpEnvironment: LPVOID;
 # set EXPLICITLY here even though it is also the library default, because the
 # choice is io-mon's to own: a child that cannot be injected within a deadline
 # that is already 10 minutes by default (and can be `INFINITE`) is a genuinely
-# wedged child, and letting it run UNINSTRUMENTED (`btpDetach`) would produce
-# exactly the silently-incomplete subtree this monitor exists to make loud.
+# wedged child. Detaching it (`btpDetach`) would leave a child running with
+# its monitoring UNKNOWN: the borrowed call is not cancelled, so a detached
+# `repro_runtime_init` may go on to install all, some or none of its hooks.
+# The spawn record would say `inject=ioChildDetached`, but the evidence below
+# it could only be graded incomplete.
 # Terminating it, failing the spawn with `ERROR_TIMEOUT`, and leaving a spawn
 # record with no matching process-start is the honest, visible outcome.
 #
