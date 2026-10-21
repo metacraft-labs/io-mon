@@ -1707,11 +1707,17 @@ proc waitForMonitorRoot(h: var MonitorHandle) =
     # that costs and why it is still the honest shape.
     if not h.spawned:
       h.spawned = true
+      # onBorrowTimeout is NAMED here, not left to the library default: when a
+      # call borrowed on the root's parked main thread outlives the deadline,
+      # io-mon's policy is to TERMINATE and let runWithMonitorShim raise, never
+      # to let the root run unmonitored. Same justification as the shim's
+      # spawnInjectionConfig (see windows_interpose).
       h.injection = runWithMonitorShim(h.request.command, h.shimLib,
                                        cwd = h.request.cwd,
                                        captureStdio = h.request.captureChildStdio,
                                        captureStdioPath = h.request.captureStdioPath,
-                                       env = h.spawnEnv)
+                                       env = h.spawnEnv,
+                                       onBorrowTimeout = btpTerminate)
       h.rootPid =
         if h.injection.monitoringSkipped: 0'u64 else: h.injection.rootPid
       recordRootExit(h, h.injection.exitCode)
