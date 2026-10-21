@@ -262,7 +262,7 @@ jobs:
         with:
           repository: metacraft-labs/nim-stackable-hooks
           # Keep in lockstep with stackable-hooks-src in flake.nix.
-          ref: 3af63afc5c0b55a27fc5e0a26f3a32833caf8873
+          ref: 059c549306621e2f769adf75630b0b7f29018dca
           path: nim-stackable-hooks
           token: ${{ steps.app-token.outputs.token }}
       - uses: actions/checkout@v4
