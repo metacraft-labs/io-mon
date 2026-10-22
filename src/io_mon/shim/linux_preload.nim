@@ -4453,11 +4453,11 @@ proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
     # No drain runs here (a fork child skips bookkeeping until exec): report
     # trapped events a successful exec would discard unclassified.
     reportInlineEventsIfPending()
-    if inForkChild and disabled == 0:
-      # A fork child skipping bookkeeping cannot record, but an exec it makes
-      # into an image the shim cannot enter must still be reported: the
-      # unnamed pre-encoded frame, allocation-free.
-      reportExecHookEntryUnrecorded(ctx.path)
+    # A context that cannot record -- a fork child skipping bookkeeping, or
+    # a thread inside a hook (a host signal handler that interrupted one) --
+    # must still report an exec into an image the shim cannot enter: the
+    # unnamed pre-encoded frame, allocation-free and async-signal-safe.
+    reportExecHookEntryUnrecorded(ctx.path)
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -4524,14 +4524,31 @@ proc recordPosixSpawn(ctx: var PosixSpawnContext; usePath: bool)
   # of the child as posix_spawn's result, so, unlike an execve, an image that
   # never ran leaves no loss. See `emitExecAttempt` for why the loss is
   # recorded at the entry.
-  let uninjectable = spawnImageUninjectable(ctx.path, usePath)
+  var uninjectable = spawnImageUninjectable(ctx.path, usePath)
   let originalEnv = ctx.envp
   let preparedEnv = envWithPreload(ctx.envp)
   ctx.envp = preparedEnv
+  # The child's pid is needed below even when the caller passes no pid
+  # pointer, so lend the call one and put the caller's NULL back afterwards.
+  let callerPid = ctx.pid
+  var lentPid: PidT
+  if callerPid == nil:
+    ctx.pid = addr lentPid
   callNext(ctx)
   let savedErrno = c_get_errno()
+  let childPid = int(ctx.pid[])
+  ctx.pid = callerPid
   freeOwnedEnv(preparedEnv, originalEnv)
   ctx.envp = originalEnv
+  # File actions may change the child's directory before its exec
+  # (posix_spawn_file_actions_addchdir_np), and a relative name is then
+  # resolved there, not here: classify again from the child itself (its
+  # /proc exe and cwd; see `ct_linux_spawn_image_uninjectable`). The actions
+  # are opaque, so this runs whenever there are any; it is only a second
+  # lookup when the directory did not change.
+  if ctx.result == 0 and ctx.fileActions != nil and childPid > 0 and
+      uninjectable.len == 0:
+    uninjectable = spawnImageUninjectable(ctx.path, usePath, childPid)
   if ctx.result == 0 and ctx.pid != nil:
     var record = baseRecord(mrProcessSpawn, moExecute)
     record.childOsPid = uint64(ctx.pid[])
@@ -4548,21 +4565,35 @@ proc recordPosixSpawn(ctx: var PosixSpawnContext; usePath: bool)
       (if ctx.pid != nil: " child=" & $ctx.pid[] else: ""))
   c_set_errno(savedErrno)
 
+proc spawnWithoutRecording(ctx: var PosixSpawnContext; usePath: bool)
+    {.raises: [].} =
+  ## The posix_spawn hooks when this context cannot record (see
+  ## `repro_hook_execve`): a spawn into an image the shim cannot enter is
+  ## still reported, through the unnamed frame, once the spawn succeeded.
+  ## Allocation-free, as `recordPosixSpawn` is not.
+  let preFlagged = spawnEntryUnrecordedPre(ctx.path, usePath)
+  let callerPid = ctx.pid
+  var lentPid: PidT
+  if callerPid == nil:
+    ctx.pid = addr lentPid
+  callNext(ctx)
+  let savedErrno = c_get_errno()
+  let childPid = int(ctx.pid[])
+  ctx.pid = callerPid
+  reportSpawnEntryUnrecorded(ctx.path, usePath, preFlagged,
+    succeeded = ctx.result == 0, hasFileActions = ctx.fileActions != nil,
+    childPid = childPid)
+  c_set_errno(savedErrno)
+
 proc repro_hook_posix_spawn*(ctx: var PosixSpawnContext) {.raises: [].} =
   if shouldBypass():
-    if inForkChild and disabled == 0:
-      # As in `repro_hook_execve`: a fork child that cannot record still
-      # reports a spawn into an image the shim cannot enter.
-      reportSpawnEntryUnrecorded(ctx.path, usePath = false)
-    callNext(ctx)
+    spawnWithoutRecording(ctx, usePath = false)
     return
   recordPosixSpawn(ctx, usePath = false)
 
 proc repro_hook_posix_spawnp*(ctx: var PosixSpawnContext) {.raises: [].} =
   if shouldBypass():
-    if inForkChild and disabled == 0:
-      reportSpawnEntryUnrecorded(ctx.path, usePath = true)
-    callNext(ctx)
+    spawnWithoutRecording(ctx, usePath = true)
     return
   recordPosixSpawn(ctx, usePath = true)
 

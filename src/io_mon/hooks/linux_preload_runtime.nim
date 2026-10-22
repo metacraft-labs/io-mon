@@ -6,6 +6,7 @@ import std/[algorithm, locks, os, strutils]
 import stackable_hooks/platform/linux_preload
 import stackable_hooks/platform/linux_raw_syscalls
 import ./linux_mapping_policy
+import ../exec_image_header
 
 export linux_mapping_policy
 
@@ -606,9 +607,7 @@ extern char **environ;
 # file's header comment and "AN EXEC INTO AN IMAGE THE SHIM CANNOT ENTER IS
 # EVENT-LOSS" below. Included (all `static`) rather than linked, so this shim
 # exports no symbol of it.
-const execImageInjectabilityHeader = currentSourcePath().parentDir()
-  .parentDir() / "exec_image_injectability.h"
-{.emit: "#include \"" & execImageInjectabilityHeader & "\"".}
+{.emit: execImageIncludeDirective.}
 
 {.emit: """
 typedef long ssize_like_t;
@@ -4123,14 +4122,16 @@ static const char *ct_exec_caller_path(void) {
   return NULL;
 }
 
-/* Classify what a PATH-searching exec of `file` would run. */
-static int ct_exec_classify_searched(const char *file, char *detail,
-                                     size_t cap) {
+/* Classify what a PATH-searching exec of `file`, run in the directory
+ * `dirfd`, would run. */
+static int ct_exec_classify_searched(int dirfd, const char *file,
+                                     char *detail, size_t cap) {
   char resolved[PATH_MAX];
-  if (!iomon_exec_search_path(&ct_exec_raw_io, file, ct_exec_caller_path(),
-                              resolved, sizeof(resolved)))
+  if (!iomon_exec_search_path(&ct_exec_raw_io, dirfd, file,
+                              ct_exec_caller_path(), resolved,
+                              sizeof(resolved)))
     return IOMON_EXEC_INJECTABLE;
-  return iomon_exec_image_classify(&ct_exec_raw_io, AT_FDCWD, resolved, 0,
+  return iomon_exec_image_classify(&ct_exec_raw_io, dirfd, resolved, 0,
                                    NULL, detail, cap);
 }
 
@@ -4161,7 +4162,7 @@ int ct_linux_exec_hook_image_uninjectable(const char *path, char *detail,
                                         detail, cap);
   } else if (ct_exec_announce_only && path != NULL &&
              strchr(path, '/') == NULL) {
-    verdict = ct_exec_classify_searched(path, detail, cap);
+    verdict = ct_exec_classify_searched(AT_FDCWD, path, detail, cap);
   } else {
     verdict = iomon_exec_image_classify(&ct_exec_raw_io, AT_FDCWD, path, 0,
                                         NULL, detail, cap);
@@ -4180,37 +4181,131 @@ void ct_linux_report_exec_hook_entry_unrecorded(const char *path) {
     ct_linux_report_uninjectable_exec_frame();
 }
 
+/* Whether what a spawn of `file` runs depends on the directory it is
+ * resolved in: a relative name with a slash, or a PATH search (`use_path`,
+ * no slash) over a PATH holding a relative or empty element. */
+static int ct_exec_name_depends_on_cwd(const char *file, int use_path) {
+  if (file == NULL || file[0] == '\0') return 0;
+  if (!use_path || strchr(file, '/') != NULL) return file[0] != '/';
+  const char *p = ct_exec_caller_path();
+  if (p == NULL) p = "/bin:/usr/bin";
+  for (;;) {
+    if (*p != '/') return 1;   /* empty (`::`, leading/trailing `:`) or relative */
+    const char *end = strchr(p, ':');
+    if (end == NULL) return 0;
+    p = end + 1;
+  }
+}
+
+/* "/proc/<pid>/<leaf>" into `out[cap]`. */
+static void ct_proc_pid_path(char *out, size_t cap, long pid,
+                             const char *leaf) {
+  size_t at = iomon_exec_append(out, 0, cap, "/proc/");
+  at = iomon_exec_append_dec(out, at, cap, (unsigned long)pid);
+  at = iomon_exec_append(out, at, cap, "/");
+  iomon_exec_append(out, at, cap, leaf);
+}
+
 /* For the posix_spawn/posix_spawnp hooks: 1, with `detail` filled, when the
  * spawn starts an image the shim cannot enter. posix_spawnp (`use_path`)
- * searches the caller's PATH as glibc's __spawni does. A relative `file` is
- * taken relative to the caller's working directory; a file action that
- * changes the child's directory first (posix_spawn_file_actions_addchdir_np)
- * is not modelled. errno is preserved. */
+ * searches the caller's PATH as glibc's __spawni does.
+ *
+ * With `child_pid` 0 a relative `file` (or a candidate from a relative PATH
+ * element) is looked up in the caller's working directory, which is right
+ * unless a file action changed the child's directory first
+ * (posix_spawn_file_actions_addchdir_np / addfchdir_np). For that case the
+ * hook calls again after a successful spawn with the child's pid; glibc
+ * returns only once the child has exec'd, so the kernel's answer is there:
+ *   - /proc/<pid>/exe, the image the exec actually loaded (for a `#!` script,
+ *     its interpreter), is classified first;
+ *   - then the name is resolved in /proc/<pid>/cwd, which catches an
+ *     uninjectable image that already exec'd on into a monitored one (the
+ *     shape this whole check exists for), whose exe no longer names it;
+ *   - when neither can be read (the child already exited) and the name
+ *     depends on the directory, the entry cannot be verified and is flagged
+ *     (fail closed), as an execute-only image is.
+ * errno is preserved. */
 int ct_linux_spawn_image_uninjectable(const char *file, int use_path,
-                                      char *detail, size_t cap)
+                                      long child_pid, char *detail,
+                                      size_t cap)
     __attribute__((visibility("hidden")));
 int ct_linux_spawn_image_uninjectable(const char *file, int use_path,
-                                      char *detail, size_t cap) {
+                                      long child_pid, char *detail,
+                                      size_t cap) {
   int saved_errno = errno;
-  int verdict = use_path
-      ? ct_exec_classify_searched(file, detail, cap)
-      : iomon_exec_image_classify(&ct_exec_raw_io, AT_FDCWD, file, 0, NULL,
-                                  detail, cap);
+  int verdict;
+  if (cap > 0) detail[0] = '\0';
+  if (child_pid <= 0) {
+    verdict = use_path
+        ? ct_exec_classify_searched(AT_FDCWD, file, detail, cap)
+        : iomon_exec_image_classify(&ct_exec_raw_io, AT_FDCWD, file, 0, NULL,
+                                    detail, cap);
+    errno = saved_errno;
+    return verdict != IOMON_EXEC_INJECTABLE;
+  }
+  char proc_path[48];
+  ct_proc_pid_path(proc_path, sizeof(proc_path), child_pid, "exe");
+  long exe = ct_raw_syscall6(SYS_openat, AT_FDCWD, (long)proc_path,
+                             O_PATH | O_CLOEXEC, 0, 0, 0);
+  int exe_readable = exe >= 0;
+  if (exe_readable) (void)ct_raw_syscall6(SYS_close, exe, 0, 0, 0, 0, 0);
+  verdict = exe_readable
+      ? iomon_exec_image_classify(&ct_exec_raw_io, AT_FDCWD, proc_path, 0,
+                                  file, detail, cap)
+      : IOMON_EXEC_INJECTABLE;
+  if (verdict == IOMON_EXEC_INJECTABLE) {
+    ct_proc_pid_path(proc_path, sizeof(proc_path), child_pid, "cwd");
+    long dirfd = ct_raw_syscall6(SYS_openat, AT_FDCWD, (long)proc_path,
+                                 O_PATH | O_DIRECTORY | O_CLOEXEC, 0, 0, 0);
+    if (dirfd >= 0) {
+      verdict = use_path
+          ? ct_exec_classify_searched((int)dirfd, file, detail, cap)
+          : iomon_exec_image_classify(&ct_exec_raw_io, (int)dirfd, file, 0,
+                                      NULL, detail, cap);
+      (void)ct_raw_syscall6(SYS_close, dirfd, 0, 0, 0, 0, 0);
+    } else if (!exe_readable && ct_exec_name_depends_on_cwd(file, use_path)) {
+      size_t at = iomon_exec_append(detail, 0, cap,
+          "spawned image unverifiable: the child exited before the directory "
+          "its file actions chose could be read image=");
+      iomon_exec_append(detail, at, cap, file);
+      verdict = IOMON_EXEC_UNREADABLE;
+    }
+  }
   errno = saved_errno;
   return verdict != IOMON_EXEC_INJECTABLE;
 }
 
-/* The posix_spawn hooks' entry when they cannot record (a fork child
- * skipping bookkeeping): classify, and report through the unnamed frame. The
- * spawn's outcome is not known yet, so this may report a spawn that then
- * fails; that only happens in a child that is already reporting skipped
- * evidence. */
-void ct_linux_report_spawn_entry_unrecorded(const char *file, int use_path)
+/* The posix_spawn hooks' path when they cannot record (a thread inside a
+ * hook, e.g. a signal handler that interrupted one, or a fork child skipping
+ * bookkeeping), split around the real call as the recording path is:
+ * ct_linux_spawn_entry_unrecorded_pre classifies before the spawn, and
+ * ct_linux_spawn_entry_unrecorded_post reports through the unnamed frame
+ * only after the spawn succeeded, classifying again in the child's directory
+ * when file actions may have changed it (see
+ * ct_linux_spawn_image_uninjectable). Allocation-free; errno is preserved. */
+int ct_linux_spawn_entry_unrecorded_pre(const char *file, int use_path)
     __attribute__((visibility("hidden")));
-void ct_linux_report_spawn_entry_unrecorded(const char *file, int use_path) {
+int ct_linux_spawn_entry_unrecorded_pre(const char *file, int use_path) {
   char detail[CT_EXEC_DETAIL_CAP];
-  if (ct_linux_spawn_image_uninjectable(file, use_path, detail,
-                                        sizeof(detail)))
+  if (file == NULL) return 0;
+  return ct_linux_spawn_image_uninjectable(file, use_path, 0, detail,
+                                           sizeof(detail));
+}
+void ct_linux_spawn_entry_unrecorded_post(const char *file, int use_path,
+                                          int pre_flagged, int succeeded,
+                                          int has_file_actions,
+                                          long child_pid)
+    __attribute__((visibility("hidden")));
+void ct_linux_spawn_entry_unrecorded_post(const char *file, int use_path,
+                                          int pre_flagged, int succeeded,
+                                          int has_file_actions,
+                                          long child_pid) {
+  char detail[CT_EXEC_DETAIL_CAP];
+  if (!succeeded || file == NULL) return;
+  if (pre_flagged ||
+      (has_file_actions && child_pid > 0 &&
+       ct_linux_spawn_image_uninjectable(file, use_path, child_pid, detail,
+                                         sizeof(detail))))
     ct_linux_report_uninjectable_exec_frame();
 }
 
@@ -6337,11 +6432,14 @@ proc cExecHookImageUninjectable(path: cstring; detail: cstring;
 proc cReportExecHookEntryUnrecorded(path: cstring)
   {.importc: "ct_linux_report_exec_hook_entry_unrecorded", nodecl,
     raises: [].}
-proc cSpawnImageUninjectable(file: cstring; usePath: cint; detail: cstring;
-                             cap: csize_t): cint
+proc cSpawnImageUninjectable(file: cstring; usePath: cint; childPid: clong;
+                             detail: cstring; cap: csize_t): cint
   {.importc: "ct_linux_spawn_image_uninjectable", nodecl, raises: [].}
-proc cReportSpawnEntryUnrecorded(file: cstring; usePath: cint)
-  {.importc: "ct_linux_report_spawn_entry_unrecorded", nodecl, raises: [].}
+proc cSpawnEntryUnrecordedPre(file: cstring; usePath: cint): cint
+  {.importc: "ct_linux_spawn_entry_unrecorded_pre", nodecl, raises: [].}
+proc cSpawnEntryUnrecordedPost(file: cstring; usePath, preFlagged, succeeded,
+                               hasFileActions: cint; childPid: clong)
+  {.importc: "ct_linux_spawn_entry_unrecorded_post", nodecl, raises: [].}
 proc cReportForkChildSkippedEvidence()
   {.importc: "ct_linux_report_fork_child_skipped_evidence", nodecl,
     raises: [].}
@@ -7042,22 +7140,36 @@ proc reportExecHookEntryUnrecorded*(path: cstring) {.raises: [].} =
   ## pre-encoded frame. Allocation-free.
   cReportExecHookEntryUnrecorded(path)
 
-proc spawnImageUninjectable*(file: cstring; usePath: bool): string
-    {.raises: [].} =
+proc spawnImageUninjectable*(file: cstring; usePath: bool;
+                             childPid: int = 0): string {.raises: [].} =
   ## For the posix_spawn/posix_spawnp hooks: "" or the detail, as
-  ## `execHookImageUninjectable`; `usePath` searches the caller's PATH.
+  ## `execHookImageUninjectable`; `usePath` searches the caller's PATH. With
+  ## `childPid` (after a successful spawn) a relative name is resolved in
+  ## that child's working directory instead of the caller's; see
+  ## `ct_linux_spawn_image_uninjectable`.
   if file == nil:
     return ""
   var buf = newString(uninjectableDetailCap)
-  if cSpawnImageUninjectable(file, cint(usePath), cstring(buf),
-                             csize_t(buf.len)) == 0:
+  if cSpawnImageUninjectable(file, cint(usePath), clong(childPid),
+                             cstring(buf), csize_t(buf.len)) == 0:
     return ""
   $cstring(buf)
 
-proc reportSpawnEntryUnrecorded*(file: cstring; usePath: bool)
+proc spawnEntryUnrecordedPre*(file: cstring; usePath: bool): bool
     {.raises: [].} =
-  ## `reportExecHookEntryUnrecorded` for the posix_spawn hooks.
-  cReportSpawnEntryUnrecorded(file, cint(usePath))
+  ## For the posix_spawn hooks where they cannot record: whether the spawn
+  ## is about to start an image the shim cannot enter. Allocation-free; pass
+  ## the answer to `reportSpawnEntryUnrecorded` after the real call.
+  cSpawnEntryUnrecordedPre(file, cint(usePath)) != 0
+
+proc reportSpawnEntryUnrecorded*(file: cstring; usePath, preFlagged,
+                                 succeeded, hasFileActions: bool;
+                                 childPid: int) {.raises: [].} =
+  ## `reportExecHookEntryUnrecorded` for the posix_spawn hooks, after the
+  ## real call: reports through the unnamed frame when the spawn succeeded
+  ## and started an image the shim cannot enter. Allocation-free.
+  cSpawnEntryUnrecordedPost(file, cint(usePath), cint(preFlagged),
+    cint(succeeded), cint(hasFileActions), clong(childPid))
 
 proc reportForkChildSkippedEvidence*() {.raises: [].} =
   ## Report, once per process, that this fork child skipped a hook that

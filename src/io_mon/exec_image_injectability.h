@@ -35,9 +35,18 @@
  * Never flagged: a file that is neither ELF nor `#!` (a shell retries
  * ENOEXEC as a script; binfmt_misc may claim it), and a target that does not
  * exist, is not a regular file or is not executable: the exec fails, and
- * Python's PATH loop, for one, tries nonexistent candidates. A target that
- * cannot be read is not flagged either, since its header cannot be inspected
- * (see RESIDUAL).
+ * Python's PATH loop, for one, tries nonexistent candidates.
+ *
+ * EXECUTE-ONLY IMAGES. A regular file the caller may execute but not read
+ * (mode --x) is run by the kernel, yet its header cannot be inspected here.
+ * It is flagged (IOMON_EXEC_UNREADABLE): an entry whose injectability cannot
+ * be verified is graded as a loss rather than assumed monitored, because a
+ * static or other-class execute-only image is exactly the one that would
+ * otherwise publish an incomplete capture as complete. The cost is a loss for
+ * a dynamic execute-only image the shim does enter -- rare in builds, and the
+ * safe direction (a re-run, never a false skip). A caller with
+ * CAP_DAC_OVERRIDE (root) reads the header anyway and gets the ordinary
+ * verdict.
  *
  * RESIDUAL. The verdict is made before the exec; an exec that then fails
  * leaves a loss for an image that never ran. Checking X_OK and the file type
@@ -46,9 +55,7 @@
  * binfmt_misc handler claims (an aarch64 test binary run by a cross build's
  * configure on x86_64, say), plus ETXTBSY/E2BIG/ENOMEM races. Each leaves the
  * capture incomplete (re-run, never a false skip), which is the safe
- * direction. The one residual in the unsafe direction is an execute-only
- * image (mode --x for the caller): the kernel runs it, but its header cannot
- * be read here, so a static or other-class execute-only image is missed.
+ * direction.
  *
  * SAFETY CONTRACT, because the shim calls this from inside hooks, in a vfork
  * child, and from the inline-syscall SIGTRAP handler: no allocation, no
@@ -62,6 +69,7 @@
 #define IOMON_EXEC_IMAGE_INJECTABILITY_H
 
 #include <elf.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <link.h>
 #include <stddef.h>
@@ -83,7 +91,14 @@ enum {
   IOMON_EXEC_INJECTABLE = 0,
   IOMON_EXEC_OTHER_ELF = 1,
   IOMON_EXEC_STATIC = 2,
-  IOMON_EXEC_STATIC_PIE = 3
+  IOMON_EXEC_STATIC_PIE = 3,
+  IOMON_EXEC_UNREADABLE = 4
+};
+
+/* What `iomon_exec_open_image` reports instead of a readable descriptor. */
+enum {
+  IOMON_EXEC_OPEN_WILL_FAIL = -1,   /* the exec fails on it: never flagged */
+  IOMON_EXEC_OPEN_EXEC_ONLY = -2    /* the kernel runs it; it cannot be read */
 };
 
 /* The images one exec may pass through: fs/exec.c `exec_binprm` lets
@@ -275,6 +290,30 @@ static int iomon_exec_elf_verdict(const iomon_exec_io *io, int fd,
   return IOMON_EXEC_STATIC_PIE;
 }
 
+/* Open the image an exec of `name` (relative to `dirfd`) would load, to read
+ * its header. Returns the descriptor; IOMON_EXEC_OPEN_WILL_FAIL when the exec
+ * fails on it (not executable for the caller, missing, not a regular file);
+ * or IOMON_EXEC_OPEN_EXEC_ONLY when it is an executable regular file the
+ * caller cannot read. That last case is told apart through an O_PATH
+ * descriptor, which needs no read permission and still answers fstat. */
+static long iomon_exec_open_image(const iomon_exec_io *io, int dirfd,
+                                  const char *name, int nofollow) {
+  int follow = nofollow ? O_NOFOLLOW : 0;
+  if (io->access_x(dirfd, name) != 0) return IOMON_EXEC_OPEN_WILL_FAIL;
+  long fd = io->openat(dirfd, name, IOMON_EXEC_OPEN_FLAGS | follow);
+  if (fd >= 0) {
+    if (io->is_regular((int)fd) == 1) return fd;
+    io->close((int)fd);
+    return IOMON_EXEC_OPEN_WILL_FAIL;
+  }
+  if (fd != -EACCES) return IOMON_EXEC_OPEN_WILL_FAIL;
+  long probe = io->openat(dirfd, name, O_PATH | O_CLOEXEC | follow);
+  if (probe < 0) return IOMON_EXEC_OPEN_WILL_FAIL;
+  long regular = io->is_regular((int)probe);
+  io->close((int)probe);
+  return regular == 1 ? IOMON_EXEC_OPEN_EXEC_ONLY : IOMON_EXEC_OPEN_WILL_FAIL;
+}
+
 /* Classify what `execveat(dirfd, path, ..., at_flags)` would run. Returns an
  * IOMON_EXEC_* verdict; when it is not IOMON_EXEC_INJECTABLE, `detail` holds
  * "<why> image=<the uninjectable image>[ script=<the #! file>]". `display`,
@@ -303,14 +342,20 @@ static int iomon_exec_image_classify(const iomon_exec_io *io, int dirfd,
   int nofollow = (at_flags & AT_SYMLINK_NOFOLLOW) != 0;
   int via_script = 0;
   for (int depth = 0; depth < IOMON_EXEC_MAX_IMAGES; depth++) {
+    long fd = iomon_exec_open_image(io, dirfd, name, nofollow);
     /* What the exec would fail on is never flagged. */
-    if (io->access_x(dirfd, name) != 0) return IOMON_EXEC_INJECTABLE;
-    long fd = io->openat(dirfd, name,
-                          IOMON_EXEC_OPEN_FLAGS | (nofollow ? O_NOFOLLOW : 0));
-    if (fd < 0) return IOMON_EXEC_INJECTABLE;
-    if (io->is_regular((int)fd) != 1) {
-      io->close((int)fd);
-      return IOMON_EXEC_INJECTABLE;
+    if (fd == IOMON_EXEC_OPEN_WILL_FAIL) return IOMON_EXEC_INJECTABLE;
+    if (fd == IOMON_EXEC_OPEN_EXEC_ONLY) {
+      /* See EXECUTE-ONLY IMAGES above. */
+      size_t at = iomon_exec_append(detail, 0, detail_cap,
+          "execute-only image: header unreadable, injection unverifiable "
+          "image=");
+      at = iomon_exec_append(detail, at, detail_cap, via_script ? name : top);
+      if (via_script) {
+        at = iomon_exec_append(detail, at, detail_cap, " script=");
+        iomon_exec_append(detail, at, detail_cap, top);
+      }
+      return IOMON_EXEC_UNREADABLE;
     }
     unsigned char head[IOMON_BINPRM_BUF];
     memset(head, 0, sizeof(head));
@@ -356,11 +401,13 @@ static int iomon_exec_image_classify(const iomon_exec_io *io, int dirfd,
  * is unset is "/bin:/usr/bin"), an empty element meaning the working
  * directory, and run the first candidate the kernel accepts -- so the first
  * that is executable and a regular file (execve's EACCES on anything else
- * makes them try the next). A `file` containing a slash is not searched.
- * Returns 1 with the path in `out`, 0 when no candidate would run. */
-static int iomon_exec_search_path(const iomon_exec_io *io, const char *file,
-                                  const char *search, char *out,
-                                  size_t out_cap) {
+ * makes them try the next), readable or not. A `file` containing a slash is
+ * not searched. A relative candidate (from a relative PATH element, or the
+ * empty one) is looked up relative to `dirfd`, the directory the exec runs
+ * in. Returns 1 with the path in `out`, 0 when no candidate would run. */
+static int iomon_exec_search_path(const iomon_exec_io *io, int dirfd,
+                                  const char *file, const char *search,
+                                  char *out, size_t out_cap) {
   if (file == NULL || file[0] == '\0' || out_cap == 0) return 0;
   if (strchr(file, '/') != NULL) {
     size_t at = iomon_exec_append(out, 0, out_cap, file);
@@ -382,13 +429,12 @@ static int iomon_exec_search_path(const iomon_exec_io *io, const char *file,
         out[at++] = '/';
       }
       memcpy(out + at, file, file_len + 1);
-      if (io->access_x(AT_FDCWD, out) == 0) {
-        long fd = io->openat(AT_FDCWD, out, IOMON_EXEC_OPEN_FLAGS);
-        if (fd >= 0) {
-          long regular = io->is_regular((int)fd);
-          io->close((int)fd);
-          if (regular == 1) return 1;
-        }
+      /* An execute-only candidate runs too: the search must stop at it. */
+      long fd = iomon_exec_open_image(io, dirfd, out, 0);
+      if (fd == IOMON_EXEC_OPEN_EXEC_ONLY) return 1;
+      if (fd >= 0) {
+        io->close((int)fd);
+        return 1;
       }
     }
     if (end == NULL) break;

@@ -14,10 +14,9 @@ when not defined(linux):
 
 import std/[os, strutils]
 
-const execImageHeader = currentSourcePath().parentDir() /
-  "exec_image_injectability.h"
+import ./exec_image_header
 
-{.emit: "#include \"" & execImageHeader & "\"".}
+{.emit: execImageIncludeDirective.}
 
 {.emit: """
 #include <errno.h>

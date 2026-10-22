@@ -15,12 +15,15 @@
 ##
 ## WHAT THIS TEST GRADES. Each way a monitored context can start an image --
 ## the root spawn, every exec entry point the shim hooks (execve, execvp's
-## PATH search, fexecve, posix_spawn, posix_spawnp), and the raw `execve`
+## PATH search, fexecve, posix_spawn -- also with a file action that changes
+## the child's directory before a relative name is resolved --, posix_spawnp),
+## and the raw `execve`
 ## system call through syscall(2) and through an inline `syscall`
 ## instruction, and an execve from a raw-clone child that skips monitor
 ## bookkeeping and so can only report the loss unnamed -- is driven into an
 ## image the shim cannot enter: an i686
-## dynamic shell, a static and a static-pie x86_64 binary, and a `#!` script
+## dynamic shell, a static and a static-pie x86_64 binary, an execute-only
+## (mode --x) static binary whose header cannot be read, and a `#!` script
 ## whose interpreter is the i686 shell. The uninjectable image then execs a
 ## monitored 64-bit helper in the same pid, the shape that defeated the
 ## counting signals. Each capture must be `mcIncomplete`, with an event-loss
@@ -76,6 +79,7 @@ int main(int argc, char **argv) {
 
 const hostSource = """
 #define _GNU_SOURCE
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
@@ -111,6 +115,21 @@ static int spawn_and_wait(int use_path, char *target, char **argv) {
   return WIFEXITED(status) ? WEXITSTATUS(status) : 32;
 }
 
+/* posix_spawn TARGET (typically relative) in DIR: a file action changes the
+ * child's directory before its exec resolves the name. */
+static int spawn_in_dir_and_wait(const char *dir, char *target, char **argv) {
+  posix_spawn_file_actions_t fa;
+  if (posix_spawn_file_actions_init(&fa) != 0) return 33;
+  if (posix_spawn_file_actions_addchdir_np(&fa, dir) != 0) return 34;
+  pid_t pid;
+  int rc = posix_spawn(&pid, target, &fa, NULL, argv, environ);
+  posix_spawn_file_actions_destroy(&fa);
+  if (rc != 0) return 30;
+  int status = 0;
+  if (waitpid(pid, &status, 0) != pid) return 31;
+  return WIFEXITED(status) ? WEXITSTATUS(status) : 32;
+}
+
 /* A second thread that only waits, so the process is multi-threaded. */
 static void *idle_thread(void *arg) {
   (void)arg;
@@ -135,6 +154,16 @@ static int clone_child_exec(char *target, char **targv) {
   return WIFEXITED(status) ? WEXITSTATUS(status) : 44;
 }
 
+/* Make this thread one the shim cannot record from, as it is inside a hook
+ * (where a host signal handler can run), through the shim's own switch. */
+static int disable_shim_recording(void) {
+  void (*disable)(void) = (void (*)(void))dlsym(
+      RTLD_DEFAULT, "repro_monitor_shim_disable_current_thread");
+  if (disable == NULL) return 0;
+  disable();
+  return 1;
+}
+
 /* exec-host MODE TARGET ARG...: start TARGET with argv TARGET ARG... */
 int main(int argc, char **argv) {
   if (argc < 3) return 2;
@@ -153,12 +182,23 @@ int main(int argc, char **argv) {
     return spawn_and_wait(0, target, targv);
   } else if (strcmp(mode, "posix_spawnp") == 0) {
     return spawn_and_wait(1, target, targv);
+  } else if (strncmp(mode, "posix_spawn-chdir=", 18) == 0) {
+    return spawn_in_dir_and_wait(mode + 18, target, targv);
   } else if (strcmp(mode, "syscall-execve") == 0) {
     syscall(SYS_execve, target, targv, environ);
 #ifdef __x86_64__
   } else if (strcmp(mode, "inline-execve") == 0) {
     raw3(SYS_execve, (long)target, (long)targv, (long)environ);
 #endif
+  } else if (strcmp(mode, "unrecorded-execve") == 0) {
+    if (!disable_shim_recording()) return 5;
+    execve(target, targv, environ);
+  } else if (strcmp(mode, "unrecorded-posix_spawn") == 0) {
+    if (!disable_shim_recording()) return 5;
+    return spawn_and_wait(0, target, targv);
+  } else if (strncmp(mode, "unrecorded-posix_spawn-chdir=", 29) == 0) {
+    if (!disable_shim_recording()) return 5;
+    return spawn_in_dir_and_wait(mode + 29, target, targv);
   } else if (strcmp(mode, "clone-child-execve") == 0) {
     return clone_child_exec(target, targv);
   } else if (strcmp(mode, "fail-then-execve") == 0) {
@@ -351,6 +391,18 @@ suite "io-mon Linux: entry into an image the shim cannot enter":
         checkUninjectable(capture(@[host, mode, name, "-c",
           helper & " " & input], extraPath = dir), dir / name)
 
+  test "descendant via posix_spawn with a chdir file action: i686 shell":
+    # The relative name exists only in the directory the file action moves
+    # the child to, so classifying it in the caller's directory finds
+    # nothing: the shim must resolve it where the child exec'd it.
+    if requireI686():
+      let dir = work / "chdir-target"
+      createDir(dir)
+      createSymlink(i686Sh, dir / "sh32-chdir")
+      require not fileExists(getCurrentDir() / "sh32-chdir")
+      checkUninjectable(capture(@[host, "posix_spawn-chdir=" & dir,
+        "./sh32-chdir", "-c", helper & " " & input]), "./sh32-chdir")
+
   test "descendant via execve from a child that cannot record: i686 shell":
     # A raw clone of a multi-threaded host: its child skips monitor
     # bookkeeping until exec, so it cannot record the loss by name. It must
@@ -365,6 +417,29 @@ suite "io-mon Linux: entry into an image the shim cannot enter":
       check dep.completeness == mcIncomplete
       check lossDetails(dep).anyIt("uninjectable image" in it and
         "could not record it by name" in it)
+
+  # A thread the shim cannot record from: inside a hook, where a host signal
+  # handler that execs or spawns would run, and here reached deterministically
+  # through the shim's per-thread switch. The entry has to be reported anyway
+  # (unnamed). At 06ee30af only a fork child skipping bookkeeping did.
+  for mode in ["unrecorded-execve", "unrecorded-posix_spawn",
+               "unrecorded-posix_spawn-chdir"]:
+    test "descendant via " & mode & " from a thread that cannot record":
+      if requireI686():
+        var hostMode = mode
+        var target = i686Sh
+        if mode.endsWith("-chdir"):
+          let dir = work / "chdir-unrecorded"
+          createDir(dir)
+          createSymlink(i686Sh, dir / "sh32-unrecorded")
+          hostMode = mode & "=" & dir
+          target = "./sh32-unrecorded"
+        let dep = capture(@[host, hostMode, target, "-c",
+          helper & " " & input])
+        check helperRanMonitored(dep)
+        check dep.completeness == mcIncomplete
+        check lossDetails(dep).anyIt("uninjectable image" in it and
+          "could not record it by name" in it)
 
   # --- #! script whose interpreter is the i686 shell ---------------------
 
@@ -399,6 +474,32 @@ suite "io-mon Linux: entry into an image the shim cannot enter":
       checkUninjectable(capture(@[host, "execve", staticExec, helper, input]),
         staticExec)
 
+    # --- execute-only (mode --x): the header cannot be read -------------
+    #
+    # The kernel runs it, but the classifier cannot inspect it, so the entry
+    # is unverifiable and must be graded as a loss rather than assumed
+    # monitored. As root (CAP_DAC_OVERRIDE) the header is readable and the
+    # ordinary "statically linked" verdict names the same image, so the
+    # check holds either way.
+    let execOnly = work / "static-exec-xonly"
+    copyFile(staticExec, execOnly)
+    setFilePermissions(execOnly, {fpUserExec})
+
+    test "root: an execute-only static binary":
+      checkUninjectable(capture(@[execOnly, helper, input]), execOnly)
+
+    test "descendant via execve: an execute-only static binary":
+      checkUninjectable(capture(@[host, "execve", execOnly, helper, input]),
+        execOnly)
+
+    test "descendant via execvp PATH search: an execute-only static binary":
+      let dir = work / "path-xonly"
+      createDir(dir)
+      copyFile(staticExec, dir / "xonly-static")
+      setFilePermissions(dir / "xonly-static", {fpUserExec})
+      checkUninjectable(capture(@[host, "execvp", "xonly-static", helper,
+        input], extraPath = dir), dir / "xonly-static")
+
   # --- negative controls: no false loss ----------------------------------
 
   test "control: an ordinary 64-bit dynamic root":
@@ -406,6 +507,17 @@ suite "io-mon Linux: entry into an image the shim cannot enter":
 
   test "control: posix_spawn of an ordinary 64-bit dynamic image":
     checkComplete(capture(@[host, "posix_spawn", helper, input]))
+
+  test "control: a chdir file action before an ordinary 64-bit image":
+    # The post-spawn re-check (the child's /proc exe and cwd) must not flag
+    # an image the shim enters, whether or not the thread can record.
+    let dir = work / "chdir-control"
+    createDir(dir)
+    createSymlink(helper, dir / "helper64-chdir")
+    checkComplete(capture(@[host, "posix_spawn-chdir=" & dir,
+      "./helper64-chdir", input]))
+    checkComplete(capture(@[host, "unrecorded-posix_spawn-chdir=" & dir,
+      "./helper64-chdir", input]))
 
   test "control: a #! script whose interpreter is a 64-bit shell":
     let bash64 = findExe("bash")
