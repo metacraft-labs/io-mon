@@ -600,7 +600,17 @@ type
 #include <unistd.h>
 
 extern char **environ;
+""".}
 
+# The exec-target classifier shared with the consumer's root spawn: see that
+# file's header comment and "AN EXEC INTO AN IMAGE THE SHIM CANNOT ENTER IS
+# EVENT-LOSS" below. Included (all `static`) rather than linked, so this shim
+# exports no symbol of it.
+const execImageInjectabilityHeader = currentSourcePath().parentDir()
+  .parentDir() / "exec_image_injectability.h"
+{.emit: "#include \"" & execImageInjectabilityHeader & "\"".}
+
+{.emit: """
 typedef long ssize_like_t;
 typedef int (*ct_open_hook_fn)(char *, int, int);
 typedef int (*ct_openat_hook_fn)(int, char *, int, int);
@@ -1600,9 +1610,8 @@ int ct_linux_preload_arm_fork_skip_loss_report(const unsigned char *frame,
                                                long frame_len, long pid_offset,
                                                long tid_offset)
     __attribute__((visibility("default")));
-static int ct_arm_fork_skip_loss_report(int subscriber,
+static int ct_arm_loss_frame(ct_fork_loss_frame *slot,
     const unsigned char *frame, long frame_len, long pid_offset, long tid_offset) {
-  ct_fork_loss_frame *slot = &ct_fork_skip_loss[subscriber];
   __atomic_store_n(&slot->len, 0, __ATOMIC_RELEASE);
   if (ct_inline_loss_dir[0] != '/' || frame == NULL || frame_len <= 0 ||
       frame_len > CT_INLINE_LOSS_FRAME_CAP)
@@ -1622,14 +1631,16 @@ static int ct_arm_fork_skip_loss_report(int subscriber,
 }
 int ct_linux_preload_arm_fork_skip_loss_report(const unsigned char *frame,
     long frame_len, long pid_offset, long tid_offset) {
-  return ct_arm_fork_skip_loss_report(0, frame, frame_len, pid_offset, tid_offset);
+  return ct_arm_loss_frame(&ct_fork_skip_loss[0], frame, frame_len, pid_offset,
+                           tid_offset);
 }
 int ct_linux_preload_arm_subscriber_fork_skip_loss_report(const unsigned char *frame,
     long frame_len, long pid_offset, long tid_offset)
     __attribute__((visibility("hidden")));
 int ct_linux_preload_arm_subscriber_fork_skip_loss_report(const unsigned char *frame,
     long frame_len, long pid_offset, long tid_offset) {
-  return ct_arm_fork_skip_loss_report(1, frame, frame_len, pid_offset, tid_offset);
+  return ct_arm_loss_frame(&ct_fork_skip_loss[1], frame, frame_len, pid_offset,
+                           tid_offset);
 }
 
 void ct_linux_report_fork_child_skipped_evidence(void)
@@ -1649,6 +1660,163 @@ void ct_linux_report_fork_child_skipped_evidence(void) {
       __atomic_store_n(&ct_fork_skip_loss_reported_pid, (int)pid,
                        __ATOMIC_RELEASE);
   }
+  errno = saved_errno;
+}
+
+/* AN EXEC INTO AN IMAGE THE SHIM CANNOT ENTER IS EVENT-LOSS.
+ *
+ * The loader drops LD_PRELOAD for an image of another ELF class or machine
+ * ("wrong ELF class: ignored") and a static image has no loader at all, so
+ * such an image runs with no shim and leaves no record. The merge's
+ * process-tree accounting cannot tell: when that image later execs a
+ * monitored one in the same pid, the monitored image emits the pid's
+ * process-start and the unmonitored one emitted no exec, so starts and
+ * execs balance. Only the monitored context that starts the image knows, so
+ * every entry this shim sees classifies its target
+ * (exec_image_injectability.h) and records event-loss naming the image:
+ *   - the exec family, through the execve hook, which resolves what the
+ *     kernel will run (the descriptor of fexecve/execveat, the caller's PATH
+ *     for execvp): ct_linux_exec_hook_image_uninjectable;
+ *   - posix_spawn/posix_spawnp, through their hooks, after a successful
+ *     spawn: ct_linux_spawn_image_uninjectable;
+ *   - a raw execve/execveat (syscall(2), its patched replacement, and an
+ *     inline `syscall` instruction the trap handler replays), which reach no
+ *     exec hook: ct_linux_check_raw_exec_entry, below.
+ * Files are read with raw system calls, so the classification neither
+ * re-enters this shim's hooks nor is recorded as an observation, and it is
+ * async-signal-safe for the trap handler.
+ *
+ * The record is emitted by the shim (ct_uninjectable_exec_observer) when it
+ * can record: this thread is not inside a hook. Otherwise -- a host signal
+ * handler that interrupted a hook, or a fork child skipping bookkeeping until
+ * exec -- a pre-encoded event-loss frame is written instead, with raw
+ * syscalls, as for unclassified inline events; it cannot name the image, but
+ * the capture is still graded incomplete. */
+static long ct_exec_io_openat(int dirfd, const char *path, int flags) {
+  return ct_raw_syscall6(SYS_openat, dirfd, (long)path, flags, 0, 0, 0);
+}
+static long ct_exec_io_pread(int fd, void *buf, unsigned long len,
+                             long offset) {
+  long n;
+  do {
+    n = ct_raw_syscall6(SYS_pread64, fd, (long)buf, (long)len, offset, 0, 0);
+  } while (n == -EINTR);
+  return n;
+}
+static long ct_exec_io_is_regular(int fd) {
+  /* The kernel's struct stat is glibc's on x86_64 and on the generic ABI
+   * (aarch64), so st_mode is where <sys/stat.h> says. */
+  struct stat st;
+  long rc = ct_raw_syscall6(SYS_fstat, fd, (long)&st, 0, 0, 0, 0);
+  return rc < 0 ? rc : (S_ISREG(st.st_mode) ? 1 : 0);
+}
+static long ct_exec_io_access_x(int dirfd, const char *path) {
+  return ct_raw_syscall6(SYS_faccessat, dirfd, (long)path, X_OK, 0, 0, 0);
+}
+static void ct_exec_io_close(int fd) {
+  (void)ct_raw_syscall6(SYS_close, fd, 0, 0, 0, 0, 0);
+}
+static const iomon_exec_io ct_exec_raw_io = {
+  ct_exec_io_openat, ct_exec_io_pread, ct_exec_io_is_regular,
+  ct_exec_io_access_x, ct_exec_io_close
+};
+
+/* Room for the reason, an image path and a script path on the paths that
+ * keep the detail on the stack (the trap handler may run on a small
+ * alternate signal stack); a longer one is truncated, never overrun. */
+#define CT_EXEC_DETAIL_CAP 1024
+
+/* The shim's recorder (linux_preload.nim): emits the loss and flushes, and
+ * returns 1, or returns 0 when it cannot record (then the frame is used). */
+typedef int (*ct_uninjectable_exec_fn)(const char *entry, const char *detail);
+static ct_uninjectable_exec_fn ct_uninjectable_exec_observer = NULL;
+void ct_linux_preload_register_uninjectable_exec(ct_uninjectable_exec_fn fn)
+    __attribute__((visibility("hidden")));
+void ct_linux_preload_register_uninjectable_exec(ct_uninjectable_exec_fn fn) {
+  __atomic_store_n(&ct_uninjectable_exec_observer, fn, __ATOMIC_RELEASE);
+}
+
+static ct_fork_loss_frame ct_uninjectable_exec_loss;
+int ct_linux_preload_arm_uninjectable_exec_loss_report(
+    const unsigned char *frame, long frame_len, long pid_offset,
+    long tid_offset) __attribute__((visibility("hidden")));
+int ct_linux_preload_arm_uninjectable_exec_loss_report(
+    const unsigned char *frame, long frame_len, long pid_offset,
+    long tid_offset) {
+  return ct_arm_loss_frame(&ct_uninjectable_exec_loss, frame, frame_len,
+                           pid_offset, tid_offset);
+}
+
+/* The unnamed fallback: one pre-encoded frame per uninjectable entry. */
+void ct_linux_report_uninjectable_exec_frame(void)
+    __attribute__((visibility("hidden")));
+void ct_linux_report_uninjectable_exec_frame(void) {
+  long frame_len = __atomic_load_n(&ct_uninjectable_exec_loss.len,
+                                   __ATOMIC_ACQUIRE);
+  if (frame_len <= 0) return;
+  int saved_errno = errno;
+  long pid = ct_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
+  long tid = ct_raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
+  (void)ct_write_loss_frame(ct_uninjectable_exec_loss.bytes, frame_len,
+                            ct_uninjectable_exec_loss.pid_offset,
+                            ct_uninjectable_exec_loss.tid_offset,
+                            "-exec-loss.iomon-frag", pid, tid);
+  errno = saved_errno;
+}
+
+/* Record that `entry` is about to start the uninjectable image `detail`
+ * describes: through the shim when this thread is not inside a hook (the
+ * recorder takes the shim's locks), else through the frame. */
+static void ct_report_uninjectable_exec(const char *entry,
+                                        const char *detail) {
+  ct_uninjectable_exec_fn observer =
+      __atomic_load_n(&ct_uninjectable_exec_observer, __ATOMIC_ACQUIRE);
+  if (observer != NULL && stackable_linux_preload_current_depth() == 0) {
+    int saved_errno = errno;
+    stackable_linux_preload_enter_hook();
+    int recorded = observer(entry, detail);
+    stackable_linux_preload_exit_hook();
+    if (recorded) {
+      /* The exec discards this image: make a batched record durable first
+       * (the shared-memory set needs no flush; the file fallback does). */
+      repro_linux_sig_safe_flush();
+      errno = saved_errno;
+      return;
+    }
+    errno = saved_errno;
+  }
+  ct_linux_report_uninjectable_exec_frame();
+}
+
+/* A raw execve(path, ...) or execveat(dirfd, path, ..., flags) is about to
+ * be issued (a1, a2, a5 are its first, second and fifth arguments). */
+void ct_linux_check_raw_exec_entry(long nr, long a1, long a2, long a5)
+    __attribute__((visibility("hidden")));
+void ct_linux_check_raw_exec_entry(long nr, long a1, long a2, long a5) {
+  int dirfd = AT_FDCWD, flags = 0;
+  const char *path;
+  const char *entry;
+  if (nr == SYS_execve) {
+    path = (const char *)a1;
+    entry = "raw execve";
+#ifdef SYS_execveat
+  } else if (nr == SYS_execveat) {
+    dirfd = (int)a1;
+    path = (const char *)a2;
+    flags = (int)a5;
+    entry = "raw execveat";
+#endif
+  } else {
+    return;
+  }
+  (void)a2;
+  (void)a5;
+  int saved_errno = errno;
+  char detail[CT_EXEC_DETAIL_CAP];
+  if (iomon_exec_image_classify(&ct_exec_raw_io, dirfd, path, flags, NULL,
+                                detail, sizeof(detail)) !=
+      IOMON_EXEC_INJECTABLE)
+    ct_report_uninjectable_exec(entry, detail);
   errno = saved_errno;
 }
 
@@ -1992,6 +2160,9 @@ static void ct_linux_inline_syscall_sigtrap_handler(
 #endif
       ) {
     ct_linux_drain_inline_events_before_image_end();
+    /* No exec hook runs for a replayed inline exec: classify its target. */
+    ct_linux_check_raw_exec_entry(regs.nr, regs.args[0], regs.args[1],
+                                  regs.args[4]);
   }
 
   /* A trapped fork-like call (an inline `syscall` issuing clone/clone3
@@ -2777,8 +2948,11 @@ long ct_linux_preload_syscall_replacement(long nr, long a1, long a2, long a3,
 #ifdef SYS_execveat
       || nr == SYS_execveat
 #endif
-      )
+      ) {
     ct_linux_drain_inline_events_before_image_end();
+    /* No exec hook runs for a raw exec: classify its target here. */
+    ct_linux_check_raw_exec_entry(nr, a1, a2, a5);
+  }
   int forks = ct_raw_call_forks_process(nr, a1) && !CT_BYPASS() &&
               ct_raw_fork_sample != NULL && ct_raw_fork_child != NULL;
   int parent_single = forks ? CT_CALL_HOOK(ct_raw_fork_sample()) : 1;
@@ -3936,6 +4110,108 @@ int ct_linux_preload_real_execveat(int dirfd, const char *path, char **argv,
   errno = ENOSYS;
   return -1;
 #endif
+}
+
+/* The caller's PATH, as glibc's execvpe and posix_spawnp read it
+ * (getenv("PATH") of the process, never the envp passed to the call),
+ * scanned from `environ` directly so the shim's getenv hook is not entered.
+ * NULL when unset. */
+static const char *ct_exec_caller_path(void) {
+  if (environ == NULL) return NULL;
+  for (char **entry = environ; *entry != NULL; entry++)
+    if (strncmp(*entry, "PATH=", 5) == 0) return *entry + 5;
+  return NULL;
+}
+
+/* Classify what a PATH-searching exec of `file` would run. */
+static int ct_exec_classify_searched(const char *file, char *detail,
+                                     size_t cap) {
+  char resolved[PATH_MAX];
+  if (!iomon_exec_search_path(&ct_exec_raw_io, file, ct_exec_caller_path(),
+                              resolved, sizeof(resolved)))
+    return IOMON_EXEC_INJECTABLE;
+  return iomon_exec_image_classify(&ct_exec_raw_io, AT_FDCWD, resolved, 0,
+                                   NULL, detail, cap);
+}
+
+/* For the execve hook: 1, with `detail` filled, when the exec it is about
+ * to perform on `path` enters an image the shim cannot enter. The hook's
+ * `path` is not always what the kernel runs, and this resolves the same
+ * target the hook's real execve will:
+ *   - fexecve/execveat (ct_exec_redirect_state): the descriptor and path of
+ *     THAT call; `path` is only its label (ct_exec_image_label), kept for
+ *     the detail;
+ *   - execvp/execvpe/execlp of a name without a slash
+ *     (ct_exec_announce_only): glibc's PATH search over the caller's PATH;
+ *   - otherwise `path` itself, relative to the working directory.
+ * errno is preserved. */
+int ct_linux_exec_hook_image_uninjectable(const char *path, char *detail,
+                                          size_t cap)
+    __attribute__((visibility("hidden")));
+int ct_linux_exec_hook_image_uninjectable(const char *path, char *detail,
+                                          size_t cap) {
+  int saved_errno = errno;
+  int verdict;
+  if (ct_exec_redirect_state.active &&
+      ct_exec_redirect_state.announced == path &&
+      ct_exec_redirect_state.pid == getpid()) {
+    struct ct_exec_redirect redirect = ct_exec_redirect_state;
+    verdict = iomon_exec_image_classify(&ct_exec_raw_io, redirect.fd,
+                                        redirect.path, redirect.flags, path,
+                                        detail, cap);
+  } else if (ct_exec_announce_only && path != NULL &&
+             strchr(path, '/') == NULL) {
+    verdict = ct_exec_classify_searched(path, detail, cap);
+  } else {
+    verdict = iomon_exec_image_classify(&ct_exec_raw_io, AT_FDCWD, path, 0,
+                                        NULL, detail, cap);
+  }
+  errno = saved_errno;
+  return verdict != IOMON_EXEC_INJECTABLE;
+}
+
+/* The execve hook's entry when it cannot record (a fork child skipping
+ * bookkeeping until exec): classify, and report through the unnamed frame. */
+void ct_linux_report_exec_hook_entry_unrecorded(const char *path)
+    __attribute__((visibility("hidden")));
+void ct_linux_report_exec_hook_entry_unrecorded(const char *path) {
+  char detail[CT_EXEC_DETAIL_CAP];
+  if (ct_linux_exec_hook_image_uninjectable(path, detail, sizeof(detail)))
+    ct_linux_report_uninjectable_exec_frame();
+}
+
+/* For the posix_spawn/posix_spawnp hooks: 1, with `detail` filled, when the
+ * spawn starts an image the shim cannot enter. posix_spawnp (`use_path`)
+ * searches the caller's PATH as glibc's __spawni does. A relative `file` is
+ * taken relative to the caller's working directory; a file action that
+ * changes the child's directory first (posix_spawn_file_actions_addchdir_np)
+ * is not modelled. errno is preserved. */
+int ct_linux_spawn_image_uninjectable(const char *file, int use_path,
+                                      char *detail, size_t cap)
+    __attribute__((visibility("hidden")));
+int ct_linux_spawn_image_uninjectable(const char *file, int use_path,
+                                      char *detail, size_t cap) {
+  int saved_errno = errno;
+  int verdict = use_path
+      ? ct_exec_classify_searched(file, detail, cap)
+      : iomon_exec_image_classify(&ct_exec_raw_io, AT_FDCWD, file, 0, NULL,
+                                  detail, cap);
+  errno = saved_errno;
+  return verdict != IOMON_EXEC_INJECTABLE;
+}
+
+/* The posix_spawn hooks' entry when they cannot record (a fork child
+ * skipping bookkeeping): classify, and report through the unnamed frame. The
+ * spawn's outcome is not known yet, so this may report a spawn that then
+ * fails; that only happens in a child that is already reporting skipped
+ * evidence. */
+void ct_linux_report_spawn_entry_unrecorded(const char *file, int use_path)
+    __attribute__((visibility("hidden")));
+void ct_linux_report_spawn_entry_unrecorded(const char *file, int use_path) {
+  char detail[CT_EXEC_DETAIL_CAP];
+  if (ct_linux_spawn_image_uninjectable(file, use_path, detail,
+                                        sizeof(detail)))
+    ct_linux_report_uninjectable_exec_frame();
 }
 
 int ct_linux_preload_real_posix_spawn(pid_t *pid, char *path,
@@ -6048,6 +6324,24 @@ proc cArmSubscriberForkSkipLossReport(frame: pointer; frameLen: clong;
                             pidOffset, tidOffset: clong): cint
   {.importc: "ct_linux_preload_arm_subscriber_fork_skip_loss_report", nodecl,
     raises: [].}
+proc cArmUninjectableExecLossReport(frame: pointer; frameLen: clong;
+                                    pidOffset, tidOffset: clong): cint
+  {.importc: "ct_linux_preload_arm_uninjectable_exec_loss_report", nodecl,
+    raises: [].}
+proc cRegisterUninjectableExec(observer: pointer)
+  {.importc: "ct_linux_preload_register_uninjectable_exec", nodecl,
+    raises: [].}
+proc cExecHookImageUninjectable(path: cstring; detail: cstring;
+                                cap: csize_t): cint
+  {.importc: "ct_linux_exec_hook_image_uninjectable", nodecl, raises: [].}
+proc cReportExecHookEntryUnrecorded(path: cstring)
+  {.importc: "ct_linux_report_exec_hook_entry_unrecorded", nodecl,
+    raises: [].}
+proc cSpawnImageUninjectable(file: cstring; usePath: cint; detail: cstring;
+                             cap: csize_t): cint
+  {.importc: "ct_linux_spawn_image_uninjectable", nodecl, raises: [].}
+proc cReportSpawnEntryUnrecorded(file: cstring; usePath: cint)
+  {.importc: "ct_linux_report_spawn_entry_unrecorded", nodecl, raises: [].}
 proc cReportForkChildSkippedEvidence()
   {.importc: "ct_linux_report_fork_child_skipped_evidence", nodecl,
     raises: [].}
@@ -6704,6 +6998,66 @@ proc armForkSkipLossReport*(frame: openArray[byte];
   else:
     cArmForkSkipLossReport(unsafeAddr frame[0], clong(frame.len),
       clong(pidOffset), clong(tidOffset)) == 1
+
+proc armUninjectableExecLossReport*(frame: openArray[byte];
+                                    pidOffset, tidOffset: int): bool
+    {.raises: [].} =
+  ## Hand the runtime the pre-encoded event-loss frame it writes, with raw
+  ## syscalls, for an entry into an image the shim cannot enter that it
+  ## cannot record by name (`ct_linux_report_uninjectable_exec_frame`). Call
+  ## after `armInlineLossReport`, whose fragment directory it shares.
+  if frame.len == 0:
+    return false
+  cArmUninjectableExecLossReport(unsafeAddr frame[0], clong(frame.len),
+    clong(pidOffset), clong(tidOffset)) == 1
+
+proc registerUninjectableExecRecorder*(
+    observer: proc(entry, detail: cstring): cint {.cdecl, raises: [].})
+    {.raises: [].} =
+  ## What a raw execve/execveat into an image the shim cannot enter calls
+  ## to record the loss by name (see `ct_report_uninjectable_exec`). It runs
+  ## inside a hook bracket and returns 0 when it could not record.
+  # A pointer: the C side takes `const char *` parameters, Nim passes
+  # `char *`, and the function is the same.
+  cRegisterUninjectableExec(cast[pointer](observer))
+
+const uninjectableDetailCap = 4096 + 512
+  ## A full path, a `#!` script's path and the reason.
+
+proc execHookImageUninjectable*(path: cstring): string {.raises: [].} =
+  ## For the execve hook: "" when the shim can enter the image the exec on
+  ## `path` will run, else "<reason> image=<image>[ script=<file>]". Resolves
+  ## the target the kernel will run (fexecve/execveat descriptor, execvp PATH
+  ## search); see `ct_linux_exec_hook_image_uninjectable`.
+  if path == nil:
+    return ""
+  var buf = newString(uninjectableDetailCap)
+  if cExecHookImageUninjectable(path, cstring(buf), csize_t(buf.len)) == 0:
+    return ""
+  $cstring(buf)
+
+proc reportExecHookEntryUnrecorded*(path: cstring) {.raises: [].} =
+  ## For the execve hook where it cannot record (a fork child skipping
+  ## bookkeeping): an uninjectable target is reported through the unnamed
+  ## pre-encoded frame. Allocation-free.
+  cReportExecHookEntryUnrecorded(path)
+
+proc spawnImageUninjectable*(file: cstring; usePath: bool): string
+    {.raises: [].} =
+  ## For the posix_spawn/posix_spawnp hooks: "" or the detail, as
+  ## `execHookImageUninjectable`; `usePath` searches the caller's PATH.
+  if file == nil:
+    return ""
+  var buf = newString(uninjectableDetailCap)
+  if cSpawnImageUninjectable(file, cint(usePath), cstring(buf),
+                             csize_t(buf.len)) == 0:
+    return ""
+  $cstring(buf)
+
+proc reportSpawnEntryUnrecorded*(file: cstring; usePath: bool)
+    {.raises: [].} =
+  ## `reportExecHookEntryUnrecorded` for the posix_spawn hooks.
+  cReportSpawnEntryUnrecorded(file, cint(usePath))
 
 proc reportForkChildSkippedEvidence*() {.raises: [].} =
   ## Report, once per process, that this fork child skipped a hook that

@@ -984,6 +984,10 @@ int repro_linux_install_terminating_signal_handlers(void) {
 #include <stdint.h>
 
 extern int ct_linux_drain_inline_events_before_image_end(void);
+/* Classify a raw execve/execveat target and record an entry into an image
+ * the shim cannot enter (linux_preload_runtime.nim). */
+extern void ct_linux_check_raw_exec_entry(long nr, long a1, long a2, long a5)
+    __attribute__((visibility("hidden")));
 extern void ct_linux_preload_after_raw_fork_syscall(long, long, long);
 
 typedef long (*repro_libc_syscall_fn)(long, ...);
@@ -1028,6 +1032,12 @@ long syscall(long number, ...) {
 #endif
       ) {
     ct_linux_drain_inline_events_before_image_end();
+    /* A raw exec reaches no exec hook: classify its target here. When this
+     * image patched libc's syscall(2), this body is redirected to the
+     * runtime's replacement, which does the same; when another image owns
+     * that patch, both run and the loss is recorded twice, which is
+     * harmless. */
+    ct_linux_check_raw_exec_entry(number, a0, a1, a4);
   }
   if (repro_real_libc_syscall != NULL) {
     long result = repro_real_libc_syscall(number, a0, a1, a2, a3, a4, a5);
@@ -2171,6 +2181,10 @@ const
     "inline raw syscall events unclassified at image end"
   ForkChildSkippedEvidenceDetail =
     "linux fork child skipped evidence before exec"
+  UninjectableExecUnrecordedDetail =
+    "uninjectable image: an exec or spawn entered an image the loader will " &
+    "not inject the shim into, where the shim could not record it by name " &
+    "(inside a hook, or a fork child skipping bookkeeping)"
   LossFramePidMarker = 0x5A17C0DE5A17C0DE'u64
   LossFrameTidMarker = 0x7E1DC0DE7E1DC0DE'u64
 
@@ -2191,6 +2205,7 @@ proc leU64Offset(frame: openArray[byte]; value: uint64): int =
 var
   inlineLossReportArmed = true
   forkSkipLossReportArmed = true
+  uninjectableExecReportArmed = true
 
 proc encodeLossFrame(detail: string): tuple[frame: seq[byte];
                                             pidOffset, tidOffset: int] =
@@ -2227,6 +2242,20 @@ proc armForkChildSkipLossReport(): bool {.raises: [].} =
       " override=" & getEnv("REPRO_MONITOR_SHIM_LIB"))
     result = armForkSkipLossReport(subscriber.frame, subscriber.pidOffset,
       subscriber.tidOffset, subscriber = true) and result
+  except CatchableError:
+    result = false
+
+proc armUninjectableExecReport(): bool {.raises: [].} =
+  ## Pre-encode the event-loss frame the runtime writes for an exec or spawn
+  ## into an image this shim cannot enter that it cannot record by name
+  ## (`ct_linux_report_uninjectable_exec_frame`). False when it could not be
+  ## armed; the caller reports that.
+  if fragmentDir.len == 0:
+    return true
+  try:
+    let encoded = encodeLossFrame(UninjectableExecUnrecordedDetail)
+    result = armUninjectableExecLossReport(encoded.frame, encoded.pidOffset,
+      encoded.tidOffset)
   except CatchableError:
     result = false
 
@@ -2279,6 +2308,8 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     inlineLossReportArmed = armUnclassifiedInlineLossReport()
     forkSkipLossReportArmed =
       inlineLossReportArmed and armForkChildSkipLossReport()
+    uninjectableExecReportArmed =
+      inlineLossReportArmed and armUninjectableExecReport()
     # DEP-SHM-2 — attach the process to the edge's shared-memory dependency
     # queue (the FAST PATH in front of the file fragments). The engine created
     # the segment before launching us and named it via REPRO_MONITOR_DEP_SHM;
@@ -2342,6 +2373,10 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
   if not forkSkipLossReportArmed:
     # Likewise, a fork child could not report the evidence it skips.
     emitEventLoss("fork child skipped-evidence loss report unavailable")
+  if not uninjectableExecReportArmed:
+    # Likewise, an exec into an image the shim cannot enter, made where the
+    # shim cannot record, could not be reported.
+    emitEventLoss("uninjectable-image loss report unavailable")
   let collection = getEnv("REPRO_MONITOR_COLLECTION_EVIDENCE")
   if collection.len > 0 and collection != "full:" & runId:
     emitEventLoss("invalid internal collection scope for active capture route")
@@ -3260,6 +3295,20 @@ proc repro_linux_drain_inline_events() {.cdecl, raises: [].} =
   ## Registered with the runtime as the drain the exit/exec trap paths run.
   ensureInitializedPreservingErrno()
   drainInlineRawSyscallEvents()
+
+proc repro_linux_record_uninjectable_exec(entry, detail: cstring): cint
+    {.cdecl, raises: [].} =
+  ## Registered with the runtime as the recorder for a raw execve/execveat
+  ## (syscall(2) or an inline `syscall` instruction, which reach no exec
+  ## hook) into an image this shim cannot enter. Runs inside a hook bracket,
+  ## possibly in the inline-syscall trap handler, as the drain above does.
+  ## Returns 0 when it cannot record (muted, or a fork child skipping
+  ## bookkeeping), and the runtime writes the unnamed pre-encoded frame.
+  if shouldBypass():
+    return 0
+  ensureInitializedPreservingErrno()
+  emitEventLoss("uninjectable image: " & $entry & ": " & $detail)
+  1
 
 proc repro_hook_stat*(ctx: var StatContext) {.raises: [].} =
   if bypassEvidence():
@@ -4382,6 +4431,17 @@ proc emitExecAttempt(path: cstring; envp: cstringArray) {.raises: [].} =
   if path != nil:
     record.path = $path
   emitRecord(record)
+  # An exec into an image the loader will not inject this shim into (another
+  # ELF class or machine, static, or a `#!` script whose interpreter is one of
+  # those) runs unobserved, and the merge cannot infer that from the record
+  # above: a monitored image the unobserved one execs later in this pid emits
+  # the process-start that balances it. So the loss is recorded here, at the
+  # entry, naming the image. See "AN EXEC INTO AN IMAGE THE SHIM CANNOT ENTER
+  # IS EVENT-LOSS" in linux_preload_runtime.nim, which also resolves the
+  # target the kernel will actually run.
+  let uninjectable = execHookImageUninjectable(path)
+  if uninjectable.len > 0:
+    emitEventLoss("uninjectable image: exec: " & uninjectable)
   let routeStatus = childCaptureRouteStatus(envp)
   if routeStatus != 0:
     emitEventLoss("linux child capture route invalid code=" & $routeStatus)
@@ -4393,6 +4453,11 @@ proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
     # No drain runs here (a fork child skips bookkeeping until exec): report
     # trapped events a successful exec would discard unclassified.
     reportInlineEventsIfPending()
+    if inForkChild and disabled == 0:
+      # A fork child skipping bookkeeping cannot record, but an exec it makes
+      # into an image the shim cannot enter must still be reported: the
+      # unnamed pre-encoded frame, allocation-free.
+      reportExecHookEntryUnrecorded(ctx.path)
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
@@ -4446,14 +4511,20 @@ proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
   emitRecord(failRecord)
   c_set_errno(execFailedErrno)
 
-proc repro_hook_posix_spawn*(ctx: var PosixSpawnContext) {.raises: [].} =
-  if shouldBypass():
-    callNext(ctx)
-    return
+proc recordPosixSpawn(ctx: var PosixSpawnContext; usePath: bool)
+    {.raises: [].} =
+  ## The body of the posix_spawn and posix_spawnp hooks (`usePath`: the
+  ## latter, which searches the caller's PATH).
   ensureInitializedPreservingErrno()
   let routeStatus = childCaptureRouteStatus(ctx.envp)
   if routeStatus != 0:
     emitEventLoss("linux child capture route invalid code=" & $routeStatus)
+  # Classified before the spawn so the file inspected is the one about to
+  # run; reported only if the spawn succeeded. glibc reports a failed exec
+  # of the child as posix_spawn's result, so, unlike an execve, an image that
+  # never ran leaves no loss. See `emitExecAttempt` for why the loss is
+  # recorded at the entry.
+  let uninjectable = spawnImageUninjectable(ctx.path, usePath)
   let originalEnv = ctx.envp
   let preparedEnv = envWithPreload(ctx.envp)
   ctx.envp = preparedEnv
@@ -4467,34 +4538,33 @@ proc repro_hook_posix_spawn*(ctx: var PosixSpawnContext) {.raises: [].} =
     record.result = ctx.result.int64
     if ctx.path != nil:
       record.path = $ctx.path
-    record.detail = "posix_spawn"
+    record.detail = if usePath: "posix_spawnp" else: "posix_spawn"
     emitRecord(record)
+  # Not inside the branch above: a caller may pass a NULL pid pointer, and
+  # the child it started is just as unobserved.
+  if ctx.result == 0 and uninjectable.len > 0:
+    emitEventLoss("uninjectable image: " &
+      (if usePath: "posix_spawnp" else: "posix_spawn") & ": " & uninjectable &
+      (if ctx.pid != nil: " child=" & $ctx.pid[] else: ""))
   c_set_errno(savedErrno)
+
+proc repro_hook_posix_spawn*(ctx: var PosixSpawnContext) {.raises: [].} =
+  if shouldBypass():
+    if inForkChild and disabled == 0:
+      # As in `repro_hook_execve`: a fork child that cannot record still
+      # reports a spawn into an image the shim cannot enter.
+      reportSpawnEntryUnrecorded(ctx.path, usePath = false)
+    callNext(ctx)
+    return
+  recordPosixSpawn(ctx, usePath = false)
 
 proc repro_hook_posix_spawnp*(ctx: var PosixSpawnContext) {.raises: [].} =
   if shouldBypass():
+    if inForkChild and disabled == 0:
+      reportSpawnEntryUnrecorded(ctx.path, usePath = true)
     callNext(ctx)
     return
-  ensureInitializedPreservingErrno()
-  let routeStatus = childCaptureRouteStatus(ctx.envp)
-  if routeStatus != 0:
-    emitEventLoss("linux child capture route invalid code=" & $routeStatus)
-  let originalEnv = ctx.envp
-  let preparedEnv = envWithPreload(ctx.envp)
-  ctx.envp = preparedEnv
-  callNext(ctx)
-  let savedErrno = c_get_errno()
-  freeOwnedEnv(preparedEnv, originalEnv)
-  ctx.envp = originalEnv
-  if ctx.result == 0 and ctx.pid != nil:
-    var record = baseRecord(mrProcessSpawn, moExecute)
-    record.childOsPid = uint64(ctx.pid[])
-    record.result = ctx.result.int64
-    if ctx.path != nil:
-      record.path = $ctx.path
-    record.detail = "posix_spawnp"
-    emitRecord(record)
-  c_set_errno(savedErrno)
+  recordPosixSpawn(ctx, usePath = true)
 
 proc repro_hook_exit*(ctx: var ExitContext) {.raises: [].} =
   sampleKillDiag("exit-enter")
@@ -4871,3 +4941,4 @@ registerPosixSpawnpHook(repro_hook_posix_spawnp)
 registerExitHook(repro_hook_exit)
 registerRawSyscallHook(repro_hook_raw_syscall)
 registerInlineRawSyscallDrain(repro_linux_drain_inline_events)
+registerUninjectableExecRecorder(repro_linux_record_uninjectable_exec)

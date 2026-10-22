@@ -40,6 +40,7 @@ when defined(linux) or defined(windows):
 when defined(linux):
   import std/[algorithm, monotimes, posix]
   from io_mon/proc_start_time import predatesRoot
+  import io_mon/exec_image_injectability
 
   const
     LinuxInjectedDescendantGraceMsDefault = 500
@@ -2077,6 +2078,22 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
         request.command[1 .. ^1]
       else:
         @[]
+    # An UNINJECTABLE ROOT is event-loss, recorded here because nothing else
+    # can see it. If the root image is one the loader will not preload the
+    # shim into (another ELF class or machine, static, static-pie, or a `#!`
+    # script whose interpreter is one of those), it runs unobserved; and if it
+    # then execs a monitored image in the same pid, that image's shim emits
+    # the root pid's `process-start`, which satisfies the root-spawn signal in
+    # the merge. Only this spawn site knows which image the root started as.
+    # The target is resolved the way `startProcess` resolves it below (see
+    # `resolveSpawnTarget`), and classified by the classifier the shim uses
+    # for its own exec entries (exec_image_injectability.h).
+    let rootLoss = uninjectableImageDetail(
+      resolveSpawnTarget(request.command[0], request.cwd))
+    if rootLoss.len > 0:
+      appendLauncherEventLoss(h.fragmentDir, h.runId,
+        "uninjectable image: root spawn: " & rootLoss,
+        if h.depSetLive and h.depSet.available: h.depSet.path0 else: "")
     h.process = startProcess(request.command[0],
       workingDir = request.cwd,
       args = childArgs,

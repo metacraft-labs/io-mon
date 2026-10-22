@@ -231,6 +231,14 @@
             RELEASE_STACKABLE_HOOKS_SRC = "${inputs.stackable-hooks-src}/src";
             RELEASE_SHM_QUEUE_SRC = "${inputs.shm-queue-src}/src";
             RELEASE_SHM_GSET_SRC = "${inputs.shm-gset-src}/src";
+            # A dynamically linked 32-bit (i686) shell. glibc's loader refuses a
+            # 64-bit LD_PRELOAD object in it ("wrong ELF class: ignored") and
+            # runs it anyway, so it is the canonical image the shim cannot
+            # enter. tests/linux/test_io_mon_uninjectable_image_entry.nim
+            # requires it on x86_64-linux (a missing value fails that test
+            # there) and skips on every other system, where it is empty.
+            IO_MON_TEST_I686_SH =
+              if system == "x86_64-linux" then "${pkgs.pkgsi686Linux.bash}/bin/bash" else "";
             # Paired workspace editing keeps using siblings. Release scripts
             # explicitly select the immutable inputs exported above.
             shellHook = ''

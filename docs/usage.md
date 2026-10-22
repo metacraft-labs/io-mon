@@ -626,3 +626,17 @@ makes the merge downgrade an un-monitored root to `mcIncomplete`. The built-in
 nim-stackable-hooks' `WindowsInjectionResult` gained `rootPid`; any custom
 launcher must too. Passing `0` (the default) preserves legacy behaviour for
 callers merging hand-built fragment dirs with no single known root.
+
+The root pid alone is not enough on **Linux**. A root image the loader will not
+inject the shim into — a 32-bit (or other-machine) ELF, whose loader prints
+`wrong ELF class: ignored` and runs it anyway, a static or static-pie binary, or
+a `#!` script whose interpreter is one of those — runs unobserved, and if it then
+execs a monitored image in the same pid (`i686-bash -c 'gcc …'`, a static
+`sh -c …`), that image emits the root pid's `mrProcessStart` and the guard is
+satisfied. So the spawn site classifies the root image before starting it and
+records an event-loss naming it (`uninjectable image: root spawn: <reason>
+image=<path>`); the shim does the same for every exec, `posix_spawn` and raw
+`execve` it sees. The built-in launchers do this; a custom Linux launcher must
+classify its root with `io_mon/exec_image_injectability.uninjectableImageDetail`
+(resolving the command with `resolveSpawnTarget` when it searches `PATH`) and
+record a non-empty answer as an event-loss for the run.
