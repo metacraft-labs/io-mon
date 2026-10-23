@@ -120,7 +120,7 @@ jobs:
         # revisions before materialising the env. Those two are io-mon's
         # `uses:` library producers in repro.nim; reprobuild builds each
         # from source and threads their `src/` roots onto io-mon's compile.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@e2b9947768dccce6de2687a495c8286df4d6de96
         with:
           env-flavor: reprobuild
           # The engine reads the committed v3 lock on every host. Keep the
@@ -131,6 +131,7 @@ jobs:
           repro-build-pin: d4e516041296065b665710e4c685205c69dd5e5d
           repro-runquota-pin: f9f1118cd33a27051c6fea683348f343df91e96f
           repro-io-mon-pin: 6fc4ba9a2a9636298fc2e6c6578bc4677bd0a134
+          repro-stackable-hooks-pin: 059c549306621e2f769adf75630b0b7f29018dca
           gh-token: ${{ steps.ci_token.outputs.token }}
 
       - name: Verify CI engine reads the committed lock

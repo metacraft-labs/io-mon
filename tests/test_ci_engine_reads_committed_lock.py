@@ -96,7 +96,8 @@ def main():
                 engine_lock = json.loads((work / 'flake.lock').read_text())
                 inputs = engine_lock['nodes'][engine_lock['root']]['inputs']
                 for setting, dependency in [('repro-runquota-pin', 'runquota-src'),
-                                            ('repro-io-mon-pin', 'io-mon-src')]:
+                                            ('repro-io-mon-pin', 'io-mon-src'),
+                                            ('repro-stackable-hooks-pin', 'nim-stackable-hooks-src')]:
                     row = re.search(r'^\s+' + setting + r':\s*(.+)$', workflow, re.M)
                     assert row, f'CI must declare {setting}'
                     supplied = set(re.findall(r'\b[0-9a-f]{40}\b', row.group(1)))
