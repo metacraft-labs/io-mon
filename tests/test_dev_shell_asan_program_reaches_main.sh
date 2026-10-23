@@ -80,9 +80,10 @@ exit 0
 EOF
 
 # The scratch directory is outside this repository, so the dev shell's
-# git-hook setup plays no part.
+# git-hook setup plays no part. Clear the ambient environment so a host
+# compiler on PATH (or compiler flags) cannot hide a missing shell prerequisite.
 status=0
-output="$(cd "$SCRATCH" && nix develop "$REPO" --no-write-lock-file -c bash "$SCRATCH/probe.sh" "$SCRATCH" "$MARKER" "$TIMEOUT_S" 2>&1)" || status=$?
+output="$(cd "$SCRATCH" && nix develop "$REPO" --ignore-environment --no-write-lock-file -c bash "$SCRATCH/probe.sh" "$SCRATCH" "$MARKER" "$TIMEOUT_S" 2>&1)" || status=$?
 
 case "$status" in
   0) ;;

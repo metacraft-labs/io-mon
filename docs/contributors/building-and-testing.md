@@ -132,7 +132,9 @@ These tests run `nix develop` themselves, so start them from a shell that has
   Nix OpenSSL 3; `flake.nix` builds it with `-d:sslVersion=3`.
 - `tests/test_dev_shell_asan_program_reaches_main.sh`: a C program built by
   the dev shell's `cc` and `clang` with `-fsanitize=address,undefined` reaches
-  main and exits 0, and ASan reports a control heap overflow. On macOS 26
+  main and exits 0, and ASan reports a control heap overflow. The probe clears
+  the ambient environment, so both compilers must come from the dev shell.
+  Linux supplies GCC's `cc` and a separate wrapped Clang. On macOS 26
   nixpkgs' compiler-rt 21.1.8 hangs every such program before main; a timeout
   fails the test and names that hang (see §4).
 

@@ -314,6 +314,11 @@
               pkgs.rustc
             ]
             ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              # The sanitizer startup probe exercises both GCC's cc and Clang.
+              # Keep GCC ahead of Clang's cc alias on the shell's PATH.
+              # Darwin already supplies clang through darwinSanitizerCc.
+              pkgs.stdenv.cc
+              pkgs.clang
               pkgs.strace
               pkgs.zig
               pkgs.patchelf
