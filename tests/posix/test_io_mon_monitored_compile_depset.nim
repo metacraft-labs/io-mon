@@ -30,6 +30,7 @@
 ## ground truth independent of io-mon.
 
 import descendant_guard_expectations
+import unmonitored_env
 import std/[os, osproc, sequtils, sets, streams, strtabs, strutils, unittest]
 
 import io_mon
@@ -41,7 +42,10 @@ const
 
 proc run(cmd: string; args: seq[string]; env: StringTableRef = nil):
     tuple[output: string; code: int] =
-  let p = startProcess(cmd, args = args, env = env,
+  # Every child belongs to this fixture, never to an inherited monitor.
+  var childEnv = if env == nil: unmonitoredEnv() else: env
+  childEnv.del("DYLD_INSERT_LIBRARIES")
+  let p = startProcess(cmd, args = args, env = childEnv,
     options = {poStdErrToStdOut, poUsePath})
   let output = p.outputStream.readAll()
   let code = p.waitForExit()
@@ -111,7 +115,52 @@ int main(void) { printf("%d\n", TOP_VALUE); return 0; }
   let shimBuild = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
   checkpoint(shimBuild.output)
   require shimBuild.code == 0
-  let shimLib = findShimLibrary()
+  # Use the artifact this fixture just built, even if its parent selected a
+  # different shim. Discovery intentionally honors the parent's override.
+  let shimLib = repoRoot / "build" / "lib" /
+    (when defined(macosx): "librepro_monitor_shim.dylib"
+     else: "librepro_monitor_shim.so")
+  require fileExists(shimLib)
+
+  # Inspect the live loader, not just environment variables: an outer shim
+  # reinjects across exec even when the child environment has been scrubbed.
+  let probeSource = work / "shim_probe.c"
+  let probe = work / "shim-probe"
+  writeFile(probeSource, """
+#include <dlfcn.h>
+#include <stdio.h>
+int main(void) {
+  int loaded = dlsym(RTLD_DEFAULT, "repro_monitor_shim_init") != NULL;
+  printf("shim-loaded=%d\n", loaded);
+  return loaded;
+}
+""")
+  var probeArgs = @[probeSource, "-o", probe]
+  when defined(linux): probeArgs.add "-ldl"
+  let probeBuild = run(cc, probeArgs)
+  checkpoint(probeBuild.output)
+  require probeBuild.code == 0
+
+  proc monitoredEnv(): StringTableRef =
+    result = unmonitoredEnv()
+    result["REPRO_MONITOR_SHIM_LIB"] = shimLib
+
+  # Positive control and load-bearing prerequisite for the transparency
+  # comparison. A missing isolation policy must fail before accepting a
+  # supposedly bare compiler as our independent baseline.
+  let bareProbe = run(probe, @[])
+  checkpoint("unmonitored prerequisite: " & bareProbe.output)
+  require bareProbe.code == 0
+  require bareProbe.output.strip == "shim-loaded=0"
+
+  test "the shim-free prerequisite rejects a deliberately monitored process":
+    # Negative control: the exact same probe must detect the real shim under
+    # a real consumer. Exit 1 is the probe's refusal of an injected baseline.
+    let injected = run(snoopBin,
+      @["run", "--depfile", work / "probe.iomon", "--", probe], monitoredEnv())
+    checkpoint(injected.output)
+    check injected.code == 1
+    check "shim-loaded=1" in injected.output
 
   proc compileArgs(objName, depName: string): seq[string] =
     @["-I", work / "include", "-MD", "-MF", work / depName,
@@ -123,9 +172,7 @@ int main(void) { printf("%d\n", TOP_VALUE); return 0; }
     require bare.code == 0
     require fileExists(work / "bare.o")
 
-    var childEnv = newStringTable(modeCaseSensitive)
-    for k, v in envPairs(): childEnv[k] = v
-    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let childEnv = monitoredEnv()
 
     let depfile = work / "compile.iomon"
     let monitored = run(snoopBin,
@@ -223,9 +270,7 @@ int main(int argc, char **argv) {
 }
 """)
     require run(cc, @[source, "-o", binary]).code == 0
-    var childEnv = newStringTable(modeCaseSensitive)
-    for k, v in envPairs(): childEnv[k] = v
-    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+    let childEnv = monitoredEnv()
     let depfile = work / "update.iomon"
     require run(snoopBin, @["run", "--depfile", depfile, "--", binary, output],
       childEnv).code == 0
@@ -234,3 +279,5 @@ int main(int argc, char **argv) {
     let outputPath = canonical(output)
     check dep.records.anyIt(canonical(it.path) == outputPath and it.kind == mrFileWrite)
     check dep.records.anyIt(canonical(it.path) == outputPath and it.kind == mrFileOpen)
+
+  removeDir(work)
