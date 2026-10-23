@@ -34,7 +34,9 @@
 ## `mcComplete`: a false loss makes an action uncacheable.
 ##
 ## The i686 shell comes from io-mon's dev shell (`IO_MON_TEST_I686_SH`,
-## `pkgsi686Linux.bash`). On x86_64-linux a missing value FAILS this test
+## `pkgsi686Linux.bash`) or the recipe's declared `io-mon-test-i686-sh`
+## executable, which provisions that same shell for isolated actions.
+## On x86_64-linux a missing shell FAILS this test
 ## rather than skipping it, so a CI shell that lost the variable cannot pass
 ## vacuously; on other hosts the i686 and x86_64-only cases report an explicit
 ## skip.
@@ -284,13 +286,13 @@ suite "io-mon Linux: entry into an image the shim cannot enter":
   writeFile(input, "input\n")
 
   # The i686 shell. Applicable only on x86_64-linux, and required there.
-  let i686Sh = getEnv("IO_MON_TEST_I686_SH")
+  let i686Sh = getEnv("IO_MON_TEST_I686_SH", findExe("io-mon-test-i686-sh"))
   # Templates, not procs, wherever a check is made: unittest's `check`,
   # `require` and `skip` fail the enclosing `test` only when expanded in it
   # (in a suite-level proc they set the exit code and the test reads [OK]).
   template requireI686(): bool =
     ## True when the i686 cases can run. On x86_64 a missing or wrong shell
-    ## FAILS (the dev shell must provide it); elsewhere the case is skipped.
+    ## FAILS (the dev shell or recipe must provide it); elsewhere it skips.
     when i686Applicable:
       checkpoint("IO_MON_TEST_I686_SH=" & i686Sh)
       require i686Sh.len > 0

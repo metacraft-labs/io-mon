@@ -179,46 +179,57 @@
             };
           };
 
-          packages.default = pkgs.stdenv.mkDerivation {
-            pname = "io-mon";
-            inherit version;
-            src = ./.;
+          packages = {
+            default = pkgs.stdenv.mkDerivation {
+              pname = "io-mon";
+              inherit version;
+              src = ./.;
 
-            nativeBuildInputs = [
-              pkgs.just
-              pkgs.nim2
-            ];
+              nativeBuildInputs = [
+                pkgs.just
+                pkgs.nim2
+              ];
 
-            STACKABLE_HOOKS_BUILT_TOOLS_DIR =
-              if pkgs.stdenv.isDarwin then
-                "${inputs.stackable-hooks-macos-tools.packages.${system}.default}"
-              else
-                "";
-            STACKABLE_HOOKS_SRC = "${inputs.stackable-hooks-src}/src";
-            SHM_QUEUE_SRC = "${inputs.shm-queue-src}/src";
-            SHM_GSET_SRC = "${inputs.shm-gset-src}/src";
+              STACKABLE_HOOKS_BUILT_TOOLS_DIR =
+                if pkgs.stdenv.isDarwin then
+                  "${inputs.stackable-hooks-macos-tools.packages.${system}.default}"
+                else
+                  "";
+              STACKABLE_HOOKS_SRC = "${inputs.stackable-hooks-src}/src";
+              SHM_QUEUE_SRC = "${inputs.shm-queue-src}/src";
+              SHM_GSET_SRC = "${inputs.shm-gset-src}/src";
 
-            postPatch = ''
-              patchShebangs scripts/build_shim.sh
-            '';
+              postPatch = ''
+                patchShebangs scripts/build_shim.sh
+              '';
 
-            buildPhase = ''
-              runHook preBuild
-              just build
-              runHook postBuild
-            '';
+              buildPhase = ''
+                runHook preBuild
+                just build
+                runHook postBuild
+              '';
 
-            installPhase = ''
-              runHook preInstall
-              mkdir -p "$out/bin" "$out/lib"
-              if [ -f build/bin/io-mon ]; then
-                install -m755 build/bin/io-mon "$out/bin/io-mon"
-              fi
-              for lib in build/lib/*; do
-                [ -e "$lib" ] || continue
-                install -m755 "$lib" "$out/lib/$(basename "$lib")"
-              done
-              runHook postInstall
+              installPhase = ''
+                runHook preInstall
+                mkdir -p "$out/bin" "$out/lib"
+                if [ -f build/bin/io-mon ]; then
+                  install -m755 build/bin/io-mon "$out/bin/io-mon"
+                fi
+                for lib in build/lib/*; do
+                  [ -e "$lib" ] || continue
+                  install -m755 "$lib" "$out/lib/$(basename "$lib")"
+                done
+                runHook postInstall
+              '';
+            };
+          }
+          // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+            # The entry-loss oracle needs a real 32-bit image, also when the
+            # engine runs outside the dev shell. A distinct name avoids
+            # shadowing the ordinary 64-bit bash used by its controls.
+            io-mon-test-i686-sh = pkgs.runCommand "io-mon-test-i686-sh" { } ''
+              mkdir -p "$out/bin"
+              ln -s ${pkgs.pkgsi686Linux.bash}/bin/bash "$out/bin/io-mon-test-i686-sh"
             '';
           };
 

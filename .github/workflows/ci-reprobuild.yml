@@ -123,16 +123,20 @@ jobs:
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
         with:
           env-flavor: reprobuild
-          # macOS needs the corrected Nim producer source selection and the
-          # RunQuota revision declared by that engine; its POSIX bootstrap
-          # retains the engine's own io-mon source pin.
+          # The engine reads the committed v3 lock on every host. Keep the
+          # bootstrap libraries at that engine's own flake-lock revisions;
+          # POSIX retains its monitor input without an older override.
           # Windows ARM64 keeps the existing emulated x64 Reprobuild tools.
           repro-from-source: true
-          repro-build-pin: ${{ matrix.os == 'macos' && 'e679fa157604097bdb306fa80b2683a977648480' || '1f85ace0037d0a70e966fe8eee645d766522b1ab' }}
-          repro-runquota-pin: ${{ matrix.os == 'macos' && '416274abe4cda8ec9aef7dca9165cfb8c25a1846' || '292e578d57eb85d6037f9e2d3a03f0bcb0489dbb' }}
-          repro-io-mon-pin: 5e71adf033b860c0fdbe13dda4320cf4a580f632
-          repro-posix-io-mon-pin: ${{ matrix.os == 'linux' && '004b8fc3eb0a6c31f78622272ba323c221b79b28' || '' }}
+          repro-build-pin: d4e516041296065b665710e4c685205c69dd5e5d
+          repro-runquota-pin: f9f1118cd33a27051c6fea683348f343df91e96f
+          repro-io-mon-pin: 6fc4ba9a2a9636298fc2e6c6578bc4677bd0a134
           gh-token: ${{ steps.ci_token.outputs.token }}
+
+      - name: Verify CI engine reads the committed lock
+        if: matrix.os == 'linux'
+        shell: bash
+        run: dev-exec python3 tests/test_ci_engine_reads_committed_lock.py --reprobuild .reprobuild-src
 
       - name: Refresh authentication before repro build
         uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bcd29c631ff01fbd0e577c5f96e5f9d5211fed26
@@ -208,7 +212,7 @@ jobs:
         if: matrix.os == 'macos' || matrix.os == 'linux'
         shell: bash
         env:
-          EXPECTED_ISOLATED_TESTS: ${{ matrix.os == 'macos' && '48' || '15' }}
+          EXPECTED_ISOLATED_TESTS: ${{ matrix.os == 'macos' && '48' || '16' }}
         run: |
           dev-exec repro build --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }} .#test-monitor-isolation --write-report=build/monitor-isolation-repeat.json
           "$REPROBUILD_BOOTSTRAP_PYTHON" - <<'PYCODE'

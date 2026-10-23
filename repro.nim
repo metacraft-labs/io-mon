@@ -87,6 +87,8 @@ when defined(windows):
   import repro_dsl_stdlib/packages/coreutils_install
 when defined(linux):
   import ./repro_support/getconf
+  when defined(amd64):
+    import ./repro_support/i686_shell
   import ./repro_support/shim_publication_tools
   import ./repro_support/strace
 
@@ -131,6 +133,9 @@ package io_mon:
       "grep"
       "nm"
       "strace"
+      "patchelf"
+      when defined(amd64):
+        "io-mon-test-i686-sh"
     # The C-family compiler ``nim c`` shells out to for the C backend. macOS
     # builds (and the shim's arm64/arm64e fat link) use Apple ``clang``; Linux
     # and Windows (``--cc:gcc`` for the shim DLL) use ``gcc``. The user supplies
@@ -331,6 +336,10 @@ package io_mon:
           "test_io_mon_evidence_scope_older_shim.nim",
           "test_io_mon_evidence_scope_shim_gate.nim",
           "test_io_mon_library_load_closure.nim",
+          # This oracle disables recording in its private shim to require the
+          # unnamed-loss fallback. An outer shim keeps recording by name and
+          # changes that experiment, so execution must own its monitor too.
+          "test_io_mon_uninjectable_image_entry.nim",
           "test_io_mon_linux_fragment_fd_reuse.nim",
           # This suite builds and selects a private current shim. The same
           # fixture exits 139 with an enclosing shim and passes all 39 cases
@@ -399,6 +408,11 @@ package io_mon:
       when defined(linux):
         appendRegisteredActionToolIdentityRefs(executeEdge.id,
           ["strace", "nm", "getconf", "grep", "mv", "rmdir"])
+        if stem == "test_io_mon_uninjectable_image_entry":
+          appendRegisteredActionToolIdentityRefs(executeEdge.id, ["patchelf"])
+          when defined(amd64):
+            appendRegisteredActionToolIdentityRefs(executeEdge.id,
+              ["io-mon-test-i686-sh"])
         if stem == "test_io_mon_shim_static_tls_small_stack_threads":
           appendRegisteredActionToolIdentityRefs(executeEdge.id, ["node"])
       testExecuteActions.add(executeEdge)
