@@ -164,6 +164,10 @@ jobs:
         if: matrix.os == 'linux'
         run: repro build --daemon=off --tool-provisioning=nix .#test-monitor-runtime --write-report=build/monitor-test-runtime-producer.json
 
+      - name: Verify Linux dev-shell compiler agrees with shim actions
+        if: matrix.os == 'linux'
+        run: dev-exec just test-repro-shim-compiler
+
       - name: repro test with the owned Linux monitor runtime
         if: matrix.os == 'linux'
         run: |

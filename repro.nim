@@ -183,6 +183,12 @@ package io_mon:
 
   build:
     const backendCompiler = (when defined(macosx): "clang" else: "gcc")
+    # Nix's Nim config reads ambient CC for both the backend and its compiler
+    # and linker executables. Bind all three to the action's declared tool:
+    # --cc:gcc alone still leaves gcc.exe=clang in a CC=clang development shell.
+    const shimBuildCommand = "scripts/build_shim.sh --cc:" & backendCompiler &
+      " --" & backendCompiler & ".exe:" & backendCompiler &
+      " --" & backendCompiler & ".linkerexe:" & backendCompiler
     const binSuffix = (when defined(windows): ".exe" else: "")
     const shimExt =
       when defined(windows): "dll"
@@ -199,7 +205,7 @@ package io_mon:
     # ``librepro_monitor_shim.<ext>``.
     let shimOutput = "build/lib/librepro_monitor_shim." & shimExt
     let shimBuild = shell(
-      command = "scripts/build_shim.sh",
+      command = shimBuildCommand,
       actionId = "io-mon.shim.build_shim",
       extraInputs = @[
         "scripts/build_shim.sh",
@@ -225,7 +231,7 @@ package io_mon:
       # Keep the monitor used for this project's tests separate from the
       # default subject output that original tests legitimately rebuild.
       let testMonitor = shell(
-        command = "scripts/build_shim.sh",
+        command = shimBuildCommand,
         actionId = "io-mon.shim.build_test_monitor_runtime",
         extraInputs = @["scripts/build_shim.sh", "src", "io_mon.nimble", "config.nims"],
         extraOutputs = @["build/monitor-test-runtime/librepro_monitor_shim.so"],

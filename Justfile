@@ -66,6 +66,11 @@ test-dev-shell:
     bash tests/test_dev_shell_nimble_runs_tasks.sh
     bash tests/test_dev_shell_asan_program_reaches_main.sh
 
+# Linux recipe/compiler integration, using the Reprobuild on PATH (or the
+# source-built CLI selected by IO_MON_TEST_REPRO). CI supplies its pinned CLI.
+test-repro-shim-compiler:
+    bash tests/test_dev_shell_repro_shim_compiler.sh
+
 # Documentation-site recipes (delegating to docs/site)
 dev-docs *args:
     just -f docs/site/Justfile --working-directory docs/site dev-docs {{args}}

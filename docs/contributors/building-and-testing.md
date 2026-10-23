@@ -144,6 +144,16 @@ These tests run `nix develop` themselves, so start them from a shell that has
   nixpkgs' compiler-rt 21.1.8 hangs every such program before main; a timeout
   fails the test and names that hang (see §4).
 
+On Linux, `just test-repro-shim-compiler` also checks the supported combination
+of the Nix dev shell and Reprobuild shim actions. It runs both `shim` and
+`test-monitor-runtime` with ambient `CC=clang`, forcing actual compilation
+under automatic monitoring and RunQuota. Both actions must use their declared
+GCC backend, even though the development shell also supplies Clang. CI runs
+this in its Reprobuild job with the pinned engine. To use a local engine,
+set `IO_MON_TEST_REPRO=/absolute/path/to/repro`; otherwise it uses `repro`
+on PATH. Reports and compiler logs remain in
+`build/compiler-selection-regression/`.
+
 ---
 
 ## 4. Memory safety: the sanitizer arm
