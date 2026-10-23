@@ -65,7 +65,7 @@ def main():
         with tempfile.TemporaryDirectory(prefix='io-mon-ci-lock-reader-') as scratch:
             work = Path(scratch)
             archive = subprocess.check_output(['git', '-C', str(args.reprobuild),
-                                               'archive', revision, 'libs', 'flake.lock'])
+                                                'archive', revision, 'libs', 'flake.lock'])
             with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
                 tar.extractall(work, filter='data')
             (work / 'probe.nim').write_text(PROBE)
@@ -73,10 +73,10 @@ def main():
             (work / 'committed.lock').write_bytes(committed)
             paths = sorted((work / 'libs').glob('*/src'))
             command = [args.nim, 'c', '--hints:off', '--parallelBuild:2',
-                       '-d:reproVendoredHash',
-                       '--passC:-I' + str(work / 'libs/blake3/src/blake3/vendor'),
-                       *('--path:' + str(p) for p in paths),
-                       '--out:' + str(work / 'probe'), str(work / 'probe.nim')]
+                        '-d:reproVendoredHash',
+                        '--passC:-I' + str(work / 'libs/blake3/src/blake3/vendor'),
+                        *('--path:' + str(p) for p in paths),
+                        '--out:' + str(work / 'probe'), str(work / 'probe.nim')]
             print(f'Compiling exact CI reader {revision}', flush=True)
             run(*command, cwd=work)
             # A v2 positive control proves the probe and dependencies actually
@@ -84,7 +84,7 @@ def main():
             control = subprocess.check_output([str(work / 'probe'), str(work / 'v2.lock')], text=True)
             assert control.strip() == 'packages=0 deps=0', control
             current = subprocess.run([str(work / 'probe'), str(work / 'committed.lock')],
-                                     capture_output=True, text=True)
+                                      capture_output=True, text=True)
             if current.returncode or current.stdout.strip() != expected:
                 failures.append(revision)
                 print(f'FAIL {revision}: {current.stdout}{current.stderr}', flush=True)
