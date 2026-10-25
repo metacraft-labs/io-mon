@@ -851,7 +851,9 @@ char *ct_linux_preload_raw_owner_join_image(void) {
 #define CT_RAW_CAP_TARGET 2 /* symlink(at)'s target */
 #define CT_RAW_CAP_FD0 3    /* /proc/self/fd link of the first descriptor */
 #define CT_RAW_CAP_FD1 4    /* ... of the second (sendfile/copy/splice) */
-#define CT_RAW_CAP_SLOTS 5
+#define CT_RAW_CAP_NEW_PATH 5 /* renameat2 destination pathname */
+#define CT_RAW_CAP_NEW_BASE 6 /* its independently captured directory base */
+#define CT_RAW_CAP_SLOTS 7
 #define CT_RAW_CAPTURE_NONE 0
 #define CT_RAW_CAPTURE_OK 1
 #define CT_RAW_CAPTURE_FAILED 2
@@ -1296,12 +1298,19 @@ static int ct_raw_capture_fd(struct ct_raw_syscall_event *event, int slot,
 
 /* A pathname argument, and for a relative one the directory it was resolved
  * against (an empty pathname needs none: it is AT_EMPTY_PATH or ENOENT). */
-static int ct_raw_capture_at(struct ct_raw_syscall_event *event, long dirfd,
-                             long path) {
-  if (!ct_raw_capture_string(event, CT_RAW_CAP_PATH, path)) return 0;
+static int ct_raw_capture_at_slots(struct ct_raw_syscall_event *event,
+                                    long dirfd, long path,
+                                    int path_slot, int base_slot) {
+  if (!ct_raw_capture_string(event, path_slot, path)) return 0;
   const char *text = (const char *)path;
   if (text[0] == '\0' || text[0] == '/') return 1;
-  return ct_raw_capture_fd(event, CT_RAW_CAP_BASE, dirfd, 1);
+  return ct_raw_capture_fd(event, base_slot, dirfd, 1);
+}
+
+static int ct_raw_capture_at(struct ct_raw_syscall_event *event, long dirfd,
+                             long path) {
+  return ct_raw_capture_at_slots(event, dirfd, path,
+                                 CT_RAW_CAP_PATH, CT_RAW_CAP_BASE);
 }
 
 /* Everything the deferred classification of `event` reads indirectly. The
@@ -1346,6 +1355,17 @@ static void ct_raw_capture_event(struct ct_raw_syscall_event *event) {
 #endif
   case SYS_truncate:
     ok = ct_raw_capture_at(event, AT_FDCWD, a[0]);
+    break;
+  case SYS_renameat2:
+    /* Only successful mutations need paths. A failed call may not have read
+     * either pointer (e.g. EBADF), so do not dereference it here. EFAULT was
+     * already left for the classifier's fail-closed handling above. */
+    if (r == 0)
+      ok = ct_raw_capture_at(event, a[0], a[1]) &&
+           ct_raw_capture_at_slots(event, a[2], a[3],
+                                   CT_RAW_CAP_NEW_PATH, CT_RAW_CAP_NEW_BASE);
+    else
+      needed = 0;
     break;
   case SYS_openat:
   case SYS_unlinkat:
@@ -7058,7 +7078,9 @@ type
     rcsPath,   ## the pathname argument as passed
     rcsTarget, ## symlink(at)'s target
     rcsFd0,    ## what the first descriptor named ("" = no path)
-    rcsFd1     ## what the second descriptor named ("" = no path)
+    rcsFd1,    ## what the second descriptor named ("" = no path)
+    rcsNewPath, ## renameat2 destination pathname
+    rcsNewBase  ## directory the destination was resolved against
   RawSyscallCaptureState* = enum
     rcsNone,   ## the classification reads nothing indirectly
     rcsCaptured,

@@ -353,6 +353,7 @@ package io_mon:
           # fixture exits 139 with an enclosing shim and passes all 39 cases
           # under this policy (diagnostic e13a98f, Linux job 110498730972).
           "test_io_mon_linux_stdio_ipc.nim",
+          "test_io_mon_raw_renameat2.nim",
           # These build their own shim and compare a bare (shim-free) or
           # LD_PRELOAD-only child with an io-mon-monitored one. Deleting
           # LD_PRELOAD from the child environment does not make it bare: the

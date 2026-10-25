@@ -71,6 +71,7 @@ when defined(amd64):
     LinuxSysSplice                = 275.clong
     LinuxSysEventfd2              = 290.clong
     LinuxSysGetcpu                = 309.clong
+    LinuxSysRenameat2             = 316.clong
     LinuxSysGetrandom             = 318.clong
     LinuxSysMemfdCreate           = 319.clong
     LinuxSysCopyFileRange         = 326.clong
@@ -126,6 +127,7 @@ elif defined(arm64):
     LinuxSysSplice                = 76.clong
     LinuxSysEventfd2              = 19.clong
     LinuxSysGetcpu                = 168.clong
+    LinuxSysRenameat2             = 276.clong
     LinuxSysGetrandom             = 278.clong
     LinuxSysMemfdCreate           = 279.clong
     LinuxSysCopyFileRange         = 285.clong
@@ -153,6 +155,7 @@ else:
 
 {.emit: ["""
 #include <sys/syscall.h>
+_Static_assert(""", LinuxSysRenameat2, """ == SYS_renameat2, "LinuxSysRenameat2 != SYS_renameat2");
 #ifdef SYS_truncate
 _Static_assert(""", LinuxSysTruncate, """ == SYS_truncate, "LinuxSysTruncate != SYS_truncate");
 #else
@@ -2900,6 +2903,10 @@ proc rawSyscallFailed(callResult: clong): bool {.inline, raises: [].} =
   ## as an mmap address that merely has the top bit set.
   callResult < 0 and callResult >= -4095
 
+proc recordRenameat2Mutation(oldDirfd: cint; oldPath: cstring;
+                             newDirfd: cint; newPath: cstring;
+                             flags: uint32) {.raises: [].}
+
 proc classifyRawPathMutation(number, a1, a2, a3, callResult: clong;
                              inlineTrap: cint): bool {.raises: [].} =
   ## The path-mutation syscalls reached through `syscall(2)` or an inline
@@ -2994,6 +3001,15 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
     if resultLooksFaulted(callResult):
       return false
     emitProbe(cstringArg(a2), probeResultFromRaw(callResult), intArg(a1))
+    true
+  of LinuxSysRenameat2:
+    if resultLooksFaulted(callResult):
+      return false
+    if callResult == 0:
+      recordRenameat2Mutation(intArg(a1), cstringArg(a2), intArg(a3),
+        cstringArg(a4), cast[uint32](intArg(a5)))
+    # An ordinary kernel failure changed no path. EFAULT remains a loss,
+    # matching the conservative policy for other raw path-mutation calls.
     true
   of LinuxSysCreat, LinuxSysUnlink, LinuxSysUnlinkat, LinuxSysRmdir,
       LinuxSysMkdir, LinuxSysMkdirat, LinuxSysSymlink, LinuxSysSymlinkat,
@@ -3229,6 +3245,24 @@ proc classifyTrappedInlineEvent(index: int; number: clong;
       LinuxSysFaccessat, LinuxSysReadlinkat, LinuxSysStatx:
     a[0] = clong(LinuxAtFdcwd)
     a[1] = pathArg()
+  of LinuxSysRenameat2:
+    let rawNew = rawSyscallEventCapture(index, rcsNewPath)
+    let baseNew = rawSyscallEventCapture(index, rcsNewBase)
+    let absoluteNew =
+      if rawNew.ok and baseNew.ok and rawNew.text.len > 0 and
+          not rawNew.text.isAbsolute:
+        anchoredRelativePath(baseNew.text, rawNew.text)
+      else:
+        rawNew.text
+    # The classifier runs below while both owned strings are alive. Neither
+    # pathname nor either directory fd may be consulted again at drain time.
+    if classifyRawFileSyscall(number, clong(LinuxAtFdcwd), pathArg(),
+        clong(LinuxAtFdcwd), cast[clong](cstring(absoluteNew)), a[4], a[5],
+        callResult, source):
+      return
+    emitEventLoss(rawSyscallSourceName(source) & " unsupported nr=" & $number,
+      int64(number))
+    return
   of LinuxSysOpenat2:
     a[0] = clong(LinuxAtFdcwd)
     a[1] = pathArg()
@@ -3709,6 +3743,22 @@ proc recordPathWrite(path: cstring; detail: string) {.raises: [].} =
     return
   recordPathWrite(pathForAt(LinuxAtFdcwd, path), detail)
 
+proc recordRenameat2Mutation(oldDirfd: cint; oldPath: cstring;
+                             newDirfd: cint; newPath: cstring;
+                             flags: uint32) {.raises: [].} =
+  ## All renameat2 entry points share one evidence shape. An exchange mutates
+  ## both names; treating its old path as an ordinary source misses an output.
+  let oldName = pathForAt(oldDirfd, oldPath)
+  let newName = pathForAt(newDirfd, newPath)
+  let detail = "renameat2 olddirfd=" & $oldDirfd & " newdirfd=" & $newDirfd &
+    " flags=" & $flags
+  if (flags and LinuxRenameExchange) != 0'u32:
+    recordPathWrite(oldName, detail & " exchange-left")
+    recordPathWrite(newName, detail & " exchange-right")
+  else:
+    recordPathRead(oldName, detail & " source")
+    recordPathWrite(newName, detail & " destination")
+
 proc recordLinkMutation(resultCode: cint; oldPath, newPath: cstring;
                         detail: string) {.raises: [].} =
   if resultCode != 0:
@@ -3783,16 +3833,8 @@ proc repro_hook_renameat2*(ctx: var RenameatContext) {.raises: [].} =
   callNext(ctx)
   let savedErrno = c_get_errno()
   if ctx.result == 0:
-    let oldPath = pathForAt(ctx.oldDirfd, ctx.oldPath)
-    let newPath = pathForAt(ctx.newDirfd, ctx.newPath)
-    let detail = "renameat2 olddirfd=" & $ctx.oldDirfd & " newdirfd=" &
-      $ctx.newDirfd & " flags=" & $ctx.flags
-    if (uint32(ctx.flags) and LinuxRenameExchange) != 0'u32:
-      recordPathWrite(oldPath, detail & " exchange-left")
-      recordPathWrite(newPath, detail & " exchange-right")
-    else:
-      recordPathRead(oldPath, detail & " source")
-      recordPathWrite(newPath, detail & " destination")
+    recordRenameat2Mutation(ctx.oldDirfd, ctx.oldPath, ctx.newDirfd,
+      ctx.newPath, uint32(ctx.flags))
   c_set_errno(savedErrno)
 
 proc repro_hook_dlopen*(ctx: var DlopenContext) {.raises: [].} =
