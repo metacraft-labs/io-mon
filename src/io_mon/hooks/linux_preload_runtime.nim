@@ -4519,15 +4519,25 @@ ssize_t write(int fd, const void *buf, size_t count) {
   return (ssize_t)CT_CALL_HOOK(ct_write_hook(fd, (void *)buf, count));
 }
 
+static int ct_dispatch_open(const char *path, int flags, int mode) {
+  if (CT_BYPASS() || ct_open_hook == NULL)
+    return ct_linux_preload_real_open((char *)path, flags, mode);
+  return CT_CALL_HOOK(ct_open_hook((char *)path, flags, mode));
+}
+
 int open(const char *path, int flags, ...) __attribute__((visibility("default")));
 int open(const char *path, int flags, ...) {
   int mode = 0;
   if (ct_open_flags_need_mode(flags)) {
     va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
   }
-  if (CT_BYPASS() || ct_open_hook == NULL)
-    return ct_linux_preload_real_open((char *)path, flags, mode);
-  return CT_CALL_HOOK(ct_open_hook((char *)path, flags, mode));
+  return ct_dispatch_open(path, flags, mode);
+}
+
+static int ct_dispatch_open64(const char *path, int flags, int mode) {
+  if (CT_BYPASS() || ct_open64_hook == NULL)
+    return ct_linux_preload_real_open64((char *)path, flags, mode);
+  return CT_CALL_HOOK(ct_open64_hook((char *)path, flags, mode));
 }
 
 int open64(const char *path, int flags, ...) __attribute__((visibility("default")));
@@ -4536,9 +4546,13 @@ int open64(const char *path, int flags, ...) {
   if (ct_open_flags_need_mode(flags)) {
     va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
   }
-  if (CT_BYPASS() || ct_open64_hook == NULL)
-    return ct_linux_preload_real_open64((char *)path, flags, mode);
-  return CT_CALL_HOOK(ct_open64_hook((char *)path, flags, mode));
+  return ct_dispatch_open64(path, flags, mode);
+}
+
+static int ct_dispatch_openat(int dirfd, const char *path, int flags, int mode) {
+  if (CT_BYPASS() || ct_openat_hook == NULL)
+    return ct_linux_preload_real_openat(dirfd, (char *)path, flags, mode);
+  return CT_CALL_HOOK(ct_openat_hook(dirfd, (char *)path, flags, mode));
 }
 
 int openat(int dirfd, const char *path, int flags, ...) __attribute__((visibility("default")));
@@ -4547,9 +4561,13 @@ int openat(int dirfd, const char *path, int flags, ...) {
   if (ct_open_flags_need_mode(flags)) {
     va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
   }
-  if (CT_BYPASS() || ct_openat_hook == NULL)
-    return ct_linux_preload_real_openat(dirfd, (char *)path, flags, mode);
-  return CT_CALL_HOOK(ct_openat_hook(dirfd, (char *)path, flags, mode));
+  return ct_dispatch_openat(dirfd, path, flags, mode);
+}
+
+static int ct_dispatch_openat64(int dirfd, const char *path, int flags, int mode) {
+  if (CT_BYPASS() || ct_openat64_hook == NULL)
+    return ct_linux_preload_real_openat64(dirfd, (char *)path, flags, mode);
+  return CT_CALL_HOOK(ct_openat64_hook(dirfd, (char *)path, flags, mode));
 }
 
 int openat64(int dirfd, const char *path, int flags, ...) __attribute__((visibility("default")));
@@ -4558,9 +4576,7 @@ int openat64(int dirfd, const char *path, int flags, ...) {
   if (ct_open_flags_need_mode(flags)) {
     va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
   }
-  if (CT_BYPASS() || ct_openat64_hook == NULL)
-    return ct_linux_preload_real_openat64(dirfd, (char *)path, flags, mode);
-  return CT_CALL_HOOK(ct_openat64_hook(dirfd, (char *)path, flags, mode));
+  return ct_dispatch_openat64(dirfd, path, flags, mode);
 }
 
 int close(int fd) __attribute__((visibility("default")));
@@ -6079,20 +6095,38 @@ void _Exit(int status) {
  *   read(fd, buf, sizeof(buf));
  * resolves to __open_2 / __read_chk rather than open / read, and an
  * LD_PRELOAD shim that only exports open / read silently sees zero
- * calls. Forward each fortify entry point to its public sibling so
- * the registered hook chain fires regardless of how aggressively
- * the host glibc fortifies. */
+ * calls. Share internal dispatch with the public entries: calling open()
+ * here is itself fortified by glibc's inline headers back into __open_2(),
+ * which GCC folds into an unconditional self-jump. The fixed-signature
+ * helpers also avoid reading a nonexistent mode vararg. */
+static void ct_check_fortified_open_flags(int flags) {
+  /* Like glibc's _2 entries, reject O_CREAT / O_TMPFILE without a mode.
+   * Never manufacture a mode for a call whose contract requires one. */
+  if (ct_open_flags_need_mode(flags)) abort();
+}
 int __open_2(const char *path, int flags) __attribute__((visibility("default")));
-int __open_2(const char *path, int flags) { return open(path, flags); }
+int __open_2(const char *path, int flags) {
+  ct_check_fortified_open_flags(flags);
+  return ct_dispatch_open(path, flags, 0);
+}
 
 int __open64_2(const char *path, int flags) __attribute__((visibility("default")));
-int __open64_2(const char *path, int flags) { return open64(path, flags); }
+int __open64_2(const char *path, int flags) {
+  ct_check_fortified_open_flags(flags);
+  return ct_dispatch_open64(path, flags, 0);
+}
 
 int __openat_2(int dirfd, const char *path, int flags) __attribute__((visibility("default")));
-int __openat_2(int dirfd, const char *path, int flags) { return openat(dirfd, path, flags); }
+int __openat_2(int dirfd, const char *path, int flags) {
+  ct_check_fortified_open_flags(flags);
+  return ct_dispatch_openat(dirfd, path, flags, 0);
+}
 
 int __openat64_2(int dirfd, const char *path, int flags) __attribute__((visibility("default")));
-int __openat64_2(int dirfd, const char *path, int flags) { return openat64(dirfd, path, flags); }
+int __openat64_2(int dirfd, const char *path, int flags) {
+  ct_check_fortified_open_flags(flags);
+  return ct_dispatch_openat64(dirfd, path, flags, 0);
+}
 
 ssize_t __read_chk(int fd, void *buf, size_t nbytes, size_t buflen)
     __attribute__((visibility("default")));

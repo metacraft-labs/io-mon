@@ -342,6 +342,7 @@ package io_mon:
           "test_io_mon_host_session_scope.nim",
           "test_io_mon_evidence_scope_older_shim.nim",
           "test_io_mon_evidence_scope_shim_gate.nim",
+          "test_io_mon_fortified_open.nim",
           "test_io_mon_library_load_closure.nim",
           # This oracle disables recording in its private shim to require the
           # unnamed-loss fallback. An outer shim keeps recording by name and
