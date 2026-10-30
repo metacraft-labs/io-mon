@@ -188,8 +188,13 @@ jobs:
         with:
           env-flavor: ${{ matrix.env }}
           repro-from-source: ${{ matrix.env == 'reprobuild' }}
-          repro-build-pin: 1f85ace0037d0a70e966fe8eee645d766522b1ab
-          repro-posix-io-mon-pin: ${{ matrix.env == 'reprobuild' && '004b8fc3eb0a6c31f78622272ba323c221b79b28' || '' }}
+          # The same engine, and its own flake-lock RunQuota and io-mon
+          # bootstrap inputs, as ci-reprobuild.yml: reprobuild v0.2.18. An
+          # older engine rejects the committed v3 `repro.lock`
+          # (tests/test_ci_engine_reads_committed_lock.py checks both files).
+          repro-build-pin: 413830138a7a73293dfc551d623f7bf2cb0ab62c
+          repro-runquota-pin: 35b9dfe4af6e18f3f2a2242ece7cff330eb581e2
+          repro-io-mon-pin: 6fccd929cb09da0bfc0844b93ced9ffb1ac0f74f
           gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: Run tests
@@ -200,7 +205,9 @@ jobs:
             dev-exec repro build --daemon=off --tool-provisioning=nix .#test-monitor-runtime --write-report=build/monitor-test-runtime-producer.json
             monitor="$PWD/build/monitor-test-runtime/librepro_monitor_shim.so"
             test -f "$monitor" && test ! -L "$monitor"
-            dev-exec sha256sum "$monitor"
+            # Host coreutils must not see the engine's store LD_LIBRARY_PATH
+            # (see the same step in ci-reprobuild.yml).
+            env -u LD_LIBRARY_PATH sha256sum "$monitor"
             REPRO_MONITOR_SHIM_LIB="$monitor" dev-exec repro test --daemon=off --tool-provisioning=nix --write-report=build/current-source-monitor-test-report.json 2>&1 | tee test.log
           else
             dev-exec just test 2>&1 | tee test.log

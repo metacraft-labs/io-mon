@@ -46,17 +46,27 @@ def run(*args, **kwargs):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--reprobuild', type=Path, default=ROOT.parent / 'reprobuild')
-    parser.add_argument('--workflow', type=Path,
-                        default=ROOT / '.github/workflows/ci-reprobuild.yml')
+    # Every workflow that builds the engine from source must build the same
+    # one: ci.yml once kept an engine that rejected the v3 lock after
+    # ci-reprobuild.yml had moved on.
+    parser.add_argument('--workflow', type=Path, action='append',
+                        help='default: ci-reprobuild.yml and ci.yml')
     parser.add_argument('--nim', default='nim')
     args = parser.parse_args()
-    workflow = args.workflow.read_text()
-    pin = re.search(r'^\s+repro-build-pin:\s*(.+)$', workflow, re.M)
-    if not pin:
-        raise AssertionError('CI must declare its Reprobuild source pin')
-    revisions = sorted(set(re.findall(r'\b[0-9a-f]{40}\b', pin.group(1))))
-    if not revisions:
-        raise AssertionError('CI engines must use immutable full source revisions')
+    paths = args.workflow or [ROOT / '.github/workflows/ci-reprobuild.yml',
+                              ROOT / '.github/workflows/ci.yml']
+    workflows = {path.name: path.read_text() for path in paths}
+    pins = {}
+    for name, text in workflows.items():
+        pin = re.search(r'^\s+repro-build-pin:\s*(.+)$', text, re.M)
+        if not pin:
+            raise AssertionError(f'{name} must declare its Reprobuild source pin')
+        pins[name] = sorted(set(re.findall(r'\b[0-9a-f]{40}\b', pin.group(1))))
+        if not pins[name]:
+            raise AssertionError(f'{name}: CI engines must use immutable full source revisions')
+    if len({tuple(v) for v in pins.values()}) != 1:
+        raise AssertionError(f'workflows build different engines: {pins}')
+    revisions = next(iter(pins.values()))
     committed = (ROOT / 'repro.lock').read_bytes()
     lock = tomllib.loads(committed.decode())['lock']
     expected = f"packages={len(lock['packages'])} deps={len(lock['deps'])}"
@@ -95,19 +105,26 @@ def main():
                 # producer identities, not version strings or ancestry.
                 engine_lock = json.loads((work / 'flake.lock').read_text())
                 inputs = engine_lock['nodes'][engine_lock['root']]['inputs']
-                for setting, dependency in [('repro-runquota-pin', 'runquota-src'),
-                                            ('repro-io-mon-pin', 'io-mon-src'),
-                                            ('repro-stackable-hooks-pin', 'nim-stackable-hooks-src')]:
-                    row = re.search(r'^\s+' + setting + r':\s*(.+)$', workflow, re.M)
-                    assert row, f'CI must declare {setting}'
-                    supplied = set(re.findall(r'\b[0-9a-f]{40}\b', row.group(1)))
-                    locked_revision = engine_lock['nodes'][inputs[dependency]]['locked']['rev']
-                    assert locked_revision in supplied, (revision, setting, locked_revision, supplied)
-                override = re.search(r'^\s+repro-posix-io-mon-pin:\s*(.+)$', workflow, re.M)
-                if override:
-                    supplied = set(re.findall(r'\b[0-9a-f]{40}\b', override.group(1)))
-                    monitor = engine_lock['nodes'][inputs['io-mon-src']]['locked']['rev']
-                    assert supplied <= {monitor}, ('POSIX bootstrap monitor differs from engine', supplied, monitor)
+                for name, workflow in workflows.items():
+                    # Only the Windows lanes (ci-reprobuild.yml) bootstrap
+                    # the hook library from an explicit revision.
+                    settings = [('repro-runquota-pin', 'runquota-src', True),
+                                ('repro-io-mon-pin', 'io-mon-src', True),
+                                ('repro-stackable-hooks-pin', 'nim-stackable-hooks-src',
+                                 name == 'ci-reprobuild.yml')]
+                    for setting, dependency, required in settings:
+                        row = re.search(r'^\s+' + setting + r':\s*(.+)$', workflow, re.M)
+                        if not row:
+                            assert not required, f'{name} must declare {setting}'
+                            continue
+                        supplied = set(re.findall(r'\b[0-9a-f]{40}\b', row.group(1)))
+                        locked_revision = engine_lock['nodes'][inputs[dependency]]['locked']['rev']
+                        assert locked_revision in supplied, (name, revision, setting, locked_revision, supplied)
+                    override = re.search(r'^\s+repro-posix-io-mon-pin:\s*(.+)$', workflow, re.M)
+                    if override:
+                        supplied = set(re.findall(r'\b[0-9a-f]{40}\b', override.group(1)))
+                        monitor = engine_lock['nodes'][inputs['io-mon-src']]['locked']['rev']
+                        assert supplied <= {monitor}, (name, 'POSIX bootstrap monitor differs from engine', supplied, monitor)
     assert not failures, f'CI engines cannot read committed lock: {failures}'
 
 
