@@ -1145,8 +1145,12 @@ extern int stackable_linux_chain_sigtrap(int signum, void *siginfo_ptr,
  * every code path. */
 extern void repro_linux_sig_safe_flush(void);
 /* Provided by shim/linux_preload.nim beside the flush: records the signal a
- * dying image is about to be terminated by (M9.R.64.1). */
-extern void repro_linux_sig_safe_note_signal(long signum);
+ * dying image is about to be terminated by (M9.R.64.1). Weak: it is a Nim
+ * exportc proc, hidden in the shim's dynamic table, so a program that links
+ * this runtime against the built shim
+ * (tests/helpers/owned_capture_environment_body.nim) cannot resolve it and
+ * failed to link. Inside the shim it binds at link time as before. */
+extern void repro_linux_sig_safe_note_signal(long signum) __attribute__((weak));
 
 /* A raw fork-like call (fork, or clone/clone3 without CLONE_VM) creates a
  * process that runs no atfork handlers: it inherits every shim lock another
@@ -2212,7 +2216,8 @@ static void ct_linux_inline_syscall_sigtrap_handler(
        * which those handlers leave to us, so this is the only record a real
        * illegal-instruction crash gets there. Both calls are
        * async-signal-safe and no-ops when the slot is closed. */
-      repro_linux_sig_safe_note_signal((long)signum);
+      if (repro_linux_sig_safe_note_signal != NULL)
+        repro_linux_sig_safe_note_signal((long)signum);
       repro_linux_sig_safe_flush();
       signal(signum, SIG_DFL);
       raise(signum);
