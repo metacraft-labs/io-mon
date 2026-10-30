@@ -139,7 +139,13 @@ three nesting levels, inner loss, interruption and real filesystem failures.
   swapped in around the trap because r7 is Thumb's frame pointer). 8-byte atomics
   are inline only from ARMv7 on (`ldrexd`/`strexd`), so the shim and its consumers
   are built for ARMv7; an ARMv6 build turns them into libatomic calls, which nothing
-  links.
+  links. Do not read the baseline off the linked image: `readelf -A` on it reports
+  `Tag_CPU_arch: v6` / `Tag_FP_arch: VFPv2`, because lld copies the build attributes
+  of the first object it links, Debian's `crt1.o`, which is built for the armhf
+  floor. The compiled code's baseline is what the compiler was told
+  (`-march=armv7-a -mfpu=vfpv3-d16`), and the check that holds is a probe compiled
+  through the same flags asserting `__ARM_ARCH >= 7` and an inline `ldrexd`
+  (reprobuild's `scripts/cross/build_linux_cross.sh` does exactly that).
 - **File Transfers**: Tracks vector/zero-copy operations (`pread`, `readv`, `sendfile`, `copy_file_range`, `splice`) and records them as reads/writes.
 - **Non-File Tracking**: Logs `getenv`, `uname`, `sysconf` accesses, system time calls, and entropy (non-determinism) events. The entropy surface is `getrandom` (libc symbol, raw syscall and vDSO entry) plus the glibc >= 2.36 BSD set `getentropy` / `arc4random` / `arc4random_buf` / `arc4random_uniform`, deduped once per process per source — the same cross-platform observation contract the macOS shim follows (see `mrNonDeterministic` in `src/io_mon/types.nim`).
 
