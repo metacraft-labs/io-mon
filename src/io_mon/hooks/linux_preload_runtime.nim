@@ -6641,6 +6641,27 @@ ssize_t __read_chk(int fd, void *buf, size_t nbytes, size_t buflen) {
   (void)buflen;
   return read(fd, buf, nbytes);
 }
+
+/* Clang folds a pread() into a buffer of known size to __pread_chk even
+ * where GCC keeps the plain call, so a Clang-built fortified program read
+ * a file through pread() with no record at all (the dev shell's CC is
+ * Clang; tests/linux/test_io_mon_linux_stdio_ipc.nim "positioned vector
+ * and zero-copy libc reads"). Delegate like __read_chk. */
+ssize_t __pread_chk(int fd, void *buf, size_t nbytes, off_t offset,
+                    size_t buflen) __attribute__((visibility("default")));
+ssize_t __pread_chk(int fd, void *buf, size_t nbytes, off_t offset,
+                    size_t buflen) {
+  (void)buflen;
+  return pread(fd, buf, nbytes, offset);
+}
+
+ssize_t __pread64_chk(int fd, void *buf, size_t nbytes, off64_t offset,
+                      size_t buflen) __attribute__((visibility("default")));
+ssize_t __pread64_chk(int fd, void *buf, size_t nbytes, off64_t offset,
+                      size_t buflen) {
+  (void)buflen;
+  return pread64(fd, buf, nbytes, offset);
+}
 """.}
 
 proc setPreloadShimEnvVar*(name: cstring) {.importc: "ct_linux_preload_set_shim_env_name",
