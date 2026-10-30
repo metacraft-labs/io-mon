@@ -15,15 +15,26 @@
       # source: captured-output lifetime, initialized injection permits and
       # one preparation per executable page. Match .github/sibling-repos,
       # the ordinary Windows checkout and the committed Repro lock.
-      url = "github:metacraft-labs/nim-stackable-hooks/059c549306621e2f769adf75630b0b7f29018dca";
+      # Bumped 059c549 -> 3af8a4e (2026-10-30, nim-stackable-hooks `agents`):
+      # the 32-bit ARM (armhf) raw-syscall substrate this shim's Linux inline
+      # trap and syscall(2) owner protocol compile against on `__arm__`.
+      url = "github:metacraft-labs/nim-stackable-hooks/3af8a4e937dcf68666d1e47e4191cad496c6d793";
       flake = false;
     };
     shm-queue-src = {
-      url = "github:metacraft-labs/nim-shm-queue/a3564c13e0b7d0c6a092c19c998cd3faee5ce20a";
+      # Bumped a3564c13 -> 84fd76b (2026-10-30, `agents`): a new segment file is
+      # preallocated, so a full filesystem is ENOSPC at creation instead of
+      # SIGBUS at the first header store.
+      url = "github:metacraft-labs/nim-shm-queue/84fd76b174d4868e703ba3d599668ee340e0b6ea";
       flake = false;
     };
     shm-gset-src = {
-      url = "github:metacraft-labs/nim-shm-gset/43a61120ae54b542c3e3038453094cca707a6c05";
+      # Bumped 43a61120 -> 6333cc9 (2026-10-30, `agents`): shard files are backed
+      # with storage at creation (`posix_fallocate`), so a full tmpfs fragment
+      # directory makes the dependency set unavailable (and the shim fall back to
+      # its file transport) instead of killing the monitor root with SIGBUS --
+      # the ~1-in-5 cold `repro infra plan` failure measured on rpi2.
+      url = "github:metacraft-labs/nim-shm-gset/6333cc915689559b00f81371734783c2e894ca45";
       flake = false;
     };
   };
