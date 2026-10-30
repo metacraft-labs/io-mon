@@ -1069,30 +1069,33 @@ extern int stackable_linux_preload_hooks_allowed(void);
 extern int stackable_linux_preload_current_depth(void);
 extern void stackable_linux_preload_enter_hook(void);
 extern void stackable_linux_preload_exit_hook(void);
-/* The raw-syscall / INT3 substrate below lives in nim-stackable-hooks'
- * ``platform/linux_raw_syscalls.nim``, whose entire ``{.emit.}`` body is
- * guarded by ``when defined(linux) and defined(amd64)``. On any other Linux
- * architecture NONE of these symbols exist, and the same module's
- * ``linuxRawSyscallSupported()`` reports ``lrsUnsupportedArchitecture``.
+/* The raw-syscall substrate below lives in nim-stackable-hooks'
+ * ``platform/linux_raw_syscalls.nim``, whose ``{.emit.}`` body is guarded by
+ * ``when defined(linux) and (defined(amd64) or defined(arm))``: x86-64 uses
+ * `syscall` (`0f 05`) + INT3, and 32-bit ARM (armhf) uses `svc #0` + an
+ * undefined instruction (UDF -> SIGILL). On any OTHER Linux architecture NONE
+ * of these symbols exist, and the module's ``linuxRawSyscallSupported()``
+ * reports ``lrsUnsupportedArchitecture``.
  *
  * The Nim side of this file already honours that predicate:
  * ``installRawSyscallWrapperPatch`` and ``installInlineSyscallPatches`` both
- * return early when ``linuxRawSyscallSupported() != lrsOk``, so on aarch64 the
- * substrate is never *used*. But a runtime guard does not stop the C below from
- * being COMPILED and REFERENCING the symbols, and ``librepro_monitor_shim.so``
- * is consumed via ``LD_PRELOAD`` — which binds every undefined symbol eagerly.
- * The result on ``eph-linux-arm64`` was that the very first monitored process
- * died before ``main``:
+ * return early when ``linuxRawSyscallSupported() != lrsOk``, so on e.g. aarch64
+ * the substrate is never *used*. But a runtime guard does not stop the C below
+ * from being COMPILED and REFERENCING the symbols, and
+ * ``librepro_monitor_shim.so`` is consumed via ``LD_PRELOAD`` — which binds
+ * every undefined symbol eagerly. The result on ``eph-linux-arm64`` was that
+ * the very first monitored process died before ``main``:
  *
  *   repro: symbol lookup error: .../build/lib/librepro_monitor_shim.so:
  *     undefined symbol: stackable_linux_chain_sigtrap
  *
  * So the reference has to disappear at COMPILE time, not merely go untaken at
- * run time. ``__x86_64__`` is the C-preprocessor spelling of Nim's ``amd64``
- * define, keeping this guard byte-for-byte aligned with the producing module's.
- * Every entry point the Nim ``importc``s below still exists on non-x86_64 — the
- * stubs just never touch the absent substrate. */
-#if defined(__x86_64__)
+ * run time. ``__x86_64__`` and ``__arm__`` are the C-preprocessor spellings of
+ * Nim's ``amd64`` / ``arm`` defines, keeping this guard aligned with the
+ * producing module's. Every entry point the Nim ``importc``s below still exists
+ * on an unsupported architecture — the stubs just never touch the absent
+ * substrate. */
+#if defined(__x86_64__) || defined(__arm__)
 extern long stackable_linux_raw_syscall6(long nr, long a1, long a2, long a3,
                                          long a4, long a5, long a6);
 struct stackable_linux_syscall_regs {
@@ -1111,7 +1114,7 @@ extern int stackable_linux_write_syscall_result_to_ucontext(
     void *ucontext_ptr, long result, unsigned long resume_rip);
 extern int stackable_linux_chain_sigtrap(int signum, void *siginfo_ptr,
                                          void *ucontext_ptr);
-#endif /* __x86_64__ */
+#endif /* __x86_64__ || __arm__ */
 
 /* Provided by shim/linux_preload.nim. Async-signal-safe: writes the
  * batched read frames + the pre-encoded committed marker via raw
@@ -1391,6 +1394,12 @@ static void ct_raw_capture_event(struct ct_raw_syscall_event *event) {
 #ifdef SYS_readlink
   case SYS_readlink:
 #endif
+#ifdef SYS_stat64
+  case SYS_stat64:
+#endif
+#ifdef SYS_lstat64
+  case SYS_lstat64:
+#endif
   case SYS_truncate:
     ok = ct_raw_capture_at(event, AT_FDCWD, a[0]);
     break;
@@ -1410,6 +1419,9 @@ static void ct_raw_capture_event(struct ct_raw_syscall_event *event) {
   case SYS_mkdirat:
 #ifdef SYS_newfstatat
   case SYS_newfstatat:
+#endif
+#ifdef SYS_fstatat64
+  case SYS_fstatat64:
 #endif
   case SYS_faccessat:
   case SYS_readlinkat:
@@ -2135,7 +2147,7 @@ int ct_linux_inline_syscall_record_site(unsigned long address) {
   return 0;
 }
 
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(__arm__)
 /* Whether this process has exactly one thread, from field 20 (num_threads) of
  * /proc/self/stat. The inline-syscall trap handler runs in signal context, so
  * it cannot use the Nim sampler the syscall(2) replacement uses (that one
@@ -2172,6 +2184,13 @@ static void ct_linux_inline_syscall_sigtrap_handler(
   if (rc != 0 || ct_inline_syscall_site_index(regs.syscall_address) < 0) {
     rc = stackable_linux_chain_sigtrap(signum, info, ucontext);
     if (rc != 0) {
+      /* A genuine trap-signal crash (not one of our sites) with no previous
+       * handler to chain to: the process is about to die by this signal, so
+       * retire the fragment slot first, as the terminating-signal handlers
+       * do. On 32-bit ARM this signal is SIGILL, which those handlers leave
+       * to us, so this is the only flush a real illegal-instruction crash
+       * gets there. Async-signal-safe and a no-op when the slot is closed. */
+      repro_linux_sig_safe_flush();
       signal(signum, SIG_DFL);
       raise(signum);
     }
@@ -2247,15 +2266,15 @@ static void ct_linux_inline_syscall_sigtrap_handler(
 void *ct_linux_inline_syscall_handler_address(void) {
   return (void *)&ct_linux_inline_syscall_sigtrap_handler;
 }
-#else /* !__x86_64__ */
-/* No INT3 syscall-trap substrate on this architecture. Returning NULL is the
+#else /* !(__x86_64__ || __arm__) */
+/* No inline syscall-trap substrate on this architecture. Returning NULL is the
  * value ``installInlineSyscallPatches`` already treats as "no handler" — it
  * records ``lrsInvalidArgument`` and installs nothing. In practice that branch
  * is unreachable because the caller bails on
  * ``linuxRawSyscallSupported() != lrsOk`` first; this keeps the symbol defined
  * so the Nim ``importc`` binding resolves. */
 void *ct_linux_inline_syscall_handler_address(void) { return NULL; }
-#endif /* __x86_64__ */
+#endif /* __x86_64__ || __arm__ */
 
 long ct_linux_inline_syscall_site_count(void) {
   return (long)ct_inline_syscall_site_count_value;
@@ -2814,13 +2833,38 @@ long ct_linux_preload_syscall_replacement(long nr, long a1, long a2, long a3,
 /* This protocol deliberately does not accept an arbitrary existing jump.
  * Both its destination and the owner ABI must resolve inside the same loaded
  * DSO; the owner then independently checks its live target/replacement pair. */
-static int ct_raw_patch_matches(void *target, void *replacement) {
+/* Decode the replacement address embedded in an installed syscall-wrapper body
+ * patch, per architecture. x86-64: `ff 25 00 00 00 00 <abs64>`. 32-bit ARM:
+ * `ldr pc,[pc,#-4]` (0xe51ff004) followed by `<abs32>` (see the ARM
+ * `{.emit.}` block in nim-stackable-hooks). Returns 1 and *out on a match. */
+static int ct_raw_decode_jump_target(void *target, void **out) {
+  if (target == NULL || out == NULL) return 0;
 #if defined(__x86_64__)
   static const unsigned char prefix[6] = {0xff, 0x25, 0, 0, 0, 0};
+  if (memcmp(target, prefix, sizeof(prefix)) != 0) return 0;
+  void *a = NULL;
+  memcpy(&a, (unsigned char *)target + 6, sizeof(a));
+  *out = a;
+  return 1;
+#elif defined(__arm__)
+  uint32_t ins;
+  memcpy(&ins, target, 4);
+  if (ins != 0xe51ff004u) return 0;
+  uint32_t a;
+  memcpy(&a, (unsigned char *)target + 4, 4);
+  *out = (void *)(uintptr_t)a;
+  return 1;
+#else
+  (void)out;
+  return 0;
+#endif
+}
+
+static int ct_raw_patch_matches(void *target, void *replacement) {
+#if defined(__x86_64__) || defined(__arm__)
   void *actual = NULL;
-  if (target == NULL || replacement == NULL ||
-      memcmp(target, prefix, sizeof(prefix)) != 0) return 0;
-  memcpy(&actual, (unsigned char *)target + 6, sizeof(actual));
+  if (target == NULL || replacement == NULL) return 0;
+  if (!ct_raw_decode_jump_target(target, &actual)) return 0;
   return actual == replacement;
 #else
   return 0;
@@ -2954,13 +2998,11 @@ void ct_linux_preload_library_scan_all(const char *reason) {
 }
 
 int ct_linux_preload_raw_owner_join(void *target) {
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(__arm__)
   void *replacement = NULL;
   Dl_info owner, api_image, scan_image;
-  static const unsigned char prefix[6] = {0xff, 0x25, 0, 0, 0, 0};
   ct_raw_owner_join_reason = "target-not-absolute-jump";
-  if (target == NULL || memcmp(target, prefix, sizeof(prefix)) != 0) return 0;
-  memcpy(&replacement, (unsigned char *)target + 6, sizeof(replacement));
+  if (!ct_raw_decode_jump_target(target, &replacement)) return 0;
   ct_raw_owner_join_reason = "replacement-image-unavailable";
   if (replacement == NULL || !dladdr(replacement, &owner)) return 0;
   snprintf(ct_raw_owner_join_image, sizeof(ct_raw_owner_join_image), "%s",

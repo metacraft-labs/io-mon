@@ -94,6 +94,13 @@ when defined(amd64):
     LinuxSysMkdirat               = 258.clong
     LinuxSysUnlinkat              = 263.clong
     LinuxSysSymlinkat             = 266.clong
+    # The 32-bit `*64` stat/mmap calls are armhf-only compat syscalls; x86-64
+    # has only the native forms, so these are negative sentinels here.
+    LinuxSysStat64                = -2001.clong  # no SYS_stat64 on this architecture
+    LinuxSysLstat64               = -2002.clong  # no SYS_lstat64 on this architecture
+    LinuxSysFstat64               = -2003.clong  # no SYS_fstat64 on this architecture
+    LinuxSysFstatat64             = -2004.clong  # no SYS_fstatat64 on this architecture
+    LinuxSysMmap2                 = -2005.clong  # no SYS_mmap2 on this architecture
 elif defined(arm64):
   const
     LinuxSysRead                  = 63.clong
@@ -150,6 +157,13 @@ elif defined(arm64):
     LinuxSysMkdirat               = 34.clong
     LinuxSysUnlinkat              = 35.clong
     LinuxSysSymlinkat             = 36.clong
+    # asm-generic (arm64) has only the native stat/mmap forms; the 32-bit
+    # `*64` compat calls do not exist, so these are negative sentinels.
+    LinuxSysStat64                = -2001.clong  # no SYS_stat64 on this architecture
+    LinuxSysLstat64               = -2002.clong  # no SYS_lstat64 on this architecture
+    LinuxSysFstat64               = -2003.clong  # no SYS_fstat64 on this architecture
+    LinuxSysFstatat64             = -2004.clong  # no SYS_fstatat64 on this architecture
+    LinuxSysMmap2                 = -2005.clong  # no SYS_mmap2 on this architecture
 elif defined(arm):
   # 32-bit ARM, EABI (armhf / armel). The legacy calls exist here, but
   # `mmap` (only `mmap2`), `time` and `newfstatat` (only `fstatat64`) do not.
@@ -210,6 +224,14 @@ elif defined(arm):
     LinuxSysMkdirat               = 323.clong
     LinuxSysUnlinkat              = 328.clong
     LinuxSysSymlinkat             = 331.clong
+    # 32-bit ARM EABI has no SYS_stat/lstat (native 64-bit-offset variants),
+    # only the `*64` forms, and uses SYS_mmap2 rather than SYS_mmap. Their raw
+    # numbers from arch/arm/tools/syscall.tbl, checked by the `_Static_assert`s.
+    LinuxSysStat64                = 195.clong
+    LinuxSysLstat64               = 196.clong
+    LinuxSysFstat64               = 197.clong
+    LinuxSysFstatat64             = 327.clong
+    LinuxSysMmap2                 = 192.clong
 else:
   {.error: "io-mon's Linux shim needs this architecture's syscall numbers".}
 
@@ -480,6 +502,31 @@ _Static_assert(""", LinuxSysLandlockAddRule, """ < 0, "LinuxSysLandlockAddRule: 
 _Static_assert(""", LinuxSysLandlockRestrictSelf, """ == SYS_landlock_restrict_self, "LinuxSysLandlockRestrictSelf != SYS_landlock_restrict_self");
 #else
 _Static_assert(""", LinuxSysLandlockRestrictSelf, """ < 0, "LinuxSysLandlockRestrictSelf: SYS_landlock_restrict_self is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_stat64
+_Static_assert(""", LinuxSysStat64, """ == SYS_stat64, "LinuxSysStat64 != SYS_stat64");
+#else
+_Static_assert(""", LinuxSysStat64, """ < 0, "LinuxSysStat64: SYS_stat64 is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_lstat64
+_Static_assert(""", LinuxSysLstat64, """ == SYS_lstat64, "LinuxSysLstat64 != SYS_lstat64");
+#else
+_Static_assert(""", LinuxSysLstat64, """ < 0, "LinuxSysLstat64: SYS_lstat64 is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_fstat64
+_Static_assert(""", LinuxSysFstat64, """ == SYS_fstat64, "LinuxSysFstat64 != SYS_fstat64");
+#else
+_Static_assert(""", LinuxSysFstat64, """ < 0, "LinuxSysFstat64: SYS_fstat64 is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_fstatat64
+_Static_assert(""", LinuxSysFstatat64, """ == SYS_fstatat64, "LinuxSysFstatat64 != SYS_fstatat64");
+#else
+_Static_assert(""", LinuxSysFstatat64, """ < 0, "LinuxSysFstatat64: SYS_fstatat64 is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_mmap2
+_Static_assert(""", LinuxSysMmap2, """ == SYS_mmap2, "LinuxSysMmap2 != SYS_mmap2");
+#else
+_Static_assert(""", LinuxSysMmap2, """ < 0, "LinuxSysMmap2: SYS_mmap2 is absent, so the Nim value must be a negative sentinel");
 #endif
 """].}
 
@@ -1057,7 +1104,21 @@ static int repro_linux_install_one_signal_handler(int signum) {
  * cancellations → SIGTERM/SIGINT/SIGHUP/SIGQUIT, crashes → SIGSEGV /
  * SIGABRT / SIGBUS / SIGFPE / SIGILL). */
 static const int repro_linux_terminating_signals[] = {
-  SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGABRT, SIGFPE, SIGBUS, SIGSEGV,
+  SIGHUP, SIGINT, SIGQUIT,
+#if !defined(__arm__)
+  /* On 32-bit ARM, SIGILL is the inline-syscall trap signal (the substrate
+   * replaces `svc #0` with an undefined instruction, there being no one-byte
+   * breakpoint and no catchable `bkpt` without a ptracer), exactly as SIGTRAP
+   * is on x86-64. Hooking it here would REPLACE the trap handler that
+   * `installInlineSyscallPatches` installed earlier in this constructor, and
+   * every trapped inline syscall would then terminate the process (measured
+   * on rpi2, 2026-10-30: exit 132 at the first inline `svc`). The trap
+   * handler chains a SIGILL at a non-site address to the disposition it saved
+   * and, failing that, runs the same sig-safe flush before re-raising, so the
+   * genuine-crash coverage this entry gives on other architectures is kept. */
+  SIGILL,
+#endif
+  SIGABRT, SIGFPE, SIGBUS, SIGSEGV,
   SIGPIPE, SIGTERM
 };
 
@@ -3096,12 +3157,16 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
     if callResult >= 0 and trackFd:
       removeFdPath(intArg(a1))
     true
-  of LinuxSysStat, LinuxSysLstat, LinuxSysAccess, LinuxSysReadlink:
+  of LinuxSysStat, LinuxSysLstat, LinuxSysAccess, LinuxSysReadlink,
+      LinuxSysStat64, LinuxSysLstat64:
+    # armhf has no native stat/lstat; a raw `syscall(SYS_stat64|SYS_lstat64,
+    # path, buf)` probes the path exactly as stat/lstat does elsewhere.
     if resultLooksFaulted(callResult):
       return false
     emitProbe(cstringArg(a1), probeResultFromRaw(callResult))
     true
-  of LinuxSysNewfstatat, LinuxSysFaccessat, LinuxSysReadlinkat, LinuxSysStatx:
+  of LinuxSysNewfstatat, LinuxSysFaccessat, LinuxSysReadlinkat, LinuxSysStatx,
+      LinuxSysFstatat64:
     # A relative pathname is resolved against the directory fd (a1), as the
     # libc probe hooks resolve it, not against the working directory.
     if resultLooksFaulted(callResult):
@@ -3152,8 +3217,10 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
     if callResult >= 0:
       recordNonDeterministic("getrandom")
     true
-  of LinuxSysMmap:
-    # `syscall(SYS_mmap|SYS_mprotect|SYS_munmap, ...)`: allocators issue the
+  of LinuxSysMmap, LinuxSysMmap2:
+    # armhf has no SYS_mmap, only SYS_mmap2 (offset in pages); its `prot`
+    # argument is a3, the same position as mmap, so the PROT_EXEC rule is
+    # identical. `syscall(SYS_mmap|SYS_mprotect|SYS_munmap, ...)`: allocators issue the
     # memory syscalls directly — Chromium's PartitionAlloc calls
     # `syscall(SYS_mprotect)` under its lock — and these were all
     # `unsupported` event-loss, so every such host was permanently
@@ -3181,6 +3248,13 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
   of LinuxSysMunmap:
     observeMunmapResult(cast[pointer](a1), cast[csize_t](a2),
       (if rawSyscallFailed(callResult): -1.cint else: 0.cint))
+    true
+  of LinuxSysFstat64:
+    # `fstat64(fd, buf)` queries an already-open descriptor. The file was
+    # observed when it was opened (and its identity recorded then); fstat
+    # introduces no new path dependency and reads no external input, so it is
+    # classified as supported with nothing to record. armhf-only: the native
+    # stat/lstat tables elsewhere have no plain fstat case either.
     true
   of LinuxSysGetpid, LinuxSysCapget, LinuxSysPkeyAlloc, LinuxSysPkeyFree:
     # Pure queries of the calling process's own state (its pid; its
@@ -3345,10 +3419,11 @@ proc classifyTrappedInlineEvent(index: int; number: clong;
   case number
   of LinuxSysOpen, LinuxSysCreat, LinuxSysUnlink, LinuxSysRmdir, LinuxSysMkdir,
       LinuxSysStat, LinuxSysLstat, LinuxSysAccess, LinuxSysReadlink,
+      LinuxSysStat64, LinuxSysLstat64,
       LinuxSysTruncate:
     a[0] = pathArg()
   of LinuxSysOpenat, LinuxSysUnlinkat, LinuxSysMkdirat, LinuxSysNewfstatat,
-      LinuxSysFaccessat, LinuxSysReadlinkat, LinuxSysStatx:
+      LinuxSysFaccessat, LinuxSysReadlinkat, LinuxSysStatx, LinuxSysFstatat64:
     a[0] = clong(LinuxAtFdcwd)
     a[1] = pathArg()
   of LinuxSysRenameat2:
