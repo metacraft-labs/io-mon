@@ -1936,10 +1936,22 @@ proc recordRawSyscallCoverage(status: RawSyscallPatchStatus) {.raises: [].} =
     " errno=" & $status.osErrno & " ownerJoin=" & rawSyscallOwnerJoinReason() &
     " ownerImage=" & rawSyscallOwnerJoinImage())
 
+proc emitThumbUnscannedLoss(status: InlineSyscallPatchStatus; source: string)
+    {.raises: [].} =
+  ## 32-bit ARM: an executable mapping the scanner took belongs to an image
+  ## that may hold Thumb-state code, which the ARM-state `svc` scanner cannot
+  ## discover. Fail closed: the capture grades `mcIncomplete` on this loss.
+  if status.thumbUnscanned == 0:
+    return
+  emitEventLoss("linux inline raw-syscall scanner cannot cover Thumb-state " &
+    "code source=" & source & " mappings=" & $status.thumbUnscanned &
+    " first=" & status.firstThumbPath)
+
 proc recordInlineSyscallCoverage(status: InlineSyscallPatchStatus) {.raises: [].} =
   if inlineSyscallCoverageRecorded:
     return
   inlineSyscallCoverageRecorded = true
+  emitThumbUnscannedLoss(status, "startup")
   if status.handlerInstalled and status.scanDiagnostic == lrsOk and
       status.firstPatchDiagnostic == lrsOk:
     return
@@ -1950,8 +1962,14 @@ proc recordInlineSyscallCoverage(status: InlineSyscallPatchStatus) {.raises: [].
     " stage=" & $status.firstPatchStage &
     " errno=" & $status.firstPatchErrno)
 
+var lateThumbUnscannedReported = 0
+
 proc recordLateInlineSyscallScanCoverage(status: InlineSyscallPatchStatus;
                                          source: string) {.raises: [].} =
+  # A late scan carries the cumulative count; report only what is new.
+  if status.thumbUnscanned > lateThumbUnscannedReported:
+    lateThumbUnscannedReported = status.thumbUnscanned
+    emitThumbUnscannedLoss(status, source)
   if status.handlerInstalled and status.scanDiagnostic == lrsOk and
       status.firstPatchDiagnostic == lrsOk:
     return

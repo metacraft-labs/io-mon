@@ -6,7 +6,7 @@
 #
 # nim-stackable-hooks is a bare name: `clone-siblings` resolves it from this
 # commit's own committed `repro.lock` (`lock-store: committed`, reprobuild-pm
-# Unified-Locking-And-Hooks.md §14.5), which pins 059c549 — the same revision
+# Unified-Locking-And-Hooks.md §14.5), which pins 7533478 — the same revision
 # `flake.nix` pins `stackable-hooks-src` to. Keep the two in step: a `nim c` in
 # the dev shell resolves `stackable_hooks/...` through the sibling checkout,
 # while `nix build .#default` resolves it through the flake input, and a build
@@ -42,9 +42,11 @@ nim-shm-queue
 # same gap.) The durable fix is to add nim-shm-gset to io-mon's develop set
 # (its `depends` edges in the workspace manifest), so `repro lock refresh`
 # pins it alongside its siblings; this pin should be dropped then.
-# 43a61120 is the revision `flake.nix` pins `shm-gset-src` to, so the
-# ordinary checkout and `nix build .#default` compile the same nim-shm-gset
-# (keep the two in step, as for nim-stackable-hooks above).
+# 6333cc91 is the revision `flake.nix` pins `shm-gset-src` to (moved from
+# 43a61120 on 2026-10-30: shard files are preallocated so a full tmpfs is
+# ENOSPC at creation, not SIGBUS at the first store), so the ordinary checkout
+# and `nix build .#default` compile the same nim-shm-gset (keep the two in
+# step, as for nim-stackable-hooks above).
 #
 # Spelled '!=' rather than '='. It was added when a record-store lock did pin
 # nim-shm-gset (at 8a9f2f13), which made a plain '=' an unacknowledged
@@ -54,4 +56,4 @@ nim-shm-queue
 # pin this repo"), and '!=' and '=' behave identically. Once the lock pins it,
 # drop this entry as the paragraph above says, rather than keep an
 # acknowledged override.
-nim-shm-gset!=43a61120ae54b542c3e3038453094cca707a6c05
+nim-shm-gset!=6333cc915689559b00f81371734783c2e894ca45

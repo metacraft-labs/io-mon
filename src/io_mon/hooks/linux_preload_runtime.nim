@@ -5,6 +5,7 @@ import std/[algorithm, locks, os, strutils]
 
 import stackable_hooks/platform/linux_preload
 import stackable_hooks/platform/linux_raw_syscalls
+import io_mon/hooks/linux_arm_image
 import ./linux_mapping_policy
 import ../exec_image_header
 
@@ -381,6 +382,14 @@ type
     firstPatchStage*: LinuxPatchStage
     firstPatchErrno*: cint
     firstPatchAddress*: uint
+    thumbUnscanned*: int
+      ## 32-bit ARM only: how many scanned executable mappings belong to an
+      ## image that may hold Thumb-state code, which the scanner cannot cover
+      ## (it recognises word-aligned ARM-state `svc #0` only). Such a mapping
+      ## is a coverage gap, and the capture is graded `mcIncomplete` on it.
+    firstThumbPath*: string
+      ## The first such mapping's path, with the reason the image was judged
+      ## Thumb-capable, for the loss record.
 
   AnonymousExecutableRange = object
     start: uint
@@ -1126,6 +1135,9 @@ extern int stackable_linux_chain_sigtrap(int signum, void *siginfo_ptr,
  * is not open (e.g. shim not initialised) so the handler stays safe on
  * every code path. */
 extern void repro_linux_sig_safe_flush(void);
+/* Provided by shim/linux_preload.nim beside the flush: records the signal a
+ * dying image is about to be terminated by (M9.R.64.1). */
+extern void repro_linux_sig_safe_note_signal(long signum);
 
 /* A raw fork-like call (fork, or clone/clone3 without CLONE_VM) creates a
  * process that runs no atfork handlers: it inherits every shim lock another
@@ -2186,10 +2198,12 @@ static void ct_linux_inline_syscall_sigtrap_handler(
     if (rc != 0) {
       /* A genuine trap-signal crash (not one of our sites) with no previous
        * handler to chain to: the process is about to die by this signal, so
-       * retire the fragment slot first, as the terminating-signal handlers
-       * do. On 32-bit ARM this signal is SIGILL, which those handlers leave
-       * to us, so this is the only flush a real illegal-instruction crash
-       * gets there. Async-signal-safe and a no-op when the slot is closed. */
+       * note the signal and retire the fragment slot first, exactly as the
+       * terminating-signal handlers do. On 32-bit ARM this signal is SIGILL,
+       * which those handlers leave to us, so this is the only record a real
+       * illegal-instruction crash gets there. Both calls are
+       * async-signal-safe and no-ops when the slot is closed. */
+      repro_linux_sig_safe_note_signal((long)signum);
       repro_linux_sig_safe_flush();
       signal(signum, SIG_DFL);
       raise(signum);
@@ -8023,9 +8037,30 @@ proc currentExecutablePath(): string {.raises: [].} =
   except CatchableError:
     result = ""
 
+proc noteThumbCapableMapping(mapping: LinuxExecutableMapping;
+                             status: var InlineSyscallPatchStatus) {.raises: [].} =
+  ## 32-bit ARM: the scanner only discovers ARM-state `svc #0`, so a mapping of
+  ## an image that may hold Thumb-state code is a coverage gap the capture
+  ## must report (`recordInlineSyscallCoverage`), never a silent `mcComplete`.
+  ## Anonymous (JIT) ranges carry no image to judge and are left to the
+  ## executable-mapping lifecycle gap already declared for them.
+  when defined(arm):
+    if mapping.path.len == 0 or mapping.path[0] != '/':
+      return
+    let judged = armImageThumbVerdict(mapping.path)
+    if judged.verdict == atvArmOnly:
+      return
+    inc status.thumbUnscanned
+    if status.firstThumbPath.len == 0:
+      status.firstThumbPath = mapping.path & " (" & judged.reason & ")"
+  else:
+    discard mapping
+    discard status
+
 proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
                                status: var InlineSyscallPatchStatus)
     {.raises: [].} =
+  noteThumbCapableMapping(mapping, status)
   let statusPtr = addr status
   visitLinuxExecutableMappingSyscalls(mapping, proc(site: LinuxSyscallSite): bool =
     let tx = installInt3SyscallPatchTransaction(cast[pointer](site.address))

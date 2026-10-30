@@ -18,7 +18,9 @@
       # Bumped 059c549 -> 3af8a4e (2026-10-30, nim-stackable-hooks `agents`):
       # the 32-bit ARM (armhf) raw-syscall substrate this shim's Linux inline
       # trap and syscall(2) owner protocol compile against on `__arm__`.
-      url = "github:metacraft-labs/nim-stackable-hooks/3af8a4e937dcf68666d1e47e4191cad496c6d793";
+      # 3af8a4e -> 7533478 (2026-10-30): review fixes of that substrate (ARM
+      # body patch writes its target word first; idempotent restore).
+      url = "github:metacraft-labs/nim-stackable-hooks/75334780682e70b1adb58bf813d869e7f5df63f5";
       flake = false;
     };
     shm-queue-src = {
