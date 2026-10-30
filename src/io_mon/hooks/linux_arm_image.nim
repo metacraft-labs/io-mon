@@ -8,6 +8,15 @@
 ## `mcIncomplete` instead of silently missing the call. The judgement is a
 ## module of its own so the shim and the tests share one implementation.
 ##
+## WHAT IT CAN AND CANNOT SEE. The verdict is drawn from compiler output: the
+## `.ARM.attributes` the toolchain records for the whole image and the parity
+## of its function symbols. `atvArmOnly` therefore means "no COMPILER-EMITTED
+## Thumb functions are possible here" (an ARMv6 hard-float image: GCC refuses
+## Thumb-1 hard-float code). Hand-assembled `.thumb_func` code in such an image
+## -- stripped of its symbols -- keeps the v6/Thumb-1/VFP attributes and no odd
+## symbol, and is NOT detected; that residual is recorded in reprobuild-pm's
+## armhf issue beside the literal-pool one.
+##
 ## On other architectures the verdict is `atvNotApplicable`.
 
 type

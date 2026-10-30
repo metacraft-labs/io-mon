@@ -1945,7 +1945,7 @@ proc emitThumbUnscannedLoss(status: InlineSyscallPatchStatus; source: string)
     return
   emitEventLoss("linux inline raw-syscall scanner cannot cover Thumb-state " &
     "code source=" & source & " mappings=" & $status.thumbUnscanned &
-    " first=" & status.firstThumbPath)
+    " first=" & firstThumbPathText(status))
 
 proc recordInlineSyscallCoverage(status: InlineSyscallPatchStatus) {.raises: [].} =
   if inlineSyscallCoverageRecorded:

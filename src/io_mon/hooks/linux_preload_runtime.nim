@@ -387,9 +387,18 @@ type
       ## image that may hold Thumb-state code, which the scanner cannot cover
       ## (it recognises word-aligned ARM-state `svc #0` only). Such a mapping
       ## is a coverage gap, and the capture is graded `mcIncomplete` on it.
-    firstThumbPath*: string
+    firstThumbPath*: array[256, char]
       ## The first such mapping's path, with the reason the image was judged
-      ## Thumb-capable, for the loss record.
+      ## Thumb-capable, for the loss record. A fixed buffer, NOT a `string`:
+      ## this object is the type of the global `inlineSyscallPatchStatus`,
+      ## and a global with a GC-managed field is no longer a static C
+      ## initializer -- Nim then assigns it at runtime in `NimMainInit`, which
+      ## the shim's C file runs AFTER `repro_linux_monitor_constructor`, so
+      ## the status the constructor stored was wiped (handler "not installed",
+      ## no late patching, a loss on every dlopen) while the POD
+      ## `inlineSyscallPatchAttempted` stayed true. Measured at io-mon
+      ## 7a3e4c89 on both armhf and x86-64; `tests/linux/
+      ## test_io_mon_shim_globals_are_static.nim` keeps every such global POD.
 
   AnonymousExecutableRange = object
     start: uint
@@ -8051,11 +8060,18 @@ proc noteThumbCapableMapping(mapping: LinuxExecutableMapping;
     if judged.verdict == atvArmOnly:
       return
     inc status.thumbUnscanned
-    if status.firstThumbPath.len == 0:
-      status.firstThumbPath = mapping.path & " (" & judged.reason & ")"
+    if status.firstThumbPath[0] == '\0':
+      let text = mapping.path & " (" & judged.reason & ")"
+      let n = min(text.len, status.firstThumbPath.len - 1)
+      if n > 0: copyMem(addr status.firstThumbPath[0], unsafeAddr text[0], n)
+      status.firstThumbPath[n] = '\0'
   else:
     discard mapping
     discard status
+
+proc firstThumbPathText*(status: InlineSyscallPatchStatus): string {.raises: [].} =
+  ## The recorded first Thumb-capable mapping, as a string ("" when none).
+  $cast[cstring](unsafeAddr status.firstThumbPath[0])
 
 proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
                                status: var InlineSyscallPatchStatus)
