@@ -150,6 +150,66 @@ elif defined(arm64):
     LinuxSysMkdirat               = 34.clong
     LinuxSysUnlinkat              = 35.clong
     LinuxSysSymlinkat             = 36.clong
+elif defined(arm):
+  # 32-bit ARM, EABI (armhf / armel). The legacy calls exist here, but
+  # `mmap` (only `mmap2`), `time` and `newfstatat` (only `fstatat64`) do not.
+  # Generated from <sys/syscall.h> on Raspberry Pi OS 13 (armhf) and checked
+  # by the `_Static_assert`s below on every build.
+  const
+    LinuxSysRead                  = 3.clong
+    LinuxSysOpen                  = 5.clong
+    LinuxSysClose                 = 6.clong
+    LinuxSysStat                  = 106.clong
+    LinuxSysLstat                 = 107.clong
+    LinuxSysMmap                  = -1001.clong  # no SYS_mmap on this architecture
+    LinuxSysMprotect              = 125.clong
+    LinuxSysMunmap                = 91.clong
+    LinuxSysAccess                = 33.clong
+    LinuxSysGetpid                = 20.clong
+    LinuxSysSendfile              = 187.clong
+    LinuxSysGetcwd                = 183.clong
+    LinuxSysReadlink              = 85.clong
+    LinuxSysGettimeofday          = 78.clong
+    LinuxSysCapget                = 184.clong
+    LinuxSysCapset                = 185.clong
+    LinuxSysRtSigaction           = 174.clong
+    LinuxSysRtSigprocmask         = 175.clong
+    LinuxSysGettid                = 224.clong
+    LinuxSysTime                  = -1002.clong  # no SYS_time on this architecture
+    LinuxSysFutex                 = 240.clong
+    LinuxSysGetdents64            = 217.clong
+    LinuxSysClockGettime          = 263.clong
+    LinuxSysClockGetres           = 264.clong
+    LinuxSysOpenat                = 322.clong
+    LinuxSysNewfstatat            = -1003.clong  # no SYS_newfstatat on this architecture
+    LinuxSysReadlinkat            = 332.clong
+    LinuxSysFaccessat             = 334.clong
+    LinuxSysSplice                = 340.clong
+    LinuxSysEventfd2              = 356.clong
+    LinuxSysGetcpu                = 345.clong
+    LinuxSysRenameat2             = 382.clong
+    LinuxSysGetrandom             = 384.clong
+    LinuxSysMemfdCreate           = 385.clong
+    LinuxSysCopyFileRange         = 391.clong
+    LinuxSysPkeyMprotect          = 394.clong
+    LinuxSysPkeyAlloc             = 395.clong
+    LinuxSysPkeyFree              = 396.clong
+    LinuxSysStatx                 = 397.clong
+    LinuxSysIoUringSetup          = 425.clong
+    LinuxSysIoUringEnter          = 426.clong
+    LinuxSysOpenat2               = 437.clong
+    LinuxSysLandlockCreateRuleset = 444.clong
+    LinuxSysLandlockAddRule       = 445.clong
+    LinuxSysLandlockRestrictSelf  = 446.clong
+    LinuxSysTruncate              = 92.clong
+    LinuxSysMkdir                 = 39.clong
+    LinuxSysRmdir                 = 40.clong
+    LinuxSysCreat                 = 8.clong
+    LinuxSysUnlink                = 10.clong
+    LinuxSysSymlink               = 83.clong
+    LinuxSysMkdirat               = 323.clong
+    LinuxSysUnlinkat              = 328.clong
+    LinuxSysSymlinkat             = 331.clong
 else:
   {.error: "io-mon's Linux shim needs this architecture's syscall numbers".}
 
@@ -536,6 +596,11 @@ var
 #include <fcntl.h>
 #include <errno.h>
 #include <dlfcn.h>
+#include <stdint.h>
+#if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 4
+#include <sys/sysmacros.h>
+#include <linux/stat.h>   /* struct statx: see repro_linux_fd_identity_kind */
+#endif
 
 /* nim-stackable-hooks emits ``stackable_linux_raw_syscall6`` (and the rest of
  * its raw-syscall substrate) only under
@@ -583,6 +648,27 @@ static long repro_raw_syscall6(long nr, long a1, long a2, long a3, long a4,
                    : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
                    : "memory", "cc");
   return x0;
+#elif defined(__arm__) && defined(__ARM_EABI__)
+  /* 32-bit ARM EABI: number in r7, args in r0-r5, ``svc #0``, result in r0
+   * under the same ``-errno`` convention. r7 is the frame pointer in Thumb
+   * code, so it cannot be named as an asm register variable: the number
+   * travels in r6 and is swapped into r7 around the trap, which restores
+   * the frame pointer before anything can unwind through it. */
+  register long r0 __asm__("r0") = a1;
+  register long r1 __asm__("r1") = a2;
+  register long r2 __asm__("r2") = a3;
+  register long r3 __asm__("r3") = a4;
+  register long r4 __asm__("r4") = a5;
+  register long r5 __asm__("r5") = a6;
+  register long r6 __asm__("r6") = nr;
+  __asm__ volatile("push {r7}\n\t"
+                   "mov r7, r6\n\t"
+                   "svc #0\n\t"
+                   "pop {r7}"
+                   : "+r"(r0)
+                   : "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5), "r"(r6)
+                   : "memory", "cc");
+  return r0;
 #else
 #error "io-mon: no raw syscall primitive for this architecture. Add one here \
 rather than routing through libc syscall(2) — this shim interposes that \
@@ -666,20 +752,40 @@ int repro_linux_sockaddr_un_path(void *addr, unsigned int addrlen,
   return n;
 }
 
-int repro_linux_fd_identity_kind(int fd, unsigned long *dev,
-                                 unsigned long *ino, int *kind) {
+/* `dev` and `ino` are 64-bit on every ABI (the Nim side passes `ptr uint64`);
+ * `unsigned long` is 32 bits on ILP32 and would also make this definition
+ * disagree with Nim's prototype for it.
+ *
+ * On ILP32 (32-bit ARM) the identity comes from statx(2), not fstat(2): there
+ * glibc's `struct stat` is not the kernel's `fstat` layout (and differs again
+ * under _FILE_OFFSET_BITS / _TIME_BITS), whereas `struct statx` is one fixed
+ * layout on every architecture. `makedev` re-encodes the device exactly as
+ * glibc encodes `st_dev`, so identities compare equal to the LP64 path's. */
+int repro_linux_fd_identity_kind(int fd, uint64_t *dev,
+                                 uint64_t *ino, int *kind) {
+#if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 4
+  struct statx stx;
+  if (repro_raw_syscall6(SYS_statx, fd, (long)"", AT_EMPTY_PATH,
+                         STATX_TYPE | STATX_INO, (long)&stx, 0) != 0)
+    return 0;
+  *dev = (uint64_t)makedev(stx.stx_dev_major, stx.stx_dev_minor);
+  *ino = (uint64_t)stx.stx_ino;
+  unsigned int mode = stx.stx_mode;
+#else
   struct stat st;
   if (repro_raw_syscall6(SYS_fstat, fd, (long)&st, 0, 0, 0, 0) != 0)
     return 0;
-  *dev = (unsigned long)st.st_dev;
-  *ino = (unsigned long)st.st_ino;
-  if (S_ISREG(st.st_mode))
+  *dev = (uint64_t)st.st_dev;
+  *ino = (uint64_t)st.st_ino;
+  unsigned int mode = st.st_mode;
+#endif
+  if (S_ISREG(mode))
     *kind = 1;
-  else if (S_ISFIFO(st.st_mode))
+  else if (S_ISFIFO(mode))
     *kind = 2;
-  else if (S_ISSOCK(st.st_mode))
+  else if (S_ISSOCK(mode))
     *kind = 3;
-  else if (S_ISDIR(st.st_mode))
+  else if (S_ISDIR(mode))
     *kind = 4;
   else
     *kind = 5;
@@ -702,14 +808,14 @@ static int repro_linux_append_uint(char *buf, int pos, int limit, int value) {
   return pos;
 }
 
-int repro_linux_fd_proc_path(int fd, void *raw_buf, unsigned long len) {
+int repro_linux_fd_proc_path(int fd, void *raw_buf, size_t len) {
   const char prefix[] = "/proc/self/fd/";
   char *buf = (char *)raw_buf;
   char linkpath[64];
   int pos = 0;
   if (len == 0 || fd < 0)
     return 0;
-  for (unsigned long i = 0; i + 1 < sizeof(prefix); ++i)
+  for (size_t i = 0; i + 1 < sizeof(prefix); ++i)
     linkpath[pos++] = prefix[i];
   pos = repro_linux_append_uint(linkpath, pos, (int)sizeof(linkpath) - 1, fd);
   linkpath[pos] = '\0';
@@ -737,7 +843,7 @@ int repro_linux_fd_proc_path(int fd, void *raw_buf, unsigned long len) {
  * of one pid stays distinct without a synthetic tag. Raw syscall (no libc, no
  * hooked call) keeps it re-entrancy-safe at constructor time. Returns the byte
  * length written (0 on failure). */
-int repro_linux_self_exe_path(void *raw_buf, unsigned long len) {
+int repro_linux_self_exe_path(void *raw_buf, size_t len) {
   char *buf = (char *)raw_buf;
   if (len == 0)
     return 0;
@@ -3397,29 +3503,36 @@ proc repro_hook_opendir*(ctx: var OpendirContext) {.raises: [].} =
     updateDirPath(ctx.result, cstring(anchored))
   c_set_errno(savedErrno)
 
-proc repro_hook_readdir*(ctx: var ReaddirContext) {.raises: [].} =
-  if bypassEvidence():
-    callNext(ctx)
-    return
-  ensureInitializedPreservingErrno()
-  var dirPath = pathForDir(ctx.dirp)
-  if dirPath.len == 0 and ctx.dirp != nil:
+proc readdirDirPath(dirp: pointer): string {.raises: [].} =
+  ## The directory a readdir on `dirp` enumerates.
+  result = pathForDir(dirp)
+  if result.len == 0 and dirp != nil:
     # A DIR* neither the opendir hook nor the fdopendir observer named (one
     # opened while the shim bypassed evidence, or over a descriptor nothing
     # can name at that point): name it by its descriptor now, and remember it
     # so later entries do not ask again. Without this the enumeration is
     # recorded with an empty path, which names no directory at all.
-    dirPath = kernelPathForFd(c_dirfd(ctx.dirp))
-    if dirPath.len > 0:
-      updateDirPath(ctx.dirp, cstring(dirPath))
+    result = kernelPathForFd(c_dirfd(dirp))
+    if result.len > 0:
+      updateDirPath(dirp, cstring(result))
+
+proc emitReaddirRecord(dirPath: string) {.raises: [].} =
+  var record = baseRecord(mrDirectoryEnumerate, moDirectoryEnumerate)
+  record.path = dirPath
+  record.result = 1
+  record.detail = "readdir"
+  emitRecord(record)
+
+proc repro_hook_readdir*(ctx: var ReaddirContext) {.raises: [].} =
+  if bypassEvidence():
+    callNext(ctx)
+    return
+  ensureInitializedPreservingErrno()
+  let dirPath = readdirDirPath(ctx.dirp)
   callNext(ctx)
   let savedErrno = c_get_errno()
   if ctx.result != nil:
-    var record = baseRecord(mrDirectoryEnumerate, moDirectoryEnumerate)
-    record.path = dirPath
-    record.result = 1
-    record.detail = "readdir"
-    emitRecord(record)
+    emitReaddirRecord(dirPath)
   c_set_errno(savedErrno)
 
 proc repro_hook_closedir*(ctx: var ClosedirContext) {.raises: [].} =
@@ -4961,6 +5074,55 @@ ct_linux_preload_register_observers(cast[pointer](repro_linux_observe_probe),
   cast[pointer](repro_linux_observe_fdopendir),
   cast[pointer](repro_linux_observe_mprotect),
   cast[pointer](repro_linux_observe_localfd_create))
+
+when sizeof(pointer) == 4:
+  # ILP32 (32-bit ARM): what the large-file and 64-bit-time interpositions
+  # report ("ILP32 LARGE-FILE AND 64-BIT-TIME ENTRY POINTS" in
+  # linux_preload_runtime.nim). Each records exactly what the hook of its
+  # plain twin records, so readdir64, mmap64, pread64 & co. and the time64
+  # clocks leave the same evidence as readdir, mmap, pread and clock_gettime.
+  proc repro_linux_observe_readdir(dirp: pointer) {.cdecl, raises: [].} =
+    if bypassEvidence():
+      return
+    ensureInitializedPreservingErrno()
+    emitReaddirRecord(readdirDirPath(dirp))
+
+  proc repro_linux_observe_mmap(result: pointer; length: csize_t;
+                                prot, flags, fd: cint) {.cdecl, raises: [].} =
+    if bypassEvidence():
+      return
+    ensureInitializedPreservingErrno()
+    observeMmapResult(result, length, prot, flags, fd)
+
+  proc repro_linux_observe_fd_io(inFd, outFd: cint; bytes: clong)
+      {.cdecl, raises: [].} =
+    if bypassEvidence():
+      return
+    ensureInitializedPreservingErrno()
+    if inFd >= 0:
+      recordFdRead(inFd, bytes)
+    if outFd >= 0:
+      recordFdWrite(outFd, bytes)
+
+  proc repro_linux_observe_time_read(which, clockId: cint)
+      {.cdecl, raises: [].} =
+    if bypassEvidence():
+      return
+    ensureInitializedPreservingErrno()
+    case which
+    of 0: recordTimeRead("clock_gettime:" & $clockId)
+    of 1: recordTimeRead("gettimeofday")
+    else: recordTimeRead("time")
+
+  proc ct_linux_preload_register_ilp32_observers(readdirFn, mmapFn, fdIoFn,
+                                                 timeReadFn: pointer)
+    {.importc, cdecl, raises: [].}
+
+  ct_linux_preload_register_ilp32_observers(
+    cast[pointer](repro_linux_observe_readdir),
+    cast[pointer](repro_linux_observe_mmap),
+    cast[pointer](repro_linux_observe_fd_io),
+    cast[pointer](repro_linux_observe_time_read))
 registerOpenHook(repro_hook_open)
 registerOpen64Hook(repro_hook_open64)
 registerOpenatHook(repro_hook_openat)

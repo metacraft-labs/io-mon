@@ -126,6 +126,20 @@ three nesting levels, inner loss, interruption and real filesystem failures.
   (the pre-existing kill-before-flush inherent-loss class). `LD_AUDIT`'s `la_objopen`
   would close that at the cost of a second injected copy of io-mon per process, in its
   own link-map namespace — see `docs/cases/dlopen-runpath-transparency.md` alternative C.
+- **32-bit glibc (armhf)**: On LP64 each `*64` function is an alias of its plain
+  twin, and the shim exports the `*64` names as aliases of its interpositions. On
+  ILP32 they are different functions with different structures (`struct stat64`,
+  `off64_t`, `struct dirent64`), and a program built with `_TIME_BITS=64` — all of
+  Debian's armhf userland since trixie — calls `__stat64_time64`,
+  `__glob64_time64`, `__clock_gettime64` and friends instead. There each name is a
+  separate interposition that forwards to the real function of the same name and
+  reports through its plain twin's observer; the shim's own C is compiled with
+  `_TIME_BITS` / `_FILE_OFFSET_BITS` undefined so its plain definitions keep the
+  plain ABI. The ARM EABI raw syscall is issued with `svc #0` (number in r7,
+  swapped in around the trap because r7 is Thumb's frame pointer). 8-byte atomics
+  are inline only from ARMv7 on (`ldrexd`/`strexd`), so the shim and its consumers
+  are built for ARMv7; an ARMv6 build turns them into libatomic calls, which nothing
+  links.
 - **File Transfers**: Tracks vector/zero-copy operations (`pread`, `readv`, `sendfile`, `copy_file_range`, `splice`) and records them as reads/writes.
 - **Non-File Tracking**: Logs `getenv`, `uname`, `sysconf` accesses, system time calls, and entropy (non-determinism) events. The entropy surface is `getrandom` (libc symbol, raw syscall and vDSO entry) plus the glibc >= 2.36 BSD set `getentropy` / `arc4random` / `arc4random_buf` / `arc4random_uniform`, deduped once per process per source — the same cross-platform observation contract the macOS shim follows (see `mrNonDeterministic` in `src/io_mon/types.nim`).
 

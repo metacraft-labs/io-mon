@@ -126,7 +126,11 @@ typedef struct {
   uint32_t magic;
   uint32_t cls;     /* size class, or PH_LARGE */
   size_t size;      /* the size the caller asked for (for realloc) */
-} ph_header;        /* exactly PH_HEADER bytes on LP64 */
+#if SIZE_MAX == UINT32_MAX
+  uint32_t pad;     /* ILP32 (armhf): keep the header, and so every user
+                       pointer, at PH_HEADER bytes */
+#endif
+} ph_header;        /* exactly PH_HEADER bytes on LP64 and ILP32 */
 
 _Static_assert(sizeof(ph_header) == PH_HEADER, "ph_header must be 16 bytes");
 _Static_assert(PH_HEADER >= _Alignof(max_align_t),
@@ -156,8 +160,17 @@ static __thread uint16_t ph_fork_held;
  * forking thread from prepare in that time. */
 static uint32_t ph_fork_seq[PH_CLASSES];
 
+/* 32-bit ARM (and other ILP32 ABIs) have no SYS_mmap, only SYS_mmap2, whose
+ * last argument is the offset in 4096-byte units. Every mapping here is
+ * anonymous at offset 0, so the two calls are the same request. */
+#if defined(SYS_mmap)
+#define PH_SYS_MMAP SYS_mmap
+#else
+#define PH_SYS_MMAP SYS_mmap2
+#endif
+
 static void *ph_map(size_t bytes) {
-  long p = repro_linux_raw_syscall6(SYS_mmap, 0, (long)bytes,
+  long p = repro_linux_raw_syscall6(PH_SYS_MMAP, 0, (long)bytes,
                                     PROT_READ | PROT_WRITE,
                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (p < 0 && p > -4096) return NULL; /* -errno */

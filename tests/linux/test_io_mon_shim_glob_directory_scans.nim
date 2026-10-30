@@ -23,7 +23,9 @@
 ##
 ## WHAT THIS TEST GRADES.
 ##   * `t_glob_records_the_directories_its_pattern_scans`: absolute patterns
-##     through `glob` and `glob64` — a wildcard in the last component, one in
+##     through `glob` and `glob64`, and through `glob` of a program built with
+##     `_FILE_OFFSET_BITS=64 _TIME_BITS=64` (`__glob64_time64` on 32-bit ARM)
+##     — a wildcard in the last component, one in
 ##     a middle component (every directory it walks into is scanned), and a
 ##     wildcard that matches nothing — record a directory enumeration of each
 ##     directory scanned, scoped to the component matched there. The no-match
@@ -74,11 +76,11 @@ proc run(cmd: string; args: seq[string]; env: StringTableRef = nil;
   p.close()
   (output, code)
 
-proc buildC(work, name, source: string): string =
+proc buildC(work, name, source: string; flags: seq[string] = @[]): string =
   result = work / name
   let sourcePath = work / (name & ".c")
   writeFile(sourcePath, source)
-  let built = run(getEnv("CC", "cc"), @[sourcePath, "-o", result])
+  let built = run(getEnv("CC", "cc"), flags & @[sourcePath, "-o", result])
   checkpoint(name & " cc: " & built.output)
   doAssert built.code == 0, built.output
 
@@ -210,6 +212,11 @@ suite "io-mon Linux shim records directory scans made through glob":
     doAssert cli.code == 0, cli.output
   let shimLib = buildPrivateLinuxShim(repoRoot)
   let globber = buildC(work, "globber", globberSource)
+  # The same program built the way Debian builds its armhf userland: there
+  # `glob` is `__glob64_time64` (and `glob64` stays `glob64`), whose stat
+  # callbacks take a different structure. On LP64 both defines change nothing.
+  let globberTime64 = buildC(work, "globber-time64", globberSource,
+    @["-D_FILE_OFFSET_BITS=64", "-D_TIME_BITS=64"])
   let altDir = buildC(work, "altdir", altDirSource)
 
   # The tree every case scans:
@@ -244,8 +251,9 @@ suite "io-mon Linux shim records directory scans made through glob":
       $lossDetails(result.dep) & "; enumerated: " & $enumerated(result.dep))
 
   test "t_glob_records_the_directories_its_pattern_scans":
-    for mode in ["glob", "glob64"]:
-      let r = monitor("scan-" & mode, @[globber, mode,
+    for (bin, mode) in [(globber, "glob"), (globber, "glob64"),
+                        (globberTime64, "glob")]:
+      let r = monitor("scan-" & bin.extractFilename & "-" & mode, @[bin, mode,
         project / "*.nimble",          # last component: scans project
         project / "*" / "*.txt",       # middle component: project and each
                                        # subdirectory it walks into

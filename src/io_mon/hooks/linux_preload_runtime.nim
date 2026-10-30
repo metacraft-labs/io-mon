@@ -1017,6 +1017,44 @@ static ct_mkstemps_real_fn real_mkstemps_ptr = NULL;
 static ct_mkostemps_real_fn real_mkostemps_ptr = NULL;
 static ct_mkdtemp_real_fn real_mkdtemp_ptr = NULL;
 
+/* ILP32 (32-bit ARM): the large-file and 64-bit-time entry points get their
+ * own interpositions (see "ILP32 LARGE-FILE AND 64-BIT-TIME ENTRY POINTS"
+ * below); these are the real functions they forward to. */
+#if !defined(__LP64__) && defined(__GLIBC__)
+typedef int (*ct_ilp32_path_buf_fn)(const char *, void *);
+typedef int (*ct_ilp32_at_path_buf_fn)(int, const char *, void *, int);
+typedef void *(*ct_ilp32_readdir64_fn)(void *);
+typedef void *(*ct_ilp32_mmap64_fn)(void *, size_t, int, int, int, long long);
+typedef ssize_t (*ct_ilp32_pread64_fn)(int, void *, size_t, long long);
+typedef ssize_t (*ct_ilp32_preadv64_fn)(int, const struct iovec *, int,
+                                        long long);
+typedef ssize_t (*ct_ilp32_sendfile64_fn)(int, int, long long *, size_t);
+typedef int (*ct_ilp32_truncate64_fn)(const char *, long long);
+typedef int (*ct_ilp32_clock_gettime64_fn)(int, void *);
+typedef int (*ct_ilp32_gettimeofday64_fn)(void *, void *);
+typedef long long (*ct_ilp32_time64_fn)(void *);
+static ct_ilp32_path_buf_fn real_stat64_ptr = NULL;
+static ct_ilp32_path_buf_fn real_lstat64_ptr = NULL;
+static ct_ilp32_path_buf_fn real_stat64_time64_ptr = NULL;
+static ct_ilp32_path_buf_fn real_lstat64_time64_ptr = NULL;
+static ct_ilp32_at_path_buf_fn real_fstatat64_time64_ptr = NULL;
+static ct_ilp32_readdir64_fn real_readdir64_ptr = NULL;
+static ct_ilp32_mmap64_fn real_mmap64_ptr = NULL;
+static ct_ilp32_pread64_fn real_ilp32_pread64_ptr = NULL;
+static ct_ilp32_preadv64_fn real_ilp32_preadv64_ptr = NULL;
+static ct_ilp32_sendfile64_fn real_sendfile64_ptr = NULL;
+static ct_ilp32_truncate64_fn real_truncate64_ptr = NULL;
+static ct_creat_real_fn real_creat64_ptr = NULL;
+static ct_mkstemp_real_fn real_mkstemp64_ptr = NULL;
+static ct_mkostemp_real_fn real_mkostemp64_ptr = NULL;
+static ct_mkstemps_real_fn real_mkstemps64_ptr = NULL;
+static ct_mkostemps_real_fn real_mkostemps64_ptr = NULL;
+static ct_glob_real_fn real_glob64_time64_ptr = NULL;
+static ct_ilp32_clock_gettime64_fn real_clock_gettime64_ptr = NULL;
+static ct_ilp32_gettimeofday64_fn real_gettimeofday64_ptr = NULL;
+static ct_ilp32_time64_fn real_time64_ptr = NULL;
+#endif
+
 #define CT_INLINE_SYSCALL_SITE_CAP 4096
 static unsigned long ct_inline_syscall_sites[CT_INLINE_SYSCALL_SITE_CAP];
 static volatile sig_atomic_t ct_inline_syscall_site_count_value = 0;
@@ -2732,6 +2770,27 @@ static long ct_raw_syscall6(long nr, long a1, long a2, long a3, long a4,
                    : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
                    : "memory", "cc");
   return x0;
+#elif defined(__arm__) && defined(__ARM_EABI__)
+  /* 32-bit ARM EABI: number in r7, args in r0-r5, ``svc #0``, result in r0
+   * under the same ``-errno`` convention. r7 is the frame pointer in Thumb
+   * code, so it cannot be named as an asm register variable: the number
+   * travels in r6 and is swapped into r7 around the trap, which restores
+   * the frame pointer before anything can unwind through it. */
+  register long r0 __asm__("r0") = a1;
+  register long r1 __asm__("r1") = a2;
+  register long r2 __asm__("r2") = a3;
+  register long r3 __asm__("r3") = a4;
+  register long r4 __asm__("r4") = a5;
+  register long r5 __asm__("r5") = a6;
+  register long r6 __asm__("r6") = nr;
+  __asm__ volatile("push {r7}\n\t"
+                   "mov r7, r6\n\t"
+                   "svc #0\n\t"
+                   "pop {r7}"
+                   : "+r"(r0)
+                   : "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5), "r"(r6)
+                   : "memory", "cc");
+  return r0;
 #else
 #error "io-mon: no raw syscall primitive for this architecture. Add one here \
 rather than routing through libc syscall(2) -- this shim interposes that \
@@ -3151,6 +3210,12 @@ ssize_like_t ct_linux_preload_real_pread(int fd, void *buf, size_t count,
 
 ssize_like_t ct_linux_preload_real_pread64(int fd, void *buf, size_t count,
                                            long offset) {
+#if !defined(__LP64__) && defined(__GLIBC__)
+  /* ILP32: pread64 takes off64_t, which the off_t-typed pointer below
+   * would pass in the wrong registers. */
+  CT_REAL("pread64", real_ilp32_pread64_ptr, ct_ilp32_pread64_fn);
+  return (ssize_like_t)real_ilp32_pread64_ptr(fd, buf, count, (long long)offset);
+#endif
   if (real_pread64_ptr == NULL)
     real_pread64_ptr = (ct_pread_real_fn)ct_resolve("pread64");
   if (real_pread64_ptr == NULL)
@@ -3173,6 +3238,11 @@ ssize_like_t ct_linux_preload_real_preadv(int fd, void *iov, int iovcnt,
 
 ssize_like_t ct_linux_preload_real_preadv64(int fd, void *iov, int iovcnt,
                                             long offset) {
+#if !defined(__LP64__) && defined(__GLIBC__)
+  CT_REAL("preadv64", real_ilp32_preadv64_ptr, ct_ilp32_preadv64_fn);
+  return (ssize_like_t)real_ilp32_preadv64_ptr(fd, (const struct iovec *)iov,
+                                               iovcnt, (long long)offset);
+#endif
   if (real_preadv64_ptr == NULL)
     real_preadv64_ptr = (ct_preadv_real_fn)ct_resolve("preadv64");
   if (real_preadv64_ptr == NULL)
@@ -3874,6 +3944,9 @@ int ct_linux_library_scan(ct_ll_sink_fn sink, char *reason,
 
 #if defined(__aarch64__)
 #define CT_DLSYM_GLIBC_BASE "GLIBC_2.17"
+#elif defined(__arm__)
+/* 32-bit ARM EABI's oldest glibc symbol version (dlsym@GLIBC_2.4). */
+#define CT_DLSYM_GLIBC_BASE "GLIBC_2.4"
 #else
 #define CT_DLSYM_GLIBC_BASE "GLIBC_2.2.5"
 #endif
@@ -4456,6 +4529,31 @@ void ct_linux_preload_prime_real_functions(void) {
   CT_PRIME(real_realpath_chk_ptr, ct_realpath_chk_real_fn, "__realpath_chk");
   CT_PRIME(real_eventfd_ptr, ct_eventfd_real_fn, "eventfd");
   CT_PRIME(real_timerfd_create_ptr, ct_timerfd_create_real_fn, "timerfd_create");
+#if !defined(__LP64__) && defined(__GLIBC__)
+  CT_PRIME(real_stat64_ptr, ct_ilp32_path_buf_fn, "stat64");
+  CT_PRIME(real_lstat64_ptr, ct_ilp32_path_buf_fn, "lstat64");
+  CT_PRIME(real_stat64_time64_ptr, ct_ilp32_path_buf_fn, "__stat64_time64");
+  CT_PRIME(real_lstat64_time64_ptr, ct_ilp32_path_buf_fn, "__lstat64_time64");
+  CT_PRIME(real_fstatat64_time64_ptr, ct_ilp32_at_path_buf_fn,
+           "__fstatat64_time64");
+  CT_PRIME(real_readdir64_ptr, ct_ilp32_readdir64_fn, "readdir64");
+  CT_PRIME(real_mmap64_ptr, ct_ilp32_mmap64_fn, "mmap64");
+  CT_PRIME(real_ilp32_pread64_ptr, ct_ilp32_pread64_fn, "pread64");
+  CT_PRIME(real_ilp32_preadv64_ptr, ct_ilp32_preadv64_fn, "preadv64");
+  CT_PRIME(real_sendfile64_ptr, ct_ilp32_sendfile64_fn, "sendfile64");
+  CT_PRIME(real_truncate64_ptr, ct_ilp32_truncate64_fn, "truncate64");
+  CT_PRIME(real_creat64_ptr, ct_creat_real_fn, "creat64");
+  CT_PRIME(real_mkstemp64_ptr, ct_mkstemp_real_fn, "mkstemp64");
+  CT_PRIME(real_mkostemp64_ptr, ct_mkostemp_real_fn, "mkostemp64");
+  CT_PRIME(real_mkstemps64_ptr, ct_mkstemps_real_fn, "mkstemps64");
+  CT_PRIME(real_mkostemps64_ptr, ct_mkostemps_real_fn, "mkostemps64");
+  CT_PRIME(real_glob64_time64_ptr, ct_glob_real_fn, "__glob64_time64");
+  CT_PRIME(real_clock_gettime64_ptr, ct_ilp32_clock_gettime64_fn,
+           "__clock_gettime64");
+  CT_PRIME(real_gettimeofday64_ptr, ct_ilp32_gettimeofday64_fn,
+           "__gettimeofday64");
+  CT_PRIME(real_time64_ptr, ct_ilp32_time64_fn, "__time64");
+#endif
   CT_PRIME(real_readlink_chk_ptr, ct_readlink_chk_real_fn, "__readlink_chk");
   CT_PRIME(real_readlinkat_chk_ptr, ct_readlinkat_chk_real_fn,
            "__readlinkat_chk");
@@ -4496,6 +4594,9 @@ ssize_t pread(int fd, void *buf, size_t count, off_t offset) {
   return (ssize_t)CT_CALL_HOOK(ct_pread_hook(fd, buf, count, (long)offset));
 }
 
+/* ILP32 glibc: pread64 is not pread there (off64_t), so it is defined with
+ * the other ILP32 entry points below. */
+#if defined(__LP64__) || !defined(__GLIBC__)
 ssize_t pread64(int fd, void *buf, size_t count, off64_t offset)
     __attribute__((visibility("default")));
 ssize_t pread64(int fd, void *buf, size_t count, off64_t offset) {
@@ -4503,6 +4604,7 @@ ssize_t pread64(int fd, void *buf, size_t count, off64_t offset) {
     return (ssize_t)ct_linux_preload_real_pread64(fd, buf, count, (long)offset);
   return (ssize_t)CT_CALL_HOOK(ct_pread_hook(fd, buf, count, (long)offset));
 }
+#endif
 
 ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
     __attribute__((visibility("default")));
@@ -4522,6 +4624,8 @@ ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset) {
                                               (long)offset));
 }
 
+/* ILP32 glibc: defined with the other ILP32 entry points below. */
+#if defined(__LP64__) || !defined(__GLIBC__)
 ssize_t preadv64(int fd, const struct iovec *iov, int iovcnt, off64_t offset)
     __attribute__((visibility("default")));
 ssize_t preadv64(int fd, const struct iovec *iov, int iovcnt, off64_t offset) {
@@ -4531,6 +4635,7 @@ ssize_t preadv64(int fd, const struct iovec *iov, int iovcnt, off64_t offset) {
   return (ssize_t)CT_CALL_HOOK(ct_preadv_hook(fd, (void *)iov, iovcnt,
                                               (long)offset));
 }
+#endif
 
 ssize_t write(int fd, const void *buf, size_t count) __attribute__((visibility("default")));
 ssize_t write(int fd, const void *buf, size_t count) {
@@ -5127,7 +5232,9 @@ int scandir(const char *dir, struct dirent ***namelist,
   return rc;
 }
 
-#if defined(__LP64__) && defined(__GLIBC__)
+/* Forwards the caller's buffers untouched, so it is correct on ILP32 too,
+ * where the *64 function is not the plain one. */
+#if defined(__GLIBC__)
 int ct_scandir64_impl(const char *, void *, void *, void *)
     __asm__("scandir64") __attribute__((visibility("default")));
 int ct_scandir64_impl(const char *dir, void *namelist, void *filter,
@@ -5178,7 +5285,7 @@ void ct_linux_preload_register_glob_scan_observer(
   ct_glob_scan_observer = observer;
 }
 
-#if defined(__LP64__) && defined(__GLIBC__) && defined(GLOB_ALTDIRFUNC)
+#if defined(__GLIBC__) && defined(GLOB_ALTDIRFUNC)
 /* The pattern of the glob call running on this thread, or NULL when its
  * components cannot be mapped onto the directories glob opens. Saved and
  * restored around each call, so a glob made from inside an errfunc does not
@@ -5293,7 +5400,37 @@ static void *ct_glob_opendir(const char *path) {
   return dir;
 }
 
+#if !defined(__LP64__)
+/* ILP32: glob, glob64 and __glob64_time64 are three functions whose
+ * GLOB_ALTDIRFUNC callbacks take three different structures (dirent/stat,
+ * dirent64/stat64, dirent64/__stat64_t64), unlike LP64 where they are one.
+ * The interposition records the flavour of the call running on this thread
+ * so the callbacks below forward to the real function of the matching
+ * flavour; the caller's buffers are passed through untouched. Saved and
+ * restored around each call, like ct_glob_active_pattern. */
+#define CT_GLOB_PLAIN 0
+#define CT_GLOB_LFS 1
+#define CT_GLOB_TIME64 2
+static __thread int ct_glob_flavor = CT_GLOB_PLAIN;
+
+static void *ct_glob_flavor_real(const char *plain, const char *lfs,
+                                 const char *time64) {
+  const char *name = ct_glob_flavor == CT_GLOB_TIME64 ? time64
+                   : ct_glob_flavor == CT_GLOB_LFS    ? lfs
+                                                      : plain;
+  return ct_resolve(name);
+}
+#endif
+
 static struct dirent *ct_glob_readdir(void *dir) {
+#if !defined(__LP64__)
+  if (ct_glob_flavor != CT_GLOB_PLAIN) {
+    if (real_readdir64_ptr == NULL)
+      real_readdir64_ptr = (ct_ilp32_readdir64_fn)ct_resolve("readdir64");
+    if (real_readdir64_ptr == NULL) { errno = ENOSYS; return NULL; }
+    return (struct dirent *)real_readdir64_ptr(dir);
+  }
+#endif
   return (struct dirent *)ct_linux_preload_real_readdir(dir);
 }
 
@@ -5302,13 +5439,31 @@ static void ct_glob_closedir(void *dir) {
 }
 
 static int ct_glob_stat(const char *path, struct stat *buf) {
-  int rc = ct_linux_preload_real_stat((char *)path, buf);
+  int rc;
+#if !defined(__LP64__)
+  if (ct_glob_flavor != CT_GLOB_PLAIN) {
+    ct_ilp32_path_buf_fn real = (ct_ilp32_path_buf_fn)ct_glob_flavor_real(
+        "stat", "stat64", "__stat64_time64");
+    if (real == NULL) { errno = ENOSYS; rc = -1; }
+    else rc = real(path, (void *)buf);
+  } else
+#endif
+  rc = ct_linux_preload_real_stat((char *)path, buf);
   CT_OBSERVE(ct_probe_observer, AT_FDCWD, path, rc);
   return rc;
 }
 
 static int ct_glob_lstat(const char *path, struct stat *buf) {
-  int rc = ct_linux_preload_real_lstat((char *)path, buf);
+  int rc;
+#if !defined(__LP64__)
+  if (ct_glob_flavor != CT_GLOB_PLAIN) {
+    ct_ilp32_path_buf_fn real = (ct_ilp32_path_buf_fn)ct_glob_flavor_real(
+        "lstat", "lstat64", "__lstat64_time64");
+    if (real == NULL) { errno = ENOSYS; rc = -1; }
+    else rc = real(path, (void *)buf);
+  } else
+#endif
+  rc = ct_linux_preload_real_lstat((char *)path, buf);
   CT_OBSERVE(ct_probe_observer, AT_FDCWD, path, rc);
   return rc;
 }
@@ -5365,8 +5520,40 @@ int ct_glob64_impl(const char *, int, int (*)(const char *, int), glob_t *)
 int ct_glob64_impl(const char *pattern, int flags,
                    int (*errfunc)(const char *, int), glob_t *pglob) {
   CT_OBSERVED_REAL(real_glob64_ptr, ct_glob_real_fn, "glob64", GLOB_ABORTED);
+#if defined(__LP64__)
   return ct_glob_observed(real_glob64_ptr, pattern, flags, errfunc, pglob);
+#else
+  int outer_flavor = ct_glob_flavor;
+  ct_glob_flavor = CT_GLOB_LFS;
+  int rc = ct_glob_observed(real_glob64_ptr, pattern, flags, errfunc, pglob);
+  int saved_errno = errno;
+  ct_glob_flavor = outer_flavor;
+  errno = saved_errno;
+  return rc;
+#endif
 }
+
+#if !defined(__LP64__)
+/* A _TIME_BITS=64 program's glob (glob_t's stat callbacks then take
+ * struct __stat64_t64). glob64_t and its time64 twin share glob_t's layout:
+ * only the callback signatures differ, and ct_glob_flavor handles those. */
+int ct_glob64_time64_impl(const char *, int, int (*)(const char *, int),
+                          glob_t *)
+    __asm__("__glob64_time64") __attribute__((visibility("default")));
+int ct_glob64_time64_impl(const char *pattern, int flags,
+                          int (*errfunc)(const char *, int), glob_t *pglob) {
+  CT_OBSERVED_REAL(real_glob64_time64_ptr, ct_glob_real_fn, "__glob64_time64",
+                   GLOB_ABORTED);
+  int outer_flavor = ct_glob_flavor;
+  ct_glob_flavor = CT_GLOB_TIME64;
+  int rc = ct_glob_observed(real_glob64_time64_ptr, pattern, flags, errfunc,
+                            pglob);
+  int saved_errno = errno;
+  ct_glob_flavor = outer_flavor;
+  errno = saved_errno;
+  return rc;
+}
+#endif
 #endif
 
 /* fdopendir: the DIR* reads a directory the shim knows by its fd, so the
@@ -5398,7 +5585,9 @@ int fstatat(int dirfd, const char *path, struct stat *buf, int flags) {
   return rc;
 }
 
-#if defined(__LP64__) && defined(__GLIBC__)
+/* Forwards the caller's buffers untouched, so it is correct on ILP32 too,
+ * where the *64 function is not the plain one. */
+#if defined(__GLIBC__)
 int ct_fstatat64_impl(int, const char *, void *, int)
     __asm__("fstatat64") __attribute__((visibility("default")));
 int ct_fstatat64_impl(int dirfd, const char *path, void *buf, int flags) {
@@ -5612,6 +5801,235 @@ extern int ct_mkstemps64_alias(char *, int)
     __asm__("mkstemps64") __attribute__((alias("mkstemps"), visibility("default")));
 extern int ct_mkostemps64_alias(char *, int, int)
     __asm__("mkostemps64") __attribute__((alias("mkostemps"), visibility("default")));
+#endif
+
+/* ---------------------------------------------------------------------------
+ * ILP32 LARGE-FILE AND 64-BIT-TIME ENTRY POINTS (32-bit ARM).
+ *
+ * On ILP32 glibc a *64 function is NOT its plain twin: it takes off64_t,
+ * struct stat64 or returns struct dirent64, so the LP64 aliases above would
+ * hand a caller's buffer to a function that fills a different structure. And
+ * a program built with _TIME_BITS=64 -- all of Debian's armhf userland since
+ * trixie -- does not call those names either: its stat is __stat64_time64,
+ * its glob __glob64_time64, its clock_gettime __clock_gettime64. Measured on
+ * Raspberry Pi OS 13 (armhf): ld.bfd, bash and make import __stat64_time64,
+ * __lstat64_time64, readdir64, __glob64_time64 and __clock_gettime64, and
+ * none of them was observed before these interpositions existed.
+ *
+ * Each is therefore its own interposition: it calls the real function OF THE
+ * SAME NAME with the caller's arguments untouched, then reports what the call
+ * means through the observer its plain twin reports through -- a probe for
+ * the stat family, an enumeration for readdir64, the mapping lifecycle for
+ * mmap64, fd traffic for pread64/preadv64/sendfile64, a mutation for
+ * truncate64/creat64/mkstemp*64 and a clock read for the time functions.
+ *
+ * Not covered here (no interposition for the plain twin either): fstat and
+ * its *64 / time64 forms, fcntl, utimensat, scandirat, nftw.
+ * ------------------------------------------------------------------------- */
+#if !defined(__LP64__) && defined(__GLIBC__)
+/* Observers only an ILP32 shim registers (linux_preload.nim). */
+typedef void (*ct_readdir_observer_fn)(void *dirp);
+typedef void (*ct_mmap_observer_fn)(void *result, size_t length, int prot,
+                                    int flags, int fd);
+typedef void (*ct_fd_io_observer_fn)(int in_fd, int out_fd, long bytes);
+typedef void (*ct_time_read_observer_fn)(int which, int clock_id);
+static ct_readdir_observer_fn ct_readdir_observer = NULL;
+static ct_mmap_observer_fn ct_mmap_observer = NULL;
+static ct_fd_io_observer_fn ct_fd_io_observer = NULL;
+static ct_time_read_observer_fn ct_time_read_observer = NULL;
+void ct_linux_preload_register_ilp32_observers(
+    ct_readdir_observer_fn readdir_fn, ct_mmap_observer_fn mmap_fn,
+    ct_fd_io_observer_fn fd_io_fn, ct_time_read_observer_fn time_read_fn) {
+  ct_readdir_observer = readdir_fn;
+  ct_mmap_observer = mmap_fn;
+  ct_fd_io_observer = fd_io_fn;
+  ct_time_read_observer = time_read_fn;
+}
+
+/* The stat family: what the stat/lstat hooks record, a probe of the path. */
+#define CT_ILP32_PATH_PROBE(impl, symbol, slot)                               \
+  int impl(const char *, void *) __asm__(symbol)                              \
+      __attribute__((visibility("default")));                                 \
+  int impl(const char *path, void *buf) {                                     \
+    CT_OBSERVED_REAL(slot, ct_ilp32_path_buf_fn, symbol, -1);                 \
+    int rc = slot(path, buf);                                                 \
+    CT_OBSERVE(ct_probe_observer, AT_FDCWD, path, rc);                        \
+    return rc;                                                                \
+  }
+CT_ILP32_PATH_PROBE(ct_ilp32_stat64, "stat64", real_stat64_ptr)
+CT_ILP32_PATH_PROBE(ct_ilp32_lstat64, "lstat64", real_lstat64_ptr)
+CT_ILP32_PATH_PROBE(ct_ilp32_stat64_time64, "__stat64_time64",
+                    real_stat64_time64_ptr)
+CT_ILP32_PATH_PROBE(ct_ilp32_lstat64_time64, "__lstat64_time64",
+                    real_lstat64_time64_ptr)
+#undef CT_ILP32_PATH_PROBE
+
+int ct_ilp32_fstatat64_time64(int, const char *, void *, int)
+    __asm__("__fstatat64_time64") __attribute__((visibility("default")));
+int ct_ilp32_fstatat64_time64(int dirfd, const char *path, void *buf,
+                              int flags) {
+  CT_OBSERVED_REAL(real_fstatat64_time64_ptr, ct_ilp32_at_path_buf_fn,
+                   "__fstatat64_time64", -1);
+  int rc = real_fstatat64_time64_ptr(dirfd, path, buf, flags);
+  CT_OBSERVE(ct_probe_observer, dirfd, path, rc);
+  return rc;
+}
+
+/* readdir64: the same enumeration the readdir hook records for the DIR*. */
+void *ct_ilp32_readdir64(void *) __asm__("readdir64")
+    __attribute__((visibility("default")));
+void *ct_ilp32_readdir64(void *dirp) {
+  CT_OBSERVED_REAL(real_readdir64_ptr, ct_ilp32_readdir64_fn, "readdir64",
+                   NULL);
+  void *entry = real_readdir64_ptr(dirp);
+  if (entry != NULL) CT_OBSERVE(ct_readdir_observer, dirp);
+  return entry;
+}
+
+void *ct_ilp32_mmap64(void *, size_t, int, int, int, long long)
+    __asm__("mmap64") __attribute__((visibility("default")));
+void *ct_ilp32_mmap64(void *addr, size_t length, int prot, int flags, int fd,
+                      long long offset) {
+  CT_OBSERVED_REAL(real_mmap64_ptr, ct_ilp32_mmap64_fn, "mmap64", MAP_FAILED);
+  void *result = real_mmap64_ptr(addr, length, prot, flags, fd, offset);
+  CT_OBSERVE(ct_mmap_observer, result, length, prot, flags, fd);
+  return result;
+}
+
+/* pread64/preadv64 keep the read hook chain for every offset a `long` holds
+ * (the chain carries one, and below 2 GiB pread is pread64); a larger offset
+ * calls the real *64 function and reports the read directly. */
+ssize_t pread64(int fd, void *buf, size_t count, off64_t offset)
+    __attribute__((visibility("default")));
+ssize_t pread64(int fd, void *buf, size_t count, off64_t offset) {
+  if (!CT_BYPASS() && ct_pread_hook != NULL && offset == (off64_t)(long)offset)
+    return (ssize_t)CT_CALL_HOOK(ct_pread_hook(fd, buf, count, (long)offset));
+  CT_OBSERVED_REAL(real_ilp32_pread64_ptr, ct_ilp32_pread64_fn, "pread64", -1);
+  ssize_t n = real_ilp32_pread64_ptr(fd, buf, count, (long long)offset);
+  if (n > 0) CT_OBSERVE(ct_fd_io_observer, fd, -1, (long)n);
+  return n;
+}
+
+ssize_t preadv64(int fd, const struct iovec *iov, int iovcnt, off64_t offset)
+    __attribute__((visibility("default")));
+ssize_t preadv64(int fd, const struct iovec *iov, int iovcnt, off64_t offset) {
+  if (!CT_BYPASS() && ct_preadv_hook != NULL &&
+      offset == (off64_t)(long)offset)
+    return (ssize_t)CT_CALL_HOOK(ct_preadv_hook(fd, (void *)iov, iovcnt,
+                                                (long)offset));
+  CT_OBSERVED_REAL(real_ilp32_preadv64_ptr, ct_ilp32_preadv64_fn, "preadv64",
+                   -1);
+  ssize_t n = real_ilp32_preadv64_ptr(fd, iov, iovcnt, (long long)offset);
+  if (n > 0) CT_OBSERVE(ct_fd_io_observer, fd, -1, (long)n);
+  return n;
+}
+
+ssize_t ct_ilp32_sendfile64(int, int, long long *, size_t)
+    __asm__("sendfile64") __attribute__((visibility("default")));
+ssize_t ct_ilp32_sendfile64(int out_fd, int in_fd, long long *offset,
+                            size_t count) {
+  CT_OBSERVED_REAL(real_sendfile64_ptr, ct_ilp32_sendfile64_fn, "sendfile64",
+                   -1);
+  ssize_t n = real_sendfile64_ptr(out_fd, in_fd, offset, count);
+  if (n > 0) CT_OBSERVE(ct_fd_io_observer, in_fd, out_fd, (long)n);
+  return n;
+}
+
+int ct_ilp32_truncate64(const char *, long long) __asm__("truncate64")
+    __attribute__((visibility("default")));
+int ct_ilp32_truncate64(const char *path, long long length) {
+  CT_OBSERVED_REAL(real_truncate64_ptr, ct_ilp32_truncate64_fn, "truncate64",
+                   -1);
+  int rc = real_truncate64_ptr(path, length);
+  /* The observer records the length as a `long`; past 2 GiB it is clamped,
+   * which changes the record's detail but not the path it names. */
+  long recorded = length > (long long)LONG_MAX ? LONG_MAX : (long)length;
+  CT_OBSERVE(ct_mutation_observer, CT_MUTATION_TRUNCATE, AT_FDCWD, path, NULL,
+             recorded, rc);
+  return rc;
+}
+
+/* creat64 is open64(path, O_CREAT|O_WRONLY|O_TRUNC), as creat is open. */
+int ct_ilp32_creat64(const char *, mode_t) __asm__("creat64")
+    __attribute__((visibility("default")));
+int ct_ilp32_creat64(const char *path, mode_t mode) {
+  if (CT_BYPASS() || ct_open64_hook == NULL) {
+    CT_OBSERVED_REAL(real_creat64_ptr, ct_creat_real_fn, "creat64", -1);
+    return real_creat64_ptr(path, mode);
+  }
+  return CT_CALL_HOOK(ct_open64_hook((char *)path, O_CREAT | O_WRONLY | O_TRUNC,
+                                     (int)mode));
+}
+
+int ct_ilp32_mkstemp64(char *) __asm__("mkstemp64")
+    __attribute__((visibility("default")));
+int ct_ilp32_mkstemp64(char *template_name) {
+  CT_OBSERVED_REAL(real_mkstemp64_ptr, ct_mkstemp_real_fn, "mkstemp64", -1);
+  return ct_report_mkstemp(template_name, real_mkstemp64_ptr(template_name),
+                           0);
+}
+
+int ct_ilp32_mkostemp64(char *, int) __asm__("mkostemp64")
+    __attribute__((visibility("default")));
+int ct_ilp32_mkostemp64(char *template_name, int flags) {
+  CT_OBSERVED_REAL(real_mkostemp64_ptr, ct_mkostemp_real_fn, "mkostemp64", -1);
+  return ct_report_mkstemp(template_name,
+                           real_mkostemp64_ptr(template_name, flags), flags);
+}
+
+int ct_ilp32_mkstemps64(char *, int) __asm__("mkstemps64")
+    __attribute__((visibility("default")));
+int ct_ilp32_mkstemps64(char *template_name, int suffixlen) {
+  CT_OBSERVED_REAL(real_mkstemps64_ptr, ct_mkstemps_real_fn, "mkstemps64", -1);
+  return ct_report_mkstemp(template_name,
+                           real_mkstemps64_ptr(template_name, suffixlen), 0);
+}
+
+int ct_ilp32_mkostemps64(char *, int, int) __asm__("mkostemps64")
+    __attribute__((visibility("default")));
+int ct_ilp32_mkostemps64(char *template_name, int suffixlen, int flags) {
+  CT_OBSERVED_REAL(real_mkostemps64_ptr, ct_mkostemps_real_fn, "mkostemps64",
+                   -1);
+  return ct_report_mkstemp(
+      template_name, real_mkostemps64_ptr(template_name, suffixlen, flags),
+      flags);
+}
+
+/* The 64-bit-time clocks: the clock reads their 32-bit twins record. */
+#define CT_TIME_READ_CLOCK_GETTIME 0
+#define CT_TIME_READ_GETTIMEOFDAY 1
+#define CT_TIME_READ_TIME 2
+
+int ct_ilp32_clock_gettime64(int, void *) __asm__("__clock_gettime64")
+    __attribute__((visibility("default")));
+int ct_ilp32_clock_gettime64(int clock_id, void *tp) {
+  CT_OBSERVED_REAL(real_clock_gettime64_ptr, ct_ilp32_clock_gettime64_fn,
+                   "__clock_gettime64", -1);
+  int rc = real_clock_gettime64_ptr(clock_id, tp);
+  if (rc == 0)
+    CT_OBSERVE(ct_time_read_observer, CT_TIME_READ_CLOCK_GETTIME, clock_id);
+  return rc;
+}
+
+int ct_ilp32_gettimeofday64(void *, void *) __asm__("__gettimeofday64")
+    __attribute__((visibility("default")));
+int ct_ilp32_gettimeofday64(void *tv, void *tz) {
+  CT_OBSERVED_REAL(real_gettimeofday64_ptr, ct_ilp32_gettimeofday64_fn,
+                   "__gettimeofday64", -1);
+  int rc = real_gettimeofday64_ptr(tv, tz);
+  if (rc == 0)
+    CT_OBSERVE(ct_time_read_observer, CT_TIME_READ_GETTIMEOFDAY, 0);
+  return rc;
+}
+
+long long ct_ilp32_time64(void *) __asm__("__time64")
+    __attribute__((visibility("default")));
+long long ct_ilp32_time64(void *tloc) {
+  CT_OBSERVED_REAL(real_time64_ptr, ct_ilp32_time64_fn, "__time64", -1);
+  long long rc = real_time64_ptr(tloc);
+  if (rc != -1) CT_OBSERVE(ct_time_read_observer, CT_TIME_READ_TIME, 0);
+  return rc;
+}
 #endif
 
 /* In-tree creation of the anonymous local channels Chromium's message pump
