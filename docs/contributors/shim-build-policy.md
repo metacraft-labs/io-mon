@@ -72,7 +72,11 @@ platforms retain their existing allocation path.
 Linux builds also enable linker `--as-needed` before Nim's automatic system
 library arguments. The shim must not carry unused libc companion libraries:
 a Nix RUNPATH can otherwise load a newer libm/librt/libdl/libpthread beside an
-older executable's libc and fail before the program starts. This preserves
+older executable's libc and fail before the program starts. The link also
+uses `-static-libgcc`: Clang links the shared libgcc as
+`--as-needed -lgcc_s --no-as-needed`, which switched `--as-needed` off for the
+`-lpthread` that `-pthread` adds, so a Clang-built shim recorded an empty
+`libpthread.so.0` as needed. This preserves
 compatibility only down to the shim's actual imported glibc symbol floor; it
 does not promise arbitrary old-glibc or cross-libc injection compatibility.
 
