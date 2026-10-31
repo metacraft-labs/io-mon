@@ -333,7 +333,12 @@ package io_mon:
           "test_io_mon_dep_identity_scope.nim",
           "test_io_mon_cli_interest_stamp.nim",
           "test_io_mon_cli_evidence_scope.nim",
-          "test_io_mon_host_session_scope.nim"])) or
+          "test_io_mon_host_session_scope.nim",
+          # Sets REPRO_MONITOR_SHIM_LIB to a missing file for its io-mon
+          # child. An enclosing macOS shim injects that value into the child
+          # too, so dyld kills io-mon before it can refuse the override
+          # (reprobuild v0.2.18, io-mon run 41139374981).
+          "test_io_mon_shim_override_honoured.nim"])) or
         (defined(linux) and source.extractFilename in [
           "test_io_mon_monitored_compile_depset.nim",
           "test_io_mon_shared_producer_growth.nim",

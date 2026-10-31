@@ -73,8 +73,12 @@ proc copyMacosShimAsDistinctImage*(shim, dest: string) =
   ## same fixture with a renamed copy fails. The copy therefore gets its own
   ## install name, and the ad-hoc signature arm64 requires after the edit.
   copyFile(shim, dest)
+  # codesign is Apple's, not a cctools tool, so a Reprobuild test action's
+  # declared PATH does not carry it; it is always at /usr/bin on macOS.
+  var codesign = findExe("codesign")
+  if codesign.len == 0: codesign = "/usr/bin/codesign"
   for cmd in ["install_name_tool -id " & quoteShell(dest) & " " & quoteShell(dest),
-              "codesign --force --sign - " & quoteShell(dest)]:
+              quoteShell(codesign) & " --force --sign - " & quoteShell(dest)]:
     let (output, code) = execCmdEx(cmd)
     doAssert code == 0, cmd & ": " & output
   let (id, idCode) = execCmdEx("otool -D " & quoteShell(dest))

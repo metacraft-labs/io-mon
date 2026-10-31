@@ -41,6 +41,23 @@ import std/[os, strutils, tempfiles, unittest]
 import io_mon
 import io_mon/fs_snoop
 
+proc getCurrentProcess(): pointer {.stdcall, dynlib: "kernel32",
+  importc: "GetCurrentProcess".}
+proc isWow64Process2(process: pointer; processMachine,
+    nativeMachine: ptr uint16): int32 {.stdcall, dynlib: "kernel32",
+  importc: "IsWow64Process2".}
+
+proc fixturesShareMonitorMachine(): bool =
+  ## On an ARM64 host this x64 monitor runs emulated, while System32's curl
+  ## and cmd are native ARM64: the x64 shim cannot be loaded into them at all
+  ## (CreateRemoteThread fails), which says nothing about shadow stacks. ARM64
+  ## has no Intel CET either. Architecture mismatch is graded by
+  ## test_io_mon_windows_native_system_child.nim.
+  var processMachine, nativeMachine: uint16
+  doAssert isWow64Process2(getCurrentProcess(), addr processMachine,
+    addr nativeMachine) != 0
+  nativeMachine != 0xaa64'u16
+
 proc curlExe(): string =
   getEnv("SystemRoot", r"C:\Windows") / "System32" / "curl.exe"
 
@@ -55,65 +72,71 @@ proc monitor(command: seq[string]; depFilePath: string): MonitorResult =
 
 suite "Windows: a /CETCOMPAT child survives injection":
   test "as the root of the monitored tree":
-    require fileExists(curlExe())
-    let dir = createTempDir("io_mon_cetcompat_root_", "")
-    defer:
-      try: removeDir(dir)
-      except CatchableError: discard
-    let result = monitor(@[curlExe(), "--version"], dir / "run.iomon")
-    # Before the fix this case did not even get an exit code: the root
-    # injector's borrowed `LoadLibraryW` killed `curl` with 0xC0000409 and
-    # `runMonitored` raised "the parked child's main thread could not be
-    # borrowed to load the shim".
-    checkpoint("exit code " & $result.exitCode)
-    check result.exitCode == 0
-    # Surviving is not enough: the child must also have been MONITORED. A
-    # monitoring failure looks like a process with no dependencies, so the
-    # grade is what is asserted (see tests/windows/README.md).
-    check subsystemEvidence(result).completeness == mcComplete
-    var rootStarted = false
-    for r in result.records:
-      if r.kind == mrProcessStart:
-        rootStarted = true
-    check rootStarted
+    if not fixturesShareMonitorMachine():
+      skip()
+    else:
+      require fileExists(curlExe())
+      let dir = createTempDir("io_mon_cetcompat_root_", "")
+      defer:
+        try: removeDir(dir)
+        except CatchableError: discard
+      let result = monitor(@[curlExe(), "--version"], dir / "run.iomon")
+      # Before the fix this case did not even get an exit code: the root
+      # injector's borrowed `LoadLibraryW` killed `curl` with 0xC0000409 and
+      # `runMonitored` raised "the parked child's main thread could not be
+      # borrowed to load the shim".
+      checkpoint("exit code " & $result.exitCode)
+      check result.exitCode == 0
+      # Surviving is not enough: the child must also have been MONITORED. A
+      # monitoring failure looks like a process with no dependencies, so the
+      # grade is what is asserted (see tests/windows/README.md).
+      check subsystemEvidence(result).completeness == mcComplete
+      var rootStarted = false
+      for r in result.records:
+        if r.kind == mrProcessStart:
+          rootStarted = true
+      check rootStarted
 
   test "as a grandchild injected by the shim's CreateProcessW hook":
-    require fileExists(curlExe())
-    let dir = createTempDir("io_mon_cetcompat_grandchild_", "")
-    defer:
-      try: removeDir(dir)
-      except CatchableError: discard
-    # `cmd.exe` is not `/CETCOMPAT`, so the root injection is not what is
-    # under test here: the shim inside `cmd` injects `curl`.
-    let result = monitor(@[getEnv("ComSpec", r"C:\Windows\System32\cmd.exe"),
-      "/d", "/c", curlExe() & " --version"], dir / "run.iomon")
-    # Before the fix `curl` died inside the shim's borrowed `LoadLibraryW`
-    # (0xC0000409, subcode 0x39, measured under `cdb -o`) and the run
-    # reported 0xC0000005 (3221225477) to this test, deterministically.
-    checkpoint("exit code " & $result.exitCode)
-    check result.exitCode == 0
-    # The grandchild must have been spawned under monitoring, injected
-    # without a recorded failure, AND have reported in. The root's own
-    # synthetic `io-mon-root-spawn` record also carries a child pid and no
-    # `inject=`, so a check that only looks for "some spawn record without
-    # `inject=`" passes even when `curl` was never injected; it has to be
-    # `curl`'s own `CreateProcessW` record, paired with `curl`'s
-    # `mrProcessStart`, and the run must grade complete. Measured: a shim
-    # whose borrowed `LoadLibraryW` is forced to time out leaves `curl`
-    # running uninjected (exit 0, `inject=ioInjectFailed`, `mcIncomplete`),
-    # and only these assertions catch it.
-    check subsystemEvidence(result).completeness == mcComplete
-    var curlPid = 0'u64
-    for r in result.records:
-      if r.kind == mrProcessSpawn and r.childOsPid != 0 and
-          r.detail.startsWith("CreateProcessW") and
-          "curl.exe" in r.path.toLowerAscii:
-        checkpoint("curl spawn record: " & r.detail)
-        if "inject=" notin r.detail:
-          curlPid = r.childOsPid
-    check curlPid != 0
-    var curlStarted = false
-    for r in result.records:
-      if r.kind == mrProcessStart and r.osPid == curlPid:
-        curlStarted = true
-    check curlStarted
+    if not fixturesShareMonitorMachine():
+      skip()
+    else:
+      require fileExists(curlExe())
+      let dir = createTempDir("io_mon_cetcompat_grandchild_", "")
+      defer:
+        try: removeDir(dir)
+        except CatchableError: discard
+      # `cmd.exe` is not `/CETCOMPAT`, so the root injection is not what is
+      # under test here: the shim inside `cmd` injects `curl`.
+      let result = monitor(@[getEnv("ComSpec", r"C:\Windows\System32\cmd.exe"),
+        "/d", "/c", curlExe() & " --version"], dir / "run.iomon")
+      # Before the fix `curl` died inside the shim's borrowed `LoadLibraryW`
+      # (0xC0000409, subcode 0x39, measured under `cdb -o`) and the run
+      # reported 0xC0000005 (3221225477) to this test, deterministically.
+      checkpoint("exit code " & $result.exitCode)
+      check result.exitCode == 0
+      # The grandchild must have been spawned under monitoring, injected
+      # without a recorded failure, AND have reported in. The root's own
+      # synthetic `io-mon-root-spawn` record also carries a child pid and no
+      # `inject=`, so a check that only looks for "some spawn record without
+      # `inject=`" passes even when `curl` was never injected; it has to be
+      # `curl`'s own `CreateProcessW` record, paired with `curl`'s
+      # `mrProcessStart`, and the run must grade complete. Measured: a shim
+      # whose borrowed `LoadLibraryW` is forced to time out leaves `curl`
+      # running uninjected (exit 0, `inject=ioInjectFailed`, `mcIncomplete`),
+      # and only these assertions catch it.
+      check subsystemEvidence(result).completeness == mcComplete
+      var curlPid = 0'u64
+      for r in result.records:
+        if r.kind == mrProcessSpawn and r.childOsPid != 0 and
+            r.detail.startsWith("CreateProcessW") and
+            "curl.exe" in r.path.toLowerAscii:
+          checkpoint("curl spawn record: " & r.detail)
+          if "inject=" notin r.detail:
+            curlPid = r.childOsPid
+      check curlPid != 0
+      var curlStarted = false
+      for r in result.records:
+        if r.kind == mrProcessStart and r.osPid == curlPid:
+          curlStarted = true
+      check curlStarted

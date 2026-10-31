@@ -20,8 +20,13 @@ when defined(macosx):
     # The Apple compiler itself is injectable; /usr/bin/clang is only its
     # SIP-protected xcode-select launcher. Avoid an unrelated launcher loss.
     let clang = execCmdEx("/usr/bin/xcrun -f clang").output.strip()
+    # The toolchain clang (unlike the xcrun launcher) has no default SDK, so
+    # an isolated environment must name it, or the compile cannot find
+    # <string.h>. The experiment is about PATH, not the SDK.
+    let sdk = execCmdEx("/usr/bin/xcrun --show-sdk-path").output.strip()
     doAssert nim.len > 0
     doAssert fileExists(clang)
+    doAssert dirExists(sdk)
     let shim = buildPrivateMacosShim(repoRoot, builtToolsDir)
     let work = createTempDir("io-mon-no-path-nim-", "")
     defer: removeDir(work)
@@ -44,7 +49,8 @@ when defined(macosx):
       let images = injectedImages(nim, compileArgs &
         @["--nimcache:" & (work / "oracle-cache"),
           "--out:" & oracleOutput, source], workRoot = work,
-        envOverrides = [("PATH", emptyPath), ("HOME", work)], isolateEnv = true)
+        envOverrides = [("PATH", emptyPath), ("HOME", work), ("SDKROOT", sdk)],
+        isolateEnv = true)
       doAssert fileExists(oracleOutput)
       expected = if "sh" in images: mcComplete else: mcIncomplete
 
@@ -67,7 +73,8 @@ when defined(macosx):
       command: @[nim] & compileArgs &
         @["--nimcache:" & cache, "--out:" & output, source],
       cwd: work, depFilePath: depfile, streamMode: fsoNone,
-      isolateEnv: true, env: @[("PATH", emptyPath), ("HOME", work)]))
+      isolateEnv: true,
+      env: @[("PATH", emptyPath), ("HOME", work), ("SDKROOT", sdk)]))
     let evidence = readMonitorDepFile(depfile)
     for record in evidence.records:
       if record.kind == mrEventLoss: checkpoint(record.detail)
