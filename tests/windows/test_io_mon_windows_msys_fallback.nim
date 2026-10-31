@@ -1,3 +1,4 @@
+import descendant_guard_expectations
 import std/[os, osproc, strutils, tempfiles, unittest]
 
 import io_mon
@@ -30,7 +31,7 @@ proc runDirectFallbackProbe(): int =
     captureStdioPath: work / "stdio.log"))
   if monitored.exitCode != 0:
     return 2
-  if monitored.completeness != mcIncomplete:
+  if subsystemEvidence(monitored).completeness != mcIncomplete:
     return 3
   # THE PROPERTY IS THE EXPLICIT LOSS, NOT THE SENTENCE THAT EXPLAINS IT.
   # There are now two ways an MSYS2/Cygwin root reaches "incomplete", and
@@ -133,7 +134,7 @@ proc runNestedInstrumentedProbe(): int =
       instrumented = true
   if not instrumented:
     return 5
-  if monitored.completeness != mcComplete:
+  if subsystemEvidence(monitored).completeness != mcComplete:
     return 6
   0
 

@@ -553,31 +553,58 @@ library API**, not only a CLI:
   the source; and LF-4's `markConsumerGone` pinned by a real producer whose
   late `emit` must answer `emConsumerGone`.
 
-  A DROPPED handle deliberately does NOT run the guard: it is an evidence step
-  and a dropped handle publishes no edge for a loss marker to downgrade. That
-  asymmetry is asserted, not just documented (the census's `settled` counter).
+**Windows: a Job Object guard, in the same funnel.** Windows proves the same
+property with a kernel primitive instead of a scan. The launcher assigns the
+root, still suspended, to a fresh job that refuses breakaway, and the guard
+waits for the job's `ActiveProcesses` to reach zero. The job is created at the
+module's only Windows spawn site and waited on inside
+`settleMonitorDescendants`, so the DH-3 argument above holds unchanged: no
+exported proc creates, assigns, polls or skips it. Its contract (knobs, the
+named-survivor loss, the failure diagnostics, what it does not cover) is
+normative in `docs/usage.md`, "The Windows tree-lifetime guard (normative)";
+the design is reprobuild-pm `spec/io-mon-Windows-Tree-Lifetime-Guard.md`.
 
-  **And the two launch paths are now measured against each other (DH-4).** That
-  the guard is unskippable says the decomposed host CANNOT miss it; it does not
-  by itself say the two paths agree about everything else. DH-4 renders every
-  field of both edges — records, completeness, loss markers, backend
-  diagnostics — and compares them byte for byte for the same action, including
-  the detached-descendant case
-  (`tests/linux/test_io_mon_evidence_identical_across_launch_paths.nim`). Only
-  kernel-allocated identifiers that cannot be equal are normalised (pids, the
-  per-call run id, a `localfd:` inode), each through a bijection, and the file
-  perturbs the real evidence to prove the comparison still sees a dropped
-  record, a flipped verdict, a changed path or two processes collapsed into one.
+**macOS limitation (normative).** Root exit alone does not prove that the
+process tree is empty. The macOS backend has neither a complete kernel
+descendant census nor a tree-lifetime primitive. Every finished macOS capture
+MUST therefore publish an `mrEventLoss` / `moEventLoss` record with detail
+`detached-descendant quiescence cannot be established: macos backend has no complete tree-lifetime guard run=<id>`
+before evidence is merged. This applies even when no spawn was observed, to
+batch and decomposed hosts, every interest set and evidence scope, and both
+in-memory and on-disk depfiles. Such captures MUST grade `mcIncomplete`;
+consumers must conservatively rebuild. The marker states uncertainty, not
+proof that a descendant exists. Process and file evidence remains available
+for diagnosis. Linux retains its real descendant scan and grace window, and
+Windows its job guard; neither platform's knobs have any effect on the macOS
+limitation. There is no override that promotes these captures to complete.
+The real gated macOS regression also checks a fully quiesced control, which
+fails closed for the same reason.
 
-  Three seams make that agreement a property to hold rather than a formality.
-  `waitForMonitorRoot`'s `if h.exited: return` is the ONE code-level place the
-  paths differ, so state added after it runs on the batch path only. The root's
-  exit status now has a SINGLE writer (`recordRootExit`), reached by both paths,
-  so they cannot disagree about it. And the grace window opens when
-  `finishMonitor` runs, which a polled host chooses — a descendant that dies in
-  that interval is graded differently by the two paths with nothing wrong, which
-  is inherent to owning the wait and is documented for callers in
-  `docs/usage.md` rather than papered over.
+A DROPPED handle deliberately does NOT run the guard: it is an evidence step
+and a dropped handle publishes no edge for a loss marker to downgrade. That
+asymmetry is asserted, not just documented (the census's `settled` counter).
+
+**And the two launch paths are now measured against each other (DH-4).** That
+the guard is unskippable says the decomposed host CANNOT miss it; it does not
+by itself say the two paths agree about everything else. DH-4 renders every
+field of both edges — records, completeness, loss markers, backend
+diagnostics — and compares them byte for byte for the same action, including
+the detached-descendant case
+(`tests/linux/test_io_mon_evidence_identical_across_launch_paths.nim`). Only
+kernel-allocated identifiers that cannot be equal are normalised (pids, the
+per-call run id, a `localfd:` inode), each through a bijection, and the file
+perturbs the real evidence to prove the comparison still sees a dropped
+record, a flipped verdict, a changed path or two processes collapsed into one.
+
+Three seams make that agreement a property to hold rather than a formality.
+`waitForMonitorRoot`'s `if h.exited: return` is the ONE code-level place the
+paths differ, so state added after it runs on the batch path only. The root's
+exit status now has a SINGLE writer (`recordRootExit`), reached by both paths,
+so they cannot disagree about it. And the grace window opens when
+`finishMonitor` runs, which a polled host chooses — a descendant that dies in
+that interval is graded differently by the two paths with nothing wrong, which
+is inherent to owning the wait and is documented for callers in
+`docs/usage.md` rather than papered over.
 
 ---
 

@@ -3443,7 +3443,34 @@ proc environmentWithMonitorConfigA(lpEnvironment: LPVOID;
 # a literal at each call site so the behavioural tests (which `include` this
 # module) can shorten the hard deadline and drive the abandoned-injection
 # path for real; nothing in the shipped shim changes it.
-var spawnInjectionConfig = shProp.defaultInjectionConfig()
+#
+# POLICY FOR A TIMED-OUT BORROW (io-mon's choice). nim-stackable-hooks no
+# longer decides what happens when a call borrowed on the child's parked main
+# thread misses the hard deadline; it reports the timeout and offers building
+# blocks (keep waiting / terminate / detach). io-mon's policy is `btpTerminate`,
+# set EXPLICITLY here even though it is also the library default, because the
+# choice is io-mon's to own: a child that cannot be injected within a deadline
+# that is already 10 minutes by default (and can be `INFINITE`) is a genuinely
+# wedged child. Detaching it (`btpDetach`) would leave a child running with
+# its monitoring UNKNOWN: the borrowed call is not cancelled, so a detached
+# `repro_runtime_init` may go on to install all, some or none of its hooks.
+# The spawn record would say `inject=ioChildDetached`, but the evidence below
+# it could only be graded incomplete.
+# Terminating it, failing the spawn with `ERROR_TIMEOUT`, and leaving a spawn
+# record with no matching process-start is the honest, visible outcome.
+#
+# WHY NO USER-FACING KNOB. The one tunable that matters is already here:
+# `parkTimeoutMs` (the deadline), which the tests shorten. The policy itself is
+# deliberately NOT exposed as a shim configuration variable: every alternative
+# to terminate weakens io-mon's core guarantee that a monitored subtree is
+# either observed or loudly reported as lost, so there is no honest default
+# other than terminate and no reason to let an environment variable pick a
+# weaker one. The building blocks remain available to other consumers of the
+# library; io-mon simply does not want them.
+var spawnInjectionConfig = block:
+  var c = shProp.defaultInjectionConfig()
+  c.onBorrowTimeout = shProp.btpTerminate
+  c
 
 proc injectSpawnedChild(record: var MonitorRecord;
                         pi: ptr PROCESS_INFORMATION; hThread: HANDLE):

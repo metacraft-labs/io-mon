@@ -2,6 +2,10 @@
   description = "Filesystem and process monitoring library and tools";
 
   inputs = {
+    # Keep the shipped SIP replacements available when a child has an empty PATH.
+    stackable-hooks-macos-tools = {
+      url = "github:metacraft-labs/stackable-hooks-macos-tools/1ad378d58776ec9b6cc73e1c27b8e53c15676f03";
+    };
     nixos-modules.url = "github:metacraft-labs/devops-modules";
     nixpkgs.follows = "nixos-modules/nixpkgs-unstable";
     flake-parts.follows = "nixos-modules/flake-parts";
@@ -11,15 +15,28 @@
       # source: captured-output lifetime, initialized injection permits and
       # one preparation per executable page. Match .github/sibling-repos,
       # the ordinary Windows checkout and the committed Repro lock.
-      url = "github:metacraft-labs/nim-stackable-hooks/a043a07f71a9b662c6ae9bae7837107e6c1ade67";
+      # Bumped 059c549 -> 3af8a4e (2026-10-30, nim-stackable-hooks `agents`):
+      # the 32-bit ARM (armhf) raw-syscall substrate this shim's Linux inline
+      # trap and syscall(2) owner protocol compile against on `__arm__`.
+      # 3af8a4e -> 7533478 (2026-10-30): review fixes of that substrate (ARM
+      # body patch writes its target word first; idempotent restore).
+      url = "github:metacraft-labs/nim-stackable-hooks/75334780682e70b1adb58bf813d869e7f5df63f5";
       flake = false;
     };
     shm-queue-src = {
-      url = "github:metacraft-labs/nim-shm-queue/02f442ac12ce2587d9c053c527041097af38609f";
+      # Bumped a3564c13 -> 84fd76b (2026-10-30, `agents`): a new segment file is
+      # preallocated, so a full filesystem is ENOSPC at creation instead of
+      # SIGBUS at the first header store.
+      url = "github:metacraft-labs/nim-shm-queue/84fd76b174d4868e703ba3d599668ee340e0b6ea";
       flake = false;
     };
     shm-gset-src = {
-      url = "github:metacraft-labs/nim-shm-gset/43a61120ae54b542c3e3038453094cca707a6c05";
+      # Bumped 43a61120 -> 6333cc9 (2026-10-30, `agents`): shard files are backed
+      # with storage at creation (`posix_fallocate`), so a full tmpfs fragment
+      # directory makes the dependency set unavailable (and the shim fall back to
+      # its file transport) instead of killing the monitor root with SIGBUS --
+      # the ~1-in-5 cold `repro infra plan` failure measured on rpi2.
+      url = "github:metacraft-labs/nim-shm-gset/6333cc915689559b00f81371734783c2e894ca45";
       flake = false;
     };
   };
@@ -39,7 +56,12 @@
       ];
 
       perSystem =
-        { pkgs, config, ... }:
+        {
+          pkgs,
+          config,
+          system,
+          ...
+        }:
         let
           version = builtins.replaceStrings [ "\n" "\r" ] [ "" "" ] (builtins.readFile ./version.txt);
           # git-hooks.nix installs `.pre-commit-config.yaml` and git hooks into
@@ -96,6 +118,66 @@
           nimble = pkgs.nimble.overrideAttrs (old: {
             nimFlags = (old.nimFlags or [ ]) ++ [ "-d:sslVersion=3" ];
           });
+          # On macOS 26 the ASan runtime of nixpkgs' compiler-rt 21.1.8 hangs
+          # every instrumented program before main: InitializeShadowMemory ->
+          # get_dyld_hdr walks the shared cache with
+          # dyld_shared_cache_iterate_text, whose _Block_copy mallocs, and that
+          # malloc re-enters AsanInitFromRtl and spins on the init mutex it
+          # holds. scripts/run_sanitizer_tests.sh then never runs a test
+          # (metacraft-pm issues/2026-10-01-nix-compiler-rt-asan-startup-hangs-on-macos-26.md).
+          # Upstream LLVM 2e7d07a33725 ("Adopt _dyld_get_dyld_header", first
+          # released in 22.1.3) asks dyld for its header instead; this is that
+          # change backported to 21.x, minus its lib/tsan/go/buildgo.sh hunk
+          # (the Go race runtime, which this CMake build does not produce).
+          # Darwin only: on Linux the dev shell's derivation changes only by
+          # the flake.nix hash its git-hook guard embeds.
+          #
+          # The patched runtime must replace the one the stdenv's wrapper
+          # links into its resource-root, which is NOT
+          # `pkgs.llvmPackages.compiler-rt` (a different derivation), so it is
+          # taken from the wrapper's own arguments. Evaluation fails rather
+          # than silently shipping the hang if the wrapper stops having
+          # exactly one compiler-rt, if the replacement does not take, or once
+          # compiler-rt leaves 21.x: at 22.1.3+ the fix is upstream and this
+          # whole override should be deleted.
+          # tests/test_dev_shell_asan_program_reaches_main.sh
+          darwinSanitizerCc = pkgs.stdenv.cc.override (
+            old:
+            let
+              inherit (pkgs) lib;
+              crts = builtins.filter (p: lib.hasPrefix "compiler-rt" (p.pname or "")) old.extraPackages;
+              crt =
+                if builtins.length crts == 1 then
+                  builtins.head crts
+                else
+                  throw "io-mon flake.nix: expected exactly one compiler-rt in stdenv.cc's extraPackages, found ${toString (builtins.length crts)}; re-derive the ASan startup-hang override";
+              patched =
+                if lib.versions.major crt.version == "21" then
+                  crt.overrideAttrs (a: {
+                    patches = (a.patches or [ ]) ++ [ ./nix/patches/compiler-rt-21-darwin-dyld-get-dyld-header.patch ];
+                  })
+                else
+                  throw "io-mon flake.nix: stdenv.cc's compiler-rt is ${crt.version}, not 21.x. 22.1.3+ carries the _dyld_get_dyld_header fix upstream: drop darwinSanitizerCc and its patch; otherwise port the patch.";
+              extraBuildCommands = builtins.replaceStrings [ "${crt}" ] [ "${patched}" ] old.extraBuildCommands;
+            in
+            if
+              extraBuildCommands == old.extraBuildCommands
+              || lib.hasInfix (builtins.unsafeDiscardStringContext "${crt}") extraBuildCommands
+            then
+              throw "io-mon flake.nix: stdenv.cc's resource-root no longer links ${crt}; re-derive the ASan startup-hang override"
+            else
+              {
+                inherit extraBuildCommands;
+                extraPackages = map (p: if p.outPath == crt.outPath then patched else p) old.extraPackages;
+              }
+          );
+          # The dev shell's `cc`/`clang`, and so the sanitizer arm's, is
+          # darwinSanitizerCc on Darwin.
+          mkDevShell =
+            if pkgs.stdenv.isDarwin then
+              pkgs.mkShell.override { stdenv = pkgs.overrideCC pkgs.stdenv darwinSanitizerCc; }
+            else
+              pkgs.mkShell;
         in
         {
           pre-commit.settings.hooks = {
@@ -110,44 +192,77 @@
             };
           };
 
-          packages.default = pkgs.stdenv.mkDerivation {
-            pname = "io-mon";
-            inherit version;
-            src = ./.;
+          packages = {
+            default = pkgs.stdenv.mkDerivation {
+              pname = "io-mon";
+              inherit version;
+              src = ./.;
 
-            nativeBuildInputs = [
-              pkgs.just
-              pkgs.nim2
-            ];
+              nativeBuildInputs = [
+                pkgs.just
+                pkgs.nim2
+              ];
 
-            STACKABLE_HOOKS_SRC = "${inputs.stackable-hooks-src}/src";
-            SHM_QUEUE_SRC = "${inputs.shm-queue-src}/src";
-            SHM_GSET_SRC = "${inputs.shm-gset-src}/src";
+              STACKABLE_HOOKS_BUILT_TOOLS_DIR =
+                if pkgs.stdenv.isDarwin then
+                  "${inputs.stackable-hooks-macos-tools.packages.${system}.default}"
+                else
+                  "";
+              STACKABLE_HOOKS_SRC = "${inputs.stackable-hooks-src}/src";
+              SHM_QUEUE_SRC = "${inputs.shm-queue-src}/src";
+              SHM_GSET_SRC = "${inputs.shm-gset-src}/src";
 
-            buildPhase = ''
-              runHook preBuild
-              just build
-              runHook postBuild
-            '';
+              postPatch = ''
+                patchShebangs scripts/build_shim.sh
+              '';
 
-            installPhase = ''
-              runHook preInstall
-              mkdir -p "$out/bin" "$out/lib"
-              if [ -f build/bin/io-mon ]; then
-                install -m755 build/bin/io-mon "$out/bin/io-mon"
-              fi
-              for lib in build/lib/*; do
-                [ -e "$lib" ] || continue
-                install -m755 "$lib" "$out/lib/$(basename "$lib")"
-              done
-              runHook postInstall
+              buildPhase = ''
+                runHook preBuild
+                just build
+                runHook postBuild
+              '';
+
+              installPhase = ''
+                runHook preInstall
+                mkdir -p "$out/bin" "$out/lib"
+                if [ -f build/bin/io-mon ]; then
+                  install -m755 build/bin/io-mon "$out/bin/io-mon"
+                fi
+                for lib in build/lib/*; do
+                  [ -e "$lib" ] || continue
+                  install -m755 "$lib" "$out/lib/$(basename "$lib")"
+                done
+                runHook postInstall
+              '';
+            };
+          }
+          // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+            # The entry-loss oracle needs a real 32-bit image, also when the
+            # engine runs outside the dev shell. A distinct name avoids
+            # shadowing the ordinary 64-bit bash used by its controls.
+            io-mon-test-i686-sh = pkgs.runCommand "io-mon-test-i686-sh" { } ''
+              mkdir -p "$out/bin"
+              ln -s ${pkgs.pkgsi686Linux.bash}/bin/bash "$out/bin/io-mon-test-i686-sh"
             '';
           };
 
-          devShells.default = pkgs.mkShell {
+          devShells.default = mkDevShell {
+            STACKABLE_HOOKS_BUILT_TOOLS_DIR =
+              if pkgs.stdenv.isDarwin then
+                "${inputs.stackable-hooks-macos-tools.packages.${system}.default}"
+              else
+                "";
             RELEASE_STACKABLE_HOOKS_SRC = "${inputs.stackable-hooks-src}/src";
             RELEASE_SHM_QUEUE_SRC = "${inputs.shm-queue-src}/src";
             RELEASE_SHM_GSET_SRC = "${inputs.shm-gset-src}/src";
+            # A dynamically linked 32-bit (i686) shell. glibc's loader refuses a
+            # 64-bit LD_PRELOAD object in it ("wrong ELF class: ignored") and
+            # runs it anyway, so it is the canonical image the shim cannot
+            # enter. tests/linux/test_io_mon_uninjectable_image_entry.nim
+            # requires it on x86_64-linux (a missing value fails that test
+            # there) and skips on every other system, where it is empty.
+            IO_MON_TEST_I686_SH =
+              if system == "x86_64-linux" then "${pkgs.pkgsi686Linux.bash}/bin/bash" else "";
             # Paired workspace editing keeps using siblings. Release scripts
             # explicitly select the immutable inputs exported above.
             shellHook = ''
@@ -223,6 +338,11 @@
               pkgs.rustc
             ]
             ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              # The sanitizer startup probe exercises both GCC's cc and Clang.
+              # Keep GCC ahead of Clang's cc alias on the shell's PATH.
+              # Darwin already supplies clang through darwinSanitizerCc.
+              pkgs.stdenv.cc
+              pkgs.clang
               pkgs.strace
               pkgs.zig
               pkgs.patchelf

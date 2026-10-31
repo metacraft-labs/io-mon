@@ -80,9 +80,28 @@ after a task exception.
 `repro build .#test-monitor-isolation --write-report=build/monitor-isolation-repeat.json`
 reruns the programs whose fixture must own its monitor environment. Their
 compilation stays monitored and their execution stays uncached. CI requires
-all selected programs to launch and succeed on the repeat: 45 on macOS, nine
+all selected programs to launch and succeed on the repeat: 48 on macOS, 19
 on Linux and eight on Windows. Update that explicit inventory when adding an
 isolated program; keep the complete report among failure artifacts.
+
+The Linux uninjectable-image oracle also owns its shim: its disabled-thread
+controls require an unnamed loss, which an enclosing monitor changes by
+recording the same entry by name. Its execute edge therefore follows the
+same non-cacheable isolation policy and declares both the ELF editor and,
+on x86_64, the real i686 shell it needs.
+
+A Linux test that runs a bare (shim-free) control, or loads a shim under test
+into its own children, must be in the isolation list (`isolatesMonitor` in
+`repro.nim`). Under `repro test` the test process itself runs under the outer
+monitor shim, which re-injects itself across `exec`, so removing `LD_PRELOAD`
+from a child's environment does not make that child bare: the control reports
+a shim loaded, and the shim under test loads beside the outer one. Such a test
+passes under `just test` and fails under `repro test`. Its bare and
+`LD_PRELOAD`-only children must also not inherit the outer monitor's exported
+`REPRO_MONITOR_*` settings: build their environment with `unmonitoredEnv()`
+(`tests/helpers/unmonitored_env.nim`), which drops `LD_PRELOAD` and every
+`REPRO_MONITOR_*` variable, and set `REPRO_MONITOR_SHIM_LIB` explicitly in each
+monitored arm.
 
 At `40a0adc` plus the workflow inventory repair, the macOS repeat passes all
 137 actions and launches all 45 isolated programs. The previous expectation
@@ -100,6 +119,41 @@ just test-portable
 just test-platform
 ```
 
+### Check the dev shell itself
+
+```sh
+just test-dev-shell
+```
+
+These tests run `nix develop` themselves, so start them from a shell that has
+`nix` and `bash`; they are not part of `just test`. CI runs them after
+`just test` in the Nix-flavoured _Test_ jobs on Linux and macOS
+(`.github/workflows/ci.yml`, step _Run dev-shell tests_).
+
+- `tests/test_dev_shell_writes_nothing_elsewhere.sh`: entering the dev shell
+  from another git repository writes no files or git hooks there.
+- `tests/test_dev_shell_nimble_runs_tasks.sh`: the dev shell's `nimble` runs a
+  package task. Stock nixpkgs nimble 0.20.1 crashes with SIGSEGV on Darwin
+  before running any task, because it passes a system LibreSSL TLS method to
+  Nix OpenSSL 3; `flake.nix` builds it with `-d:sslVersion=3`.
+- `tests/test_dev_shell_asan_program_reaches_main.sh`: a C program built by
+  the dev shell's `cc` and `clang` with `-fsanitize=address,undefined` reaches
+  main and exits 0, and ASan reports a control heap overflow. The probe clears
+  the ambient environment, so both compilers must come from the dev shell.
+  Linux supplies GCC's `cc` and a separate wrapped Clang. On macOS 26
+  nixpkgs' compiler-rt 21.1.8 hangs every such program before main; a timeout
+  fails the test and names that hang (see §4).
+
+On Linux, `just test-repro-shim-compiler` also checks the supported combination
+of the Nix dev shell and Reprobuild shim actions. It runs both `shim` and
+`test-monitor-runtime` with ambient `CC=clang`, forcing actual compilation
+under automatic monitoring and RunQuota. Both actions must use their declared
+GCC backend, even though the development shell also supplies Clang. CI runs
+this in its Reprobuild job with the pinned engine. To use a local engine,
+set `IO_MON_TEST_REPRO=/absolute/path/to/repro`; otherwise it uses `repro`
+on PATH. Reports and compiler logs remain in
+`build/compiler-selection-regression/`.
+
 ---
 
 ## 4. Memory safety: the sanitizer arm
@@ -116,6 +170,22 @@ UndefinedBehaviorSanitizer**. CI runs it on every push and pull request to
 arm rather than a flag on `just test` because the instrumented builds are
 slower, and because it grades a class of defect the ordinary suite
 structurally cannot.
+
+**On macOS the dev shell's compiler carries a patched compiler-rt.** The ASan
+runtime of nixpkgs' compiler-rt 21.1.8 hangs every instrumented program before
+main on macOS 26: `get_dyld_hdr` walks the dyld shared cache, the walk's
+`_Block_copy` mallocs, and the malloc re-enters ASan's initializer, which
+spins on its own init mutex. The arm then never runs a test. `flake.nix`
+rebuilds the Darwin stdenv's compiler-rt with a backport of LLVM
+`2e7d07a33725` ("Adopt `_dyld_get_dyld_header`", upstream from 22.1.3) and
+makes that the shell's `cc`/`clang`; evaluation fails once compiler-rt is no
+longer 21.x, when the patch should be dropped.
+`tests/test_dev_shell_asan_program_reaches_main.sh` is the regression test.
+Measured 2026-10-18 on macOS 26.5.2 arm64: run against the dev shell of
+io-mon `4e988af` (before this change, runtime
+`3ph0blg…-compiler-rt-libc-21.1.8`), the test fails because its program did
+not reach main within 30 s; against `4e988af` plus this change it passes, and
+this arm is **rc=0, 29 files, 0 failed** in 186 s.
 
 **What it is for.** `src/io_mon/codec.nim` moves string bodies and
 fixed-width header fields with `copyMem`. A wrong _size_ on one of those

@@ -87,6 +87,8 @@ when defined(windows):
   import repro_dsl_stdlib/packages/coreutils_install
 when defined(linux):
   import ./repro_support/getconf
+  when defined(amd64):
+    import ./repro_support/i686_shell
   import ./repro_support/shim_publication_tools
   import ./repro_support/strace
 
@@ -122,10 +124,18 @@ package io_mon:
       "cctools"
       "python3"
     when defined(linux):
+      # tests/linux/test_io_mon_shim_static_tls_small_stack_threads.nim starts
+      # real Node under the shim. The dev shell (flake.nix) provides it for
+      # ``just test``; this entry is what puts it on the action's PATH under
+      # ``repro test``, where an undeclared tool is simply not found.
+      "node"
       "getconf"
       "grep"
       "nm"
       "strace"
+      "patchelf"
+      when defined(amd64):
+        "io-mon-test-i686-sh"
     # The C-family compiler ``nim c`` shells out to for the C backend. macOS
     # builds (and the shim's arm64/arm64e fat link) use Apple ``clang``; Linux
     # and Windows (``--cc:gcc`` for the shim DLL) use ``gcc``. The user supplies
@@ -143,10 +153,9 @@ package io_mon:
     # Naming the two workspace repos here makes reprobuild build each from
     # source (their ``library stackable_hooks`` / ``library shm_queue``) and
     # thread their ``src/`` roots onto this repo's ``nim c --path:`` via the
-    # ``nimPathDirs`` aux channel — replacing ``config.nims``'s hardcoded
-    # ``--path:../nim-stackable-hooks/src`` + ``$SHM_QUEUE_SRC`` for the
-    # engine-driven compile (``config.nims`` is not read by the engine's build
-    # edges, only by a plain ``nimble``/``nim c`` invocation). The scripted
+    # ``nimPathDirs`` aux channel. The engine restores these selected roots
+    # ahead of fallback paths configured by ``config.nims``, which Nim also
+    # reads for engine-driven compiles. The scripted
     # shim edge still resolves ``$STACKABLE_HOOKS_SRC`` itself.
     "nim-stackable-hooks"
     "nim-shm-queue"
@@ -174,6 +183,12 @@ package io_mon:
 
   build:
     const backendCompiler = (when defined(macosx): "clang" else: "gcc")
+    # Nix's Nim config reads ambient CC for both the backend and its compiler
+    # and linker executables. Bind all three to the action's declared tool:
+    # --cc:gcc alone still leaves gcc.exe=clang in a CC=clang development shell.
+    const shimBuildCommand = "scripts/build_shim.sh --cc:" & backendCompiler &
+      " --" & backendCompiler & ".exe:" & backendCompiler &
+      " --" & backendCompiler & ".linkerexe:" & backendCompiler
     const binSuffix = (when defined(windows): ".exe" else: "")
     const shimExt =
       when defined(windows): "dll"
@@ -190,7 +205,7 @@ package io_mon:
     # ``librepro_monitor_shim.<ext>``.
     let shimOutput = "build/lib/librepro_monitor_shim." & shimExt
     let shimBuild = shell(
-      command = "scripts/build_shim.sh",
+      command = shimBuildCommand,
       actionId = "io-mon.shim.build_shim",
       extraInputs = @[
         "scripts/build_shim.sh",
@@ -216,7 +231,7 @@ package io_mon:
       # Keep the monitor used for this project's tests separate from the
       # default subject output that original tests legitimately rebuild.
       let testMonitor = shell(
-        command = "scripts/build_shim.sh",
+        command = shimBuildCommand,
         actionId = "io-mon.shim.build_test_monitor_runtime",
         extraInputs = @["scripts/build_shim.sh", "src", "io_mon.nimble", "config.nims"],
         extraOutputs = @["build/monitor-test-runtime/librepro_monitor_shim.so"],
@@ -235,9 +250,9 @@ package io_mon:
       source = "cmd/io_mon_snoop.nim",
       binary = cliOutput,
       threadsOn = true,
-      # ``src`` reproduces ``config.nims``'s ``switch("path", "src")`` for the
-      # engine compile (which does not read ``config.nims``). The sibling
-      # ``stackable_hooks`` / ``shm_queue`` ``src`` roots ride in automatically
+      # Keep the consumer's own source path explicit. The sibling
+      # ``stackable_hooks`` / ``shm_queue`` roots take precedence over
+      # configured fallbacks and ride in automatically
       # via the ``uses:`` ``nimPathDirs`` channel.
       paths = @["src"],
       extraInputs = @["src", "io_mon.nimble"],
@@ -318,20 +333,48 @@ package io_mon:
           "test_io_mon_dep_identity_scope.nim",
           "test_io_mon_cli_interest_stamp.nim",
           "test_io_mon_cli_evidence_scope.nim",
-          "test_io_mon_host_session_scope.nim"])) or
+          "test_io_mon_host_session_scope.nim",
+          # Sets REPRO_MONITOR_SHIM_LIB to a missing file for its io-mon
+          # child. An enclosing macOS shim injects that value into the child
+          # too, so dyld kills io-mon before it can refuse the override
+          # (reprobuild v0.2.18, io-mon run 41139374981).
+          "test_io_mon_shim_override_honoured.nim"])) or
         (defined(linux) and source.extractFilename in [
+          "test_io_mon_monitored_compile_depset.nim",
           "test_io_mon_shared_producer_growth.nim",
           "test_io_mon_cli_exit_status.nim",
           "test_io_mon_dep_identity_scope.nim",
           "test_io_mon_host_session_scope.nim",
           "test_io_mon_evidence_scope_older_shim.nim",
           "test_io_mon_evidence_scope_shim_gate.nim",
+          "test_io_mon_fortified_open.nim",
           "test_io_mon_library_load_closure.nim",
+          # This oracle disables recording in its private shim to require the
+          # unnamed-loss fallback. An outer shim keeps recording by name and
+          # changes that experiment, so execution must own its monitor too.
+          "test_io_mon_uninjectable_image_entry.nim",
           "test_io_mon_linux_fragment_fd_reuse.nim",
           # This suite builds and selects a private current shim. The same
           # fixture exits 139 with an enclosing shim and passes all 39 cases
           # under this policy (diagnostic e13a98f, Linux job 110498730972).
-          "test_io_mon_linux_stdio_ipc.nim"]) or
+          "test_io_mon_linux_stdio_ipc.nim",
+          "test_io_mon_raw_renameat2.nim",
+          # These build their own shim and compare a bare (shim-free) or
+          # LD_PRELOAD-only child with an io-mon-monitored one. Deleting
+          # LD_PRELOAD from the child environment does not make it bare: the
+          # outer monitor re-injects itself across exec, so the "bare" control
+          # of test_io_mon_shim_host_allocator_isolation reports
+          # `host shim-loaded=1`, and the shim under test loads beside the
+          # outer one (wrong completeness, missing records, exit 1). At io-mon
+          # 82061e82 with repro 0.2.6 all six fail under `repro test`, and
+          # all six pass when `repro build .#test-monitor-isolation` reruns
+          # them under this policy.
+          "test_io_mon_linux_host_entry_points.nim",
+          "test_io_mon_shim_fork_child_evidence.nim",
+          "test_io_mon_shim_host_allocator_isolation.nim",
+          "test_io_mon_shim_path_mutations.nim",
+          "test_io_mon_shim_private_heap.nim",
+          "test_io_mon_shim_static_tls_small_stack_threads.nim"]) or
         (defined(windows) and source.extractFilename in [
         "test_io_mon_cli_exit_status.nim",
         "test_io_mon_windows_exit_status.nim",
@@ -379,6 +422,13 @@ package io_mon:
       when defined(linux):
         appendRegisteredActionToolIdentityRefs(executeEdge.id,
           ["strace", "nm", "getconf", "grep", "mv", "rmdir"])
+        if stem == "test_io_mon_uninjectable_image_entry":
+          appendRegisteredActionToolIdentityRefs(executeEdge.id, ["patchelf"])
+          when defined(amd64):
+            appendRegisteredActionToolIdentityRefs(executeEdge.id,
+              ["io-mon-test-i686-sh"])
+        if stem == "test_io_mon_shim_static_tls_small_stack_threads":
+          appendRegisteredActionToolIdentityRefs(executeEdge.id, ["node"])
       testExecuteActions.add(executeEdge)
 
     # Portable tests — always in the graph.

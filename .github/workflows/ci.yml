@@ -30,7 +30,7 @@ jobs:
     # Native macOS jobs retain their full gates while the fleet repair lands.
     # Owner: zah. Follow-up: metacraft-specs/issues/
     # 2026-09-28-shared-macos-host-has-no-headroom-for-runquota-measurements.md
-    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@146ea35853f859bcf78cc5da7fa53705a825da30
     with:
       preferred: macos-26
       fallback: '["self-hosted","macos","arm64"]'
@@ -38,7 +38,7 @@ jobs:
   choose-linux:
     # The shared CI_RUNNER_MODE policy selects free hosted runners for public
     # repos by default and preserves the org-controlled self-hosted fallback.
-    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@146ea35853f859bcf78cc5da7fa53705a825da30
     with:
       preferred: ubuntu-24.04
       fallback: '["self-hosted","linux","x64"]'
@@ -188,8 +188,13 @@ jobs:
         with:
           env-flavor: ${{ matrix.env }}
           repro-from-source: ${{ matrix.env == 'reprobuild' }}
-          repro-build-pin: 1f85ace0037d0a70e966fe8eee645d766522b1ab
-          repro-posix-io-mon-pin: ${{ matrix.env == 'reprobuild' && '004b8fc3eb0a6c31f78622272ba323c221b79b28' || '' }}
+          # The same engine, and its own flake-lock RunQuota and io-mon
+          # bootstrap inputs, as ci-reprobuild.yml: reprobuild v0.2.18. An
+          # older engine rejects the committed v3 `repro.lock`
+          # (tests/test_ci_engine_reads_committed_lock.py checks both files).
+          repro-build-pin: 413830138a7a73293dfc551d623f7bf2cb0ab62c
+          repro-runquota-pin: 35b9dfe4af6e18f3f2a2242ece7cff330eb581e2
+          repro-io-mon-pin: 6fccd929cb09da0bfc0844b93ced9ffb1ac0f74f
           gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: Run tests
@@ -200,11 +205,25 @@ jobs:
             dev-exec repro build --daemon=off --tool-provisioning=nix .#test-monitor-runtime --write-report=build/monitor-test-runtime-producer.json
             monitor="$PWD/build/monitor-test-runtime/librepro_monitor_shim.so"
             test -f "$monitor" && test ! -L "$monitor"
-            dev-exec sha256sum "$monitor"
+            # Host coreutils must not see the engine's store LD_LIBRARY_PATH
+            # (see the same step in ci-reprobuild.yml).
+            env -u LD_LIBRARY_PATH sha256sum "$monitor"
             REPRO_MONITOR_SHIM_LIB="$monitor" dev-exec repro test --daemon=off --tool-provisioning=nix --write-report=build/current-source-monitor-test-report.json 2>&1 | tee test.log
           else
             dev-exec just test 2>&1 | tee test.log
           fi
+
+      - name: Run dev-shell tests
+        # The dev shell itself is under test here: its nimble must run a task
+        # (tests/test_dev_shell_nimble_runs_tasks.sh; on Darwin an unpinned TLS
+        # lookup made it SIGSEGV before any task), entering it from another
+        # repository must write nothing there, and its compiler's ASan+UBSan
+        # programs must reach main (tests/test_dev_shell_asan_program_reaches_main.sh;
+        # on macOS 26 compiler-rt 21's ASan hung before main). The scripts run `nix develop`,
+        # so they are not part of `just test` and only the Nix flavour has them.
+        if: matrix.env == 'nix'
+        shell: bash
+        run: dev-exec just test-dev-shell 2>&1 | tee -a test.log
 
       - name: Upload logs
         if: always()
@@ -250,7 +269,7 @@ jobs:
         with:
           repository: metacraft-labs/nim-stackable-hooks
           # Keep in lockstep with stackable-hooks-src in flake.nix.
-          ref: a043a07f71a9b662c6ae9bae7837107e6c1ade67
+          ref: 059c549306621e2f769adf75630b0b7f29018dca
           path: nim-stackable-hooks
           token: ${{ steps.app-token.outputs.token }}
       - uses: actions/checkout@v4
@@ -262,8 +281,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: metacraft-labs/nim-shm-gset
-          # Same revision as .github/sibling-repos.
-          ref: cf0adf2f39647f5b203b2ab694414a3c50e93951
+          # Same revision as .github/sibling-repos and shm-gset-src in flake.nix.
+          ref: 43a61120ae54b542c3e3038453094cca707a6c05
           path: nim-shm-gset
           token: ${{ steps.app-token.outputs.token }}
 

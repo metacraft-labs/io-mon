@@ -40,7 +40,7 @@ concurrency:
 jobs:
   choose-windows:
     # Public-repository policy route; retain the existing fleet fallback.
-    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@146ea35853f859bcf78cc5da7fa53705a825da30
     with:
       preferred: windows-2025
       fallback: '["self-hosted","windows","x64"]'
@@ -49,7 +49,7 @@ jobs:
     # Existing x64-emulation suite on a native ARM64 host; no backend port.
     # Temporary migration owner: zah. Follow-up: metacraft-specs/issues/
     # 2026-09-29-windows-arm64-release-runner-migration.md
-    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@146ea35853f859bcf78cc5da7fa53705a825da30
     with:
       preferred: windows-11-arm
       fallback: '["self-hosted","windows","arm64"]'
@@ -58,7 +58,7 @@ jobs:
     # Native macOS jobs retain their full gates while the fleet repair lands.
     # Owner: zah. Follow-up: metacraft-specs/issues/
     # 2026-09-28-shared-macos-host-has-no-headroom-for-runquota-measurements.md
-    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@146ea35853f859bcf78cc5da7fa53705a825da30
     with:
       preferred: macos-26
       fallback: '["self-hosted","macos","arm64","nix-darwin"]'
@@ -66,7 +66,7 @@ jobs:
   choose-linux:
     # The shared CI_RUNNER_MODE policy selects free hosted runners for public
     # repos by default and preserves the org-controlled self-hosted fallback.
-    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@146ea35853f859bcf78cc5da7fa53705a825da30
     with:
       preferred: ubuntu-24.04
       fallback: '["self-hosted","linux","x64"]'
@@ -120,17 +120,25 @@ jobs:
         # revisions before materialising the env. Those two are io-mon's
         # `uses:` library producers in repro.nim; reprobuild builds each
         # from source and threads their `src/` roots onto io-mon's compile.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@e2b9947768dccce6de2687a495c8286df4d6de96
         with:
           env-flavor: reprobuild
-          # Exercise the published bootstrap repairs before a new CLI release.
+          # Reprobuild v0.2.18. The engine reads the committed v3 lock on
+          # every host and builds on Windows. Keep the
+          # bootstrap libraries at that engine's own flake-lock revisions;
+          # POSIX retains its monitor input without an older override.
           # Windows ARM64 keeps the existing emulated x64 Reprobuild tools.
           repro-from-source: true
-          repro-build-pin: 1f85ace0037d0a70e966fe8eee645d766522b1ab
-          repro-runquota-pin: 292e578d57eb85d6037f9e2d3a03f0bcb0489dbb
-          repro-io-mon-pin: 5e71adf033b860c0fdbe13dda4320cf4a580f632
-          repro-posix-io-mon-pin: ${{ matrix.os == 'linux' && '004b8fc3eb0a6c31f78622272ba323c221b79b28' || '' }}
+          repro-build-pin: 413830138a7a73293dfc551d623f7bf2cb0ab62c
+          repro-runquota-pin: 35b9dfe4af6e18f3f2a2242ece7cff330eb581e2
+          repro-io-mon-pin: 6fccd929cb09da0bfc0844b93ced9ffb1ac0f74f
+          repro-stackable-hooks-pin: 059c549306621e2f769adf75630b0b7f29018dca
           gh-token: ${{ steps.ci_token.outputs.token }}
+
+      - name: Verify CI engine reads the committed lock
+        if: matrix.os == 'linux'
+        shell: bash
+        run: dev-exec python3 tests/test_ci_engine_reads_committed_lock.py --reprobuild .reprobuild-src
 
       - name: Refresh authentication before repro build
         uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bcd29c631ff01fbd0e577c5f96e5f9d5211fed26
@@ -157,12 +165,20 @@ jobs:
         if: matrix.os == 'linux'
         run: repro build --daemon=off --tool-provisioning=nix .#test-monitor-runtime --write-report=build/monitor-test-runtime-producer.json
 
+      - name: Verify Linux dev-shell compiler agrees with shim actions
+        if: matrix.os == 'linux'
+        run: dev-exec just test-repro-shim-compiler
+
       - name: repro test with the owned Linux monitor runtime
         if: matrix.os == 'linux'
         run: |
           monitor="$PWD/build/monitor-test-runtime/librepro_monitor_shim.so"
           test -f "$monitor" && test ! -L "$monitor"
-          sha256sum "$monitor"
+          # setup-dev-env exports the engine's store LD_LIBRARY_PATH to every
+          # later step. The host sha256sum links libcrypto, so with it set it
+          # loads the store's OpenSSL and glibc beside the host libc and fails
+          # (GLIBC_ABI_DT_X86_64_PLT not found). Only `repro` needs it.
+          env -u LD_LIBRARY_PATH sha256sum "$monitor"
           REPRO_MONITOR_SHIM_LIB="$monitor" repro test --daemon=off --tool-provisioning=nix --write-report=build/current-source-monitor-test-report.json
 
       - name: repro test
@@ -206,7 +222,7 @@ jobs:
         if: matrix.os == 'macos' || matrix.os == 'linux'
         shell: bash
         env:
-          EXPECTED_ISOLATED_TESTS: ${{ matrix.os == 'macos' && '45' || '9' }}
+          EXPECTED_ISOLATED_TESTS: ${{ matrix.os == 'macos' && '49' || '19' }}
         run: |
           dev-exec repro build --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }} .#test-monitor-isolation --write-report=build/monitor-isolation-repeat.json
           "$REPROBUILD_BOOTSTRAP_PYTHON" - <<'PYCODE'
@@ -289,6 +305,10 @@ jobs:
       - name: Mirror logs to S3 (non-blocking)
         if: failure()
         continue-on-error: true
+        # Bounded: on run 41065157413 this step retried failing uploads of
+        # build/nimcache for five hours and held the macOS runner until the
+        # job was cancelled.
+        timeout-minutes: 15
         uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
         with:
           path: build/

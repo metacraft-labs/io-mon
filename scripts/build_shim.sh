@@ -188,9 +188,20 @@ case "${io_mon_host_platform_name}" in
     # be loaded into an older monitored process and fail its libc ABI checks.
     # These variables are expanded by Nim when rendering its linker command.
     # shellcheck disable=SC2016
+    #
+    # `-static-libgcc` keeps that state in force for the `-lpthread` the
+    # driver adds for `-pthread`. Clang links the shared libgcc as
+    # `--as-needed -lgcc_s --no-as-needed`, and that trailing
+    # `--no-as-needed` applies to the `-lpthread -lc` after it, so the dev
+    # shell's Clang recorded libpthread.so.0 as NEEDED although glibc >= 2.34
+    # puts nothing in it. A host `/bin/sh` on an older glibc then loaded the
+    # store's libpthread through RUNPATH and died on its
+    # GLIBC_ABI_DT_X86_64_PLT check. The static libgcc adds code only for
+    # libgcc symbols the shim references; it imports no unwinder today.
     linux_shim_link_flags=(
       '--gcc.linkTmpl:-Wl,--as-needed $buildgui $builddll -o $exefile $objfiles $options'
       '--clang.linkTmpl:-Wl,--as-needed $buildgui $builddll -o $exefile $objfiles $options'
+      '--passL:-static-libgcc'
     )
     if getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
       linux_shim_link_flags+=(

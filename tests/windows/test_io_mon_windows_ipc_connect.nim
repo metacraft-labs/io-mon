@@ -25,6 +25,7 @@
 when not defined(windows):
   {.error: "windows-only test".}
 
+import descendant_guard_expectations
 import std/[nativesockets, net, os, strutils, tempfiles, unittest]
 
 import io_mon
@@ -83,8 +84,8 @@ suite "Windows ipc-connect: named pipes":
         if r.childOsPid != 0'u64 and r.childOsPid == r.osPid:
           sawSelfPeer = true
       check sawSelfPeer
-      check res.completeness == mcComplete
-      check res.depFile.summary.eventLossCount == 0'u64
+      check subsystemEvidence(res).completeness == mcComplete
+      check subsystemEvidence(res).summary.eventLossCount == 0'u64
       check unmonitoredSubtreeLossCount(res.records) == 0)
 
   test "an OUT-OF-TREE named-pipe peer downgrades the capture":
@@ -113,7 +114,7 @@ suite "Windows ipc-connect: named pipes":
         if d.startsWith("ipc peer outside monitored tree"):
           sawIpcLoss = true
       check sawIpcLoss
-      check res.completeness == mcIncomplete)
+      check subsystemEvidence(res).completeness == mcIncomplete)
 
   test "a client calling NtCreateFile DIRECTLY on a pipe is still seen":
     ## The NT-layer arm, exercised the only way that isolates it.
@@ -153,7 +154,7 @@ suite "Windows ipc-connect: named pipes":
         if d.startsWith("ipc peer outside monitored tree"):
           sawIpcLoss = true
       check sawIpcLoss
-      check res.completeness == mcIncomplete)
+      check subsystemEvidence(res).completeness == mcIncomplete)
 
   test "a FAILED open of a non-existent pipe must not be recorded":
     ## The pipe-arm counterpart of the refused-socket case below, and the rule
@@ -171,7 +172,7 @@ suite "Windows ipc-connect: named pipes":
           r.path & " " & r.detail)
       check ipcRecords(res).len == 0
       check unmonitoredSubtreeLossCount(res.records) == 0
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)
 
 suite "Windows ipc-connect: sockets":
 
@@ -197,7 +198,7 @@ suite "Windows ipc-connect: sockets":
           check r.flags == 2'u32           # AF_INET
           check r.childOsPid == 0'u64      # unknown peer, stated as such
       check sawSocketPeer
-      check res.completeness == mcIncomplete)
+      check subsystemEvidence(res).completeness == mcIncomplete)
 
   test "an IN-FLIGHT non-blocking connect IS recorded":
     ## The other side of the same guard, and the reason it is not simply
@@ -227,7 +228,7 @@ suite "Windows ipc-connect: sockets":
           sawSocketPeer = true
           check r.childOsPid == 0'u64      # unknown peer, stated as such
       check sawSocketPeer
-      check res.completeness == mcIncomplete)
+      check subsystemEvidence(res).completeness == mcIncomplete)
 
   test "a REFUSED socket connect reaches no peer and must not be recorded":
     ## The case the live-listener test above cannot see, and the one a build
@@ -264,8 +265,8 @@ suite "Windows ipc-connect: sockets":
           r.path & " " & r.detail)
       check ipcRecords(res).len == 0
       check unmonitoredSubtreeLossCount(res.records) == 0
-      check res.depFile.summary.eventLossCount == 0'u64
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).summary.eventLossCount == 0'u64
+      check subsystemEvidence(res).completeness == mcComplete)
 
 suite "Windows ipc-connect: what must NOT be recorded":
 
@@ -283,7 +284,7 @@ suite "Windows ipc-connect: what must NOT be recorded":
       let res = runFixture(dir, "map-file", file)
       check res.exitCode == 0
       check ipcRecords(res).len == 0
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)
 
   test "a RELATIVE path into a `pipe` directory is not an IPC peer":
     ## The absolute case above is caught by the cheap prefix pre-filter before
@@ -318,7 +319,7 @@ suite "Windows ipc-connect: what must NOT be recorded":
       check res.exitCode == 0
       check ipcRecords(res).len == 0
       check unmonitoredSubtreeLossCount(res.records) == 0
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)
 
   test "an EXTENDED-LENGTH path through a `pipe` directory is not an IPC peer":
     ## `\\?\C:\...\pipe\x.txt` is the other spelling that gets past a cheap
@@ -335,4 +336,4 @@ suite "Windows ipc-connect: what must NOT be recorded":
       check res.exitCode == 0
       check ipcRecords(res).len == 0
       check unmonitoredSubtreeLossCount(res.records) == 0
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)

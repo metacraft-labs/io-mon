@@ -102,6 +102,7 @@
 ## Assertion helpers are `template`s, never `proc`s: a `check` inside a plain
 ## `proc` prints "Check failed" and the enclosing test still reports `[OK]`.
 
+import descendant_guard_expectations
 import std/[algorithm, os, osproc, sequtils, sets, streams, strtabs, strutils,
             tables, times, unittest]
 
@@ -576,7 +577,7 @@ suite "io-mon DA-1b dependency-identity scope":
     # …and therefore no downgrade.
     checkpoint("in-tree losses: " & $ipcLosses(inDep))
     check ipcLosses(inDep).len == 0
-    check inDep.completeness == mcComplete
+    check subsystemEvidence(inDep).completeness == mcComplete
 
     # ── OUT-OF-TREE: the same client, a server started outside the monitor ──
     let outSock = work / "out.sock"
@@ -602,7 +603,7 @@ suite "io-mon DA-1b dependency-identity scope":
     let losses = ipcLosses(outDep)
     checkpoint("out-of-tree losses: " & $losses)
     check losses.len >= 1
-    check outDep.completeness == mcIncomplete
+    check subsystemEvidence(outDep).completeness == mcIncomplete
     # The peer really was named and really was outside the tree — so the
     # downgrade is the guard firing, not a capture failure.
     var outTreeStartPids = initHashSet[uint64]()
@@ -762,6 +763,6 @@ suite "io-mon DA-1b dependency-identity scope":
       of disPathScoped: discard
     check processScopedWithPid > 0
     check factScopedWithPid == 0
-    check dep.completeness == mcComplete
+    check subsystemEvidence(dep).completeness == mcComplete
 
   removeDir(work)

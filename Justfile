@@ -56,10 +56,20 @@ format-nix:
 alias t := test
 alias fmt := format
 
-# Entering the dev shell from another git repository must write nothing there.
-# Runs `nix develop`, so it is not part of the in-shell test recipes.
+# Dev-shell properties: entering the shell from another git repository writes
+# nothing there, the shell's `nimble` runs a package task instead of crashing
+# in its TLS setup (Darwin), and an ASan+UBSan program built by the shell's
+# compiler reaches main (the compiler-rt startup hang on macOS 26). All run
+# `nix develop`, so they are not part of the in-shell test recipes.
 test-dev-shell:
     bash tests/test_dev_shell_writes_nothing_elsewhere.sh
+    bash tests/test_dev_shell_nimble_runs_tasks.sh
+    bash tests/test_dev_shell_asan_program_reaches_main.sh
+
+# Linux recipe/compiler integration, using the Reprobuild on PATH (or the
+# source-built CLI selected by IO_MON_TEST_REPRO). CI supplies its pinned CLI.
+test-repro-shim-compiler:
+    bash tests/test_dev_shell_repro_shim_compiler.sh
 
 # Documentation-site recipes (delegating to docs/site)
 dev-docs *args:
@@ -73,3 +83,8 @@ serve-docs:
 
 open-docs *args:
     just -f docs/site/Justfile --working-directory docs/site open-docs {{args}}
+
+# Compile each workflow-selected engine's real reader against the shipping lock.
+# Needs an adjacent Reprobuild Git checkout containing the selected revisions.
+test-ci-engine-lock:
+    python3 tests/test_ci_engine_reads_committed_lock.py

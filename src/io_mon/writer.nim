@@ -172,9 +172,86 @@ const
     ## `mrEventLoss`, forcing `mcIncomplete` (fail-incomplete): the capped run is
     ## honestly reported as needing a re-run rather than a false `mcComplete`.
 
+const fragmentFileIsFd = not (defined(macosx) or defined(windows))
+  ## HOW THE FRAGMENT WRITER TALKS TO ITS FILE — and why not through stdio on
+  ## Linux.
+  ##
+  ## The fragment writer runs inside a hook, i.e. inside whatever the host was
+  ## doing when it made the observed call — possibly while holding its own
+  ## allocator's lock (PartitionAlloc calls `syscall(SYS_mprotect)` under its
+  ## lock; rustc's allocator calls `clock_gettime` under its lock). The shim's
+  ## OWN allocations are kept off the host's allocator by
+  ## `shim/linux_private_heap.c`, but stdio is not the shim's code: glibc's
+  ## `fopen` allocates the `FILE` with `malloc`, and glibc routes its internal
+  ## `malloc` calls to whatever `malloc` the executable interposes. Opening a
+  ## fragment with `open(File)` from such a hook therefore re-entered the host's
+  ## allocator and deadlocked it
+  ## (`tests/linux/test_io_mon_shim_host_allocator_isolation`).
+  ##
+  ## So on Linux the fragment handle is a plain file descriptor written with
+  ## `write(2)`; nothing on the path allocates outside the shim. Flushing is a
+  ## no-op there because nothing is buffered in user space: `write` has
+  ## already handed the bytes to the kernel, which is the durability point the
+  ## stdio `flushFile` reached (a SIGKILL after it loses nothing). The macOS
+  ## and Windows shims keep `File`: their writers do not have this hazard
+  ## under the hosts they monitor today, and their file arms are being
+  ## retired in favour of the shared-memory set (`hostUsesFileFallback`).
+
+when fragmentFileIsFd:
+  from std/posix import nil
+
+  type FragFile = distinct cint
+    ## An open fragment descriptor, or -1. Same verbs as `File` below, so the
+    ## writer's call sites read the same on every platform.
+
+  template noFragFile(): FragFile = FragFile(-1)
+
+  proc isNil(f: FragFile): bool {.inline, raises: [].} = cint(f) < 0
+
+  proc getFileHandle(f: FragFile): cint {.inline, raises: [].} = cint(f)
+
+  proc open(f: var FragFile; path: string; mode: FileMode): bool
+      {.raises: [].} =
+    ## Append-only open, matching `fopen(path, "a")` plus Nim's default of
+    ## not leaking the descriptor into exec'd children (O_CLOEXEC).
+    doAssert mode == fmAppend
+    let fd = posix.open(cstring(path),
+      posix.O_WRONLY or posix.O_CREAT or posix.O_APPEND or posix.O_CLOEXEC,
+      posix.Mode(0o666))
+    f = FragFile(fd)
+    fd >= 0
+
+  proc writeBuffer(f: FragFile; buffer: pointer; len: Natural): int
+      {.raises: [].} =
+    ## Write all of `buffer`, retrying on EINTR and short writes; returns the
+    ## bytes written (less than `len` only on an error), like `fwrite`.
+    var done = 0
+    while done < len:
+      let n = posix.write(cint(f),
+        cast[pointer](cast[uint](buffer) + uint(done)), len - done)
+      if n < 0:
+        if posix.errno == posix.EINTR: continue
+        break
+      if n == 0: break
+      done += n
+    done
+
+  proc flushFile(f: FragFile) {.inline, raises: [].} =
+    ## Nothing is buffered in user space; see `fragmentFileIsFd`.
+    discard f
+
+  proc close(f: FragFile) {.raises: [].} =
+    discard posix.close(cint(f))
+
+  proc getFileInfo(f: FragFile): FileInfo {.raises: [OSError].} =
+    getFileInfo(FileHandle(cint(f)))
+else:
+  type FragFile = File
+  template noFragFile(): FragFile = nil
+
 type
   FragmentSlot = object
-    # M9.R.15c.3 — the slot is a threadvar; with ``--mm:orc`` + the
+    # M9.R.15c.3 — the slot is per-thread state; with ``--mm:orc`` + the
     # ``--app:lib`` LD_PRELOAD shim build, a Nim ``string`` field on
     # a threadvar can trip the orc collector when cmake spawns and
     # tears down hundreds of worker threads (the qtbase configure
@@ -185,8 +262,15 @@ type
     # at thread exit is a no-op. The buffer is sized for typical
     # absolute paths plus PATH_MAX headroom; an overrun aborts
     # cleanly before writing anything.
+    #
+    # Being pure POD is also what lets the ELF arm keep the slot on the C heap
+    # (see `fragmentSlotOnHeap`): `calloc` yields a valid all-default slot and
+    # `free` needs no destructor.
     isOpen: bool
-    file: File
+    file: FragFile
+      ## A descriptor on Linux, a `File` elsewhere — see `fragmentFileIsFd`.
+      ## Zero-filled memory is NOT "no file" on Linux (fd 0); `isOpen` is
+      ## what says whether `file` is meaningful.
     fileDevice: uint64
     fileId: uint64
     fragmentDirLen: int
@@ -257,7 +341,8 @@ const
   # slots. A fixed table (per the milestone spec's "fixed table" option)
   # allocates NO Nim heap on the hot path: registration happens once per
   # thread at first slot open, and each entry is a raw `ptr FragmentSlot`
-  # into that thread's TLS. The cap is generous relative to any realistic
+  # to that thread's slot (its TLS on macOS/Windows, its heap block on
+  # the ELF arm — see `fragmentSlotOnHeap`). The cap is generous relative to any realistic
   # monitored-process thread count (cmake/ninja worker pools top out in
   # the low thousands); an overflow simply leaves the extra thread
   # unregistered — its batch still flushes on the eager per-record path
@@ -265,13 +350,57 @@ const
   # preserved (only the process-exit sweep can't reach it).
   MaxFragmentSlots = 8192
 
+const fragmentSlotOnHeap = not (defined(macosx) or defined(windows))
+  ## WHERE A THREAD'S `FragmentSlot` LIVES — and why it is not plain TLS on
+  ## Linux.
+  ##
+  ## The slot is ~70 KB, almost all of it `batchBuf`. As a `{.threadvar.}` it
+  ## lands in the shim's ELF `PT_TLS` segment, and a library loaded through
+  ## `LD_PRELOAD` is part of the initial link map, so glibc puts that segment
+  ## in the STATIC TLS block. nptl carves the static TLS block out of EVERY
+  ## thread's stack, and `allocate_stack` fails `pthread_create` with EINVAL
+  ## when a caller-requested stack cannot hold
+  ## `guard + static TLS + MINIMAL_REST_STACK`:
+  ##   https://sourceware.org/git/?p=glibc.git;a=blob;f=nptl/allocatestack.c
+  ## So the shim made every host thread created with an explicit stack of
+  ## 64 KiB or less fail — Node 24 printed `pthread_create: Invalid argument`
+  ## and a Playwright Chromium launch timed out under monitoring
+  ## (reprobuild-pm issue 2026-10-02-action-monitor-prevents-declared-browser-
+  ## launch; regression test
+  ## `tests/linux/test_io_mon_shim_static_tls_small_stack_threads`). And the
+  ## cost was paid by every thread of every monitored process even though the
+  ## Linux shim publishes through the shared-memory set and never opens a
+  ## fragment on the normal path.
+  ##
+  ## On the ELF arm, therefore, TLS holds only a POINTER, and the slot is
+  ## `calloc`ed on the thread's first fragment open (`obtainFragmentSlot`) and
+  ## freed by the thread-exit destructor (`threadExitFlushSlot`). A thread
+  ## that never writes a fragment never allocates one.
+  ##
+  ## macOS and Windows keep the slot in TLS. Neither carves TLS out of the
+  ## thread's stack (dyld allocates a thread's `__thread` block lazily from
+  ## the heap; the Windows loader allocates implicit TLS from the process
+  ## heap), so they never had this failure — and the macOS shim has no
+  ## thread-exit hook that could free a heap slot (worker threads close their
+  ## slot after every emit but keep its identity; see
+  ## `closeFragmentSlot(retainIdentity)`), so moving it there would only
+  ## trade a non-problem for a per-thread leak.
+
+when fragmentSlotOnHeap:
+  var fragmentSlotPtr {.threadvar.}: ptr FragmentSlot
+    ## nil until this thread's first fragment open; reset to nil by
+    ## `releaseFragmentSlot` BEFORE the block is freed.
+else:
+  var fragmentSlotStorage {.threadvar.}: FragmentSlot
+
 var
-  fragmentSlot {.threadvar.}: FragmentSlot
   fragmentOpenCount: Atomic[uint64]
+  fragmentCloseCount: Atomic[uint64]
   fragmentWriteCount: Atomic[uint64]
   fragmentFlushCount: Atomic[uint64]
+  fragmentHandleProbeCount: Atomic[uint64]
   # DEP-FLUSH-1 — the registry itself. Guarded by `registryLock`; entries
-  # hold the address of a thread's `fragmentSlot` threadvar (nil == free).
+  # hold the address of a thread's slot (nil == free).
   # `registryCount` is the high-water mark of used indices so the sweep
   # only scans the populated prefix.
   registryLock: Lock
@@ -330,11 +459,80 @@ var
   fragmentByteCap: int64 = FragmentMaxBytesDefault
   fragmentByteCapResolved = false
 
-# A generous stack buffer for one `encodeDepSetElement` (identity encoding plus
-# the incarnation-image suffix) on the insert hot path — no heap. A record whose
-# key exceeds it (a pathological path+detail) is surfaced as a loss element
-# (LF-2), never a file spill.
-const SetProducerBufBytes = 16384
+proc c_calloc(count, size: csize_t): pointer
+  {.importc: "calloc", header: "<stdlib.h>", raises: [].}
+proc c_free(p: pointer) {.importc: "free", header: "<stdlib.h>", raises: [].}
+  # The C allocator directly, not Nim's: the block must not belong to a Nim
+  # thread-local heap region (it can be reached from the process-exit sweep
+  # on another thread), and in the Linux shim `calloc`/`free` are linked to
+  # the shim's own mmap-backed heap, which touches neither the host's
+  # allocator nor the program break (see `shim/linux_private_heap.c`).
+
+proc peekFragmentSlot(): ptr FragmentSlot {.inline, raises: [].} =
+  ## The calling thread's slot, or nil when it has none yet (ELF arm only;
+  ## always non-nil on macOS/Windows). NEVER allocates, so it is the accessor
+  ## for every path that only inspects or tears down — including the
+  ## async-signal-safe `sigSafe*` accessors, for which "no slot" reads exactly
+  ## like "slot closed".
+  when fragmentSlotOnHeap:
+    fragmentSlotPtr
+  else:
+    addr fragmentSlotStorage
+
+proc obtainFragmentSlot(): ptr FragmentSlot {.raises: [].} =
+  ## The calling thread's slot, allocating it on first use (ELF arm). Returns
+  ## nil when the allocation fails; the caller must then fall back without a
+  ## slot (see `appendFragmentRecordUnbuffered`). Only the fragment-OPEN path
+  ## calls this, and that path already heap-allocates (the fragment path
+  ## string, `createDir`), so this adds no allocation to a context that had
+  ## none. `calloc` zero-fills, which is the slot's default state.
+  when fragmentSlotOnHeap:
+    if fragmentSlotPtr == nil:
+      fragmentSlotPtr = cast[ptr FragmentSlot](
+        c_calloc(1, csize_t(sizeof(FragmentSlot))))
+    fragmentSlotPtr
+  else:
+    addr fragmentSlotStorage
+
+proc releaseFragmentSlot() {.raises: [].} =
+  ## Free the calling thread's heap slot (ELF arm; a no-op elsewhere, where
+  ## the TLS slot dies with the thread). The caller guarantees the slot is
+  ## closed AND unregistered: the process-exit sweep only dereferences
+  ## registry entries while holding `registryLock`, and `unregisterFragmentSlot`
+  ## removes the entry under that same lock, so once it has returned no sweep
+  ## can still hold this pointer.
+  ##
+  ## The TLS pointer is cleared BEFORE the free, behind a signal fence, so a
+  ## terminating-signal handler that interrupts this thread sees either the
+  ## (closed) live block or nil — never a freed block.
+  when fragmentSlotOnHeap:
+    let slot = fragmentSlotPtr
+    if slot == nil:
+      return
+    fragmentSlotPtr = nil
+    signalFence(moSequentiallyConsistent)
+    c_free(slot)
+
+const
+  SetProducerBufBytes = 16384
+    ## The largest dep-set element key (identity encoding plus the
+    ## incarnation-image suffix) the producer frames. A record whose key
+    ## exceeds it (a pathological path+detail) is surfaced as a loss element
+    ## (LF-2), never a file spill.
+  SetProducerStackBytes = 1024
+    ## How much of that is encoded on the stack. The key used to be built in a
+    ## 16 KiB stack array, which every hooked call that records paid on
+    ## whatever stack the HOST gave its thread: a thread created with
+    ## PTHREAD_STACK_MIN (16 KiB on x86_64) overflowed its stack inside a
+    ## hooked `open` and the process died with SIGSEGV
+    ## (`tests/linux/test_io_mon_shim_static_tls_small_stack_threads`).
+    ## Real keys are a few hundred bytes (header, a path, the image path), so
+    ## a key that does not fit here is retried in a heap buffer of the full
+    ## `SetProducerBufBytes`; which records are framable is unchanged.
+
+proc c_malloc(size: csize_t): pointer
+  {.importc: "malloc", header: "<stdlib.h>", raises: [].}
+
 
 proc resolveFragmentByteCap() =
   ## LEAK-GUARD — resolve the per-fragment byte cap ONCE per process from
@@ -368,7 +566,8 @@ proc fragmentSlotIsOverCap*(): bool =
   ## Test/introspection — true once the calling thread's fragment hit the byte
   ## cap and its fd was closed (LEAK-GUARD retirement). `sigSafeSlotIsOpen`
   ## reads false in the same state.
-  fragmentSlot.overCap
+  let slot = peekFragmentSlot()
+  slot != nil and slot.overCap
 
 type
   DepSetElemFit* = enum
@@ -438,6 +637,35 @@ proc encodeDepSetElement*(record: MonitorRecord; buf: var openArray[byte];
     while i < setElemImage.len and total < buf.len:
       buf[total] = byte(setElemImage[i]); inc total; inc i
   total
+
+proc emitDepSetElement(record: MonitorRecord): bool {.raises: [].} =
+  ## Encode `record`'s dep-set element key and publish it. True when the
+  ## outcome needs no loss marker (inserted, already present, saturation that
+  ## the producer signals itself, or a consumer that is gone); false when the
+  ## record is unframable, the heap retry could not allocate, or the emit was
+  ## oversize/unavailable — the caller then publishes the loss element (LF-2).
+  ##
+  ## The heap retry allocates on the record path, which already allocates
+  ## (the record's own strings), from the C heap like the fragment slot, and
+  ## frees before returning, so it adds no allocation hazard and no state
+  ## that a nested call could clobber. No nested call can occur anyway: every
+  ## shim reaches this from `emitRecord` inside `withShimMuted`, so a hook
+  ## re-entered on this thread (including from a signal handler) bypasses
+  ## recording instead of emitting.
+  const durable = {emInserted, emExists, emSaturated, emConsumerGone}
+  var small {.noinit.}: array[SetProducerStackBytes, byte]
+  let total = encodeDepSetElement(record, small, dseRequireFit)
+  if total >= 0:
+    return setProducer.emit(small.toOpenArray(0, total - 1)) in durable
+  let big = cast[ptr UncheckedArray[byte]](
+    c_malloc(csize_t(SetProducerBufBytes)))
+  if big == nil:
+    return false
+  let bigTotal = encodeDepSetElement(record,
+    big.toOpenArray(0, SetProducerBufBytes - 1), dseRequireFit)
+  if bigTotal >= 0:
+    result = setProducer.emit(big.toOpenArray(0, bigTotal - 1)) in durable
+  c_free(big)
 
 proc rebuildDepSetLossElem*() =
   ## M3 part 2a (LF-2) — pre-encode the event-loss SET element ONCE per attach so
@@ -539,12 +767,12 @@ proc ensureRegistryLock() {.raises: [].} =
     initLock(registryLock)
     registryLockReady = true
 
-proc registerFragmentSlot() {.raises: [].} =
+proc registerFragmentSlot(slot: ptr FragmentSlot) {.raises: [].} =
   ## DEP-FLUSH-1 — self-register the CALLING thread's slot in the process-
   ## global registry on first open. Idempotent (a slot already carrying a
   ## registryIndex is left untouched). One lock acquisition per thread per
   ## open, never per emit, so the hot path stays alloc- and contention-free.
-  if fragmentSlot.registryIndex != 0:
+  if slot == nil or slot.registryIndex != 0:
     return
   ensureRegistryLock()
   acquire(registryLock)
@@ -558,23 +786,25 @@ proc registerFragmentSlot() {.raises: [].} =
     idx = registryCount
     inc registryCount
   if idx >= 0:
-    registrySlots[idx] = addr fragmentSlot
-    fragmentSlot.registryIndex = idx + 1   # 1-based; 0 == unregistered.
+    registrySlots[idx] = slot
+    slot.registryIndex = idx + 1   # 1-based; 0 == unregistered.
   release(registryLock)
 
 proc unregisterFragmentSlot() {.raises: [].} =
   ## DEP-FLUSH-1 — self-unregister the calling thread's slot (close /
   ## fork-child reset / thread-exit). Clears the table entry so the
-  ## process-exit sweep never dereferences a stale TLS pointer.
-  if fragmentSlot.registryIndex == 0:
+  ## process-exit sweep never dereferences a stale slot pointer — and, on the
+  ## ELF arm, so `releaseFragmentSlot` may free the block once this returns.
+  let slot = peekFragmentSlot()
+  if slot == nil or slot.registryIndex == 0:
     return
   ensureRegistryLock()
   acquire(registryLock)
-  let idx = fragmentSlot.registryIndex - 1
+  let idx = slot.registryIndex - 1
   if idx >= 0 and idx < registryCount and
-      registrySlots[idx] == addr fragmentSlot:
+      registrySlots[idx] == slot:
     registrySlots[idx] = nil
-  fragmentSlot.registryIndex = 0
+  slot.registryIndex = 0
   release(registryLock)
 
 proc slotFragmentDirEquals(slot: var FragmentSlot; s: string): bool =
@@ -842,41 +1072,55 @@ proc killDiagContextForMarker(): string =
 # in-flight batch buffer to the fragment fd via raw write(2), then close
 # the fd — all without allocation, without fflush, without lock acquisition.
 # Every accessor returns fixed-size data or bounded pointers into the
-# threadvar; no code path in these accessors triggers heap allocation
-# once the slot is open.
+# calling thread's slot; no accessor allocates (they use
+# `peekFragmentSlot`, never `obtainFragmentSlot`), and a thread with no slot
+# yet reads as closed.
 
 proc sigSafeSlotIsOpen*(): bool {.raises: [].} =
-  fragmentSlot.isOpen
+  let slot = peekFragmentSlot()
+  slot != nil and slot.isOpen
 
 proc sigSafeSlotFd*(): cint {.raises: [].} =
   ## Returns the OS-level file descriptor of the calling thread's
   ## fragment slot, or -1 if no slot is open. `File.getFileHandle` on
   ## POSIX is a thin wrapper around `fileno(3)` — signal-safe per
   ## POSIX.1-2017 Table 2-4.
-  if not fragmentSlot.isOpen:
+  let slot = peekFragmentSlot()
+  if slot == nil or not slot.isOpen:
     return cint(-1)
   try:
-    result = cint(fragmentSlot.file.getFileHandle())
+    result = cint(slot.file.getFileHandle())
   except IOError:
     result = cint(-1)
 
+# A thread with no slot yet (ELF arm) reads as closed: device/id 0, nil
+# buffers, zero lengths. The C handler checks `sigSafeSlotIsOpen` /
+# `sigSafeSlotFd` first, so it never reaches a nil buffer with a non-zero
+# length.
+
 proc sigSafeSlotDevice*(): uint64 {.raises: [].} =
-  fragmentSlot.fileDevice
+  let slot = peekFragmentSlot()
+  if slot == nil: 0'u64 else: slot.fileDevice
 
 proc sigSafeSlotFileId*(): uint64 {.raises: [].} =
-  fragmentSlot.fileId
+  let slot = peekFragmentSlot()
+  if slot == nil: 0'u64 else: slot.fileId
 
 proc sigSafeBatchPtr*(): pointer {.raises: [].} =
-  addr fragmentSlot.batchBuf[0]
+  let slot = peekFragmentSlot()
+  if slot == nil: nil else: addr slot.batchBuf[0]
 
 proc sigSafeBatchLen*(): int {.raises: [].} =
-  fragmentSlot.batchLen
+  let slot = peekFragmentSlot()
+  if slot == nil: 0 else: slot.batchLen
 
 proc sigSafeCommittedPtr*(): pointer {.raises: [].} =
-  addr fragmentSlot.committedFrame[0]
+  let slot = peekFragmentSlot()
+  if slot == nil: nil else: addr slot.committedFrame[0]
 
 proc sigSafeCommittedLen*(): int {.raises: [].} =
-  int(fragmentSlot.committedFrameLen)
+  let slot = peekFragmentSlot()
+  if slot == nil: 0 else: int(slot.committedFrameLen)
 
 proc sigSafeMarkSlotClosed*() {.raises: [].} =
   ## Called by the signal handler AFTER it has written the batch +
@@ -886,10 +1130,13 @@ proc sigSafeMarkSlotClosed*() {.raises: [].} =
   ## Nim `File` handle — the raw `close(2)` already did — so the finalizer
   ## is a POD-only reset. All assignments to fixed-size fields are
   ## async-signal-safe.
-  fragmentSlot.isOpen = false
-  fragmentSlot.batchLen = 0
-  fragmentSlot.readingSentinelActive = false
-  fragmentSlot.committedFrameLen = 0
+  let slot = peekFragmentSlot()
+  if slot == nil:
+    return
+  slot.isOpen = false
+  slot.batchLen = 0
+  slot.readingSentinelActive = false
+  slot.committedFrameLen = 0
 
 proc fragmentHandleIsCurrent(): bool {.raises: [].}
 proc reopenFragmentHandle(): bool {.raises: [].}
@@ -904,18 +1151,19 @@ proc writeReadTailMarker(detail: string) =
   ## swallowed — it never aborts the monitored process), but UNLIKE the round-2
   ## sidecar it does not depend on a writable directory: the fd is already open, so a
   ## tracee that chmod's the fragment dir cannot block it.
-  if not fragmentSlot.isOpen:
+  let slot = peekFragmentSlot()
+  if slot == nil or not slot.isOpen:
     return
   if not fragmentHandleIsCurrent() and not reopenFragmentHandle():
     return
   let marker = MonitorRecord(kind: mrEventLoss, observationKind: moEventLoss,
-    osPid: fragmentSlot.osPid, threadId: fragmentSlot.threadId,
+    osPid: slot.osPid, threadId: slot.threadId,
     detail: detail & fragmentRunToken & killDiagContextForMarker())
   let frame = encodeFrame(marker)
   try:
-    let n = fragmentSlot.file.writeBuffer(unsafeAddr frame[0], frame.len)
+    let n = slot.file.writeBuffer(unsafeAddr frame[0], frame.len)
     if n == frame.len:
-      flushFile(fragmentSlot.file)
+      flushFile(slot.file)
   except IOError, OSError:
     discard
 
@@ -995,19 +1243,21 @@ proc markReadingSentinel(record: MonitorRecord) =
     return
   if recordSuppressesOnlyADowngrade(record):
     return
-  if fragmentSlot.readingSentinelActive or not fragmentSlot.isOpen:
+  let slot = peekFragmentSlot()
+  if slot == nil or slot.readingSentinelActive or not slot.isOpen:
     return
   writeReadTailMarker(ReadTailPendingDetail)
-  fragmentSlot.readingSentinelActive = true
+  slot.readingSentinelActive = true
 
 proc clearReadingSentinel() =
   ## ROUND-5 F — the batch just became durable (flushed); write a matching
   ## `read-tail-committed` marker so `mergeFragments` nets this cycle to zero (a
   ## clean continuation / exit is NOT mistaken for a kill-before-flush).
-  if not fragmentSlot.readingSentinelActive:
+  let slot = peekFragmentSlot()
+  if slot == nil or not slot.readingSentinelActive:
     return
   writeReadTailMarker(ReadTailCommittedDetail)
-  fragmentSlot.readingSentinelActive = false
+  slot.readingSentinelActive = false
 
 proc fragmentLogOpenCount*(): uint64 =
   ## DSL-port M9.R.15c.1 — return the lifetime number of fragment-log
@@ -1021,6 +1271,20 @@ proc fragmentLogOpenCount*(): uint64 =
 proc resetFragmentLogOpenCount*() =
   ## Test-only — reset the open counter between scenarios.
   fragmentOpenCount.store(0, moRelaxed)
+
+proc fragmentLogCloseCount*(): uint64 =
+  ## Return the lifetime number of times the writer closed a fragment handle
+  ## that `fragmentLogOpenCount` counted as opened. Each handle is closed
+  ## exactly once, so the close count never exceeds the open count; a close
+  ## count above it is a second close of a descriptor number the tracee may
+  ## already have reused. It can fall below: `reopenFragmentHandle` detaches a
+  ## replaced handle without closing it, and the signal handler's raw
+  ## `close(2)` (`sigSafeMarkSlotClosed`) is not counted.
+  fragmentCloseCount.load(moRelaxed)
+
+proc resetFragmentLogCloseCount*() =
+  ## Test-only — reset the close counter between scenarios.
+  fragmentCloseCount.store(0, moRelaxed)
 
 proc fragmentLogWriteCount*(): uint64 =
   ## DSL-port M9.R.15f.1 — return the lifetime number of underlying
@@ -1044,22 +1308,40 @@ proc resetFragmentLogFlushCount*() =
   ## Test-only — reset the flush counter between scenarios.
   fragmentFlushCount.store(0, moRelaxed)
 
+proc fragmentLogHandleProbeCount*(): uint64 =
+  ## Return the lifetime number of descriptor-identity probes
+  ## (``fragmentHandleIsCurrent``, one ``fstat`` each) the fragment writer
+  ## issued. Every probe is a syscall, so tests assert it scales with the
+  ## number of flushes and markers, never with the number of appended
+  ## records: a per-record probe puts a syscall back on the batched hot path
+  ## that M9.R.15f.1 exists to keep syscall-free.
+  fragmentHandleProbeCount.load(moRelaxed)
+
+proc resetFragmentLogHandleProbeCount*() =
+  ## Test-only — reset the identity-probe counter between scenarios.
+  fragmentHandleProbeCount.store(0, moRelaxed)
+
 proc captureFragmentHandleIdentity(): bool {.raises: [].} =
+  let slot = peekFragmentSlot()
+  if slot == nil:
+    return false
   try:
-    let info = getFileInfo(fragmentSlot.file)
-    fragmentSlot.fileDevice = uint64(info.id.device)
-    fragmentSlot.fileId = uint64(info.id.file)
+    let info = getFileInfo(slot.file)
+    slot.fileDevice = uint64(info.id.device)
+    slot.fileId = uint64(info.id.file)
     result = true
   except IOError, OSError:
     result = false
 
 proc fragmentHandleIsCurrent(): bool {.raises: [].} =
-  if not fragmentSlot.isOpen or fragmentSlot.file.isNil:
+  let slot = peekFragmentSlot()
+  if slot == nil or not slot.isOpen or slot.file.isNil:
     return false
+  discard fragmentHandleProbeCount.fetchAdd(1, moRelaxed)
   try:
-    let info = getFileInfo(fragmentSlot.file.getFileHandle())
-    result = uint64(info.id.device) == fragmentSlot.fileDevice and
-      uint64(info.id.file) == fragmentSlot.fileId
+    let info = getFileInfo(slot.file.getFileHandle())
+    result = uint64(info.id.device) == slot.fileDevice and
+      uint64(info.id.file) == slot.fileId
   except IOError, OSError:
     result = false
 
@@ -1067,27 +1349,53 @@ proc reopenFragmentHandle(): bool {.raises: [].} =
   ## The descriptor may have been replaced through a hidden libc call or raw
   ## syscall. Do not fclose the stale FILE because that descriptor number may
   ## now belong to the tracee; detach it and reopen the same fragment instead.
-  let path = fragmentPath(slotFragmentDir(fragmentSlot),
-    fragmentSlot.osPid, fragmentSlot.threadId)
-  fragmentSlot.file = nil
+  let slot = peekFragmentSlot()
+  if slot == nil:
+    return false
+  let path = fragmentPath(slotFragmentDir(slot[]),
+    slot.osPid, slot.threadId)
+  slot.file = noFragFile()
   try:
-    if not open(fragmentSlot.file, extendedPath(path), fmAppend):
-      fragmentSlot.isOpen = false
+    if not open(slot.file, extendedPath(path), fmAppend):
+      slot.isOpen = false
       unregisterFragmentSlot()
       return false
   except IOError, OSError, ValueError:
-    fragmentSlot.isOpen = false
+    slot.isOpen = false
     unregisterFragmentSlot()
     return false
   if not captureFragmentHandleIdentity():
-    try: close(fragmentSlot.file)
+    try: close(slot.file)
     except IOError, OSError: discard
-    fragmentSlot.file = nil
-    fragmentSlot.isOpen = false
+    slot.file = noFragFile()
+    slot.isOpen = false
     unregisterFragmentSlot()
     return false
   discard fragmentOpenCount.fetchAdd(1, moRelaxed)
   true
+
+proc fragmentSlotOwnsDescriptor*(fd: cint): bool {.raises: [].} =
+  ## True when ``fd`` is the calling thread's open fragment descriptor AND it
+  ## still refers to the fragment file. A shim ``close`` hook asks this before
+  ## routing a tracee's ``close(fd)`` through ``closeFragmentSlot``.
+  ##
+  ## The number alone is not ownership: the tracee can replace the descriptor
+  ## (``dup2`` over it, or a raw close followed by an open that reuses the
+  ## number) and later close ITS file under that number. The append path does
+  ## not probe identity per record, so the slot can still name a replaced
+  ## number when that close arrives. Here the stale handle is detached and the
+  ## fragment reopened on a fresh descriptor (never closed — the number is the
+  ## tracee's), and the answer is false, so the hook lets the tracee's close
+  ## proceed instead of swallowing it and leaking the tracee's descriptor.
+  let slot = peekFragmentSlot()
+  if fd < 0 or slot == nil or not slot.isOpen or slot.file.isNil:
+    return false
+  if sigSafeSlotFd() != fd:
+    return false
+  if fragmentHandleIsCurrent():
+    return true
+  discard reopenFragmentHandle()
+  false
 
 proc accountFragmentBytes(written: int) =
   ## LEAK-GUARD — record `written` on-disk bytes against the calling thread's
@@ -1103,25 +1411,27 @@ proc accountFragmentBytes(written: int) =
   ## drops later records for this producer thread instead of reopening and
   ## resuming unbounded growth. A different key (fork child / new thread) opens a
   ## fresh, uncapped fragment via `openFragmentSlot`.
-  if fragmentSlot.overCap or not fragmentSlot.isOpen:
+  let slot = peekFragmentSlot()
+  if slot == nil or slot.overCap or not slot.isOpen:
     return
-  fragmentSlot.fragmentBytes += int64(written)
-  if fragmentSlot.fragmentBytes < fragmentByteCap:
+  slot.fragmentBytes += int64(written)
+  if slot.fragmentBytes < fragmentByteCap:
     return
   # Cap reached — mark the run incomplete through the already-open fd (a dir
   # chmod / removal cannot block it), then retire the fd.
   writeReadTailMarker(FragmentCapReachedDetail)
-  fragmentSlot.overCap = true
+  slot.overCap = true
   clearReadingSentinel()
   try:
-    close(fragmentSlot.file)
+    close(slot.file)
   except IOError, OSError:
     discard
-  fragmentSlot.isOpen = false
-  fragmentSlot.batchLen = 0
-  fragmentSlot.batchOpenedAtNs = 0
-  fragmentSlot.batchProbeCountdown = 0
-  fragmentSlot.readingSentinelActive = false
+  discard fragmentCloseCount.fetchAdd(1, moRelaxed)
+  slot.isOpen = false
+  slot.batchLen = 0
+  slot.batchOpenedAtNs = 0
+  slot.batchProbeCountdown = 0
+  slot.readingSentinelActive = false
   # Leave osPid/threadId/fragmentDir set so the drop guard in
   # `appendFragmentRecord` recognises this retired producer key.
   unregisterFragmentSlot()
@@ -1132,29 +1442,30 @@ proc flushFragmentBatch*() =
   ## merge, test teardown) can force a sync point without closing the
   ## file handle. If the slot is not open or the batch is empty, the
   ## call is a no-op.
-  if not fragmentSlot.isOpen or fragmentSlot.batchLen == 0:
+  let slot = peekFragmentSlot()
+  if slot == nil or not slot.isOpen or slot.batchLen == 0:
     return
   if not fragmentHandleIsCurrent() and not reopenFragmentHandle():
     raiseEnvelopeError(eeMalformed,
       "cannot recover externally replaced iomon fragment handle")
-  let bufLen = fragmentSlot.batchLen
-  let written = fragmentSlot.file.writeBuffer(
-    addr fragmentSlot.batchBuf[0], bufLen)
+  let bufLen = slot.batchLen
+  let written = slot.file.writeBuffer(
+    addr slot.batchBuf[0], bufLen)
   if written != bufLen:
     # Drain whatever we managed, reset the buffer so we don't replay
     # bytes on the next flush, and raise — the producer cannot
     # recover from a short write.
-    fragmentSlot.batchLen = 0
-    fragmentSlot.batchOpenedAtNs = 0
+    slot.batchLen = 0
+    slot.batchOpenedAtNs = 0
     raiseEnvelopeError(eeMalformed,
-      "short write to iomon fragment for osPid=" & $fragmentSlot.osPid &
-      " threadId=" & $fragmentSlot.threadId)
-  flushFile(fragmentSlot.file)
+      "short write to iomon fragment for osPid=" & $slot.osPid &
+      " threadId=" & $slot.threadId)
+  flushFile(slot.file)
   discard fragmentWriteCount.fetchAdd(1, moRelaxed)
   discard fragmentFlushCount.fetchAdd(1, moRelaxed)
-  fragmentSlot.batchLen = 0
-  fragmentSlot.batchOpenedAtNs = 0
-  fragmentSlot.batchProbeCountdown = 0
+  slot.batchLen = 0
+  slot.batchOpenedAtNs = 0
+  slot.batchProbeCountdown = 0
   # ROUND-2 R5 — the buffered tail is now on disk; the kill-before-flush window
   # is closed for this batch, so retire the sentinel.
   clearReadingSentinel()
@@ -1169,7 +1480,12 @@ proc closeFragmentSlot*(retainIdentity = false) =
   ## the on-disk fragment includes every appended frame.
   ## `retainIdentity` releases a macOS worker's resources after an emit while
   ## retaining its cumulative byte budget for the next emit on that thread.
-  if fragmentSlot.isOpen:
+  let slot = peekFragmentSlot()
+  if slot == nil:
+    # ELF arm: this thread never opened a fragment, so there is nothing to
+    # flush, close or unregister.
+    return
+  if slot.isOpen:
     if not fragmentHandleIsCurrent() and not reopenFragmentHandle():
       return
     try:
@@ -1180,26 +1496,27 @@ proc closeFragmentSlot*(retainIdentity = false) =
     # stale sentinel survives a flush that raised / early-returned.
     clearReadingSentinel()
     # A flush that reaches the byte cap has already closed this handle.
-    if fragmentSlot.isOpen:
+    if slot.isOpen:
       try:
-        close(fragmentSlot.file)
+        close(slot.file)
       except IOError, OSError:
         discard
-    fragmentSlot.isOpen = false
+      discard fragmentCloseCount.fetchAdd(1, moRelaxed)
+    slot.isOpen = false
     if not retainIdentity:
-      fragmentSlot.fragmentDirLen = 0
-      fragmentSlot.fragmentDirBuf[0] = '\0'
-      fragmentSlot.osPid = 0
-      fragmentSlot.threadId = 0
-    fragmentSlot.batchLen = 0
-    fragmentSlot.batchOpenedAtNs = 0
-    fragmentSlot.batchProbeCountdown = 0
-    fragmentSlot.readingSentinelActive = false
+      slot.fragmentDirLen = 0
+      slot.fragmentDirBuf[0] = '\0'
+      slot.osPid = 0
+      slot.threadId = 0
+    slot.batchLen = 0
+    slot.batchOpenedAtNs = 0
+    slot.batchProbeCountdown = 0
+    slot.readingSentinelActive = false
     # Workers close synchronously while their TLS is alive. Retain their key
     # and cumulative byte budget so reopening cannot evade the fragment cap.
     if not retainIdentity:
-      fragmentSlot.fragmentBytes = 0
-      fragmentSlot.overCap = false
+      slot.fragmentBytes = 0
+      slot.overCap = false
   # A cap-triggered flush also closes the slot. Its TLS must leave the registry
   # before a worker exits, even when the handle was already closed on entry.
   unregisterFragmentSlot()
@@ -1213,41 +1530,51 @@ proc discardFragmentSlotAfterFork*() =
   ## append opens a fresh fragment under the child's own (osPid, threadId).
   ## (Between batches the stdio buffer is already empty — flushFragmentBatch
   ## ends with flushFile — so close() writes none of the parent's frames.)
-  if fragmentSlot.isOpen:
-    try:
-      close(fragmentSlot.file)
-    except IOError, OSError:
-      discard
-  fragmentSlot.isOpen = false
-  fragmentSlot.fragmentDirLen = 0
-  fragmentSlot.fragmentDirBuf[0] = '\0'
-  fragmentSlot.osPid = 0
-  fragmentSlot.threadId = 0
-  fragmentSlot.batchLen = 0
-  fragmentSlot.batchOpenedAtNs = 0
-  fragmentSlot.batchProbeCountdown = 0
-  # LEAK-GUARD — the child gets a clean byte budget under its own identity; a
-  # parent that hit the cap must not leave the child stuck dropping records.
-  fragmentSlot.fragmentBytes = 0
-  fragmentSlot.overCap = false
-  # ROUND-5 F (post-fork sentinel-state hygiene) — the child inherits the
-  # parent's `readingSentinelActive` value via copy-on-write. Without
-  # resetting it here, the child's first `markReadingSentinel` bails on
-  # the "already active" guard and NEVER writes its own pending marker;
-  # then the child's subsequent flush retires a phantom "cycle" by
-  # writing an orphan committed marker under the CHILD's (osPid,
-  # threadId). mergeFragments' pending-vs-committed netting is
-  # per-(osPid, threadId), so the orphan committed is harmless
-  # (max(0, -1) clamps to 0), but every intermediate child batch cycle
-  # is UN-BOOKKEEPED — a kill-before-flush IN the child on any of
-  # those cycles goes silently un-detected. Reset the flag so the
-  # child's first read faithfully re-marks the sentinel under its own
-  # identity. `closeFragmentSlot` (line 346) already does this on the
-  # parent's flush path; parity below matches it on the fork-child path.
-  fragmentSlot.readingSentinelActive = false
+  # The forking thread's slot is a COW copy in the child: on the ELF arm a
+  # copy of the parent's heap block, owned by the child from here on and
+  # reused by its next open (it is NOT freed here — this also runs inside
+  # fork's atfork child handler). A thread that never opened a fragment
+  # has no slot to reset, but the inherited registry below must still be
+  # cleared.
+  let slot = peekFragmentSlot()
+  if slot != nil:
+    if slot.isOpen:
+      try:
+        close(slot.file)
+      except IOError, OSError:
+        discard
+      discard fragmentCloseCount.fetchAdd(1, moRelaxed)
+    slot.isOpen = false
+    slot.fragmentDirLen = 0
+    slot.fragmentDirBuf[0] = '\0'
+    slot.osPid = 0
+    slot.threadId = 0
+    slot.batchLen = 0
+    slot.batchOpenedAtNs = 0
+    slot.batchProbeCountdown = 0
+    # LEAK-GUARD — the child gets a clean byte budget under its own identity; a
+    # parent that hit the cap must not leave the child stuck dropping records.
+    slot.fragmentBytes = 0
+    slot.overCap = false
+    # ROUND-5 F (post-fork sentinel-state hygiene) — the child inherits the
+    # parent's `readingSentinelActive` value via copy-on-write. Without
+    # resetting it here, the child's first `markReadingSentinel` bails on
+    # the "already active" guard and NEVER writes its own pending marker;
+    # then the child's subsequent flush retires a phantom "cycle" by
+    # writing an orphan committed marker under the CHILD's (osPid,
+    # threadId). mergeFragments' pending-vs-committed netting is
+    # per-(osPid, threadId), so the orphan committed is harmless
+    # (max(0, -1) clamps to 0), but every intermediate child batch cycle
+    # is UN-BOOKKEEPED — a kill-before-flush IN the child on any of
+    # those cycles goes silently un-detected. Reset the flag so the
+    # child's first read faithfully re-marks the sentinel under its own
+    # identity. `closeFragmentSlot` (line 346) already does this on the
+    # parent's flush path; parity below matches it on the fork-child path.
+    slot.readingSentinelActive = false
   # DEP-FLUSH-4 — the child inherited a COW copy of the WHOLE registry
   # table (holding the addresses of the PARENT's per-thread slots, which
-  # in the child are stale TLS the child must never sweep). Reset the
+  # in the child belong to threads that do not exist and must never be
+  # swept). Reset the
   # entire registry to empty so a shutdown sweep in the child can only
   # ever reach the child's OWN re-registered slot. The registry lock is
   # also reset: a sibling parent thread could have held it at fork time,
@@ -1258,7 +1585,8 @@ proc discardFragmentSlotAfterFork*() =
   for i in 0 ..< registryCount:
     registrySlots[i] = nil
   registryCount = 0
-  fragmentSlot.registryIndex = 0
+  if slot != nil:
+    slot.registryIndex = 0
 
 proc flushAllRegisteredSlots*() =
   ## DEP-FLUSH-1 — flush the in-flight batch of EVERY slot currently in the
@@ -1270,20 +1598,26 @@ proc flushAllRegisteredSlots*() =
   ## (DEP-FLUSH-3) and is no longer registered, so the sweep only touches
   ## still-live threads' batches.
   ##
-  ## Cross-thread flush safety: each entry is a raw `ptr FragmentSlot` into
-  ## another thread's TLS. Flushing it issues `writeBuffer`+`flushFile` on
+  ## Cross-thread flush safety: each entry is a raw `ptr FragmentSlot` to
+  ## another thread's slot. Flushing it issues `writeBuffer`+`flushFile` on
   ## that slot's already-open fd. At a true process-exit point (destructor /
   ## exit hook) no other thread is making forward progress, so the sweep is
   ## quiescent; the append-only fd + length-prefixed frames + tolerant
   ## reader mean even a rare overlap can at worst re-flush already-durable
   ## bytes, never lose or duplicate a committed frame.
+  ##
+  ## Lifetime: on the ELF arm an entry points at a heap block its owning
+  ## thread frees on exit (`threadExitFlushSlot`). The owner unregisters under
+  ## `registryLock` before freeing, and this loop dereferences entries only
+  ## while holding that lock, so an entry seen here is never a freed block.
   ensureRegistryLock()
+  let own = peekFragmentSlot()
   acquire(registryLock)
   for i in 0 ..< registryCount:
     let slot = registrySlots[i]
     if slot == nil:
       continue
-    if slot == addr fragmentSlot:
+    if slot == own:
       # Defer the caller's own slot to the close below so it gets ONE
       # consistent teardown (flush + close + unregister).
       continue
@@ -1303,7 +1637,7 @@ proc flushAllRegisteredSlots*() =
           # has non-durable captured-dependency bytes"), and nothing else
           # will ever contradict it: `clearReadingSentinel` writes through
           # `writeReadTailMarker`, which only ever addresses the CALLING
-          # thread's `fragmentSlot` threadvar. So without this, every batch
+          # thread's own slot. So without this, every batch
           # a sweep rescued was ALSO reported as a kill-before-flush loss —
           # the run paid for the rescue with a downgrade, and a monitored
           # shell that reads on more than one thread could not reach
@@ -1351,12 +1685,26 @@ proc threadExitFlushSlot*() =
   ## already-dead worker's slot. `closeFragmentSlot` already flushes the
   ## batch, retires the reading sentinel, closes the fd and unregisters, so
   ## this is a thin, intention-revealing wrapper the shim can name.
+  ##
+  ## On the ELF arm it also FREES the thread's heap slot (see
+  ## `fragmentSlotOnHeap`): this destructor is the last point at which the
+  ## thread runs shim code, so it is where the block's lifetime ends. The
+  ## explicit unregister covers the one `closeFragmentSlot` exit that does not
+  ## reach its own unregister (a replaced descriptor that cannot be
+  ## reopened), so the block is never freed while still in the registry. A
+  ## record emitted by a LATER destructor on this thread allocates a fresh
+  ## slot; the shim re-arms its thread-exit key for that case (see
+  ## `repro_linux_thread_exit_flush`), and libc runs key destructors again
+  ## while values remain set.
   closeFragmentSlot()
+  unregisterFragmentSlot()
+  releaseFragmentSlot()
 
 proc fragmentSlotIsRegistered*(): bool =
   ## Test/introspection helper — true when the calling thread's slot holds
   ## a live registry index.
-  fragmentSlot.registryIndex != 0
+  let slot = peekFragmentSlot()
+  slot != nil and slot.registryIndex != 0
 
 proc fragmentPath*(fragmentDir: string; osPid, threadId: uint64): string =
   fragmentDir / ("repro-monitor-" & $osPid & "-" & $threadId & ".iomon-frag")
@@ -1429,40 +1777,41 @@ proc precomputeSigSafeCommittedFrame(slot: var FragmentSlot) =
     cursor += detailLen
   slot.committedFrameLen = int32(cursor)
 
-proc openFragmentSlot(fragmentDir: string; osPid, threadId: uint64;
-                      path: string): bool =
-  let sameIdentity = slotFragmentDirEquals(fragmentSlot, fragmentDir) and
-    fragmentSlot.osPid == osPid and fragmentSlot.threadId == threadId
-  if not open(fragmentSlot.file, extendedPath(path), fmAppend):
+proc openFragmentSlot(slot: ptr FragmentSlot; fragmentDir: string;
+                      osPid, threadId: uint64; path: string): bool =
+  ## `slot` is the calling thread's slot from `obtainFragmentSlot` (non-nil).
+  let sameIdentity = slotFragmentDirEquals(slot[], fragmentDir) and
+    slot.osPid == osPid and slot.threadId == threadId
+  if not open(slot.file, extendedPath(path), fmAppend):
     return false
   if not captureFragmentHandleIdentity():
-    try: close(fragmentSlot.file)
+    try: close(slot.file)
     except IOError, OSError: discard
-    fragmentSlot.file = nil
+    slot.file = noFragFile()
     return false
-  if not slotFragmentDirAssign(fragmentSlot, fragmentDir):
+  if not slotFragmentDirAssign(slot[], fragmentDir):
     # fragmentDir overflows the fixed-size buffer — close and bail out;
     # the caller falls back to the no-cache (raise) path.
-    try: close(fragmentSlot.file)
+    try: close(slot.file)
     except IOError, OSError: discard
     return false
-  fragmentSlot.isOpen = true
-  fragmentSlot.osPid = osPid
-  fragmentSlot.threadId = threadId
-  fragmentSlot.batchLen = 0
-  fragmentSlot.batchOpenedAtNs = 0
-  fragmentSlot.batchProbeCountdown = 0
-  fragmentSlot.readingSentinelActive = false
+  slot.isOpen = true
+  slot.osPid = osPid
+  slot.threadId = threadId
+  slot.batchLen = 0
+  slot.batchOpenedAtNs = 0
+  slot.batchProbeCountdown = 0
+  slot.readingSentinelActive = false
   # Only a different fragment starts a new budget. macOS worker threads close
   # after every emit and can reopen this same fragment many times.
   resolveFragmentByteCap()
   if not sameIdentity:
-    fragmentSlot.fragmentBytes = 0
-    fragmentSlot.overCap = false
-  precomputeSigSafeCommittedFrame(fragmentSlot)
+    slot.fragmentBytes = 0
+    slot.overCap = false
+  precomputeSigSafeCommittedFrame(slot[])
   # DEP-FLUSH-1 — join the process-global registry so a shutdown sweep on
   # ANY thread can reach this batch. No-op after the first open per thread.
-  registerFragmentSlot()
+  registerFragmentSlot(slot)
   discard fragmentOpenCount.fetchAdd(1, moRelaxed)
   true
 
@@ -1473,6 +1822,30 @@ proc monoNowNs(): int64 =
   ## ``QueryPerformanceCounter`` on Windows; both are vDSO-resolved /
   ## userspace-fast and add ~ns of overhead to the hot path.
   cast[int64]((getMonoTime() - MonoTime()).inNanoseconds)
+
+proc appendFragmentRecordUnbuffered(path: string; record: MonitorRecord) =
+  ## The no-slot fallback of `appendFragmentRecord` (ELF arm only): the
+  ## thread's slot could not be allocated, so there is no batch, cached
+  ## descriptor or sentinel bookkeeping to use. Rather than lose the record,
+  ## append its frame to the fragment with a private open/write/close. The
+  ## frame is durable when this returns, so no read-tail sentinel is needed,
+  ## and the descriptor is never cached, so fd-reuse cannot touch it. It does
+  ## not count toward the LEAK-GUARD byte cap (that budget lives in the slot);
+  ## a thread only takes this path while allocation keeps failing. A failure
+  ## here raises exactly like a failed fragment open on the normal path.
+  let frame = encodeFrame(record)
+  var f: FragFile
+  if not open(f, extendedPath(path), fmAppend):
+    raiseEnvelopeError(eeMalformed,
+      "cannot open iomon fragment for append: " & path)
+  try:
+    if f.writeBuffer(unsafeAddr frame[0], frame.len) != frame.len:
+      raiseEnvelopeError(eeMalformed,
+        "short write to iomon fragment for osPid=" & $record.osPid &
+        " threadId=" & $record.threadId)
+    discard fragmentWriteCount.fetchAdd(1, moRelaxed)
+  finally:
+    close(f)
 
 proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   ## DSL-port M9.R.15c.1 — emit ``record`` to the (osPid, threadId)
@@ -1491,6 +1864,11 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   ## (d) the current batch has been open for longer than
   ## ``FragmentBatchMaxAgeNs`` (default 100 ms) — bounding the worst-
   ## case data-loss window on SIGKILL.
+  ##
+  ## Appending into the batch issues no syscall per record. The cached
+  ## descriptor's identity (it may have been replaced by the tracee) is
+  ## validated at every point that touches the descriptor — flush, marker
+  ## write, close, oversize direct write — not on every append.
   # io-mon-Lossless-Event-Capture M3 part 2a — PRIMARY path is the SET transport
   # (nim-shm-gset, the M1-winning Candidate-C channel). Part 2b removed the
   # superseded DEP-SHM ring, so the only channels are the SET (Linux) and the
@@ -1526,7 +1904,6 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   # consumer's root-spawn completeness guard downgrades the edge. Still no file.
   if setProducerAttached:
     if setProducer.available:
-      var recBuf {.noinit.}: array[SetProducerBufBytes, byte]
       # DA-1b/DA-1d — the incarnation suffix is a process-local coordinate, so it
       # is appended only for the kinds whose identity keeps one. Appending it to
       # a FACT-scoped kind would defeat that kind's dedup with exactly the
@@ -1545,14 +1922,10 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
       #
       # `decodeDepRecord` reads only the record's own fields (seq reconstructs as
       # 0) and IGNORES the trailing image bytes, so a decoded element is a
-      # faithful MonitorRecord for the merge.
-      let total = encodeDepSetElement(record, recBuf, dseRequireFit)
-      if total >= 0:
-        case setProducer.emit(recBuf.toOpenArray(0, total - 1))
-        of emInserted, emExists, emSaturated, emConsumerGone:
-          return
-        of emOversize, emUnavailable:
-          discard   # signal loss below
+      # faithful MonitorRecord for the merge. (Encoding and the emit status
+      # mapping live in `emitDepSetElement`.)
+      if emitDepSetElement(record):
+        return
       # Unframable (path+detail too large) or a non-durable emit status: surface a
       # loss element so the edge is honestly `mcIncomplete` (LF-2), never a spill.
       if setLossElemLen > 0:
@@ -1565,34 +1938,59 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   # than reopen the fragment and resume unbounded growth (the run is already
   # flagged incomplete by the cap marker). A DIFFERENT key (fork child / new
   # thread) falls through and opens a fresh, uncapped fragment below.
-  if fragmentSlot.overCap and
-      slotFragmentDirEquals(fragmentSlot, fragmentDir) and
-      fragmentSlot.osPid == record.osPid and
-      fragmentSlot.threadId == record.threadId:
+  # `slot` is nil on the ELF arm until this thread's first open (see
+  # `fragmentSlotOnHeap`); it is obtained on the open path below.
+  var slot = peekFragmentSlot()
+  if slot != nil and slot.overCap and
+      slotFragmentDirEquals(slot[], fragmentDir) and
+      slot.osPid == record.osPid and
+      slot.threadId == record.threadId:
     return
 
-  if fragmentSlot.isOpen and not fragmentHandleIsCurrent() and
-      not reopenFragmentHandle():
-    raiseEnvelopeError(eeMalformed,
-      "cannot recover externally replaced iomon fragment handle")
-
-  let needsReopen = not fragmentSlot.isOpen or
-    not slotFragmentDirEquals(fragmentSlot, fragmentDir) or
-    fragmentSlot.osPid != record.osPid or
-    fragmentSlot.threadId != record.threadId
+  # Descriptor identity (`fragmentHandleIsCurrent`, one `fstat`) is checked
+  # only where this path TOUCHES the descriptor — before closing it on a key
+  # change and before the oversize direct write below — never once per record.
+  # Appending into the batch buffer touches no descriptor, and every other
+  # descriptor use (`flushFragmentBatch`, `writeReadTailMarker`,
+  # `closeFragmentSlot`) validates it itself. A per-record probe here put a
+  # syscall back on the hot path batching exists to keep syscall-free: on
+  # macOS / APFS it held the batched writer to ~2.2x the unbatched one.
+  let needsReopen = slot == nil or not slot.isOpen or
+    not slotFragmentDirEquals(slot[], fragmentDir) or
+    slot.osPid != record.osPid or
+    slot.threadId != record.threadId
   if needsReopen:
-    if fragmentSlot.isOpen:
+    if slot != nil and slot.isOpen:
+      # The descriptor may have been replaced since the last flush; closing it
+      # unchecked would close a descriptor that now belongs to the tracee.
+      if not fragmentHandleIsCurrent() and not reopenFragmentHandle():
+        raiseEnvelopeError(eeMalformed,
+          "cannot recover externally replaced iomon fragment handle")
       # Flush the in-flight batch BEFORE we close — otherwise the
       # buffered frames belong to the previous (osPid, threadId)
       # fragment but the close path drops them on the floor.
       try: flushFragmentBatch()
       except EnvelopeError, IOError, OSError: discard
-      try: close(fragmentSlot.file)
-      except IOError, OSError: discard
-      fragmentSlot.isOpen = false
+      # A flush that reaches the byte cap has already closed this handle
+      # (`accountFragmentBytes`), as has a failed recovery inside the flush.
+      # Closing it again would close a descriptor number the tracee may have
+      # reused since, which is the hazard the identity check above prevents.
+      if slot.isOpen:
+        try: close(slot.file)
+        except IOError, OSError: discard
+        discard fragmentCloseCount.fetchAdd(1, moRelaxed)
+      slot.isOpen = false
     createDir(extendedPath(fragmentDir))
     let path = fragmentPath(fragmentDir, record.osPid, record.threadId)
-    if not openFragmentSlot(fragmentDir, record.osPid, record.threadId, path):
+    if slot == nil:
+      slot = obtainFragmentSlot()
+      if slot == nil:
+        # No memory for a slot: write this record straight to the fragment
+        # instead of dropping it (see `appendFragmentRecordUnbuffered`).
+        appendFragmentRecordUnbuffered(path, record)
+        return
+    if not openFragmentSlot(slot, fragmentDir, record.osPid, record.threadId,
+                            path):
       raiseEnvelopeError(eeMalformed,
         "cannot open iomon fragment for append: " & path)
 
@@ -1618,22 +2016,27 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
     # via the legacy ``encodeFrame`` path to keep the file's frame-
     # boundary invariant.
     flushFragmentBatch()
+    # `flushFragmentBatch` validates the descriptor only when it had bytes to
+    # write; this direct write must not reach a replaced descriptor either.
+    if not fragmentHandleIsCurrent() and not reopenFragmentHandle():
+      raiseEnvelopeError(eeMalformed,
+        "cannot recover externally replaced iomon fragment handle")
     let frame = encodeFrame(record)
-    let n = fragmentSlot.file.writeBuffer(unsafeAddr frame[0], frame.len)
+    let n = slot.file.writeBuffer(unsafeAddr frame[0], frame.len)
     if n != frame.len:
       raiseEnvelopeError(eeMalformed,
         "short write to iomon fragment for osPid=" & $record.osPid &
         " threadId=" & $record.threadId)
-    flushFile(fragmentSlot.file)
+    flushFile(slot.file)
     discard fragmentWriteCount.fetchAdd(1, moRelaxed)
     discard fragmentFlushCount.fetchAdd(1, moRelaxed)
     # LEAK-GUARD — a single oversize frame counts toward the cap too.
     accountFragmentBytes(frame.len)
     return
 
-  if fragmentSlot.batchLen + frameLen > FragmentBatchBufLen:
+  if slot.batchLen + frameLen > FragmentBatchBufLen:
     flushFragmentBatch()
-  elif fragmentSlot.batchLen > 0:
+  elif slot.batchLen > 0:
     # Buffer non-empty + frame fits — but is the batch stale? If the
     # first frame of this batch landed more than ``FragmentBatchMaxAgeNs``
     # ago, force a flush so a sparse-emit producer doesn't sit on
@@ -1646,29 +2049,29 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
     # always probes (catches the sparse-emit producer that lingers
     # past 100 ms between calls), then refreshes the countdown to the
     # full interval on a not-stale result.
-    if fragmentSlot.batchProbeCountdown <= 0:
+    if slot.batchProbeCountdown <= 0:
       let nowNs = monoNowNs()
-      if nowNs - fragmentSlot.batchOpenedAtNs > FragmentBatchMaxAgeNs:
+      if nowNs - slot.batchOpenedAtNs > FragmentBatchMaxAgeNs:
         flushFragmentBatch()
       else:
-        fragmentSlot.batchProbeCountdown = BatchStalenessProbeInterval
+        slot.batchProbeCountdown = BatchStalenessProbeInterval
     else:
-      dec fragmentSlot.batchProbeCountdown
+      dec slot.batchProbeCountdown
 
-  if fragmentSlot.batchLen == 0:
-    fragmentSlot.batchOpenedAtNs = monoNowNs()
+  if slot.batchLen == 0:
+    slot.batchOpenedAtNs = monoNowNs()
     # Countdown starts at 0 so the first post-batch-start emit always
     # probes the clock — this catches sparse-emit producers whose
     # inter-emit gap exceeds the 100 ms staleness threshold and
     # ensures bounded data loss on SIGKILL.
-    fragmentSlot.batchProbeCountdown = 0
+    slot.batchProbeCountdown = 0
 
   # Inline little-endian encode straight into the batch buffer at the
   # current offset. ``cursor`` is a local copy so we can store it
   # back to ``batchLen`` as a single write at the end.
-  var cursor = fragmentSlot.batchLen
+  var cursor = slot.batchLen
   template putByte(b: byte) =
-    fragmentSlot.batchBuf[cursor] = b
+    slot.batchBuf[cursor] = b
     inc cursor
   template putU16Le(v: uint16) =
     putByte(byte(v and 0xFF'u16))
@@ -1690,7 +2093,7 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   template putString(s: string) =
     putU32Le(uint32(s.len))
     if s.len > 0:
-      copyMem(addr fragmentSlot.batchBuf[cursor], unsafeAddr s[0], s.len)
+      copyMem(addr slot.batchBuf[cursor], unsafeAddr s[0], s.len)
       cursor += s.len
 
   # Frame length prefix.
@@ -1711,7 +2114,7 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
   putString(record.path)
   putString(record.detail)
 
-  fragmentSlot.batchLen = cursor
+  slot.batchLen = cursor
   # ROUND-2 R5 — the batch now holds a non-durable tail; mark the kill-before-flush
   # sentinel (once per dirty cycle). A subsequent flush retires it; an uncatchable
   # SIGKILL leaves it behind for `mergeFragments` to detect.

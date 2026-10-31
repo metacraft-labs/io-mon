@@ -74,6 +74,18 @@ io-mon run --depfile build.iomon -- ./build.sh
 
 ---
 
+## Linux: 32-bit and Static Programs
+
+On Linux, `io-mon` enters each program through the dynamic loader (`LD_PRELOAD`). These programs cannot be entered that way, or cannot be shown to be:
+
+- a program of a different ELF class or architecture than `io-mon`'s monitor library, such as a 32-bit (i686) program under the 64-bit monitor. The loader prints `wrong ELF class: ELFCLASS64): ignored` and runs the program unmonitored;
+- a statically linked program (including static-pie), which has no loader at all;
+- a program `io-mon` may run but not read (execute-only, mode `--x`): it cannot check which kind it is, so it treats it as one it cannot enter.
+
+A `#!` script whose interpreter is one of these is in the same position. Whenever the build starts such a program (as the command itself, or through `exec`, `posix_spawn` or a raw `execve`), `io-mon` records an event-loss naming it, for example `uninjectable image: exec: statically linked, … image=/path/to/tool`, and the run is `mcIncomplete`. This holds even when that program goes on to run a monitored one in the same process. A consumer such as a build cache should then re-run the step rather than trust its dependency set. To keep such a step cacheable, use a dynamically linked build of the tool for the same architecture as `io-mon`.
+
+---
+
 ## Compiler Daemons & Breakaway Processes
 
 Some build environments use long-running daemon processes (such as Gradle daemon or local compilation caches). If a child connects via IPC to an unmonitored external process, `io-mon` detects the socket connection (`mrIpcConnect`) and conservatively flags the run as `mcIncomplete` to avoid missing out-of-band dependencies.

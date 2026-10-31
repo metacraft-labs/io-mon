@@ -83,7 +83,10 @@ when defined(macosx):
   from build_test_shim import buildPrivateMacosShim
 
   proc buildShim(): string =
-    buildPrivateMacosShim(repoRoot)
+    # This fixture contrasts an explicitly seeded bundle with no replacement.
+    # Disable the embedded fallback in its private shim so that independent
+    # SIP loader control still measures the same executable on both sides.
+    buildPrivateMacosShim(repoRoot, builtToolsDir = "")
 
   proc buildSandboxBundle(dest: string): string =
     ## Resolve the NON-SIP drop-in bundle the SIP-child test redirects to.
