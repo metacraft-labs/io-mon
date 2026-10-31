@@ -94,6 +94,45 @@ when defined(macosx):
           if started.kind == mrProcessStart and
               started.osPid == record.childOsPid:
             shellStarted = true
+    if expected == mcComplete and not (compilerRead and shellStarted):
+      # DIAGNOSTIC (throwaway branch): keep the capture and its context.
+      let diag = "/tmp/io-mon-diag" / work.extractFilename
+      createDir(diag)
+      copyFile(depfile, diag / "capture.iomon")
+      var lines: seq[string]
+      lines.add "loader-control=" & $useLoaderControl & " compilerRead=" &
+        $compilerRead & " shellStarted=" & $shellStarted
+      lines.add "clang=" & clang
+      lines.add "sdk=" & sdk
+      lines.add "nim=" & nim
+      try: lines.add "nim -> " & expandSymlink(nim)
+      except OSError: discard
+      for cmd in ["/usr/bin/codesign -dvvv --entitlements - " & quoteShell(clang),
+                  "/usr/bin/file " & quoteShell(clang),
+                  "/bin/ls -l@ " & quoteShell(clang),
+                  "/usr/bin/xcode-select -p", "/usr/bin/csrutil status",
+                  "/usr/bin/xcrun --find clang", "/usr/bin/xcrun --show-sdk-path",
+                  "/bin/cat " & quoteShell(nim)]:
+        let r = execCmdEx(cmd)
+        lines.add "$ " & cmd & " (exit " & $r.exitCode & ")"
+        lines.add r.output
+      lines.add "--- test process env"
+      for k, v in envPairs(): lines.add k & "=" & v
+      lines.add "--- completeness=" & $evidence.completeness &
+        " subsystem=" & $subsystemEvidence(evidence).completeness &
+        " backend=" & $evidence.backendFamily
+      lines.add "--- records (all)"
+      for r in evidence.records:
+        lines.add $r.kind & " pid=" & $r.osPid & " ppid=" & $r.parentOsPid &
+          " child=" & $r.childOsPid & " result=" & $r.result & " path=" &
+          r.path & " detail=" & r.detail
+      writeFile(diag / "diagnostics.txt", lines.join("\n"))
+      for r in evidence.records:
+        if r.kind in {mrProcessStart, mrProcessSpawn, mrProcessExec,
+                      mrEventLoss} or r.path.endsWith(".c"):
+          checkpoint($r.kind & " pid=" & $r.osPid & " child=" &
+            $r.childOsPid & " path=" & r.path & " detail=" & r.detail)
+      checkpoint("clang=" & clang & " sdk=" & sdk)
     if expected == mcComplete:
       doAssert compilerRead
       doAssert shellStarted

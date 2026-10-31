@@ -81,8 +81,8 @@ jobs:
         # Manual diagnostics retain the complete build/test job and assertions.
         include:
           ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.linux-arm64 &&
-          '[{"os":"linux","arch":"x64","runner":["self-hosted","linux","x64"]},{"os":"macos","arch":"arm64","runner":["self-hosted","macos","arm64","nix-darwin"]},{"os":"windows","arch":"x64","runner":["self-hosted","windows","x64"]},{"os":"windows","arch":"arm64","runner":["self-hosted","windows","arm64"]},{"os":"linux","arch":"arm64","runner":["self-hosted","linux","arm64"]}]' ||
-          '[{"os":"linux","arch":"x64","runner":["self-hosted","linux","x64"]},{"os":"macos","arch":"arm64","runner":["self-hosted","macos","arm64","nix-darwin"]},{"os":"windows","arch":"x64","runner":["self-hosted","windows","x64"]},{"os":"windows","arch":"arm64","runner":["self-hosted","windows","arm64"]}]') }}
+          '[{"os":"macos","arch":"arm64","runner":["self-hosted","macos","arm64","nix-darwin"]},{"os":"linux","arch":"arm64","runner":["self-hosted","linux","arm64"]}]' ||
+          '[{"os":"macos","arch":"arm64","runner":["self-hosted","macos","arm64","nix-darwin"]}]') }}
     # Source bootstrap exceeds the current Tart guest's writable storage.
     # The native nix-darwin class retains every test; owner zah, follow-up:
     # metacraft-specs/issues/2026-09-29-macos-tart-source-bootstrap-exhausts-guest-disk.md
@@ -183,9 +183,22 @@ jobs:
 
       - name: repro test
         if: matrix.os != 'linux'
-        # Materialises the `test` collection (the portable + host-OS
-        # io-mon suites).
-        run: dev-exec repro test --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }}
+        # DIAGNOSTIC (throwaway branch): only the isolated set, which holds
+        # test_io_mon_macos_no_path_nim_children.
+        run: dev-exec repro build --tool-provisioning=nix .#test-monitor-isolation --write-report=build/monitor-isolation-diag.json
+
+      - name: Upload macOS capture diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-no-path-nim-diag
+          path: |
+            /tmp/io-mon-diag/
+            build/monitor-isolation-diag.json
+            .repro/build/*/build-engine-cache/actions/io-mon.test_execute.test_io_mon_macos_no_path_nim_children*
+          include-hidden-files: true
+          retention-days: 3
+          if-no-files-found: warn
 
       - name: Verify isolated Windows tests execute again
         if: matrix.os == 'windows'
