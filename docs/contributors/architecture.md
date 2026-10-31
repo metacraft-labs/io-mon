@@ -108,7 +108,7 @@ three nesting levels, inner loss, interruption and real filesystem failures.
 ### Linux
 
 - **`LD_PRELOAD` Shim**: Injects wrapper symbols that route filesystem activity to the monitor.
-- **Raw Syscall Hooking**: Uses a raw-syscall SIGTRAP substrate to intercept inline `0f 05` assembly instructions inside main executable pages and custom dynamic libraries.
+- **Raw Syscall Hooking**: Uses a raw-syscall SIGTRAP substrate to intercept inline `0f 05` assembly instructions inside main executable pages and custom dynamic libraries. Only the image's executable sections (`SHF_EXECINSTR`, read from its ELF section table through `linux_image_code_ranges`) are scanned: an `R E` segment can also carry `.rodata`/`.eh_frame` (BOLT output, `-z noseparate-code`), and decoding that data once INT3-patched a jump-table entry of rustc 1.94.0. An image whose section table cannot be read is left unscanned and reported as event loss (`skipped image without a readable executable-section table`).
 - **Library-Load Observation (`dl_iterate_phdr`)**: `ld.so` maps a shared object through
   internal `__mmap` / `__open64_nocancel` calls that do **not** traverse `LD_PRELOAD`
   symbol interposition, so no file hook can ever see a loader-driven load. io-mon

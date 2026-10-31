@@ -1947,11 +1947,33 @@ proc emitThumbUnscannedLoss(status: InlineSyscallPatchStatus; source: string)
     "code source=" & source & " mappings=" & $status.thumbUnscanned &
     " first=" & firstThumbPathText(status))
 
+proc emitUnscannedImagesLoss(status: InlineSyscallPatchStatus; source: string)
+    {.raises: [].} =
+  ## A file-backed executable mapping whose image has no readable ELF section
+  ## table was not scanned at all: without the table the scanner cannot tell
+  ## the image's code from the read-only data an `R E` segment may carry, and
+  ## sweeping the data is what corrupted rustc 1.94.0's jump table. Fail
+  ## closed: the capture grades `mcIncomplete` on this loss.
+  if status.imagesUnscanned == 0:
+    return
+  emitEventLoss("linux inline raw-syscall scanner skipped image without a " &
+    "readable executable-section table source=" & source &
+    " images=" & $status.imagesUnscanned &
+    " first=" & firstUnscannedImageText(status))
+
+var lateUnscannedImagesReported = 0
+  ## `imagesUnscanned` as of the last loss record emitted: the startup record
+  ## sets it, and a late scan emits again only when the count has grown, so
+  ## an image reported at startup is not reported a second time on the first
+  ## `dlopen`.
+
 proc recordInlineSyscallCoverage(status: InlineSyscallPatchStatus) {.raises: [].} =
   if inlineSyscallCoverageRecorded:
     return
   inlineSyscallCoverageRecorded = true
   emitThumbUnscannedLoss(status, "startup")
+  emitUnscannedImagesLoss(status, "startup")
+  lateUnscannedImagesReported = status.imagesUnscanned
   if status.handlerInstalled and status.scanDiagnostic == lrsOk and
       status.firstPatchDiagnostic == lrsOk:
     return
@@ -1970,6 +1992,9 @@ proc recordLateInlineSyscallScanCoverage(status: InlineSyscallPatchStatus;
   if status.thumbUnscanned > lateThumbUnscannedReported:
     lateThumbUnscannedReported = status.thumbUnscanned
     emitThumbUnscannedLoss(status, source)
+  if status.imagesUnscanned > lateUnscannedImagesReported:
+    lateUnscannedImagesReported = status.imagesUnscanned
+    emitUnscannedImagesLoss(status, source)
   if status.handlerInstalled and status.scanDiagnostic == lrsOk and
       status.firstPatchDiagnostic == lrsOk:
     return

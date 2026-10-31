@@ -374,7 +374,12 @@ package io_mon:
           "test_io_mon_shim_host_allocator_isolation.nim",
           "test_io_mon_shim_path_mutations.nim",
           "test_io_mon_shim_private_heap.nim",
-          "test_io_mon_shim_static_tls_small_stack_threads.nim"]) or
+          "test_io_mon_shim_static_tls_small_stack_threads.nim",
+          # These load a private shim under test into their children and
+          # compare with bare controls: the code-sections-only scan gate and
+          # the rustc crate pair from the rustc 1.94.0 SIGILL issue.
+          "test_io_mon_linux_inline_scan_code_sections_only.nim",
+          "test_io_mon_linux_rustc_crates_under_shim.nim"]) or
         (defined(windows) and source.extractFilename in [
         "test_io_mon_cli_exit_status.nim",
         "test_io_mon_windows_exit_status.nim",

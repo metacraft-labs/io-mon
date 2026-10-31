@@ -22,10 +22,12 @@
 ##
 ## HOW. Compile the shim module exactly as `scripts/build_shim.sh` does (into a
 ## private nimcache, `--compileOnly`) and read the generated C of
-## `linux_preload_runtime`: every listed global must be declared WITH an
-## initializer on its declaration line, and the module's `Init000` body must
-## not assign any of them. A new constructor-owned global is added to the list
-## below when it is introduced.
+## `linux_preload_runtime`: every listed global must be declared as a data
+## object of that module (with a static initializer, or bare -- C zero-fills
+## a bare file-scope object at load), and the module's `Init000` body must
+## not assign any of them, which is what a GC-managed field or a
+## `= default(...)` spelling would make it do. A new constructor-owned global
+## is added to the list below when it is introduced.
 
 import std/[os, osproc, re, streams, strutils, unittest]
 
@@ -36,7 +38,10 @@ const
   ## prefix followed by `__`.
   constructorOwnedGlobals = [
     "inlineSyscallPatchStatus", "inlineSyscallPatchAttempted",
-    "rawSyscallPatchStatus", "rawSyscallPatchAttempted"]
+    "rawSyscallPatchStatus", "rawSyscallPatchAttempted",
+    # The startup scan's table of images counted as unscanned; a later scan
+    # reads it to count each image once.
+    "unscannedImageKeys", "unscannedImageKeyCount"]
 
 proc siblingPath(envName, relative: string): string =
   let override = getEnv(envName)
@@ -80,10 +85,19 @@ suite "the shim's constructor-owned globals are static C initializers":
     for name in constructorOwnedGlobals:
       var declared = false
       for line in lines:
-        # `N_LIB_PRIVATE <type> <name>__<hash> = {…};` or `= NIM_FALSE;`
+        # `N_LIB_PRIVATE <type> <name>__<hash> = {…};`, `= NIM_FALSE;`, or a
+        # bare `N_LIB_PRIVATE <type> <name>__<hash>;`. The bare form is what
+        # Nim emits for a POD array declared without a value
+        # (`unscannedImageKeys`, like `anonymousExecutableRanges`): C
+        # zero-initialises it at load (C11 6.7.9p10), which is as static as
+        # `= {…}`. Spelling such a table `= default(array[...])` instead is
+        # NOT static: Nim then emits the same bare declaration AND a
+        # `nimZeroMem` in the module init (measured with Nim 2.2.4). So the
+        # declaration line proves only that the global is a data object of
+        # this module (the pattern excludes prototypes); the runtime-init check
+        # below is what grades the hazard, for both spellings.
         if line.match(declPattern(name)):
           checkpoint(name & ": " & line[0 ..< min(line.len, 160)])
-          check " = " in line                       # STATIC initializer present
           declared = true
       check declared
     # The module's Init000 (NimMainInit) must not assign any of them.

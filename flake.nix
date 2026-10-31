@@ -20,7 +20,12 @@
       # trap and syscall(2) owner protocol compile against on `__arm__`.
       # 3af8a4e -> 7533478 (2026-10-30): review fixes of that substrate (ARM
       # body patch writes its target word first; idempotent restore).
-      url = "github:metacraft-labs/nim-stackable-hooks/75334780682e70b1adb58bf813d869e7f5df63f5";
+      # 7533478 -> c1d55ce (2026-11-01): `platform/linux_image_code_ranges`,
+      # the executable-section ranges of a mapped ELF image, so the Linux
+      # inline raw-syscall scanner decodes code and never the `.rodata` /
+      # `.eh_frame` a BOLT or `-z noseparate-code` executable segment carries
+      # (the rustc 1.94.0 jump-table SIGILL).
+      url = "github:metacraft-labs/nim-stackable-hooks/c1d55ce33fb2a29e4cf8d8bdbe1713f355370d0a";
       flake = false;
     };
     shm-queue-src = {

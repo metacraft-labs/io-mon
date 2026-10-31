@@ -5,6 +5,7 @@ import std/[algorithm, locks, os, strutils]
 
 import stackable_hooks/platform/linux_preload
 import stackable_hooks/platform/linux_raw_syscalls
+import stackable_hooks/platform/linux_image_code_ranges
 import io_mon/hooks/linux_arm_image
 import ./linux_mapping_policy
 import ../exec_image_header
@@ -399,6 +400,21 @@ type
       ## `inlineSyscallPatchAttempted` stayed true. Measured at io-mon
       ## 7a3e4c89 on both armhf and x86-64; `tests/linux/
       ## test_io_mon_shim_globals_are_static.nim` keeps every such global POD.
+    imagesUnscanned*: int
+      ## How many distinct file-backed executable mappings the scanner left
+      ## untouched because the image's ELF section table could not be read, so
+      ## its code bytes are unknown (`linuxImageCodeRanges` not `licrOk`). Each
+      ## late scan re-enumerates every mapping, so a mapping is counted once
+      ## (`unscannedImageAlreadyNoted`), not once per scan. The scanner
+      ## decodes only `SHF_EXECINSTR` sections: a BOLT or `-z noseparate-code`
+      ## image keeps `.rodata`/`.eh_frame` in its executable segment, and
+      ## sweeping those bytes INT3-patched a jump-table entry of rustc 1.94.0
+      ## (reprobuild-pm issue 2026-10-30-io-mon-shim-kills-upstream-rustc-1.94.0-
+      ## on-crates-with-macro-rules). An unreadable table is a coverage gap
+      ## reported as event loss, never a reason to sweep the whole mapping.
+    firstUnscannedImage*: array[256, char]
+      ## The first such mapping's path with the diagnostic and errno, for the
+      ## loss record. A fixed buffer for the same reason as `firstThumbPath`.
 
   AnonymousExecutableRange = object
     start: uint
@@ -8099,12 +8115,69 @@ proc firstThumbPathText*(status: InlineSyscallPatchStatus): string {.raises: [].
   ## The recorded first Thumb-capable mapping, as a string ("" when none).
   $cast[cstring](unsafeAddr status.firstThumbPath[0])
 
+proc firstUnscannedImageText*(status: InlineSyscallPatchStatus): string {.raises: [].} =
+  ## The recorded first image left unscanned, as a string ("" when none).
+  $cast[cstring](unsafeAddr status.firstUnscannedImage[0])
+
+const unscannedImageTableCap = 64
+  ## Distinct unreadable images one process is expected to carry: a handful
+  ## at most (an `sstrip`ped vendor library, a replaced-on-disk plugin).
+
+type UnscannedImageKey = object
+  ## Identity of a mapping already counted as unscanned: its address, its file
+  ## offset and the inode `/proc/self/maps` reported. A library unloaded and
+  ## another mapped at the same address differs in inode and is counted.
+  start, offset: uint
+  inode: uint64
+
+var
+  unscannedImageKeys: array[unscannedImageTableCap, UnscannedImageKey]
+  unscannedImageKeyCount: int = 0
+    ## Written by the constructor's startup scan and read by every later scan,
+    ## so both must be static C initializers (POD, no GC field) like the
+    ## patch-status globals: `tests/linux/test_io_mon_shim_globals_are_static`
+    ## lists them. A fixed table, like `anonymousExecutableRanges`, so the
+    ## scan touches no allocator.
+
+proc unscannedImageAlreadyNoted(mapping: LinuxExecutableMapping): bool
+    {.raises: [].} =
+  ## Every late scan (each `dlopen`, each JIT transition) re-enumerates all
+  ## mappings and would otherwise count the same unreadable image again, and
+  ## the loss watermark in `recordLateInlineSyscallScanCoverage` would then
+  ## re-emit its record on every scan with a growing `images=` count (measured
+  ## 2026-10-31: a host without section headers that dlopens three times
+  ## reported `images=1`, `2`, `3`, `4`). When the table is full, further
+  ## images are counted on every scan: an over-reported loss that is already
+  ## recorded, never a dropped one.
+  let key = UnscannedImageKey(start: mapping.start, offset: mapping.offset,
+                              inode: mapping.inode)
+  for i in 0 ..< min(unscannedImageKeyCount, unscannedImageTableCap):
+    if unscannedImageKeys[i] == key:
+      return true
+  if unscannedImageKeyCount < unscannedImageTableCap:
+    unscannedImageKeys[unscannedImageKeyCount] = key
+  inc unscannedImageKeyCount
+  false
+
+proc noteUnscannedImage(mapping: LinuxExecutableMapping;
+                        ranges: LinuxImageCodeRanges;
+                        status: var InlineSyscallPatchStatus) {.raises: [].} =
+  if unscannedImageAlreadyNoted(mapping):
+    return
+  inc status.imagesUnscanned
+  if status.firstUnscannedImage[0] == '\0':
+    let text = mapping.path & " (" & $ranges.diagnostic & " errno=" &
+      $ranges.osErrno & ")"
+    let n = min(text.len, status.firstUnscannedImage.len - 1)
+    if n > 0: copyMem(addr status.firstUnscannedImage[0], unsafeAddr text[0], n)
+    status.firstUnscannedImage[n] = '\0'
+
 proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
                                status: var InlineSyscallPatchStatus)
     {.raises: [].} =
   noteThumbCapableMapping(mapping, status)
   let statusPtr = addr status
-  visitLinuxExecutableMappingSyscalls(mapping, proc(site: LinuxSyscallSite): bool =
+  let patchSite = proc(site: LinuxSyscallSite): bool {.closure, raises: [].} =
     let tx = installInt3SyscallPatchTransaction(cast[pointer](site.address))
     if tx.diagnostic == lrsOk and tx.patchLive:
       if cInlineSyscallRecordSite(culong(site.address)) == 0:
@@ -8115,7 +8188,27 @@ proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
       statusPtr[].firstPatchErrno = tx.osErrno
       statusPtr[].firstPatchAddress = site.address
     true
-  )
+  if mapping.path.len == 0 or mapping.path[0] != '/':
+    # An anonymous (JIT) range has no image to consult; the caller established
+    # through the mmap wrapper that the program created it as code.
+    visitLinuxExecutableMappingSyscalls(mapping, patchSite)
+    return
+  # A file-backed mapping is scanned only over the image's executable
+  # sections. The rest of an `R E` segment can be read-only data -- BOLT and
+  # `-z noseparate-code` place `.rodata`/`.eh_frame` there -- and the linear
+  # decoder cannot tell a jump-table entry that happens to read `0f 05` from a
+  # `syscall`; patching one corrupted the table and killed rustc 1.94.0 with
+  # SIGILL. See `linux_image_code_ranges` for the ELF facts. No table, no scan:
+  # the gap is reported as event loss (`emitUnscannedImagesLoss`).
+  let ranges = linuxImageCodeRanges(mapping)
+  if ranges.diagnostic != licrOk:
+    noteUnscannedImage(mapping, ranges, status)
+    return
+  for r in ranges.ranges:
+    if r.stop <= r.start:
+      continue
+    visitLinuxX8664SyscallMemory(cast[pointer](r.start), int(r.stop - r.start),
+                                 patchSite)
 
 proc installInlineSyscallPatches*(): InlineSyscallPatchStatus {.raises: [].}
 
