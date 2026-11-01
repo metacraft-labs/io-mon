@@ -82,13 +82,25 @@ when defined(macosx):
     doAssert subsystemEvidence(evidence).completeness == expected
     var compilerRead = false
     var shellStarted = false
+    # A pid runs clang when it exec'd clang, or when it was spawned as clang
+    # and started under the shim. Apple clang 26 (Xcode 26.6) posix_spawns
+    # its -cc1 child, which reads the .c with no exec record of its own:
+    # CI (reprobuild) run 41165223178 recorded pid 89071 that way.
+    var clangPids: seq[uint64]
+    for image in evidence.records:
+      if image.kind == mrProcessExec and "clang" in image.path.extractFilename:
+        clangPids.add image.osPid
+      if image.kind == mrProcessSpawn and image.childOsPid != 0 and
+          "clang" in image.path.extractFilename:
+        for started in evidence.records:
+          if started.kind == mrProcessStart and
+              started.osPid == image.childOsPid:
+            clangPids.add image.childOsPid
     for record in evidence.records:
       if record.kind in {mrFileOpen, mrFileRead} and
-          record.path.startsWith(cache) and record.path.endsWith(".c"):
-        for image in evidence.records:
-          if image.kind == mrProcessExec and image.osPid == record.osPid and
-              "clang" in image.path.extractFilename:
-            compilerRead = true
+          record.path.startsWith(cache) and record.path.endsWith(".c") and
+          record.osPid in clangPids:
+        compilerRead = true
       if record.kind == mrProcessSpawn and record.path == "/bin/sh":
         for started in evidence.records:
           if started.kind == mrProcessStart and
