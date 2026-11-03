@@ -42,6 +42,7 @@ import std/[os, tempfiles, unittest]
 import ../helpers/windows_fixture_child
 
 import io_mon
+import descendant_guard_expectations
 
 proc runUninitialisedShimRoot(inertShim: string): MonitorResult =
   ## Monitor a native root under a DLL that loads but never initialises, and
@@ -94,3 +95,4 @@ suite "Windows R1 root-guard (an injected root that reports nothing)":
     # where disarming the guard in `mergeFragments` does redden), plus the
     # assumption that this arm reaches that merge on a real Windows host.
     check monitored.completeness == mcIncomplete
+    check subsystemEvidence(monitored).completeness == mcIncomplete

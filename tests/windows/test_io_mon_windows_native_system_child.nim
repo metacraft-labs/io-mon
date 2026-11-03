@@ -1,6 +1,7 @@
 ## No mocks: an x64 fixture starts the actual Windows identity tool. Compare
 ## its native output with a monitored run, including on an ARM64 host where
 ## the system child cannot use the x64 shim. Missing capture must remain loss.
+import descendant_guard_expectations
 import std/[os, osproc, strutils, tempfiles, unittest]
 import io_mon
 
@@ -45,8 +46,8 @@ suite "Windows native system children keep their execution semantics":
     if nativeMachine == 0xaa64'u16:
       check unsupportedSpawn
       check childLoss
-      check monitored.completeness == mcIncomplete
+      check subsystemEvidence(monitored).completeness == mcIncomplete
     else:
       check not unsupportedSpawn
       check not childLoss
-      check monitored.completeness == mcComplete
+      check subsystemEvidence(monitored).completeness == mcComplete

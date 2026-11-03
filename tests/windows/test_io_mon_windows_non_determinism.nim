@@ -34,6 +34,7 @@
 when not defined(windows):
   {.error: "windows-only test".}
 
+import descendant_guard_expectations
 import std/[os, strutils, tempfiles, unittest]
 
 import io_mon
@@ -98,8 +99,8 @@ suite "Windows non-determinism: entropy":
       check sawProgramCaller
       # Evidence, not loss.
       check nonDeterminismObservationCount(res.records) > 0
-      check res.completeness == mcComplete
-      check res.depFile.summary.eventLossCount == 0'u64)
+      check subsystemEvidence(res).completeness == mcComplete
+      check subsystemEvidence(res).summary.eventLossCount == 0'u64)
 
   test "500 entropy calls produce a bounded number of records":
     ## Per-call recording would be both useless and expensive. The evidence M6
@@ -113,7 +114,7 @@ suite "Windows non-determinism: entropy":
       let entropy = recordsOfKind(res, mrNonDeterministic)
       check entropy.len > 0
       check entropy.len <= 8
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)
 
 suite "Windows non-determinism: clocks":
 
@@ -141,8 +142,8 @@ suite "Windows non-determinism: clocks":
         check n == 1
       # Almost every program reads a clock. Downgrading on that would re-run
       # everything, which is the cardinal sin in its other direction.
-      check res.completeness == mcComplete
-      check res.depFile.summary.eventLossCount == 0'u64)
+      check subsystemEvidence(res).completeness == mcComplete
+      check subsystemEvidence(res).summary.eventLossCount == 0'u64)
 
   test "500 clock reads per source still produce one record per source":
     ## The single-call case above cannot tell "recorded once" from "recorded
@@ -162,7 +163,7 @@ suite "Windows non-determinism: clocks":
           if r.path == source:
             inc n
         check n == 1
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)
 
 suite "Windows non-determinism: the stated limit":
 

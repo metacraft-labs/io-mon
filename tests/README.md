@@ -27,6 +27,11 @@ capabilities/render) on **synthetic** records — no `build_shim`, no
 macOS-only API/import. It is **platform-specific** if it builds/injects the shim
 or compiles + runs a live C probe.
 
+The `tests/test_dev_shell_*.sh` scripts at the top level are not part of the
+Nim suite. They test the dev shell itself, run `nix develop` themselves, and
+run through `just test-dev-shell` (see
+`docs/contributors/building-and-testing.md`).
+
 ## How the suite selects tests per OS
 
 `just test` runs `scripts/run_tests.nims`, using the directory catalog shared

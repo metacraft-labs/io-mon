@@ -10,8 +10,9 @@
 ##   (res1_dylib_entropy). The fix attributes entropy to a DLOPEN'd non-system image
 ##   too (a compiler pass-plugin). The CARDINAL-SIN guard: a trivial program — whose
 ##   only entropy is the libsystem startup baseline — STAYS mcComplete, and (covered
-##   by test_io_mon_macos_rd) a real cc compile, whose link-time libLLVM/libc++ draw
-##   benign temp-name entropy, also stays clean.
+##   by test_io_mon_macos_rd) a real `cc -fno-temp-file` compile also stays clean.
+##   clang's temp-name draw in libLLVM, without that flag, IS reported
+##   (test_io_mon_macos_r4_s3b_linktime).
 ##
 ## S3a — SELF-AUTHORED BREAKAWAY-REPORT FORGERY (res4_forge): an in-tree client that
 ##   reads REPRO_MONITOR_SESSION and forges a `complete` report omitting the real

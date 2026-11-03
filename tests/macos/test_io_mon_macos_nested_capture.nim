@@ -1,7 +1,8 @@
 ## Real nested processes and production shims; no mocks. Independent captures
 ## must retain their own scope, and an unfinished handoff must remain a loss.
 ## Every launch is supervised in its own process group with a 30-second bound.
-import std/[os, osproc, sequtils, streams, strutils, tempfiles, unittest]
+import descendant_guard_expectations
+import std/[os, osproc, sequtils, streams, strtabs, strutils, tempfiles, unittest]
 
 when defined(macosx):
   import std/posix
@@ -39,7 +40,20 @@ when defined(macosx):
 
   if paramCount() >= 2 and paramStr(1) == "--reader":
     let work = paramStr(2)
+    doAssert getEnv("DYLD_INSERT_LIBRARIES").split(':')[^1] ==
+      getEnv("REPRO_MONITOR_SHIM_LIB"),
+      "dyld=" & getEnv("DYLD_INSERT_LIBRARIES") & " shim=" &
+      getEnv("REPRO_MONITOR_SHIM_LIB")
     doAssert readFile(work / "inner-input") == "inner"
+    # Also exercise the main executable's Mach-O import stubs (`open`/`read`/
+    # `close`) directly, not only `fopen`'s shared-cache internal call, so both
+    # interpose-bound and body-patched paths run when two distinct shim images
+    # are present in `DYLD_INSERT_LIBRARIES`.
+    let cfd = posix.open((work / "inner-input").cstring, O_RDONLY)
+    doAssert cfd >= 0
+    var cbuf: array[8, char]
+    doAssert posix.read(cfd, addr cbuf[0], 5) == 5
+    doAssert posix.close(cfd) == 0
     doAssert not fileExists(work / "absent-input")
     if paramCount() == 3 and paramStr(3) == "incomplete":
       let fd = rawSyscall(sysOpen, (work / "inner-input").cstring, O_RDONLY, 0, 0, 0, 0, 0)
@@ -53,6 +67,22 @@ when defined(macosx):
   if paramCount() == 4 and paramStr(1) == "--host":
     let work = paramStr(2)
     let mode = paramStr(3)
+    if mode == "clean-env":
+      # Spawn the inner host in an `env -i`-style scrubbed environment with no
+      # `REPRO_MONITOR_*`, `DYLD_INSERT_LIBRARIES` or `CT_SANDBOX_TOOLS_DIR`.
+      var scrubbed = newStringTable(modeCaseSensitive)
+      scrubbed["HOME"] = work
+      scrubbed["PATH"] = "/usr/bin:/bin"
+      let child = startProcess(getAppFilename(),
+        args = @["--host", work, "interest", paramStr(4)],
+        env = scrubbed,
+        options = {poStdErrToStdOut})
+      let childOut = child.outputStream.readAll()
+      let childCode = child.waitForExit()
+      child.close()
+      doAssert childCode == 0, "clean-env inner host failed: " & childOut
+      doAssert readFile(work / "outer-input") == "outer"
+      quit(0)
     putEnv(ShimLibOverrideEnv, paramStr(4))
     var request = FsSnoopRequest(
       command: @[getAppFilename(), "--reader", work],
@@ -92,7 +122,7 @@ when defined(macosx):
     else:
       let inner = runMonitored(request)
       doAssert inner.exitCode == 0
-      doAssert inner.completeness == (if mode == "incomplete": mcIncomplete else: mcComplete)
+      doAssert subsystemEvidence(inner).completeness == (if mode == "incomplete": mcIncomplete else: mcComplete)
     doAssert readFile(work / "outer-input") == "outer"
     quit(0)
 
@@ -112,7 +142,7 @@ suite "macOS nested capture handoff":
     let root = currentSourcePath().parentDir.parentDir.parentDir
     let shim = buildPrivateMacosShim(root)
     let second = work / "inner-shim.dylib"
-    copyFile(shim, second)
+    copyMacosShimAsDistinctImage(shim, second)
 
     test "buffered write failure retains the pending loss marker":
       let nested = expandFilename(work) / "flush-failure"
@@ -128,7 +158,7 @@ suite "macOS nested capture handoff":
       checkpoint("exit=" & $code & " output=" & output)
       require code == 0
 
-    for mode in ["interest", "evidence", "incomplete", "three-level", "abandoned", "interrupted", "failed-write"]:
+    for mode in ["interest", "evidence", "clean-env", "incomplete", "three-level", "abandoned", "interrupted", "failed-write"]:
       test mode:
         let nested = expandFilename(work) / mode
         createDir(nested)
@@ -150,22 +180,30 @@ suite "macOS nested capture handoff":
         let losses = outer.records.filterIt(it.kind == mrEventLoss)
         checkpoint("outer loss=" & $losses)
         if mode in ["abandoned", "interrupted", "failed-write"]:
-          check outer.completeness == mcIncomplete
+          check subsystemEvidence(outer).completeness == mcIncomplete
           check losses.anyIt("nested monitor evidence handoff pending" in it.detail)
           if mode != "failed-write":
             check not fileExists(nested / "inner.iomon")
         elif mode == "incomplete":
-          check outer.completeness == mcIncomplete
+          check subsystemEvidence(outer).completeness == mcIncomplete
           check readMonitorDepFile(nested / "inner.iomon").completeness == mcIncomplete
           check losses.anyIt("syscall(2)" in it.detail)
           check not losses.anyIt("handoff pending" in it.detail)
         else:
-          check outer.completeness == mcComplete
+          check subsystemEvidence(outer).completeness == mcComplete
           check outer.records.anyIt(it.kind == mrFileRead and it.path == nested / "inner-input")
           check outer.records.anyIt(it.kind == mrFileRead and it.path == nested / "outer-input")
+          check not outer.records.anyIt(it.kind == mrLibraryLoad and
+            it.path in [shim, second, expandFilename(shim), expandFilename(second)])
           let inner = readMonitorDepFile(nested / "inner.iomon")
-          check inner.completeness == mcComplete
-          if mode in ["interest", "three-level"]:
+          check subsystemEvidence(inner).completeness == mcComplete
+          check not inner.records.anyIt(it.kind == mrLibraryLoad and
+            it.path in [shim, second, expandFilename(shim), expandFilename(second)])
+          # Two ACTIVE shims in the reader would each record its start: one
+          # process-start per pid means the earlier shim stood down.
+          check inner.records.countIt(it.kind == mrProcessStart) ==
+            inner.records.filterIt(it.kind == mrProcessStart).mapIt(it.osPid).deduplicate.len
+          if mode in ["interest", "clean-env", "three-level"]:
             check not inner.records.anyIt(it.kind == mrFileRead and it.path == nested / "inner-input")
             check inner.observedInterest == {ecAmbientReads}
           if mode == "three-level":

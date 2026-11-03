@@ -39,6 +39,7 @@ import std/[os, osproc, streams, strtabs, strutils, unittest]
 
 when defined(macosx):
   import io_mon
+  import descendant_guard_expectations
   import macos_backend_toggle
   import build_test_cli
 
@@ -261,7 +262,7 @@ suite "io-mon macOS ROUND-4 RW3 exempt-by-name re-breaks":
         if r.kind == mrExternalContent and "chan=opaque role=read" in r.detail:
           sawOpaque = true
       check sawOpaque
-      check dep.completeness == mcIncomplete
+      check subsystemEvidence(dep).completeness == mcIncomplete
 
     test "IP1 CARDINAL SIN: an in-tree pipe()+fork pipeline stays mcComplete":
       # A monitored parent pipe()s + forks; the monitored child reads the inherited

@@ -2,6 +2,7 @@
 ## compile a C program, build the production shim privately, copy it to a second
 ## image, and execute the actual kernel calls with and without injection. Every
 ## child has a timeout; a startup hang fails and is killed/reaped by the fixture.
+import descendant_guard_expectations
 import std/[os, osproc, sequtils, streams, strtabs, strutils, tempfiles, unittest]
 
 when defined(macosx):
@@ -23,7 +24,7 @@ when defined(macosx):
       command: @[getAppFilename(), "--nested-reader", work],
       depFilePath: work / "inner.iomon"))
     doAssert inner.exitCode == 0
-    doAssert inner.completeness == mcComplete
+    doAssert subsystemEvidence(inner).completeness == mcComplete
     doAssert readFile(work / "outer-input") == "outer-input"
     quit(0)
   if paramCount() == 4 and paramStr(1) == "--nested-outer":
@@ -125,7 +126,7 @@ int main(int argc, char **argv) {
     doAssert built.exitCode == 0, built.output
     let shim = buildPrivateMacosShim(root)
     let second = work / "second.dylib"
-    copyFile(shim, second)
+    copyMacosShimAsDistinctImage(shim, second)
 
     test "real variadic syscalls retain arguments, wide results and failure errno":
       for libraries in ["", shim]:
@@ -157,6 +158,10 @@ int main(int argc, char **argv) {
         require fileExists(depfile)
         let dep = readMonitorDepFile(depfile)
         check dep.records.anyIt(it.kind == mrFileRead and it.path == input)
+        check dep.completeness == mcComplete
+        check not dep.records.anyIt(it.kind == mrEventLoss)
+        check not dep.records.anyIt(it.kind == mrLibraryLoad and
+          it.path in [shim, second])
 
     test "independent sessions retain their own reads and nested child evidence":
       let nested = expandFilename(work) / "nested"
@@ -180,7 +185,7 @@ int main(int argc, char **argv) {
       require code == 0
       let inner = readMonitorDepFile(nested / "inner.iomon")
       let outer = readMonitorDepFile(nested / "outer.iomon")
-      check inner.completeness == mcComplete
+      check subsystemEvidence(inner).completeness == mcComplete
       check inner.records.anyIt(it.kind == mrFileRead and
         it.path == nested / "inner-input")
       check outer.records.anyIt(it.kind == mrFileRead and
@@ -188,7 +193,7 @@ int main(int argc, char **argv) {
       check outer.records.anyIt(it.kind == mrFileRead and
         it.path == nested / "inner-input")
       checkpoint("outer loss=" & $outer.records.filterIt(it.kind == mrEventLoss))
-      check outer.completeness == mcComplete
+      check subsystemEvidence(outer).completeness == mcComplete
   else:
     test "macOS-only syscall ABI":
       skip()

@@ -25,6 +25,7 @@
 
 import std/[os, strutils, unittest]
 import io_mon
+import descendant_guard_expectations
 
 when defined(macosx):
   import std/[osproc, streams, strtabs]
@@ -134,7 +135,7 @@ suite "io-mon macOS R5 Phase-3 mmap of out-of-tree fd (Break B)":
             r.detail.contains("mmap-inherited"):
           sawMarker = true
       check sawMarker
-      check dep.completeness == mcComplete
+      check subsystemEvidence(dep).completeness == mcComplete
 
     test "no double-record: an IN-TREE open+mmap is not tagged mmap-inherited-fd":
       # G_intree_mmap opens the marker IN-tree (the open records the dep) then

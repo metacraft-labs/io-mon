@@ -95,3 +95,12 @@ block worktreeLocalNimcache:
   if rel.len > 0:
     cacheDir.add("/" & rel)
   switch("nimcache", cacheDir & "/" & project & suffix)
+
+## 32-bit ARM: 64-bit atomics (`__atomic_*_8` on the shared-memory headers of
+## nim-shm-gset / nim-shm-queue) compile to out-of-line libatomic calls with
+## GCC's ARMv6 baseline, which is what Raspberry Pi OS's native `gcc` targets;
+## without the library every native link of the shim, the CLI or a test ends
+## in `undefined reference to __atomic_load_8`. clang -march=armv7-a inlines
+## them and the library is then merely unused. Measured on rpi2, 2026-10-30.
+when defined(linux) and defined(arm):
+  switch("passL", "-latomic")

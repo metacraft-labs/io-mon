@@ -39,7 +39,9 @@ when defined(macosx):
   from build_test_shim import buildPrivateMacosShim
 
   proc buildShim(): string =
-    buildPrivateMacosShim(repoRoot)
+    # The independent loader control requires the actual SIP /bin/cat.
+    # Suppress the shipped fallback in this private production shim.
+    buildPrivateMacosShim(repoRoot, builtToolsDir = "")
 
   proc cc(args: string) =
     let ccBin = getEnv("CC", "cc")

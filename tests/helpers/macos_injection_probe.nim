@@ -5,8 +5,14 @@
 
 import std/[os, osproc, streams, strtabs, strutils]
 
-proc injectedImages*(probe: string; args: seq[string] = @[]): seq[string] =
-  let work = probe.parentDir() / "loader-control"
+proc injectedImages*(probe: string; args: seq[string] = @[];
+    workRoot = ""; envOverrides: openArray[(string, string)] = [];
+    isolateEnv = false): seq[string] =
+  ## A read-only installed executable can use fixture-owned workRoot. Optional
+  ## child isolation matches clean-environment probes without affecting the
+  ## host environment used to compile this independent constructor.
+  let work = (if workRoot.len > 0: workRoot else: probe.parentDir()) /
+    "loader-control"
   createDir(work)
   let source = work / "probe.c"
   let dylib = work / "probe.dylib"
@@ -33,7 +39,10 @@ __attribute__((constructor)) static void record_image(void) {
   doAssert code == 0, "loader control compilation failed: " & output
   removeFile(evidence)
   var env = newStringTable(modeCaseSensitive)
-  for k, v in envPairs(): env[k] = v
+  if not isolateEnv:
+    for k, v in envPairs(): env[k] = v
+  for (key, value) in envOverrides:
+    env[key] = value
   env.del("CT_SANDBOX_TOOLS_DIR")
   env.del("REPRO_MONITOR_SHIM_LIB")
   env["DYLD_INSERT_LIBRARIES"] = dylib

@@ -94,6 +94,40 @@ proc initPodTables*() {.raises: [].} =
   initLock(fdSetLock)
   podTablesReady = true
 
+proc lockIsFree*(lock: var Lock): bool {.raises: [].} =
+  ## Whether `lock` is unheld: try to take it and give it straight back.
+  ## Meant for a fork child, the only thread of its process: a lock it finds
+  ## taken was held by a parent thread that does not exist here, so the data
+  ## it guards may be half-updated.
+  if not tryAcquire(lock):
+    return false
+  release(lock)
+  true
+
+proc podTablesLocksFree*(): bool {.raises: [].} =
+  ## In a fork child: whether no parent thread held any table lock at the
+  ## fork, so every table is in a state some complete update left it in.
+  lockIsFree(fdLockV) and lockIsFree(dirMap.lock) and
+    lockIsFree(streamMap.lock) and lockIsFree(observed.lock) and
+    lockIsFree(fdSetLock)
+
+when defined(ioMonShimForkLockTest):
+  proc podTablesTestHoldLock*(which: int; hold: bool): bool {.raises: [].} =
+    ## Test-only (`-d:ioMonShimForkLockTest`): take (`hold`) or give back
+    ## table lock `which` (0 fd paths, 1 dir map, 2 stream map, 3 observed
+    ## set, 4 fd sets) on the calling thread, so a test can fork while
+    ## another thread holds it. False for an unknown index.
+    template flip(lock: untyped) =
+      if hold: acquire(lock) else: release(lock)
+    case which
+    of 0: flip(fdLockV)
+    of 1: flip(dirMap.lock)
+    of 2: flip(streamMap.lock)
+    of 3: flip(observed.lock)
+    of 4: flip(fdSetLock)
+    else: return false
+    true
+
 proc dupCString(path: cstring; outLen: var int): cstring {.raises: [].} =
   ## libc-malloc a NUL-terminated copy of ``path``. Returns nil on OOM (the
   ## caller then simply does not track that entry — never a crash).

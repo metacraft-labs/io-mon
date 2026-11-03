@@ -196,14 +196,16 @@ suite "io-mon macOS R5-P2 determinism evidence (live)":
       # baseline, so ZERO mrNonDeterministic records must appear and the depfile
       # must not be flooded. Uses the injectable Nix cc (the system cc is
       # SIP-hardened → an un-injectable subtree whose event-loss is unrelated to
-      # this change, per test_io_mon_macos_rd.nim).
+      # this change, per test_io_mon_macos_rd.nim). `-fno-temp-file` removes
+      # clang's own temp-name draw in libLLVM, which is reported by design
+      # (test_io_mon_macos_r4_s3b_linktime); what is left is the baseline.
       let ccBin = findExe(getEnv("CC", "cc"))
       doAssert ccBin.len > 0, "cc not found for the cardinal-sin regression"
       let srcPath = work / "input.c"
       writeFile(srcPath, "int main(void){return 0;}\n")
       let ccOut = work / "cc_regression.o"
       let dep = runProbe(shim, ccBin,
-        @["-arch", "arm64", "-c", srcPath, "-o", ccOut])
+        @["-arch", "arm64", "-fno-temp-file", "-c", srcPath, "-o", ccOut])
       var ndet = 0
       for r in dep.records:
         if r.kind == mrNonDeterministic: inc ndet

@@ -9,6 +9,7 @@
 import std/[os, osproc, strtabs, strutils, tempfiles, unittest]
 import io_mon
 import fixture_cleanup
+import descendant_guard_expectations
 
 if paramCount() == 2 and paramStr(1) == "--session-scope-reader":
   doAssert readFile(paramStr(2)) == "host-session-scope-input"
@@ -34,7 +35,9 @@ proc capture(ambient, shim: string): tuple[exitCode, starts, reads: int;
       command: @[getAppFilename(), "--session-scope-reader", input],
       depFilePath: work / "capture.iomon"))
     result.exitCode = monitored.exitCode
-    result.completeness = monitored.completeness
+    # Session scoping must introduce no loss beyond the platform's explicit
+    # descendant-lifetime limitation; all other loss remains observable.
+    result.completeness = subsystemEvidence(monitored).completeness
     result.parentUnchanged = getEnv("REPRO_MONITOR_SESSION") == ambient and
       existsEnv("REPRO_MONITOR_SESSION") == (ambient.len > 0)
     for record in monitored.records:

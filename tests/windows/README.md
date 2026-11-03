@@ -229,3 +229,23 @@ when the 32-bit artefacts are absent. Note that `nt-pipe-client` is therefore
 offset unconditionally — so a 32-bit client calling `NtCreateFile` directly on
 a pipe has no coverage _and_ no classification. The kernel32 arm covers every
 client that goes through `CreateFileW`, which is nearly all of them.
+
+## The tree-lifetime guard
+
+`test_io_mon_windows_tree_lifetime_guard.nim` pins the Job Object guard
+(reprobuild-pm `spec/io-mon-Windows-Tree-Lifetime-Guard.md`) with real
+processes: a quiesced control, a detached descendant named by pid and image, a
+descendant that dies inside the window, a refused `CREATE_BREAKAWAY_FROM_JOB`,
+a real nesting refusal (a helper host nests itself into jobs until the
+kernel's depth limit), DH-4 evidence identity across both launch paths, and a
+nested monitor. Its held descendant waits on a named EVENT, not on a sentinel
+file: a still-running process that polls for a file emits a timing-dependent
+number of probe records, which no two launch paths could agree on.
+
+The guard's remaining failure modes (the job cannot be created, its limits
+cannot be read or permit breakaway, the census fails) have no outside lever,
+so `test_io_mon_windows_tree_lifetime_guard_faults.nim` reaches them through a
+seam compiled only under `-d:ioMonWindowsJobGuardFaultTest`. Its sibling
+`.nims` sets that define for that one binary. The seam follows the rule above
+and goes further: it can only make the guard FAIL, and it makes the real Win32
+call fail with a real bad argument rather than faking a result.

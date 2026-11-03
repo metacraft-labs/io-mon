@@ -193,11 +193,17 @@ suite "io-mon macOS R-D non-file determinism (live, r2_implicit corpus)":
       # UNRELATED subtree-injection machinery when a full link spawns ld, so we
       # assert the R-D-specific property — no false non-determinism flag — rather
       # than the env-dependent mcComplete.)
+      #
+      # `-fno-temp-file`: without it clang draws arc4random in libLLVM for the
+      # name of the temporary it writes `-o` through. That draw is clang's OWN
+      # and IS reported (test_io_mon_macos_r4_s3b_linktime), as on Linux; this
+      # guard is about the system baseline, so it takes the compile that draws
+      # nothing of its own.
       let ccBin = findExe(getEnv("CC", "cc"))
       doAssert ccBin.len > 0, "cc not found for the cardinal-sin regression"
       let ccOut = work / "cc_regression.o"
       let dep = runProbe(shim, ccBin,
-        @["-arch", "arm64", "-c", srcPath, "-o", ccOut])
+        @["-arch", "arm64", "-fno-temp-file", "-c", srcPath, "-o", ccOut])
       var ndet = 0
       for r in dep.records:
         if r.kind == mrNonDeterministic: inc ndet

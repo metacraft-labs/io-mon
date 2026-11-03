@@ -123,7 +123,9 @@ It is the mechanism that produced the defect.
   relation in the same run (`truth ⊆ observed`, 0 missed of 10), plus one test per
   awkward case: loaded-before-the-shim, publish-before-use under `SIGKILL`, `dlopen`
   from a worker thread, `dlopen`+`dlclose`, an unobservable load that must downgrade,
-  and a statically-linked binary (no shim at all — covered by the subtree guard).
+  and a statically-linked binary (no shim at all — covered by the root-spawn
+  guard, and by the uninjectable-image check at its entry; see
+  `tests/linux/test_io_mon_uninjectable_image_entry.nim`).
 - `tests/portable/test_io_mon_capabilities.nim` — the capability is advertised, it is
   in `InputEvidenceCapabilities`, a missing input capability downgrades with an empty
   consumer ask, and a non-input gap does **not** destroy the signal.

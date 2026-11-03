@@ -94,8 +94,11 @@ removes that marker only after writing, checking the buffered close and
 atomically publishing the completed evidence fragment. A killed host, abandoned
 handle or failed publication therefore leaves the outer capture incomplete.
 This handoff requires a cooperating host to finish its monitor; it does not
-provide live event delivery from an unfinished inner session or a macOS
-detached-descendant guard.
+provide live event delivery from an unfinished inner session. macOS finishes
+fail incomplete with an explicit tree-lifetime uncertainty marker, even for a
+quiesced root; Windows proves quiescence with a Job Object, and a nested
+monitor's job nests inside its enclosing one. See the normative descendant
+guard contracts in `usage.md`.
 
 Implementation: `src/io_mon/nested_capture.nim` and `fs_snoop.nim`.
 The real-process controls are in
@@ -105,7 +108,7 @@ three nesting levels, inner loss, interruption and real filesystem failures.
 ### Linux
 
 - **`LD_PRELOAD` Shim**: Injects wrapper symbols that route filesystem activity to the monitor.
-- **Raw Syscall Hooking**: Uses a raw-syscall SIGTRAP substrate to intercept inline `0f 05` assembly instructions inside main executable pages and custom dynamic libraries.
+- **Raw Syscall Hooking**: Uses a raw-syscall SIGTRAP substrate to intercept inline `0f 05` assembly instructions inside main executable pages and custom dynamic libraries. Only the image's executable sections (`SHF_EXECINSTR`, read from its ELF section table through `linux_image_code_ranges`) are scanned: an `R E` segment can also carry `.rodata`/`.eh_frame` (BOLT output, `-z noseparate-code`), and decoding that data once INT3-patched a jump-table entry of rustc 1.94.0. An image whose section table cannot be read is left unscanned and reported as event loss (`skipped image without a readable executable-section table`).
 - **Library-Load Observation (`dl_iterate_phdr`)**: `ld.so` maps a shared object through
   internal `__mmap` / `__open64_nocancel` calls that do **not** traverse `LD_PRELOAD`
   symbol interposition, so no file hook can ever see a loader-driven load. io-mon
@@ -123,12 +126,33 @@ three nesting levels, inner loss, interruption and real filesystem failures.
   (the pre-existing kill-before-flush inherent-loss class). `LD_AUDIT`'s `la_objopen`
   would close that at the cost of a second injected copy of io-mon per process, in its
   own link-map namespace — see `docs/cases/dlopen-runpath-transparency.md` alternative C.
+- **32-bit glibc (armhf)**: On LP64 each `*64` function is an alias of its plain
+  twin, and the shim exports the `*64` names as aliases of its interpositions. On
+  ILP32 they are different functions with different structures (`struct stat64`,
+  `off64_t`, `struct dirent64`), and a program built with `_TIME_BITS=64` — all of
+  Debian's armhf userland since trixie — calls `__stat64_time64`,
+  `__glob64_time64`, `__clock_gettime64` and friends instead. There each name is a
+  separate interposition that forwards to the real function of the same name and
+  reports through its plain twin's observer; the shim's own C is compiled with
+  `_TIME_BITS` / `_FILE_OFFSET_BITS` undefined so its plain definitions keep the
+  plain ABI. The ARM EABI raw syscall is issued with `svc #0` (number in r7,
+  swapped in around the trap because r7 is Thumb's frame pointer). 8-byte atomics
+  are inline only from ARMv7 on (`ldrexd`/`strexd`), so the shim and its consumers
+  are built for ARMv7; an ARMv6 build turns them into libatomic calls, which nothing
+  links. Do not read the baseline off the linked image: `readelf -A` on it reports
+  `Tag_CPU_arch: v6` / `Tag_FP_arch: VFPv2`, because lld copies the build attributes
+  of the first object it links, Debian's `crt1.o`, which is built for the armhf
+  floor. The compiled code's baseline is what the compiler was told
+  (`-march=armv7-a -mfpu=vfpv3-d16`), and the check that holds is a probe compiled
+  through the same flags asserting `__ARM_ARCH >= 7` and an inline `ldrexd`
+  (reprobuild's `scripts/cross/build_linux_cross.sh` does exactly that).
 - **File Transfers**: Tracks vector/zero-copy operations (`pread`, `readv`, `sendfile`, `copy_file_range`, `splice`) and records them as reads/writes.
 - **Non-File Tracking**: Logs `getenv`, `uname`, `sysconf` accesses, system time calls, and entropy (non-determinism) events. The entropy surface is `getrandom` (libc symbol, raw syscall and vDSO entry) plus the glibc >= 2.36 BSD set `getentropy` / `arc4random` / `arc4random_buf` / `arc4random_uniform`, deduped once per process per source — the same cross-platform observation contract the macOS shim follows (see `mrNonDeterministic` in `src/io_mon/types.nim`).
 
 ### Windows
 
 - **Hook Injection**: Hooks APIs using `CreateRemoteThread` and `LoadLibraryW` to inject shims into child processes, mirroring macOS environment variables.
+- **Tree-lifetime guard (Job Object)**: the root is assigned, still suspended, to a fresh job that refuses breakaway (`stackable_hooks.runWithMonitorShim(job = …)`), and a capture is complete only once the job's active-process count reaches zero after the root exits (`src/io_mon/windows_job_guard.nim`, decided in `fs_snoop.settleMonitorDescendants`). Normative contract: `docs/usage.md`, "The Windows tree-lifetime guard (normative)".
 - **Child architecture**: The x86 shim queries
   `GetProcessInformation(ProcessMachineTypeInfo)` before child propagation,
   with `IsWow64Process2` as the older-OS fallback. The explicit query

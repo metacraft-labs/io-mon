@@ -26,6 +26,7 @@
 when not defined(windows):
   {.error: "windows-only test".}
 
+import descendant_guard_expectations
 import std/[os, strutils, tempfiles, unittest]
 import ../helpers/windows_fixture_child
 
@@ -75,7 +76,7 @@ suite "Windows process-start survives the merge":
     # spawn unmatchable, and an unmatched spawn is an unknown-scope loss. The
     # completeness grade is what a consumer keys its publish decision on, so
     # assert the grade and not just the record count.
-    check result.completeness == mcComplete
+    check subsystemEvidence(result).completeness == mcComplete
 
     for r in result.records:
       if r.kind == mrEventLoss:

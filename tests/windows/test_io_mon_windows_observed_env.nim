@@ -43,6 +43,7 @@
 when not defined(windows):
   {.error: "windows-only test".}
 
+import descendant_guard_expectations
 import std/[os, strutils, tempfiles, times, unittest]
 
 import io_mon
@@ -162,8 +163,8 @@ suite "Windows observed-env: the Win32 surface":
       # An observed declared input is EVIDENCE, never loss. Downgrading on an
       # environment read would re-run every build that reads PATH, which is
       # every build.
-      check res.completeness == mcComplete
-      check res.depFile.summary.eventLossCount == 0'u64)
+      check subsystemEvidence(res).completeness == mcComplete
+      check subsystemEvidence(res).summary.eventLossCount == 0'u64)
 
   test "a variable that is SET and never read is NOT recorded":
     ## The other direction, and the one that fails against an implementation
@@ -208,7 +209,7 @@ suite "Windows observed-env: the Win32 surface":
       # other cases -- one read by them, one never read by anything.
       check ObservedVar notin envNames(res)
       check UnreadVar notin envNames(res)
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)
 
   test "a lookup that found NOTHING is still recorded":
     ## Absence is a dependency. A build that behaves one way with a variable
@@ -220,7 +221,7 @@ suite "Windows observed-env: the Win32 surface":
       let res = runFixture(dir, "env-absent", AbsentVar)
       check res.exitCode == 0
       check AbsentVar in envNames(res)
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)
 
 suite "Windows observed-env: the CRT surfaces":
 
@@ -237,7 +238,7 @@ suite "Windows observed-env: the CRT surfaces":
       for suffix in ["MGETENV", "MWGETENV", "MGETENVS", "MWGETENVS"]:
         checkpoint("msvcrt entry point: " & suffix)
         check entryPointVar(suffix) in names
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)
 
   test "the UCRT's getenv family is recorded":
     ## The runtime MSVC, clang-cl, mingw-w64 UCRT builds, Node and Python all
@@ -252,7 +253,7 @@ suite "Windows observed-env: the CRT surfaces":
                      "UDUPENVS", "UWDUPENVS"]:
         checkpoint("ucrtbase entry point: " & suffix)
         check entryPointVar(suffix) in names
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)
 
 suite "Windows observed-env: the whole-block read":
 
@@ -283,7 +284,7 @@ suite "Windows observed-env: the whole-block read":
           # it". Both are dependencies; only the first is evidence the program
           # cared.
           check r.detail.contains("scope=block")
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)
 
   test "a block read from a SYSTEM image is NOT expanded":
     ## The other side of the gate, and it exists because mutation testing
@@ -313,7 +314,7 @@ suite "Windows observed-env: the whole-block read":
       check envSize > 10
       check envNames(res).len < envSize div 4
       check UnreadVar notin envNames(res)
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)
 
   test "the block expansion still refuses the denylisted control variables":
     ## The block contains `REPRO_MONITOR_*` -- the engine put them there. If
@@ -338,7 +339,7 @@ suite "Windows observed-env: what must NOT reach the record":
       check res.exitCode == 0
       checkpoint("recorded names: " & envNames(res).join(","))
       check DeniedVar notin envNames(res)
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)
 
 suite "Windows observed-env: dedup and cost":
 
@@ -362,7 +363,7 @@ suite "Windows observed-env: dedup and cost":
       let res = runFixture(dir, "env-loop", LoopVar)
       check res.exitCode == 0
       check countOf(res, LoopVar) == 1
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)
 
   test "300 distinct variables are each recorded exactly once":
     ## The dedup the trampoline consults is a fixed-size open-addressed table,
@@ -391,7 +392,7 @@ suite "Windows observed-env: dedup and cost":
         " duplicated: " & duplicated.join(","))
       check missing.len == 0
       check duplicated.len == 0
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)
 
   test "50000 reads cost bounded wall time under the monitor":
     ## `getenv` is HOT, and the trampoline here cannot take the entropy and

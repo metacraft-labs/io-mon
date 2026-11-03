@@ -88,6 +88,14 @@ int main(int argc, char **argv) {
 
   int monitor_fd = fragment_fd();
   if (monitor_fd < 0) return 6;
+  /* fragment_fd's readlink calls are themselves observed (path probes), so
+     they dirtied the batch again. Flush that cycle the same way before the
+     descriptor is replaced: the replacement must find no buffered frames, or
+     the signal-safe flush below rightly drops them and reports the loss. */
+  child = fork();
+  if (child < 0) return 4;
+  if (child == 0) _exit(0);
+  if (waitpid(child, NULL, 0) != child) return 5;
   int channel[2];
   if (pipe(channel) != 0) return 7;
   /* dup2 closes monitor_fd inside the kernel without calling close(). */

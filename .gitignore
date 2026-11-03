@@ -22,6 +22,9 @@ test-logs/
 # minus the extension. Ignore the binaries, keep the sources.
 tests/*/test_*
 !tests/*/test_*.nim
+# A test's own NimScript config (per-test defines, e.g. a compile-gated fault
+# seam) is source too.
+!tests/*/test_*.nims
 
 # Reprobuild environment cache
 .repro/

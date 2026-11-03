@@ -25,6 +25,7 @@
 when not defined(windows):
   {.error: "windows-only test".}
 
+import descendant_guard_expectations
 import std/[os, strutils, tempfiles, unittest]
 
 import io_mon
@@ -82,7 +83,7 @@ suite "Windows external content: mapped views of files":
           check r.observationKind == moFileRead
           sawMappedRead = true
       check sawMappedRead
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)
 
 suite "Windows external content: shared memory":
 
@@ -94,7 +95,7 @@ suite "Windows external content: shared memory":
       check channelRecords(res, "shm", "create").len > 0
       check channelRecords(res, "shm", "attach").len > 0
       check externalContentLossCount(res.records) == 0
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)
 
   test "joining an OUT-OF-TREE section downgrades the capture":
     ## The section is created by this test process, which is not monitored, so
@@ -116,7 +117,7 @@ suite "Windows external content: shared memory":
       check sawName
       check channelRecords(res, "shm", "create").len == 0
       check externalContentLossCount(res.records) >= 1
-      check res.completeness == mcIncomplete)
+      check subsystemEvidence(res).completeness == mcIncomplete)
 
   test "CreateFileMapping over a name ALREADY OWNED out of tree is an attach":
     ## The branch that decides whether a section is an input, tested through the
@@ -160,7 +161,7 @@ suite "Windows external content: shared memory":
             "create: " & r.detail & " path=" & r.path)
           fail()
       check externalContentLossCount(res.records) >= 1
-      check res.completeness == mcIncomplete)
+      check subsystemEvidence(res).completeness == mcIncomplete)
 
 suite "Windows external content: anonymous pipes":
 
@@ -189,7 +190,7 @@ suite "Windows external content: anonymous pipes":
           pairedRead = true
       check pairedRead
       check externalContentLossCount(res.records) == 0
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)
 
   test "an INHERITED pipe pairs across two processes on one identity":
     ## The case the in-process test above structurally cannot reach.
@@ -230,7 +231,7 @@ suite "Windows external content: anonymous pipes":
           pairedAcrossProcesses = true
       check pairedAcrossProcesses
       check externalContentLossCount(res.records) == 0
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)
 
 suite "Windows external content: alternate data streams":
 
@@ -265,7 +266,7 @@ suite "Windows external content: alternate data streams":
       # An ADS is content on a path the capture already fingerprints, so it is
       # deliberately NOT one of the roles the merge downgrades on.
       check externalContentLossCount(res.records) == 0
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)
 
 suite "Windows external content: what must NOT be classified":
 
@@ -283,4 +284,4 @@ suite "Windows external content: what must NOT be classified":
           checkpoint("unexpected external-content record: " & r.detail &
             " path=" & r.path)
           fail()
-      check res.completeness == mcComplete)
+      check subsystemEvidence(res).completeness == mcComplete)

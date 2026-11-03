@@ -21,6 +21,7 @@
 when not defined(windows):
   {.error: "windows-only test".}
 
+import descendant_guard_expectations
 import std/[os, strutils, tempfiles, unittest]
 import ../helpers/windows_fixture_child
 
@@ -185,7 +186,7 @@ suite "Windows library-load observation":
     # And the run stays complete: the enumeration runs on the injector's
     # remote init thread, whose read batch has to be flushed before that
     # thread exits or the records become a kill-before-flush loss instead.
-    check result.completeness == mcComplete
+    check subsystemEvidence(result).completeness == mcComplete
 
   test "library loads are recorded as reads so their bytes are fingerprinted":
     # `moFileRead` is what makes an in-place DLL upgrade bust a cached action.

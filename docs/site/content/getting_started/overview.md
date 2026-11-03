@@ -34,7 +34,7 @@ Most traditional build systems rely on compiler-emitted dependency lists (such a
 When a monitored root process runs, `io-mon` tracks the full lifetime of all descendant processes across:
 
 - `fork` and `vfork`
-- `execve`, `fexecve`, and `posix_spawn`
+- `execve`, `execveat`, `fexecve`, and `posix_spawn`
 - Windows process creation (`CreateProcessW`)
 
 Every event records the exact originating `osPid`, `parentOsPid`, and `threadId`, producing a complete tree of execution.

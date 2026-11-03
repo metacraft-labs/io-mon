@@ -12,22 +12,25 @@
 ##
 ## ROUND-4 FIX: narrow the exemption from "all link-time images" to "link-time images
 ## under a recognized TOOLCHAIN prefix" (/nix/store, /opt/homebrew, /usr/local, the
-## Xcode/Developer trees — ct_macos_path_is_toolchain). A link-time CUSTOM dylib in
-## the BUILD/PROJECT tree (NOT under a toolchain prefix) is now registered for entropy
-## caller-attribution, so its arc4random draws ARE recorded as an mrNonDeterministic
-## EVIDENCE record.
+## Xcode/Developer trees), so a link-time CUSTOM dylib in the build tree is attributed.
+##
+## That prefix exemption was itself the next hole (reprobuild-pm issue
+## 2026-10-14-macos-monitoring-does-not-report-entropy-drawn-by-toolchain-dylibs): a
+## Nix clang's libLLVM draws arc4random for the name of the temporary it writes `-o`
+## through, the shim saw it and DISCARDED it, and a consumer edge with no entropy
+## blessing published over it -- while the Linux preload shim reports the same draw.
+## Every non-system image is now attributed, link-time or dlopen'd, wherever it is
+## installed; whether a tool's entropy is harmless is the consumer's per-tool blessing.
 ##
 ## DETERMINISM MODEL (canonical, cross-platform): entropy is recorded as EVIDENCE, not
 ## a completeness loss — the depfile stays mcComplete (the monitor observed everything)
 ## and the CONSUMER folds the mrNonDeterministic record into its cache-key/invalidation
-## policy (a build that drew entropy is not served from cache). S3b's contribution is
-## therefore the EVIDENCE DISTINCTION: a custom link-time entropy dylib emits an
-## arc4random evidence record; a toolchain compile emits NONE. Both stay mcComplete.
+## policy (a build that drew entropy is not served from cache).
 ##
-## CARDINAL SIN (dominates): a real cc compile MUST emit ZERO entropy evidence. cc here
-## is a Nix clang whose libLLVM/libc++/libffi/libxml2 all live under /nix/store (under
-## a toolchain prefix), so their benign startup entropy stays EXEMPT — no spurious
-## evidence record that would make the consumer needlessly re-run every compile.
+## CARDINAL SIN (still dominates): the libsystem/libobjc/libcorecrypto STARTUP baseline
+## lives in /usr/lib and the dyld shared cache, never in a registered image, so a clang
+## compile that draws nothing of its own (`-fno-temp-file`) emits ZERO evidence even
+## though libLLVM and friends are now registered.
 ##
 ## macOS-only; a no-op pass elsewhere.
 
@@ -135,22 +138,60 @@ suite "io-mon macOS R4 S3b link-time dylib entropy attribution":
       # the EVIDENCE record above, contrasted with the toolchain compile's ZERO below.
       check dep.completeness == mcComplete
 
-    test "CARDINAL SIN: a real cc compile (toolchain libLLVM entropy) emits NO evidence":
-      # The keystone: cc is a Nix clang whose link-time libLLVM/libc++ live under
-      # /nix/store (a toolchain prefix) and draw benign temp-name/hash entropy. The
-      # round-4 fix keeps that exempt, so a normal compile emits ZERO entropy evidence
-      # — a spurious evidence record here would make the consumer needlessly re-run
-      # EVERY compile in a build. Completeness is mcComplete (monitor saw everything).
-      let srcFile = work / "hello.c"
-      writeFile(srcFile, "int main(void){ return 0; }\n")
+    # The compiler under test: an ABSOLUTE path (startProcess does not search
+    # PATH). In the dev shell it is the Nix clang wrapper, whose real clang links
+    # libLLVM.dylib from /nix/store.
+    var ccBin = getEnv("CC", "cc")
+    if not ccBin.isAbsolute: ccBin = findExe(ccBin)
+    doAssert ccBin.len > 0 and fileExists(ccBin), "cc not found on PATH"
+    let srcFile = work / "hello.c"
+    writeFile(srcFile, "int main(void){ return 0; }\n")
+
+    proc loadsToolchainLibLLVM(dep: MonitorDepFile): bool =
+      ## Vacuity guard: the compile really ran a clang whose libLLVM is a
+      ## LINK-TIME dylib under a toolchain prefix -- the image class the old
+      ## prefix exemption silenced. Without it the tests below would prove
+      ## nothing about that class.
+      for r in dep.records:
+        if r.kind == mrLibraryLoad and r.path.startsWith("/nix/store/") and
+            "libLLVM" in r.path.extractFilename():
+          return true
+
+    test "REGRESSION: a toolchain dylib's entropy (clang's temp-file name in libLLVM) is reported":
+      # reprobuild-pm issue 2026-10-14-macos-monitoring-does-not-report-entropy-
+      # drawn-by-toolchain-dylibs. clang names the temporary it writes `-o`
+      # through with `llvm::sys::Process::GetRandomNumber`, which calls
+      # arc4random from libLLVM.dylib -- a LINK-TIME dylib under /nix/store.
+      # The shim used to exempt every link-time dylib under a "toolchain" prefix
+      # (/nix/store, /opt/homebrew, /usr/local, the Xcode trees), so this draw
+      # was seen and discarded: no record, and a consumer with no blessing for
+      # the tool published over it. The Linux preload shim reports the same
+      # draw. Whether a tool's entropy is harmless is the CONSUMER's blessing
+      # decision (made per process image), not a path prefix's.
       let objOut = work / "hello.o"
-      # startProcess needs an ABSOLUTE program path (it does not search PATH).
-      var ccBin = getEnv("CC", "cc")
-      if not ccBin.isAbsolute: ccBin = findExe(ccBin)
-      doAssert ccBin.len > 0 and fileExists(ccBin), "cc not found on PATH"
       let dep = runProbe(shim, ccBin,
         @["-arch", "arm64", "-c", srcFile, "-o", objOut])
       doAssert fileExists(objOut), "cc produced no object file"
+      check loadsToolchainLibLLVM(dep)
+      var sawArc = false
+      for r in dep.records:
+        if r.kind == mrNonDeterministic and r.path == "arc4random": sawArc = true
+      check sawArc
+      # Evidence, not a completeness loss: the monitor observed the draw.
+      check dep.completeness == mcComplete
+
+    test "CARDINAL SIN: a clang compile that draws no entropy of its own emits NO evidence":
+      # The same compile with `-fno-temp-file` writes the object directly, so
+      # clang draws no randomness of its own. Everything the run still draws is
+      # the libsystem/libobjc/libcorecrypto startup baseline in /usr/lib and the
+      # shared cache, which the caller attribution excludes. A record here would
+      # mean that baseline leaked, and every compile would look
+      # non-deterministic.
+      let objOut = work / "hello-no-temp.o"
+      let dep = runProbe(shim, ccBin,
+        @["-arch", "arm64", "-fno-temp-file", "-c", srcFile, "-o", objOut])
+      doAssert fileExists(objOut), "cc produced no object file"
+      check loadsToolchainLibLLVM(dep)
       check countNonDeterministic(dep) == 0
       check dep.completeness == mcComplete
 
