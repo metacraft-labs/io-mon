@@ -564,21 +564,43 @@ named-survivor loss, the failure diagnostics, what it does not cover) is
 normative in `docs/usage.md`, "The Windows tree-lifetime guard (normative)";
 the design is reprobuild-pm `spec/io-mon-Windows-Tree-Lifetime-Guard.md`.
 
-**macOS limitation (normative).** Root exit alone does not prove that the
-process tree is empty. The macOS backend has neither a complete kernel
-descendant census nor a tree-lifetime primitive. Every finished macOS capture
-MUST therefore publish an `mrEventLoss` / `moEventLoss` record with detail
-`detached-descendant quiescence cannot be established: macos backend has no complete tree-lifetime guard run=<id>`
-before evidence is merged. This applies even when no spawn was observed, to
-batch and decomposed hosts, every interest set and evidence scope, and both
-in-memory and on-disk depfiles. Such captures MUST grade `mcIncomplete`;
-consumers must conservatively rebuild. The marker states uncertainty, not
-proof that a descendant exists. Process and file evidence remains available
-for diagnosis. Linux retains its real descendant scan and grace window, and
-Windows its job guard; neither platform's knobs have any effect on the macOS
-limitation. There is no override that promotes these captures to complete.
-The real gated macOS regression also checks a fully quiesced control, which
-fails closed for the same reason.
+**macOS: a kernel census, in the same funnel.** macOS has no Job Object and no
+subreaper, so it proves the property the way Linux does, by scanning, with one
+rule Linux lacks, plus a second source of evidence. After the root is reaped,
+the guard takes a single `sysctl(KERN_PROC_ALL)` snapshot, skips processes that
+started before the root (by the kernel's monotonic start time, so a wall-clock
+step cannot hide a descendant), and reads each remaining process's live
+argument/environment area (`KERN_PROCARGS2`) for this run's needles. A sweep
+counts only if it finds no carrier AND no young process it could not classify.
+A young process that vanished between the snapshot and its read counts as
+unclassified, because it may have forked after the snapshot, so a clean sweep
+proves that no carrier was alive at the snapshot instant.
+
+That area is the process's own memory, and a process can overwrite its needles
+in place (setproctitle-style; PostgreSQL does it on Darwin), after which the
+census cannot tell it from an unrelated process. So the same snapshot is also
+checked against the run's **tree ledger** (`src/io_mon/tree_ledger.nim`): one
+file per process the shim saw come into existence, named by (pid, kernel start
+time), written synchronously before the creating call or shim init returns to
+the program, and not gated by the event interest. A live ledger process is a
+live descendant whatever its memory says. The `mrProcessStart` /
+`mrProcessSpawn` records carry the same identities but cannot serve: they are
+batched until the producer flushes, which a quiet live process never does, and
+they are gated by `ecProcessTree`. Which mechanism catches which descendant,
+and the one residual case (a raw-syscall fork whose child also overwrites its
+area), is argued in the header of `src/io_mon/macos_tree_guard.nim`. Linux's
+`/proc/<pid>/environ` scan reads live memory too and has no ledger yet (io-mon
+issue `2026-10-30-linux-descendant-guard-misses-an-overwritten-environment`).
+
+The census and the ledger check run inside `settleMonitorDescendants`, so the
+DH-3 argument above holds unchanged. Platform (SIP) binaries hide their environment from it. They are
+covered by the unmonitored-subtree accounting instead, whose creating record
+survives a creator SIGKILLed right after the spawn (a pinned case). Its
+contract (knobs, the named-survivor loss, the failure diagnostics, what it does
+not cover) is normative in `docs/usage.md`, "The macOS tree-lifetime guard
+(normative)". The retired blanket marker
+(`detached-descendant quiescence cannot be established: macos backend has no
+complete tree-lifetime guard`) is no longer published.
 
 A DROPPED handle deliberately does NOT run the guard: it is an evidence step
 and a dropped handle publishes no edge for a loss marker to downgrade. That

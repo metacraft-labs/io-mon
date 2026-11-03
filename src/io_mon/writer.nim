@@ -277,6 +277,10 @@ type
     fragmentDirBuf: array[FragmentDirBufLen, char]
     osPid: uint64
     threadId: uint64
+    ownerPid: int
+      ## The process that OPENED this slot. A fork child inherits the slot
+      ## (the parent's descriptor and its in-flight batch) with a different
+      ## pid; see `slotInheritedAcrossFork`.
     # M9.R.15f.1 — per-thread batch buffer. ``batchLen`` records how
     # many bytes of ``batchBuf`` are currently populated; flush
     # consumes the populated prefix and resets ``batchLen`` to 0.
@@ -1436,6 +1440,20 @@ proc accountFragmentBytes(written: int) =
   # `appendFragmentRecord` recognises this retired producer key.
   unregisterFragmentSlot()
 
+proc discardFragmentSlotAfterFork*() {.raises: [].}
+
+proc slotInheritedAcrossFork(slot: ptr FragmentSlot): bool {.inline.} =
+  ## Is this open slot the PARENT's, inherited by a fork child? Its batch
+  ## then holds the parent's frames (the parent flushes its own copy) and
+  ## its descriptor shares the parent's open file description, so the same
+  ## file offset: flushing it from the child duplicates the parent's frames
+  ## and races the parent's writes into an interleaved, corrupt fragment.
+  ## Checked where a batch would be flushed, because a fork child can emit
+  ## (and exit) before any fork hook of its own runs: on macOS, libsystem's
+  ## fork child handlers read the environment, which the shim records.
+  slot.isOpen and slot.ownerPid != 0 and
+    slot.ownerPid != getCurrentProcessId()
+
 proc flushFragmentBatch*() =
   ## DSL-port M9.R.15f.1 — flush the in-flight batch buffer (if any)
   ## to the cached fragment file. Public so external code (close,
@@ -1444,6 +1462,10 @@ proc flushFragmentBatch*() =
   ## call is a no-op.
   let slot = peekFragmentSlot()
   if slot == nil or not slot.isOpen or slot.batchLen == 0:
+    return
+  if slotInheritedAcrossFork(slot):
+    # A fork child flushing the parent's batch: drop it, never write it.
+    discardFragmentSlotAfterFork()
     return
   if not fragmentHandleIsCurrent() and not reopenFragmentHandle():
     raiseEnvelopeError(eeMalformed,
@@ -1521,7 +1543,7 @@ proc closeFragmentSlot*(retainIdentity = false) =
   # before a worker exits, even when the handle was already closed on entry.
   unregisterFragmentSlot()
 
-proc discardFragmentSlotAfterFork*() =
+proc discardFragmentSlotAfterFork*() {.raises: [].} =
   ## Reset the calling thread's fragment slot in a fork CHILD WITHOUT flushing
   ## the in-flight batch. The child inherited the slot copy-on-write; its
   ## buffered frames belong to the PARENT (which flushes its own copy), so
@@ -1549,6 +1571,7 @@ proc discardFragmentSlotAfterFork*() =
     slot.fragmentDirBuf[0] = '\0'
     slot.osPid = 0
     slot.threadId = 0
+    slot.ownerPid = 0
     slot.batchLen = 0
     slot.batchOpenedAtNs = 0
     slot.batchProbeCountdown = 0
@@ -1620,6 +1643,11 @@ proc flushAllRegisteredSlots*() =
     if slot == own:
       # Defer the caller's own slot to the close below so it gets ONE
       # consistent teardown (flush + close + unregister).
+      continue
+    if slotInheritedAcrossFork(slot):
+      # A fork child that never reset the inherited registry (it forked
+      # without the hook and never emitted): this is a PARENT thread's slot.
+      # Its batch is the parent's to flush (see `slotInheritedAcrossFork`).
       continue
     if slot.isOpen and slot.batchLen > 0:
       let bufLen = slot.batchLen
@@ -1798,6 +1826,7 @@ proc openFragmentSlot(slot: ptr FragmentSlot; fragmentDir: string;
   slot.isOpen = true
   slot.osPid = osPid
   slot.threadId = threadId
+  slot.ownerPid = getCurrentProcessId()
   slot.batchLen = 0
   slot.batchOpenedAtNs = 0
   slot.batchProbeCountdown = 0
@@ -1960,6 +1989,10 @@ proc appendFragmentRecord*(fragmentDir: string; record: MonitorRecord) =
     slot.osPid != record.osPid or
     slot.threadId != record.threadId
   if needsReopen:
+    if slot != nil and slotInheritedAcrossFork(slot):
+      # A fork child's first record: the open slot is the parent's. Drop it
+      # without flushing (see `slotInheritedAcrossFork`).
+      discardFragmentSlotAfterFork()
     if slot != nil and slot.isOpen:
       # The descriptor may have been replaced since the last flush; closing it
       # unchecked would close a descriptor that now belongs to the tracee.

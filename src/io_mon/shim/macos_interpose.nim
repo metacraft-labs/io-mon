@@ -19,6 +19,7 @@ import io_mon/hooks/macos_interpose_runtime
 import stackable_hooks/platform/macos_bodypatch
 import io_mon/types
 import io_mon/writer
+import io_mon/tree_ledger
 
 {.emit: """
 #include <copyfile.h>
@@ -510,14 +511,39 @@ proc runIdToken(): string {.raises: [].} =
   ## source of truth so process-start and IPC-connect stamp it identically.
   if runId.len > 0: " run=" & runId else: ""
 
+proc markTreeLedgerEntry(pid: cint; startUsec: uint64) {.raises: [].} =
+  ## Write the tree-ledger entry for (pid, startUsec) (`io_mon/tree_ledger`):
+  ## the evidence the host's tree-lifetime guard checks for liveness after the
+  ## root exits, which, unlike this process's environment, the program cannot
+  ## overwrite. Synchronous and NOT gated by the event interest. A failed write
+  ## is published as a loss and flushed at once, so a capture whose ledger may
+  ## be short is never graded complete.
+  if not initialized or fragmentDir.len == 0 or pid <= 0:
+    return
+  var err: cint = 0
+  withShimMuted:
+    err = markTreeLedger(fragmentDir, int(pid), startUsec)
+  if err != 0:
+    var loss = baseRecord(mrEventLoss, moEventLoss)
+    loss.detail = "macos tree ledger write failed errno=" & $err &
+      " pid=" & $pid
+    emitRecord(loss)
+    withShimMuted:
+      flushFragmentBatch()
+
 proc recordProcessStart() {.raises: [].} =
   var record = baseRecord(mrProcessStart, moProcessStart)
   # ROUND-2 R7/R8 — stamp this process's (pid, kernel-start-time) identity and the
   # invocation run id. The merge keys monitored-process matching on (pid,
   # start-time) so a wrapped/recycled pid cannot false-match a stale process-start,
   # and scopes trusted-daemon reports to `run`.
-  record.detail = "shim-loaded start=" &
-    $ct_macos_proc_start_usec(c_getpid()) & runIdToken()
+  let selfPid = c_getpid()
+  let selfStart = ct_macos_proc_start_usec(selfPid)
+  # The tree-ledger entry first: it is the guard's liveness evidence, and it
+  # must exist before this process runs any program code (shim init runs
+  # before `main`; the fork child's call runs before `fork` returns there).
+  markTreeLedgerEntry(selfPid, selfStart)
+  record.detail = "shim-loaded start=" & $selfStart & runIdToken()
   emitRecord(record)
 
 proc observationForOpen(flags: cint): MonitorObservationKind =
@@ -1072,6 +1098,10 @@ proc recordSpawn(childPid: PidT; callResult: cint; path: cstring; detail: string
   # stale monitored process-start is then correctly seen as un-monitored.
   if childPid > 0:
     let childStart = ct_macos_proc_start_usec(cint(childPid))
+    # The child's tree-ledger entry, written by the PARENT before fork /
+    # posix_spawn returns to the program: the child may not have run yet, and
+    # by the time it does the parent may have exited.
+    markTreeLedgerEntry(cint(childPid), childStart)
     if childStart != 0:
       if d.len > 0: d.add ' '
       d.add "childstart=" & $childStart
@@ -3861,6 +3891,11 @@ proc repro_hook_execve*(path: cstring; argv, envp: cstringArray): cint
   ## only in that child's buffer, which exec would otherwise discard.)
   if not initialized or disabled > 0:
     return ct_macos_interpose_real_execve(path, argv, envp)
+  # The tree-ledger entry for THIS pid, before the image is replaced: an exec
+  # keeps the pid and start time, so the entry stays valid for the new image
+  # even if it never loads the shim. Usually already there (shim init or the
+  # fork hook wrote it); a `vfork` child runs no fork hook and gets it here.
+  markTreeLedgerEntry(c_getpid(), ct_macos_proc_start_usec(c_getpid()))
   var record = baseRecord(mrProcessExec, moExecute)
   # A relative program path is resolved against the cwd now; record it so.
   let execPath = anchoredExecPath(path, pathSearched = false)
@@ -3958,6 +3993,8 @@ proc repro_hook_fork*(): PidT {.exportc, cdecl, dynlib.} =
   if result > 0:
     recordSpawn(result, result, nil, "fork")
   elif result == 0:
+    # (The child's first record drops the inherited fragment slot without
+    # flushing it: `writer.slotInheritedAcrossFork`.)
     recordProcessStart()
 
 var inSpawnForward {.threadvar.}: int

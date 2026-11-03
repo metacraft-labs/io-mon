@@ -1,10 +1,18 @@
 ## Real double-forked, setsid descendant: a blocked release signal holds it alive
 ## until AFTER finishMonitor, independently of scheduling and host load.
+##
+## Under the macOS tree-lifetime guard (docs/usage.md) a detached descendant
+## still alive when the grace window closes grades the capture incomplete with
+## the guard's own `macos descendants still live after root exit` loss naming
+## it, while a tree that quiesced before root exit grades complete. Neither may
+## carry the retired "no complete tree-lifetime guard" marker.
 import std/[os, osproc, posix, streams, strutils, tempfiles, unittest]
 import io_mon
 import descendant_guard_expectations
 
 const repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
+const RetiredMarker = "detached-descendant quiescence cannot be established"
+const StillLive = "macos descendants still live after root exit"
 
 proc run(cmd: string; args: seq[string]): tuple[output: string; code: int] =
   let p = startProcess(cmd, args = args, options = {poStdErrToStdOut, poUsePath})
@@ -182,19 +190,34 @@ suite "macOS descendant finish fails closed":
           check readFile(proof) == "read\n"
           echo "binary=", getAppFilename(), " hosted=", hosted,
             " detached=", detached, " verdict=", monitored.completeness
-          check monitored.completeness == mcIncomplete
+          let expected = if detached: mcIncomplete else: mcComplete
+          check monitored.completeness == expected
           let disk = readMonitorDepFile(request.depFilePath)
-          check disk.completeness == mcIncomplete
-          var markers = 0
+          check disk.completeness == expected
+          var retired = 0
+          var stillLive: seq[string]
+          var losses = 0
           var inputRead = false
           for record in disk.records:
-            if isDescendantLimitation(record): inc markers
+            if record.kind == mrEventLoss:
+              inc losses
+              if RetiredMarker in record.detail: inc retired
+              if record.detail.startsWith(StillLive):
+                stillLive.add record.detail
             if record.kind == mrFileRead and record.path == expandFilename(work / "input"):
               inputRead = true
-          check markers == 1
+          check retired == 0
+          if detached:
+            let descendant = readFile(release & ".pid").strip()
+            check stillLive.len == 1
+            check losses == 1
+            if stillLive.len == 1:
+              check ("pids=" & descendant) in stillLive[0]
+          else:
+            check losses == 0
           check inputRead
           check disk.records == monitored.depFile.records
-          check subsystemEvidence(disk).completeness == mcComplete
+          check subsystemEvidence(disk).completeness == expected
         finally:
           if detached:
             awaitFile(release & ".pid")
@@ -202,19 +225,28 @@ suite "macOS descendant finish fails closed":
             doAssert posix.kill(descendant, SIGUSR1) == 0
             awaitFile(release & ".ack")
   test "reduced interest and reads-only scope retain the guard":
+    let release = work / "narrow.release"
     let request = FsSnoopRequest(command: @[fixture, work / "input",
-      work / "narrow.proof", "0", "0", "-"],
+      work / "narrow.proof", "0", "0", release],
       depFilePath: work / "narrow.iomon", interest: {ecProcessTree},
       evidenceScope: esReadsOnly)
-    let monitored = runMonitored(request)
-    check monitored.exitCode == 0
-    check monitored.completeness == mcIncomplete
-    let disk = readMonitorDepFile(request.depFilePath)
-    check disk.completeness == mcIncomplete
-    var markers = 0
-    for record in disk.records:
-      if isDescendantLimitation(record): inc markers
-    check markers == 1
-    check disk.records == monitored.depFile.records
-    check subsystemEvidence(disk).completeness == mcComplete
+    try:
+      let monitored = runMonitored(request)
+      check monitored.exitCode == 0
+      check monitored.completeness == mcIncomplete
+      let disk = readMonitorDepFile(request.depFilePath)
+      check disk.completeness == mcIncomplete
+      var stillLive = 0
+      for record in disk.records:
+        check not (record.kind == mrEventLoss and RetiredMarker in record.detail)
+        if record.kind == mrEventLoss and record.detail.startsWith(StillLive):
+          inc stillLive
+      check stillLive == 1
+      check disk.records == monitored.depFile.records
+      check subsystemEvidence(disk).completeness == mcIncomplete
+    finally:
+      awaitFile(release & ".pid")
+      let descendant = Pid(parseInt(readFile(release & ".pid").strip()))
+      doAssert posix.kill(descendant, SIGUSR1) == 0
+      awaitFile(release & ".ack")
   removeDir(work)

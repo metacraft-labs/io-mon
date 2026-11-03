@@ -77,6 +77,7 @@ wants a wider bar still calls `evaluateMonitorEvidence` with its own required-se
 - **Interpose (`__DATA,__interpose`)**: Standard DYLD technique. dyld rebinds the target binary's import bindings to our shim's thunks. It misses syscalls made inside standard libraries (e.g., `fopen` calling internal `open$NOCANCEL` inside `libsystem_c`).
 - **Body-Patching**: Overwrites entry points of libsystem syscall wrappers (e.g., via `mach_vm_remap` overwrites). The constructor installs this automatically to catch all callers and close the interpose blind spot.
 - **SIP Bypass**: System Integrity Protection (SIP) automatically strips `DYLD_INSERT_LIBRARIES` for binaries in `/bin`, `/usr/bin`, etc. `io-mon` handles this by mapping system calls to GNU drop-in equivalents (sandbox-tools) that are not protected by SIP.
+- **Tree-lifetime guard (kernel census)**: after the root is reaped, the capture is complete only once one sweep finds no live process carrying this run's injection needles and no young process it could not classify. A sweep is one `sysctl(KERN_PROC_ALL)` snapshot, then `KERN_PROCARGS2` (the live argument/environment area) for each process no older than the root by monotonic start time, and a liveness check of every entry in the run's tree ledger (`src/io_mon/tree_ledger.nim`) against the same snapshot, which finds a descendant that overwrote its needles in place (`src/io_mon/macos_tree_guard.nim`, decided in `fs_snoop.settleMonitorDescendants`). Platform binaries hide their environment from the census. They are graded by the unmonitored-subtree accounting instead, whose creating record survives a creator that is SIGKILLed right after the spawn. Normative contract: `docs/usage.md`, "The macOS tree-lifetime guard (normative)".
 - **Diagnostics (Debug builds only)**: Toggles such as `IO_MON_DEBUG_DISABLE_BODYPATCH`, `IO_MON_DEBUG_DISABLE_INTERPOSE`, and `IO_MON_DEBUG_SKIP` allow isolating mechanisms for A/B testing.
 
 #### Cooperating nested macOS monitors
@@ -94,11 +95,12 @@ removes that marker only after writing, checking the buffered close and
 atomically publishing the completed evidence fragment. A killed host, abandoned
 handle or failed publication therefore leaves the outer capture incomplete.
 This handoff requires a cooperating host to finish its monitor; it does not
-provide live event delivery from an unfinished inner session. macOS finishes
-fail incomplete with an explicit tree-lifetime uncertainty marker, even for a
-quiesced root; Windows proves quiescence with a Job Object, and a nested
-monitor's job nests inside its enclosing one. See the normative descendant
-guard contracts in `usage.md`.
+provide live event delivery from an unfinished inner session. Each host runs
+its own tree-lifetime guard for its own run: macOS proves quiescence with a
+kernel census (below), and Windows with a Job Object, where a nested monitor's
+job nests inside its enclosing one. An inner run's leftover descendant is
+reported by the inner guard, and that loss transfers to the enclosing capture.
+See the normative descendant guard contracts in `usage.md`.
 
 Implementation: `src/io_mon/nested_capture.nim` and `fs_snoop.nim`.
 The real-process controls are in
