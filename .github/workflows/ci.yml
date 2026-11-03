@@ -197,6 +197,26 @@ jobs:
           repro-io-mon-pin: 6fccd929cb09da0bfc0844b93ced9ffb1ac0f74f
           gh-token: ${{ steps.app-token.outputs.token }}
 
+      - name: Point sibling source overrides at the locked checkouts
+        # The engine seeds STACKABLE_HOOKS_SRC, SHM_QUEUE_SRC and SHM_GSET_SRC
+        # with ITS OWN build-time sources when they are unset, and forwards
+        # them into every action, where config.nims and build_shim.sh prefer
+        # them over the sibling checkouts (a config.nims --path also beats the
+        # engine's own --path). io-mon then compiled against reprobuild's
+        # nim-stackable-hooks pin, not its own: at 327e7ab that pin lacks
+        # stackable_hooks/platform/linux_image_code_ranges. Name the checkouts
+        # setup-dev-env cloned at this commit's lock, as the dev shell does.
+        if: matrix.env == 'reprobuild'
+        shell: bash
+        run: |
+          parent="$(cd .. && pwd)"
+          for pair in nim-stackable-hooks:STACKABLE_HOOKS_SRC nim-shm-queue:SHM_QUEUE_SRC nim-shm-gset:SHM_GSET_SRC; do
+            dir="$parent/${pair%%:*}/src"
+            test -d "$dir"
+            echo "${pair##*:}=$dir" >> "$GITHUB_ENV"
+            echo "${pair##*:}=$dir ($(git -C "$dir" rev-parse HEAD))"
+          done
+
       - name: Run tests
         # See the note on `Run lint`: without pipefail, `| tee` masks failure.
         shell: bash
