@@ -108,10 +108,11 @@ def main():
                 for name, workflow in workflows.items():
                     # Only the Windows lanes (ci-reprobuild.yml) bootstrap
                     # the hook library from an explicit revision.
-                    settings = [('repro-runquota-pin', 'runquota-src', True),
-                                ('repro-io-mon-pin', 'io-mon-src', True),
-                                ('repro-stackable-hooks-pin', 'nim-stackable-hooks-src',
-                                 name == 'ci-reprobuild.yml')]
+                    settings = [
+                        ('repro-runquota-pin', 'runquota-src', True),
+                        ('repro-io-mon-pin', 'io-mon-src', True),
+                        ('repro-stackable-hooks-pin', 'nim-stackable-hooks-src', name == 'ci-reprobuild.yml'),
+                    ]
                     for setting, dependency, required in settings:
                         row = re.search(r'^\s+' + setting + r':\s*(.+)$', workflow, re.M)
                         if not row:

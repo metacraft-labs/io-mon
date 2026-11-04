@@ -31,7 +31,10 @@
 ## ordinary dynamic root, a script with a 64-bit interpreter, ld.so run
 ## directly (it honours LD_PRELOAD), and execs that fail (a missing file, a
 ## file that is neither ELF nor `#!`) before a good one -- must stay
-## `mcComplete`: a false loss makes an action uncacheable.
+## `mcComplete`: a false loss makes an action uncacheable. A spawn with a
+## chdir file action is re-checked from the child's /proc entries; its control
+## holds the child alive across that re-check, and a child whose entries
+## cannot be read must be graded as a loss (the fail-closed arm).
 ##
 ## The i686 shell comes from io-mon's dev shell (`IO_MON_TEST_I686_SH`,
 ## `pkgsi686Linux.bash`) or the recipe's declared `io-mon-test-i686-sh`
@@ -44,6 +47,7 @@
 ## Mocks: none. Real programs, the real shim, the real `io-mon run` driver.
 
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
+from std/posix import geteuid
 
 import io_mon
 import build_test_shim
@@ -75,6 +79,13 @@ int main(int argc, char **argv) {
   char buf[16];
   if (read(fd, buf, sizeof(buf)) <= 0) return 22;
   close(fd);
+#ifdef HOLD_FD
+  /* The held build stays alive until the host closes the pipe's write end
+   * (EOF), which it does only after posix_spawn has returned. A missing
+   * descriptor fails, so a pass proves the child was held. */
+  char c;
+  if (read(HOLD_FD, &c, 1) != 0) return 23;
+#endif
   return 0;
 }
 """
@@ -126,6 +137,31 @@ static int spawn_in_dir_and_wait(const char *dir, char *target, char **argv) {
   pid_t pid;
   int rc = posix_spawn(&pid, target, &fa, NULL, argv, environ);
   posix_spawn_file_actions_destroy(&fa);
+  if (rc != 0) return 30;
+  int status = 0;
+  if (waitpid(pid, &status, 0) != pid) return 31;
+  return WIFEXITED(status) ? WEXITSTATUS(status) : 32;
+}
+
+/* As spawn_in_dir_and_wait, but the child gets the read end of a pipe as
+ * descriptor HOLD_FD, and the write end is closed only once posix_spawn has
+ * returned. The shim's post-spawn re-check of the child's /proc exe and cwd
+ * runs inside posix_spawn, so a child that waits for EOF on HOLD_FD (the held
+ * helper) is provably alive when that re-check reads them. */
+#define HOLD_FD 100
+static int spawn_in_dir_held_and_wait(const char *dir, char *target,
+                                      char **argv) {
+  int hold[2];
+  if (pipe2(hold, O_CLOEXEC) != 0) return 35;
+  posix_spawn_file_actions_t fa;
+  if (posix_spawn_file_actions_init(&fa) != 0) return 33;
+  if (posix_spawn_file_actions_addchdir_np(&fa, dir) != 0) return 34;
+  if (posix_spawn_file_actions_adddup2(&fa, hold[0], HOLD_FD) != 0) return 36;
+  pid_t pid;
+  int rc = posix_spawn(&pid, target, &fa, NULL, argv, environ);
+  posix_spawn_file_actions_destroy(&fa);
+  close(hold[1]);
+  close(hold[0]);
   if (rc != 0) return 30;
   int status = 0;
   if (waitpid(pid, &status, 0) != pid) return 31;
@@ -186,6 +222,8 @@ int main(int argc, char **argv) {
     return spawn_and_wait(1, target, targv);
   } else if (strncmp(mode, "posix_spawn-chdir=", 18) == 0) {
     return spawn_in_dir_and_wait(mode + 18, target, targv);
+  } else if (strncmp(mode, "posix_spawn-chdir-held=", 23) == 0) {
+    return spawn_in_dir_held_and_wait(mode + 23, target, targv);
   } else if (strcmp(mode, "syscall-execve") == 0) {
     syscall(SYS_execve, target, targv, environ);
 #ifdef __x86_64__
@@ -201,6 +239,9 @@ int main(int argc, char **argv) {
   } else if (strncmp(mode, "unrecorded-posix_spawn-chdir=", 29) == 0) {
     if (!disable_shim_recording()) return 5;
     return spawn_in_dir_and_wait(mode + 29, target, targv);
+  } else if (strncmp(mode, "unrecorded-posix_spawn-chdir-held=", 34) == 0) {
+    if (!disable_shim_recording()) return 5;
+    return spawn_in_dir_held_and_wait(mode + 34, target, targv);
   } else if (strcmp(mode, "clone-child-execve") == 0) {
     return clone_child_exec(target, targv);
   } else if (strcmp(mode, "fail-then-execve") == 0) {
@@ -281,6 +322,9 @@ suite "io-mon Linux: entry into an image the shim cannot enter":
     require built.code == 0
 
   let helper = compile("helper64", helperSource)
+  # The same helper, held alive on descriptor 100 until the host releases it
+  # (HOLD_FD in the host's spawn_in_dir_held_and_wait).
+  let heldHelper = compile("helper64-held", helperSource, @["-DHOLD_FD=100"])
   let host = compile("exec-host", hostSource, @["-O0", "-pthread"])
   let input = work / "in.txt"
   writeFile(input, "input\n")
@@ -513,13 +557,56 @@ suite "io-mon Linux: entry into an image the shim cannot enter":
   test "control: a chdir file action before an ordinary 64-bit image":
     # The post-spawn re-check (the child's /proc exe and cwd) must not flag
     # an image the shim enters, whether or not the thread can record.
+    #
+    # The child is HELD: it stays alive until the host closes a pipe after
+    # posix_spawn has returned, and so after the re-check. A child that has
+    # already exited by then leaves both /proc links unreadable, and the shim
+    # then fails closed by contract ("spawned image unverifiable"; see
+    # `ct_linux_spawn_image_uninjectable`). An unheld helper exits fast
+    # enough to lose that race on a loaded host (2 of 2 full runs at
+    # b60947c), which made this control flaky. That false loss is a product
+    # gap recorded in issues/2026-11-04-linux-posix-spawn-chdir-reports-a-
+    # false-loss-when-the-child-exits-before-the-recheck.md; this control
+    # grades the re-check of a live child, which is what it is for.
     let dir = work / "chdir-control"
     createDir(dir)
-    createSymlink(helper, dir / "helper64-chdir")
-    checkComplete(capture(@[host, "posix_spawn-chdir=" & dir,
+    createSymlink(heldHelper, dir / "helper64-chdir")
+    checkComplete(capture(@[host, "posix_spawn-chdir-held=" & dir,
       "./helper64-chdir", input]))
-    checkComplete(capture(@[host, "unrecorded-posix_spawn-chdir=" & dir,
+    checkComplete(capture(@[host, "unrecorded-posix_spawn-chdir-held=" & dir,
       "./helper64-chdir", input]))
+
+  test "a chdir file action before a child whose /proc entries are unreadable":
+    # The fail-closed arm of the post-spawn re-check, made deterministic:
+    # neither /proc/<child>/exe nor /proc/<child>/cwd can be read and the
+    # name depends on the directory, so the entry cannot be verified and must
+    # be graded as a loss. Exiting before the re-check is not something a
+    # test can force (the re-check runs inside posix_spawn, before the caller
+    # can reap), so this uses the other way to make both links unreadable:
+    # exec of an image the caller may not read makes the child non-dumpable,
+    # and the kernel then refuses its /proc links to a same-user process
+    # without CAP_SYS_PTRACE. The image itself is an ordinary dynamic one
+    # the shim enters, held alive across the re-check as in the control.
+    if geteuid() == 0:
+      checkpoint("skipped: root reads a non-dumpable child's /proc links")
+      skip()
+    else:
+      let dir = work / "chdir-unreadable"
+      createDir(dir)
+      copyFile(heldHelper, dir / "helper64-xonly-chdir")
+      setFilePermissions(dir / "helper64-xonly-chdir", {fpUserExec})
+      let dep = capture(@[host, "posix_spawn-chdir-held=" & dir,
+        "./helper64-xonly-chdir", input])
+      check helperRanMonitored(dep)
+      check dep.completeness == mcIncomplete
+      check lossDetails(dep).anyIt("spawned image unverifiable" in it and
+        "image=./helper64-xonly-chdir" in it)
+      let unrecorded = capture(@[host, "unrecorded-posix_spawn-chdir-held=" &
+        dir, "./helper64-xonly-chdir", input])
+      check helperRanMonitored(unrecorded)
+      check unrecorded.completeness == mcIncomplete
+      check lossDetails(unrecorded).anyIt("uninjectable image" in it and
+        "could not record it by name" in it)
 
   test "control: a #! script whose interpreter is a 64-bit shell":
     let bash64 = findExe("bash")

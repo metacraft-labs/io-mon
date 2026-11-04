@@ -458,11 +458,12 @@ marked. A decomposed host therefore grades an edge exactly as `runMonitored`
 does, and cannot opt out. Pinned by
 `tests/linux/test_io_mon_external_host_descendant_guard.nim`, which runs a real
 detached descendant past a real grace window down both launch paths. Windows
-has the same guarantee through its Job Object guard (the next paragraph),
-which runs at the same point of the same funnel.
+has the same guarantee through its Job Object guard (the next paragraph), and
+macOS through its kernel census (the paragraph after it). Both run at the same
+point of the same funnel.
 
-**The Windows tree-lifetime guard (normative).** Windows has the primitive
-the macOS backend lacks: the Job Object. The full design, with its failure
+**The Windows tree-lifetime guard (normative).** Windows has a kernel
+primitive for this: the Job Object. The full design, with its failure
 modes and interactions, is reprobuild-pm
 `spec/io-mon-Windows-Tree-Lifetime-Guard.md`. What a host can rely on:
 
@@ -499,7 +500,7 @@ modes and interactions, is reprobuild-pm
   created; its limits cannot be read or permit breakaway; the root cannot be
   assigned (and whether it already belonged to a job that refused nesting); or
   the active-process census fails. None of them is silently complete, and
-  none is reported as the macOS marker below.
+  none is reported as the retired blanket marker.
 - The guard covers the job's members and nothing else. Processes that a
   member gets an already-running process or an OS service to start are not
   descendants and are not in the job: COM out-of-process servers, Task
@@ -527,23 +528,123 @@ launch paths, a nested monitor) and
 `tests/windows/test_io_mon_windows_tree_lifetime_guard_faults.nim` (the
 failure modes with no honest trigger, through a compile-gated seam).
 
-**macOS limitation (normative).** Root exit alone does not prove that the
-process tree is empty. The macOS backend has neither a complete kernel
-descendant census nor a tree-lifetime primitive. Every finished macOS capture
-MUST therefore publish an `mrEventLoss` / `moEventLoss` record with detail
-`detached-descendant quiescence cannot be established: macos backend has no complete tree-lifetime guard run=<id>`
-before evidence is merged. This applies even when no spawn was observed, to
-batch and decomposed hosts, every interest set and evidence scope, and both
-in-memory and on-disk depfiles. Such captures MUST grade `mcIncomplete`;
-consumers must conservatively rebuild. The marker states uncertainty, not
-proof that a descendant exists. Process and file evidence remains available
-for diagnosis. Linux retains its real descendant scan and grace window, and
-Windows its job guard (above). Neither platform's knobs have any effect on the
-macOS limitation. There is no override that promotes these captures to
-complete. The real gated macOS regression also checks a fully quiesced
-control, which fails closed for the same reason. (Until the Windows guard
-landed, Windows published the same marker with `windows` in place of
-`macos`. That marker is retired, and a Windows capture never carries it.)
+**The macOS tree-lifetime guard (normative).** macOS has neither a Job Object
+nor a subreaper, and `kqueue` no longer follows forks (`NOTE_TRACK`). It does
+have an unprivileged, point-in-time process listing, and a way to read a
+same-user process's live argument/environment area. The guard is built from
+those two plus a ledger the shim keeps, in `src/io_mon/macos_tree_guard.nim`,
+and it runs inside the same funnel as the Linux and Windows guards. What a host
+can rely on:
+
+- After the root has been reaped, the guard sweeps. One sweep is one
+  `sysctl(KERN_PROC_ALL)` snapshot of every process, then `KERN_PROCARGS2` for
+  each process that started no earlier than the root. "Earlier" is judged by
+  the kernel's monotonic start time, so a wall clock stepped backwards cannot
+  make a descendant look older than its root. The sweep looks for this run's
+  injection needles (`REPRO_MONITOR_SESSION=<runId>` or
+  `REPRO_MONITOR_FRAGMENT_DIR=<dir>`) as whole NUL-separated strings anywhere
+  in the area. Zombies and processes already exiting are not live.
+- **The area is live memory, and the tree ledger covers what it hides.** The
+  area `KERN_PROCARGS2` returns is the process's own memory, not a copy taken
+  at exec. A process can overwrite its needles in place, as setproctitle-style
+  code does (PostgreSQL reuses the whole argv+environ area for its process
+  title on Darwin), and the census can then no longer tell it from an
+  unrelated process. So the shim also keeps a **tree ledger** in the fragment
+  directory: one file per process it saw come into existence, named by pid and
+  kernel start time (`src/io_mon/tree_ledger.nim`). It is written at shim
+  init, by the parent of a `fork` or `posix_spawn` before the call returns,
+  and before an exec, and it is not affected by the event interest. Every
+  sweep also checks each ledger entry against the same snapshot. A live
+  process with the entry's pid and start time is a live descendant, whatever
+  its memory says. The only descendant neither can see is one created by a raw
+  `fork` syscall that bypasses the shim and that then overwrites its own area,
+  or one that deletes its own ledger entry and then overwrites its area. The
+  ledger lives in the run's fragment directory, which the tree can write; the
+  guard detects accidental behaviour, not a tree that tampers with io-mon's
+  own evidence. Removing the whole directory (or the root's entry) is still
+  caught: a ledger without the root's entry fails closed.
+- A sweep is **conclusive** only if it finds no carrier, no live ledger
+  process, no ledger entry added while it ran, and no young process it
+  could not classify. A young process that vanished between the snapshot and
+  its read could have forked after the snapshot. A live, same-user process
+  whose strings the kernel refuses (one caught mid-fork or mid-exec) could be a
+  carrier. Each of these is classified through its parent in the snapshot,
+  unless that parent is launchd. On macOS an orphan is reparented to launchd
+  and to nothing else, so any other parent is the process that created it, and
+  the child of a non-carrier is a non-carrier. Whatever is still unclassified
+  makes the sweep inconclusive. A conclusive empty sweep proves that no
+  carrier was alive at the snapshot instant. Linux's scan stops at its first
+  empty sweep and does not have this rule. Without the parent rule, a host
+  busy with unrelated short-lived processes could keep every sweep
+  inconclusive; with it, a trivial capture taken under four loops of
+  continuous process churn stayed complete in 100 out of 100 runs.
+- The capture is `mcComplete` only after a conclusive empty sweep within the
+  grace window: `IO_MON_MACOS_DESCENDANT_GRACE_MS` (default 500) and
+  `IO_MON_MACOS_DESCENDANT_POLL_MS` (default 25). They are read like the Linux
+  and Windows knobs. The first sweep runs immediately, so a tree that has
+  already quiesced costs one sweep.
+- If carriers are still alive when the window ends, the capture publishes
+  `macos descendants still live after root exit live=<n> pids=<p,...> images=<i,...> run=<id>`
+  and grades `mcIncomplete`, as Linux and Windows do. If only ledger processes
+  that no longer carry the needles are alive, it publishes
+  `macos recorded descendants still live after root exit live=<n> pids=<p,...> images=<i,...> run=<id>`.
+  Those processes are **left running**. A long-lived server that a step leaves
+  behind makes the step incomplete by design.
+- If only unclassified processes remain at the end of the window, the capture
+  publishes
+  `macos tree-lifetime guard could not classify young processes after root exit unresolved=<n> pids=… images=… run=<id>`.
+  If the census call itself fails, it publishes
+  `macos tree-lifetime guard failed: sysctl(KERN_PROC_ALL) census failed errno=<e> run=<id>`.
+  If the ledger cannot be listed, or has no entry for the root (a shim that
+  does not keep it, or a root that never loaded the shim), it publishes
+  `macos tree-lifetime guard failed: the tree ledger could not be read` or
+  `... the tree ledger has no entry for the root pid=<p>`. A shim that cannot
+  write an entry publishes `macos tree ledger write failed errno=<e> pid=<p>`.
+  None of these is ever silently complete.
+- **What the census cannot see, and why that stays incomplete.** The kernel
+  withholds the environment of platform (SIP-protected) binaries, and of other
+  users' processes. dyld also strips `DYLD_INSERT_LIBRARIES` from both, so
+  neither ever carries the shim. Such a process can enter a monitored tree only
+  as an unmonitored subtree: as the root (the root guard), as a child of an
+  injected process (its `mrProcessSpawn` or `mrProcessExec` has no matching
+  `mrProcessStart`), or as a child of another unmonitored process. Each of those
+  grades `mcIncomplete` on its own, whether or not the process is still alive.
+  That holds even when the creator is SIGKILLed right after the spawn: the
+  `mrProcessExec` record is flushed before the image is replaced, and the
+  `mrProcessSpawn` record of a `posix_spawn` reaches the fragment before the
+  call returns. A test pins this. Out-of-tree work is
+  not covered either: work a member gets an already-running process to do
+  (launchd jobs, XPC services, `open(1)`) is not a descendant. That is the same
+  boundary as on Linux and Windows. On macOS such requests travel over Mach,
+  which `ipc-connect` records only in part (see the XPC/Mach breakaway tests).
+- Like the Linux scan and the Windows job, the guard runs inside
+  `collectMonitorEvidence` (DH-3), for `runMonitored` and for `startMonitor` /
+  `pollMonitor` / `finishMonitor` alike. No exported proc runs, polls or skips
+  it.
+- **Cost.** A sweep is one snapshot, one monotonic start-time read
+  (`proc_pid_rusage`) for each live process, and one strings read for each
+  process younger than the root. The shim creates one empty ledger file per
+  process, plus one `open` per `fork` or `posix_spawn` in the parent (usually
+  finding the file the child already created, or creating it first). The
+  measured numbers are in reprobuild-pm's
+  `Distributed-Execution-Threat-Model.md`, G42.
+
+Pinned by `tests/macos/test_io_mon_macos_tree_lifetime_guard.nim`. It covers a
+quiesced control on both launch paths, nested children, an exec chain,
+fast-exiting children that outlive the root, a detached daemon held past
+finish on both launch paths, a daemon that exits inside the window, a
+concurrent run, SIP children (synchronous, detached, and spawned by a
+creator that is then SIGKILLed), and daemons that overwrite their area: one
+that overwrites its `REPRO_MONITOR_*` strings (on both launch paths, and under
+an interest without `proc`), one that sets a PostgreSQL-style process title
+over argv and environ, and one that does so and exits inside the window.
+Census failure, a wall clock stepped backwards, the needle scan of an empty
+`argv[0]`, and the vanished-process and parent rules, are pinned by
+`tests/macos/test_io_mon_macos_tree_lifetime_guard_faults.nim`, through
+compile-gated seams. The retired macOS marker
+(`detached-descendant quiescence cannot be established: macos backend has no complete tree-lifetime guard`)
+is no longer published. Until this guard landed, every finished macOS capture
+carried it and graded `mcIncomplete`.
 
 **The two launch paths produce the same evidence, and that is measured** (DH-4).
 `runMonitored` and a host driving `startMonitor` → `pollMonitor` →

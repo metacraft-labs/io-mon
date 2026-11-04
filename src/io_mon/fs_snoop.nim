@@ -22,11 +22,12 @@ export shim_discovery  ## `findShimLibrary`/`ShimLibOverrideEnv` moved to their
 import shm_gset as shmset_core
 import shm_gset/transport as shmset
 
-when defined(linux) or defined(windows):
+when defined(linux) or defined(windows) or defined(macosx):
   proc envInt(name: string; defaultValue, minValue: int): int =
     ## A §4.1 descendant-guard knob: unset or unparsable -> `defaultValue`,
-    ## below `minValue` -> `minValue`. Shared by the Linux scan and the Windows
-    ## job guard so both platforms read their knobs by one rule.
+    ## below `minValue` -> `minValue`. Shared by the Linux scan, the Windows
+    ## job guard and the macOS census so every platform reads its knobs by one
+    ## rule.
     let raw = getEnv(name)
     if raw.len == 0:
       return defaultValue
@@ -505,6 +506,9 @@ when defined(windows):
 # previously-correct capture wrong.
 when defined(macosx):
   import stackable_hooks/propagation as ct_propagation
+  # The macOS tree-lifetime guard's census. Its DECISIONS stay in
+  # `settleMonitorDescendants`; see `io_mon/macos_tree_guard`.
+  import io_mon/macos_tree_guard
 
   const reproSandboxBinaries = [
     # Shells (the original route-B set — the most common SIP exec target via
@@ -1640,6 +1644,13 @@ type
     when defined(macosx):
       sandboxDir: string
       ownsSandboxDir: bool
+      rootStartAbs: uint64     ## The monitored ROOT's MONOTONIC kernel start
+                               ## time (mach absolute time), captured
+                               ## immediately after the spawn. The macOS
+                               ## tree-lifetime guard's census skips every
+                               ## process that started before it. Monotonic,
+                               ## so a wall-clock step cannot move it. `0`
+                               ## means "unknown" and disables that skip.
     when defined(windows):
       shimLib: string
       spawnEnv: StringTableRef
@@ -1788,9 +1799,9 @@ proc settleMonitorDescendants(h: var MonitorHandle) =
   ## Per platform: Linux scans `/proc` for this run's injected descendants;
   ## Windows waits for the root's Job Object to report no active process (the
   ## job is created and the root assigned at the module's only Windows spawn
-  ## site, `waitForMonitorRoot`); macOS has no primitive and publishes its
-  ## normative limitation marker. Only Linux and Windows can ever publish no
-  ## loss here, and only on a measured, empty tree.
+  ## site, `waitForMonitorRoot`); macOS sweeps the kernel's process list for
+  ## this run's needles (`io_mon/macos_tree_guard`). Each platform publishes no
+  ## loss here only on a measured, empty tree.
   if h.settled:
     return
   h.settled = true
@@ -1833,15 +1844,28 @@ proc settleMonitorDescendants(h: var MonitorHandle) =
         osPid: uint64(getCurrentProcessId()),
         detail: lossDetail & " run=" & h.runId))
   elif defined(macosx):
-    # Root exit proves nothing about a detached descendant. This backend owns
-    # no kernel tree-lifetime primitive and no complete descendant census;
-    # even a run with no observed spawn cannot prove that no child escaped.
-    # Publish before the merge, so every finish path fails incomplete.
-    appendFragmentRecord(h.fragmentDir, MonitorRecord(
-      kind: mrEventLoss, observationKind: moEventLoss,
-      osPid: uint64(getCurrentProcessId()),
-      detail: "detached-descendant quiescence cannot be established: " &
-        "macos backend has no complete tree-lifetime guard run=" & h.runId))
+    # THE macOS TREE-LIFETIME GUARD (docs/usage.md, "The macOS tree-lifetime
+    # guard (normative)"; mechanics and soundness argument in
+    # `io_mon/macos_tree_guard`). The root has been reaped; sweep the kernel's
+    # process list for live processes carrying this run's injection needles,
+    # and check every process in this run's tree ledger (`io_mon/tree_ledger`)
+    # for liveness against the same snapshot, until one round is conclusive
+    # and empty, or the window closes. Only a conclusive empty round publishes
+    # no loss. A failed census or ledger read, a ledger without the root's
+    # entry, members or ledger processes still alive at the end of the window,
+    # or young processes the census could not classify each record their own
+    # specific loss before the merge.
+    let graceMs = envInt("IO_MON_MACOS_DESCENDANT_GRACE_MS",
+      MacosDescendantGraceMsDefault, 0)
+    let pollMs = envInt("IO_MON_MACOS_DESCENDANT_POLL_MS",
+      MacosDescendantPollMsDefault, 1)
+    let settled = waitForTreeQuiescence(h.runId, h.fragmentDir,
+      int(h.rootPid), h.rootStartAbs, graceMs, pollMs)
+    if not settled.quiesced:
+      appendFragmentRecord(h.fragmentDir, MonitorRecord(
+        kind: mrEventLoss, observationKind: moEventLoss,
+        osPid: uint64(getCurrentProcessId()),
+        detail: settled.lossDetail & " run=" & h.runId))
 
 proc releaseMonitor(h: var MonitorHandle) =
   ## Release everything the monitor owns: mark the consumer gone and unmap it,
@@ -2000,6 +2024,9 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
     # mergeFragments downgrades that case to mcIncomplete instead of asserting a
     # false mcComplete over an empty record set.
     h.rootPid = uint64(h.process.processID)
+    # The root is our unreaped child, so its kernel entry (and start time)
+    # exists until `waitForMonitorRoot` reaps it, even if it already exited.
+    h.rootStartAbs = processStartAbs(h.process.processID)
   elif defined(linux):
     let shimLib = findShimLibrary()
     if shimLib.len == 0:

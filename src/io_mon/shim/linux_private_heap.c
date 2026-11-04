@@ -127,8 +127,9 @@ typedef struct {
   uint32_t cls;     /* size class, or PH_LARGE */
   size_t size;      /* the size the caller asked for (for realloc) */
 #if SIZE_MAX == UINT32_MAX
-  uint32_t pad;     /* ILP32 (armhf): keep the header, and so every user
-                       pointer, at PH_HEADER bytes */
+  /* ILP32 (armhf): keep the header, and so every user pointer, at
+   * PH_HEADER bytes. */
+  uint32_t pad;
 #endif
 } ph_header;        /* exactly PH_HEADER bytes on LP64 and ILP32 */
 

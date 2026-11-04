@@ -13,7 +13,13 @@ when appType == "lib" and not defined(useMalloc):
     "scripts/build_shim.sh sets it, and says why".}
 
 when defined(ioMonGlibcPrivateHeap):
-  {.compile: "linux_private_heap.c".}
+  # Object named after a hash of the C source, so a C-only edit always
+  # rebuilds it (a plain `{.compile.}` trusts the object's newer mtime; see
+  # io_mon/macos_tree_guard for the failure).
+  import std/hashes
+  const PrivateHeapCHash = $cast[uint](hash(staticRead("linux_private_heap.c")))
+  {.compile: ("linux_private_heap.c",
+              "linux_private_heap_" & PrivateHeapCHash & ".o").}
   {.passL: "-Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free".}
 
 import std/[locks, os, strutils]
