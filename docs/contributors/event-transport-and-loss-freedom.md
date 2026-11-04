@@ -593,9 +593,10 @@ area), is argued in the header of `src/io_mon/macos_tree_guard.nim`. Linux's
 issue `2026-10-30-linux-descendant-guard-misses-an-overwritten-environment`).
 
 The census and the ledger check run inside `settleMonitorDescendants`, so the
-DH-3 argument above holds unchanged. Platform (SIP) binaries hide their environment from it. They are
-covered by the unmonitored-subtree accounting instead, whose creating record
-survives a creator SIGKILLed right after the spawn (a pinned case). Its
+DH-3 argument above holds unchanged. While SIP is on, platform (SIP) binaries
+hide their environment from it. They are covered by the unmonitored-subtree
+accounting instead, whose creating record survives a creator SIGKILLed right
+after the spawn (a pinned case). Its
 contract (knobs, the named-survivor loss, the failure diagnostics, what it does
 not cover) is normative in `docs/usage.md`, "The macOS tree-lifetime guard
 (normative)". The retired blanket marker

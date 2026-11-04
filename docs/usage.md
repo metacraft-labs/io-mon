@@ -601,13 +601,19 @@ can rely on:
   `... the tree ledger has no entry for the root pid=<p>`. A shim that cannot
   write an entry publishes `macos tree ledger write failed errno=<e> pid=<p>`.
   None of these is ever silently complete.
-- **What the census cannot see, and why that stays incomplete.** The kernel
-  withholds the environment of platform (SIP-protected) binaries, and of other
-  users' processes. dyld also strips `DYLD_INSERT_LIBRARIES` from both, so
-  neither ever carries the shim. Such a process can enter a monitored tree only
-  as an unmonitored subtree: as the root (the root guard), as a child of an
-  injected process (its `mrProcessSpawn` or `mrProcessExec` has no matching
-  `mrProcessStart`), or as a child of another unmonitored process. Each of those
+- **What the census cannot see, and why that stays incomplete.** While System
+  Integrity Protection (SIP) is on, the kernel withholds the environment of
+  platform (SIP-protected) binaries, and it never discloses other users'
+  processes' environments. dyld also strips `DYLD_INSERT_LIBRARIES` from both,
+  so neither ever carries the shim. With SIP off (`csrutil disable`, as on
+  GitHub's hosted macOS runners), neither holds for a platform binary: the shim
+  loads into it and the kernel discloses its environment, so it is an ordinary
+  member, and a live one is named in
+  `macos descendants still live after root exit`. A process the census cannot
+  see can enter a monitored tree only as an unmonitored subtree: as the root
+  (the root guard), as a child of an injected process (its `mrProcessSpawn`
+  or `mrProcessExec` has no matching `mrProcessStart`), or as a child of
+  another unmonitored process. Each of those
   grades `mcIncomplete` on its own, whether or not the process is still alive.
   That holds even when the creator is SIGKILLed right after the spawn: the
   `mrProcessExec` record is flushed before the image is replaced, and the
