@@ -127,7 +127,8 @@ static int still_alive(int32_t pid, uint64_t start_usec) {
  * when argv[0] is empty (its NUL is eaten as padding) and would then skip the
  * first environment string; scanning everything cannot miss one, and a needle
  * in argv is still a needle (it fails closed). A process whose environment
- * the kernel withholds (platform binaries) yields argv only. */
+ * the kernel withholds (platform binaries, while SIP is on) yields argv
+ * only. */
 static int carries_needle(const char *buf, size_t n, const char *n1,
                           size_t n1len, const char *n2, size_t n2len) {
   if (n < sizeof(int))

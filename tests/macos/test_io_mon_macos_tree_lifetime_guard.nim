@@ -25,7 +25,9 @@
 ##  8. SIP binaries in the tree stay incomplete: a synchronous SIP child, a
 ##     detached SIP grandchild that outlives the root, and a creator SIGKILLed
 ##     right after spawning one. The SIP tool is /usr/bin/caffeinate, which
-##     has no sandbox-tools drop-in, so it really runs uninjected.
+##     has no sandbox-tools drop-in, so while SIP is on it really runs
+##     uninjected. (With SIP off it loads the shim, and these cases are
+##     incomplete for another reason: see the fixture's SIP_TOOL note.)
 ##  9. unrelated process churn outside the monitor does not keep the guard
 ##     from a conclusive sweep (20 captures under four spawn loops).
 ## 10. a daemon grandchild that OVERWRITES its argument/environment area in
@@ -35,10 +37,15 @@
 ##     whole argv+environ area for a process title the way PostgreSQL does on
 ##     Darwin; (c) the same with an event interest that excludes `proc`; (d) a
 ##     clobbering daemon that exits inside the window is complete; (e) the
-##     detached SIP grandchild of 8b is found by the guard itself, through
-##     the entry its creator's posix_spawn hook wrote: it never loads the shim
-##     (no entry of its own) and the kernel withholds its environment (no
-##     needle), so that parent-side entry is the only evidence the guard has.
+##     detached SIP grandchild of 8b is found by the guard itself. Where SIP
+##     is on, it never loads the shim (no entry of its own) and the kernel
+##     withholds its environment (no needle), so the entry its creator's
+##     posix_spawn hook wrote is the only evidence the guard has, and the case
+##     pins that the guard finds it there. Where SIP is off, the shim loads
+##     into it and the kernel discloses its environment, so the census finds
+##     the needles, and the case pins the census report instead. The fixture's
+##     `env-visible` mode asks the kernel which of the two holds, through the
+##     same call the census makes.
 import std/[os, osproc, posix, sequtils, streams, strutils, tempfiles, unittest]
 import io_mon
 
@@ -56,13 +63,18 @@ const fixtureSrc = """
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 /* A SIP-protected platform binary that io-mon has NO drop-in for (the spawn
-   hook rewrites /bin/sleep and friends to injectable GNU tools), so dyld strips
-   the shim and the kernel withholds its environment. `caffeinate -t N` just
-   waits N seconds. */
+   hook rewrites /bin/sleep and friends to injectable GNU tools). While SIP is
+   on, dyld strips the shim from it and the kernel withholds its environment
+   (see env_visible). While SIP is off, neither holds: the shim loads into it,
+   but its records never reach the fragment, so the 8x cases still see no
+   process-start for it (measured on macOS 26.5.1: io-mon issue
+   2026-11-04-macos-exit-from-a-worker-thread-drops-the-main-thread-batch).
+   `caffeinate -t N` just waits N seconds. */
 #define SIP_TOOL "/usr/bin/caffeinate"
 
 extern char **environ;
@@ -272,6 +284,43 @@ static int kill_after_spawn(const char *secs) {
   return r == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL ? 0 : 22;
 }
 
+/* Can this unentitled, same-user process read `pid`'s environment through
+   KERN_PROCARGS2, the call the guard's census makes? Returns 0 when the image
+   carries a REPRO_MONITOR_SESSION string, 1 when it carries none (the kernel
+   withheld the environment), 2 when the read itself failed. XNU's
+   sysctl_procargsx withholds the environment of a CS_RESTRICT process (a
+   platform binary) unless the caller is that process, SIP is off
+   (CSR_ALLOW_UNRESTRICTED_DTRACE), or the caller holds the
+   com.apple.private.read-environment-variables entitlement:
+   https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sysctl.c
+   So for a SIP binary the answer is the host's SIP state, and GitHub's hosted
+   macOS runners run with SIP off. */
+static int env_visible(pid_t pid) {
+  int amib[2] = {CTL_KERN, KERN_ARGMAX};
+  int argmax = 0;
+  size_t len = sizeof(argmax);
+  if (sysctl(amib, 2, &argmax, &len, NULL, 0) != 0 || argmax <= 0) return 2;
+  char *buf = malloc((size_t)argmax);
+  if (!buf) return 2;
+  int mib[3] = {CTL_KERN, KERN_PROCARGS2, pid};
+  size_t n = (size_t)argmax;
+  if (sysctl(mib, 3, buf, &n, NULL, 0) != 0) {
+    free(buf);
+    return 2;
+  }
+  static const char needle[] = "REPRO_MONITOR_SESSION=";
+  const size_t nlen = sizeof(needle) - 1;
+  int found = 0;
+  /* Every NUL-separated string after the argc word, as the census scans. */
+  for (size_t i = sizeof(int); i < n && !found;) {
+    size_t sl = strnlen(buf + i, n - i);
+    if (sl >= nlen && !memcmp(buf + i, needle, nlen)) found = 1;
+    i += sl + 1;
+  }
+  free(buf);
+  return found ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
   self_path = argv[0];
   g_argc = argc;
@@ -304,6 +353,8 @@ int main(int argc, char **argv) {
     return kill_after_spawn(argv[2]);
   if (!strcmp(mode, "killed-creator") && argc == 3)
     return killed_creator(argv[2]);
+  if (!strcmp(mode, "env-visible") && argc == 3)
+    return env_visible((pid_t)atoi(argv[2]));
   return 2;
 }
 """
@@ -625,11 +676,18 @@ suite "macOS tree-lifetime guard":
       it.path == input and it.osPid == uint64(daemon))
 
   test "10e. a SIP grandchild is found through its creator's entry":
-    # The SIP grandchild never loads the shim, so it writes no entry of its
-    # own, and the kernel withholds its environment, so the census sees no
-    # needle. The guard can name it only through the entry the creator's
-    # posix_spawn hook wrote before the call returned. (The unmonitored-subtree
-    # accounting flags it too, case 8b; this pins the guard's own evidence.)
+    # While SIP is on, the SIP grandchild never loads the shim, so it writes
+    # no entry of its own, and the kernel withholds its environment, so the
+    # census sees no needle. The guard can then name it only through the entry
+    # the creator's posix_spawn hook wrote before the call returned. (The
+    # unmonitored-subtree accounting flags it too, case 8b; this pins the
+    # guard's own evidence.) While SIP is off, the shim loads into it and the
+    # kernel discloses its environment, so the census finds the needles. The
+    # guard then reports the census hit, which names the pid, and leaves the
+    # same pid out of the recorded-live list, which holds only pids the census
+    # did not find (`waitForTreeQuiescence`). Which of the two applies is a
+    # kernel fact, so the fixture asks the kernel about this same process
+    # right after the capture, through the call the census makes.
     let pidFile = work / "sip-ledger.pid"
     let req = request("sip-detached", "3", pidFile)
     var sip = Pid(0)
@@ -638,14 +696,28 @@ suite "macOS tree-lifetime guard":
       sip = awaitPidFile(pidFile)
       check res.exitCode == 0
       check alive(sip)
+      let probe = run(fixture, @["env-visible", $sip])
+      check probe.code in [0, 1]
+      # Still alive (`caffeinate -t 3`), so the probe read the process the
+      # guard swept.
+      check alive(sip)
       check res.completeness == mcIncomplete
       let recorded = res.depFile.losses.filterIt(it.startsWith(RecordedLive))
-      check recorded.len == 1
-      if recorded.len == 1:
-        check ("pids=" & $sip) in recorded[0]
+      let census = res.depFile.losses.filterIt(it.startsWith(StillLive))
+      if probe.code == 1:
+        # Environment withheld: the creator's entry is the only evidence.
+        check recorded.len == 1
+        if recorded.len == 1:
+          check ("pids=" & $sip) in recorded[0]
+        check census.len == 0
       else:
-        echo res.depFile.losses
-      check not res.depFile.losses.anyIt(it.startsWith(StillLive))
+        # Environment disclosed: the census finds the grandchild by its needles.
+        check census.len == 1
+        if census.len == 1:
+          check ("pids=" & $sip) in census[0]
+        check recorded.len == 0
+      if recorded.len + census.len != 1 or probe.code notin [0, 1]:
+        echo "env-visible=", probe.code, " ", res.depFile.losses
       check res.depFile.noRetiredMarker
     finally:
       if sip != Pid(0): reap(sip)
