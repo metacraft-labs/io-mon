@@ -59,9 +59,19 @@
 ##
 ## ── WHAT THE CENSUS CANNOT SEE, AND WHY THAT IS STILL SOUND ───────────────
 ##
-## The kernel withholds the environment of platform (SIP-protected) binaries
-## and of other users' processes. Neither can be a REPORTING member: dyld
-## strips `DYLD_INSERT_LIBRARIES` from both, so neither ever loads the shim.
+## While SIP is on, the kernel withholds the environment of platform
+## (SIP-protected) binaries, and it never discloses that of other users'
+## processes. Neither can be a REPORTING member then: dyld strips
+## `DYLD_INSERT_LIBRARIES` from both, so neither ever loads the shim. (XNU's
+## `sysctl_procargsx` omits a `CS_RESTRICT` target's environment unless SIP
+## is off or the caller is entitled:
+## https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sysctl.c.)
+## With SIP off (`csrutil disable`, as on GitHub's hosted macOS runners),
+## neither holds for a platform binary: dyld loads the shim into it and the
+## kernel discloses its environment (measured on macOS 26.5.1 with
+## /usr/bin/caffeinate). It is then a member the census finds by its needles,
+## as well as through its creator's ledger entry. That only adds evidence.
+## The rest of this section is about the SIP-on case.
 ## Such a process can only enter a monitored tree as an UNMONITORED subtree:
 ## as the root (the root guard), or created by an injected process (its
 ## `mrProcessSpawn` / `mrProcessExec` record then has no matching
