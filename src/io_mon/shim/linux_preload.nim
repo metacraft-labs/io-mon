@@ -1138,6 +1138,100 @@ int repro_linux_install_terminating_signal_handlers(void) {
   return installed;
 }
 
+/* ONE ACTIVE SHIM PER PROCESS.
+ *
+ * Nested monitoring can preload two distinct io-mon shim images into one
+ * process: a monitored host starts an inner monitor whose own shim (say an
+ * installed build) is added to the LD_PRELOAD list the host inherited from
+ * the outer monitor (a development build), or a parent's exec hook adds its
+ * shim to the inner route's list. glibc loads both, because it identifies a
+ * preload by its file, not by its SONAME. Both constructors would then
+ * initialise from the same REPRO_MONITOR_* route, both would install raw and
+ * inline syscall patches, and both would append to the same per-thread
+ * fragment: the first image owns the program's symbols, and its
+ * dlsym(RTLD_NEXT) forwarders reach the second image's interposers, which
+ * would record every call a second time.
+ *
+ * So exactly one image is active: the one that owns the program's symbols.
+ * The dynamic linker binds a symbol to the first definition in the global
+ * lookup scope (the executable, then the LD_PRELOAD list in order, then the
+ * initial dependencies; see ld.so(8) and the "Shared Object Dependencies"
+ * section of the System V gABI,
+ * https://refspecs.linuxfoundation.org/elf/gabi4+/ch5.dynamic.html). A
+ * lookup of a symbol only shims define, through the handle `dlopen(NULL)`
+ * returns for the program, searches exactly that scope in that order (POSIX
+ * dlopen: "the original program image file, and objects loaded at program
+ * start-up",
+ * https://pubs.opengroup.org/onlinepubs/9799919799/functions/dlopen.html),
+ * so it names the owner whatever order the constructors run in. It must be
+ * that handle and not RTLD_DEFAULT: this image links with -Bsymbolic, which
+ * marks it DT_SYMBOLIC, and glibc searches a DT_SYMBOLIC caller's own
+ * definitions first for RTLD_DEFAULT, so each image would find itself
+ * (measured: with two preloads, each answered that the last image in the
+ * dlsym forwarding chain owned the scope). Every other image stands down:
+ * its constructor initialises nothing, and its interposers forward straight
+ * to the next definition. An image outside the global scope (dlopen'd
+ * RTLD_LOCAL) interposes nothing, and stands down too when a global shim
+ * exists; with no global shim it is the only one, and stays active.
+ *
+ * The lookup goes through the real dlopen and dlsym, which are the next
+ * images' interposers when another shim follows this one. Those images come
+ * later in the scope, so they never own it, and they forward it unrecorded.
+ *
+ * The marker is a function, not data: -Bsymbolic binds this image's own
+ * reference to its own definition, so `&marker` is this image's address. */
+__attribute__((visibility("default"), noinline))
+void repro_linux_monitor_shim_image_marker(void) {
+  __asm__ volatile("");
+}
+
+extern void *ct_linux_preload_real_dlsym(void *handle, char *name);
+extern void *ct_linux_preload_real_dlopen(char *path, int flags);
+
+enum {
+  REPRO_LINUX_IMAGE_UNDECIDED = 0,
+  REPRO_LINUX_IMAGE_ACTIVE = 1,
+  REPRO_LINUX_IMAGE_STANDING_DOWN = 2
+};
+static int repro_linux_image_state = REPRO_LINUX_IMAGE_UNDECIDED;
+/* The lookup enters the dynamic linker, which may call interposed functions
+ * (malloc, getenv) on this thread; those calls pass through unrecorded rather
+ * than recursing into the decision. Per thread, so another thread's hooks are
+ * never bypassed while one thread decides. */
+static __thread int repro_linux_image_deciding = 0;
+
+/* Whether this image is the process's active io-mon shim. Decided once, on
+ * first use: normally by the constructor below, earlier when another
+ * library's constructor reaches one of this image's interposers first. The
+ * answer cannot change: the global scope's preload order is fixed before any
+ * constructor runs, and a later dlopen appends after it. Concurrent first
+ * uses compute the same answer, so the race is benign. */
+__attribute__((visibility("hidden")))
+int ct_linux_preload_image_active(void) {
+  int state = __atomic_load_n(&repro_linux_image_state, __ATOMIC_ACQUIRE);
+  if (state != REPRO_LINUX_IMAGE_UNDECIDED)
+    return state == REPRO_LINUX_IMAGE_ACTIVE;
+  if (repro_linux_image_deciding) return 0;
+  repro_linux_image_deciding = 1;
+  /* The program's handle names an object that is never unloaded, so it is
+   * not closed: dlclose would only drop the reference dlopen added. */
+  void *program = ct_linux_preload_real_dlopen(NULL, RTLD_LAZY);
+  void *owner = program == NULL ? NULL : ct_linux_preload_real_dlsym(
+      program, (char *)"repro_linux_monitor_shim_image_marker");
+  repro_linux_image_deciding = 0;
+  state = owner == NULL ||
+          owner == (void *)&repro_linux_monitor_shim_image_marker
+    ? REPRO_LINUX_IMAGE_ACTIVE : REPRO_LINUX_IMAGE_STANDING_DOWN;
+  __atomic_store_n(&repro_linux_image_state, state, __ATOMIC_RELEASE);
+  return state == REPRO_LINUX_IMAGE_ACTIVE;
+}
+
+/* Public query: whether the image it is looked up in records this process. */
+__attribute__((visibility("default")))
+int repro_linux_monitor_shim_is_active(void) {
+  return ct_linux_preload_image_active();
+}
+
 /* M9.R.62.2 addendum — interpose libc's `syscall(3)` wrapper so raw
  * `syscall(SYS_exit_group, N)` and `syscall(SYS_exit, N)` calls flush
  * the fragment slot before the kernel tears the process down. Phase A
@@ -1189,8 +1283,11 @@ long syscall(long number, ...) {
   a0 = va_arg(ap, long); a1 = va_arg(ap, long); a2 = va_arg(ap, long);
   a3 = va_arg(ap, long); a4 = va_arg(ap, long); a5 = va_arg(ap, long);
   va_end(ap);
+  /* A standing-down image records nothing and has nothing to flush: it only
+   * forwards, still recognising its own raw-fork child below. */
+  int active = ct_linux_preload_image_active();
 #ifdef SYS_exit_group
-  if (number == SYS_exit_group) {
+  if (active && number == SYS_exit_group) {
     /* Classify trapped inline syscalls first; when some cannot be (this
      * thread is inside a hook), withhold the commit so the loss shows. */
     if (ct_linux_drain_inline_events_before_image_end())
@@ -1198,15 +1295,15 @@ long syscall(long number, ...) {
   }
 #endif
 #ifdef SYS_exit
-  if (number == SYS_exit) {
+  if (active && number == SYS_exit) {
     repro_linux_sig_safe_flush();
   }
 #endif
-  if (number == SYS_execve
+  if (active && (number == SYS_execve
 #ifdef SYS_execveat
       || number == SYS_execveat
 #endif
-      ) {
+      )) {
     ct_linux_drain_inline_events_before_image_end();
     /* A raw exec reaches no exec hook: classify its target here. When this
      * image patched libc's syscall(2), this body is redirected to the
@@ -1247,7 +1344,10 @@ static void repro_linux_monitor_constructor(void) {
   ct_linux_preload_prime_real_functions();
   repro_linux_resolve_libc_syscall();
   repro_linux_prepare_thread_exit_key();
-  repro_monitor_shim_init(NULL);
+  /* Only the image that owns the program's symbols records it (see "ONE
+   * ACTIVE SHIM PER PROCESS"); the forwarders resolved above are all a
+   * standing-down image needs. */
+  if (ct_linux_preload_image_active()) repro_monitor_shim_init(NULL);
   ct_linux_preload_prepare_real_connect();
 }
 
@@ -1259,7 +1359,9 @@ static void repro_linux_monitor_destructor(void) {
      on process exit (via the registry sweep in repro_monitor_shim_shutdown)
      so a short-lived process (or the trailing batch of any process) does
      not drop its records — which would otherwise make a fast child look
-     un-injected and downgrade completeness to mcIncomplete. */
+     un-injected and downgrade completeness to mcIncomplete. A standing-down
+     image opened nothing and trapped nothing. */
+  if (!ct_linux_preload_image_active()) return;
   repro_monitor_shim_shutdown();
   /* Report trapped events the shutdown drain could not classify, and from
    * now on any event trapped after it (other threads still running, later
@@ -2037,6 +2139,10 @@ proc observerLibraryScan(reason: cstring) {.cdecl, raises: [].} =
 proc repro_monitor_shim_init*(configPath: cstring): cint
     {.exportc, dynlib, raises: [].}
 
+proc ct_linux_preload_image_active(): cint {.importc, cdecl, raises: [].}
+  ## Whether this image is the process's one active io-mon shim (the C note
+  ## "ONE ACTIVE SHIM PER PROCESS" above the constructor).
+
 proc ensureInitialized() {.raises: [].} =
   if not initialized:
     discard repro_monitor_shim_init(nil)
@@ -2498,6 +2604,11 @@ proc armUnclassifiedInlineLossReport(): bool {.raises: [].} =
 
 proc repro_monitor_shim_init*(configPath: cstring): cint
     {.exportc, dynlib, raises: [].} =
+  # A standing-down image never initialises, however it is reached: through
+  # its constructor, or lazily through a hook. Its `initialized` stays false,
+  # so nothing it might still be handed is recorded (`emitRecord`).
+  if ct_linux_preload_image_active() == 0:
+    return 0
   if not locksReady:
     initLock(initLockVar)
     initLock(recordLock)

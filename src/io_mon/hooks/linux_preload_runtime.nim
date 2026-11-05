@@ -2382,8 +2382,20 @@ static void ct_restore_vfork_exec_guard(void) {
   }
 }
 
+/* Defined by the io-mon monitor shim (its "ONE ACTIVE SHIM PER PROCESS"
+ * note): whether this image is the process's one active io-mon shim. Weak,
+ * because this runtime also serves other shim families and test programs
+ * that link no monitor shim; there it is absent and every hook stays live. */
+extern int ct_linux_preload_image_active(void)
+    __attribute__((weak, visibility("hidden")));
+
 static int ct_preload_hooks_allowed(void) {
   ct_restore_vfork_exec_guard();
+  /* A standing-down image forwards every call to the next definition
+   * unrecorded and leaves the child environment of an exec or spawn as the
+   * active image prepared it. */
+  if (ct_linux_preload_image_active != NULL && !ct_linux_preload_image_active())
+    return 0;
   return stackable_linux_preload_hooks_allowed();
 }
 
@@ -2465,6 +2477,45 @@ static int ct_child_env_has(char *const source[], const char *name) {
   return 0;
 }
 
+/* The value of the first `name=` entry of `source`, or NULL. */
+static const char *ct_child_env_value(char *const source[], const char *name) {
+  size_t n = strlen(name);
+  for (char *const *it = source; *it != NULL; ++it)
+    if (strncmp(*it, name, n) == 0 && (*it)[n] == '=') return *it + n + 1;
+  return NULL;
+}
+
+/* The shim a child's LD_PRELOAD must carry, or NULL when this process injects
+ * none. Normally this process's own shim. A child given a complete explicit
+ * route into another run (an inner monitor's: REPRO_MONITOR_FRAGMENT_DIR and
+ * REPRO_MONITOR_SESSION non-empty, the session not this process's own) that
+ * names its own REPRO_MONITOR_SHIM_LIB is recorded by that run alone, through
+ * that shim: adding this process's shim as well would load a second, distinct
+ * image into it, and as the first preload that image would own the child's
+ * symbols and record the inner run in its place. The enclosing run sees such
+ * a child through the nested handoff, not through its own shim. A child that
+ * stays in this process's run keeps this process's shim, whatever shim its
+ * environment names. */
+static const char *ct_linux_preload_injected_shim(char *const source[]) {
+  if (ct_linux_preload_shim_env_name == NULL ||
+      ct_linux_preload_shim_env_name[0] == '\0') return NULL;
+  const char *own = getenv(ct_linux_preload_shim_env_name);
+  if (own == NULL || own[0] == '\0') return NULL;
+  if (source == NULL ||
+      strcmp(ct_linux_preload_shim_env_name, "REPRO_MONITOR_SHIM_LIB") != 0)
+    return own;
+  const char *fragment = ct_child_env_value(source, "REPRO_MONITOR_FRAGMENT_DIR");
+  const char *session = ct_child_env_value(source, "REPRO_MONITOR_SESSION");
+  const char *requested = ct_child_env_value(source, "REPRO_MONITOR_SHIM_LIB");
+  const char *own_session = getenv("REPRO_MONITOR_SESSION");
+  if (fragment != NULL && fragment[0] != '\0' &&
+      session != NULL && session[0] != '\0' &&
+      (own_session == NULL || strcmp(session, own_session) != 0) &&
+      requested != NULL && requested[0] != '\0')
+    return requested;
+  return own;
+}
+
 /* Report malformed routing to the active parent; application syscalls still
  * execute. Complete child routes are left to the existing nested handoff. */
 int ct_linux_preload_child_capture_route_status(char *const envp[]) {
@@ -2504,12 +2555,10 @@ int ct_linux_preload_child_capture_route_status(char *const envp[]) {
 }
 
 char **ct_linux_preload_env_with_preload(char *const envp[]) {
-  if (ct_linux_preload_shim_env_name == NULL ||
-      ct_linux_preload_shim_env_name[0] == '\0') return (char **)envp;
-  const char *shim = getenv(ct_linux_preload_shim_env_name);
-  if (shim == NULL || shim[0] == '\0') return (char **)envp;
   char *const *source = envp != NULL ? envp : environ;
   if (source == NULL) return (char **)envp;
+  const char *shim = ct_linux_preload_injected_shim(source);
+  if (shim == NULL) return (char **)envp;
 
   const char *existing = NULL;
   size_t count = 0;
@@ -2627,12 +2676,10 @@ char **ct_linux_preload_env_with_exec_gen(char *const envp[], long nextGen) {
   snprintf(genValue, sizeof(genValue), "%ld", nextGen);
   size_t genEntryLen = strlen("REPRO_MONITOR_EXEC_GEN=") + strlen(genValue) + 1;
 
-  const char *shim = NULL;
-  if (ct_linux_preload_shim_env_name != NULL &&
-      ct_linux_preload_shim_env_name[0] != '\0') {
-    const char *s = getenv(ct_linux_preload_shim_env_name);
-    if (s != NULL && s[0] != '\0') shim = s;
-  }
+  /* The same shim ct_linux_preload_env_with_preload injects, so the entry
+   * rebuilt below keeps what it prepared. */
+  const char *shim =
+    ct_linux_preload_injected_shim(envp != NULL ? envp : environ);
 
   char **prepared = ct_linux_preload_env_with_preload(envp);
   char *const *source = prepared != NULL ? prepared : environ;
