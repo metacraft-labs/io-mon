@@ -61,8 +61,9 @@
 ## run in a child that may hold another thread's lock image, and free of any
 ## thread-local state, because the CLONE_VM creator writes while the child
 ## already runs on its memory (and, without CLONE_SETTLS, on its TLS). A
-## child-side or creator-side failure is reported through the shim's
-## pre-encoded fork-child loss frame. Every Linux writer also records its
+## child-side failure is reported through the shim's pre-encoded fork-child
+## loss frame, a creator-side one through the CLONE_VM creator's own
+## pre-encoded frames. Every Linux writer also records its
 ## pid namespace, and one that cannot read it reports a failed write
 ## (`linuxPidNamespaceSys`). Children of `posix_spawn`, `system(3)`
 ## and `popen(3)` (glibc spawns with CLONE_VM | CLONE_VFORK, its parent

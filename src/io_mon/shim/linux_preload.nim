@@ -2707,6 +2707,14 @@ const
     "linux CLONE_VM process (not a thread or vfork child): it shares its " &
     "creator's memory and thread state, which the shim cannot keep apart, " &
     "so its evidence may be missing or carry the creator's identity"
+  VmProcessLedgerLossPrefix =
+    "linux tree ledger write failed in the creator of a CLONE_VM process "
+  VmProcessLedgerLossDetail = VmProcessLedgerLossPrefix &
+    "(the entry of the process it created could not be written, so the " &
+    "guard may not see that process outlive the root)"
+  VmProcessLedgerPidNsLossDetail = VmProcessLedgerLossPrefix &
+    "(the creator's pid namespace could not be read, so the guard could " &
+    "not place the pid of the process it created)"
   LossFramePidMarker = 0x5A17C0DE5A17C0DE'u64
   LossFrameTidMarker = 0x7E1DC0DE7E1DC0DE'u64
 
@@ -2783,15 +2791,27 @@ proc armUninjectableExecReport(): bool {.raises: [].} =
     result = false
 
 proc armVmProcessReport(): bool {.raises: [].} =
-  ## Pre-encode the event-loss frame the creator of a CLONE_VM process writes
-  ## (see "A CLONE_VM PROCESS IS EVENT-LOSS" in the runtime). False when it
-  ## could not be armed; the caller reports that.
+  ## Pre-encode the event-loss frames the creator of a CLONE_VM process
+  ## writes: the process itself (see "A CLONE_VM PROCESS IS EVENT-LOSS" in
+  ## the runtime), and a failed write of its tree-ledger entry (one frame
+  ## for the entry, one for the pid namespace). False when any could not be
+  ## armed; the caller reports that.
   if fragmentDir.len == 0:
     return true
   try:
     let encoded = encodeLossFrame(VmProcessLossDetail)
     result = armVmProcessLossReport(encoded.frame, encoded.pidOffset,
       encoded.tidOffset)
+    # The creator's failed write of that process's ledger entry
+    # (`repro_linux_vm_process_parent`): frames of their own, so the loss
+    # names that cause and not a fork child's skipped evidence, and one per
+    # failure, as the hooked writer tells them apart (`markTreeLedgerEntry`).
+    let ledger = encodeLossFrame(VmProcessLedgerLossDetail)
+    result = armVmProcessLedgerLossReport(false, ledger.frame,
+      ledger.pidOffset, ledger.tidOffset) and result
+    let ledgerNs = encodeLossFrame(VmProcessLedgerPidNsLossDetail)
+    result = armVmProcessLedgerLossReport(true, ledgerNs.frame,
+      ledgerNs.pidOffset, ledgerNs.tidOffset) and result
   except CatchableError:
     result = false
 
@@ -5066,14 +5086,18 @@ proc repro_linux_vm_process_parent(childPid: clong) {.cdecl, raises: [].} =
   ## not errno. `writeTreeLedgerEntryRaw` issues raw system calls only. It
   ## also runs in a fork child skipping bookkeeping (no lock is taken), so
   ## that child's CLONE_VM process gets its entry too. A failed write is
-  ## reported through the pre-encoded loss frame (raw syscalls); only that
-  ## failure path touches thread state (it saves and restores errno).
+  ## reported through its own pre-encoded loss frame (raw syscalls, errno
+  ## untouched), which names this cause rather than a fork child's skipped
+  ## evidence: `VmProcessLedgerLossDetail` when the entry could not be
+  ## written, `VmProcessLedgerPidNsLossDetail` when it was written but this
+  ## process's pid namespace could not be read. Neither can carry an errno
+  ## or the child's pid: the frame is encoded at init.
   if not initialized or fragmentDir.len == 0 or childPid <= 0:
     return
   let w = writeTreeLedgerEntryRaw(int(childPid),
     linuxProcStartTicksSys(ledgerSyscall, int(childPid)))
   if w.err != 0:
-    reportForkChildSkippedEvidence()
+    reportVmProcessLedgerWriteFailed(w.nsUnknown)
 {.pop.}
 
 proc ct_linux_preload_register_vm_process(fn: pointer)

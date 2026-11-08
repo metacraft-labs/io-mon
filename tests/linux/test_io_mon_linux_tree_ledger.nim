@@ -61,6 +61,13 @@
 ##     creator's entry and is found by it. Every CLONE_VM process (here and
 ##     the `vm-clone` of case 9) is also one loss of its own: it shares its
 ##     creator's memory and thread state, which the shim cannot keep apart.
+## 16. a CLONE_VM creator that writes the process's entry but cannot read its
+##     pid namespace (a /proc hidden by a tmpfs) reports that cause by name,
+##     not as a fork child's skipped evidence (the tree has no fork child at
+##     all) and not as an entry that was never written;
+## 17. a CLONE_VM creator whose write of the entry itself fails (a seccomp
+##     filter denies exclusive creates) reports THAT cause, not the
+##     namespace one.
 ##
 ## Neuters that turn this file red: `noledgercheck` (the guard
 ## ignores the ledger) — 3, 4, 5 come back `mcComplete` and 6 loses the
@@ -81,6 +88,11 @@ const NoRootEntry = "linux descendant guard failed: the tree ledger has no " &
 const UnknownPidNs = "pid namespace could not be read"
 const UninjectableRoot = "uninjectable image: root spawn"
 const VmProcessLoss = "linux CLONE_VM process (not a thread or vfork child)"
+const VmProcessLedgerLoss = "linux tree ledger write failed in the creator " &
+  "of a CLONE_VM process"
+const EntryNotWritten = "the entry of the process it created could not be " &
+  "written"
+const ForkChildSkipped = "linux fork child skipped evidence"
 
 const staticExitSource = """
 /* Freestanding: no libc and no loader, so LD_PRELOAD cannot reach it. */
@@ -105,6 +117,12 @@ const fixtureSrc = """
 #include <dirent.h>
 #include <stdint.h>
 #include <pty.h>
+#include <sys/mount.h>
+#include <sys/prctl.h>
+#include <stddef.h>
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 
 extern char **environ;
 static int g_argc;
@@ -502,6 +520,68 @@ static int syscall_vm(const char *how, const char *pidfile) {
   return 0;
 }
 
+/* hidden-proc-vm <vm-clone|clone|clone3> <pidfile>: run in a user and mount
+   namespace of its own, hide /proc under a tmpfs (as a chroot without proc
+   would), then create a CLONE_VM process through glibc's clone(3)
+   (`vm-clone`) or syscall(2) (`clone`, `clone3`). The shim initialised
+   before the tmpfs, so this process's own entry is written; its creator-side
+   write of the CLONE_VM process's entry cannot read the pid namespace and
+   fails. There is no fork anywhere in this tree. */
+static int hidden_proc_vm(const char *how, const char *pidfile) {
+  if (mount("none", "/proc", "tmpfs", 0, NULL) != 0) return 90;
+  if (access("/proc/self", F_OK) == 0) return 91;
+  if (!strcmp(how, "vm-clone")) return internal_fork(how, pidfile, g_argv[0]);
+  return syscall_vm(how, pidfile);
+}
+
+/* excl-denied-vm <vm-clone|clone|clone3> <pidfile>: install a seccomp
+   filter that fails every openat(2) with O_EXCL with EACCES, then create a
+   CLONE_VM process as hidden-proc-vm does. The shim initialised before the
+   filter, so this process's own entry and pid-namespace marker are written.
+   The creator-side entry is the next exclusive create, and it fails, while
+   the namespace is readable and the loss frame (O_APPEND, no O_EXCL) can
+   still be written. Exit 92: no filter for this architecture, or the kernel
+   refused it; 93: the filter did not bite. */
+static int deny_exclusive_create(void) {
+#if defined(__x86_64__)
+  const unsigned audit_arch = AUDIT_ARCH_X86_64;
+#elif defined(__aarch64__)
+  const unsigned audit_arch = AUDIT_ARCH_AARCH64;
+#else
+  return 0;
+#endif
+  /* The flags are the low 32 bits of args[2] (both targets are
+     little-endian), which is all O_EXCL needs. */
+  struct sock_filter filter[] = {
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, audit_arch, 1, 0),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_openat, 1, 0),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[2])),
+    BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, O_EXCL, 0, 1),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EACCES & SECCOMP_RET_DATA)),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+  };
+  struct sock_fprog prog = {(unsigned short)(sizeof(filter) / sizeof(filter[0])),
+                            filter};
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return 0;
+  return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) == 0;
+}
+static int excl_denied_vm(const char *how, const char *pidfile) {
+  if (!deny_exclusive_create()) return 92;
+  char probe[4096];
+  snprintf(probe, sizeof(probe), "%s.probe", pidfile);
+  int fd = open(probe, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+  if (fd >= 0 || errno != EACCES) {
+    if (fd >= 0) close(fd);
+    return 93;
+  }
+  if (!strcmp(how, "vm-clone")) return internal_fork(how, pidfile, g_argv[0]);
+  return syscall_vm(how, pidfile);
+}
+
 int main(int argc, char **argv) {
   g_argc = argc;
   g_argv = argv;
@@ -515,6 +595,10 @@ int main(int argc, char **argv) {
     return pidns(argv[2], argv[3], atoi(argv[4]));
   if (!strcmp(mode, "syscall-vm") && argc == 4)
     return syscall_vm(argv[2], argv[3]);
+  if (!strcmp(mode, "hidden-proc-vm") && argc == 4)
+    return hidden_proc_vm(argv[2], argv[3]);
+  if (!strcmp(mode, "excl-denied-vm") && argc == 4)
+    return excl_denied_vm(argv[2], argv[3]);
   if (!strcmp(mode, "linger") && argc == 3) linger(argv[2]);
   if (!strcmp(mode, "internal") && argc == 4)
     return internal_fork(argv[2], argv[3], argv[0]);
@@ -974,6 +1058,91 @@ suite "Linux descendant guard: the tree ledger":
           echo how, ": ", res.depFile.losses
         check not res.depFile.losses.anyIt(it.startsWith(StillLive))
         check res.depFile.losses.filterIt(it.startsWith(VmProcessLoss)).len == 1
+      finally:
+        if child == Pid(0) and fileExists(pidFile):
+          child = awaitPidFile(pidFile)
+        if child != Pid(0): reap(child)
+
+  test "16. a CLONE_VM creator's failed ledger write names its cause":
+    # The fixture hides /proc under a tmpfs after the shim initialised, then
+    # creates a CLONE_VM process on each route that writes the creator-side
+    # entry (glibc's clone(3), and syscall(2) with SYS_clone / SYS_clone3).
+    # That write cannot read the pid namespace, so it fails, and the loss
+    # must say so. The tree makes no fork, so a fork child's skipped-evidence
+    # loss would name a cause that did not happen.
+    if unprivilegedNamespaces("--mount", "sh", "-c",
+        "mount -t tmpfs none /proc && test ! -e /proc/self"):
+      for how in ["vm-clone", "clone", "clone3"]:
+        checkpoint(how)
+        let pidFile = work / ("hidden-proc-vm-" & how & ".pid")
+        inc serial
+        let req = FsSnoopRequest(command: @[findExe("unshare"), "--user",
+          "--map-root-user", "--mount", fixture, "hidden-proc-vm", how,
+          pidFile], depFilePath: work / ("capture-" & $serial & ".iomon"))
+        var child = Pid(0)
+        try:
+          let res = capture(req, false)
+          check res.exitCode == 0
+          if res.exitCode != 0:
+            echo how, ": fixture exit ", res.exitCode
+            continue
+          child = awaitPidFile(pidFile)
+          check alive(child)
+          check res.completeness == mcIncomplete
+          let ledger = res.depFile.losses.filterIt(
+            it.startsWith(VmProcessLedgerLoss))
+          check ledger.len == 1
+          # The entry WAS written (the guard names the survivor); what failed
+          # is the namespace read.
+          check ledger.allIt(UnknownPidNs in it and EntryNotWritten notin it)
+          check res.depFile.losses.anyIt(it.startsWith(RecordedLive))
+          check not res.depFile.losses.anyIt(it.startsWith(ForkChildSkipped))
+          check res.depFile.losses.filterIt(
+            it.startsWith(VmProcessLoss)).len == 1
+          if ledger.len != 1 or
+              res.depFile.losses.anyIt(it.startsWith(ForkChildSkipped)):
+            echo how, ": ", res.depFile.losses
+        finally:
+          if child == Pid(0) and fileExists(pidFile):
+            child = awaitPidFile(pidFile)
+          if child != Pid(0): reap(child)
+    else:
+      skip()
+
+  test "17. a CLONE_VM creator's failed entry write names that cause":
+    # A seccomp filter installed after the shim initialised fails every
+    # exclusive create, so the creator-side entry of the CLONE_VM process
+    # cannot be written while the pid namespace stays readable and the loss
+    # frame (an append) can still be written. The loss must name the entry,
+    # not the namespace and not a fork child.
+    for how in ["vm-clone", "clone", "clone3"]:
+      checkpoint(how)
+      let pidFile = work / ("excl-denied-vm-" & how & ".pid")
+      let req = request("excl-denied-vm", how, pidFile)
+      var child = Pid(0)
+      try:
+        let res = capture(req, false)
+        if res.exitCode == 92:
+          echo "    SKIP: no seccomp filter for this architecture or kernel"
+          skip()
+          break
+        check res.exitCode == 0
+        if res.exitCode != 0:
+          echo how, ": fixture exit ", res.exitCode
+          continue
+        child = awaitPidFile(pidFile)
+        check alive(child)
+        check res.completeness == mcIncomplete
+        let ledger = res.depFile.losses.filterIt(
+          it.startsWith(VmProcessLedgerLoss))
+        check ledger.len == 1
+        check ledger.allIt(EntryNotWritten in it and UnknownPidNs notin it)
+        check not res.depFile.losses.anyIt(it.startsWith(ForkChildSkipped))
+        check res.depFile.losses.filterIt(
+          it.startsWith(VmProcessLoss)).len == 1
+        if ledger.len != 1 or
+            res.depFile.losses.anyIt(it.startsWith(ForkChildSkipped)):
+          echo how, ": ", res.depFile.losses
       finally:
         if child == Pid(0) and fileExists(pidFile):
           child = awaitPidFile(pidFile)

@@ -19,20 +19,28 @@ program passed. The handler's frames are not on that stack, so the child
 crashes as soon as it returns.
 
 Measured with a 30-line C program (`clone(SIGCHLD [| CLONE_VM], stack)` in
-inline assembly; the child calls a function that exits 7, the parent waits):
+inline assembly; the child calls a function that exits 7, the parent waits).
+Every run below passes a child stack; only the flags differ:
 
-| Run                          | Child               |
-| ---------------------------- | ------------------- |
-| unmonitored, fork-like / VM  | exited 7            |
-| `io-mon run`, fork-like / VM | killed by signal 11 |
+| Run          | Flags (all with a child stack) | Child               |
+| ------------ | ------------------------------ | ------------------- |
+| unmonitored  | `SIGCHLD`                      | exited 7            |
+| unmonitored  | `SIGCHLD \| CLONE_VM`          | exited 7            |
+| `io-mon run` | `SIGCHLD`                      | killed by signal 11 |
+| `io-mon run` | `SIGCHLD \| CLONE_VM`          | killed by signal 11 |
 
 Both monitored captures are `mcIncomplete` with
 `inline raw syscall unsupported nr=56`, because no trapped clone is
 classified. So the capture fails closed, but the monitored program behaves
 differently from the unmonitored one.
 
-A clone without a child stack (the fork-like form, `newsp == 0`) is not
-affected: the child continues on a copy of the handler's stack.
+A clone WITHOUT a child stack (`newsp == 0`, the form `fork` uses) is not
+affected. Measured at `f98f17e` (with the change that follows it) with the
+same program and `SIGCHLD`: under `io-mon run` the child exits 7, as it does
+unmonitored, because it continues on a copy of the handler's stack. That capture is still `mcIncomplete` with
+`inline raw syscall unsupported nr=56`, as in the runs with a stack.
+(`CLONE_VM` without a child stack is not a usable form, monitored or not:
+both processes would run on one stack.)
 
 ## Expected
 

@@ -1946,6 +1946,48 @@ static void ct_report_vm_process(void) {
     __atomic_store_n(&ct_vm_process_reported_pid, (int)pid, __ATOMIC_RELEASE);
 }
 
+/* The creator's write of a CLONE_VM process's tree-ledger entry failed
+ * (repro_linux_vm_process_parent). Reported through frames of their own, not
+ * the fork-child one, which would name a cause that did not happen. Two
+ * frames, because the two failures differ for the guard, as the hooked
+ * writer's message says: slot 0, the entry itself could not be written (the
+ * guard may not see the process at all); slot 1, the entry was written but
+ * the creator's pid namespace could not be read (the guard sees a pid it
+ * cannot place). Written as ct_report_vm_process writes its frame, and for
+ * the same reason: the child already runs on this memory and TLS, so raw
+ * system calls only, and errno is left alone. Once per process and slot: a
+ * pre-encoded frame cannot name the child, and one report already grades the
+ * capture incomplete. */
+static ct_fork_loss_frame ct_vm_process_ledger_loss[2];
+static int ct_vm_process_ledger_reported_pid[2] = {0, 0};
+int ct_linux_preload_arm_vm_process_ledger_loss_report(
+    int ns_unknown, const unsigned char *frame, long frame_len,
+    long pid_offset, long tid_offset) __attribute__((visibility("hidden")));
+int ct_linux_preload_arm_vm_process_ledger_loss_report(
+    int ns_unknown, const unsigned char *frame, long frame_len,
+    long pid_offset, long tid_offset) {
+  return ct_arm_loss_frame(&ct_vm_process_ledger_loss[ns_unknown != 0], frame,
+                           frame_len, pid_offset, tid_offset);
+}
+void ct_linux_report_vm_process_ledger_write_failed(int ns_unknown)
+    __attribute__((visibility("hidden")));
+void ct_linux_report_vm_process_ledger_write_failed(int ns_unknown) {
+  const int k = ns_unknown != 0;
+  ct_fork_loss_frame *slot = &ct_vm_process_ledger_loss[k];
+  long frame_len = __atomic_load_n(&slot->len, __ATOMIC_ACQUIRE);
+  if (frame_len <= 0) return;
+  long pid = ct_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
+  if (__atomic_load_n(&ct_vm_process_ledger_reported_pid[k],
+                      __ATOMIC_ACQUIRE) == (int)pid)
+    return;
+  long tid = ct_raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
+  if (ct_write_loss_frame(slot->bytes, frame_len, slot->pid_offset,
+                          slot->tid_offset, "-vm-ledger-loss.iomon-frag", pid,
+                          tid))
+    __atomic_store_n(&ct_vm_process_ledger_reported_pid[k], (int)pid,
+                     __ATOMIC_RELEASE);
+}
+
 static ct_fork_loss_frame ct_uninjectable_exec_loss;
 int ct_linux_preload_arm_uninjectable_exec_loss_report(
     const unsigned char *frame, long frame_len, long pid_offset,
@@ -7363,6 +7405,14 @@ proc cArmVmProcessLossReport(frame: pointer; frameLen: clong;
                              pidOffset, tidOffset: clong): cint
   {.importc: "ct_linux_preload_arm_vm_process_loss_report", nodecl,
     raises: [].}
+proc cArmVmProcessLedgerLossReport(nsUnknown: cint; frame: pointer;
+                                   frameLen: clong;
+                                   pidOffset, tidOffset: clong): cint
+  {.importc: "ct_linux_preload_arm_vm_process_ledger_loss_report", nodecl,
+    raises: [].}
+proc cReportVmProcessLedgerWriteFailed(nsUnknown: cint)
+  {.importc: "ct_linux_report_vm_process_ledger_write_failed", nodecl,
+    raises: [].}
 proc cArmUninjectableExecLossReport(frame: pointer; frameLen: clong;
                                     pidOffset, tidOffset: clong): cint
   {.importc: "ct_linux_preload_arm_uninjectable_exec_loss_report", nodecl,
@@ -8054,6 +8104,29 @@ proc armVmProcessLossReport*(frame: openArray[byte];
     return false
   cArmVmProcessLossReport(unsafeAddr frame[0], clong(frame.len),
     clong(pidOffset), clong(tidOffset)) == 1
+
+proc armVmProcessLedgerLossReport*(nsUnknown: bool; frame: openArray[byte];
+                                   pidOffset, tidOffset: int): bool
+    {.raises: [].} =
+  ## Hand the runtime one of the two pre-encoded event-loss frames the
+  ## creator of a CLONE_VM process writes, with raw syscalls, when its write
+  ## of that process's tree-ledger entry fails
+  ## (`ct_linux_report_vm_process_ledger_write_failed`): `nsUnknown` false
+  ## for an entry that could not be written, true for a written entry whose
+  ## pid namespace the creator could not read. Call after
+  ## `armInlineLossReport`, whose fragment directory it shares.
+  if frame.len == 0:
+    return false
+  cArmVmProcessLedgerLossReport(cint(nsUnknown), unsafeAddr frame[0],
+    clong(frame.len), clong(pidOffset), clong(tidOffset)) == 1
+
+proc reportVmProcessLedgerWriteFailed*(nsUnknown: bool) {.raises: [].} =
+  ## Report, once per process and cause, that this CLONE_VM creator's write
+  ## of its child's tree-ledger entry failed: the entry itself, or (with
+  ## `nsUnknown`) the pid namespace it is relative to (see
+  ## `armVmProcessLedgerLossReport`). Raw syscalls only; touches no
+  ## thread-local state, errno included.
+  cReportVmProcessLedgerWriteFailed(cint(nsUnknown))
 
 proc armUninjectableExecLossReport*(frame: openArray[byte];
                                     pidOffset, tidOffset: int): bool

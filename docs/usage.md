@@ -473,7 +473,14 @@ chroot) reports the write as failed for that reason. A process created with
 CLONE_VM that is neither a thread nor a vfork child shares its creator's
 memory and thread state, which the shim cannot keep apart, so its creator
 publishes `linux CLONE_VM process (not a thread or vfork child): …` once per
-process, beside the child's ledger entry (all pinned by
+process, beside the child's ledger entry. The creator writes that entry, and
+when the write fails it publishes
+`linux tree ledger write failed in the creator of a CLONE_VM process (…)`
+instead of the `errno=`/`pid=` form: the parenthesis says either that the
+entry could not be written, or that it was written but the creator's pid
+namespace could not be read. It carries no errno and no pid, because the
+child already runs on the creator's memory and thread state, so the creator
+writes a frame encoded at shim init with raw system calls only (all pinned by
 `tests/linux/test_io_mon_linux_tree_ledger.nim`). Reporting
 `mcComplete` where the batch entry point reports `mcIncomplete` would be a false
 cache hit for the whole action, so the guard is **not** exported as a step you
