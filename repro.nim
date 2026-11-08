@@ -379,7 +379,11 @@ package io_mon:
           # compare with bare controls: the code-sections-only scan gate and
           # the rustc crate pair from the rustc 1.94.0 SIGILL issue.
           "test_io_mon_linux_inline_scan_code_sections_only.nim",
-          "test_io_mon_linux_rustc_crates_under_shim.nim"]) or
+          "test_io_mon_linux_rustc_crates_under_shim.nim",
+          # Compares the dlsym(RTLD_NEXT) answers of a bare control with
+          # those under a private shim; an outer shim is itself an
+          # interposer in the lookup order the test asserts.
+          "test_io_mon_foreign_preload_rtld_next.nim"]) or
         (defined(windows) and source.extractFilename in [
         "test_io_mon_cli_exit_status.nim",
         "test_io_mon_windows_exit_status.nim",

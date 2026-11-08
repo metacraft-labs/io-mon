@@ -4084,18 +4084,43 @@ int ct_linux_library_scan(ct_ll_sink_fn sink, char *reason,
 #define CT_DLSYM_GLIBC_BASE "GLIBC_2.2.5"
 #endif
 
-void *ct_linux_preload_real_dlsym(void *handle, char *name) {
+/* The real dlsym, for the RTLD_NEXT arm of the exported entry stub (below the
+ * public dlsym). Hidden, so the stub reaches it PC-relatively with no GOT. */
+__attribute__((visibility("hidden"), used))
+void *ct_linux_preload_dlsym_entry_real = NULL;
+
+static ct_dlsym_real_fn ct_real_dlsym_fn(void) {
+  if (real_dlsym_ptr == NULL) {
 #ifdef __GLIBC__
-  if (real_dlsym_ptr == NULL)
     real_dlsym_ptr = (ct_dlsym_real_fn)dlvsym(RTLD_NEXT, "dlsym", CT_DLSYM_GLIBC_BASE);
-  /* Never retry through ct_resolve on glibc: that calls our interposed
-   * dlsym again. ARM64's baseline is 2.17, not x86_64's 2.2.5. */
+    /* Never retry through ct_resolve on glibc: that calls our interposed
+     * dlsym again. ARM64's baseline is 2.17, not x86_64's 2.2.5. */
 #else
-  if (real_dlsym_ptr == NULL)
     real_dlsym_ptr = (ct_dlsym_real_fn)ct_resolve("dlsym");
 #endif
-  if (real_dlsym_ptr == NULL) { errno = ENOSYS; return NULL; }
-  return real_dlsym_ptr(handle, name);
+    if (real_dlsym_ptr != NULL)
+      __atomic_store_n(&ct_linux_preload_dlsym_entry_real,
+                       (void *)real_dlsym_ptr, __ATOMIC_RELEASE);
+  }
+  return real_dlsym_ptr;
+}
+
+void *ct_linux_preload_real_dlsym(void *handle, char *name) {
+  ct_dlsym_real_fn fn = ct_real_dlsym_fn();
+  if (fn == NULL) { errno = ENOSYS; return NULL; }
+  return fn(handle, name);
+}
+
+/* Called by the entry stub, with the caller's arguments saved, when an
+ * RTLD_NEXT lookup arrives before anything resolved the real dlsym: a
+ * constructor of a library loaded after the shim runs BEFORE the shim's own
+ * constructor primes it. NULL sends the lookup down the hooked path. */
+__attribute__((visibility("hidden"), used))
+void *ct_linux_preload_dlsym_entry_resolve(void) {
+  int saved_errno = errno;
+  void *fn = (void *)ct_real_dlsym_fn();
+  errno = saved_errno;
+  return fn;
 }
 
 void *ct_linux_preload_real_mmap(void *addr, size_t length, int prot, int flags,
@@ -5076,12 +5101,196 @@ void *dlmopen(Lmid_t namespace_id, const char *path, int flags) {
   return handle;
 }
 
-void *ct_linux_preload_public_dlsym(void *handle, const char *name)
-    __attribute__((visibility("default")));
-void *ct_linux_preload_public_dlsym(void *handle, const char *name) {
+/* --- Monitor transparency: RTLD_NEXT is answered relative to the caller -----
+ *
+ * glibc answers dlsym(RTLD_NEXT, name) with the first definition of `name`
+ * loaded after the object that CALLED dlsym, and finds that object from
+ * dlsym's return address (musl does the same). The shim interposes dlsym for
+ * the vDSO replacement, and the hooked path reaches the real dlsym from inside
+ * the shim, so a lookup forwarded that way is answered relative to the SHIM:
+ *
+ *   - an LD_PRELOAD hook library loaded after the shim (`io-mon run` prepends
+ *     the shim to the inherited LD_PRELOAD) gets its OWN export as the "next"
+ *     definition, and its hook calls itself until the stack overflows. Agent
+ *     Harbor's command-trace shim died this way in every monitored process;
+ *   - an object loaded before the shim (the program, or a hook library
+ *     preloaded ahead of it) asking for a function the shim hooks gets
+ *     libc's, which skips the shim and leaves its calls unobserved.
+ *
+ * Unlike dlopen (see "caller-scoped dlopen soname resolution"), the answer
+ * cannot be recomputed here: the search runs over the loader's private scope
+ * list, which the public link_map does not expose. So the exported dlsym is a
+ * small entry stub that sends an RTLD_NEXT lookup to the real dlsym with a
+ * TAIL JUMP, leaving the caller's return address in place for the loader to
+ * read. Every other handle takes the hooked path as before. The hooked path
+ * only replaces vDSO entry points, and RTLD_NEXT does not resolve those: the
+ * vDSO is not in any object's search scope (measured: dlsym(RTLD_NEXT,
+ * "__vdso_clock_gettime") is NULL, while the vDSO's own handle answers).
+ * The one exception is a program that first promotes the vDSO into the
+ * global scope with dlopen("linux-vdso.so.1", RTLD_NOLOAD | RTLD_GLOBAL);
+ * its later RTLD_NEXT lookups of __vdso_* names get the unreplaced entries.
+ * A lookup the shim itself makes still names the shim, as it always did.
+ *
+ * A tail call cannot be requested portably in C (GCC gained `musttail` only
+ * in 15), hence assembly. An architecture without a stub keeps the old
+ * shim-relative behaviour. */
+void *ct_linux_preload_hooked_dlsym(void *handle, const char *name)
+    __attribute__((visibility("hidden"), used));
+void *ct_linux_preload_hooked_dlsym(void *handle, const char *name) {
   if (CT_BYPASS() || ct_dlsym_hook == NULL)
     return ct_linux_preload_real_dlsym(handle, (char *)name);
   return CT_CALL_HOOK(ct_dlsym_hook(handle, (char *)name));
+}
+
+#if defined(__x86_64__)
+/* RTLD_NEXT is ((void *)-1l). At entry %rsp is 8 mod 16; the two pushes and
+ * the 8-byte adjustment realign it for the resolver call. `endbr64` is a NOP
+ * unless indirect-branch tracking is enforced, where it admits the caller's
+ * indirect call (as `bti c` does on AArch64). */
+__asm__(
+  ".pushsection .text\n"
+  ".globl ct_linux_preload_public_dlsym\n"
+  ".type ct_linux_preload_public_dlsym, @function\n"
+  "ct_linux_preload_public_dlsym:\n"
+  "  .cfi_startproc\n"
+  "  endbr64\n"
+  "  cmpq $-1, %rdi\n"
+  "  jne 2f\n"
+  "  movq ct_linux_preload_dlsym_entry_real(%rip), %rax\n"
+  "  testq %rax, %rax\n"
+  "  jz 1f\n"
+  "  jmp *%rax\n"
+  "1:\n"
+  "  pushq %rdi\n"
+  "  .cfi_adjust_cfa_offset 8\n"
+  "  pushq %rsi\n"
+  "  .cfi_adjust_cfa_offset 8\n"
+  "  subq $8, %rsp\n"
+  "  .cfi_adjust_cfa_offset 8\n"
+  "  call ct_linux_preload_dlsym_entry_resolve\n"
+  "  addq $8, %rsp\n"
+  "  .cfi_adjust_cfa_offset -8\n"
+  "  popq %rsi\n"
+  "  .cfi_adjust_cfa_offset -8\n"
+  "  popq %rdi\n"
+  "  .cfi_adjust_cfa_offset -8\n"
+  "  testq %rax, %rax\n"
+  "  jz 2f\n"
+  "  jmp *%rax\n"
+  "2:\n"
+  "  jmp ct_linux_preload_hooked_dlsym\n"
+  "  .cfi_endproc\n"
+  ".size ct_linux_preload_public_dlsym, .-ct_linux_preload_public_dlsym\n"
+  ".popsection\n");
+#define CT_DLSYM_ENTRY_STUB 1
+#elif defined(__aarch64__)
+/* `bti c` is a NOP unless branch protection is enforced, where it admits the
+ * caller's indirect call; the real dlsym is reached through x16, which a
+ * `bti c` landing pad accepts. */
+__asm__(
+  ".pushsection .text\n"
+  ".globl ct_linux_preload_public_dlsym\n"
+  ".type ct_linux_preload_public_dlsym, %function\n"
+  ".p2align 2\n"
+  "ct_linux_preload_public_dlsym:\n"
+  "  .cfi_startproc\n"
+  "  hint #34\n"
+  "  cmn x0, #1\n"
+  "  b.ne 2f\n"
+  "  adrp x16, ct_linux_preload_dlsym_entry_real\n"
+  "  ldr x16, [x16, #:lo12:ct_linux_preload_dlsym_entry_real]\n"
+  "  cbz x16, 1f\n"
+  "  br x16\n"
+  "1:\n"
+  "  stp x29, x30, [sp, #-32]!\n"
+  "  .cfi_def_cfa_offset 32\n"
+  "  .cfi_offset 29, -32\n"
+  "  .cfi_offset 30, -24\n"
+  "  mov x29, sp\n"
+  "  stp x0, x1, [sp, #16]\n"
+  "  bl ct_linux_preload_dlsym_entry_resolve\n"
+  "  mov x16, x0\n"
+  "  ldp x0, x1, [sp, #16]\n"
+  "  ldp x29, x30, [sp], #32\n"
+  "  .cfi_def_cfa_offset 0\n"
+  "  .cfi_restore 29\n"
+  "  .cfi_restore 30\n"
+  "  cbz x16, 2f\n"
+  "  br x16\n"
+  "2:\n"
+  "  b ct_linux_preload_hooked_dlsym\n"
+  "  .cfi_endproc\n"
+  ".size ct_linux_preload_public_dlsym, .-ct_linux_preload_public_dlsym\n"
+  ".popsection\n");
+#define CT_DLSYM_ENTRY_STUB 1
+#elif defined(__arm__) && defined(__ARM_EABI__)
+/* ARM state, whatever the C code around it is compiled as: `bl` to the
+ * resolver is turned into `blx` by the linker when it is Thumb, and the
+ * hooked path is entered with `bx` on an address whose low bit R_ARM_REL32
+ * sets for a Thumb target. The push keeps the stack 8-byte aligned. */
+__asm__(
+  ".pushsection .text\n"
+  ".arm\n"
+  ".globl ct_linux_preload_public_dlsym\n"
+  ".type ct_linux_preload_public_dlsym, %function\n"
+  ".p2align 2\n"
+  "ct_linux_preload_public_dlsym:\n"
+  "  cmn r0, #1\n"
+  "  bne 2f\n"
+  "  ldr r12, 4f\n"
+  "0:\n"
+  "  add r12, pc, r12\n"
+  "  ldr r12, [r12]\n"
+  "  cmp r12, #0\n"
+  "  beq 1f\n"
+  "  bx r12\n"
+  "1:\n"
+  "  push {r0, r1, r2, lr}\n"
+  "  bl ct_linux_preload_dlsym_entry_resolve\n"
+  "  mov r12, r0\n"
+  "  pop {r0, r1, r2, lr}\n"
+  "  cmp r12, #0\n"
+  "  bxne r12\n"
+  "2:\n"
+  "  ldr r12, 5f\n"
+  "3:\n"
+  "  add r12, pc, r12\n"
+  "  bx r12\n"
+  "  .p2align 2\n"
+  "4:\n"
+  "  .word ct_linux_preload_dlsym_entry_real - (0b + 8)\n"
+  "5:\n"
+  "  .word ct_linux_preload_hooked_dlsym - (3b + 8)\n"
+  ".size ct_linux_preload_public_dlsym, .-ct_linux_preload_public_dlsym\n"
+  ".popsection\n");
+#define CT_DLSYM_ENTRY_STUB 1
+#endif
+
+#ifdef CT_DLSYM_ENTRY_STUB
+/* The aliases and versions the C definition below gives an architecture
+ * without a stub. GCC rejects an alias attribute whose target only assembly
+ * defines, so they are made in assembly too. */
+#ifdef __GLIBC__
+__asm__(
+  ".globl ct_linux_preload_public_dlsym_glibc_base\n"
+  ".type ct_linux_preload_public_dlsym_glibc_base, %function\n"
+  ".set ct_linux_preload_public_dlsym_glibc_base, ct_linux_preload_public_dlsym\n"
+  ".globl ct_linux_preload_public_dlsym_glibc_2_34\n"
+  ".type ct_linux_preload_public_dlsym_glibc_2_34, %function\n"
+  ".set ct_linux_preload_public_dlsym_glibc_2_34, ct_linux_preload_public_dlsym\n"
+  ".symver ct_linux_preload_public_dlsym_glibc_base,dlsym@" CT_DLSYM_GLIBC_BASE "\n"
+  ".symver ct_linux_preload_public_dlsym_glibc_2_34,dlsym@@GLIBC_2.34\n");
+#else
+__asm__(
+  ".globl dlsym\n"
+  ".type dlsym, %function\n"
+  ".set dlsym, ct_linux_preload_public_dlsym\n");
+#endif
+#else /* !CT_DLSYM_ENTRY_STUB */
+void *ct_linux_preload_public_dlsym(void *handle, const char *name)
+    __attribute__((visibility("default")));
+void *ct_linux_preload_public_dlsym(void *handle, const char *name) {
+  return ct_linux_preload_hooked_dlsym(handle, name);
 }
 #ifdef __GLIBC__
 void *ct_linux_preload_public_dlsym_glibc_base(void *handle, const char *name)
@@ -5097,6 +5306,7 @@ void *dlsym(void *handle, const char *name)
     __attribute__((alias("ct_linux_preload_public_dlsym"),
                    visibility("default")));
 #endif
+#endif /* CT_DLSYM_ENTRY_STUB */
 
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
     __attribute__((visibility("default")));
