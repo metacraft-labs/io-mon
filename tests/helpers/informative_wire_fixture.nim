@@ -28,8 +28,8 @@
 ## are pinned to small values by the format itself, so NO legal capture —
 ## informative or not — can make their high bytes non-zero:
 ##
-##   * `kind`    — a `u16` whose legal range is 1 .. 19 (`MonitorRecordKind`).
-##   * `obs`     — a `u16` whose legal range is 1 .. 17 (`MonitorObservationKind`).
+##   * `kind`    — a `u16` whose legal range is 1 .. 20 (`MonitorRecordKind`).
+##   * `obs`     — a `u16` whose legal range is 1 .. 18 (`MonitorObservationKind`).
 ##   * `probe`   — a `u32` whose legal range is 0 .. 4 (`ProbeResult`).
 ##   * `seq`     — a `u64` the reader requires to be exactly 1 .. N in file order
 ##                 (`validateSequenceOrder`), so reaching byte 2 of it would take

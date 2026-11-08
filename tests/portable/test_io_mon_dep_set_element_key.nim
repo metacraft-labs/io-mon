@@ -70,7 +70,7 @@ const
   KeepsIncarnationKinds = {mrFileOpen, mrFileRead, mrPathProbe,
     mrDirectoryEnumerate, mrProcessStart, mrProcessExec, mrProcessSpawn,
     mrFileWrite, mrEventLoss, mrBackendProfile, mrCapabilityGap, mrIpcConnect,
-    mrNonDeterministic, mrExternalContent, mrPathMutation}
+    mrNonDeterministic, mrExternalContent, mrPathMutation, mrConnectAttempt}
   DropsIncarnationKinds = {mrLibraryLoad, mrEnvRead, mrSysctlRead, mrTimeRead}
 
   # DA-1d — the result/flags normalisation decision table, likewise restated.
@@ -81,7 +81,7 @@ const
   OutcomeVerbatimKinds = {mrDirectoryEnumerate, mrLibraryLoad, mrEnvRead,
     mrSysctlRead, mrTimeRead, mrProcessStart, mrProcessExec, mrProcessSpawn,
     mrEventLoss, mrBackendProfile, mrCapabilityGap, mrIpcConnect,
-    mrNonDeterministic, mrExternalContent, mrPathMutation}
+    mrNonDeterministic, mrExternalContent, mrPathMutation, mrConnectAttempt}
 
 proc sampleRecord(kind: MonitorRecordKind): MonitorRecord =
   ## One representative record per kind, with every identity-bearing field

@@ -40,6 +40,7 @@ import io_mon/writer
 import io_mon/shim/windows_iat_patcher
 import io_mon/shim/windows_hook_registry as hr
 import io_mon/shim/install_audit
+import io_mon/winsock_connect
 
 # Framework's safer grandchild-injection primitive — replaces the
 # bespoke INFINITE-wait inject_dll path with concurrent-injection cap
@@ -1592,6 +1593,22 @@ proc emitIpcConnect(dest: string; peerPid: uint64; family: uint16;
   record.path = dest
   record.detail = "connect " & kind &
     (if peerPid != 0'u64: " peer=" & $peerPid else: " peer=unknown")
+  emitRecord(record)
+
+proc emitConnectAttempt(dest: string; family: uint16; callResult: int64;
+                        wsaError: uint32) {.raises: [].} =
+  ## A `connect`/`WSAConnect` to an AF_INET/AF_INET6 destination that FAILED:
+  ## an attempt that reached nobody, recorded as `mrConnectAttempt`
+  ## with the destination in the spelling `emitIpcConnect` uses. Never an
+  ## `mrIpcConnect` — the merge must not derive an out-of-tree-peer loss
+  ## from a connection that was refused (see `socketConnectReachedPeer`).
+  if dest.len == 0 or (family != AfInetW and family != AfInet6W):
+    return
+  var record = baseRecord(mrConnectAttempt, moConnectAttempt)
+  record.result = callResult
+  record.flags = uint32(family)
+  record.path = dest
+  record.detail = "connect-attempt af_inet errno=" & $wsaError
   emitRecord(record)
 
 proc emitExternalContent(chan, role, identity: string; producerPid: uint64;
@@ -5139,45 +5156,6 @@ proc originalMsvcrtWGetenvS(ctx: var hr.HookContext) {.raises: [].} =
 
 # --- M5 snoop callbacks ----------------------------------------------------
 
-const
-  WSAEWOULDBLOCK = 10035'u32
-  WSAEINPROGRESS = 10036'u32
-
-proc socketConnectReachedPeer(rc: int32; wsaError: uint32): bool
-    {.inline, raises: [].} =
-  ## Did this `connect`/`WSAConnect` call actually reach a peer?
-  ##
-  ## THE SAME RULE `classifyOpenedPath` STATES FOR PIPES, applied to the socket
-  ## arm: only a connect that reached somebody is recorded. An `mrIpcConnect`
-  ## naming an UNKNOWN peer is a downgrade signal -- the merge cannot prove the
-  ## peer was in-tree, so the whole capture grades `mcIncomplete` and the action
-  ## loses its cache publication. Emitting one for a connect that was REFUSED
-  ## means a connection that never happened costs a build its cache hit: a
-  ## false re-run, which is the failure direction this machinery exists to
-  ## avoid. Windows programs probe localhost constantly (daemon discovery,
-  ## sccache and language-server probes, "is the server already up?" checks),
-  ## and every one of those probes ends in WSAECONNREFUSED by design.
-  ##
-  ## IN-FLIGHT CONNECTS ARE RECORDED, deliberately, matching the macOS arm's
-  ## `EInProgress` case. A non-blocking `connect` returns SOCKET_ERROR with
-  ## WSAEWOULDBLOCK (the Winsock spelling of EINPROGRESS; WSAEINPROGRESS is the
-  ## WinSock 1.1 blocking-call form and is accepted for completeness) and then
-  ## COMPLETES asynchronously -- that is the ordinary shape of an async client
-  ## talking to a daemon, so treating it as "reached nobody" would be a silent
-  ## false skip over a real peer. The two errors are not symmetric in cost: an
-  ## in-flight connect that later fails costs a conservative re-run, while a
-  ## refused connect recorded as a peer costs one too, and an in-flight connect
-  ## NOT recorded costs a false `mcComplete` over content that arrived from an
-  ## out-of-tree daemon. Only the last of those is unrecoverable, so the guard
-  ## is drawn to include exactly the states in which a peer may yet be reached.
-  ##
-  ## `GetLastError` is the source of `wsaError`: `WSAGetLastError` is documented
-  ## as returning the same thread-local value, and the snoops already capture it
-  ## immediately after `callNext` before anything can clobber it.
-  if rc == 0:
-    return true
-  wsaError == WSAEWOULDBLOCK or wsaError == WSAEINPROGRESS
-
 proc snoopConnect(ctx: var hr.HookContext) {.raises: [].} =
   hr.callNext(ctx)
   let savedLastError = GetLastError()
@@ -5198,6 +5176,14 @@ proc snoopConnect(ctx: var hr.HookContext) {.raises: [].} =
         # peer. The named-pipe arm, which is how Windows build daemons actually
         # talk, DOES supply the pid.
         emitIpcConnect(dest, 0'u64, family, int64(rc), "socket")
+    elif winsockConnectFailureReadAddress(savedLastError):
+      # Only a failure the transport returned about the destination: after
+      # WSAEFAULT / WSAEINVAL the address may be unreadable, and reading it
+      # would crash the program (`io_mon/winsock_connect`).
+      var family: uint16 = 0
+      let dest = sockaddrDestination(cast[pointer](ctx.args[1]),
+        cast[int32](uint32(ctx.args[2])), family)
+      emitConnectAttempt(dest, family, int64(rc), savedLastError)
   except CatchableError:
     discard
   SetLastError(savedLastError)
@@ -5216,6 +5202,14 @@ proc snoopWSAConnect(ctx: var hr.HookContext) {.raises: [].} =
         cast[int32](uint32(ctx.args[2])), family)
       if dest.len > 0:
         emitIpcConnect(dest, 0'u64, family, int64(rc), "socket")
+    elif winsockConnectFailureReadAddress(savedLastError):
+      # Only a failure the transport returned about the destination: after
+      # WSAEFAULT / WSAEINVAL the address may be unreadable, and reading it
+      # would crash the program (`io_mon/winsock_connect`).
+      var family: uint16 = 0
+      let dest = sockaddrDestination(cast[pointer](ctx.args[1]),
+        cast[int32](uint32(ctx.args[2])), family)
+      emitConnectAttempt(dest, family, int64(rc), savedLastError)
   except CatchableError:
     discard
   SetLastError(savedLastError)

@@ -39,7 +39,8 @@ when defined(linux) or defined(windows) or defined(macosx):
       result = defaultValue
 
 when defined(linux):
-  import std/[algorithm, monotimes, posix]
+  import std/[algorithm, monotimes, posix, sequtils]
+  import io_mon/tree_ledger
   from io_mon/proc_start_time import predatesRoot
   import io_mon/exec_image_injectability
 
@@ -430,27 +431,135 @@ when defined(linux):
       return
     appendFragmentRecord(fragmentDir, rec)
 
+  proc liveLedgerEntries(ledger: seq[TreeLedgerEntry]; rootPid: uint64;
+                         minStartTicks: uint64): seq[int] =
+    ## The tree-ledger entries (`io_mon/tree_ledger`) that are a LIVE process
+    ## now: `/proc/<pid>/stat` readable, run state not `Z`, and the same start
+    ## time as the entry. An entry whose start time the writer could not read
+    ## (0) matches any live process with that pid that is not provably older
+    ## than the root, which can only err towards "live". The root itself has
+    ## been reaped before the guard runs, and is skipped.
+    var statBuf {.noinit.}: array[ProcStatBufLen, char]
+    for e in ledger:
+      if e.pid <= 0 or uint64(e.pid) == rootPid:
+        continue
+      let path = "/proc/" & $e.pid & "/stat"
+      let n = readProcFileAt(AT_FDCWD, path.cstring, statBuf)
+      if n <= 0:
+        continue                          # gone
+      var state = '\0'
+      var ticks = 0'u64
+      if not parseProcStat(statBuf, n, state, ticks):
+        result.add e.pid                  # unreadable state: count it live
+        continue
+      if state == 'Z':
+        continue
+      if e.startUsec != 0:
+        if ticks != 0 and ticks != e.startUsec:
+          continue                        # the pid was reused
+      elif predatesRoot(ticks, minStartTicks):
+        continue
+      result.add e.pid
+
   proc waitForLinuxInjectedDescendants(fragmentDir, runId: string;
       rootPid: uint64; minStartTicks: uint64; depSetPath0 = "") =
+    ## The Linux §4.1 guard. Each round reads the TREE LEDGER, sweeps `/proc`
+    ## for this run's needles (`liveInjectedDescendants`), checks every ledger
+    ## entry for liveness (`liveLedgerEntries`) and reads the ledger again. A
+    ## round is conclusive only when the sweep finds no carrier, no entry is
+    ## live, and the second read found no entry the first did not.
+    ##
+    ## WHY THE LEDGER: `/proc/<pid>/environ` is the process's
+    ## own stack (`env_start..env_end`), not a copy taken at exec, so a
+    ## descendant that overwrites its `REPRO_MONITOR_*` strings in place, or
+    ## reuses the argv+environ area for a process title as PostgreSQL does
+    ## (`PS_USE_CLOBBER_ARGV`), is invisible to the needle sweep while it
+    ## keeps running. The ledger is evidence outside its memory: the shim
+    ## writes an entry per process it saw come into existence (shim init and
+    ## the fork child for itself, the parent of a hooked fork / posix_spawn
+    ## for the child before the call returns, the exec hook for itself); the
+    ## soundness argument is `io_mon/macos_tree_guard`'s, case by case. A
+    ## ledger that cannot be read, or that has no entry for the root, proves
+    ## nothing and fails closed.
     let graceMs = envInt("IO_MON_LINUX_DESCENDANT_GRACE_MS",
       LinuxInjectedDescendantGraceMsDefault, 0)
     let pollMs = envInt("IO_MON_LINUX_DESCENDANT_POLL_MS",
       LinuxInjectedDescendantPollMsDefault, 1)
     let start = getMonoTime()
+    let ownPidNs = linuxSelfPidNamespace()
     while true:
+      var before, after: seq[TreeLedgerEntry]
+      if not readTreeLedger(fragmentDir, before):
+        appendLauncherEventLoss(fragmentDir, runId,
+          "linux descendant guard failed: the tree ledger could not be read",
+          depSetPath0)
+        return
+      # A ledger pid is relative to its writer's pid namespace
+      # (`TreeLedgerPidNsPrefix`). When any writer ran in a namespace other
+      # than this guard's, its pids name processes this guard cannot see by
+      # those numbers (pid 1 in the tree's namespace is not the host's init),
+      # so the ledger proves nothing here. Fail closed at once, with that
+      # reason: waiting out the grace window cannot change the answer, and
+      # checking the pids would report unrelated host processes as live.
+      var pidNamespaces: seq[uint64]
+      if not readTreeLedgerPidNamespaces(fragmentDir, pidNamespaces):
+        appendLauncherEventLoss(fragmentDir, runId,
+          "linux descendant guard failed: the tree ledger could not be read",
+          depSetPath0)
+        return
+      if ownPidNs != 0:
+        let foreign = pidNamespaces.filterIt(it != ownPidNs)
+        if foreign.len > 0:
+          appendLauncherEventLoss(fragmentDir, runId,
+            "linux descendant guard failed: the monitored tree ran processes " &
+              "in another pid namespace pidns=" & foreign.join(",") &
+              " (this guard's pidns=" & $ownPidNs & "), whose pids it " &
+              "cannot check", depSetPath0)
+          return
+      if rootPid > 0 and not before.anyIt(uint64(it.pid) == rootPid):
+        # The root loads the shim before `main`, and shim init writes the
+        # root's entry or publishes a loss for the failed write. A ledger
+        # without it was not kept (a shim that predates the ledger, or a root
+        # that never loaded the shim), so it cannot prove anything here.
+        appendLauncherEventLoss(fragmentDir, runId,
+          "linux descendant guard failed: the tree ledger has no entry for " &
+            "the root pid=" & $rootPid, depSetPath0)
+        return
       let live = liveInjectedDescendants(runId, fragmentDir, rootPid,
         minStartTicks)
       if live.scanFailed:
         appendLauncherEventLoss(fragmentDir, runId,
           "linux injected-descendant /proc scan failed", depSetPath0)
         return
-      if live.pids.len == 0:
+      let recorded = liveLedgerEntries(before, rootPid, minStartTicks)
+      if not readTreeLedger(fragmentDir, after):
+        appendLauncherEventLoss(fragmentDir, runId,
+          "linux descendant guard failed: the tree ledger could not be read",
+          depSetPath0)
+        return
+      let ledgerGrew = after != before
+      if live.pids.len == 0 and recorded.len == 0 and not ledgerGrew:
         return
       let elapsedMs = inMilliseconds(getMonoTime() - start)
       if elapsedMs >= graceMs:
-        appendLauncherEventLoss(fragmentDir, runId,
-          "linux injected descendants still live after root exit pids=" &
-            live.pids.join(","), depSetPath0)
+        let ledgerOnly = recorded.filterIt(it notin live.pids)
+        if live.pids.len > 0:
+          var detail = "linux injected descendants still live after root " &
+            "exit pids=" & live.pids.join(",")
+          if ledgerOnly.len > 0:
+            detail.add " recorded-pids=" & ledgerOnly.join(",")
+          appendLauncherEventLoss(fragmentDir, runId, detail, depSetPath0)
+        elif ledgerOnly.len > 0:
+          # Alive, in this run's ledger, and NOT found by the needle sweep:
+          # its environment no longer carries the needles.
+          appendLauncherEventLoss(fragmentDir, runId,
+            "linux recorded descendants still live after root exit pids=" &
+              ledgerOnly.join(","), depSetPath0)
+        else:
+          appendLauncherEventLoss(fragmentDir, runId,
+            "linux descendant guard could not settle the tree ledger: " &
+              "entries kept appearing after root exit entries=" & $after.len,
+            depSetPath0)
         return
       sleep(min(pollMs, graceMs - int(elapsedMs)))
 

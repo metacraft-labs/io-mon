@@ -148,9 +148,10 @@
 ## writer could not read matches any live process with that pid that is not
 ## provably older than the root, which can only err towards "live".
 ##
-## Linux has the same blind spot (its scan reads `/proc/<pid>/environ`, which
-## is also live memory) and no ledger yet: io-mon issue
-## `2026-10-30-linux-descendant-guard-misses-an-overwritten-environment`.
+## Linux had the same blind spot (its scan reads `/proc/<pid>/environ`, which
+## is also live memory); its guard now checks the same ledger
+## (`fs_snoop.waitForLinuxInjectedDescendants`,
+## `tests/linux/test_io_mon_linux_tree_ledger.nim`).
 ##
 ## ── THE START-TIME PRUNE USES THE MONOTONIC CLOCK ─────────────────────────
 ##

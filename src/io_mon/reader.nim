@@ -38,7 +38,7 @@ proc decodeMonitorDepFile(bytes: openArray[byte];
 
   var pos = 4
   let version = readU16Le(bytes, pos)
-  if version != IomonVersion:
+  if not iomonVersionReadable(version):
     raiseMonitorDepFileReaderError(mrUnsupportedVersion, "unsupported iomon version")
   discard readU16Le(bytes, pos)
   let headerCount = readU64Le(bytes, pos)
@@ -156,7 +156,7 @@ iterator streamMonitorDepFileRecords*(path: string;
     raiseMonitorDepFileReaderError(mrBadMagic, "unknown iomon magic")
   var pos = 4
   let version = readU16Le(bytes, pos)
-  if version != IomonVersion:
+  if not iomonVersionReadable(version):
     raiseMonitorDepFileReaderError(mrUnsupportedVersion, "unsupported iomon version")
   discard readU16Le(bytes, pos)
   let headerCount = readU64Le(bytes, pos)

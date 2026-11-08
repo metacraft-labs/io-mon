@@ -1189,6 +1189,37 @@ void ct_linux_preload_register_raw_fork(ct_raw_fork_sample_fn sample,
   ct_raw_fork_child = child;
 }
 
+/* A clone with CLONE_VM but neither CLONE_THREAD nor CLONE_VFORK creates a
+ * PROCESS that shares the caller's memory and runs at once, without exec.
+ * It runs no fork-child notification (it shares the parent's live state),
+ * so it cannot write its own tree-ledger entry, and it can outlive the
+ * root. Its creator writes the entry instead, before clone returns to it
+ * (and so before the root can exit): ct_linux_preload_register_vm_process.
+ * A CLONE_VFORK child suspends its parent until it execs or exits, and the
+ * exec'd image writes its own entry; a CLONE_THREAD child is a thread. */
+typedef void (*ct_vm_process_parent_fn)(long child_pid);
+static ct_vm_process_parent_fn ct_vm_process_parent = NULL;
+void ct_linux_preload_register_vm_process(ct_vm_process_parent_fn fn) {
+  ct_vm_process_parent = fn;
+}
+
+static int ct_clone_flags_make_vm_process(unsigned long long flags) {
+  return (flags & CLONE_VM) != 0 && (flags & CLONE_THREAD) == 0 &&
+         (flags & CLONE_VFORK) == 0;
+}
+
+static int ct_preload_hooks_allowed(void);
+static void ct_note_vm_process_parent(long child_pid) {
+  if (child_pid <= 0 || ct_vm_process_parent == NULL ||
+      !ct_preload_hooks_allowed())
+    return;
+  int saved_errno = errno;
+  stackable_linux_preload_enter_hook();
+  ct_vm_process_parent(child_pid);
+  stackable_linux_preload_exit_hook();
+  errno = saved_errno;
+}
+
 static int ct_raw_call_forks_process(long nr, long a1) {
 #ifdef SYS_fork
   if (nr == SYS_fork) return 1;
@@ -1240,6 +1271,21 @@ static void ct_raw_fork_child_reset(void) {
 void ct_linux_preload_after_raw_fork_syscall(long nr, long a1, long result)
     __attribute__((visibility("hidden")));
 void ct_linux_preload_after_raw_fork_syscall(long nr, long a1, long result) {
+  if (result > 0) {
+#ifdef SYS_clone
+    if (nr == SYS_clone && ct_clone_flags_make_vm_process((unsigned long)a1))
+      ct_note_vm_process_parent(result);
+#endif
+#ifdef SYS_clone3
+    if (nr == SYS_clone3 && a1 != 0) {
+      unsigned long long flags;
+      memcpy(&flags, (void *)a1, sizeof(flags));
+      if (ct_clone_flags_make_vm_process(flags))
+        ct_note_vm_process_parent(result);
+    }
+#endif
+    return;
+  }
   if (result != 0 || !ct_raw_call_forks_process(nr, a1)) return;
   int saved_errno = errno;
   int pid = (int)ct_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
@@ -3230,8 +3276,12 @@ int clone(int (*fn)(void *), void *stack, int flags, void *arg, ...) {
   va_end(ap);
   if (real_clone_ptr == NULL) real_clone_ptr = (ct_clone_fn)ct_resolve("clone");
   if (real_clone_ptr == NULL) { errno = ENOSYS; return -1; }
-  if ((flags & CLONE_VM) != 0 || fn == NULL)
-    return real_clone_ptr(fn, stack, flags, arg, parent_tid, tls, child_tid);
+  if ((flags & CLONE_VM) != 0 || fn == NULL) {
+    int pid = real_clone_ptr(fn, stack, flags, arg, parent_tid, tls, child_tid);
+    if (pid > 0 && ct_clone_flags_make_vm_process((unsigned long)flags))
+      ct_note_vm_process_parent(pid);
+    return pid;
+  }
   int saved_errno = errno;
   struct ct_clone_trampoline call = {fn, arg, 1};
   if (!CT_BYPASS() && ct_raw_fork_sample != NULL)

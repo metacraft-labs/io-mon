@@ -20,6 +20,7 @@ import stackable_hooks/platform/macos_bodypatch
 import io_mon/types
 import io_mon/writer
 import io_mon/tree_ledger
+import io_mon/posix_connect
 
 {.emit: """
 #include <copyfile.h>
@@ -212,6 +213,7 @@ const
   AfInet = 2.cint
   AfInet6 = 30.cint
   EInProgress = 36.cint
+  EIntr = 4.cint
   # ROUND-2 R4 — `fstatat`'s AT_FDCWD sentinel (<fcntl.h>, -2 on Darwin). The
   # fstatat canonicalisation is applied only for ABSOLUTE paths or AT_FDCWD, since
   # realpath resolves a relative path against the CWD, not an arbitrary `dirfd`.
@@ -1220,6 +1222,31 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32;
   dec disabled
   d.add " nonce=" & $nonce
   record.detail = d
+  emitRecord(record)
+
+proc recordConnectAttempt(fd: cint; address: pointer; addrLen: uint32;
+    callResult: cint; err: cint) {.raises: [].} =
+  ## A FAILED connect(2) to an AF_INET/AF_INET6 destination: an
+  ## attempt that reached nobody, recorded as `mrConnectAttempt` with the
+  ## destination in the same "ip:port" spelling `recordIpcConnect` uses. Not
+  ## an `mrIpcConnect` — there is no peer to be out of tree — so the merge
+  ## never derives a loss from it. Other families are skipped.
+  if address == nil:
+    return
+  var dest: array[1024, char]
+  dest[0] = '\0'
+  var peerPid: cint = 0
+  let family = ct_macos_socket_describe(fd, address, addrLen,
+    addr dest[0], csize_t(dest.len), addr peerPid)
+  if family != AfInet and family != AfInet6:
+    return
+  var record = baseRecord(mrConnectAttempt, moConnectAttempt)
+  record.result = callResult.int64
+  record.flags = uint32(family)
+  record.path = $cast[cstring](addr dest[0])
+  if record.path.len == 0:
+    return
+  record.detail = "connect-attempt af_inet errno=" & $err
   emitRecord(record)
 
 # --- ROUND-3 S0 — Mach/XPC service-name discrimination ----------------------
@@ -3368,12 +3395,28 @@ proc repro_hook_connect*(fd: cint; address: pointer; addrLen: uint32): cint
   result = ct_macos_real_connect(fd, address, addrLen)
   let savedErrno = getErrno()
   # Record an ESTABLISHED connection (result == 0 — the blocking daemon/sccache
-  # case) or an in-flight NON-BLOCKING one (result < 0 && EINPROGRESS — the
+  # case), an in-flight NON-BLOCKING one (result < 0 && EINPROGRESS — the
   # connection will complete asynchronously; the peer pid may not be resolvable
-  # yet, which the merge treats conservatively as out-of-tree). A hard failure
-  # (ECONNREFUSED, …) reached no peer and is NOT recorded.
-  if result == 0 or (result < 0 and savedErrno == EInProgress):
+  # yet, which the merge treats conservatively as out-of-tree), or a BLOCKING
+  # one interrupted by a caught signal (EINTR), which POSIX says is not aborted
+  # but "established asynchronously"
+  # (https://pubs.opengroup.org/onlinepubs/9799919799/functions/connect.html),
+  # so it is in flight exactly as EINPROGRESS is. Leaving EINTR out recorded
+  # nothing at all for it, so a handler installed without SA_RESTART made an
+  # undeclared connection invisible. A hard failure (ECONNREFUSED, …) reached
+  # no peer and is NOT an `mrIpcConnect`.
+  if result == 0 or (result < 0 and
+      (savedErrno == EInProgress or savedErrno == EIntr)):
     recordIpcConnect(fd, address, addrLen, result)
+  elif result < 0 and connectFailureReadAddress(savedErrno):
+    # Only a failure the protocol returned: after EFAULT, EINVAL, EBADF, ...
+    # the address may never have been readable, and reading it here would
+    # crash the program (`io_mon/posix_connect`).
+    # A failed AF_INET/AF_INET6 connect is recorded as an ATTEMPT
+    # (`mrConnectAttempt`), never as an `mrIpcConnect`: it reached no peer,
+    # so it must not downgrade, but it is the evidence that the process
+    # tried (the Linux and Windows shims record the same).
+    recordConnectAttempt(fd, address, addrLen, result, savedErrno)
   setErrno(savedErrno)
 
 # --- ROUND-4 IP1 — local-IPC-fd CREATE hooks (pipe/socket/socketpair/accept) ---

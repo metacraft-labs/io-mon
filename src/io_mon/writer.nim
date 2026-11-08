@@ -2601,7 +2601,7 @@ proc unmonitoredSubtreeLossDetails*(records: openArray[MonitorRecord];
         continue
       flaggedPeers.incl key
       let peerUid = trustedDetailToken(r.detail, PeerUidToken)
-      result.add("ipc peer outside monitored tree pid=" & $r.osPid &
+      result.add(IpcPeerLossPrefix & "pid=" & $r.osPid &
         " peer=" & $peer & " peerstart=" & peerStart &
         (if peerUid.len > 0: " peeruid=" & peerUid else: "") &
         " path=" & r.path)
@@ -3568,9 +3568,7 @@ proc mergeFragments*(fragmentDir, outputPath: string;
   for loss in subtreeLosses:
     records.add MonitorRecord(kind: mrEventLoss,
       observationKind: moEventLoss,
-      detail: "unmonitored subtree/peer (un-injectable spawn child, SETEXEC " &
-        "into a hardened image, or IPC connect to an out-of-tree breakaway " &
-        "daemon): " & loss)
+      detail: UnmonitoredSubtreeLossPrefix & loss)
   # ROUND-3 S1 — DOWNGRADE on out-of-tree CONTENT CHANNELS: a POSIX shm object not
   # created in-tree, or a FIFO with no in-tree writer. The producer is outside the
   # monitored tree so the consumed content is an invisible input. One synthetic

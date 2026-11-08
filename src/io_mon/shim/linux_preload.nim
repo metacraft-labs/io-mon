@@ -27,6 +27,8 @@ from io_mon/paths import anchoredRelativePath, extendedPath,
   startsWithParentRef
 
 import io_mon/types
+import io_mon/tree_ledger
+import io_mon/posix_connect
 import io_mon/writer
 import io_mon/hooks/linux_preload_runtime
 import io_mon/shim/linux_pod_tables
@@ -643,6 +645,7 @@ var
 #include <sys/un.h>
 #include <stddef.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -748,8 +751,18 @@ void repro_linux_set_errno(int value) {
   errno = value;
 }
 
+/* Whether a failed connect(2) may still reach its peer, so that it is recorded
+ * as a connection (`mrIpcConnect`) rather than as an attempt that reached
+ * nobody. EINPROGRESS / EALREADY / EWOULDBLOCK: a non-blocking connect still
+ * in flight. EINTR: a BLOCKING connect interrupted by a caught signal, which
+ * POSIX says "shall not be aborted, and the connection shall be established
+ * asynchronously" (connect(), ERRORS / DESCRIPTION,
+ * https://pubs.opengroup.org/onlinepubs/9799919799/functions/connect.html).
+ * Leaving it out recorded nothing at all for it, so a signal handler installed
+ * without SA_RESTART made an undeclared connection invisible. */
 int repro_linux_errno_is_connect_in_progress(int value) {
-  return value == EINPROGRESS || value == EALREADY || value == EWOULDBLOCK;
+  return value == EINPROGRESS || value == EALREADY || value == EWOULDBLOCK ||
+         value == EINTR;
 }
 
 int repro_linux_sockaddr_family(void *addr, unsigned int addrlen) {
@@ -801,6 +814,45 @@ int repro_linux_sockaddr_un_path(void *addr, unsigned int addrlen,
       out[n++] = c;
     }
   }
+  out[n] = '\0';
+  return n;
+}
+
+/* The AF_INET / AF_INET6 destination a client dialled, as text — "a.b.c.d:port"
+   or "[v6]:port", the spelling the macOS shim's `repro_macos_socket_describe`
+   gives the same address, so a consumer compares one string on both. Returns the
+   length written (excluding the terminator), 0 for any other family, a short
+   address, or an output buffer too small. Never reads past `addrlen`; calls only
+   `inet_ntop` (pure formatting, no allocation, no locale) — safe in a hook. */
+int repro_linux_sockaddr_inet_dest(void *addr, unsigned int addrlen,
+                                   char *out, int cap) {
+  if (addr == NULL || out == NULL || cap < 64) return 0;
+  if (addrlen < sizeof(sa_family_t)) return 0;
+  sa_family_t family = ((struct sockaddr *)addr)->sa_family;
+  char ip[INET6_ADDRSTRLEN];
+  unsigned port;
+  int n = 0;
+  if (family == AF_INET) {
+    if (addrlen < sizeof(struct sockaddr_in)) return 0;
+    struct sockaddr_in *in4 = (struct sockaddr_in *)addr;
+    if (inet_ntop(AF_INET, &in4->sin_addr, ip, sizeof ip) == NULL) return 0;
+    port = ntohs(in4->sin_port);
+  } else if (family == AF_INET6) {
+    if (addrlen < sizeof(struct sockaddr_in6)) return 0;
+    struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
+    if (inet_ntop(AF_INET6, &in6->sin6_addr, ip, sizeof ip) == NULL) return 0;
+    port = ntohs(in6->sin6_port);
+    out[n++] = '[';
+  } else {
+    return 0;
+  }
+  for (const char *c = ip; *c && n < cap - 9; c++) out[n++] = *c;
+  if (family == AF_INET6) out[n++] = ']';
+  out[n++] = ':';
+  char digits[6];
+  int d = 0;
+  do { digits[d++] = (char)('0' + port % 10); port /= 10; } while (port && d < 5);
+  while (d > 0) out[n++] = digits[--d];
   out[n] = '\0';
   return n;
 }
@@ -1488,6 +1540,9 @@ proc c_socket_peer_uid(fd: cint): clong
 proc c_sockaddr_un_path(address: pointer; addrLen: uint32; buf: ptr char;
                         cap: cint): cint
   {.importc: "repro_linux_sockaddr_un_path", raises: [].}
+proc c_sockaddr_inet_dest(address: pointer; addrLen: uint32; buf: ptr char;
+                          cap: cint): cint
+  {.importc: "repro_linux_sockaddr_inet_dest", raises: [].}
 proc c_fd_identity_kind(fd: cint; dev, ino: ptr uint64; kind: ptr cint): cint
   {.importc: "repro_linux_fd_identity_kind", raises: [].}
 proc c_fd_proc_path(fd: cint; buf: pointer; len: csize_t): cint
@@ -1660,6 +1715,47 @@ proc armThreadExitFlush() {.raises: [].} =
   ## right after it first opens its fragment slot (see emitRecord).
   repro_linux_arm_thread_exit_flush_c()
 
+var ledgerPidNsMarked: uint64 = 0
+  ## The pid namespace this process last wrote a tree-ledger marker for. A
+  ## fork child inherits it and still compares its own namespace, which
+  ## differs after `unshare(CLONE_NEWPID)` + fork. Racing threads at worst
+  ## both write the marker, and the second write is an "already there".
+
+proc markForkChildInTreeLedger() {.raises: [].} =
+  ## This fork child's own tree-ledger entry (and its pid-namespace marker),
+  ## written in ANY fork child before it runs program code: from the libc
+  ## atfork child handler, which runs for every libc fork including the ones
+  ## glibc makes internally through `__fork` (`daemon(3)`, `forkpty(3)`),
+  ## which never reach `repro_hook_fork`; and from the raw-fork child
+  ## callback (`syscall(SYS_fork / SYS_clone)`, a trapped inline clone,
+  ## glibc's `clone(3)` without CLONE_VM, `_Fork(3)`), which runs no atfork
+  ## handler and whose parent writes no entry either. Without it such a child
+  ## had no entry at all, and once it cleared its `REPRO_MONITOR_*` needles
+  ## the guard could not see it outlive the root.
+  ##
+  ## Allocation- and lock-free (`markTreeLedgerRaw`): the child may hold a
+  ## lock image of another thread, and the private heap's own atfork handler
+  ## may not have run yet. A failed write cannot be recorded normally here,
+  ## so it is reported through the pre-encoded fork-child loss frame
+  ## (`reportForkChildSkippedEvidence`, raw syscalls): the capture is graded
+  ## incomplete rather than missing the entry silently. The hooked fork's
+  ## child writes the same entry again later (`recordProcessStart`), which is
+  ## an "already there".
+  if not initialized or fragmentDir.len == 0:
+    return
+  let pid = c_getpid()
+  if pid <= 0:
+    return
+  var err = markTreeLedgerRaw(cstring(fragmentDir), int(pid),
+    linuxProcStartTicks(int(pid)))
+  let ns = linuxSelfPidNamespace()
+  if err == 0 and ns != 0 and ns != ledgerPidNsMarked:
+    err = markTreeLedgerPidNamespaceRaw(cstring(fragmentDir), ns)
+    if err == 0:
+      ledgerPidNsMarked = ns
+  if err != 0:
+    reportForkChildSkippedEvidence()
+
 proc repro_linux_atfork_prepare() {.cdecl, raises: [].} =
   # The shared table is atomic; its process-local mapped-shard sequence is
   # mutable. Fork must copy that view only between complete publications.
@@ -1691,6 +1787,11 @@ proc repro_linux_atfork_child() {.exportc, cdecl, raises: [].} =
     # bookkeeping until exec and reports evidence it skips (`bypassEvidence`).
     inForkChild = true
   resetIdentityCaches()
+  # Before anything else that could allocate, and before the program's own
+  # atfork handlers and code: the needle sweep covers the child until then.
+  inc disabled
+  markForkChildInTreeLedger()
+  dec disabled
   withShimMuted:
     try: discardFragmentSlotAfterFork()
     except CatchableError: discard
@@ -1876,7 +1977,61 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
     if mainThreadId != 0 and record.threadId != mainThreadId:
       flushFragmentBatch()
 
+proc markTreeLedgerEntry(pid: cint; startTicks: uint64) {.raises: [].} =
+  ## Write the tree-ledger entry for (pid, startTicks) (`io_mon/tree_ledger`):
+  ## the evidence the host's descendant guard checks for
+  ## liveness after the root exits, which, unlike this process's
+  ## `/proc/<pid>/environ` (its own stack), the program cannot overwrite.
+  ## Synchronous and NOT gated by the event interest. A failed write is
+  ## published as a loss and flushed at once, so a capture whose ledger may be
+  ## short is never graded complete.
+  ##
+  ## The entry's pid is relative to this process's pid namespace, so the
+  ## namespace is recorded too (`markTreeLedgerPidNamespace`), once per
+  ## process and namespace: a guard in another namespace cannot check the pid
+  ## and must say so instead of matching it against an unrelated process.
+  if not initialized or fragmentDir.len == 0 or pid <= 0:
+    return
+  var err: cint = 0
+  withShimMuted:
+    err = markTreeLedger(fragmentDir, int(pid), startTicks)
+    let ns = linuxSelfPidNamespace()
+    if err == 0 and ns != 0 and ns != ledgerPidNsMarked:
+      err = markTreeLedgerPidNamespace(fragmentDir, ns)
+      if err == 0:
+        ledgerPidNsMarked = ns
+  if err != 0:
+    var loss = baseRecord(mrEventLoss, moEventLoss)
+    loss.detail = "linux tree ledger write failed errno=" & $err &
+      " pid=" & $pid
+    emitRecord(loss)
+    withShimMuted:
+      try: flushFragmentBatch()
+      except CatchableError: discard
+
+proc markSelfInTreeLedger() {.raises: [].} =
+  let selfPid = c_getpid()
+  var ticks = 0'u64
+  withShimMuted:
+    ticks = linuxProcStartTicks(int(selfPid))
+  markTreeLedgerEntry(selfPid, ticks)
+
+proc markChildInTreeLedger(childPid: int) {.raises: [].} =
+  ## The child's entry, written by the PARENT before fork / posix_spawn
+  ## returns to the program: the child may not have run yet, and by the time
+  ## it does the parent may have exited.
+  if childPid <= 0:
+    return
+  var ticks = 0'u64
+  withShimMuted:
+    ticks = linuxProcStartTicks(childPid)
+  markTreeLedgerEntry(cint(childPid), ticks)
+
 proc recordProcessStart() {.raises: [].} =
+  # The tree-ledger entry first: it is the guard's liveness evidence, and it
+  # must exist before this process runs any program code (shim init runs
+  # before `main`; the fork child's call runs before `fork` returns there).
+  markSelfInTreeLedger()
   var record = baseRecord(mrProcessStart, moProcessStart)
   record.detail = "linux-preload-hooks"
   emitRecord(record)
@@ -3964,6 +4119,17 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32) {.raises: [].
       copyMem(addr endpoint[0], addr buf[0], n)
   of 2, 10: # AF_INET / AF_INET6
     familyName = "af_inet"
+    # The destination ("a.b.c.d:port" / "[v6]:port"), as the macOS and Windows
+    # shims record it. The peer of an INET socket has no pid to name, so the
+    # address is the only thing that says WHERE the client went: a consumer
+    # that allows some destinations (a sandbox's declared egress) can tell
+    # them from the rest, and the merge keys each out-of-tree peer on its own
+    # destination instead of folding every INET peer into one loss.
+    var buf: array[64, char]
+    let n = c_sockaddr_inet_dest(address, addrLen, addr buf[0], cint(buf.len))
+    if n > 0:
+      endpoint = newString(n)
+      copyMem(addr endpoint[0], addr buf[0], n)
   else:
     discard
 
@@ -3976,6 +4142,23 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32) {.raises: [].
     (if peerUid >= 0: " peeruid=" & $peerUid else: "")
   emitRecord(record)
 
+proc recordConnectAttempt(address: pointer; addrLen: uint32;
+                          callResult: cint; err: cint) {.raises: [].} =
+  ## A FAILED AF_INET/AF_INET6 connect: an attempt that reached no peer.
+  ## Recorded as its own kind (`mrConnectAttempt`, see types.nim) so it never
+  ## feeds the out-of-tree-peer downgrade an `mrIpcConnect` does. Any other
+  ## family is skipped (a failed AF_UNIX probe is daemon-discovery noise).
+  var buf: array[64, char]
+  let n = c_sockaddr_inet_dest(address, addrLen, addr buf[0], cint(buf.len))
+  if n <= 0:
+    return
+  var record = baseRecord(mrConnectAttempt, moConnectAttempt)
+  record.path = newString(n)
+  copyMem(addr record.path[0], addr buf[0], n)
+  record.result = int64(callResult)
+  record.detail = "connect-attempt af_inet errno=" & $err
+  emitRecord(record)
+
 proc repro_hook_connect*(ctx: var ConnectContext) {.raises: [].} =
   if bypassEvidence():
     callNext(ctx)
@@ -3983,8 +4166,16 @@ proc repro_hook_connect*(ctx: var ConnectContext) {.raises: [].} =
   ensureInitializedPreservingErrno()
   callNext(ctx)
   let savedErrno = c_get_errno()
+  # A connect that was made, or that may still complete (in flight, or
+  # interrupted by a signal: `repro_linux_errno_is_connect_in_progress`), is a
+  # connection; the merge treats an INET or unresolved peer as out of tree. A
+  # failure the protocol returned reached nobody and is an attempt. Any other
+  # failure (EFAULT, EINVAL, EBADF, ...) may mean the address was never
+  # readable, so it is not touched (`io_mon/posix_connect`).
   if ctx.result == 0 or c_errno_is_connect_in_progress(savedErrno) != 0:
     recordIpcConnect(ctx.fd, ctx.address, ctx.addrLen)
+  elif connectFailureReadAddress(savedErrno):
+    recordConnectAttempt(ctx.address, ctx.addrLen, ctx.result, savedErrno)
   c_set_errno(savedErrno)
 
 proc repro_hook_pipe*(ctx: var PipeContext) {.raises: [].} =
@@ -4724,6 +4915,7 @@ proc repro_hook_fork*(ctx: var ForkContext) {.raises: [].} =
   callNext(ctx)
   let savedErrno = c_get_errno()
   if ctx.result > 0:
+    markChildInTreeLedger(int(ctx.result))
     var record = baseRecord(mrProcessSpawn, moExecute)
     record.childOsPid = uint64(ctx.result)
     record.result = ctx.result.int64
@@ -4788,11 +4980,30 @@ proc repro_linux_raw_fork_child(parentSingleThreaded: cint)
     # shim has not necessarily received its own child notification yet.
     # Diagnostics here could enter that image through an interposed helper
     # before it knows to avoid the parent's inherited locks.
+  # The child's own tree-ledger entry: no atfork handler ran and the parent
+  # wrote none. Allocation-free; libc's getpid/open/read/readlink/close are
+  # thin syscall wrappers that take no lock.
+  inc disabled
+  markForkChildInTreeLedger()
+  dec disabled
 
 proc ct_linux_preload_register_raw_fork(sample, child: pointer)
   {.importc, cdecl, raises: [].}
 ct_linux_preload_register_raw_fork(cast[pointer](repro_linux_raw_fork_sample),
   cast[pointer](repro_linux_raw_fork_child))
+
+proc repro_linux_vm_process_parent(childPid: clong) {.cdecl, raises: [].} =
+  ## The creator of a CLONE_VM process that is neither a thread nor a vfork
+  ## child writes that process's tree-ledger entry (see
+  ## `ct_linux_preload_register_vm_process`): the child shares this memory
+  ## and gets no fork-child notification, so it cannot write its own.
+  if bypassEvidence():
+    return
+  markChildInTreeLedger(int(childPid))
+
+proc ct_linux_preload_register_vm_process(fn: pointer)
+  {.importc, cdecl, raises: [].}
+ct_linux_preload_register_vm_process(cast[pointer](repro_linux_vm_process_parent))
 
 proc repro_linux_exec_env_for(envp: cstringArray): cstringArray
     {.cdecl, raises: [].} =
@@ -4851,6 +5062,11 @@ proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
+  # The tree-ledger entry for THIS pid, before the image is replaced: an exec
+  # keeps the pid and start time, so the entry stays valid for the new image
+  # even if it never loads the shim. Usually already there (shim init or the
+  # fork hook wrote it); a `vfork` child runs no fork hook and gets it here.
+  markSelfInTreeLedger()
   emitExecAttempt(ctx.path, ctx.envp)
   # io-mon-Lossless-Event-Capture M3 — inject LD_PRELOAD AND an INCREMENTED exec
   # generation into the child env. exec replaces the address space in the SAME
@@ -4939,6 +5155,8 @@ proc recordPosixSpawn(ctx: var PosixSpawnContext; usePath: bool)
   if ctx.result == 0 and ctx.fileActions != nil and childPid > 0 and
       uninjectable.len == 0:
     uninjectable = spawnImageUninjectable(ctx.path, usePath, childPid)
+  if ctx.result == 0 and childPid > 0:
+    markChildInTreeLedger(childPid)
   if ctx.result == 0 and ctx.pid != nil:
     var record = baseRecord(mrProcessSpawn, moExecute)
     record.childOsPid = uint64(ctx.pid[])

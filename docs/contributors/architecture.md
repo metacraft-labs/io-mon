@@ -191,4 +191,4 @@ three nesting levels, inner loss, interruption and real filesystem failures.
 
 - It maintains zero dependency on `reprobuild`.
 - It depends solely on `nim-stackable-hooks`.
-- The binary depfile format (`IOMN` version 1) is io-mon's own; the shim ABI names (`repro_monitor_shim_*`) are kept byte-identical so the observation stack remains a drop-in replacement across the suite.
+- The binary depfile format (`IOMN` version 2; see `IomonVersion` for when it is bumped) is io-mon's own; the shim ABI names (`repro_monitor_shim_*`) are kept byte-identical so the observation stack remains a drop-in replacement across the suite.

@@ -179,7 +179,7 @@ accepted as an alias for `--format` here.)
 Sample `text` output:
 
 ```
-iomon version=1 records=4 completeness=mcComplete
+iomon version=2 records=4 completeness=mcComplete
 #0 mrProcessStart pid=54321 tid=1
 #1 mrFileRead pid=54321 tid=1 path=/usr/include/stdio.h
 #2 mrLibraryLoad pid=54321 tid=1 path=/usr/lib/libfoo.dylib detail=...
@@ -449,7 +449,24 @@ can leave a DETACHED DESCENDANT behind — the root exits, but a daemonized chil
 keeps reading and writing files outside the evidence. On Linux, io-mon detects that by
 scanning `/proc/*/environ` for this run's injection needles and, past a grace
 window (`IO_MON_LINUX_DESCENDANT_GRACE_MS`, default 500), publishing an
-event-loss marker that downgrades the edge to `mcIncomplete`. Reporting
+event-loss marker that downgrades the edge to `mcIncomplete`. Because
+`/proc/<pid>/environ` is the process's own stack, not a copy taken at exec, a
+descendant that overwrites its needles in place (or reuses the argv+environ
+area for a process title, as PostgreSQL does) is invisible to that scan; so
+the Linux guard also checks the **tree ledger** the shim keeps, exactly as the
+macOS guard does (see "The macOS tree-lifetime guard" below; on Linux an
+entry's start time is field 22 of `/proc/<pid>/stat`). A live ledger process
+that no longer carries the needles publishes
+`linux recorded descendants still live after root exit pids=<p,...> run=<id>`;
+a ledger that cannot be read, or has no entry for the root, publishes
+`linux descendant guard failed: …`. A ledger pid is relative to its writer's
+pid namespace, so a tree that runs a process in another pid namespace (for
+example `unshare --pid --fork`) publishes
+`linux descendant guard failed: the monitored tree ran processes in another pid namespace pidns=<ino,...> …`
+at once instead of checking those pids against unrelated host processes; a
+shim that cannot write an entry
+publishes `linux tree ledger write failed errno=<e> pid=<p>` (pinned by
+`tests/linux/test_io_mon_linux_tree_ledger.nim`). Reporting
 `mcComplete` where the batch entry point reports `mcIncomplete` would be a false
 cache hit for the whole action, so the guard is **not** exported as a step you
 call: it is the first act of the single funnel every `MonitorResult`'s evidence

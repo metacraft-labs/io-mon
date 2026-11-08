@@ -15,6 +15,35 @@ suite "tree ledger":
     check parseTreeLedgerName(treeLedgerName(7, 0), e)
     check e == (7, 0'u64)
 
+  test "a pid-namespace marker round-trips and is never read as an entry":
+    var ino = 0'u64
+    check parseTreeLedgerPidNsName(treeLedgerPidNsName(4026531836'u64), ino)
+    check ino == 4026531836'u64
+    var e: TreeLedgerEntry
+    check not parseTreeLedgerName(treeLedgerPidNsName(4026531836'u64), e)
+    for name in ["repro-tree-pidns-.iomon-tree", "repro-tree-pidns-0.iomon-tree",
+                 "repro-tree-pidns-x.iomon-tree", "repro-tree-12-34.iomon-tree"]:
+      check not parseTreeLedgerPidNsName(name, ino)
+    let dir = createTempDir("io-mon-tree-ledger-ns-", "")
+    defer: removeDir(dir)
+    writeFile(dir / treeLedgerPidNsName(9), "")
+    writeFile(dir / treeLedgerPidNsName(3), "")
+    writeFile(dir / treeLedgerName(12, 34), "")
+    var inodes: seq[uint64]
+    check readTreeLedgerPidNamespaces(dir, inodes)
+    check inodes == @[3'u64, 9'u64]
+    var entries: seq[TreeLedgerEntry]
+    check readTreeLedger(dir, entries)
+    check entries == @[(12, 34'u64)]
+    check not readTreeLedgerPidNamespaces(dir / "missing", inodes)
+
+  test "a pid-namespace link target names its inode":
+    for (text, want) in [("pid:[4026531836]", 4026531836'u64),
+                         ("pid:[]", 0'u64), ("pid:[12", 0'u64), ("", 0'u64)]:
+      var buf = newSeq[char](text.len)
+      for i, c in text: buf[i] = c
+      check parsePidNamespaceLink(buf, buf.len) == want
+
   test "anything else is not an entry":
     var e: TreeLedgerEntry
     for name in ["repro-monitor-1-2.iomon-frag", "repro-tree-1-2.iomon-frag",

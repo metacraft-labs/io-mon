@@ -253,7 +253,9 @@ func depIdentityScope*(kind: MonitorRecordKind): DepIdentityScope =
     disFactScoped
   of mrProcessStart, mrProcessExec, mrProcessSpawn, mrFileWrite, mrEventLoss,
      mrBackendProfile, mrCapabilityGap, mrIpcConnect, mrNonDeterministic,
-     mrExternalContent, mrPathMutation:
+     mrExternalContent, mrPathMutation, mrConnectAttempt:
+    # `mrConnectAttempt`: the pid is evidence, because a consumer judging
+    # network use names the process that tried the connection.
     disProcessScoped
 
 func depIdentityKeepsIncarnation*(kind: MonitorRecordKind): bool =
@@ -365,7 +367,7 @@ func identityNormalizedOutcome*(kind: MonitorRecordKind; rawResult: int64;
   of mrDirectoryEnumerate, mrLibraryLoad, mrEnvRead, mrSysctlRead, mrTimeRead,
      mrProcessStart, mrProcessExec, mrProcessSpawn, mrEventLoss,
      mrBackendProfile, mrCapabilityGap, mrIpcConnect, mrNonDeterministic,
-     mrExternalContent, mrPathMutation:
+     mrExternalContent, mrPathMutation, mrConnectAttempt:
     (rawResult, rawFlags)
 
 proc encodeDepRecordWithSeq(record: MonitorRecord; buf: var openArray[byte];
