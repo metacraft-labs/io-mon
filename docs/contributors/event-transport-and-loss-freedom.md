@@ -589,8 +589,9 @@ batched until the producer flushes, which a quiet live process never does, and
 they are gated by `ecProcessTree`. Which mechanism catches which descendant,
 and the one residual case (a raw-syscall fork whose child also overwrites its
 area), is argued in the header of `src/io_mon/macos_tree_guard.nim`. Linux's
-`/proc/<pid>/environ` scan reads live memory too and has no ledger yet (io-mon
-issue `2026-10-30-linux-descendant-guard-misses-an-overwritten-environment`).
+`/proc/<pid>/environ` scan reads live memory too, so the Linux guard checks the
+same ledger (`waitForLinuxInjectedDescendants`; the Linux writers are listed in
+the header of `src/io_mon/tree_ledger.nim`).
 
 The census and the ledger check run inside `settleMonitorDescendants`, so the
 DH-3 argument above holds unchanged. While SIP is on, platform (SIP) binaries

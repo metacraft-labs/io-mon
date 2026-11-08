@@ -462,8 +462,9 @@ when defined(linux):
       result.add e.pid
 
   proc waitForLinuxInjectedDescendants(fragmentDir, runId: string;
-      rootPid: uint64; minStartTicks: uint64; depSetPath0 = "") =
-    ## The Linux §4.1 guard. Each round reads the TREE LEDGER, sweeps `/proc`
+      rootPid: uint64; minStartTicks: uint64; depSetPath0 = "";
+      rootUninjectable = false) =
+    ## The Linux descendant guard. Each round reads the TREE LEDGER, sweeps `/proc`
     ## for this run's needles (`liveInjectedDescendants`), checks every ledger
     ## entry for liveness (`liveLedgerEntries`) and reads the ledger again. A
     ## round is conclusive only when the sweep finds no carrier, no entry is
@@ -480,7 +481,10 @@ when defined(linux):
     ## for the child before the call returns, the exec hook for itself); the
     ## soundness argument is `io_mon/macos_tree_guard`'s, case by case. A
     ## ledger that cannot be read, or that has no entry for the root, proves
-    ## nothing and fails closed.
+    ## nothing and fails closed. The one exception is a root the spawn site
+    ## already reported as an image the shim cannot enter
+    ## (`rootUninjectable`): its missing entry is that loss, not a second
+    ## one, and the guard goes on to check the descendants it can see.
     let graceMs = envInt("IO_MON_LINUX_DESCENDANT_GRACE_MS",
       LinuxInjectedDescendantGraceMsDefault, 0)
     let pollMs = envInt("IO_MON_LINUX_DESCENDANT_POLL_MS",
@@ -516,11 +520,14 @@ when defined(linux):
               " (this guard's pidns=" & $ownPidNs & "), whose pids it " &
               "cannot check", depSetPath0)
           return
-      if rootPid > 0 and not before.anyIt(uint64(it.pid) == rootPid):
+      if rootPid > 0 and not rootUninjectable and
+          not before.anyIt(uint64(it.pid) == rootPid):
         # The root loads the shim before `main`, and shim init writes the
         # root's entry or publishes a loss for the failed write. A ledger
         # without it was not kept (a shim that predates the ledger, or a root
-        # that never loaded the shim), so it cannot prove anything here.
+        # that never loaded the shim), so it cannot prove anything here. A
+        # root the spawn site classified as uninjectable never loaded it, and
+        # that loss is already published, so it is not reported twice.
         appendLauncherEventLoss(fragmentDir, runId,
           "linux descendant guard failed: the tree ledger has no entry for " &
             "the root pid=" & $rootPid, depSetPath0)
@@ -1750,6 +1757,12 @@ type
                                ## descendants — see `liveInjectedDescendants`.
                                ## `0` means "unknown", which disables the skip
                                ## and restores the exhaustive sweep.
+      rootUninjectable: bool   ## The root image is one the loader will not
+                               ## preload the shim into, and that loss is
+                               ## already published: its shim init cannot have
+                               ## written the root's tree-ledger entry, so the
+                               ## guard does not report the missing entry as a
+                               ## second loss (it still checks everything else).
     when defined(macosx):
       sandboxDir: string
       ownsSandboxDir: bool
@@ -1919,7 +1932,7 @@ proc settleMonitorDescendants(h: var MonitorHandle) =
     let launcherLossPath0 =
       if h.depSetLive and h.depSet.available: h.depSet.path0 else: ""
     waitForLinuxInjectedDescendants(h.fragmentDir, h.runId, h.rootPid,
-      h.rootStartTicks, launcherLossPath0)
+      h.rootStartTicks, launcherLossPath0, h.rootUninjectable)
   elif defined(windows):
     # THE WINDOWS TREE-LIFETIME GUARD (reprobuild-pm
     # spec/io-mon-Windows-Tree-Lifetime-Guard.md). The root was assigned,
@@ -2230,6 +2243,7 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
       appendLauncherEventLoss(h.fragmentDir, h.runId,
         "uninjectable image: root spawn: " & rootLoss,
         if h.depSetLive and h.depSet.available: h.depSet.path0 else: "")
+      h.rootUninjectable = true
     h.process = startProcess(request.command[0],
       workingDir = request.cwd,
       args = childArgs,

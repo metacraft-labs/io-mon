@@ -21,6 +21,13 @@
 ## program, for example `connect(fd, (struct sockaddr *)8, 16)`. Unlisted
 ## errors are not recorded either: a missed attempt costs one piece of
 ## evidence, a wrong read costs the program.
+##
+## EISCONN is left out for another reason: it says the socket IS connected.
+## The non-blocking idiom (connect, poll for writability, connect again)
+## gets it on the second call after the connection was made, and the first
+## call was already recorded as a connection (EINPROGRESS is in flight). An
+## attempt record for it would claim that a connection which was made
+## reached nobody.
 
 when defined(posix):
   var
@@ -37,7 +44,6 @@ when defined(posix):
     ECONNABORTED_C {.importc: "ECONNABORTED", header: "<errno.h>".}: cint
     ENETDOWN_C {.importc: "ENETDOWN", header: "<errno.h>".}: cint
     EHOSTDOWN_C {.importc: "EHOSTDOWN", header: "<errno.h>".}: cint
-    EISCONN_C {.importc: "EISCONN", header: "<errno.h>".}: cint
 
   proc connectFailureReadAddress*(err: cint): bool {.raises: [].} =
     ## Whether a `connect(2)` that failed with `err` had its address copied in
@@ -48,5 +54,4 @@ when defined(posix):
       err == ETIMEDOUT_C or err == EACCES_C or err == EPERM_C or
       err == EADDRNOTAVAIL_C or err == EADDRINUSE_C or
       err == EAFNOSUPPORT_C or err == ECONNRESET_C or
-      err == ECONNABORTED_C or err == ENETDOWN_C or err == EHOSTDOWN_C or
-      err == EISCONN_C
+      err == ECONNABORTED_C or err == ENETDOWN_C or err == EHOSTDOWN_C

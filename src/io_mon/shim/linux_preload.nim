@@ -1720,6 +1720,48 @@ var ledgerPidNsMarked: uint64 = 0
   ## fork child inherits it and still compares its own namespace, which
   ## differs after `unshare(CLONE_NEWPID)` + fork. Racing threads at worst
   ## both write the marker, and the second write is an "already there".
+var forkChildLedgerPid: cint = 0
+  ## The pid whose own entry the libc atfork child handler just wrote, so the
+  ## hooked fork's child does not write it again in `recordProcessStart`.
+  ## Written only in a fork child (private memory) and consumed by the same
+  ## process; keyed by pid so a value left behind by an internal fork that
+  ## never reached the fork hook is never taken for another process's.
+
+type LedgerWrite = object
+  err: cint          ## 0, or the errno of the failed write
+  nsUnknown: bool    ## the failure is that this process's pid namespace
+                     ## could not be read (`linuxPidNamespaceSys`)
+
+# The ledger writes below run in fork children in any state and, for a
+# CLONE_VM process, in its creator while the child already runs on the
+# creator's TLS: raw system calls only, and no Nim stack-trace frame.
+{.push stackTrace: off, lineTrace: off.}
+proc ledgerSyscall(nr, a1, a2, a3, a4, a5, a6: clong): clong
+    {.cdecl, gcsafe, raises: [].} =
+  c_raw_syscall6(nr, a1, a2, a3, a4, a5, a6)
+
+proc writeTreeLedgerEntryRaw(pid: int; startTicks: uint64): LedgerWrite
+    {.raises: [].} =
+  ## Write the entry for (pid, startTicks) and the marker of THIS process's
+  ## pid namespace (the namespace `pid` is relative to), through raw system
+  ## calls. Touches no thread-local state and takes no lock, so it is safe
+  ## in a fork child before anything in it is consistent, in a signal
+  ## handler, and beside a CLONE_VM child. A namespace that cannot be read is
+  ## a failure: the entry would carry a pid the guard cannot place (see
+  ## `linuxPidNamespaceSys`).
+  result.err = markTreeLedgerSys(ledgerSyscall, cstring(fragmentDir), pid,
+    startTicks)
+  var ns = 0'u64
+  let nsErr = linuxPidNamespaceSys(ledgerSyscall, ns)
+  if result.err == 0 and nsErr != 0:
+    result.err = nsErr
+    result.nsUnknown = true
+  if result.err == 0 and ns != 0 and ns != ledgerPidNsMarked:
+    result.err = markTreeLedgerPidNamespaceSys(ledgerSyscall,
+      cstring(fragmentDir), ns)
+    if result.err == 0:
+      ledgerPidNsMarked = ns
+{.pop.}
 
 proc markForkChildInTreeLedger() {.raises: [].} =
   ## This fork child's own tree-ledger entry (and its pid-namespace marker),
@@ -1733,28 +1775,26 @@ proc markForkChildInTreeLedger() {.raises: [].} =
   ## had no entry at all, and once it cleared its `REPRO_MONITOR_*` needles
   ## the guard could not see it outlive the root.
   ##
-  ## Allocation- and lock-free (`markTreeLedgerRaw`): the child may hold a
-  ## lock image of another thread, and the private heap's own atfork handler
-  ## may not have run yet. A failed write cannot be recorded normally here,
-  ## so it is reported through the pre-encoded fork-child loss frame
+  ## Allocation- and lock-free (`writeTreeLedgerEntryRaw`): the child may
+  ## hold a lock image of another thread, and the private heap's own atfork
+  ## handler may not have run yet. A failed write (including a pid namespace
+  ## this child cannot read) cannot be recorded normally here, so it is
+  ## reported through the pre-encoded fork-child loss frame
   ## (`reportForkChildSkippedEvidence`, raw syscalls): the capture is graded
-  ## incomplete rather than missing the entry silently. The hooked fork's
-  ## child writes the same entry again later (`recordProcessStart`), which is
-  ## an "already there".
+  ## incomplete rather than missing the entry silently. A written entry is
+  ## remembered (`forkChildLedgerPid`) so the hooked fork's child does not
+  ## write it again in `recordProcessStart`.
   if not initialized or fragmentDir.len == 0:
     return
   let pid = c_getpid()
   if pid <= 0:
     return
-  var err = markTreeLedgerRaw(cstring(fragmentDir), int(pid),
-    linuxProcStartTicks(int(pid)))
-  let ns = linuxSelfPidNamespace()
-  if err == 0 and ns != 0 and ns != ledgerPidNsMarked:
-    err = markTreeLedgerPidNamespaceRaw(cstring(fragmentDir), ns)
-    if err == 0:
-      ledgerPidNsMarked = ns
-  if err != 0:
+  let w = writeTreeLedgerEntryRaw(int(pid),
+    linuxProcStartTicksSys(ledgerSyscall, int(pid)))
+  if w.err != 0:
     reportForkChildSkippedEvidence()
+  else:
+    forkChildLedgerPid = pid
 
 proc repro_linux_atfork_prepare() {.cdecl, raises: [].} =
   # The shared table is atomic; its process-local mapped-shard sequence is
@@ -1992,18 +2032,14 @@ proc markTreeLedgerEntry(pid: cint; startTicks: uint64) {.raises: [].} =
   ## and must say so instead of matching it against an unrelated process.
   if not initialized or fragmentDir.len == 0 or pid <= 0:
     return
-  var err: cint = 0
-  withShimMuted:
-    err = markTreeLedger(fragmentDir, int(pid), startTicks)
-    let ns = linuxSelfPidNamespace()
-    if err == 0 and ns != 0 and ns != ledgerPidNsMarked:
-      err = markTreeLedgerPidNamespace(fragmentDir, ns)
-      if err == 0:
-        ledgerPidNsMarked = ns
-  if err != 0:
+  let w = writeTreeLedgerEntryRaw(int(pid), startTicks)
+  if w.err != 0:
     var loss = baseRecord(mrEventLoss, moEventLoss)
-    loss.detail = "linux tree ledger write failed errno=" & $err &
+    loss.detail = "linux tree ledger write failed errno=" & $w.err &
       " pid=" & $pid
+    if w.nsUnknown:
+      loss.detail.add " (this process's pid namespace could not be read, " &
+        "so the guard could not place the pid)"
     emitRecord(loss)
     withShimMuted:
       try: flushFragmentBatch()
@@ -2011,10 +2047,8 @@ proc markTreeLedgerEntry(pid: cint; startTicks: uint64) {.raises: [].} =
 
 proc markSelfInTreeLedger() {.raises: [].} =
   let selfPid = c_getpid()
-  var ticks = 0'u64
-  withShimMuted:
-    ticks = linuxProcStartTicks(int(selfPid))
-  markTreeLedgerEntry(selfPid, ticks)
+  markTreeLedgerEntry(selfPid, linuxProcStartTicksSys(ledgerSyscall,
+    int(selfPid)))
 
 proc markChildInTreeLedger(childPid: int) {.raises: [].} =
   ## The child's entry, written by the PARENT before fork / posix_spawn
@@ -2022,16 +2056,20 @@ proc markChildInTreeLedger(childPid: int) {.raises: [].} =
   ## it does the parent may have exited.
   if childPid <= 0:
     return
-  var ticks = 0'u64
-  withShimMuted:
-    ticks = linuxProcStartTicks(childPid)
-  markTreeLedgerEntry(cint(childPid), ticks)
+  markTreeLedgerEntry(cint(childPid), linuxProcStartTicksSys(ledgerSyscall,
+    childPid))
 
 proc recordProcessStart() {.raises: [].} =
   # The tree-ledger entry first: it is the guard's liveness evidence, and it
   # must exist before this process runs any program code (shim init runs
   # before `main`; the fork child's call runs before `fork` returns there).
-  markSelfInTreeLedger()
+  # In the child of a hooked fork the atfork child handler has just written
+  # it (`markForkChildInTreeLedger`), so it is not written a second time.
+  let selfPid = c_getpid()
+  if forkChildLedgerPid != 0 and forkChildLedgerPid == selfPid:
+    forkChildLedgerPid = 0
+  else:
+    markSelfInTreeLedger()
   var record = baseRecord(mrProcessStart, moProcessStart)
   record.detail = "linux-preload-hooks"
   emitRecord(record)
@@ -2665,6 +2703,10 @@ const
     "uninjectable image: an exec or spawn entered an image the loader will " &
     "not inject the shim into, where the shim could not record it by name " &
     "(inside a hook, or a fork child skipping bookkeeping)"
+  VmProcessLossDetail =
+    "linux CLONE_VM process (not a thread or vfork child): it shares its " &
+    "creator's memory and thread state, which the shim cannot keep apart, " &
+    "so its evidence may be missing or carry the creator's identity"
   LossFramePidMarker = 0x5A17C0DE5A17C0DE'u64
   LossFrameTidMarker = 0x7E1DC0DE7E1DC0DE'u64
 
@@ -2686,6 +2728,7 @@ var
   inlineLossReportArmed = true
   forkSkipLossReportArmed = true
   uninjectableExecReportArmed = true
+  vmProcessReportArmed = true
 
 proc encodeLossFrame(detail: string): tuple[frame: seq[byte];
                                             pidOffset, tidOffset: int] =
@@ -2735,6 +2778,19 @@ proc armUninjectableExecReport(): bool {.raises: [].} =
   try:
     let encoded = encodeLossFrame(UninjectableExecUnrecordedDetail)
     result = armUninjectableExecLossReport(encoded.frame, encoded.pidOffset,
+      encoded.tidOffset)
+  except CatchableError:
+    result = false
+
+proc armVmProcessReport(): bool {.raises: [].} =
+  ## Pre-encode the event-loss frame the creator of a CLONE_VM process writes
+  ## (see "A CLONE_VM PROCESS IS EVENT-LOSS" in the runtime). False when it
+  ## could not be armed; the caller reports that.
+  if fragmentDir.len == 0:
+    return true
+  try:
+    let encoded = encodeLossFrame(VmProcessLossDetail)
+    result = armVmProcessLossReport(encoded.frame, encoded.pidOffset,
       encoded.tidOffset)
   except CatchableError:
     result = false
@@ -2795,6 +2851,7 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
       inlineLossReportArmed and armForkChildSkipLossReport()
     uninjectableExecReportArmed =
       inlineLossReportArmed and armUninjectableExecReport()
+    vmProcessReportArmed = inlineLossReportArmed and armVmProcessReport()
     # DEP-SHM-2 — attach the process to the edge's shared-memory dependency
     # queue (the FAST PATH in front of the file fragments). The engine created
     # the segment before launching us and named it via REPRO_MONITOR_DEP_SHM;
@@ -2862,6 +2919,9 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     # Likewise, an exec into an image the shim cannot enter, made where the
     # shim cannot record, could not be reported.
     emitEventLoss("uninjectable-image loss report unavailable")
+  if not vmProcessReportArmed:
+    # Likewise, the creation of a CLONE_VM process could not be reported.
+    emitEventLoss("CLONE_VM process loss report unavailable")
   let collection = getEnv("REPRO_MONITOR_COLLECTION_EVIDENCE")
   if collection.len > 0 and collection != "full:" & runId:
     emitEventLoss("invalid internal collection scope for active capture route")
@@ -4992,14 +5052,29 @@ proc ct_linux_preload_register_raw_fork(sample, child: pointer)
 ct_linux_preload_register_raw_fork(cast[pointer](repro_linux_raw_fork_sample),
   cast[pointer](repro_linux_raw_fork_child))
 
+{.push stackTrace: off, lineTrace: off.}
 proc repro_linux_vm_process_parent(childPid: clong) {.cdecl, raises: [].} =
   ## The creator of a CLONE_VM process that is neither a thread nor a vfork
   ## child writes that process's tree-ledger entry (see
   ## `ct_linux_preload_register_vm_process`): the child shares this memory
   ## and gets no fork-child notification, so it cannot write its own.
-  if bypassEvidence():
+  ##
+  ## The child is ALREADY RUNNING, in this memory and, unless it was created
+  ## with CLONE_SETTLS, on this thread's TLS. So nothing here may touch shim
+  ## state the child's own hooks read: not `disabled` (a muted section would
+  ## make the child's hooks skip recording, silently), not the hook depth,
+  ## not errno. `writeTreeLedgerEntryRaw` issues raw system calls only. It
+  ## also runs in a fork child skipping bookkeeping (no lock is taken), so
+  ## that child's CLONE_VM process gets its entry too. A failed write is
+  ## reported through the pre-encoded loss frame (raw syscalls); only that
+  ## failure path touches thread state (it saves and restores errno).
+  if not initialized or fragmentDir.len == 0 or childPid <= 0:
     return
-  markChildInTreeLedger(int(childPid))
+  let w = writeTreeLedgerEntryRaw(int(childPid),
+    linuxProcStartTicksSys(ledgerSyscall, int(childPid)))
+  if w.err != 0:
+    reportForkChildSkippedEvidence()
+{.pop.}
 
 proc ct_linux_preload_register_vm_process(fn: pointer)
   {.importc, cdecl, raises: [].}

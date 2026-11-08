@@ -2,17 +2,17 @@
 ##
 ## Root exit does not prove that a monitored tree has exited: a detached
 ## descendant can outlive the root and keep reading and writing files after the
-## evidence is merged (io-mon-Lossless-Event-Capture §4.1). macOS has no Job
-## Object and no subreaper, and `kqueue`'s `NOTE_TRACK` (automatic fork
-## following) has not been supported since 10.5. What it does have is a cheap,
-## unprivileged, point-in-time process listing (`sysctl(KERN_PROC_ALL)`) and a
-## way to read a same-user process's live argument/environment area
-## (`KERN_PROCARGS2`). That is the same shape as the Linux guard's
-## `/proc/*/environ` scan, and the guard mirrors that contract: after the root
-## has exited, the capture is complete only once a sweep finds no live process
-## carrying this run's injection needles (`REPRO_MONITOR_SESSION=<runId>` or
-## `REPRO_MONITOR_FRAGMENT_DIR=<dir>`) AND no live process in this run's tree
-## ledger (`io_mon/tree_ledger`), within a grace window.
+## evidence is merged. macOS has no Job Object and no subreaper, and `kqueue`'s
+## `NOTE_TRACK` (automatic fork following) has not been supported since 10.5.
+## What it does have is a cheap, unprivileged, point-in-time process listing
+## (`sysctl(KERN_PROC_ALL)`) and a way to read a same-user process's live
+## argument/environment area (`KERN_PROCARGS2`). That is the same shape as the
+## Linux guard's `/proc/*/environ` scan, and the guard mirrors that contract:
+## after the root has exited, the capture is complete only once a sweep finds no
+## live process carrying this run's injection needles
+## (`REPRO_MONITOR_SESSION=<runId>` or `REPRO_MONITOR_FRAGMENT_DIR=<dir>`) AND
+## no live process in this run's tree ledger (`io_mon/tree_ledger`), within a
+## grace window.
 ##
 ## The argument/environment area is the process's OWN memory, not a copy the
 ## kernel took at exec, so a process can overwrite its needles in place
@@ -172,7 +172,7 @@
 ## This module only gathers facts. The DECISIONS (when the guard runs, how
 ## long it waits, what a failure means for the capture) live in `fs_snoop`'s
 ## private `settleMonitorDescendants`, inside the single evidence funnel
-## (IoMon-Decomposed-Host-API DH-3). Nothing here can promote a capture: the
+## (`collectMonitorEvidence`). Nothing here can promote a capture: the
 ## caller fails closed on anything but a conclusive empty sweep.
 
 when not defined(macosx):
@@ -194,7 +194,7 @@ const TreeGuardCHash = $cast[uint](hash(staticRead("macos_tree_guard.c")))
 
 const
   MacosDescendantGraceMsDefault* = 500
-    ## Same defaults as the Linux and Windows §4.1 windows.
+    ## Same defaults as the Linux and Windows guards' windows.
   MacosDescendantPollMsDefault* = 25
   HitCapacity = 256
 

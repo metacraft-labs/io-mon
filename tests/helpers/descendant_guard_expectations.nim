@@ -5,7 +5,7 @@
 ## must always honor the original verdict.
 ##
 ## No platform carries that limitation any more. Windows proves quiescence with
-## its Job Object guard (reprobuild-pm spec/io-mon-Windows-Tree-Lifetime-Guard.md)
+## its Job Object guard (docs/usage.md, the Windows tree-lifetime guard)
 ## and macOS with its kernel census (docs/usage.md, "The macOS tree-lifetime
 ## guard (normative)"), so on every platform this helper removes NOTHING: a
 ## suite that grades through it asserts the real, un-normalized completeness,

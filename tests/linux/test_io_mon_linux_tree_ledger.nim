@@ -1,4 +1,4 @@
-## test_io_mon_linux_tree_ledger — the Linux §4.1 descendant guard checks the
+## test_io_mon_linux_tree_ledger — the Linux descendant guard checks the
 ## tree ledger (`src/io_mon/tree_ledger.nim`,
 ## `fs_snoop.waitForLinuxInjectedDescendants`).
 ##
@@ -42,7 +42,25 @@
 ##  9. a clobbering child created by a fork path that never reaches the fork
 ##     hook — `daemon(3)` (glibc's internal `__fork`), `_Fork(3)`,
 ##     `syscall(SYS_clone)`, `clone(3)`, and a CLONE_VM process — is found
-##     through its ledger entry; `popen(3)` and `system(3)` are controls.
+##     through its ledger entry; `popen(3)` and `system(3)` are controls;
+## 10. a ledger with no entry for the root (the root deletes its own entry,
+##     which is what a ledger the shim never kept looks like) fails closed;
+## 11. a static root the shim cannot enter is reported once, by the spawn
+##     site, and not a second time as a missing root entry;
+## 12. a `daemon(3)` child forked while another thread held a shim lock has
+##     only the entry the atfork child handler wrote, and is found by it;
+## 13. a raw fork (`syscall(SYS_clone)`) or `daemon(3)` that creates the first
+##     process of a new pid namespace writes that namespace's marker from the
+##     child, so the guard fails closed at once instead of checking pid 1
+##     against the host's init;
+## 14. a writer that cannot read its own pid namespace (a /proc hidden by a
+##     tmpfs) reports a loss instead of leaving namespace-relative pids the
+##     guard would check against unrelated host processes;
+## 15. a CLONE_VM process created through `syscall(2)` (SYS_clone and
+##     SYS_clone3), which glibc's clone(3) wrapper never sees, gets its
+##     creator's entry and is found by it. Every CLONE_VM process (here and
+##     the `vm-clone` of case 9) is also one loss of its own: it shares its
+##     creator's memory and thread state, which the shim cannot keep apart.
 ##
 ## Neuters that turn this file red: `noledgercheck` (the guard
 ## ignores the ledger) — 3, 4, 5 come back `mcComplete` and 6 loses the
@@ -58,6 +76,17 @@ const StillLive = "linux injected descendants still live after root exit"
 const RecordedLive = "linux recorded descendants still live after root exit"
 const OtherPidNs = "linux descendant guard failed: the monitored tree ran " &
   "processes in another pid namespace"
+const NoRootEntry = "linux descendant guard failed: the tree ledger has no " &
+  "entry for the root"
+const UnknownPidNs = "pid namespace could not be read"
+const UninjectableRoot = "uninjectable image: root spawn"
+const VmProcessLoss = "linux CLONE_VM process (not a thread or vfork child)"
+
+const staticExitSource = """
+/* Freestanding: no libc and no loader, so LD_PRELOAD cannot reach it. */
+__asm__(".text\n.global _start\n_start:\n"
+        "  mov $60, %eax\n  xor %edi, %edi\n  syscall\n  hlt\n");
+"""
 
 const fixtureSrc = """
 #define _GNU_SOURCE
@@ -73,6 +102,9 @@ const fixtureSrc = """
 #include <pthread.h>
 #include <sched.h>
 #include <sys/syscall.h>
+#include <dirent.h>
+#include <stdint.h>
+#include <pty.h>
 
 extern char **environ;
 static int g_argc;
@@ -311,6 +343,165 @@ static int internal_fork(const char *how, const char *pidfile, const char *self)
   return 57;
 }
 
+/* unledger: delete this process's own tree-ledger entry, so the ledger looks
+   like one the shim never kept (a shim that predates it). Exit 0 when exactly
+   one entry was removed. */
+static int unledger(void) {
+  const char *dir = getenv("REPRO_MONITOR_FRAGMENT_DIR");
+  if (dir == NULL) return 60;
+  char prefix[64];
+  snprintf(prefix, sizeof(prefix), "repro-tree-%ld-", (long)getpid());
+  DIR *d = opendir(dir);
+  if (d == NULL) return 61;
+  int removed = 0;
+  struct dirent *e;
+  char path[8192];
+  while ((e = readdir(d)) != NULL) {
+    if (strncmp(e->d_name, prefix, strlen(prefix)) != 0) continue;
+    snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+    if (unlink(path) == 0) removed++;
+  }
+  closedir(d);
+  return removed == 1 ? 0 : 62;
+}
+
+/* lockdaemon <pidfile>: like lockfork, but the fork is glibc's internal one
+   inside daemon(3), which never reaches the fork hook, so the parent writes
+   no entry either: the atfork child handler's entry, written although another
+   thread held a shim lock, is the child's only one. The daemon(3) parent
+   _exits at once; the child lingers. */
+static int lockdaemon(const char *pidfile) {
+  hold_lock = (hold_fn)dlsym(RTLD_DEFAULT, "repro_test_fork_hold_lock");
+  if (hold_lock == NULL) return 40;
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, SIGUSR1);
+  if (sigprocmask(SIG_BLOCK, &set, NULL) != 0) return 41;
+  pthread_t t;
+  if (pthread_create(&t, NULL, lock_holder, NULL) != 0) return 43;
+  while (!__atomic_load_n(&lock_held, __ATOMIC_ACQUIRE)) {}
+  if (daemon(1, 1) != 0) return 50;
+  linger(pidfile);
+  return 0;
+}
+
+/* pidns <how> <pidfile> <linger>: enter a new pid namespace (the caller runs
+   in a user namespace that grants CAP_SYS_ADMIN) and create its first
+   process through a fork path that never reaches the fork hook, so that the
+   only ledger writer inside the namespace is that child itself:
+   `syscall-fork` (raw clone: the raw-fork child callback), `daemon3` or
+   `forkpty` (glibc's internal fork: the atfork child handler). With linger 0
+   the child
+   exits at once; with linger 1 it clears its needles and waits for SIGUSR1,
+   and the parent writes the child's pid AS THIS NAMESPACE SEES IT to
+   <pidfile> (the child only knows itself as pid 1). */
+static int pidns(const char *how, const char *pidfile, int keep) {
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, SIGUSR1);
+  if (sigprocmask(SIG_BLOCK, &set, NULL) != 0) return 41;
+  if (unshare(CLONE_NEWPID) != 0) return 70;
+  if (!strcmp(how, "daemon3")) {
+    if (daemon(1, 1) != 0) return 71;
+    if (keep) { int sig = 0; clobber_needles(); sigwait(&set, &sig); }
+    _exit(0);
+  }
+  if (!strcmp(how, "forkpty")) {
+    /* The child's terminal hangs up when this parent exits and closes the
+       master side; the child must outlive that. It reports through the
+       terminal once forkpty's login_tty is done, because that step fails
+       once the master is closed, so the parent must not exit before it. */
+    signal(SIGHUP, SIG_IGN);
+    int master = -1;
+    pid_t pid = forkpty(&master, NULL, NULL, NULL);
+    if (pid < 0) return 75;
+    if (pid == 0) {
+      if (keep) {
+        int sig = 0;
+        clobber_needles();
+        if (write(1, "r", 1) != 1) _exit(13);
+        sigwait(&set, &sig);
+      }
+      _exit(0);
+    }
+    if (!keep) return wait_child(pid) == 0 ? 0 : 73;
+    char ready;
+    if (read(master, &ready, 1) != 1) return 76;
+    char text[32];
+    snprintf(text, sizeof(text), "%ld\n", (long)pid);
+    write_text(pidfile, text);
+    return 0;
+  }
+  if (!strcmp(how, "syscall-fork")) {
+    long pid = syscall(SYS_clone, SIGCHLD, 0, 0, 0, 0);
+    if (pid < 0) return 72;
+    if (pid == 0) {
+      if (keep) { int sig = 0; clobber_needles(); sigwait(&set, &sig); }
+      _exit(0);
+    }
+    if (!keep) return wait_child((pid_t)pid) == 0 ? 0 : 73;
+    char text[32];
+    snprintf(text, sizeof(text), "%ld\n", pid);
+    write_text(pidfile, text);
+    return 0;
+  }
+  return 74;
+}
+
+/* syscall-vm <clone|clone3> <pidfile>: a CLONE_VM process created through
+   syscall(2) (SYS_clone, or SYS_clone3 whose flags live in memory the call
+   points at), not through glibc's clone(3). The kernel starts the child at
+   the instruction after the system call, on the new stack, still inside
+   whatever function issued it; that code only unwinds to its `ret`, which
+   pops what is on the new stack. So the top of the new stack is filled with
+   the child's entry point: whichever saved registers the code pops first,
+   the `ret` lands in vm_child_entry. The needles are cleared in the shared
+   memory before the clone. The creator's ledger entry, written by the shim's
+   syscall(2) route, is the child's only one. */
+__attribute__((force_align_arg_pointer, noreturn))
+static void vm_child_entry(void) {
+  for (;;) pause();
+}
+static char g_vm_stack[256 * 1024] __attribute__((aligned(16)));
+static int syscall_vm(const char *how, const char *pidfile) {
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, SIGUSR1);
+  if (sigprocmask(SIG_BLOCK, &set, NULL) != 0) return 41;
+  enum { SLOTS = 64 };
+  void **top = (void **)(g_vm_stack + sizeof(g_vm_stack));
+  void **sp = top - SLOTS;
+  for (int i = 0; i < SLOTS; i++) sp[i] = (void *)vm_child_entry;
+  clobber_needles();
+  long pid = -1;
+  if (!strcmp(how, "clone")) {
+    pid = syscall(SYS_clone, CLONE_VM | SIGCHLD, sp, 0, 0, 0);
+  } else {
+#ifdef SYS_clone3
+    /* struct clone_args, clone(2): the first eight fields
+       (CLONE_ARGS_SIZE_VER0). The child's stack pointer is
+       stack + stack_size. */
+    static struct {
+      uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack,
+          stack_size, tls;
+    } args;
+    memset(&args, 0, sizeof(args));
+    args.flags = CLONE_VM;
+    args.exit_signal = SIGCHLD;
+    args.stack = (uint64_t)(uintptr_t)g_vm_stack;
+    args.stack_size = (uint64_t)((char *)sp - g_vm_stack);
+    pid = syscall(SYS_clone3, &args, sizeof(args));
+#else
+    return 81;
+#endif
+  }
+  if (pid <= 0) return 80;
+  char text[32];
+  snprintf(text, sizeof(text), "%ld\n", pid);
+  write_text(pidfile, text);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   g_argc = argc;
   g_argv = argv;
@@ -318,6 +509,12 @@ int main(int argc, char **argv) {
   const char *mode = argv[1];
   if (!strcmp(mode, "plain") && argc == 3) return read_input(argv[2]) ? 0 : 3;
   if (!strcmp(mode, "lockfork") && argc == 3) return lockfork(argv[2]);
+  if (!strcmp(mode, "unledger") && argc == 2) return unledger();
+  if (!strcmp(mode, "lockdaemon") && argc == 3) return lockdaemon(argv[2]);
+  if (!strcmp(mode, "pidns") && argc == 5)
+    return pidns(argv[2], argv[3], atoi(argv[4]));
+  if (!strcmp(mode, "syscall-vm") && argc == 4)
+    return syscall_vm(argv[2], argv[3]);
   if (!strcmp(mode, "linger") && argc == 3) linger(argv[2]);
   if (!strcmp(mode, "internal") && argc == 4)
     return internal_fork(argv[2], argv[3], argv[0]);
@@ -384,7 +581,7 @@ suite "Linux descendant guard: the tree ledger":
   let fixture = work / "tree"
   writeFile(work / "tree.c", fixtureSrc)
   let built = run(getEnv("CC", "cc"), @[work / "tree.c", "-pthread", "-o",
-    fixture, "-ldl"])
+    fixture, "-ldl", "-lutil"])
   doAssert built.code == 0, built.output
   let buildShim = run("bash", @[repoRoot / "scripts" / "build_shim.sh"])
   doAssert buildShim.code == 0, buildShim.output
@@ -583,10 +780,203 @@ suite "Linux descendant guard: the tree ledger":
         else:
           echo how, ": ", res.depFile.losses
         check not res.depFile.losses.anyIt(it.startsWith(StillLive))
+        # A process on its creator's memory and TLS is one the shim cannot
+        # keep apart from its creator: the creator reports it (once).
+        check res.depFile.losses.filterIt(it.startsWith(VmProcessLoss)).len ==
+          (if how == "vm-clone": 1 else: 0)
       finally:
         if child == Pid(0) and fileExists(pidFile):
           child = awaitPidFile(pidFile)
         if child != Pid(0):
           reap(child)
+
+  proc unprivilegedNamespaces(extra: varargs[string]): bool =
+    ## Whether this host lets an unprivileged user create a user namespace
+    ## (plus `extra` unshare flags) and run a command in it.
+    let unshare = findExe("unshare")
+    if unshare.len == 0:
+      echo "    SKIP: no unshare on PATH"
+      return false
+    let probe = run(unshare, @["--user", "--map-root-user"] & @extra &
+      @["true"])
+    if probe.code != 0:
+      echo "    SKIP: unprivileged namespaces are unavailable: ", probe.output
+    probe.code == 0
+
+  test "10. a ledger with no entry for the root fails closed":
+    # The root deletes its own entry before it exits, which is what a ledger
+    # the shim never kept looks like (a shim that predates the ledger). The
+    # guard cannot tell which processes the run had, so it must not grade
+    # the capture complete.
+    let req = request("unledger")
+    let res = capture(req, false)
+    check res.exitCode == 0              # exactly one entry was removed
+    check res.completeness == mcIncomplete
+    let rootless = res.depFile.losses.filterIt(it.startsWith(NoRootEntry))
+    check rootless.len == 1
+    if rootless.len != 1: echo res.depFile.losses
+
+  test "11. an uninjectable root is one loss, not two":
+    # A static root the loader never preloads the shim into: the spawn site
+    # reports it, and its missing ledger entry is that same fact, so the
+    # guard adds no "no entry for the root" loss of its own.
+    when defined(amd64):
+      let staticExit = work / "static-exit"
+      writeFile(work / "static-exit.c", staticExitSource)
+      let built = run(getEnv("CC", "cc"), @[work / "static-exit.c", "-static",
+        "-nostdlib", "-nostartfiles", "-fno-stack-protector", "-fno-pie",
+        "-no-pie", "-o", staticExit])
+      require built.code == 0
+      inc serial
+      let req = FsSnoopRequest(command: @[staticExit],
+        depFilePath: work / ("capture-" & $serial & ".iomon"))
+      let res = capture(req, false)
+      check res.exitCode == 0
+      check res.completeness == mcIncomplete
+      check res.depFile.losses.filterIt(it.startsWith(UninjectableRoot)).len == 1
+      check not res.depFile.losses.anyIt(it.startsWith(NoRootEntry))
+      if res.depFile.losses.anyIt(it.startsWith(NoRootEntry)):
+        echo res.depFile.losses
+    else:
+      echo "    SKIP: the static fixture is x86_64 assembly"
+      skip()
+
+  test "12. daemon(3) with a shim lock held: the child's own entry finds it":
+    # glibc's daemon(3) forks internally, so neither process runs the fork
+    # hook and the parent writes no entry. Another thread holds a shim lock
+    # at the fork, so the child skips monitor bookkeeping. The atfork child
+    # handler writes the child's entry anyway (it takes no lock), and it is
+    # the child's ONLY entry.
+    let lockShim = buildPrivateLinuxShimWithFlags(repoRoot,
+      ["-d:ioMonShimForkLockTest"])
+    let pidFile = work / "lockdaemon.pid"
+    let req = request("lockdaemon", pidFile)
+    var child = Pid(0)
+    putEnv("REPRO_MONITOR_SHIM_LIB", lockShim)
+    try:
+      let res = capture(req, false)
+      child = awaitPidFile(pidFile)
+      check res.exitCode == 0
+      check alive(child)
+      check "REPRO_MONITOR_SESSION=" notin
+        readFile("/proc/" & $child & "/environ")
+      check res.completeness == mcIncomplete
+      let recorded = res.depFile.losses.filterIt(it.startsWith(RecordedLive))
+      check recorded.len == 1
+      if recorded.len == 1:
+        check ("pids=" & $child) in recorded[0]
+      else:
+        echo res.depFile.losses
+    finally:
+      delEnv("REPRO_MONITOR_SHIM_LIB")
+      if child == Pid(0) and fileExists(pidFile):
+        child = awaitPidFile(pidFile)
+      if child != Pid(0): reap(child)
+
+  test "13. a raw or internal fork into a new pid namespace writes its marker":
+    # The new namespace's first process is created by a fork path that never
+    # reaches the fork hook, so the only ledger writer inside the namespace
+    # is the child itself (the raw-fork child callback, or the atfork child
+    # handler for daemon(3)). Its entry says pid 1, which on the host is
+    # init; only the namespace marker it writes beside the entry keeps the
+    # guard from checking init and waiting out the whole window for it.
+    if unprivilegedNamespaces():
+      putEnv("IO_MON_LINUX_DESCENDANT_GRACE_MS", "5000")
+      try:
+        for how in ["syscall-fork", "daemon3"]:
+          checkpoint(how)
+          inc serial
+          let req = FsSnoopRequest(command: @[findExe("unshare"), "--user",
+            "--map-root-user", fixture, "pidns", how, work / "unused", "0"],
+            depFilePath: work / ("capture-" & $serial & ".iomon"))
+          let t0 = getMonoTime()
+          let res = capture(req, false)
+          let elapsed = inMilliseconds(getMonoTime() - t0)
+          check res.exitCode == 0
+          check res.completeness == mcIncomplete
+          let ns = res.depFile.losses.filterIt(it.startsWith(OtherPidNs))
+          check ns.len == 1
+          check not res.depFile.losses.anyIt(it.startsWith(RecordedLive) or
+            it.startsWith(StillLive))
+          if ns.len != 1: echo how, ": ", res.depFile.losses
+          check elapsed < 2500
+      finally:
+        putEnv("IO_MON_LINUX_DESCENDANT_GRACE_MS", "300")
+    else:
+      skip()
+
+  test "14. a writer that cannot read its pid namespace is a loss":
+    # Inside a mount namespace whose /proc is hidden (a tmpfs over it, as in
+    # a chroot without proc), the fixture enters a new pid namespace and its
+    # first process clears its needles and outlives the root. Neither can
+    # read /proc/self/ns/pid, so no marker names the namespace and the
+    # child's entry (pid 1, no start time) points at the host's init, which
+    # predates the root and is skipped: without the loss the survivor is
+    # invisible. In the `forkpty` variant (glibc's internal fork: no fork
+    # hook, so no parent entry naming the child by the host's pid, and
+    # nothing in the child that needs /proc) nothing else reported it, and
+    # the capture could be graded complete with the survivor running.
+    if unprivilegedNamespaces("--mount", "sh", "-c",
+        "mount -t tmpfs none /proc && test ! -e /proc/self"):
+      for how in ["forkpty", "syscall-fork"]:
+        checkpoint(how)
+        let pidFile = work / ("hidden-proc-" & how & ".pid")
+        inc serial
+        let req = FsSnoopRequest(command: @[findExe("unshare"), "--user",
+          "--map-root-user", "--mount", "sh", "-c",
+          "mount -t tmpfs none /proc && exec \"$0\" pidns " & how &
+            " \"$1\" 1",
+          fixture, pidFile],
+          depFilePath: work / ("capture-" & $serial & ".iomon"))
+        var child = Pid(0)
+        try:
+          let res = capture(req, false)
+          child = awaitPidFile(pidFile)
+          check res.exitCode == 0
+          check alive(child)
+          check res.completeness == mcIncomplete
+          check res.depFile.losses.anyIt(UnknownPidNs in it)
+          if not res.depFile.losses.anyIt(UnknownPidNs in it):
+            echo how, ": ", res.completeness, " ", res.depFile.losses
+        finally:
+          if child == Pid(0) and fileExists(pidFile):
+            child = awaitPidFile(pidFile)
+          if child != Pid(0): reap(child)
+    else:
+      skip()
+
+  test "15. a CLONE_VM process created through syscall(2) is found":
+    # SYS_clone and SYS_clone3 with CLONE_VM, issued through syscall(2):
+    # glibc's clone(3) wrapper, whose creator entry case 9 pins, never runs.
+    # The shim's syscall(2) route writes the entry in the creator
+    # (`ct_linux_preload_after_raw_fork_syscall`; for clone3 it reads the
+    # flags from the argument block), and it is the child's only one.
+    for how in ["clone", "clone3"]:
+      checkpoint(how)
+      let pidFile = work / ("syscall-vm-" & how & ".pid")
+      let req = request("syscall-vm", how, pidFile)
+      var child = Pid(0)
+      try:
+        let res = capture(req, false)
+        check res.exitCode == 0
+        if res.exitCode != 0:
+          echo how, ": fixture exit ", res.exitCode
+          continue
+        child = awaitPidFile(pidFile)
+        check alive(child)
+        check res.completeness == mcIncomplete
+        let recorded = res.depFile.losses.filterIt(
+          it.startsWith(RecordedLive))
+        check recorded.len == 1
+        if recorded.len == 1:
+          check ("pids=" & $child) in recorded[0]
+        else:
+          echo how, ": ", res.depFile.losses
+        check not res.depFile.losses.anyIt(it.startsWith(StillLive))
+        check res.depFile.losses.filterIt(it.startsWith(VmProcessLoss)).len == 1
+      finally:
+        if child == Pid(0) and fileExists(pidFile):
+          child = awaitPidFile(pidFile)
+        if child != Pid(0): reap(child)
 
   removeDir(work)

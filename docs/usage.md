@@ -459,13 +459,21 @@ entry's start time is field 22 of `/proc/<pid>/stat`). A live ledger process
 that no longer carries the needles publishes
 `linux recorded descendants still live after root exit pids=<p,...> run=<id>`;
 a ledger that cannot be read, or has no entry for the root, publishes
-`linux descendant guard failed: …`. A ledger pid is relative to its writer's
+`linux descendant guard failed: …` (a root the spawn site already reported as
+`uninjectable image: root spawn: …` never loaded the shim, so its missing
+entry is not reported a second time). A ledger pid is relative to its writer's
 pid namespace, so a tree that runs a process in another pid namespace (for
 example `unshare --pid --fork`) publishes
 `linux descendant guard failed: the monitored tree ran processes in another pid namespace pidns=<ino,...> …`
 at once instead of checking those pids against unrelated host processes; a
 shim that cannot write an entry
-publishes `linux tree ledger write failed errno=<e> pid=<p>` (pinned by
+publishes `linux tree ledger write failed errno=<e> pid=<p>`, and one that
+cannot read its own pid namespace (no `/proc` in its mount namespace or
+chroot) reports the write as failed for that reason. A process created with
+CLONE_VM that is neither a thread nor a vfork child shares its creator's
+memory and thread state, which the shim cannot keep apart, so its creator
+publishes `linux CLONE_VM process (not a thread or vfork child): …` once per
+process, beside the child's ledger entry (all pinned by
 `tests/linux/test_io_mon_linux_tree_ledger.nim`). Reporting
 `mcComplete` where the batch entry point reports `mcIncomplete` would be a false
 cache hit for the whole action, so the guard is **not** exported as a step you
@@ -641,16 +649,14 @@ can rely on:
   boundary as on Linux and Windows. On macOS such requests travel over Mach,
   which `ipc-connect` records only in part (see the XPC/Mach breakaway tests).
 - Like the Linux scan and the Windows job, the guard runs inside
-  `collectMonitorEvidence` (DH-3), for `runMonitored` and for `startMonitor` /
+  `collectMonitorEvidence`, for `runMonitored` and for `startMonitor` /
   `pollMonitor` / `finishMonitor` alike. No exported proc runs, polls or skips
   it.
 - **Cost.** A sweep is one snapshot, one monotonic start-time read
   (`proc_pid_rusage`) for each live process, and one strings read for each
   process younger than the root. The shim creates one empty ledger file per
   process, plus one `open` per `fork` or `posix_spawn` in the parent (usually
-  finding the file the child already created, or creating it first). The
-  measured numbers are in reprobuild-pm's
-  `Distributed-Execution-Threat-Model.md`, G42.
+  finding the file the child already created, or creating it first).
 
 Pinned by `tests/macos/test_io_mon_macos_tree_lifetime_guard.nim`. It covers a
 quiesced control on both launch paths, nested children, an exec chain,

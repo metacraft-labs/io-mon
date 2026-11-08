@@ -4,7 +4,7 @@
 | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Status      | open                                                                                                                                                                  |
 | Recorded    | 2026-11-07                                                                                                                                                            |
-| Observed in | io-mon @ `3d47bb1` plus the change that records the AF_INET destination and failed connects; arch (x86_64 Linux)                                                      |
+| Observed in | io-mon @ `3d47bb1` plus the change that records the AF_INET destination and failed connects; x86_64 Linux                                                             |
 | Area        | `src/io_mon/shim/linux_preload.nim` (`recordLocalFdCreate`, `classifyEmptyFdRead`), `src/io_mon/hooks/linux_preload_runtime.nim` (no `socket`/`accept` interposition) |
 
 ## Observed
@@ -27,12 +27,12 @@ Cause: for `<&4` bash `dup2`s the socket onto fd 0. Fd 0 was open when the
 shim initialised, so `classifyEmptyFdRead` treats the read as an INHERITED
 descriptor and records `chan=opaque role=read` with the socket's
 `(dev,ino)`. The merge pairs such a read against an in-tree
-`chan=localfd role=create` of the same object (IM-3), but the Linux shim
+`chan=localfd role=create` of the same object, but the Linux shim
 records creates only for `pipe`/`pipe2`/`socketpair`/`eventfd`/`timerfd`/
 `memfd` — not for `socket(2)` or `accept(2)` — so the socket the tree
 created itself stays unpaired and downgrades. The macOS shim records every
-in-tree local-IPC fd creation, `socket` and `accept` included (ROUND-4 IP1),
-so the platforms disagree.
+in-tree local-IPC fd creation, `socket` and `accept` included, so the
+platforms disagree.
 
 ## Expected
 

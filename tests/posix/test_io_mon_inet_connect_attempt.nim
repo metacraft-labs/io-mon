@@ -20,7 +20,13 @@
 ##   * a made AF_INET connect to a listener outside the tree -> an
 ##     `mrIpcConnect` whose path is "127.0.0.1:<port>" (the Linux shim used to
 ##     leave it empty), and the out-of-tree-peer loss names that destination;
-##   * a failed AF_UNIX connect -> neither kind (daemon-discovery noise);
+##   * a failed AF_UNIX connect -> neither kind (daemon-discovery noise), also
+##     when it fails with an error that DOES prove the kernel read the address
+##     (ECONNREFUSED from a socket that is bound but not listening), so it is
+##     the family filter that drops it, not the error filter;
+##   * the non-blocking idiom (connect, poll, connect again): the call that
+##     fails with EISCONN, because the connection WAS made, is not an attempt;
+##     the first call already recorded the connection;
 ##   * a connect whose address pointer the kernel cannot read still fails with
 ##     EFAULT, and records nothing: the shim must not read an address the
 ##     kernel rejected as unreadable (it would crash the program);
@@ -38,7 +44,7 @@
 
 import std/[net, os, osproc, sequtils, streams, strtabs, strutils, unittest]
 from std/posix import ECONNREFUSED, ENETUNREACH, EHOSTUNREACH, ETIMEDOUT,
-  EACCES, EPERM, EADDRNOTAVAIL, EFAULT, EINVAL, EBADF, ENOTSOCK
+  EACCES, EPERM, EADDRNOTAVAIL, EFAULT, EINVAL, EBADF, ENOTSOCK, EISCONN
 
 import io_mon
 import io_mon/posix_connect
@@ -61,6 +67,8 @@ const
 #include <arpa/inet.h>
 #include <signal.h>
 #include <sys/time.h>
+#include <fcntl.h>
+#include <poll.h>
 static void on_alarm(int sig) { (void)sig; }
 /* client eintr <address> <port> <fdfile>: blocking AF_INET connects to a
    listener that never accepts, each under a 300 ms one-shot SIGALRM whose
@@ -99,6 +107,36 @@ static int eintr_mode(const char *addr, int port, const char *fdfile) {
   }
   return 3;
 }
+/* client nonblock <address> <port>: the non-blocking connect idiom on AF_INET.
+   connect (made, or EINPROGRESS), poll until writable, connect again until a
+   call fails with EISCONN (the connection was made). macOS answers EISCONN at
+   once; Linux first reports the completed connect (0) and answers EISCONN on
+   the call after. Exit 0 on EISCONN, 3 when the first call failed outright,
+   10 + (errno % 100) when a later call fails otherwise, 11 when three later
+   calls all succeed, 2 on a setup error. */
+static int nonblock_mode(const char *addr, int port) {
+  struct sockaddr_in a; memset(&a, 0, sizeof a);
+  a.sin_family = AF_INET;
+  a.sin_port = htons((unsigned short)port);
+  if (inet_pton(AF_INET, addr, &a.sin_addr) != 1) return 2;
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return 2;
+  int fl = fcntl(fd, F_GETFL, 0);
+  if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) != 0) return 2;
+  int rc = connect(fd, (struct sockaddr *)&a, sizeof a);
+  if (rc != 0 && errno != EINPROGRESS) return 3;
+  struct pollfd p; p.fd = fd; p.events = POLLOUT; p.revents = 0;
+  if (poll(&p, 1, 5000) != 1) return 2;
+  for (int i = 0; i < 3; i++) {
+    rc = connect(fd, (struct sockaddr *)&a, sizeof a);
+    int e = errno;
+    if (rc == 0) continue;
+    close(fd);
+    return e == EISCONN ? 0 : 10 + (e % 100);
+  }
+  close(fd);
+  return 11;
+}
 /* client <inet|inet6|unix> <address> <port>: one blocking connect(2); exit 0
    when it was made, 10 + (errno % 100) when it failed, 2 on a setup error. */
 int main(int argc, char **argv) {
@@ -117,6 +155,10 @@ int main(int argc, char **argv) {
   if (strcmp(argv[1], "eintr") == 0) {
     if (argc < 5) return 2;
     return eintr_mode(argv[2], atoi(argv[3]), argv[4]);
+  }
+  if (strcmp(argv[1], "nonblock") == 0) {
+    if (argc < 4) return 2;
+    return nonblock_mode(argv[2], atoi(argv[3]));
   }
   if (strcmp(argv[1], "unix") == 0) {
     struct sockaddr_un a; memset(&a, 0, sizeof a);
@@ -255,6 +297,44 @@ suite "io-mon: a failed AF_INET connect is an observation":
     check dep.records.allIt(it.kind notin {mrConnectAttempt, mrIpcConnect})
     check dep.completeness == mcComplete
 
+  test "a refused AF_UNIX connect records neither kind, though its errno proves the address was read":
+    # A socket that is bound but not listening: the kernel resolves the path
+    # (it read the address) and refuses the connection, ECONNREFUSED, which
+    # IS on the attempt allow-list. Only the family filter (AF_INET/AF_INET6
+    # only) keeps it out. A missing path (ENOENT, the case above) never got
+    # that far. sun_path holds about 104 bytes, so the socket lives in a
+    # short directory rather than under the (long on macOS) temp dir.
+    let sockPath = "/tmp/iomca-" & $getCurrentProcessId() & ".sock"
+    removeFile(sockPath)
+    let bound = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP)
+    bound.bindUnix(sockPath)
+    defer:
+      bound.close()
+      removeFile(sockPath)
+    require connectFailureReadAddress(ECONNREFUSED)
+    let (dep, code) = capture("unixrefused", @["unix", sockPath, "0"])
+    check code == 10 + (ECONNREFUSED mod 100)   # refused, not ENOENT
+    check dep.records.allIt(it.kind notin {mrConnectAttempt, mrIpcConnect})
+    check dep.completeness == mcComplete
+
+  test "the non-blocking idiom's EISCONN connect is not an attempt":
+    let server = newSocket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+    server.setSockOpt(OptReuseAddr, true)
+    server.bindAddr(Port(0), "127.0.0.1")
+    server.listen()
+    defer: server.close()
+    let port = int(server.getLocalAddr()[1])
+    let (dep, code) = capture("nonblock4", @["nonblock", "127.0.0.1", $port])
+    require code == 0                    # a later call really got EISCONN
+    let dest = "127.0.0.1:" & $port
+    # The connection is recorded (by the first call, made or in flight, and
+    # on Linux again by the call that reports its completion), and no record
+    # claims that the connection which was made reached nobody.
+    let connects = dep.records.filterIt(it.kind == mrIpcConnect)
+    check connects.len >= 1
+    check connects.allIt(it.path == dest)
+    check dep.records.allIt(it.kind != mrConnectAttempt)
+
   test "a blocking AF_INET connect interrupted by a signal (EINTR) is a connection, not nothing":
     # A listener that never accepts, with the smallest backlog: once the
     # client has filled it the kernel drops further SYNs, so the next
@@ -306,5 +386,7 @@ suite "io-mon: a failed AF_INET connect is an observation":
       check connectFailureReadAddress(err)
     for err in [EFAULT, EINVAL, EBADF, ENOTSOCK]:
       check not connectFailureReadAddress(err)
+    # Connected already: the non-blocking idiom's second call.
+    check not connectFailureReadAddress(EISCONN)
 
   removeDir(work)

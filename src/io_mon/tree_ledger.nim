@@ -37,7 +37,7 @@
 ## the writer as an `mrEventLoss`, so a capture whose ledger may be short is
 ## never graded complete.
 ##
-## LINUX: the Linux §4.1 scan reads `/proc/<pid>/environ`, which is the
+## LINUX: the Linux descendant scan reads `/proc/<pid>/environ`, which is the
 ## `env_start..env_end` range of the process's own stack, so the same in-place
 ## overwrite hides a descendant from it. The Linux guard checks the same
 ## ledger (`fs_snoop.waitForLinuxInjectedDescendants`); there the start time
@@ -54,11 +54,17 @@
 ##    CLONE_VM, `_Fork(3)`), for itself, from the raw-fork child callback;
 ##  * a CLONE_VM process that is neither a thread nor a vfork child, which
 ##    shares its creator's memory and gets no child notification, written by
-##    its creator before `clone` returns.
-## The two child-side writes are allocation- and lock-free
-## (`markTreeLedgerRaw`), because they run in a child that may hold another
-## thread's lock image; their failure is reported through the shim's
-## pre-encoded fork-child loss frame. Children of `posix_spawn`, `system(3)`
+##    its creator before `clone` returns (glibc's `clone(3)` and
+##    `syscall(SYS_clone / SYS_clone3)`).
+## The Linux shim writes every entry through raw system calls (the `*Sys`
+## writers below): allocation- and lock-free, because the child-side writes
+## run in a child that may hold another thread's lock image, and free of any
+## thread-local state, because the CLONE_VM creator writes while the child
+## already runs on its memory (and, without CLONE_SETTLS, on its TLS). A
+## child-side or creator-side failure is reported through the shim's
+## pre-encoded fork-child loss frame. Every Linux writer also records its
+## pid namespace, and one that cannot read it reports a failed write
+## (`linuxPidNamespaceSys`). Children of `posix_spawn`, `system(3)`
 ## and `popen(3)` (glibc spawns with CLONE_VM | CLONE_VFORK, its parent
 ## suspended until the child execs) exec an image that writes its own entry
 ## at shim init. An image the shim cannot enter is reported where the shim
@@ -86,6 +92,10 @@ type
 proc treeLedgerName*(pid: int; startUsec: uint64): string =
   TreeLedgerPrefix & $pid & "-" & $startUsec & TreeLedgerExt
 
+# The raw writers below run in a fork child in any state and, for a CLONE_VM
+# process, beside a child that shares this thread's TLS: no Nim stack-trace
+# frame (kept in a threadvar) may be pushed on their way.
+{.push stackTrace: off, lineTrace: off.}
 when defined(posix):
   var ledgerErrno {.importc: "errno", header: "<errno.h>".}: cint
   proc ledgerOpen(path: cstring; flags: cint; mode: cint): cint
@@ -103,6 +113,7 @@ when defined(posix):
     ## PATH_MAX plus the longest entry name (prefix, two 20-digit numbers,
     ## extension). A longer fragment directory is refused (ENAMETOOLONG).
   var ENAMETOOLONG_C {.importc: "ENAMETOOLONG", header: "<errno.h>".}: cint
+  var ENOENT_C {.importc: "ENOENT", header: "<errno.h>".}: cint
 
   proc ledgerAppend(buf: var array[LedgerPathCap, char]; pos: var int;
                     text: openArray[char]): bool {.raises: [].} =
@@ -344,6 +355,127 @@ when defined(linux):
     if fragmentDir.len == 0:
       return 0
     markTreeLedgerPidNamespaceRaw(cstring(fragmentDir), inode)
+
+  # --- The same writers over a caller-supplied raw system call --------------
+  #
+  # The `*Sys` variants issue every call through `sys` (the shim passes its
+  # raw syscall primitive), so they enter no libc wrapper, no interposed
+  # hook, and touch neither `errno` nor any other thread-local state: the
+  # error comes back as the return value. That is what lets the creator of a
+  # CLONE_VM process write the child's entry while the child, which shares
+  # the creator's memory and (without CLONE_SETTLS) its TLS, already runs,
+  # and lets a fork child write its own entry before anything else in it is
+  # consistent. Results follow the kernel's `-errno` convention.
+
+  type LedgerSyscall* = proc (nr, a1, a2, a3, a4, a5, a6: clong): clong
+    {.cdecl, gcsafe, raises: [].}
+
+  var
+    SYS_openat_C {.importc: "SYS_openat", header: "<sys/syscall.h>".}: clong
+    SYS_read_C {.importc: "SYS_read", header: "<sys/syscall.h>".}: clong
+    SYS_close_C {.importc: "SYS_close", header: "<sys/syscall.h>".}: clong
+    SYS_readlinkat_C {.importc: "SYS_readlinkat",
+      header: "<sys/syscall.h>".}: clong
+    AT_FDCWD_C {.importc: "AT_FDCWD", header: "<fcntl.h>".}: cint
+
+  proc ledgerCreateSys(sys: LedgerSyscall; buf: var array[LedgerPathCap, char];
+                       pos: int): cint {.raises: [].} =
+    ## `ledgerCreate` through `sys`: 0 when the file exists afterwards,
+    ## otherwise the errno.
+    buf[pos] = '\0'
+    let fd = sys(SYS_openat_C, clong(AT_FDCWD_C), cast[clong](addr buf[0]),
+      clong(O_WRONLY_C or O_CREAT_C or O_EXCL_C or O_CLOEXEC_C), clong(0o644),
+      0, 0)
+    if fd >= 0:
+      discard sys(SYS_close_C, fd, 0, 0, 0, 0, 0)
+      return 0
+    if cint(-fd) == EEXIST_C: 0 else: cint(-fd)
+
+  proc markTreeLedgerSys*(sys: LedgerSyscall; fragmentDir: cstring; pid: int;
+                          startUsec: uint64): cint {.raises: [].} =
+    ## `markTreeLedgerRaw` through `sys`.
+    if fragmentDir == nil or fragmentDir[0] == '\0' or pid <= 0:
+      return 0
+    var buf {.noinit.}: array[LedgerPathCap, char]
+    var pos = 0
+    if not (ledgerDirPrefix(buf, pos, fragmentDir) and
+            ledgerAppend(buf, pos, TreeLedgerPrefix) and
+            ledgerAppendDec(buf, pos, uint64(pid)) and
+            ledgerAppend(buf, pos, "-") and
+            ledgerAppendDec(buf, pos, startUsec) and
+            ledgerAppend(buf, pos, TreeLedgerExt)):
+      return ENAMETOOLONG_C
+    ledgerCreateSys(sys, buf, pos)
+
+  proc markTreeLedgerPidNamespaceSys*(sys: LedgerSyscall; fragmentDir: cstring;
+                                      inode: uint64): cint {.raises: [].} =
+    ## `markTreeLedgerPidNamespaceRaw` through `sys`.
+    if fragmentDir == nil or fragmentDir[0] == '\0' or inode == 0:
+      return 0
+    var buf {.noinit.}: array[LedgerPathCap, char]
+    var pos = 0
+    if not (ledgerDirPrefix(buf, pos, fragmentDir) and
+            ledgerAppend(buf, pos, TreeLedgerPidNsPrefix) and
+            ledgerAppendDec(buf, pos, inode) and
+            ledgerAppend(buf, pos, TreeLedgerExt)):
+      return ENAMETOOLONG_C
+    ledgerCreateSys(sys, buf, pos)
+
+  proc linuxProcStartTicksSys*(sys: LedgerSyscall; pid: int): uint64
+      {.raises: [].} =
+    ## `linuxProcStartTicks` through `sys`.
+    if pid <= 0:
+      return 0
+    var path {.noinit.}: array[LedgerPathCap, char]
+    var pos = 0
+    if not (ledgerAppend(path, pos, "/proc/") and
+            ledgerAppendDec(path, pos, uint64(pid)) and
+            ledgerAppend(path, pos, "/stat")):
+      return 0
+    path[pos] = '\0'
+    let fd = sys(SYS_openat_C, clong(AT_FDCWD_C), cast[clong](addr path[0]),
+      clong(O_RDONLY_C or O_CLOEXEC_C), 0, 0, 0)
+    if fd < 0:
+      return 0
+    var buf {.noinit.}: array[1024, char]
+    let r = sys(SYS_read_C, fd, cast[clong](addr buf[0]), clong(buf.len), 0, 0,
+      0)
+    discard sys(SYS_close_C, fd, 0, 0, 0, 0, 0)
+    if r <= 0:
+      return 0
+    parseLinuxProcStatStart(buf, int(r))
+
+  proc linuxPidNamespaceSys*(sys: LedgerSyscall; inode: var uint64): cint
+      {.raises: [].} =
+    ## The caller's pid namespace for a ledger writer: 0 with `inode` set to
+    ## the inode `/proc/self/ns/pid` names, or 0 with `inode` = 0 when this
+    ## kernel provably has no pid namespaces (`/proc/self` resolves but has
+    ## no `ns/pid` link, so every pid is global), otherwise the errno: the
+    ## namespace is UNKNOWN.
+    ##
+    ## WHY UNKNOWN IS AN ERROR. A ledger pid is relative to its writer's pid
+    ## namespace, and the guard trusts an entry only when no marker names
+    ## another namespace. A writer that cannot read its namespace (no `/proc`
+    ## in its mount namespace or chroot) and writes no marker would leave
+    ## namespace-relative pids the guard checks against unrelated host
+    ## processes: pid 1 of a new namespace is the host's init, which predates
+    ## the root and is skipped, so a surviving descendant there would go
+    ## unseen. The writer reports the failure as a lost ledger write instead.
+    inode = 0
+    var buf {.noinit.}: array[64, char]
+    let n = sys(SYS_readlinkat_C, clong(AT_FDCWD_C),
+      cast[clong](cstring("/proc/self/ns/pid")), cast[clong](addr buf[0]),
+      clong(buf.len), 0, 0)
+    if n > 0:
+      inode = parsePidNamespaceLink(buf, int(n))
+      return (if inode != 0: 0 else: ENOENT_C)
+    let selfLen = sys(SYS_readlinkat_C, clong(AT_FDCWD_C),
+      cast[clong](cstring("/proc/self")), cast[clong](addr buf[0]),
+      clong(buf.len), 0, 0)
+    if selfLen > 0 and cint(-n) == ENOENT_C:
+      return 0                            # a kernel without pid namespaces
+    if n < 0: cint(-n) else: ENOENT_C
+{.pop.}
 
 proc parseTreeLedgerName*(name: string; entry: var TreeLedgerEntry): bool =
   ## Parse `repro-tree-<pid>-<startUsec>.iomon-tree`.

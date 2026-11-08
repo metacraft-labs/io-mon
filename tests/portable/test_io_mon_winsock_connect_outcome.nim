@@ -45,3 +45,6 @@ suite "Winsock connect outcome":
     check not winsockConnectFailureReadAddress(WSAEINVAL)
     check not winsockConnectFailureReadAddress(10050'u32)   # WSAENETDOWN
     check not winsockConnectFailureReadAddress(10038'u32)   # WSAENOTSOCK
+    # The socket is already connected (the second call of the non-blocking
+    # idiom): the connection was made and recorded, it is not an attempt.
+    check not winsockConnectFailureReadAddress(WSAEISCONN)

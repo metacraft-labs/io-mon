@@ -6,7 +6,7 @@
 ## Windows import, so the rule is unit-tested on every OS
 ## (`tests/portable/test_io_mon_winsock_connect_outcome.nim`): one of its
 ## outcomes, WSAEINTR, could not be provoked from a live Winsock 2 program, so no
-## end-to-end test pins it. Measured on Windows 11 (eli-pc, 2026-11-08) against a
+## end-to-end test pins it. Measured on Windows 11 (2026-11-08) against a
 ## blocking connect to a closed loopback port: `closesocket` from another thread
 ## ends it with WSAENOTSOCK, and `QueueUserAPC` or `CancelSynchronousIo` on the
 ## blocked thread do not interrupt it (it ends with WSAECONNREFUSED after ~2 s).
@@ -98,9 +98,13 @@ func winsockConnectFailureReadAddress*(wsaError: uint32): bool
   ## an error return into an access violation in the monitored program, which
   ## no `except` catches. WSAENETDOWN is excluded too: it reports the network
   ## subsystem, and Winsock may return it before looking at the address.
+  ## WSAEISCONN is excluded because it says the socket IS connected: the
+  ## non-blocking idiom (connect, wait, connect again) gets it once the
+  ## connection was made, and the first call was already recorded as a
+  ## connection (WSAEWOULDBLOCK is in flight), so an attempt record would
+  ## claim that a connection which was made reached nobody.
   ## Unlisted errors are not recorded: a missed attempt costs one piece of
   ## evidence, a wrong read costs the program.
   wsaError in [WSAECONNREFUSED, WSAENETUNREACH, WSAEHOSTUNREACH,
     WSAETIMEDOUT, WSAEACCES, WSAEADDRNOTAVAIL, WSAEADDRINUSE,
-    WSAEAFNOSUPPORT, WSAECONNRESET, WSAECONNABORTED, WSAEHOSTDOWN,
-    WSAEISCONN]
+    WSAEAFNOSUPPORT, WSAECONNRESET, WSAECONNABORTED, WSAEHOSTDOWN]

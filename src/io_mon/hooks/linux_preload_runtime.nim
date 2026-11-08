@@ -1196,7 +1196,16 @@ void ct_linux_preload_register_raw_fork(ct_raw_fork_sample_fn sample,
  * root. Its creator writes the entry instead, before clone returns to it
  * (and so before the root can exit): ct_linux_preload_register_vm_process.
  * A CLONE_VFORK child suspends its parent until it execs or exits, and the
- * exec'd image writes its own entry; a CLONE_THREAD child is a thread. */
+ * exec'd image writes its own entry; a CLONE_THREAD child is a thread.
+ *
+ * The child is already running while its creator writes the entry, in the
+ * creator's memory and, without CLONE_SETTLS, on the creator's TLS too. So
+ * the write enters no hook bookkeeping (no hook depth, no `disabled`, no
+ * errno): the callback issues raw system calls only, and a hook the child
+ * runs meanwhile sees the shim exactly as it was. That also makes it
+ * async-signal-safe and reentrant, so it needs no hooks-allowed gate, which
+ * would have dropped the entry silently when the clone came from inside a
+ * hook (a V2 subscriber's report, ct_linux_preload_raw_enqueue_v1). */
 typedef void (*ct_vm_process_parent_fn)(long child_pid);
 static ct_vm_process_parent_fn ct_vm_process_parent = NULL;
 void ct_linux_preload_register_vm_process(ct_vm_process_parent_fn fn) {
@@ -1208,16 +1217,17 @@ static int ct_clone_flags_make_vm_process(unsigned long long flags) {
          (flags & CLONE_VFORK) == 0;
 }
 
-static int ct_preload_hooks_allowed(void);
+extern int ct_linux_preload_image_active(void)
+    __attribute__((weak, visibility("hidden")));
+static void ct_report_vm_process(void);
 static void ct_note_vm_process_parent(long child_pid) {
-  if (child_pid <= 0 || ct_vm_process_parent == NULL ||
-      !ct_preload_hooks_allowed())
+  if (child_pid <= 0 || ct_vm_process_parent == NULL) return;
+  /* A standing-down image leaves the entry to the active one, which sees the
+   * same call (its interposers or its trap handler). */
+  if (ct_linux_preload_image_active != NULL && !ct_linux_preload_image_active())
     return;
-  int saved_errno = errno;
-  stackable_linux_preload_enter_hook();
+  ct_report_vm_process();
   ct_vm_process_parent(child_pid);
-  stackable_linux_preload_exit_hook();
-  errno = saved_errno;
 }
 
 static int ct_raw_call_forks_process(long nr, long a1) {
@@ -1890,6 +1900,50 @@ void ct_linux_preload_register_uninjectable_exec(ct_uninjectable_exec_fn fn)
     __attribute__((visibility("hidden")));
 void ct_linux_preload_register_uninjectable_exec(ct_uninjectable_exec_fn fn) {
   __atomic_store_n(&ct_uninjectable_exec_observer, fn, __ATOMIC_RELEASE);
+}
+
+/* A CLONE_VM PROCESS IS EVENT-LOSS.
+ *
+ * A process created with CLONE_VM that is neither a thread nor a vfork child
+ * runs at once, beside its creator, in the creator's memory: every shim
+ * global (identity caches that name the creator's pid, fragment and producer
+ * state) and, unless it was created with CLONE_SETTLS, every thread-local
+ * value of the creating thread (`disabled`, the hook depth, the fragment
+ * slot, errno). The shim keeps processes apart by their memory and threads by
+ * their TLS, so it cannot keep this pair apart: a hook the child runs while
+ * its creator is inside a muted section is skipped silently, concurrent
+ * updates of the shared counters can be lost, and records can carry the
+ * creator's identity. glibc is in the same position (errno, the malloc
+ * caches), which is why such children are kept to a few raw calls, but a
+ * capture cannot assume that. So the creator reports a pre-encoded loss, once
+ * per process, with raw system calls (it must not touch the state the child
+ * shares), and the capture is graded incomplete. The child's tree-ledger
+ * entry is still written (ct_note_vm_process_parent), so a survivor is
+ * named. */
+static ct_fork_loss_frame ct_vm_process_loss;
+static int ct_vm_process_reported_pid = 0;
+int ct_linux_preload_arm_vm_process_loss_report(
+    const unsigned char *frame, long frame_len, long pid_offset,
+    long tid_offset) __attribute__((visibility("hidden")));
+int ct_linux_preload_arm_vm_process_loss_report(
+    const unsigned char *frame, long frame_len, long pid_offset,
+    long tid_offset) {
+  return ct_arm_loss_frame(&ct_vm_process_loss, frame, frame_len, pid_offset,
+                           tid_offset);
+}
+static void ct_report_vm_process(void) {
+  long frame_len = __atomic_load_n(&ct_vm_process_loss.len, __ATOMIC_ACQUIRE);
+  if (frame_len <= 0) return;
+  long pid = ct_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
+  if (__atomic_load_n(&ct_vm_process_reported_pid, __ATOMIC_ACQUIRE) ==
+      (int)pid)
+    return;
+  long tid = ct_raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
+  if (ct_write_loss_frame(ct_vm_process_loss.bytes, frame_len,
+                          ct_vm_process_loss.pid_offset,
+                          ct_vm_process_loss.tid_offset,
+                          "-vm-loss.iomon-frag", pid, tid))
+    __atomic_store_n(&ct_vm_process_reported_pid, (int)pid, __ATOMIC_RELEASE);
 }
 
 static ct_fork_loss_frame ct_uninjectable_exec_loss;
@@ -7305,6 +7359,10 @@ proc cArmSubscriberForkSkipLossReport(frame: pointer; frameLen: clong;
                             pidOffset, tidOffset: clong): cint
   {.importc: "ct_linux_preload_arm_subscriber_fork_skip_loss_report", nodecl,
     raises: [].}
+proc cArmVmProcessLossReport(frame: pointer; frameLen: clong;
+                             pidOffset, tidOffset: clong): cint
+  {.importc: "ct_linux_preload_arm_vm_process_loss_report", nodecl,
+    raises: [].}
 proc cArmUninjectableExecLossReport(frame: pointer; frameLen: clong;
                                     pidOffset, tidOffset: clong): cint
   {.importc: "ct_linux_preload_arm_uninjectable_exec_loss_report", nodecl,
@@ -7984,6 +8042,18 @@ proc armForkSkipLossReport*(frame: openArray[byte];
   else:
     cArmForkSkipLossReport(unsafeAddr frame[0], clong(frame.len),
       clong(pidOffset), clong(tidOffset)) == 1
+
+proc armVmProcessLossReport*(frame: openArray[byte];
+                              pidOffset, tidOffset: int): bool
+    {.raises: [].} =
+  ## Hand the runtime the pre-encoded event-loss frame the creator of a
+  ## CLONE_VM process writes, with raw syscalls (see "A CLONE_VM PROCESS IS
+  ## EVENT-LOSS"). Call after `armInlineLossReport`, whose fragment directory
+  ## it shares.
+  if frame.len == 0:
+    return false
+  cArmVmProcessLossReport(unsafeAddr frame[0], clong(frame.len),
+    clong(pidOffset), clong(tidOffset)) == 1
 
 proc armUninjectableExecLossReport*(frame: openArray[byte];
                                     pidOffset, tidOffset: int): bool
