@@ -31,6 +31,14 @@
 ## read on the file the descriptor named then, nothing under the overwritten
 ## or post-chdir names, no event-loss, and a complete capture.
 ##
+## THE SECOND TEST grades a failed open. An open of a missing path is a
+## probe, a negative dependency: the libc `open` hook records it as a
+## `file-open` with result -1. The same open made through an inline `syscall`
+## (`openat` and `open`, on the main thread and on a second thread) used to
+## record nothing while the capture stayed complete. Each must now record the
+## missing path with result -1, as libc `open` does, and the capture stays
+## complete with no loss.
+##
 ## x86_64 only: no other architecture has the inline-syscall trap backend.
 ##
 ## Mocks: none. Real program, real shim, real files.
@@ -249,4 +257,96 @@ suite "io-mon Linux shim: trapped inline syscalls are captured when they trap":
           it.path.startsWith(tree & "/"))
         check not dep.records.anyIt(it.kind == mrEventLoss)
         check dep.completeness == mcComplete
+      removeDir(work)
+
+const missingProbeSource = """
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <pthread.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static long __attribute__((noinline))
+raw4(long nr, long a, long b, long c) {
+  long ret;
+  __asm__ volatile("syscall" : "=a"(ret) : "0"(nr), "D"(a), "S"(b), "d"(c)
+                   : "rcx", "r11", "memory");
+  return ret;
+}
+
+static void *probe(void *arg) {
+  (void)arg;
+  if (raw4(SYS_openat, AT_FDCWD, (long)"missing-openat", O_RDONLY) >= 0)
+    _exit(10);
+  if (raw4(SYS_open, (long)"missing-open", O_RDONLY, 0) >= 0) _exit(11);
+  return NULL;
+}
+
+int main(int argc, char **argv) {
+  if (argc < 3 || chdir(argv[1]) != 0) return 2;
+  if (strcmp(argv[2], "thread") == 0) {
+    pthread_t t;
+    if (pthread_create(&t, NULL, probe, NULL) != 0) return 3;
+    pthread_join(t, NULL);
+  } else {
+    probe(NULL);
+  }
+  if (open("missing-libc", O_RDONLY) >= 0) return 4;   /* the comparison */
+  return 0;
+}
+"""
+
+suite "io-mon Linux shim: a failed inline open is a recorded probe":
+  test "t_failed_inline_open_records_the_missing_path":
+    when not defined(amd64):
+      skip()   # no inline-syscall trap backend on this architecture
+    else:
+      let work = expandFilename(getTempDir()) /
+        ("io-mon-inline-missing-" & $getCurrentProcessId())
+      removeDir(work)
+      createDir(work)
+      let shimLib = buildPrivateLinuxShim(repoRoot)
+      let snoopBin = work / "io-mon"
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+      let cc = getEnv("CC", "cc")
+      let host = work / "missing-host"
+      writeFile(host & ".c", missingProbeSource)
+      let hostCc = run(cc, @[host & ".c", "-O0", "-pthread", "-o", host])
+      checkpoint(hostCc.output)
+      check hostCc.code == 0
+      var env = newStringTable(modeCaseSensitive)
+      for k, v in envPairs(): env[k] = v
+      env.del("LD_PRELOAD")
+      env["REPRO_MONITOR_SHIM_LIB"] = shimLib
+      for transport in ["set", "file"]:
+        for where in ["main", "thread"]:
+          checkpoint("transport: " & transport & ", on: " & where)
+          var runEnv = newStringTable(modeCaseSensitive)
+          for k, v in env: runEnv[k] = v
+          if transport == "file":
+            runEnv["REPRO_MONITOR_DEP_SHM_DISABLE"] = "1"
+          let tree = work / ("tree-" & transport & "-" & where)
+          createDir(tree)
+          let depfile = work / (transport & "-" & where & ".iomon")
+          let cap = run(snoopBin, @["run", "--depfile", depfile, "--", host,
+            tree, where], runEnv)
+          checkpoint(cap.output)
+          check cap.code == 0
+          let dep = readMonitorDepFile(depfile)
+          for r in dep.records:
+            if r.kind in {mrFileOpen, mrEventLoss}:
+              checkpoint($r.kind & " " & r.path & " result=" & $r.result &
+                " " & r.detail)
+          for name in ["missing-openat", "missing-open", "missing-libc"]:
+            checkpoint("probe: " & name)
+            check dep.records.anyIt(it.kind == mrFileOpen and
+              it.path == tree / name and it.result == -1)
+          check not dep.records.anyIt(it.kind == mrEventLoss)
+          check dep.completeness == mcComplete
       removeDir(work)

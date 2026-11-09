@@ -695,11 +695,35 @@ proc rebuildDepSetLossElem*() =
   # distinct mrEventLoss element forces mcIncomplete), so a suffix clipped to
   # the small pre-encoded buffer is harmless — unlike a real record's.
   let total = encodeDepSetElement(lossRec, buf, dseTruncateSuffix)
-  setLossElemLen = 0
+  # The length is published last, with release order: a signal handler that
+  # reads it (`repro_dep_set_signal_loss`) sees either 0 or the whole element.
+  atomicStoreN(addr setLossElemLen, 0, ATOMIC_RELEASE)
   if total < 0: return
   for k in 0 ..< total:
     setLossElem[k] = buf[k]
-  setLossElemLen = total
+  atomicStoreN(addr setLossElemLen, total, ATOMIC_RELEASE)
+
+proc repro_dep_set_signal_loss*(): cint {.exportc, cdecl, raises: [].} =
+  ## Publish the pre-encoded event-loss element into the edge's shared-memory
+  ## SET without growing it (`emitNoGrow`), for the Linux shim's inline-syscall
+  ## loss reports when no file descriptor can be opened. When shard0 cannot
+  ## take the element, the set's growth-failure counter is bumped instead,
+  ## which the consumer also grades `mcIncomplete`; in that case the counter
+  ## means "the set lacks an element a producer had", not only an OOM growth
+  ## failure. Returns 1 when the capture will now read incomplete, 0 when this
+  ## process has no set to publish to (file transport, never attached, or the
+  ## consumer is gone).
+  ##
+  ## Async-signal-safe: it reads two plain globals and the producer's cached
+  ## shard0 mapping. No allocation, lock, descriptor or system call.
+  if not atomicLoadN(addr setProducerAttached, ATOMIC_ACQUIRE):
+    return 0
+  let n = atomicLoadN(addr setLossElemLen, ATOMIC_ACQUIRE)
+  if n <= 0 or n > setLossElem.len:
+    return 0
+  case setProducer.emitNoGrow(setLossElem.toOpenArray(0, n - 1))
+  of emInserted, emExists, emSaturated: 1
+  of emConsumerGone, emOversize, emUnavailable: 0
 
 proc depSetLossElement*(): seq[byte] =
   ## Test/introspection — a copy of the currently pre-encoded event-loss SET
@@ -746,7 +770,9 @@ proc attachDepQueueForShim*(segmentPath: string) =
     if setProducerAttached and setProducer.available:
       return
     setProducer = shmset.attachProducer(segmentPath)
-    setProducerAttached = true
+    # Release order: `repro_dep_set_signal_loss` may run in a signal handler
+    # and must see the whole producer once it sees the flag.
+    atomicStoreN(addr setProducerAttached, true, ATOMIC_RELEASE)
     rebuildDepSetLossElem()
 
 proc discardDepQueueAfterFork*(segmentPath: string) =
@@ -755,8 +781,8 @@ proc discardDepQueueAfterFork*(segmentPath: string) =
   ## the parent's inherited fd. Coordinated with the DEP-FLUSH atfork handler
   ## (`discardFragmentSlotAfterFork`) on the platforms that still use the file arm.
   if setProducerAttached:
+    atomicStoreN(addr setProducerAttached, false, ATOMIC_RELEASE)
     setProducer.detach()
-    setProducerAttached = false
   attachDepQueueForShim(segmentPath)
 
 proc depSetIsActive*(): bool =
@@ -3176,6 +3202,40 @@ proc dropStaleRunRecords(records: seq[MonitorRecord];
       detail: "duplicate identity token in fragment record for run " &
         currentRunId)
 
+const
+  ArmedInlineLossSuffix* = "-armed-inline-loss.iomon-frag"
+    ## Suffix of the Linux shim's ARMED inline-syscall loss files,
+    ## `repro-monitor-<pid>-<epoch>-armed-inline-loss.iomon-frag` and
+    ## `repro-monitor-<pid>-s<starttime>-exec-armed-inline-loss.iomon-frag`.
+    ## A process creates one before it replays a trapped inline syscall and
+    ## deletes it once a drain has classified everything it trapped
+    ## (`linux_preload_runtime.nim`, "AN ARMED LOSS"). One left behind means
+    ## the process died with trapped calls it never classified. It is created
+    ## empty, with `mknodat` on its absolute path (no descriptor needed), so
+    ## the merge reads its existence, not its contents.
+  ArmedInlineLossDetail* = "inline raw syscall events unclassified at image end"
+    ## Detail of the loss an armed file stands for: the same text the shim's
+    ## immediate report writes, so either form reads the same downstream.
+
+proc armedInlineLossRecord*(fileName: string): MonitorRecord =
+  ## The event-loss an armed inline-loss file stands for. The pid comes from
+  ## the name (`repro-monitor-<pid>-...`), so the run scoping in
+  ## `mergeFragments` keeps it for a pid of this run and drops it for a pid
+  ## seen only in a prior run's leftovers; an unparsable name keeps pid 0 and
+  ## is kept (fail closed).
+  result = MonitorRecord(kind: mrEventLoss, observationKind: moEventLoss,
+    detail: ArmedInlineLossDetail & " (armed " & fileName & ")")
+  const prefix = "repro-monitor-"
+  if fileName.startsWith(prefix):
+    var pid = 0'u64
+    var i = prefix.len
+    while i < fileName.len and fileName[i] in {'0' .. '9'}:
+      pid = pid * 10 + uint64(ord(fileName[i]) - ord('0'))
+      inc i
+    if i > prefix.len and i < fileName.len and fileName[i] == '-':
+      result.osPid = pid
+      result.threadId = pid
+
 proc foldObservationIdentity*(records: openArray[MonitorRecord]):
     seq[MonitorRecord] =
   ## DA-10 — THE IDENTITY FOLD ON THE FILE/MERGE PATH, so a backend that has no
@@ -3387,6 +3447,11 @@ proc mergeFragments*(fragmentDir, outputPath: string;
         # skip it rather than abort the WHOLE merge (which would fail the entire
         # monitored run on a benign cleanup race). OSError covers a directory
         # entry that disappeared underneath the walk.
+        # An armed inline-syscall loss (the Linux shim): its EXISTENCE is the
+        # loss, whatever it holds -- it is created empty, with no descriptor.
+        let fragName = extractFilename(path)
+        if fragName.endsWith(ArmedInlineLossSuffix):
+          records.add armedInlineLossRecord(fragName)
         try:
           var cleanEof = true
           records.add readFragmentRecordsForMerge(path, cleanEof)

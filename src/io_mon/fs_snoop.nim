@@ -2502,12 +2502,18 @@ proc collectMonitorEvidence(h: var MonitorHandle): MonitorDepFile =
         let rec = decodeDepRecord(elem, ok)
         if ok:
           depDrained.add rec
-      # A SIGNALLED growth failure (OOM) is LOUD, never a silent drop: surface it
-      # so the merged edge is understood as potentially incomplete.
+      # A SIGNALLED growth failure is never a silent drop: the set lacks an
+      # element a producer had. It is an OOM growth failure, or an element a
+      # producer published with `emitNoGrow` (the shim's descriptor-free loss
+      # channel) that shard0 could not take. Either way the capture is
+      # incomplete, so it goes into the merge as event-loss, not only stderr.
       let growthFailed = h.depSet.growthFailures()
       if growthFailed > 0'u64:
         stderr.writeLine("io-mon: dep-set growth failed " & $growthFailed &
           " time(s); dependency capture may be incomplete for this edge")
+        depDrained.add MonitorRecord(kind: mrEventLoss,
+          observationKind: moEventLoss,
+          detail: "dep-set growth failed " & $growthFailed & " time(s)")
     result = mergeFragments(h.fragmentDir, h.request.depFilePath,
       expectedRootPid = h.rootPid, currentRunId = h.runId,
       setRecords = depDrained,

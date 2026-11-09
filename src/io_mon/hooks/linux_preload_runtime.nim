@@ -604,6 +604,13 @@ type
     priority: int
     callback: ExitHook
 
+when defined(ioMonInlineWindowTest):
+  # Test-only widened windows (see CT_INLINE_WINDOW_TEST); never set by the
+  # production build.
+  {.emit: """
+#define CT_INLINE_WINDOW_TEST 1
+""".}
+
 {.emit: """
 #define _GNU_SOURCE
 #include <alloca.h>
@@ -1160,6 +1167,23 @@ extern int stackable_linux_chain_sigtrap(int signum, void *siginfo_ptr,
  * is not open (e.g. shim not initialised) so the handler stays safe on
  * every code path. */
 extern void repro_linux_sig_safe_flush(void);
+/* Provided by shim/linux_preload.nim beside it: the same flush for an image
+ * a signal is about to terminate. It first reports trapped inline events
+ * still queued (ct_linux_report_inline_events_at_signal_death) and writes
+ * the committed marker only when nothing is left unreported. */
+extern void repro_linux_sig_safe_flush_at_signal_death(void);
+/* Provided by shim/linux_preload.nim (Nim exportc, hence weak, as for
+ * repro_linux_sig_safe_note_signal below): the calling thread's fragment slot,
+ * read as plain data. Async-signal-safe. */
+extern int repro_linux_sig_safe_slot_is_open(void) __attribute__((weak));
+extern int repro_linux_sig_safe_slot_fd(void) __attribute__((weak));
+extern int repro_linux_sig_safe_slot_identity_matches(void)
+    __attribute__((weak));
+/* Provided by writer.nim (weak for the same reason): publish the pre-encoded
+ * event-loss element into the shared-memory dependency set without growing
+ * it, or bump its growth-failure counter. Needs no file descriptor and is
+ * async-signal-safe. 1 when the capture will now read incomplete. */
+extern int repro_dep_set_signal_loss(void) __attribute__((weak));
 /* Provided by shim/linux_preload.nim beside the flush: records the signal a
  * dying image is about to be terminated by (M9.R.64.1). Weak: it is a Nim
  * exportc proc, hidden in the shim's dynamic table, so a program that links
@@ -1251,8 +1275,17 @@ static int ct_raw_call_forks_process(long nr, long a1) {
 /* A child cannot inherit a registration lock held by a vanished thread.
  * No loader call runs under the lock; unpublished POD slots remain invisible.
  * libc fork registers this child reset, and raw fork replay invokes it below. */
+/* Trapped calls of this process in flight, and drains classifying (see "AN
+ * ARMED LOSS" below). */
+static long ct_inline_in_flight = 0;
+
 static void ct_raw_owner_after_fork_child(void) {
   __atomic_store_n(&ct_raw_subscriber_lock, 0, __ATOMIC_RELAXED);
+  /* The child has only the forking thread. Counts the parent's other threads
+   * held at the fork would never be released here and would keep the armed
+   * loss from ever being retracted. A trapped inline fork sets its own count
+   * again right after this (see the trap handler). */
+  __atomic_store_n(&ct_inline_in_flight, 0, __ATOMIC_SEQ_CST);
 }
 
 /* The shim's private heap (shim/linux_private_heap.c) reclaims class locks a
@@ -1606,7 +1639,7 @@ static int ct_inline_final_drain_pid = 0;
  * per candidate) write one frame. A race only duplicates a frame. */
 static int ct_inline_loss_reported_pid = 0;
 static long ct_inline_loss_reported_count = -1;
-static void ct_report_unclassified_inline_events(void);
+static int ct_report_unclassified_inline_events(void);
 
 /* Arm the report. `dir` must be absolute (a host may chdir before it ends);
  * `pid_offset`/`tid_offset` locate the frame's little-endian u64 pid and
@@ -1665,6 +1698,9 @@ static long ct_inline_loss_append_text(char *out, long at, long cap,
  * offsets given (-1: none), to "repro-monitor-<pid>-<tid><suffix>" in the
  * armed fragment directory. Raw syscalls only; async-signal-safe, no locks,
  * no allocation. Returns 1 when the whole frame was written. */
+static int ct_writev_loss_frame(long fd, const unsigned char *frame,
+                                long frame_len, long po, long to, long pid,
+                                long tid);
 static int ct_write_loss_frame(const unsigned char *frame, long frame_len,
                                long po, long to, const char *suffix,
                                long pid, long tid) {
@@ -1693,6 +1729,18 @@ static int ct_write_loss_frame(const unsigned char *frame, long frame_len,
     ct_raw_syscall6(SYS_close, dirfd, 0, 0, 0, 0, 0);
   }
   if (fd < 0) return 0;
+  int written = ct_writev_loss_frame(fd, frame, frame_len, po, to, pid, tid);
+  ct_raw_syscall6(SYS_close, fd, 0, 0, 0, 0, 0);
+  return written;
+}
+
+/* Write one pre-encoded loss frame, with `pid`/`tid` filled in at the
+ * offsets given (-1: none), to the open descriptor `fd`. Raw syscalls only;
+ * async-signal-safe, no locks, no allocation. Returns 1 when the whole frame
+ * was written. */
+static int ct_writev_loss_frame(long fd, const unsigned char *frame,
+                                long frame_len, long po, long to, long pid,
+                                long tid) {
   unsigned char pid_bytes[8], tid_bytes[8];
   for (int i = 0; i < 8; ++i) {
     pid_bytes[i] = (unsigned char)((unsigned long)pid >> (8 * i));
@@ -1721,14 +1769,21 @@ static int ct_write_loss_frame(const unsigned char *frame, long frame_len,
     parts[count++].iov_len = (size_t)(frame_len - second - 8);
   }
   long written = ct_raw_syscall6(SYS_writev, fd, (long)parts, count, 0, 0, 0);
-  ct_raw_syscall6(SYS_close, fd, 0, 0, 0, 0, 0);
   return written == frame_len;
 }
 
-static void ct_report_unclassified_inline_events(void) {
+/* Report this process's unclassified trapped events as event-loss. `fd` < 0:
+ * append to this thread's own loss file in the fragment directory, or, when
+ * that file cannot be created, publish the loss into the dependency set
+ * without growing it; otherwise write the frame to `fd` (the shim's open
+ * fragment descriptor, when no new file can be created). Returns 1 when the loss is on disk: written now, or
+ * already written for the same events. Returns 0 when the report is not
+ * armed or the frame could not be written, so a caller that can withhold a
+ * commit marker does. */
+static int ct_report_unclassified_inline_events_to(long fd) {
   long frame_len = __atomic_load_n(&ct_inline_loss_frame_len,
                                    __ATOMIC_ACQUIRE);
-  if (frame_len <= 0) return;
+  if (frame_len <= 0) return 0;
   int saved_errno = errno;
   long pid = ct_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
   long tid = ct_raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
@@ -1739,17 +1794,32 @@ static void ct_report_unclassified_inline_events(void) {
       __atomic_load_n(&ct_inline_loss_reported_count, __ATOMIC_ACQUIRE) ==
           reserved) {
     errno = saved_errno;
-    return;
+    return 1;
   }
-  if (ct_write_loss_frame(ct_inline_loss_frame, frame_len,
-                          ct_inline_loss_pid_offset, ct_inline_loss_tid_offset,
-                          "-inline-loss.iomon-frag", pid, tid)) {
+  int written =
+      fd < 0 ? ct_write_loss_frame(ct_inline_loss_frame, frame_len,
+                                   ct_inline_loss_pid_offset,
+                                   ct_inline_loss_tid_offset,
+                                   "-inline-loss.iomon-frag", pid, tid)
+             : ct_writev_loss_frame(fd, ct_inline_loss_frame, frame_len,
+                                    ct_inline_loss_pid_offset,
+                                    ct_inline_loss_tid_offset, pid, tid);
+  /* No file could be created (no descriptor left, or the directory refused
+   * it): on the set transport the loss can still be published without one. */
+  if (!written && fd < 0 && repro_dep_set_signal_loss != NULL)
+    written = repro_dep_set_signal_loss();
+  if (written) {
     __atomic_store_n(&ct_inline_loss_reported_count, reserved,
                      __ATOMIC_RELEASE);
     __atomic_store_n(&ct_inline_loss_reported_pid, (int)pid,
                      __ATOMIC_RELEASE);
   }
   errno = saved_errno;
+  return written;
+}
+
+static int ct_report_unclassified_inline_events(void) {
+  return ct_report_unclassified_inline_events_to(-1);
 }
 
 /* EVIDENCE A FORK CHILD SKIPPED IS REPORTED, NEVER DROPPED SILENTLY.
@@ -2072,6 +2142,438 @@ void ct_linux_check_raw_exec_entry(long nr, long a1, long a2, long a5) {
   errno = saved_errno;
 }
 
+/* AN ARMED LOSS: EVIDENCE THAT SURVIVES ANY DEATH.
+ *
+ * Trapped inline syscalls are classified only at a drain, and a drain runs
+ * only where the image ends in an orderly way: the exit destructor, before an
+ * exec, an inline exit_group or execve. A process that dies anywhere else
+ * takes its queued events with it. The terminating-signal handler reports
+ * what it can, but most deaths never reach it: SIGKILL, a default-terminating
+ * signal the shim does not hook (SIGUSR1, SIGALRM, SIGXCPU, ...), or a
+ * program's own handler, installed after the shim's, that restores SIG_DFL
+ * and re-raises.
+ *
+ * So the loss is written BEFORE it can happen and retracted once it did not.
+ * Before a process replays a trapped call, an armed loss file must exist for
+ * it: "repro-monitor-<pid>-<epoch>-armed-inline-loss.iomon-frag" in the
+ * fragment directory. A drain that leaves nothing pending unlinks it. Any
+ * death that skips the drain leaves it on disk, and the merge reads the
+ * existence of any "*-armed-inline-loss.iomon-frag" file as the
+ * unclassified-events loss (writer.nim, `mergeFragments`). The file is
+ * created EMPTY with mknodat on its absolute path: one system call and no
+ * file descriptor, so a process that has run out of descriptors still arms.
+ *
+ * The state is one word, `ct_inline_armed`: the pid in the high half, the
+ * armed epoch in the low half (0: disarmed, CT_INLINE_ARMED_PERMANENT: no file
+ * could be created and the loss was published through a channel that cannot
+ * be retracted). The pid makes a fork child, which inherits the parent's
+ * word, arm for itself. Each epoch names its own file, created exclusively
+ * (mknodat fails with EEXIST), so an arm never takes over or unlinks a file
+ * it did not create: not a dead predecessor's with the same pid, not a racing
+ * thread's.
+ *
+ * `ct_inline_in_flight` counts this process's trapped calls between the arm
+ * check and the record that queues them, and every drain from before it
+ * claims the first event until it has classified the last. That closes the
+ * windows in which a call has run (its read is done) but is not in the queue
+ * yet, and in which a drain has claimed an event (the queue no longer shows
+ * it) but not yet emitted its record. A retraction needs the count to be
+ * zero. A read-only call that waits in the kernel (`read`, `poll`, `futex`,
+ * ...) does not count while it waits: until it returns, nothing has been
+ * handed to the program, so a process that dies there lost no dependency.
+ * It counts again when it returns, and re-arms before it is queued.
+ *
+ * WHY A RETRACTION CANNOT STRAND A CONCURRENT TRAP OR DRAIN. The invariant
+ * is: while any event of this process is in flight, queued, or claimed but
+ * not yet recorded, some armed file exists. A trap (or a drain) increments
+ * `ct_inline_in_flight` before it loads the word (or claims an event). A
+ * retraction CASes the word to disarmed and then loads `ct_inline_in_flight`
+ * and rescans the queue. All of these accesses are sequentially consistent,
+ * so at least one side sees the other (the store-buffer pattern). Either the
+ * trap sees the word disarmed and arms a new epoch itself, or the retraction
+ * sees the count (or the queued event) and puts its epoch back. If the word
+ * has changed meanwhile and names this pid, a newer epoch's file already
+ * exists (an arm creates its file before installing its epoch), so the older
+ * file can go. If it names another pid (a vfork or CLONE_VM child sharing
+ * this memory overwrote it), the file is kept: a spurious loss, never a
+ * missing one. A fork child's count is reset (it has only the forking
+ * thread), in both the libc atfork child handler and the trap's fork path.
+ *
+ * AN INLINE EXEC is armed differently. A successful exec ends this image, so
+ * an epoch file armed for it would outlive a process whose events were all
+ * drained; a failed exec returns, and its event must be covered from before
+ * the call until it is queued. So before the replay, the trap creates
+ * "repro-monitor-<pid>-s<starttime>-exec-armed-inline-loss.iomon-frag", named
+ * by the pid and the process start time (field 22 of /proc/self/stat), which
+ * survive the exec and together never name another process. The new image's
+ * shim deletes that file at init (ct_linux_inline_exec_arm_retire). A failed
+ * exec arms an epoch file as usual and then deletes it. When the start time
+ * cannot be read, the loss is published at once through a channel that
+ * cannot be retracted.
+ *
+ * Hot path: one atomic increment, one getpid, one load and compare, and one
+ * decrement per trap. The file is created once per process, and again only
+ * after a drain.
+ *
+ * Everything here is raw syscalls, atomics and stack buffers: no lock, no
+ * allocation, errno preserved. It runs inside the trap handler. */
+#define CT_INLINE_ARMED_EPOCH_MASK 0xffffffffUL
+#define CT_INLINE_ARMED_PERMANENT 0xffffffffUL
+static unsigned long ct_inline_armed = 0;
+static unsigned long ct_inline_arm_seq = 0;
+static long ct_inline_starttime_pid = 0;
+static unsigned long long ct_inline_starttime = 0;
+
+/* The absolute path of an armed file: the fragment directory, then the name.
+ * 1 when it fits `cap` (including the terminator). */
+static int ct_inline_armed_path(char *out, long cap, const char *name) {
+  long at = 0;
+  at = ct_inline_loss_append_text(out, at, cap - 1, ct_inline_loss_dir);
+  at = ct_inline_loss_append_text(out, at, cap - 1, "/");
+  long before = at;
+  at = ct_inline_loss_append_text(out, at, cap - 1, name);
+  out[at] = '\0';
+  return at - before == (long)strlen(name);
+}
+
+static void ct_inline_epoch_name(char *name, long cap, long pid,
+                                 unsigned long epoch) {
+  long at = 0;
+  at = ct_inline_loss_append_text(name, at, cap - 1, "repro-monitor-");
+  at = ct_inline_loss_append_decimal(name, at, cap - 1, (unsigned long)pid);
+  at = ct_inline_loss_append_text(name, at, cap - 1, "-");
+  at = ct_inline_loss_append_decimal(name, at, cap - 1, epoch);
+  at = ct_inline_loss_append_text(name, at, cap - 1,
+                                  "-armed-inline-loss.iomon-frag");
+  name[at] = '\0';
+}
+
+static void ct_inline_exec_name(char *name, long cap, long pid,
+                                unsigned long long starttime) {
+  long at = 0;
+  at = ct_inline_loss_append_text(name, at, cap - 1, "repro-monitor-");
+  at = ct_inline_loss_append_decimal(name, at, cap - 1, (unsigned long)pid);
+  at = ct_inline_loss_append_text(name, at, cap - 1, "-s");
+  at = ct_inline_loss_append_decimal(name, at, cap - 1,
+                                     (unsigned long)starttime);
+  at = ct_inline_loss_append_text(name, at, cap - 1,
+                                  "-exec-armed-inline-loss.iomon-frag");
+  name[at] = '\0';
+}
+
+/* Create the empty armed file `name`. 1: created; -1: it exists; 0: it could
+ * not be created. No descriptor is used unless the absolute path is too long
+ * for the kernel, in which case it is created relative to an O_PATH
+ * descriptor of the directory. */
+static int ct_inline_armed_create(const char *name) {
+  if (__atomic_load_n(&ct_inline_loss_frame_len, __ATOMIC_ACQUIRE) <= 0)
+    return 0;   /* not armed: there is no fragment directory */
+  char path[PATH_MAX];
+  long r;
+  if (ct_inline_armed_path(path, (long)sizeof(path), name)) {
+    r = ct_raw_syscall6(SYS_mknodat, AT_FDCWD, (long)path, S_IFREG | 0600, 0,
+                        0, 0);
+  } else {
+    long dirfd = ct_raw_syscall6(SYS_openat, AT_FDCWD,
+                                 (long)ct_inline_loss_dir,
+                                 O_PATH | O_DIRECTORY | O_CLOEXEC, 0, 0, 0);
+    if (dirfd < 0) return 0;
+    r = ct_raw_syscall6(SYS_mknodat, dirfd, (long)name, S_IFREG | 0600, 0, 0,
+                        0);
+    ct_raw_syscall6(SYS_close, dirfd, 0, 0, 0, 0, 0);
+  }
+  if (r == 0) return 1;
+  return r == -EEXIST ? -1 : 0;
+}
+
+static void ct_inline_armed_unlink(const char *name) {
+  char path[PATH_MAX];
+  if (ct_inline_armed_path(path, (long)sizeof(path), name)) {
+    ct_raw_syscall6(SYS_unlinkat, AT_FDCWD, (long)path, 0, 0, 0, 0);
+    return;
+  }
+  long dirfd = ct_raw_syscall6(SYS_openat, AT_FDCWD, (long)ct_inline_loss_dir,
+                               O_PATH | O_DIRECTORY | O_CLOEXEC, 0, 0, 0);
+  if (dirfd < 0) return;
+  ct_raw_syscall6(SYS_unlinkat, dirfd, (long)name, 0, 0, 0, 0);
+  ct_raw_syscall6(SYS_close, dirfd, 0, 0, 0, 0, 0);
+}
+
+static void ct_inline_arm_unlink(long pid, unsigned long epoch) {
+  char name[128];
+  ct_inline_epoch_name(name, (long)sizeof(name), pid, epoch);
+  ct_inline_armed_unlink(name);
+}
+
+/* No armed file could be created: publish the loss now, through a channel
+ * that needs no new descriptor. That loss is permanent. 1 when published. */
+static int ct_inline_arm_fallback(long pid) {
+  if (repro_dep_set_signal_loss != NULL && repro_dep_set_signal_loss())
+    return 1;
+  if (repro_linux_sig_safe_slot_is_open != NULL &&
+      repro_linux_sig_safe_slot_fd != NULL &&
+      repro_linux_sig_safe_slot_identity_matches != NULL &&
+      repro_linux_sig_safe_slot_is_open() &&
+      repro_linux_sig_safe_slot_identity_matches()) {
+    long fd = repro_linux_sig_safe_slot_fd();
+    long frame_len = __atomic_load_n(&ct_inline_loss_frame_len,
+                                     __ATOMIC_ACQUIRE);
+    long tid = ct_raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
+    if (fd >= 0 && frame_len > 0 &&
+        ct_writev_loss_frame(fd, ct_inline_loss_frame, frame_len,
+                             ct_inline_loss_pid_offset,
+                             ct_inline_loss_tid_offset, pid, tid))
+      return 1;
+  }
+  return 0;
+}
+
+/* Make sure an armed loss covers this process before a trapped call runs.
+ * The caller has incremented ct_inline_in_flight. */
+static void ct_inline_arm_loss(void) {
+  if (__atomic_load_n(&ct_inline_loss_frame_len, __ATOMIC_ACQUIRE) <= 0)
+    return;   /* not armed: init already published that it cannot report */
+  long pid = ct_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
+  unsigned long word = __atomic_load_n(&ct_inline_armed, __ATOMIC_SEQ_CST);
+  if ((long)(word >> 32) == pid && (word & CT_INLINE_ARMED_EPOCH_MASK) != 0)
+    return;
+  int saved_errno = errno;
+  unsigned long epoch = 0;
+  int created = 0;
+  for (int attempt = 0; attempt < 64 && created == 0; ++attempt) {
+    do {
+      epoch = (__atomic_add_fetch(&ct_inline_arm_seq, 1, __ATOMIC_RELAXED)) &
+              CT_INLINE_ARMED_EPOCH_MASK;
+    } while (epoch == 0 || epoch == CT_INLINE_ARMED_PERMANENT);
+    char name[128];
+    ct_inline_epoch_name(name, (long)sizeof(name), pid, epoch);
+    int r = ct_inline_armed_create(name);
+    if (r == 1) created = 1;
+    else if (r == 0) break;
+  }
+  if (!created) {
+    /* Fail closed now, through a channel that cannot be retracted. When even
+     * that fails, leave the word alone so the next trap tries again. */
+    if (!ct_inline_arm_fallback(pid)) {
+      errno = saved_errno;
+      return;
+    }
+    epoch = CT_INLINE_ARMED_PERMANENT;
+  }
+  unsigned long desired = ((unsigned long)pid << 32) | epoch;
+  for (;;) {
+    unsigned long cur = __atomic_load_n(&ct_inline_armed, __ATOMIC_SEQ_CST);
+    if ((long)(cur >> 32) == pid && (cur & CT_INLINE_ARMED_EPOCH_MASK) != 0) {
+      /* Another thread armed first; its file covers this call too. */
+      if (created) ct_inline_arm_unlink(pid, epoch);
+      break;
+    }
+    if (__atomic_compare_exchange_n(&ct_inline_armed, &cur, desired, 0,
+                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+      break;
+  }
+  errno = saved_errno;
+}
+
+/* This process's start time (field 22 of /proc/self/stat), cached per pid,
+ * read with raw system calls into a stack buffer. 0 when it cannot be read.
+ * See proc(5): the fields resume after the last ')' of the command name. */
+static unsigned long long ct_inline_process_starttime(long pid) {
+  if (__atomic_load_n(&ct_inline_starttime_pid, __ATOMIC_ACQUIRE) == pid)
+    return ct_inline_starttime;
+  char buf[512];
+  long fd = ct_raw_syscall6(SYS_openat, AT_FDCWD, (long)"/proc/self/stat",
+                            O_RDONLY | O_CLOEXEC, 0, 0, 0);
+  if (fd < 0) return 0;
+  long n = ct_raw_syscall6(SYS_read, fd, (long)buf, (long)sizeof(buf) - 1, 0,
+                           0, 0);
+  ct_raw_syscall6(SYS_close, fd, 0, 0, 0, 0, 0);
+  if (n <= 0) return 0;
+  buf[n] = '\0';
+  char *p = strrchr(buf, ')');
+  if (p == NULL) return 0;
+  for (int field = 2; field < 22; ++field) {
+    p = strchr(p + 1, ' ');
+    if (p == NULL) return 0;
+  }
+  unsigned long long value = 0;
+  int digits = 0;
+  for (++p; *p >= '0' && *p <= '9'; ++p, ++digits)
+    value = value * 10 + (unsigned long long)(*p - '0');
+  if (digits == 0) return 0;
+  ct_inline_starttime = value;
+  __atomic_store_n(&ct_inline_starttime_pid, pid, __ATOMIC_RELEASE);
+  return value;
+}
+
+/* Before an inline exec is replayed: create the exec-armed file (see "AN
+ * INLINE EXEC" above), or, when that is impossible, publish the loss now.
+ * Returns the start time used in the name, 0 when no file was created. */
+static unsigned long long ct_inline_exec_arm(long pid) {
+  if (__atomic_load_n(&ct_inline_loss_frame_len, __ATOMIC_ACQUIRE) <= 0)
+    return 0;
+  int saved_errno = errno;
+  unsigned long long starttime = ct_inline_process_starttime(pid);
+  if (starttime != 0) {
+    char name[128];
+    ct_inline_exec_name(name, (long)sizeof(name), pid, starttime);
+    if (ct_inline_armed_create(name) != 0) {   /* created, or already there */
+      errno = saved_errno;
+      return starttime;
+    }
+  }
+  /* No file: fail closed through a channel that cannot be retracted, and keep
+   * the epoch word permanent so later traps do not retry. */
+  if (ct_inline_arm_fallback(pid))
+    __atomic_store_n(&ct_inline_armed,
+                     ((unsigned long)pid << 32) | CT_INLINE_ARMED_PERMANENT,
+                     __ATOMIC_SEQ_CST);
+  errno = saved_errno;
+  return 0;
+}
+
+static void ct_inline_exec_disarm(long pid, unsigned long long starttime) {
+  if (starttime == 0) return;
+  char name[128];
+  ct_inline_exec_name(name, (long)sizeof(name), pid, starttime);
+  ct_inline_armed_unlink(name);
+}
+
+/* Called by the shim's init in every new image: an inline exec that reached
+ * this image succeeded, so the loss its old image armed for it is withdrawn.
+ * The old image drained everything before the exec; any event another of its
+ * threads queued after that drain is covered by an epoch file, which this
+ * does not touch. */
+void ct_linux_inline_exec_arm_retire(void)
+    __attribute__((visibility("default")));
+void ct_linux_inline_exec_arm_retire(void) {
+  if (__atomic_load_n(&ct_inline_loss_frame_len, __ATOMIC_ACQUIRE) <= 0)
+    return;
+  long pid = ct_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
+  unsigned long long starttime = ct_inline_process_starttime(pid);
+  if (starttime != 0) ct_inline_exec_disarm(pid, starttime);
+}
+
+/* A drain holds the in-flight count from before it claims the first event
+ * until it has classified the last, so a concurrent drain that finds the
+ * queue empty cannot retract while a claimed event has no record yet. */
+void ct_linux_inline_classify_begin(void)
+    __attribute__((visibility("default")));
+void ct_linux_inline_classify_begin(void) {
+  __atomic_add_fetch(&ct_inline_in_flight, 1, __ATOMIC_SEQ_CST);
+}
+void ct_linux_inline_classify_end(void)
+    __attribute__((visibility("default")));
+void ct_linux_inline_classify_end(void) {
+  __atomic_sub_fetch(&ct_inline_in_flight, 1, __ATOMIC_RELEASE);
+}
+
+/* Read-only calls that may wait in the kernel: until one returns, nothing has
+ * reached the program, so it need not count as in flight while it waits. */
+static int ct_inline_call_is_read_only(long nr) {
+  switch (nr) {
+#ifdef SYS_read
+  case SYS_read:
+#endif
+#ifdef SYS_pread64
+  case SYS_pread64:
+#endif
+#ifdef SYS_readv
+  case SYS_readv:
+#endif
+#ifdef SYS_preadv
+  case SYS_preadv:
+#endif
+#ifdef SYS_recvfrom
+  case SYS_recvfrom:
+#endif
+#ifdef SYS_recvmsg
+  case SYS_recvmsg:
+#endif
+#ifdef SYS_poll
+  case SYS_poll:
+#endif
+#ifdef SYS_ppoll
+  case SYS_ppoll:
+#endif
+#ifdef SYS_select
+  case SYS_select:
+#endif
+#ifdef SYS_pselect6
+  case SYS_pselect6:
+#endif
+#ifdef SYS_epoll_wait
+  case SYS_epoll_wait:
+#endif
+#ifdef SYS_epoll_pwait
+  case SYS_epoll_pwait:
+#endif
+#ifdef SYS_wait4
+  case SYS_wait4:
+#endif
+#ifdef SYS_waitid
+  case SYS_waitid:
+#endif
+#ifdef SYS_nanosleep
+  case SYS_nanosleep:
+#endif
+#ifdef SYS_clock_nanosleep
+  case SYS_clock_nanosleep:
+#endif
+#ifdef SYS_futex
+  case SYS_futex:
+#endif
+#ifdef SYS_pause
+  case SYS_pause:
+#endif
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static int ct_linux_inline_events_unclassified(int pid);
+
+/* Retract this process's armed loss when a drain left nothing pending and no
+ * trapped call or drain is in flight. Called after every drain.
+ * Async-signal-safe; see "AN ARMED LOSS" for why it cannot strand a
+ * concurrent trap. */
+void ct_linux_retract_inline_loss_if_drained(void)
+    __attribute__((visibility("default")));
+void ct_linux_retract_inline_loss_if_drained(void) {
+  long pid = ct_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
+  unsigned long word = __atomic_load_n(&ct_inline_armed, __ATOMIC_SEQ_CST);
+  unsigned long epoch = word & CT_INLINE_ARMED_EPOCH_MASK;
+  if ((long)(word >> 32) != pid || epoch == 0 ||
+      epoch == CT_INLINE_ARMED_PERMANENT)
+    return;
+  if (__atomic_load_n(&ct_inline_in_flight, __ATOMIC_SEQ_CST) != 0 ||
+      ct_linux_inline_events_unclassified((int)pid))
+    return;
+  unsigned long disarmed = (unsigned long)pid << 32;
+  unsigned long expected = word;
+  if (!__atomic_compare_exchange_n(&ct_inline_armed, &expected, disarmed, 0,
+                                   __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+    return;
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  if (__atomic_load_n(&ct_inline_in_flight, __ATOMIC_SEQ_CST) != 0 ||
+      ct_linux_inline_events_unclassified((int)pid)) {
+    unsigned long back = disarmed;
+    if (__atomic_compare_exchange_n(&ct_inline_armed, &back, word, 0,
+                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+      return;   /* restored: this epoch's file stays */
+    /* The word changed. Only a newer epoch of THIS pid proves another file
+     * covers the event; a word naming another pid (a vfork or CLONE_VM child)
+     * does not, so the file stays. */
+    if ((long)(back >> 32) != pid ||
+        (back & CT_INLINE_ARMED_EPOCH_MASK) == 0)
+      return;
+  }
+  int saved_errno = errno;
+  ct_inline_arm_unlink(pid, epoch);
+  errno = saved_errno;
+}
+
 static void ct_record_raw_syscall_event(long nr, const long args[6],
                                         long result, int source,
                                         unsigned long address) {
@@ -2116,8 +2618,20 @@ void ct_linux_preload_raw_enqueue_v1(long nr, const long *args,
     __attribute__((visibility("default")));
 void ct_linux_preload_raw_enqueue_v1(long nr, const long *args,
     long result, int source, unsigned long address) {
+  /* Another image owns the trap and has already run the call: ABI V2 hands a
+   * subscriber only the completed call, with no callback before it. So this
+   * image can arm only now, before the event is queued here. A death between
+   * the call and this arm is not covered by THIS image's loss; it is covered
+   * by the owner's own armed loss when the owner is a build that arms (the
+   * owner's in-flight count spans its subscriber callbacks). Closing it for
+   * an owner that does not arm needs a pre-call callback, i.e. ABI V3. The
+   * fork bookkeeping runs first: it resets the in-flight count of a fork
+   * child, which must not undo the increment below. */
   ct_linux_preload_after_raw_fork_syscall(nr, args[0], result);
+  __atomic_add_fetch(&ct_inline_in_flight, 1, __ATOMIC_SEQ_CST);
+  ct_inline_arm_loss();
   ct_record_raw_syscall_event(nr, args, result, source, address);
+  __atomic_sub_fetch(&ct_inline_in_flight, 1, __ATOMIC_RELEASE);
 }
 
 /* CLASSIFY BEFORE THE IMAGE ENDS. Trapped events are classified at the
@@ -2172,14 +2686,68 @@ void ct_linux_note_final_inline_drain(void) {
   ct_linux_report_inline_events_if_pending();
 }
 
+/* A PROCESS KILLED BY A SIGNAL. A catchable terminating signal (SIGSEGV,
+ * SIGABRT, SIGTERM, ...) ends the image without the exit destructor, an exec
+ * hook or an inline exit_group, so nothing classifies what is still queued.
+ * The shim's terminating-signal handler calls this before it writes the
+ * fragment's committed marker. Classifying here is not possible: it takes
+ * the shim's locks and allocates, and the signal can arrive while this
+ * thread holds either. So whatever is pending is reported as event-loss
+ * through the pre-encoded frame (raw syscalls only, no lock, no allocation,
+ * errno preserved).
+ *
+ * Unlike the drain's pending check, a slot inside the reserved count that
+ * still carries no pid also counts: the signal may have interrupted
+ * ct_record_raw_syscall_event between its reservation and its pid store,
+ * after the call itself ran. Slots are reset only before any trap, so such
+ * a slot is never a stale one.
+ *
+ * Returns 1 when nothing is pending or the loss is on disk; 0 when events
+ * are pending and no loss could be written (not armed, or the write
+ * failed). The caller then tries the fragment it is about to flush
+ * (ct_linux_report_inline_events_into_fragment) and, failing that too,
+ * withholds its commit marker. */
+long ct_linux_raw_syscall_event_count(void);
+int ct_linux_report_inline_events_at_signal_death(void)
+    __attribute__((visibility("default")));
+int ct_linux_report_inline_events_at_signal_death(void) {
+  int pid = ct_linux_raw_current_pid();
+  int pending = ct_raw_syscall_event_overflow_value != 0;
+  long count = ct_linux_raw_syscall_event_count();
+  for (long i = 0; !pending && i < count; ++i) {
+    struct ct_raw_syscall_event *event = &ct_raw_syscall_events[i];
+    int state = __atomic_load_n(&event->state, __ATOMIC_ACQUIRE);
+    int owner = __atomic_load_n(&event->pid, __ATOMIC_RELAXED);
+    if (state == CT_RAW_EVENT_DRAINED) continue;
+    if (owner == pid || (owner == 0 && state == CT_RAW_EVENT_FREE))
+      pending = 1;
+  }
+  if (!pending) return 1;
+  return ct_report_unclassified_inline_events();
+}
+
+/* The second channel for the same report, used by the shim's signal-death
+ * flush when the loss file could not be created (no descriptor left, or the
+ * directory refused it): write the loss frame into the thread's own fragment
+ * through its already-open descriptor `fd`, which the shim has checked is
+ * still its own. Returns 1 when the whole frame was written. */
+int ct_linux_report_inline_events_into_fragment(int fd)
+    __attribute__((visibility("default")));
+int ct_linux_report_inline_events_into_fragment(int fd) {
+  if (fd < 0) return 0;
+  return ct_report_unclassified_inline_events_to(fd);
+}
+
 int ct_linux_drain_inline_events_before_image_end(void)
     __attribute__((visibility("default")));
 int ct_linux_drain_inline_events_before_image_end(void) {
   ct_inline_drain_fn observer =
       __atomic_load_n(&ct_inline_drain_observer, __ATOMIC_ACQUIRE);
   int pid = ct_linux_raw_current_pid();
-  if (observer == NULL || !ct_linux_raw_syscall_events_pending(pid))
+  if (observer == NULL || !ct_linux_raw_syscall_events_pending(pid)) {
+    ct_linux_retract_inline_loss_if_drained();
     return 1;
+  }
   if (stackable_linux_preload_current_depth() == 0) {
     int saved_errno = errno;
     stackable_linux_preload_enter_hook();
@@ -2372,11 +2940,13 @@ static void ct_linux_inline_syscall_sigtrap_handler(
        * note the signal and retire the fragment slot first, exactly as the
        * terminating-signal handlers do. On 32-bit ARM this signal is SIGILL,
        * which those handlers leave to us, so this is the only record a real
-       * illegal-instruction crash gets there. Both calls are
-       * async-signal-safe and no-ops when the slot is closed. */
+       * illegal-instruction crash gets there. Trapped inline events still
+       * queued are reported as event-loss first, as for any signal death.
+       * Both calls are async-signal-safe; the flush itself is a no-op when
+       * the slot is closed. */
       if (repro_linux_sig_safe_note_signal != NULL)
         repro_linux_sig_safe_note_signal((long)signum);
-      repro_linux_sig_safe_flush();
+      repro_linux_sig_safe_flush_at_signal_death();
       signal(signum, SIG_DFL);
       raise(signum);
     }
@@ -2434,12 +3004,67 @@ static void ct_linux_inline_syscall_sigtrap_handler(
   int forks = ct_raw_call_forks_process(regs.nr, regs.args[0]) &&
               ct_raw_fork_child != NULL;
   int parent_single = forks ? ct_raw_process_is_single_threaded() : 1;
+  /* Arm the loss before the call runs (see "AN ARMED LOSS"). A call that
+   * ends the image or the thread is not armed: the drains above have just
+   * run, an exit never returns, and an armed file created now would outlive
+   * a process whose events were all classified. An exec is armed through
+   * its own exec-armed file, which the new image withdraws; a failed exec
+   * arms an epoch file once it returns and then withdraws the exec file. A
+   * read-only call that may wait in the kernel stops counting as in flight
+   * once it is armed, and counts again (re-arming) when it returns. */
+  int execs = regs.nr == SYS_execve
+#ifdef SYS_execveat
+              || regs.nr == SYS_execveat
+#endif
+      ;
+  int exits = 0
+#ifdef SYS_exit_group
+              || regs.nr == SYS_exit_group
+#endif
+#ifdef SYS_exit
+              || regs.nr == SYS_exit
+#endif
+      ;
+  int read_only = !execs && !exits && ct_inline_call_is_read_only(regs.nr);
+  long trap_pid = 0;
+  unsigned long long exec_starttime = 0;
+  if (!exits) __atomic_add_fetch(&ct_inline_in_flight, 1, __ATOMIC_SEQ_CST);
+  if (!execs && !exits) ct_inline_arm_loss();
+  if (execs) {
+    trap_pid = ct_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
+    exec_starttime = ct_inline_exec_arm(trap_pid);
+  }
+#ifdef CT_INLINE_WINDOW_TEST
+  /* Test-only (-d:ioMonInlineWindowTest): a marker `close(-4242)` holds its
+   * in-flight count for 100 ms, so a test can fork while another thread is
+   * in flight. */
+  if (regs.nr == SYS_close && regs.args[0] == -4242) usleep(100000);
+#endif
+  if (read_only)
+    __atomic_sub_fetch(&ct_inline_in_flight, 1, __ATOMIC_RELEASE);
   long result = stackable_linux_replay_syscall_regs(&regs);
+  if (read_only)
+    __atomic_add_fetch(&ct_inline_in_flight, 1, __ATOMIC_SEQ_CST);
   ct_raw_owner_after_raw_fork(regs.nr, regs.args[0], result);
   if (forks && result == 0) ct_raw_fork_child(parent_single);
+  if (result == 0 && ct_raw_call_forks_process(regs.nr, regs.args[0])) {
+    /* A fork child has only this thread, which is still in flight: drop the
+     * counts it inherited from the parent's other threads. */
+    __atomic_store_n(&ct_inline_in_flight, 1, __ATOMIC_SEQ_CST);
+  }
+#ifdef CT_INLINE_WINDOW_TEST
+  /* Test-only: widen the window between a failed exec's return and its arm. */
+  if (execs) usleep(20000);
+#endif
+  /* A failed exec, a read-only call that may have waited past a retraction,
+   * or a call that returned 0 (a fork child among them, whose word still
+   * names the parent; for any other process this is the fast path). */
+  if (execs || read_only || result == 0) ct_inline_arm_loss();
+  if (execs) ct_inline_exec_disarm(trap_pid, exec_starttime);
   ct_record_raw_syscall_event(regs.nr, regs.args, result,
                               CT_RAW_SYSCALL_SOURCE_INLINE,
                               regs.syscall_address);
+  if (!exits) __atomic_sub_fetch(&ct_inline_in_flight, 1, __ATOMIC_RELEASE);
   rc = stackable_linux_write_syscall_result_to_ucontext(
       ucontext, result, regs.resume_rip);
   if (rc == 0) {

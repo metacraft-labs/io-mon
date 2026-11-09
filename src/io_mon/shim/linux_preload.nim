@@ -996,6 +996,11 @@ extern int repro_monitor_shim_shutdown(void);
  * reads (no allocation, no lock acquisition) — see the writer-side
  * signature.
  *
+ * Trapped inline syscalls still queued for classification are reported as
+ * event-loss before the marker is written (see
+ * repro_linux_sig_safe_flush_at_signal_death): a signal ends the image at
+ * none of the points that classify them.
+ *
  * SIGKILL and SIGSTOP are uncatchable by design; losses through those
  * paths remain inherent event-loss (correctly counted by mergeFragments).
  */
@@ -1019,15 +1024,16 @@ extern void repro_linux_sig_safe_mark_slot_closed(void);
 static struct sigaction repro_prev_sigaction[32];
 static int repro_prev_sigaction_valid[32];
 
-/* Exported so the inline-syscall SIGTRAP handler in
- * `linux_preload_runtime.nim` can invoke the same async-signal-safe flush
- * before replaying an inline-asm SYS_exit_group / SYS_exit that would
- * otherwise terminate the process with an un-flushed read batch (the
- * M9.R.62.4 pixman residual, closed by M9.R.63.3). All other callers
- * remain inside this translation unit; the external symbol is only
- * consumed by the runtime's SIGTRAP handler through a matching extern
- * declaration. */
-void repro_linux_sig_safe_flush(void) {
+extern int ct_linux_report_inline_events_into_fragment(int fd);
+
+/* `commit` is 0 when the image ends with trapped inline events whose loss
+ * could not be reported to a file of its own (see
+ * repro_linux_sig_safe_flush_at_signal_death). The batch is still written,
+ * then the loss frame goes into this fragment through the open descriptor;
+ * only if that fails too is the committed marker withheld, so that a pending
+ * sentinel this batch armed stays unretired and the merge grades the capture
+ * incomplete. */
+static void repro_linux_sig_safe_flush_impl(int commit) {
   int fd;
   long saved_errno = errno;
   if (!repro_linux_sig_safe_slot_is_open())
@@ -1061,10 +1067,14 @@ void repro_linux_sig_safe_flush(void) {
       }
     }
   }
+  /* Inline events left unreported: put their loss frame into this
+   * fragment, after the batch, through the descriptor checked above. */
+  if (!commit)
+    commit = ct_linux_report_inline_events_into_fragment(fd);
   /* Write the pre-encoded committed marker. Retires the ROUND-5 F pending
    * sentinel; mergeFragments' netting then sees a clean pending/committed
    * pair and doesn't inject a false kill-before-flush event-loss. */
-  {
+  if (commit) {
     long len = repro_linux_sig_safe_committed_len();
     if (len > 0) {
       void *p = repro_linux_sig_safe_committed_ptr();
@@ -1087,6 +1097,38 @@ void repro_linux_sig_safe_flush(void) {
   errno = (int)saved_errno;
 }
 
+/* Exported so the inline-syscall SIGTRAP handler in
+ * `linux_preload_runtime.nim` can invoke the same async-signal-safe flush
+ * before replaying an inline-asm SYS_exit_group / SYS_exit that would
+ * otherwise terminate the process with an un-flushed read batch (the
+ * M9.R.62.4 pixman residual, closed by M9.R.63.3). All other callers
+ * remain inside this translation unit; the external symbol is only
+ * consumed by the runtime's SIGTRAP handler through a matching extern
+ * declaration. */
+void repro_linux_sig_safe_flush(void) {
+  repro_linux_sig_safe_flush_impl(1);
+}
+
+/* linux_preload_runtime.nim: reports this process's trapped inline syscalls
+ * that are still queued as event-loss; 0 when some are queued and no loss
+ * could be written. Async-signal-safe. */
+extern int ct_linux_report_inline_events_at_signal_death(void);
+
+/* The flush for an image a signal is about to terminate. A process killed by
+ * a signal reaches none of the points that classify trapped inline syscalls
+ * (the exit destructor, an exec, an inline exit_group), so what is still
+ * queued would otherwise vanish under a committed marker and the capture
+ * would read complete without it. Report it first, to a file of its own or,
+ * when none can be created, into the fragment; when neither can be written,
+ * withhold the marker instead. Async-signal-safe, lock-free and
+ * allocation-free like the plain flush, and errno is preserved. Exported for
+ * the runtime's trap handler, which ends a genuine trap-signal crash the
+ * same way. */
+void repro_linux_sig_safe_flush_at_signal_death(void) {
+  repro_linux_sig_safe_flush_impl(
+      ct_linux_report_inline_events_at_signal_death());
+}
+
 extern void repro_linux_sig_safe_note_signal(long signum);
 
 static void repro_linux_terminating_signal_handler(int signum) {
@@ -1094,7 +1136,18 @@ static void repro_linux_terminating_signal_handler(int signum) {
    * signals we installed for. The signum-bounds check is defensive —
    * we register for signums < 32 only. */
   repro_linux_sig_safe_note_signal((long)signum);
-  repro_linux_sig_safe_flush();
+  /* The image dies here unless the disposition restored below ignores the
+   * signal. When it does, the process carries on and later drains its
+   * trapped events normally, so reporting them as lost would only make a
+   * sound capture incomplete. A previous user handler may or may not end the
+   * process, so it gets the report: a spurious loss is safe, a capture that
+   * reads complete without the events is not. */
+  if (signum > 0 && signum < 32 && repro_prev_sigaction_valid[signum] &&
+      (repro_prev_sigaction[signum].sa_flags & SA_SIGINFO) == 0 &&
+      repro_prev_sigaction[signum].sa_handler == SIG_IGN)
+    repro_linux_sig_safe_flush();
+  else
+    repro_linux_sig_safe_flush_at_signal_death();
   if (signum > 0 && signum < 32 && repro_prev_sigaction_valid[signum]) {
     /* Restore the previously-installed handler + re-raise. If the
      * previous handler was SIG_DFL for a default-terminating signal
@@ -2206,6 +2259,17 @@ proc scanLoadedLibraries(reason: cstring) {.raises: [].} =
       "being observed, so its bytes are an input this capture cannot name")
 
 proc drainInlineRawSyscallEvents() {.raises: [].}
+proc ctRetractInlineLossIfDrained()
+  {.importc: "ct_linux_retract_inline_loss_if_drained", cdecl, raises: [].}
+proc ctInlineClassifyBegin()
+  {.importc: "ct_linux_inline_classify_begin", cdecl, raises: [].}
+proc ctInlineClassifyEnd()
+  {.importc: "ct_linux_inline_classify_end", cdecl, raises: [].}
+proc ctInlineExecArmRetire()
+  {.importc: "ct_linux_inline_exec_arm_retire", cdecl, raises: [].}
+when defined(ioMonInlineWindowTest):
+  proc c_window_test_usleep(us: cuint): cint
+    {.importc: "usleep", header: "<unistd.h>", raises: [].}
 proc installLinuxVdsoPatches() {.raises: [].}
 proc emitLinuxVdsoPatchFailures(source: string) {.raises: [].}
 # Defined next to the other `record*` helpers, below the vDSO block; forward
@@ -2867,6 +2931,10 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))
     inlineLossReportArmed = armUnclassifiedInlineLossReport()
+    if inlineLossReportArmed:
+      # An inline exec of the previous image of this process succeeded:
+      # withdraw the loss it armed for the exec.
+      ctInlineExecArmRetire()
     forkSkipLossReportArmed =
       inlineLossReportArmed and armForkChildSkipLossReport()
     uninjectableExecReportArmed =
@@ -3522,13 +3590,23 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
   let trackFd = inlineTrap == 0
   case number
   of LinuxSysOpen:
-    if callResult < 0 or resultLooksFaulted(callResult):
+    # A failed open is a probe (a missing path is a negative dependency), and
+    # it is recorded as the libc `open` hook records one: result -1. Only a
+    # bad pathname pointer (EFAULT) names nothing to record.
+    if resultLooksFaulted(callResult):
+      return true
+    if callResult < 0:
+      recordOpen(cstringArg(a1), intArg(a2), intArg(a3), -1, trackFd = false)
       return true
     recordOpen(cstringArg(a1), intArg(a2), intArg(a3), cint(callResult),
       trackFd = trackFd)
     true
   of LinuxSysOpenat:
-    if callResult < 0 or resultLooksFaulted(callResult):
+    if resultLooksFaulted(callResult):
+      return true
+    if callResult < 0:
+      recordOpen(cstringArg(a2), intArg(a3), intArg(a4), -1, intArg(a1),
+        trackFd = false)
       return true
     recordOpen(cstringArg(a2), intArg(a3), intArg(a4), cint(callResult),
       intArg(a1), trackFd)
@@ -3880,6 +3958,10 @@ proc drainInlineRawSyscallEvents() {.raises: [].} =
   ## shared buffer) is left to that process.
   if shouldBypass():
     return
+  # Counted as in flight from before the first claim until the last record:
+  # a claimed event no longer shows as pending, so a concurrent drain must not
+  # withdraw the armed loss while this one has not emitted its record yet.
+  ctInlineClassifyBegin()
   if rawSyscallEventOverflowed():
     emitEventLoss("inline raw syscall event buffer overflow")
   let pid = rawCurrentPid()
@@ -3887,6 +3969,9 @@ proc drainInlineRawSyscallEvents() {.raises: [].} =
   for i in 0 ..< count:
     case rawSyscallEventClaim(i, pid)
     of 1:
+      when defined(ioMonInlineWindowTest):
+        # Test-only: widen the window between the claim and the record.
+        discard c_window_test_usleep(20000)
       let event = rawSyscallEventAt(i)
       if not event.ok:
         emitEventLoss("inline raw syscall event read failed index=" & $i)
@@ -3900,6 +3985,12 @@ proc drainInlineRawSyscallEvents() {.raises: [].} =
       emitEventLoss("inline raw syscall event still being written index=" & $i)
     else:
       discard
+  ctInlineClassifyEnd()
+  # Everything this process trapped is classified (or reported): withdraw the
+  # loss armed at its first trap. The runtime re-checks under its own protocol
+  # and keeps the loss when a call or another drain is still in flight, or an
+  # event is queued.
+  ctRetractInlineLossIfDrained()
 
 proc repro_linux_drain_inline_events() {.cdecl, raises: [].} =
   ## Registered with the runtime as the drain the exit/exec trap paths run.
