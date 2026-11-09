@@ -34,7 +34,7 @@ The depfile body consists of a sequence of binary records representing discrete 
 
 | Record Kind            | Description                                     | Key Fields                         |
 | :--------------------- | :---------------------------------------------- | :--------------------------------- |
-| `mrProcessStart`       | Process initialization under the monitor        | `osPid`, `parentOsPid`, `threadId` |
+| `mrProcessStart`       | Process initialization under the monitor        | `osPid`, `parentOsPid`, `path`     |
 | `mrProcessExec`        | Execution of a new binary image via `execve`    | `osPid`, `path`                    |
 | `mrProcessSpawn`       | Creation of a child process                     | `osPid`, `childPid`                |
 | `mrFileOpen`           | File descriptor acquisition                     | `osPid`, `path`, `flags`           |
@@ -89,3 +89,13 @@ symlinks, rather than compare the recorded text: `/root/a/../../etc/passwd` and 
 symlink out of `/root`) both start with `/root/`.
 
 - On Windows, paths are normalized to uppercase drive letters and backslash delimiters.
+
+### The Process-Start Image
+
+The `path` of an `mrProcessStart` is the exception to the rules above: it is the file the process image runs, as the
+kernel resolved it (`/proc/self/exe` on Linux, `proc_pidpath` on macOS, `QueryFullProcessImageNameW` on Windows),
+absolute and symlink-resolved. It names the program that ran even when the exec or spawn record only carries a bare
+name looked up in the program's own `PATH`, a relative path, or a descriptor. An image that could not be read is an
+empty `path` with the `detail` token `image=unresolved`. Like every shim record it is reported by the monitored process
+itself, so it is as trustworthy as the exec and file records and no more. See `docs/usage.md`, "The process-start
+image".

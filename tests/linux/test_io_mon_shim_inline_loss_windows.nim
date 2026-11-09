@@ -29,6 +29,13 @@
 ## into a monitored image. The new image withdraws the exec-armed file at
 ## init, so the capture is complete with no loss.
 ##
+## Every case runs twice: with a short fragment directory, and with one under
+## a `TMPDIR` longer than the shim's armed-path buffer
+## (`CT_INLINE_ARMED_PATH_CAP`, 512 bytes). The second creates and removes
+## every armed file through the directory-descriptor route instead of an
+## absolute path, so a route that failed to create the file ("fe-kill", a
+## false complete) or to remove it ("exec-ok", a spurious loss) is caught.
+##
 ## x86_64 only: no other architecture has the inline-syscall trap backend.
 ##
 ## Mocks: none. Real program, real shim (built with the test-only define),
@@ -42,6 +49,15 @@ const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
   hooksSrc = repoRoot.parentDir() / "nim-stackable-hooks" / "src"
   snoopSrc = repoRoot / "cmd" / "io_mon_snoop.nim"
+
+proc longTempDir(base: string): string =
+  ## A directory whose path leaves no room for an armed file's absolute path
+  ## in the shim's 512-byte buffer, so the fragment directory under it takes
+  ## the descriptor route.
+  result = base / "long"
+  while result.len < 560:
+    result = result / repeat('d', 60)
+  createDir(result)
 
 proc run(cmd: string; args: seq[string]; env: StringTableRef = nil):
     tuple[output: string; code: int] =
@@ -211,60 +227,64 @@ suite "io-mon Linux shim: the armed inline loss across its narrow windows":
       env.del("LD_PRELOAD")
       env["REPRO_MONITOR_SHIM_LIB"] = shimLib
 
-      for transport in ["set", "file"]:
-        for mode in ["cd-exit", "fe-kill", "fork-inflight", "exec-ok"]:
-          for attempt in 0 ..< 2:
-            checkpoint("transport: " & transport & ", mode: " & mode &
-              ", attempt " & $attempt)
-            var runEnv = newStringTable(modeCaseSensitive)
-            for k, v in env: runEnv[k] = v
-            if transport == "file":
-              runEnv["REPRO_MONITOR_DEP_SHM_DISABLE"] = "1"
-            let tree = work / ("tree-" & transport & "-" & mode & "-" &
-              $attempt)
-            createDir(tree)
-            let input = tree / "input-a.txt"
-            writeFile(input, "input a\n")
-            let depfile = work / (transport & "-" & mode & "-" & $attempt &
-              ".iomon")
-            let cap = run(snoopBin, @["run", "--depfile", depfile, "--", host,
-              tree, mode, noop], runEnv)
-            checkpoint(cap.output)
-            check cap.code == 0
-            let dep = readMonitorDepFile(depfile)
-            for r in dep.records:
-              if r.kind in {mrFileOpen, mrFileRead, mrEventLoss}:
-                checkpoint($r.kind & " " & r.path & " " & r.detail)
-            let openRecorded = dep.records.anyIt(it.kind == mrFileOpen and
-              it.path == input)
-            let readRecorded = dep.records.anyIt(it.kind == mrFileRead and
-              it.path == input)
-            let anyLoss = dep.records.anyIt(it.kind == mrEventLoss)
-            let unclassifiedLoss = dep.records.anyIt(it.kind == mrEventLoss and
-              it.detail.startsWith(
-                "inline raw syscall events unclassified at image end"))
-            checkpoint("open: " & $openRecorded & ", read: " & $readRecorded &
-              ", unclassified loss: " & $unclassifiedLoss & ", completeness: " &
-              $dep.completeness)
-            case mode
-            of "cd-exit":
-              check "child killed by signal 9" in cap.output
-              check not (dep.completeness == mcComplete and not openRecorded)
-              check openRecorded or
-                (unclassifiedLoss and dep.completeness != mcComplete)
-            of "fe-kill":
-              check "child killed by signal 9" in cap.output
-              check anyLoss
-              check dep.completeness != mcComplete
-            of "fork-inflight":
-              check "child exited 0" in cap.output
-              check readRecorded
-              check not anyLoss
-              check dep.completeness == mcComplete
-            of "exec-ok":
-              check "child exited 0" in cap.output
-              check not anyLoss
-              check dep.completeness == mcComplete
-            else:
-              check false
+      let longTmp = longTempDir(work)
+      for (dirKind, tmp) in [("short", ""), ("long", longTmp)]:
+        for transport in ["set", "file"]:
+          for mode in ["cd-exit", "fe-kill", "fork-inflight", "exec-ok"]:
+            for attempt in 0 ..< 2:
+              checkpoint("dir: " & dirKind & ", transport: " & transport &
+                ", mode: " & mode & ", attempt " & $attempt)
+              var runEnv = newStringTable(modeCaseSensitive)
+              for k, v in env: runEnv[k] = v
+              if tmp.len > 0:
+                runEnv["TMPDIR"] = tmp
+              if transport == "file":
+                runEnv["REPRO_MONITOR_DEP_SHM_DISABLE"] = "1"
+              let tree = work / ("tree-" & dirKind & "-" & transport & "-" &
+                mode & "-" & $attempt)
+              createDir(tree)
+              let input = tree / "input-a.txt"
+              writeFile(input, "input a\n")
+              let depfile = work / (dirKind & "-" & transport & "-" & mode &
+                "-" & $attempt & ".iomon")
+              let cap = run(snoopBin, @["run", "--depfile", depfile, "--", host,
+                tree, mode, noop], runEnv)
+              checkpoint(cap.output)
+              check cap.code == 0
+              let dep = readMonitorDepFile(depfile)
+              for r in dep.records:
+                if r.kind in {mrFileOpen, mrFileRead, mrEventLoss}:
+                  checkpoint($r.kind & " " & r.path & " " & r.detail)
+              let openRecorded = dep.records.anyIt(it.kind == mrFileOpen and
+                it.path == input)
+              let readRecorded = dep.records.anyIt(it.kind == mrFileRead and
+                it.path == input)
+              let anyLoss = dep.records.anyIt(it.kind == mrEventLoss)
+              let unclassifiedLoss = dep.records.anyIt(it.kind == mrEventLoss and
+                it.detail.startsWith(
+                  "inline raw syscall events unclassified at image end"))
+              checkpoint("open: " & $openRecorded & ", read: " & $readRecorded &
+                ", unclassified loss: " & $unclassifiedLoss & ", completeness: " &
+                $dep.completeness)
+              case mode
+              of "cd-exit":
+                check "child killed by signal 9" in cap.output
+                check not (dep.completeness == mcComplete and not openRecorded)
+                check openRecorded or
+                  (unclassifiedLoss and dep.completeness != mcComplete)
+              of "fe-kill":
+                check "child killed by signal 9" in cap.output
+                check anyLoss
+                check dep.completeness != mcComplete
+              of "fork-inflight":
+                check "child exited 0" in cap.output
+                check readRecorded
+                check not anyLoss
+                check dep.completeness == mcComplete
+              of "exec-ok":
+                check "child exited 0" in cap.output
+                check not anyLoss
+                check dep.completeness == mcComplete
+              else:
+                check false
       removeDir(work)

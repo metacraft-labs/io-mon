@@ -33,10 +33,16 @@
  *      unresolved.
  *   5. A vanished or unresolved process whose snapshot parent is not launchd
  *      is classified through that parent (see `classify`): the child of a
- *      non-member is a non-member. What is still vanished or unresolved after
- *      that makes the sweep inconclusive.
+ *      non-member is a non-member. A parent that is itself exiting (or a
+ *      zombie) is classified through ITS parent in turn (`creator_class`).
+ *      An unresolved process the parent chain cannot classify is then
+ *      classified by its CREATOR's kernel unique id, which survives
+ *      reparenting (`creator_predates_root`): an orphan whose creator is
+ *      older than the root is a non-member. What is still
+ *      vanished or unresolved after that makes the sweep inconclusive.
  */
 #include <errno.h>
+#include <stddef.h>
 #include <libproc.h>
 #include <signal.h>
 #include <stdint.h>
@@ -44,6 +50,7 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/sysctl.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -180,6 +187,36 @@ static void tg_fault_vanish(void) {
   for (int i = 0; i < 2000 && still_alive(pid, start); i++)
     usleep(1000);
 }
+
+/* Slow-strings seam: a process whose p_comm equals this name has its
+ * KERN_PROCARGS2 read refused, as the kernel refuses it for a process still
+ * between fork and exec or not yet scheduled, until this many milliseconds
+ * after its kernel start time. That is what a heavily loaded host does to a
+ * young process (issue: young processes the guard cannot classify under
+ * host load), made deterministic. The process is then alive, same-user and
+ * unreadable, exactly the state the census calls unresolved. Refusing a read
+ * can only make a sweep less conclusive. */
+char iomon_tg_fault_slow_comm[IOMON_TG_COMM_LEN] = {0};
+int64_t iomon_tg_fault_slow_ms = 0;
+static int tg_fault_strings_refused(const struct kinfo_proc *p) {
+  if (iomon_tg_fault_slow_comm[0] == '\0' || iomon_tg_fault_slow_ms <= 0)
+    return 0;
+  if (strncmp(p->kp_proc.p_comm, iomon_tg_fault_slow_comm,
+              IOMON_TG_COMM_LEN - 1) != 0)
+    return 0;
+  struct timeval now;
+  gettimeofday(&now, NULL);
+  uint64_t start = tv_usec(&p->kp_proc.p_starttime);
+  uint64_t at = tv_usec(&now);
+  return at < start + (uint64_t)iomon_tg_fault_slow_ms * 1000ull;
+}
+
+/* Exiting seam: this pid is classified as exiting (TG_DEAD) unless its
+ * strings carry a needle, standing in for a parent caught in exit with a
+ * child it has not yet handed to launchd, a window real timing hits only by
+ * chance. A member is never affected, so the seam cannot hide one; on a
+ * non-member it changes only how its children are classified. */
+int32_t iomon_tg_fault_exiting_pid = 0;
 #endif
 
 enum {
@@ -200,6 +237,8 @@ typedef struct {
   unsigned char *age;   /* per entry: 0 not yet known, 1 young, 2 older */
   int32_t self;
   uint64_t root_start_abs;
+  uint64_t root_uniqueid;  /* 0 = unknown: the creator rule is off */
+  uint64_t self_uniqueid;  /* 0 = unknown: the creator rule is off */
   const char *n1, *n2;
   size_t n1len, n2len;
   char *args;
@@ -257,6 +296,135 @@ static int is_young(tg_ctx *c, long idx) {
  * subtree accounting already grades incomplete.) An orphan, or a process whose
  * parent is itself unresolved, stays unresolved.
  */
+/*
+ * THE CREATOR'S UNIQUE ID. Every process has a 64-bit kernel unique id,
+ * assigned from a counter at creation and never reused, and the kernel also
+ * keeps the unique id of its parent as of its last fork or exec
+ * (`p_puniqueid`). Handing an orphan to launchd does not rewrite it, but an
+ * exec does: measured on macOS 26, an orphan that execs after its creator
+ * exited reads launchd's id, 1, exactly like a job launchd started itself. So
+ * id 1 proves nothing (a launchd job and a re-exec'd orphan of the tree look
+ * the same), and only an id of a process OLDER than the root is used. It is
+ * read with
+ * proc_pidinfo flavor PROC_PIDUNIQIDENTIFIERINFO (17), which works for any
+ * same-user process without privilege but is declared only in xnu's private
+ * header, so the flavor and the layout are copied here from
+ *   https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/proc_info_private.h
+ * (struct proc_uniqidentifierinfo). The static asserts pin the offsets read;
+ * a kernel that answers with fewer bytes than reach `p_puniqueid`, or fails,
+ * leaves the process unresolved (fail closed).
+ */
+#define IOMON_TG_PIDUNIQIDENTIFIERINFO 17
+struct iomon_tg_uniqidentifierinfo {
+  uint8_t p_uuid[16];          /* UUID of the main executable */
+  uint64_t p_uniqueid;         /* 64-bit unique id of the process */
+  uint64_t p_puniqueid;        /* unique id of the process that created it */
+  int32_t p_idversion;         /* pid version */
+  int32_t p_orig_ppidversion;  /* original parent pid version */
+  uint64_t p_reserve2;
+  uint64_t p_reserve3;
+};
+_Static_assert(offsetof(struct iomon_tg_uniqidentifierinfo, p_uniqueid) == 16,
+  "p_uniqueid offset (xnu proc_uniqidentifierinfo)");
+_Static_assert(offsetof(struct iomon_tg_uniqidentifierinfo, p_puniqueid) == 24,
+  "p_puniqueid offset (xnu proc_uniqidentifierinfo)");
+_Static_assert(sizeof(struct iomon_tg_uniqidentifierinfo) == 56,
+  "proc_uniqidentifierinfo size (xnu)");
+
+/* (unique id, creator's unique id) of `pid`; 1 when read, 0 otherwise. The
+ * buffer is larger than the struct so a kernel with a longer one still
+ * answers; only the bytes it says it wrote are used. */
+int iomon_tg_unique_ids(int32_t pid, uint64_t *uniq, uint64_t *puniq) {
+  union {
+    struct iomon_tg_uniqidentifierinfo info;
+    unsigned char raw[256];
+  } u;
+  memset(&u, 0, sizeof(u));
+  if (pid <= 0)
+    return 0;
+  int n = proc_pidinfo(pid, IOMON_TG_PIDUNIQIDENTIFIERINFO, 0, &u, sizeof(u));
+  if (n < (int)(offsetof(struct iomon_tg_uniqidentifierinfo, p_puniqueid) +
+                sizeof(uint64_t)))
+    return 0;
+  *uniq = u.info.p_uniqueid;
+  *puniq = u.info.p_puniqueid;
+  return 1;
+}
+
+#ifdef IOMON_TG_FAULT_TEST
+/* Creator-id seam: when set, the creator rule is skipped, so a test can show
+ * a case the rule (and only the rule) classifies. */
+int iomon_tg_fault_no_creator_rule = 0;
+#endif
+
+/*
+ * Is live, unreadable snapshot entry `idx` provably outside the tree by its
+ * creator? Yes when the parent recorded at its last fork or exec is older
+ * than the root (its id is below the root's) and is neither launchd (id 1,
+ * see above) nor the guard's own process (which spawned the root with the
+ * needles). Ids are assigned in creation order, so that parent was created
+ * before the root and is not a descendant, and the child of a non-member is a
+ * non-member. A tree process's parent at a fork or exec is a tree process (id
+ * above the root's), launchd, or the guard (the root only, reaped before any
+ * sweep). The one exception is a debugger older than the root that attached
+ * to a tree process (macOS makes the tracer the parent) when it exec'd; that
+ * process becomes readable, carrying the needles, once its exec completes.
+ * The ids are read between two liveness checks of the same (pid, start), so
+ * they belong to this process, not a recycled pid. Anything else, including
+ * an orphan whose creator is younger than the root and gone, and a launchd
+ * job, stays unresolved.
+ */
+static int creator_predates_root(tg_ctx *c, long idx) {
+#ifdef IOMON_TG_FAULT_TEST
+  if (iomon_tg_fault_no_creator_rule)
+    return 0;
+#endif
+  const struct kinfo_proc *p = &c->procs[idx];
+  int32_t pid = p->kp_proc.p_pid;
+  uint64_t uniq = 0, puniq = 0;
+  if (!iomon_tg_unique_ids(pid, &uniq, &puniq))
+    return 0;
+  if (!still_alive(pid, observed_start_usec(p)))
+    return 0;
+  return puniq > 1 && c->root_uniqueid != 0 && c->self_uniqueid != 0 &&
+    puniq < c->root_uniqueid && puniq != c->self_uniqueid &&
+    uniq != c->root_uniqueid;
+}
+
+static int classify(tg_ctx *c, long idx, int depth);
+
+/*
+ * The class of the process that created a child, starting from the child's
+ * snapshot parent `j`: its own class, unless it is exiting or a zombie
+ * (TG_DEAD). An exiting parent still names its children (XNU hands them to
+ * launchd during exit, so a snapshot can catch a child whose parent is
+ * mid-exit), but its strings can no longer be read. It is then classified
+ * through ITS parent by the same rule: the child of a non-member is a
+ * non-member, whether or not it is still running, so a non-member ancestor
+ * makes the whole chain below it non-members. The walk stops, unresolved, at
+ * launchd (pid 1, which adopts orphans, so it created nothing it names) and
+ * at the guard's own process: the host spawned the root with the needles,
+ * so its children are the one place the needles start, and "the child of a
+ * non-member" does not hold there. (The root has been reaped before any
+ * sweep, so no live descendant names the host or the root as its parent;
+ * the stop is a guard against a caller that breaks that order.)
+ */
+static int creator_class(tg_ctx *c, long j, int depth) {
+  for (int hop = 0; hop < 64; hop++) {
+    int r = classify(c, j, depth + hop);
+    if (r != TG_DEAD)
+      return r;
+    int32_t ppid = c->procs[j].kp_eproc.e_ppid;
+    if (ppid <= 1 || ppid == c->self)
+      return TG_UNREADABLE;
+    long k = find_pid(c, ppid);
+    if (k < 0)
+      return TG_UNREADABLE;
+    j = k;
+  }
+  return TG_UNREADABLE;
+}
+
 static int classify(tg_ctx *c, long idx, int depth) {
   if (c->memo[idx] != TG_UNKNOWN && c->memo[idx] != TG_BUSY)
     return c->memo[idx];
@@ -275,9 +443,18 @@ static int classify(tg_ctx *c, long idx, int depth) {
     c->young++;
     int amib[3] = {CTL_KERN, KERN_PROCARGS2, pid};
     size_t alen = (size_t)c->argmax;
-    if (sysctl(amib, 3, c->args, &alen, NULL, 0) == 0) {
+    int read_ok = sysctl(amib, 3, c->args, &alen, NULL, 0) == 0;
+#ifdef IOMON_TG_FAULT_TEST
+    if (read_ok && tg_fault_strings_refused(p))
+      read_ok = 0;
+#endif
+    if (read_ok) {
       result = carries_needle(c->args, alen, c->n1, c->n1len, c->n2, c->n2len)
                     ? TG_MEMBER : TG_NONMEMBER;
+#ifdef IOMON_TG_FAULT_TEST
+      if (result == TG_NONMEMBER && pid == iomon_tg_fault_exiting_pid)
+        result = TG_DEAD;
+#endif
     } else if (!still_alive(pid, observed_start_usec(p))) {
       result = TG_VANISHED;
     } else if (c->me != 0 && p->kp_eproc.e_ucred.cr_uid != c->me) {
@@ -291,10 +468,12 @@ static int classify(tg_ctx *c, long idx, int depth) {
         long j = find_pid(c, ppid);
         if (j >= 0) {
           c->memo[idx] = TG_BUSY;
-          if (classify(c, j, depth + 1) == TG_NONMEMBER)
+          if (creator_class(c, j, depth + 1) == TG_NONMEMBER)
             result = TG_NONMEMBER;
         }
       }
+      if (result == TG_UNREADABLE && creator_predates_root(c, idx))
+        result = TG_NONMEMBER;
     }
   }
   c->memo[idx] = (unsigned char)result;
@@ -348,7 +527,8 @@ static long ledger_live(tg_ctx *c, int32_t pid, uint64_t start_usec) {
  * `cap`; `*n_hits` is the full count (it may exceed `cap`). `*young` counts
  * the processes the start-time prune kept and the census read.
  */
-int iomon_tg_sweep(int32_t self, uint64_t root_start_abs, const char *n1,
+int iomon_tg_sweep(int32_t self, uint64_t root_start_abs,
+                    uint64_t root_uniqueid, const char *n1,
                     size_t n1len, const char *n2, size_t n2len,
                     const int32_t *ledger_pids, const uint64_t *ledger_starts,
                     int ledger_n,
@@ -401,6 +581,12 @@ int iomon_tg_sweep(int32_t self, uint64_t root_start_abs, const char *n1,
   c.count = size / sizeof(struct kinfo_proc);
   c.self = self;
   c.root_start_abs = root_start_abs;
+  c.root_uniqueid = root_uniqueid;
+  {
+    uint64_t self_puniq = 0;
+    if (!iomon_tg_unique_ids(self, &c.self_uniqueid, &self_puniq))
+      c.self_uniqueid = 0;
+  }
   c.n1 = n1; c.n1len = n1len; c.n2 = n2; c.n2len = n2len;
   c.me = geteuid();
   int amib[2] = {CTL_KERN, KERN_ARGMAX};

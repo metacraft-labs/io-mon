@@ -435,9 +435,11 @@ var
   # the process's real on-disk image path (`/proc/self/exe`, set by the shim via
   # `setDepSetIncarnationImage` at init and re-captured after every exec). This is
   # the REAL exec identity, NOT a synthetic nonce. It exists to keep the pre-exec
-  # and post-exec `process-start` of ONE pid distinct: those two records are
-  # byte-identical (both reset `seq` to 1, same pid/ppid/tid, empty path), so the
-  # identity element-key alone would DEDUP the second and break the completeness
+  # and post-exec `process-start` of ONE pid distinct: those two records share
+  # `seq` (both reset to 1) and pid/ppid/tid, and their `path` (the resolved
+  # image) differs only when the image does — a same-image re-exec, or a shim
+  # that predates the image field (empty path), makes them byte-identical — so
+  # the identity element-key alone could DEDUP the second and break the completeness
   # invariant `startCount == 1 + execCount` — the exec-collision part 1 patched with
   # a random tag. Because the image is per-INCARNATION-constant, a probe storm
   # WITHIN one incarnation still collapses (Candidate-C source-dedup), while a

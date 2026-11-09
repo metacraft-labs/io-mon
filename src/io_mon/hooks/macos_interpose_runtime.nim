@@ -595,6 +595,24 @@ unsigned long long repro_macos_proc_start_usec(int pid) {
 }
 
 /*
+ * The file this process image runs, for its `mrProcessStart` (docs/usage.md,
+ * "The process-start image"): proc_pidpath(getpid()), which names the
+ * executable vnode the kernel activated, as an absolute path with symlinks
+ * resolved (the kernel builds it from the vnode, not from the spelling the
+ * exec was given). Writes a NUL-terminated path into `out` and returns its
+ * length, or 0 when it cannot be read whole. proc_pidpath is a proc_info
+ * system call wrapper, not hooked, so this is reentrancy-free.
+ */
+int repro_macos_self_image_path(void *out_buf, int cap) {
+  char *out = (char *)out_buf;
+  if (out == NULL || cap < PROC_PIDPATHINFO_MAXSIZE) return 0;
+  int n = proc_pidpath(getpid(), out, (uint32_t)cap);
+  if (n <= 0 || n >= cap) return 0;
+  out[n] = '\0';
+  return n;
+}
+
+/*
  * ROUND-2 R8 (trusted-daemon report authentication): a cryptographically random
  * per-connection nonce stamped into each `mrIpcConnect` record (and offered to a
  * cooperating daemon via the ticket sidecar). The merge rejects a breakaway
@@ -3070,6 +3088,17 @@ proc ct_macos_proc_start_usec*(pid: cint): uint64 =
   proc impl(pid: cint): uint64
     {.importc: "repro_macos_proc_start_usec", cdecl.}
   impl(pid)
+
+proc ct_macos_self_image_path*(): string =
+  ## The absolute, physical path of the file this process image runs
+  ## (`proc_pidpath`), or "" when it cannot be read. See the C helper.
+  proc impl(outBuf: pointer; cap: cint): cint
+    {.importc: "repro_macos_self_image_path", cdecl.}
+  var buf: array[4096, char]   # PROC_PIDPATHINFO_MAXSIZE (4 * MAXPATHLEN)
+  let n = impl(addr buf[0], cint(buf.len))
+  if n > 0:
+    result = newString(int(n))
+    copyMem(addr result[0], addr buf[0], int(n))
 
 proc ct_macos_random_u64*(): uint64 =
   ## ROUND-2 R8 — an unguessable per-connection nonce (arc4random_buf) stamped on

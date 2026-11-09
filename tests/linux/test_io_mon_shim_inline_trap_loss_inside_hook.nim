@@ -81,6 +81,16 @@ const
   hooksSrc = repoRoot.parentDir() / "nim-stackable-hooks" / "src"
   snoopSrc = repoRoot / "cmd" / "io_mon_snoop.nim"
 
+proc longTempDir(base: string): string =
+  ## A directory whose path leaves no room for an armed file's absolute path
+  ## in the shim's 512-byte buffer (`CT_INLINE_ARMED_PATH_CAP`), so a
+  ## fragment directory under it creates and removes armed files through the
+  ## directory-descriptor route.
+  result = base / "long"
+  while result.len < 560:
+    result = result / repeat('d', 60)
+  createDir(result)
+
 proc run(cmd: string; args: seq[string]; env: StringTableRef = nil):
     tuple[output: string; code: int] =
   let p = startProcess(cmd, args = args, env = env,
@@ -686,78 +696,89 @@ suite "io-mon Linux shim: trapped inline syscalls when the image ends inside a h
       env["REPRO_MONITOR_SHIM_LIB"] = shimLib
 
       # Both dependency transports: the shared-memory set (the default) and
-      # the fragment files REPRO_MONITOR_DEP_SHM_DISABLE selects.
-      for transport in ["set", "file"]:
-        # (mode, signal the process must die of; 0 = exits normally)
-        for (mode, signum) in [("exit", 0), ("term-ignored", 0),
-                               ("uh-survive", 0), ("bt", 0), ("segv", 11),
-                               ("abort", 6), ("int3", 5), ("term", 15),
-                               ("kill", 9), ("usr1", 10), ("uh-die", 11),
-                               ("segv-nofd", 11), ("nofd-first", 9),
-                               ("rodir-first", 9), ("nf-rodir", 9),
-                               ("rf", 9), ("parked-kill", 9),
-                               ("root-segv", 11)]:
-          checkpoint("transport: " & transport & ", mode: " & mode)
-          var runEnv = newStringTable(modeCaseSensitive)
-          for k, v in env: runEnv[k] = v
-          if transport == "file":
-            runEnv["REPRO_MONITOR_DEP_SHM_DISABLE"] = "1"
-          let tree = work / ("tree-" & transport & "-" & mode)
-          createDir(tree)
-          writeFile(tree / "input-a.txt", "input a\n")
-          writeFile(tree / "input-b.txt", "input b\n")
-          # "rf": the dependency at stake is the child's read of input-b
-          # (the root's read of input-a is drained normally).
-          let input = tree / (if mode == "rf": "input-b.txt" else: "input-a.txt")
-          let depfile = work / (transport & "-" & mode & ".iomon")
-          let cap = run(snoopBin, @["run", "--depfile", depfile, "--", host,
-            tree, mode], runEnv)
-          checkpoint(cap.output)
-          if mode.startsWith("root-"):
-            # The CLI reports a signal death as 128 + signal.
-            check cap.code == 128 + signum
-          else:
-            check cap.code == 0
-            if signum == 0:
-              check "child exited 0" in cap.output
+      # the fragment files REPRO_MONITOR_DEP_SHM_DISABLE selects. A few modes
+      # run again under a TMPDIR too long for the shim's armed-path buffer,
+      # so the armed file is created ("kill", "parked-kill") and withdrawn
+      # ("exit") through the directory-descriptor route.
+      let longTmp = longTempDir(work)
+      for (dirKind, tmp) in [("short", ""), ("long", longTmp)]:
+        for transport in ["set", "file"]:
+          # (mode, signal the process must die of; 0 = exits normally)
+          for (mode, signum) in [("exit", 0), ("term-ignored", 0),
+                                 ("uh-survive", 0), ("bt", 0), ("segv", 11),
+                                 ("abort", 6), ("int3", 5), ("term", 15),
+                                 ("kill", 9), ("usr1", 10), ("uh-die", 11),
+                                 ("segv-nofd", 11), ("nofd-first", 9),
+                                 ("rodir-first", 9), ("nf-rodir", 9),
+                                 ("rf", 9), ("parked-kill", 9),
+                                 ("root-segv", 11)]:
+            if dirKind == "long" and mode notin ["exit", "kill", "parked-kill"]:
+              continue
+            checkpoint("dir: " & dirKind & ", transport: " & transport &
+              ", mode: " & mode)
+            var runEnv = newStringTable(modeCaseSensitive)
+            for k, v in env: runEnv[k] = v
+            if tmp.len > 0:
+              runEnv["TMPDIR"] = tmp
+            if transport == "file":
+              runEnv["REPRO_MONITOR_DEP_SHM_DISABLE"] = "1"
+            let tree = work / ("tree-" & dirKind & "-" & transport & "-" & mode)
+            createDir(tree)
+            writeFile(tree / "input-a.txt", "input a\n")
+            writeFile(tree / "input-b.txt", "input b\n")
+            # "rf": the dependency at stake is the child's read of input-b
+            # (the root's read of input-a is drained normally).
+            let input = tree / (if mode == "rf": "input-b.txt" else: "input-a.txt")
+            let depfile = work / (dirKind & "-" & transport & "-" & mode &
+              ".iomon")
+            let cap = run(snoopBin, @["run", "--depfile", depfile, "--", host,
+              tree, mode], runEnv)
+            checkpoint(cap.output)
+            if mode.startsWith("root-"):
+              # The CLI reports a signal death as 128 + signal.
+              check cap.code == 128 + signum
             else:
-              check ("child killed by signal " & $signum) in cap.output
-          let dep = readMonitorDepFile(depfile)
-          for r in dep.records:
-            if r.kind in {mrFileOpen, mrFileRead, mrEventLoss}:
-              checkpoint($r.kind & " " & r.path & " " & r.detail)
-          let openRecorded = dep.records.anyIt(it.kind == mrFileOpen and
-            it.path == input)
-          let readRecorded = dep.records.anyIt(it.kind == mrFileRead and
-            it.path == input)
-          let unclassifiedLoss = dep.records.anyIt(it.kind == mrEventLoss and
-            it.detail.startsWith(unclassifiedLossPrefix))
-          let anyLoss = dep.records.anyIt(it.kind == mrEventLoss)
-          checkpoint("open recorded: " & $openRecorded & ", read recorded: " &
-            $readRecorded & ", unclassified loss: " & $unclassifiedLoss &
-            ", completeness: " & $dep.completeness)
-          if signum == 0:
-            # The controls: a normal exit, a signal the process survives
-            # because it was ignored, and a crash its own handler recovers
-            # from. No spurious loss for events it goes on to classify: the
-            # loss armed at its first trap is withdrawn by the drain.
-            check openRecorded
-            check readRecorded
-            check dep.completeness == mcComplete
-            check not anyLoss
-          elif mode in ["nofd-first", "rodir-first", "nf-rodir"]:
-            # "nofd-first" arms with no descriptor (mknodat). In the other two
-            # no file can be armed at all: the loss goes out through the set's
-            # no-grow insert, or the growth-failure counter when shard0 is
-            # full, or the open fragment, and is not necessarily the
-            # unclassified-events detail.
-            check not (dep.completeness == mcComplete and not readRecorded)
-            check readRecorded or (anyLoss and dep.completeness != mcComplete)
-          else:
-            # Never complete without the read the process made.
-            check not (dep.completeness == mcComplete and not readRecorded)
-            check (openRecorded and readRecorded) or
-              (unclassifiedLoss and dep.completeness != mcComplete)
+              check cap.code == 0
+              if signum == 0:
+                check "child exited 0" in cap.output
+              else:
+                check ("child killed by signal " & $signum) in cap.output
+            let dep = readMonitorDepFile(depfile)
+            for r in dep.records:
+              if r.kind in {mrFileOpen, mrFileRead, mrEventLoss}:
+                checkpoint($r.kind & " " & r.path & " " & r.detail)
+            let openRecorded = dep.records.anyIt(it.kind == mrFileOpen and
+              it.path == input)
+            let readRecorded = dep.records.anyIt(it.kind == mrFileRead and
+              it.path == input)
+            let unclassifiedLoss = dep.records.anyIt(it.kind == mrEventLoss and
+              it.detail.startsWith(unclassifiedLossPrefix))
+            let anyLoss = dep.records.anyIt(it.kind == mrEventLoss)
+            checkpoint("open recorded: " & $openRecorded & ", read recorded: " &
+              $readRecorded & ", unclassified loss: " & $unclassifiedLoss &
+              ", completeness: " & $dep.completeness)
+            if signum == 0:
+              # The controls: a normal exit, a signal the process survives
+              # because it was ignored, and a crash its own handler recovers
+              # from. No spurious loss for events it goes on to classify: the
+              # loss armed at its first trap is withdrawn by the drain.
+              check openRecorded
+              check readRecorded
+              check dep.completeness == mcComplete
+              check not anyLoss
+            elif mode in ["nofd-first", "rodir-first", "nf-rodir"]:
+              # "nofd-first" arms with no descriptor (mknodat). In the other two
+              # no file can be armed at all: the loss goes out through the set's
+              # no-grow insert, or the growth-failure counter when shard0 is
+              # full, or the open fragment, and is not necessarily the
+              # unclassified-events detail.
+              check not (dep.completeness == mcComplete and not readRecorded)
+              check readRecorded or (anyLoss and dep.completeness != mcComplete)
+            else:
+              # Never complete without the read the process made.
+              check not (dep.completeness == mcComplete and not readRecorded)
+              check (openRecorded and readRecorded) or
+                (unclassifiedLoss and dep.completeness != mcComplete)
       removeDir(work)
 
   test "t_stackless_vm_clone_root_killed_by_a_signal_is_not_complete":

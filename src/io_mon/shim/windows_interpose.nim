@@ -316,6 +316,9 @@ proc EnumProcessModulesEx(hProcess: HANDLE, lphModule: ptr pointer,
   {.importc, stdcall, dynlib: "psapi".}
 proc GetCurrentProcess(): HANDLE
   {.importc, stdcall, dynlib: "kernel32".}
+proc QueryFullProcessImageNameW(hProcess: HANDLE; dwFlags: DWORD;
+                                lpExeName: LPWSTR; lpdwSize: ptr DWORD): BOOL
+  {.importc, stdcall, dynlib: "kernel32".}
 proc IsWow64Process2(hProcess: HANDLE; processMachine,
                      nativeMachine: ptr WORD): BOOL
   {.importc, stdcall, dynlib: "kernel32".}
@@ -2059,9 +2062,38 @@ proc ensureFragmentDir() =
   except ValueError:
     discard
 
+proc selfImagePath(): string {.raises: [].} =
+  ## The file this process runs, as the kernel names it:
+  ## `QueryFullProcessImageNameW` on the current process, flag 0 (the Win32
+  ## form, `C:\dir\tool.exe`), UTF-8. That is the image `CreateProcessW`
+  ## resolved (application name, else the command line's first token searched
+  ## along the documented directories and `PATH`), taken from the image's
+  ## file object rather than from the caller's spelling. "" when it cannot be
+  ## read whole.
+  ## https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-queryfullprocessimagenamew
+  var buf: array[32768, uint16]
+  var size = DWORD(buf.len)
+  if QueryFullProcessImageNameW(GetCurrentProcess(), 0'u32,
+      cast[LPWSTR](addr buf[0]), addr size) == 0 or size == 0 or
+      size >= DWORD(buf.len):
+    return ""
+  buf[int(size)] = 0'u16
+  widePtrToString(cast[LPCWSTR](addr buf[0]))
+
 proc recordProcessStart() =
   var record = baseRecord(mrProcessStart, moProcessStart)
   record.detail = "shim-loaded"
+  # THE RESOLVED IMAGE (docs/usage.md, "The process-start image"). The spawn
+  # record carries what the caller passed to `CreateProcessW`: an application
+  # name, or a command line whose first token the loader searched for. This
+  # names the file that actually runs, the same field the Linux and macOS
+  # shims fill. An unreadable name is an empty path plus `image=unresolved`.
+  var image = ""
+  withShimMuted:
+    image = selfImagePath()
+  record.path = image
+  if image.len == 0:
+    record.detail.add " image=unresolved"
   emitRecord(record)
   # Flush immediately: this record is written from a thread that is about to
   # disappear.

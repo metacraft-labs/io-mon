@@ -597,6 +597,11 @@ var
   # byte-identical (a Nix gcc/rustc bash-wrapper that re-execs the real compiler
   # in-place) remain DISTINCT elements instead of deduping down to mcIncomplete.
   currentExecGen: clong = 0
+  # The file THIS image runs, as `readlink("/proc/self/exe")` named it at init
+  # (empty when it could not be read whole). Recorded as the `path` of every
+  # `mrProcessStart` this image emits, its fork children's included: a fork
+  # child runs the same file. See `recordProcessStart`.
+  selfImagePath: string
   nextProcessSeq: uint64 = 0
   rawSyscallCoverageRecorded = false
   inlineSyscallCoverageRecorded = false
@@ -2125,6 +2130,18 @@ proc recordProcessStart() {.raises: [].} =
     markSelfInTreeLedger()
   var record = baseRecord(mrProcessStart, moProcessStart)
   record.detail = "linux-preload-hooks"
+  # THE RESOLVED IMAGE (docs/usage.md, "The process-start image"). The exec
+  # and spawn records carry what the program PASSED: a bare name looked up in
+  # the program's own PATH, or a path relative to its working directory, which
+  # nothing records. The kernel's answer is `/proc/self/exe`: the absolute,
+  # physical path of the file this image runs, symlinks resolved, read at
+  # init. It covers every way in, `posix_spawnp`, the `execvp` family,
+  # `fexecve`, `posix_spawn` with file actions, alike. An unreadable or
+  # over-long link is recorded as an empty path plus `image=unresolved`, so a
+  # consumer can tell it from a shim that predates the field.
+  record.path = selfImagePath
+  if selfImagePath.len == 0:
+    record.detail.add " image=unresolved"
   emitRecord(record)
 
 proc emitEventLoss(detail: string; result: int64 = 0) {.raises: [].} =
@@ -2978,6 +2995,10 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
       if n > 0:
         img = newString(n)
         for i in 0 ..< n: img[i] = exeBuf[i]
+      # A full buffer may be a truncated name: never record a prefix as the
+      # image (it could name a different file). The incarnation identity
+      # below only needs distinct bytes, so it keeps them.
+      selfImagePath = if n > 0 and n < cint(exeBuf.len) - 1: img else: ""
       # Separator (0x1f, unit-separator) cannot occur in a path; the generation
       # suffix keeps same-image re-execs on one pid distinct. Opaque identity
       # bytes only — `decodeDepRecord` ignores everything past the framed record.

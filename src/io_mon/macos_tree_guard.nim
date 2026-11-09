@@ -178,7 +178,7 @@
 when not defined(macosx):
   {.error: "io_mon/macos_tree_guard is macOS-only".}
 
-import std/[hashes, monotimes, os, sequtils, strutils, times]
+import std/[algorithm, hashes, monotimes, os, sequtils, strutils, times]
 import io_mon/tree_ledger
 
 when defined(ioMonMacosTreeGuardFaultTest):
@@ -196,6 +196,9 @@ const
   MacosDescendantGraceMsDefault* = 500
     ## Same defaults as the Linux and Windows guards' windows.
   MacosDescendantPollMsDefault* = 25
+  MacosDescendantGraceCeilingMsDefault* = 5000
+    ## The hard ceiling on the extended window (see `waitForTreeQuiescence`,
+    ## "WHY THE WINDOW STRETCHES"). Never below the grace window itself.
   HitCapacity = 256
 
 type
@@ -210,7 +213,9 @@ type
     sweeps*: int        ## sweeps taken (diagnostics and tests)
 
 proc iomon_tg_start_abs(pid: int32): uint64 {.importc, cdecl.}
-proc iomon_tg_sweep(self: int32; rootStartAbs: uint64;
+proc iomon_tg_unique_ids(pid: int32; uniq, puniq: ptr uint64): cint
+  {.importc, cdecl.}
+proc iomon_tg_sweep(self: int32; rootStartAbs, rootUniqueId: uint64;
                     n1: cstring; n1len: csize_t; n2: cstring; n2len: csize_t;
                     ledgerPids: ptr int32; ledgerStarts: ptr uint64;
                     ledgerN: cint;
@@ -248,6 +253,32 @@ when defined(ioMonMacosTreeGuardFaultTest):
     iomon_tg_test_carries_needle(cstring(image), csize_t(image.len),
       cstring(needle), csize_t(needle.len)) != 0
 
+  var iomon_tg_fault_slow_comm {.importc.}: array[17, char]
+  var iomon_tg_fault_slow_ms {.importc.}: int64
+  var iomon_tg_fault_exiting_pid {.importc.}: int32
+  var iomon_tg_fault_no_creator_rule {.importc.}: cint
+  proc armLoadSeams() =
+    # `slow` seam: processes named IO_MON_TEST_MACOS_TREE_GUARD_SLOW_COMM
+    # have their strings refused for IO_MON_TEST_MACOS_TREE_GUARD_SLOW_MS
+    # after they start (see the C side). `exiting` seam: the non-member
+    # IO_MON_TEST_MACOS_TREE_GUARD_EXITING_PID is classified as exiting.
+    let comm = getEnv("IO_MON_TEST_MACOS_TREE_GUARD_SLOW_COMM")
+    zeroMem(addr iomon_tg_fault_slow_comm[0], iomon_tg_fault_slow_comm.len)
+    for i in 0 ..< min(comm.len, iomon_tg_fault_slow_comm.len - 1):
+      iomon_tg_fault_slow_comm[i] = comm[i]
+    iomon_tg_fault_slow_ms =
+      try: int64(parseInt(getEnv("IO_MON_TEST_MACOS_TREE_GUARD_SLOW_MS", "0")))
+      except ValueError: 0
+    iomon_tg_fault_exiting_pid =
+      try: int32(parseInt(getEnv("IO_MON_TEST_MACOS_TREE_GUARD_EXITING_PID",
+        "0")))
+      except ValueError: 0
+    # `nocreator` seam: skip the creator-id rule, so a test can show what
+    # the rule alone classifies.
+    iomon_tg_fault_no_creator_rule =
+      if getEnv("IO_MON_TEST_MACOS_TREE_GUARD_NO_CREATOR_RULE") == "1": 1
+      else: 0
+
   var iomon_tg_fault_vanish_verdict {.importc.}: cint
   proc faultVanishVerdict*(): string =
     ## TEST SEAM: how the last capture's census classified the pid the
@@ -272,6 +303,17 @@ proc processStartAbs*(pid: int): uint64 =
   ## it. 0 disables the prune (slower, never blinder).
   iomon_tg_start_abs(int32(pid))
 
+proc processUniqueId*(pid: int): uint64 =
+  ## The kernel's 64-bit unique id of `pid` (assigned at creation, never
+  ## reused), or 0 when it cannot be read. Taken for the monitored root right
+  ## after the spawn, it arms the census's creator rule: an unreadable orphan
+  ## whose creator's id is below the root's was created by a process older
+  ## than the root (see `creator_predates_root` in the C side). 0 disables
+  ## the rule (fail closed).
+  var uniq, puniq: uint64
+  if iomon_tg_unique_ids(int32(pid), addr uniq, addr puniq) == 1: uniq
+  else: 0
+
 proc sanitizeToken(s: string): string =
   ## Keep a detail token one token: no whitespace, `,` or `=`.
   result = newStringOfCap(s.len)
@@ -283,10 +325,11 @@ type Sweep = object
   members, unresolved, recordedLive: seq[(int, string)]
   total: int
 
-proc sweepOnce(runId, fragmentDir: string; rootStartAbs: uint64;
+proc sweepOnce(runId, fragmentDir: string; rootStartAbs, rootUniqueId: uint64;
                ledger: seq[TreeLedgerEntry]): Sweep =
   when defined(ioMonMacosTreeGuardFaultTest):
     armInjectedFault()
+    armLoadSeams()
   let sessionNeedle = "REPRO_MONITOR_SESSION=" & runId
   let fragmentNeedle = "REPRO_MONITOR_FRAGMENT_DIR=" & fragmentDir
   var ledgerPids = newSeq[int32](max(ledger.len, 1))
@@ -297,6 +340,7 @@ proc sweepOnce(runId, fragmentDir: string; rootStartAbs: uint64;
   var hits: array[HitCapacity, TgHit]
   var n, young: cint
   let err = iomon_tg_sweep(int32(getCurrentProcessId()), rootStartAbs,
+    rootUniqueId,
     cstring(sessionNeedle), csize_t(sessionNeedle.len),
     cstring(fragmentNeedle), csize_t(fragmentNeedle.len),
     addr ledgerPids[0], addr ledgerStarts[0], cint(ledger.len),
@@ -320,11 +364,33 @@ proc describe(entries: seq[(int, string)]): string =
     images.add image
   "pids=" & pids.join(",") & " images=" & images.join(",")
 
+proc c_getloadavg(loadavg: ptr cdouble; nelem: cint): cint
+  {.importc: "getloadavg", header: "<stdlib.h>".}
+
+proc spentToken(elapsedMs, ceilingMs: int; ceilingReached: bool): string =
+  ## ` grace-ms=<spent> ceiling-ms=<ceiling>[ ceiling-reached]
+  ## load1=<1-minute load average>`: how long the guard actually waited,
+  ## the bound on the stretch, whether the stretch ran into that bound (the
+  ## unclassified set was still changing when the window ended), and how
+  ## busy the host was, so a consumer can tell a starved host's unresolved
+  ## census from a real surviving descendant. `load1=unknown` when the
+  ## kernel does not answer.
+  result = " grace-ms=" & $elapsedMs & " ceiling-ms=" & $ceilingMs
+  if ceilingReached:
+    result.add " ceiling-reached"
+  var load: array[1, cdouble]
+  if c_getloadavg(addr load[0], 1) == 1:
+    result.add " load1=" & formatFloat(float(load[0]), ffDecimal, 2)
+  else:
+    result.add " load1=unknown"
+
 proc waitForTreeQuiescence*(runId, fragmentDir: string; rootPid: int;
                             rootStartAbs: uint64;
-                            graceMs, pollMs: int): TreeQuiescence =
+                            graceMs, pollMs: int;
+                            ceilingMs = MacosDescendantGraceCeilingMsDefault;
+                            rootUniqueId = 0'u64): TreeQuiescence =
   ## After the root has exited, sweep until one sweep is conclusive and empty,
-  ## or the grace window ends. The first sweep is immediate.
+  ## or the window ends. The first sweep is immediate.
   ##
   ## Each round: read the tree ledger, take one census snapshot and match
   ## BOTH the needle census and every ledger entry against it, then read the
@@ -333,7 +399,26 @@ proc waitForTreeQuiescence*(runId, fragmentDir: string; rootPid: int;
   ## read found no entry the first did not (an entry written meanwhile is a
   ## process created after the first read, by a process that was alive then;
   ## the next round checks it).
+  ##
+  ## WHY THE WINDOW STRETCHES. The window is `graceMs`, except when the only
+  ## thing keeping the last round inconclusive is young processes the census
+  ## could not classify (alive, same user, strings refused: caught between
+  ## fork and exec, or not yet scheduled). On a starved host that set is
+  ## rarely empty at a fixed instant even though the tree has quiesced: new
+  ## young processes keep appearing and each takes long to become readable.
+  ## So the window is extended while that set is still changing, up to the
+  ## hard ceiling `ceilingMs` (never below `graceMs`); once it has stayed the
+  ## same for a whole `graceMs` (a process that is not going to become
+  ## readable soon), the guard stops waiting. The extension cannot make a
+  ## capture complete by itself: completion still needs a conclusive, empty
+  ## round, and a live member, a live ledger process, a ledger that keeps
+  ## growing or an overflowing census ends the window at `graceMs` exactly as
+  ## before. Every loss published after the window names the time actually
+  ## spent and the host's load (`spentToken`).
   let start = getMonoTime()
+  let ceiling = max(ceilingMs, graceMs)
+  var lastUnresolved: seq[int]
+  var unresolvedChangedMs = 0
   while true:
     var before, after: seq[TreeLedgerEntry]
     if not readTreeLedger(fragmentDir, before):
@@ -348,7 +433,7 @@ proc waitForTreeQuiescence*(runId, fragmentDir: string; rootPid: int;
       result.lossDetail = "macos tree-lifetime guard failed: " &
         "the tree ledger has no entry for the root pid=" & $rootPid
       return
-    let s = sweepOnce(runId, fragmentDir, rootStartAbs, before)
+    let s = sweepOnce(runId, fragmentDir, rootStartAbs, rootUniqueId, before)
     inc result.sweeps
     if s.failedErr != 0:
       result.lossDetail = "macos tree-lifetime guard failed: " &
@@ -363,9 +448,19 @@ proc waitForTreeQuiescence*(runId, fragmentDir: string; rootPid: int;
       result.quiesced = true
       return
     let elapsedMs = int(inMilliseconds(getMonoTime() - start))
-    if elapsedMs >= graceMs:
-      let overflow = s.total >
-        s.members.len + s.unresolved.len + s.recordedLive.len
+    var unresolvedNow: seq[int]
+    for (pid, _) in s.unresolved: unresolvedNow.add pid
+    unresolvedNow.sort()
+    if unresolvedNow != lastUnresolved:
+      lastUnresolved = unresolvedNow
+      unresolvedChangedMs = elapsedMs
+    let overflow = s.total >
+      s.members.len + s.unresolved.len + s.recordedLive.len
+    let onlyUnresolved = s.unresolved.len > 0 and s.members.len == 0 and
+      s.recordedLive.len == 0 and not overflow and not ledgerGrew
+    let stillChanging = elapsedMs - unresolvedChangedMs < graceMs
+    let stretch = onlyUnresolved and elapsedMs < ceiling and stillChanging
+    if elapsedMs >= graceMs and not stretch:
       var censusPids: seq[int]
       for (pid, _) in s.members: censusPids.add pid
       let ledgerOnly = s.recordedLive.filterIt(it[0] notin censusPids)
@@ -396,5 +491,8 @@ proc waitForTreeQuiescence*(runId, fragmentDir: string; rootPid: int;
         result.lossDetail =
           "macos tree-lifetime guard could not settle the tree ledger: " &
             "entries kept appearing after root exit entries=" & $after.len
+      result.lossDetail.add spentToken(elapsedMs, ceiling,
+        onlyUnresolved and stillChanging and elapsedMs >= ceiling)
       return
-    sleep(min(pollMs, graceMs - elapsedMs))
+    let windowEnd = if elapsedMs >= graceMs: ceiling else: graceMs
+    sleep(max(1, min(pollMs, windowEnd - elapsedMs)))

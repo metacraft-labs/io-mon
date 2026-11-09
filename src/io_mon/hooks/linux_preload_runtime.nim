@@ -2261,14 +2261,31 @@ static void ct_inline_exec_name(char *name, long cap, long pid,
   name[at] = '\0';
 }
 
+/* THE STACK THESE TWO HELPERS USE. They run inside the SIGTRAP handler, which
+ * is installed without SA_ONSTACK and so runs on whatever stack the trapped
+ * thread was on. That may be a program's own signal alternate stack (an inline
+ * system call made by a handler that runs on a sigaltstack), which can be as
+ * small as MINSIGSTKSZ. A PATH_MAX array here put 4 KiB on that stack, and a
+ * compiler free to inline the helpers into `ct_inline_arm_loss` and the
+ * handler would charge it to every trap. So the helpers are never inlined,
+ * and the absolute path is built in a CT_INLINE_ARMED_PATH_CAP buffer, which
+ * holds any fragment directory up to a few hundred bytes plus the longest
+ * armed name. A longer directory takes the descriptor route below, which
+ * needs no path buffer at all (the directory string is static, the name is
+ * the caller's). A preallocated shared buffer is not used instead: two
+ * threads may be in the handler at once, and a lock is not signal-safe.
+ * `tests/linux/test_io_mon_shim_inline_trap_small_sigaltstack.nim` measures
+ * how deep the first trap, the one that arms, uses an alternate stack. */
+#define CT_INLINE_ARMED_PATH_CAP 512
+
 /* Create the empty armed file `name`. 1: created; -1: it exists; 0: it could
- * not be created. No descriptor is used unless the absolute path is too long
- * for the kernel, in which case it is created relative to an O_PATH
+ * not be created. No descriptor is used unless the absolute path does not fit
+ * CT_INLINE_ARMED_PATH_CAP, in which case it is created relative to an O_PATH
  * descriptor of the directory. */
-static int ct_inline_armed_create(const char *name) {
+static __attribute__((noinline)) int ct_inline_armed_create(const char *name) {
   if (__atomic_load_n(&ct_inline_loss_frame_len, __ATOMIC_ACQUIRE) <= 0)
     return 0;   /* not armed: there is no fragment directory */
-  char path[PATH_MAX];
+  char path[CT_INLINE_ARMED_PATH_CAP];
   long r;
   if (ct_inline_armed_path(path, (long)sizeof(path), name)) {
     r = ct_raw_syscall6(SYS_mknodat, AT_FDCWD, (long)path, S_IFREG | 0600, 0,
@@ -2286,8 +2303,9 @@ static int ct_inline_armed_create(const char *name) {
   return r == -EEXIST ? -1 : 0;
 }
 
-static void ct_inline_armed_unlink(const char *name) {
-  char path[PATH_MAX];
+static __attribute__((noinline)) void ct_inline_armed_unlink(
+    const char *name) {
+  char path[CT_INLINE_ARMED_PATH_CAP];
   if (ct_inline_armed_path(path, (long)sizeof(path), name)) {
     ct_raw_syscall6(SYS_unlinkat, AT_FDCWD, (long)path, 0, 0, 0, 0);
     return;

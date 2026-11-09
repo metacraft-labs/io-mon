@@ -879,6 +879,13 @@ const
     ##       of them rejects a v1 file that carries it as a semantic error.
     ##   2 — adds `mrConnectAttempt` (20) / `moConnectAttempt` (18), the
     ##       failed AF_INET/AF_INET6 connect.
+    ##
+    ## Not bumps, by the rule above: `mrProcessStart`'s `path`, empty until
+    ## then, carries the process image's resolved physical path (and its
+    ## `detail` the token `image=unresolved` when that cannot be read;
+    ## docs/usage.md, "The process-start image"). Every reader already
+    ## decodes a `path` on every kind, so an older reader reads such a file
+    ## unchanged and merely ignores the value.
   IomonMinReadableVersion* = 1'u16
     ## The oldest envelope version this build READS. Every version up to
     ## `IomonVersion` only appended kinds, so a reader that knows the newest

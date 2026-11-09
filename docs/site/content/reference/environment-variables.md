@@ -34,6 +34,8 @@ These variables are automatically configured by the `io-mon` driver when launchi
 | `REPRO_MONITOR_OUTPUT`             | Target path where the final canonical `.iomon` depfile will be created.                                 |
 | `REPRO_MONITOR_SESSION`            | Unique UUID identifying the current capture session.                                                    |
 | `IO_MON_LINUX_DESCENDANT_GRACE_MS` | Milliseconds to wait before checking for detached orphan processes on Linux. Defaults to `500`.         |
+| `IO_MON_MACOS_DESCENDANT_GRACE_MS` | Milliseconds the macOS tree-lifetime guard waits for the tree to quiesce after the root exits. Defaults to `500`. |
+| `IO_MON_MACOS_DESCENDANT_GRACE_CEILING_MS` | The most the macOS guard stretches that wait while only unclassifiable young processes remain and keep changing (a starved host). Defaults to `5000`. |
 
 ---
 

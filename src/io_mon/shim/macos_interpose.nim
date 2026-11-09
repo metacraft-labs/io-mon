@@ -427,6 +427,11 @@ var
   # retaining descriptors or registry pointers after they exit. This closes the threaded-write
   # capture gap without a teardown-time Nim call.
   mainThreadId: uint64 = 0
+  # The file THIS image runs (`ct_macos_self_image_path`, read once at init;
+  # empty when it could not be read). The `path` of every `mrProcessStart`
+  # this image emits, its fork children's included. See `recordProcessStart`.
+  selfImagePath: string
+  selfImagePathRead = false
   # ROUND-2 R8 — this invocation's RUN ID, read once from REPRO_MONITOR_SESSION at
   # init. Stamped (as a `run=` token) onto every process-start and IPC-connect
   # record so the merge can scope trusted-daemon breakaway reports to THIS run and
@@ -546,6 +551,20 @@ proc recordProcessStart() {.raises: [].} =
   # before `main`; the fork child's call runs before `fork` returns there).
   markTreeLedgerEntry(selfPid, selfStart)
   record.detail = "shim-loaded start=" & $selfStart & runIdToken()
+  # THE RESOLVED IMAGE (docs/usage.md, "The process-start image"). The exec
+  # and spawn records carry what the program PASSED: a bare name looked up in
+  # the program's own PATH, or a path relative to its working directory, which
+  # nothing records. `proc_pidpath` is the kernel's answer: the absolute,
+  # physical path of the executable it activated, symlinks resolved. Read once,
+  # at the first process-start of this image (init, single-threaded); a fork
+  # child runs the same file, so it reuses the value. An unreadable path is
+  # recorded as an empty path plus `image=unresolved`.
+  if not selfImagePathRead:
+    selfImagePath = ct_macos_self_image_path()
+    selfImagePathRead = true
+  record.path = selfImagePath
+  if selfImagePath.len == 0:
+    record.detail.add " image=unresolved"
   emitRecord(record)
 
 proc observationForOpen(flags: cint): MonitorObservationKind =

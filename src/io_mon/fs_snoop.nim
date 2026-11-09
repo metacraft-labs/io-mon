@@ -1773,6 +1773,11 @@ type
                                ## process that started before it. Monotonic,
                                ## so a wall-clock step cannot move it. `0`
                                ## means "unknown" and disables that skip.
+      rootUniqueId: uint64     ## The ROOT's kernel unique id, captured with
+                               ## its start time. The census classifies an
+                               ## unreadable orphan whose creator's id is
+                               ## below it (a creator older than the root) as
+                               ## a non-member. `0` disables that rule.
     when defined(windows):
       shimLib: string
       spawnEnv: StringTableRef
@@ -1981,8 +1986,15 @@ proc settleMonitorDescendants(h: var MonitorHandle) =
       MacosDescendantGraceMsDefault, 0)
     let pollMs = envInt("IO_MON_MACOS_DESCENDANT_POLL_MS",
       MacosDescendantPollMsDefault, 1)
+    # The ceiling of the window's extension while only unclassified young
+    # processes remain and that set keeps changing (a starved host), see
+    # `waitForTreeQuiescence`. Waiting longer can never complete a capture
+    # without a conclusive empty sweep.
+    let ceilingMs = envInt("IO_MON_MACOS_DESCENDANT_GRACE_CEILING_MS",
+      MacosDescendantGraceCeilingMsDefault, 0)
     let settled = waitForTreeQuiescence(h.runId, h.fragmentDir,
-      int(h.rootPid), h.rootStartAbs, graceMs, pollMs)
+      int(h.rootPid), h.rootStartAbs, graceMs, pollMs, ceilingMs,
+      h.rootUniqueId)
     if not settled.quiesced:
       appendFragmentRecord(h.fragmentDir, MonitorRecord(
         kind: mrEventLoss, observationKind: moEventLoss,
@@ -2149,6 +2161,7 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
     # The root is our unreaped child, so its kernel entry (and start time)
     # exists until `waitForMonitorRoot` reaps it, even if it already exited.
     h.rootStartAbs = processStartAbs(h.process.processID)
+    h.rootUniqueId = processUniqueId(h.process.processID)
   elif defined(linux):
     let shimLib = findShimLibrary()
     if shimLib.len == 0:
