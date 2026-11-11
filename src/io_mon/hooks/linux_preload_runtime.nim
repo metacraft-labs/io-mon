@@ -4877,8 +4877,9 @@ int ct_linux_library_scan(ct_ll_sink_fn sink, char *reason,
 #define CT_DLSYM_GLIBC_BASE "GLIBC_2.2.5"
 #endif
 
-/* The real dlsym, for the RTLD_NEXT arm of the exported entry stub (below the
- * public dlsym). Hidden, so the stub reaches it PC-relatively with no GOT. */
+/* The real dlsym, for the caller-relative arm (RTLD_NEXT and RTLD_DEFAULT) of
+ * the exported entry stub (below the public dlsym). Hidden, so the stub
+ * reaches it PC-relatively with no GOT. */
 __attribute__((visibility("hidden"), used))
 void *ct_linux_preload_dlsym_entry_real = NULL;
 
@@ -4905,9 +4906,10 @@ void *ct_linux_preload_real_dlsym(void *handle, char *name) {
 }
 
 /* Called by the entry stub, with the caller's arguments saved, when an
- * RTLD_NEXT lookup arrives before anything resolved the real dlsym: a
- * constructor of a library loaded after the shim runs BEFORE the shim's own
- * constructor primes it. NULL sends the lookup down the hooked path. */
+ * RTLD_NEXT or RTLD_DEFAULT lookup arrives before anything resolved the real
+ * dlsym: a constructor of a library loaded after the shim runs BEFORE the
+ * shim's own constructor primes it. NULL sends the lookup down the hooked
+ * path. */
 __attribute__((visibility("hidden"), used))
 void *ct_linux_preload_dlsym_entry_resolve(void) {
   int saved_errno = errno;
@@ -5894,13 +5896,16 @@ void *dlmopen(Lmid_t namespace_id, const char *path, int flags) {
   return handle;
 }
 
-/* --- Monitor transparency: RTLD_NEXT is answered relative to the caller -----
+/* --- Monitor transparency: RTLD_NEXT and RTLD_DEFAULT are answered relative
+ * to the caller ---------------------------------------------------------------
  *
  * glibc answers dlsym(RTLD_NEXT, name) with the first definition of `name`
  * loaded after the object that CALLED dlsym, and finds that object from
- * dlsym's return address (musl does the same). The shim interposes dlsym for
- * the vDSO replacement, and the hooked path reaches the real dlsym from inside
- * the shim, so a lookup forwarded that way is answered relative to the SHIM:
+ * dlsym's return address (musl does the same). It answers
+ * dlsym(RTLD_DEFAULT, name) from the CALLER's lookup scope, found the same
+ * way. The shim interposes dlsym for the vDSO replacement, and the hooked path
+ * reaches the real dlsym from inside the shim, so a lookup forwarded that way
+ * is answered relative to the SHIM:
  *
  *   - an LD_PRELOAD hook library loaded after the shim (`io-mon run` prepends
  *     the shim to the inherited LD_PRELOAD) gets its OWN export as the "next"
@@ -5908,20 +5913,26 @@ void *dlmopen(Lmid_t namespace_id, const char *path, int flags) {
  *     Harbor's command-trace shim died this way in every monitored process;
  *   - an object loaded before the shim (the program, or a hook library
  *     preloaded ahead of it) asking for a function the shim hooks gets
- *     libc's, which skips the shim and leaves its calls unobserved.
+ *     libc's, which skips the shim and leaves its calls unobserved;
+ *   - an RTLD_DEFAULT lookup is answered from the shim's own scope, which
+ *     puts the shim first because it links with -Bsymbolic (DT_SYMBOLIC), so
+ *     a function that a hook library preloaded ahead of the shim also defines
+ *     resolves to the shim's definition instead of the hook library's.
  *
  * Unlike dlopen (see "caller-scoped dlopen soname resolution"), the answer
  * cannot be recomputed here: the search runs over the loader's private scope
  * list, which the public link_map does not expose. So the exported dlsym is a
- * small entry stub that sends an RTLD_NEXT lookup to the real dlsym with a
- * TAIL JUMP, leaving the caller's return address in place for the loader to
- * read. Every other handle takes the hooked path as before. The hooked path
- * only replaces vDSO entry points, and RTLD_NEXT does not resolve those: the
- * vDSO is not in any object's search scope (measured: dlsym(RTLD_NEXT,
- * "__vdso_clock_gettime") is NULL, while the vDSO's own handle answers).
- * The one exception is a program that first promotes the vDSO into the
- * global scope with dlopen("linux-vdso.so.1", RTLD_NOLOAD | RTLD_GLOBAL);
- * its later RTLD_NEXT lookups of __vdso_* names get the unreplaced entries.
+ * small entry stub that sends an RTLD_NEXT or RTLD_DEFAULT lookup to the real
+ * dlsym with a TAIL JUMP, leaving the caller's return address in place for
+ * the loader to read. A lookup on any other handle does not depend on the
+ * caller and takes the hooked path. The hooked path only replaces vDSO entry
+ * points, and neither pseudo-handle resolves those: the vDSO is not in any
+ * object's search scope (measured: dlsym(RTLD_NEXT, "__vdso_clock_gettime")
+ * and dlsym(RTLD_DEFAULT, "__vdso_clock_gettime") are NULL, while the vDSO's
+ * own handle answers). The one exception is a program that first promotes
+ * the vDSO into the global scope with dlopen("linux-vdso.so.1", RTLD_NOW |
+ * RTLD_NOLOAD | RTLD_GLOBAL); its later pseudo-handle lookups of __vdso_*
+ * names get the unreplaced entries.
  * A lookup the shim itself makes still names the shim, as it always did.
  *
  * A tail call cannot be requested portably in C (GCC gained `musttail` only
@@ -5936,8 +5947,9 @@ void *ct_linux_preload_hooked_dlsym(void *handle, const char *name) {
 }
 
 #if defined(__x86_64__)
-/* RTLD_NEXT is ((void *)-1l). At entry %rsp is 8 mod 16; the two pushes and
- * the 8-byte adjustment realign it for the resolver call. `endbr64` is a NOP
+/* RTLD_NEXT is ((void *)-1l) and RTLD_DEFAULT is ((void *)0). At entry %rsp
+ * is 8 mod 16; the two pushes and the 8-byte adjustment realign it for the
+ * resolver call. `endbr64` is a NOP
  * unless indirect-branch tracking is enforced, where it admits the caller's
  * indirect call (as `bti c` does on AArch64). */
 __asm__(
@@ -5948,7 +5960,10 @@ __asm__(
   "  .cfi_startproc\n"
   "  endbr64\n"
   "  cmpq $-1, %rdi\n"
+  "  je 0f\n"
+  "  testq %rdi, %rdi\n"
   "  jne 2f\n"
+  "0:\n"
   "  movq ct_linux_preload_dlsym_entry_real(%rip), %rax\n"
   "  testq %rax, %rax\n"
   "  jz 1f\n"
@@ -5989,7 +6004,9 @@ __asm__(
   "  .cfi_startproc\n"
   "  hint #34\n"
   "  cmn x0, #1\n"
-  "  b.ne 2f\n"
+  "  b.eq 0f\n"
+  "  cbnz x0, 2f\n"
+  "0:\n"
   "  adrp x16, ct_linux_preload_dlsym_entry_real\n"
   "  ldr x16, [x16, #:lo12:ct_linux_preload_dlsym_entry_real]\n"
   "  cbz x16, 1f\n"
@@ -6029,7 +6046,10 @@ __asm__(
   ".p2align 2\n"
   "ct_linux_preload_public_dlsym:\n"
   "  cmn r0, #1\n"
+  "  beq 6f\n"
+  "  cmp r0, #0\n"
   "  bne 2f\n"
+  "6:\n"
   "  ldr r12, 4f\n"
   "0:\n"
   "  add r12, pc, r12\n"
