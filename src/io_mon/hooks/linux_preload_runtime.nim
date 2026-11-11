@@ -1587,6 +1587,10 @@ static void ct_raw_capture_event(struct ct_raw_syscall_event *event) {
    * may map the number to another file. */
   case SYS_read:
   case SYS_getdents64:
+  case SYS_write:
+  case SYS_pwrite64:
+  case SYS_writev:
+  case SYS_pwritev:
     if (r >= 0) ok = ct_raw_capture_fd(event, CT_RAW_CAP_FD0, a[0], 0);
     break;
   case SYS_sendfile: /* sendfile(out_fd, in_fd, ...) */

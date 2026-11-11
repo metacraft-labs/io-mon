@@ -49,6 +49,10 @@ import stackable_hooks/platform/linux_raw_syscalls
 when defined(amd64):
   const
     LinuxSysRead                  = 0.clong
+    LinuxSysWrite                 = 1.clong
+    LinuxSysPwrite64              = 18.clong
+    LinuxSysWritev                = 20.clong
+    LinuxSysPwritev               = 296.clong
     LinuxSysOpen                  = 2.clong
     LinuxSysClose                 = 3.clong
     LinuxSysStat                  = 4.clong
@@ -112,6 +116,10 @@ when defined(amd64):
 elif defined(arm64):
   const
     LinuxSysRead                  = 63.clong
+    LinuxSysWrite                 = 64.clong
+    LinuxSysPwrite64              = 68.clong
+    LinuxSysWritev                = 66.clong
+    LinuxSysPwritev               = 70.clong
     LinuxSysOpen                  = -1001.clong  # no SYS_open on this architecture
     LinuxSysClose                 = 57.clong
     LinuxSysStat                  = -1002.clong  # no SYS_stat on this architecture
@@ -179,6 +187,10 @@ elif defined(arm):
   # by the `_Static_assert`s below on every build.
   const
     LinuxSysRead                  = 3.clong
+    LinuxSysWrite                 = 4.clong
+    LinuxSysPwrite64              = 181.clong
+    LinuxSysWritev                = 146.clong
+    LinuxSysPwritev               = 362.clong
     LinuxSysOpen                  = 5.clong
     LinuxSysClose                 = 6.clong
     LinuxSysStat                  = 106.clong
@@ -340,6 +352,26 @@ _Static_assert(""", LinuxSysAccess, """ < 0, "LinuxSysAccess: SYS_access is abse
 _Static_assert(""", LinuxSysGetpid, """ == SYS_getpid, "LinuxSysGetpid != SYS_getpid");
 #else
 _Static_assert(""", LinuxSysGetpid, """ < 0, "LinuxSysGetpid: SYS_getpid is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_write
+_Static_assert(""", LinuxSysWrite, """ == SYS_write, "LinuxSysWrite != SYS_write");
+#else
+_Static_assert(""", LinuxSysWrite, """ < 0, "LinuxSysWrite: SYS_write is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_pwrite64
+_Static_assert(""", LinuxSysPwrite64, """ == SYS_pwrite64, "LinuxSysPwrite64 != SYS_pwrite64");
+#else
+_Static_assert(""", LinuxSysPwrite64, """ < 0, "LinuxSysPwrite64: SYS_pwrite64 is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_writev
+_Static_assert(""", LinuxSysWritev, """ == SYS_writev, "LinuxSysWritev != SYS_writev");
+#else
+_Static_assert(""", LinuxSysWritev, """ < 0, "LinuxSysWritev: SYS_writev is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_pwritev
+_Static_assert(""", LinuxSysPwritev, """ == SYS_pwritev, "LinuxSysPwritev != SYS_pwritev");
+#else
+_Static_assert(""", LinuxSysPwritev, """ < 0, "LinuxSysPwritev: SYS_pwritev is absent, so the Nim value must be a negative sentinel");
 #endif
 #ifdef SYS_sendfile
 _Static_assert(""", LinuxSysSendfile, """ == SYS_sendfile, "LinuxSysSendfile != SYS_sendfile");
@@ -3417,6 +3449,33 @@ proc recordRawWrite(fd: cint; callResult: clong;
   emitRecord(record)
   true
 
+proc recordRawFdWrite(fd: cint; callResult: clong;
+                      paths = RawFdPaths()): bool {.raises: [].} =
+  ## `write`/`pwrite64`/`writev`/`pwritev` reached through `syscall(2)` or an
+  ## inline trap, recorded exactly as the libc `write` hook records the call
+  ## (`recordFdWrite`): a write to a descriptor that names a file is an
+  ## `mrFileWrite` output fact on that path, and a write to one that names no
+  ## path (a pipe, a socket, a tty) is no filesystem event at all. Unlike
+  ## `recordRawWrite`, an unnamed descriptor is NOT a loss: the zero-copy
+  ## calls there move file bytes, while these are how a process talks to its
+  ## peers. LD_PRELOADed tracers report process events this way — agent-
+  ## harbor's command-trace shim writes one `syscall(SYS_write)` to its
+  ## socket per `waitpid` — and each one made the whole capture incomplete,
+  ## which disabled caching for the session (reprobuild-pm issue
+  ## 2026-11-10-raw-syscall-write-is-unclassified-and-disables-caching-for-
+  ## the-test-fixtures-collection).
+  if callResult < 0 or fd <= 2:
+    return true
+  let path = rawFdPath(fd, paths)
+  if path.len == 0:
+    return true
+  var record = baseRecord(mrFileWrite, moFileWrite)
+  record.path = path
+  record.result = callResult.int64
+  record.flags = uint32(fd)
+  emitRecord(record)
+  true
+
 proc recordRawFileCopy(inFd, outFd: cint; callResult: clong;
                        paths = RawFdPaths()): bool {.raises: [].} =
   if callResult <= 0:
@@ -3641,6 +3700,8 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
     true
   of LinuxSysRead:
     recordRawRead(intArg(a1), callResult, fdPaths)
+  of LinuxSysWrite, LinuxSysPwrite64, LinuxSysWritev, LinuxSysPwritev:
+    recordRawFdWrite(intArg(a1), callResult, fdPaths)
   of LinuxSysSendfile:
     recordRawFileCopy(intArg(a2), intArg(a1), callResult, fdPaths)
   of LinuxSysCopyFileRange:
@@ -3955,7 +4016,8 @@ proc classifyTrappedInlineEvent(index: int; number: clong;
     a[0] = targetArg()
     a[1] = clong(LinuxAtFdcwd)
     a[2] = pathArg()
-  of LinuxSysRead, LinuxSysGetdents64:
+  of LinuxSysRead, LinuxSysGetdents64, LinuxSysWrite, LinuxSysPwrite64,
+      LinuxSysWritev, LinuxSysPwritev:
     overrideFds(a[0], -1)
   of LinuxSysSendfile:
     overrideFds(a[1], a[0])   # sendfile(out_fd, in_fd, ...)

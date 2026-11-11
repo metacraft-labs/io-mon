@@ -1229,6 +1229,84 @@ int main(int argc, char **argv) {
       check not dep.records.anyIt(it.kind == mrEventLoss and
         "libc raw syscall unsupported" in it.detail)
 
+  test "raw libc write family records file outputs; pipe and stdio writes are not loss":
+    # `syscall(SYS_write|SYS_pwrite64|SYS_writev|SYS_pwritev, ...)` used to
+    # fall through the classifier to `libc raw syscall unsupported nr=1`
+    # (nr=18/20/296), which made the capture incomplete. An LD_PRELOADed
+    # tracer that reports to its socket this way (agent-harbor's command-trace
+    # shim, once per waitpid) therefore turned off caching for every action
+    # run under it. Each call is now recorded as the libc `write` hook records
+    # it: a file output when the descriptor names a file, nothing otherwise.
+    let snoopBin = work / "io-mon"
+    if not fileExists(snoopBin):
+      let cli = run("nim", @[
+        "c", "--hints:off", "--warnings:off", "--threads:on",
+        "--path:" & (repoRoot / "src"), "--path:" & hooksSrc,
+        "--out:" & snoopBin, snoopSrc])
+      checkpoint(cli.output)
+      check cli.code == 0
+    let shimLib = buildPrivateLinuxShim(repoRoot)
+
+    let writer = buildC(work, "raw_write_family", """
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <unistd.h>
+static int open_out(const char *path) {
+  return (int)syscall(SYS_openat, AT_FDCWD, path,
+                      O_WRONLY | O_CREAT | O_TRUNC, 0666);
+}
+int main(int argc, char **argv) {
+  if (argc != 5) return 2;
+  static const char text[] = "raw write family\n";
+  struct iovec iov[2] = {{(void *)text, 4}, {(void *)(text + 4), sizeof(text) - 5}};
+  int w = open_out(argv[1]), pw = open_out(argv[2]);
+  int wv = open_out(argv[3]), pwv = open_out(argv[4]);
+  if (w < 0 || pw < 0 || wv < 0 || pwv < 0) return 3;
+  if (syscall(SYS_write, w, text, sizeof(text) - 1) <= 0) return 4;
+  if (syscall(SYS_pwrite64, pw, text, sizeof(text) - 1, 0) <= 0) return 5;
+  if (syscall(SYS_writev, wv, iov, 2) <= 0) return 6;
+  if (syscall(SYS_pwritev, pwv, iov, 2, 0, 0) <= 0) return 7;
+  /* Not files: a pipe (what a tracer's socket looks like to the shim), and
+   * stdout. Neither may be a loss or a file output. */
+  int p[2];
+  if (pipe(p) != 0) return 8;
+  if (syscall(SYS_write, p[1], text, sizeof(text) - 1) <= 0) return 9;
+  if (syscall(SYS_write, 1, text, sizeof(text) - 1) <= 0) return 10;
+  /* A failed write changed nothing and is not a loss either. */
+  if (syscall(SYS_write, -1, text, 1) != -1) return 11;
+  close(p[0]); close(p[1]);
+  syscall(SYS_close, w); syscall(SYS_close, pw);
+  syscall(SYS_close, wv); syscall(SYS_close, pwv);
+  return 0;
+}
+""")
+    var childEnv = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): childEnv[k] = v
+    childEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
+
+    var outs: seq[string]
+    for mode in ["write", "pwrite64", "writev", "pwritev"]:
+      outs.add work / ("raw-write-family-" & mode & ".out")
+    let depfile = work / "raw-write-family.iomon"
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", writer] &
+      outs, childEnv)
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+    for it in dep.records:
+      if it.kind == mrEventLoss: checkpoint("event-loss: " & it.detail)
+    check dep.completeness == mcComplete
+    for path in outs:
+      check readFile(path) == "raw write family\n"
+      check hasFileWrite(dep, path)
+    check not dep.records.anyIt(it.kind == mrEventLoss and
+      "raw syscall unsupported" in it.detail)
+    check not dep.records.anyIt(it.kind == mrFileWrite and it.path.len == 0)
+
   test "inline assembly syscall openat/read captures dependency":
     let snoopBin = work / "io-mon"
     if not fileExists(snoopBin):
