@@ -12,11 +12,16 @@
 ## build), and kills the process inside them:
 ##
 ## - "cd-exit": two concurrent drains. Thread A exits (the exit destructor's
-##   drain claims the one queued event, then sleeps 20 ms before it records
-##   it); thread B makes a failing libc exec 5 ms later (a second drain, which
-##   finds nothing pending and would withdraw the loss); the process is
-##   SIGKILLed at 10 ms. The claimed event must still be covered: the open is
-##   recorded, or the capture reports the loss and is not complete.
+##   drain claims the one queued event, then holds it before it records it;
+##   this case sets `IO_MON_INLINE_WINDOW_TEST_CLAIM_US` so the hold lasts
+##   10 s instead of 20 ms); once A's exit has reached the destructors, thread
+##   B makes a failing libc exec 5 ms later (a second drain, which finds
+##   nothing pending and would withdraw the loss); when B's exec has returned,
+##   the process is SIGKILLed. The kill is ordered after B's drain by a join,
+##   not by a sleep, and A's window outlasts any plausible scheduling delay,
+##   so the process never exits on its own. The claimed event must still be
+##   covered: the open is recorded, or the capture reports the loss and is
+##   not complete.
 ## - "fe-kill": a failed inline exec, killed in the 20 ms after the exec
 ##   returns and before its epoch loss is armed. The exec-armed file created
 ##   before the call must cover it: the capture is not complete.
@@ -104,6 +109,16 @@ static void sleep_us(long us) {
 
 static const char *noop;
 
+/* Set by this executable's destructor, which glibc's _dl_fini runs before
+ * the shim's (the executable is finalised first), so once it is set the
+ * exiting thread is about to run the shim's exit drain. */
+static volatile int exit_begun = 0;
+
+__attribute__((destructor))
+static void mark_exit_begun(void) {
+  __atomic_store_n(&exit_begun, 1, __ATOMIC_RELEASE);
+}
+
 static void *exit_now(void *arg) { (void)arg; exit(0); return NULL; }
 
 static void *failing_exec(void *arg) {
@@ -130,9 +145,10 @@ static void child(const char *mode) {
   if (strcmp(mode, "cd-exit") == 0) {
     raw6(SYS_openat, AT_FDCWD, (long)"input-a.txt", O_RDONLY, 0, 0, 0);
     pthread_create(&a, NULL, exit_now, NULL);
+    while (!__atomic_load_n(&exit_begun, __ATOMIC_ACQUIRE)) sleep_us(100);
     sleep_us(5000);
     pthread_create(&b, NULL, failing_exec, NULL);
-    sleep_us(5000);
+    pthread_join(b, NULL);
     kill(getpid(), SIGKILL);
     for (;;) pause();
   }
@@ -240,6 +256,11 @@ suite "io-mon Linux shim: the armed inline loss across its narrow windows":
                 runEnv["TMPDIR"] = tmp
               if transport == "file":
                 runEnv["REPRO_MONITOR_DEP_SHM_DISABLE"] = "1"
+              if mode == "cd-exit":
+                # Hold A's claimed event for 10 s: the host kills the process
+                # as soon as B's exec returns, so the kill always lands inside
+                # the window instead of racing a 20 ms one.
+                runEnv["IO_MON_INLINE_WINDOW_TEST_CLAIM_US"] = "10000000"
               let tree = work / ("tree-" & dirKind & "-" & transport & "-" &
                 mode & "-" & $attempt)
               createDir(tree)

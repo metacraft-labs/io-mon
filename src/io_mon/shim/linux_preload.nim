@@ -2319,6 +2319,24 @@ proc ctInlineExecArmRetire()
 when defined(ioMonInlineWindowTest):
   proc c_window_test_usleep(us: cuint): cint
     {.importc: "usleep", header: "<unistd.h>", raises: [].}
+  proc c_window_test_getenv(name: cstring): cstring
+    {.importc: "getenv", header: "<stdlib.h>", raises: [].}
+  proc windowTestClaimMicros(): cuint {.raises: [].} =
+    ## Test-only: how long a drain holds a claimed event before recording it.
+    ## 20 ms unless `IO_MON_INLINE_WINDOW_TEST_CLAIM_US` names another length
+    ## in microseconds, so a test can hold the window open for as long as it
+    ## needs to act inside it instead of racing a fixed 20 ms.
+    let raw = c_window_test_getenv("IO_MON_INLINE_WINDOW_TEST_CLAIM_US")
+    if raw == nil or raw[0] == '\0':
+      return 20000
+    var micros: uint64 = 0
+    var i = 0
+    while raw[i] != '\0':
+      if raw[i] notin {'0' .. '9'} or micros > 100_000_000'u64:
+        return 20000
+      micros = micros * 10 + uint64(ord(raw[i]) - ord('0'))
+      inc i
+    cuint(micros)
 proc installLinuxVdsoPatches() {.raises: [].}
 proc emitLinuxVdsoPatchFailures(source: string) {.raises: [].}
 # Defined next to the other `record*` helpers, below the vDSO block; forward
@@ -4054,7 +4072,7 @@ proc drainInlineRawSyscallEvents() {.raises: [].} =
     of 1:
       when defined(ioMonInlineWindowTest):
         # Test-only: widen the window between the claim and the record.
-        discard c_window_test_usleep(20000)
+        discard c_window_test_usleep(windowTestClaimMicros())
       let event = rawSyscallEventAt(i)
       if not event.ok:
         emitEventLoss("inline raw syscall event read failed index=" & $i)
