@@ -25,10 +25,11 @@
 ##
 ## THE SECOND TEST grades events trapped after the process's final drain: a
 ## thread keeps opening files through the inline `syscall` while `main`
-## returns, so some of its opens land after the exit destructor drained.
-## Every open it made must be in the capture, or the capture must report the
-## loss and not be complete; and at least two of up to twenty runs must have
-## had such a late open, so the case was exercised at all.
+## returns, and the exiting main thread waits after the exit destructor's
+## drain until the thread has opened more files. Every open it made must be in
+## the capture, or the capture must report the loss and not be complete; and
+## each of five runs must have had such a late open, so the case is exercised
+## on every run rather than when the scheduler happens to produce it.
 ##
 ## THE THIRD TEST grades a process killed by a signal. A forked child opens
 ## and reads a file through its own inline `syscall` and then dies of SIGSEGV,
@@ -178,11 +179,31 @@ int main(int argc, char **argv) {
 # every index printed was opened before the process died. The thread sleeps
 # between opens so the trap buffer cannot overflow (that would report a
 # different loss and hide the case).
+#
+# The main thread holds the image open after the final drain until the
+# thread has completed two more opens, so every run has an open trapped after
+# that drain instead of only the runs the scheduler happens to produce one in
+# (issues/2026-11-04-linux-inline-trap-control-needs-two-late-opens-by-chance.md).
+# The shim drains in its ELF destructor, which glibc's `_dl_fini` runs; `exit`
+# runs `_dl_fini` as an exit handler registered before `main`. A handler
+# registered while `_dl_fini` is running is still run, after `_dl_fini`
+# returns and before the process ends (glibc stdlib/exit.c restarts its walk
+# when a handler registers another:
+# https://sourceware.org/git/?p=glibc.git;a=blob;f=stdlib/exit.c). So this
+# program's own destructor, which `_dl_fini` runs before the shim's (the
+# executable is finalised first), registers `hold_after_final_drain`. It is
+# registered with `on_exit`, not `atexit`: an `atexit` handler carries the
+# executable's DSO handle, and the executable's own `__cxa_finalize`, run from
+# its last destructor, would call it at once, before the shim's drain. If the
+# handler nonetheless ran before the drain, the drain would classify the
+# opens and the test would see no late open and fail, so a wrong ordering
+# cannot pass silently.
 const lateThreadSource = """
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -222,6 +243,27 @@ static void *opener(void *arg) {
   }
   for (;;) pause();
   return NULL;
+}
+
+/* Runs after _dl_fini, i.e. after the shim's final drain (see above). Two
+ * more completed opens guarantee one that STARTED after this point: the one
+ * in progress when it began may have trapped before the drain. Bounded, so a
+ * thread that stopped opening ends the run (which the test then reports as
+ * one without a late open) instead of hanging it. */
+static void hold_after_final_drain(int status, void *arg) {
+  (void)status;
+  (void)arg;
+  int start = __atomic_load_n(&opened, __ATOMIC_ACQUIRE);
+  for (int waited = 0; waited < 10000; waited++) {
+    if (__atomic_load_n(&opened, __ATOMIC_ACQUIRE) >= start + 2) return;
+    struct timespec pause = {0, 1000000};
+    nanosleep(&pause, NULL);
+  }
+}
+
+__attribute__((destructor))
+static void register_hold_after_final_drain(void) {
+  if (on_exit(hold_after_final_drain, NULL) != 0) _exit(32);
 }
 
 int main(int argc, char **argv) {
@@ -623,10 +665,13 @@ suite "io-mon Linux shim: trapped inline syscalls when the image ends inside a h
       for k, v in envPairs(): env[k] = v
       env.del("LD_PRELOAD")
       env["REPRO_MONITOR_SHIM_LIB"] = shimLib
+      # The host holds its image open after the final drain until the thread
+      # has opened past it (see lateThreadSource), so EVERY attempt must have
+      # a late open; an attempt without one means the hold did not run after
+      # the drain, and nothing in that attempt was graded.
+      const attempts = 5
       var lateOpens = 0
-      for attempt in 0 ..< 20:
-        if lateOpens >= 2:
-          break
+      for attempt in 0 ..< attempts:
         let tree = work / ("tree-" & $attempt)
         createDir(tree)
         for i in 0 ..< limit:
@@ -656,14 +701,14 @@ suite "io-mon Linux shim: trapped inline syscalls when the image ends inside a h
         for r in dep.records:
           if r.kind == mrEventLoss:
             checkpoint("event-loss " & r.detail)
+        check missing > 0
         if missing > 0:
           inc lateOpens
           check lossReported
           check dep.completeness != mcComplete
-      # The thread must actually have outlived the drain at least once, or
-      # nothing above was graded.
-      checkpoint("runs with opens after the final drain: " & $lateOpens)
-      check lateOpens >= 2
+      checkpoint("runs with opens after the final drain: " & $lateOpens &
+        " of " & $attempts)
+      check lateOpens == attempts
       removeDir(work)
 
   test "t_inline_events_of_a_process_killed_by_a_signal_are_reported":
