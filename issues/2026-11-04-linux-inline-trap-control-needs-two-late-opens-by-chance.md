@@ -49,3 +49,11 @@ two of up to twenty), with the per-attempt loss and completeness assertions
 unchanged. Measured at `7a9b2f3` plus the change: 20 of 20 runs passed, 10
 pinned to one CPU and 10 unpinned; with the `on_exit` registration removed,
 3 of 3 pinned runs failed (0, 2 and 1 late-open attempts of 5).
+
+`dev` fixed the same failure independently in `5477f9f` (PR #60): it preloads
+a library whose destructor sleeps 20 ms after the shim's drain and keeps the
+two-of-twenty precondition. Merging `dev` into the promotion branch kept the
+`on_exit` hold above instead, because it waits for two opens that started
+after the drain rather than for a fixed time, so a late open does not depend
+on the opening thread being scheduled within 20 ms, and it requires a late
+open in every attempt rather than in two of up to twenty.
