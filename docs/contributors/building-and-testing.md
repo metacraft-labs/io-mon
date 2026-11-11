@@ -80,9 +80,11 @@ after a task exception.
 `repro build .#test-monitor-isolation --write-report=build/monitor-isolation-repeat.json`
 reruns the programs whose fixture must own its monitor environment. Their
 compilation stays monitored and their execution stays uncached. CI requires
-all selected programs to launch and succeed on the repeat: 48 on macOS, 22
-on Linux and eight on Windows. Update that explicit inventory when adding an
-isolated program; keep the complete report among failure artifacts.
+all selected programs to launch and succeed on the repeat: 51 on macOS
+(every `tests/macos` program plus eight named ones), 27 on Linux and eight
+on Windows. Update that explicit inventory when adding an isolated program,
+including a new `tests/macos` program, which is isolated by directory; keep
+the complete report among failure artifacts.
 
 The Linux uninjectable-image oracle also owns its shim: its disabled-thread
 controls require an unnamed loss, which an enclosing monitor changes by

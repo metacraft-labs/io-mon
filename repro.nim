@@ -383,7 +383,26 @@ package io_mon:
           # Compares the dlsym(RTLD_NEXT) answers of a bare control with
           # those under a private shim; an outer shim is itself an
           # interposer in the lookup order the test asserts.
-          "test_io_mon_foreign_preload_rtld_next.nim"]) or
+          "test_io_mon_foreign_preload_rtld_next.nim",
+          # Builds two distinct shims and asserts that a nested capture
+          # carries exactly one active image; an enclosing shim is a third
+          # image in that loader closure. It also needs `patchelf` (below).
+          "test_io_mon_linux_nested_distinct_shims.nim",
+          # These grade trapped inline syscalls over both dependency
+          # transports, or through a private shim built with a test-only
+          # define (`ioMonInlineWindowTest`). Under an enclosing shim the
+          # file-transport captures report every forked or threaded child as
+          # "spawn child missing process-start" and grade incomplete, and the
+          # outer image, not the private one, owns the process. At io-mon
+          # 7a9b2f3 with repro 0.2.19 all four fail under `repro test` with
+          # the owned monitor runtime and pass directly.
+          "test_io_mon_shim_inline_loss_windows.nim",
+          "test_io_mon_shim_inline_trap_capture.nim",
+          "test_io_mon_shim_inline_trap_loss_inside_hook.nim",
+          # Compares the alternate-stack depth of an unmonitored control with
+          # a monitored run; the outer monitor re-injects itself into the
+          # control, so both measured 8104 bytes at 7a9b2f3.
+          "test_io_mon_shim_inline_trap_small_sigaltstack.nim"]) or
         (defined(windows) and source.extractFilename in [
         "test_io_mon_cli_exit_status.nim",
         "test_io_mon_windows_exit_status.nim",
@@ -431,6 +450,9 @@ package io_mon:
       when defined(linux):
         appendRegisteredActionToolIdentityRefs(executeEdge.id,
           ["strace", "nm", "getconf", "grep", "mv", "rmdir"])
+        if stem == "test_io_mon_linux_nested_distinct_shims":
+          # Gives its second shim its own SONAME (`patchelf --set-soname`).
+          appendRegisteredActionToolIdentityRefs(executeEdge.id, ["patchelf"])
         if stem == "test_io_mon_uninjectable_image_entry":
           appendRegisteredActionToolIdentityRefs(executeEdge.id, ["patchelf"])
           when defined(amd64):
