@@ -1,5 +1,5 @@
-## Linux: the monitor must not change what `dlsym(RTLD_NEXT, …)` returns to
-## the object that asks.
+## Linux: the monitor must not change what `dlsym(RTLD_NEXT, …)` and
+## `dlsym(RTLD_DEFAULT, …)` return to the object that asks.
 ##
 ## glibc answers `dlsym(RTLD_NEXT, name)` with the first definition of `name`
 ## loaded AFTER the object that called `dlsym`, and it identifies that object
@@ -20,6 +20,13 @@
 ## (the program, or a hook library preloaded ahead of it) asking for the next
 ## definition of a function the shim hooks got libc's, skipping the shim, so
 ## its calls went unobserved.
+##
+## `RTLD_DEFAULT` is answered from the CALLER's lookup scope, found the same
+## way. The shim links with `-Bsymbolic`, so its own scope lists the shim
+## first: forwarded from inside the shim, a program's `RTLD_DEFAULT` lookup of
+## a function that both the shim and a hook library preloaded AHEAD of it
+## define returned the shim's, where the loader's global order gives the hook
+## library's.
 ##
 ## NO MOCKS. A real hook library and program built with `cc`, the real shim,
 ## the real `io-mon run` driver and the real dynamic loader. The expected
@@ -73,6 +80,16 @@ pid_t getppid(void) {
   return result;
 }
 
+/* A name the shim also defines. Only its owner matters: the program asks
+   RTLD_DEFAULT for it, whose answer is the first definition in global load
+   order, and never calls it. */
+int access(const char *path, int mode) {
+  int (*real)(const char *, int) =
+      (int (*)(const char *, int))dlsym(RTLD_NEXT, "access");
+  if (real == NULL) _exit(98);
+  return real(path, mode);
+}
+
 /* What RTLD_NEXT answers when THIS library asks. */
 const char *foreign_next_owner(const char *name) {
   return foreign_owner_of(dlsym(RTLD_NEXT, name));
@@ -108,6 +125,7 @@ int main(void) {
   printf("hook-getppid=%s\n", next_owner("getppid"));
   printf("hook-getenv=%s\n", next_owner("getenv"));
   printf("main-getenv=%s\n", owner_of(dlsym(RTLD_NEXT, "getenv")));
+  printf("main-default-access=%s\n", owner_of(dlsym(RTLD_DEFAULT, "access")));
   return 0;
 }
 """
@@ -141,7 +159,7 @@ proc line(output, key: string): string =
       return candidate[key.len + 1 .. ^1]
   "(missing)"
 
-suite "io-mon Linux RTLD_NEXT is answered relative to the caller":
+suite "io-mon Linux dlsym pseudo-handles are answered relative to the caller":
   let work = createTempDir("io-mon-rtld-next-", "")
   let cc = getEnv("CC", "cc")
   let hookLib = work / "libforeign_hook.so"
@@ -170,6 +188,7 @@ suite "io-mon Linux RTLD_NEXT is answered relative to the caller":
   require bare.output.line("ctor-getppid") == libcName
   require bare.output.line("hook-getenv") == libcName
   require bare.output.line("main-getenv") == libcName
+  require bare.output.line("main-default-access") == extractFilename(hookLib)
 
   test "a hook library inherited by io-mon run reaches libc, not itself":
     # The launch the issue took: `io-mon run` prepends its shim to the
@@ -191,15 +210,20 @@ suite "io-mon Linux RTLD_NEXT is answered relative to the caller":
     # definition after the program is the shim's, so the call stays observed.
     # Before the fix: libc's.
     check monitored.output.line("main-getenv") == shimName
+    # The shim precedes the hook library in global load order.
+    check monitored.output.line("main-default-access") == shimName
     require fileExists(depfile)
     check readMonitorDepFile(depfile).completeness == mcComplete
 
   test "both preload orders answer with the first definition after the caller":
-    for (order, preload, hookGetenv) in [
-        ("shim first", shimLib & ":" & hookLib, libcName),
+    for (order, preload, hookGetenv, defaultAccess) in [
+        ("shim first", shimLib & ":" & hookLib, libcName, shimName),
         # The hook library precedes the shim, so the next getenv after it is
         # the shim's. Before the fix: libc's, which bypassed the monitor.
-        ("hook first", hookLib & ":" & shimLib, shimName)]:
+        # And the first access in global order is the hook library's, not the
+        # shim's, which the shim's own -Bsymbolic scope would answer.
+        ("hook first", hookLib & ":" & shimLib, shimName,
+          extractFilename(hookLib))]:
       let monitored = run(program, @[], envWith([("LD_PRELOAD", preload),
         ("REPRO_MONITOR_SHIM_LIB", shimLib)]))
       checkpoint(order & ": " & monitored.output)
@@ -210,5 +234,6 @@ suite "io-mon Linux RTLD_NEXT is answered relative to the caller":
       # The hook library defines no getenv, so in either order the first
       # definition after the program is the shim's.
       check monitored.output.line("main-getenv") == shimName
+      check monitored.output.line("main-default-access") == defaultAccess
 
   removeDir(work)
