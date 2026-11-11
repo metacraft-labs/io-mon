@@ -30,6 +30,17 @@
 ## loss and not be complete; and at least two of up to twenty runs must have
 ## had such a late open, so the case was exercised at all.
 ##
+## The thread must be running between the shim's final drain and the end of the
+## image, and nothing in the program can promise that on its own: the gap is a
+## few microseconds, and on a host with one CPU to spare the thread does not
+## run at all while the main thread finishes exiting (measured on one CPU: no
+## late open in 20 attempts; the CI runner got 1 in 20). The host is
+## therefore preloaded together with a tiny library that sleeps in its
+## destructor. LD_PRELOAD puts the shim first, so the shim initialises after
+## the library and its destructor (which drains) runs before the library's:
+## the sleep falls exactly between the final drain and the end of the image,
+## on any CPU count, and lets the thread open and print inside it.
+##
 ## x86_64 only: no other architecture has the inline-syscall trap backend.
 ##
 ## Mocks: none. Real program, real shim, real files.
@@ -191,6 +202,18 @@ int main(int argc, char **argv) {
 }
 """
 
+# Sleeps in a destructor, which runs after the shim's (see the header). It
+# makes no syscall the shim cares about before that: it only waits.
+const lingerSource = """
+#include <time.h>
+
+__attribute__((destructor))
+static void linger_after_the_shim_destructor(void) {
+  struct timespec pause = {0, 20000000};
+  nanosleep(&pause, NULL);
+}
+"""
+
 suite "io-mon Linux shim: trapped inline syscalls when the image ends inside a hook":
   test "t_unclassified_inline_events_are_recorded_or_reported_as_loss":
     when not defined(amd64):
@@ -283,10 +306,17 @@ suite "io-mon Linux shim: trapped inline syscalls when the image ends inside a h
       let hostCc = run(cc, @[host & ".c", "-O0", "-pthread", "-o", host])
       checkpoint(hostCc.output)
       check hostCc.code == 0
+      let linger = work / "liblinger.so"
+      writeFile(work / "linger.c", lingerSource)
+      let lingerCc = run(cc, @[work / "linger.c", "-O0", "-shared", "-fPIC",
+        "-o", linger])
+      checkpoint(lingerCc.output)
+      check lingerCc.code == 0
       const limit = 2000
       var env = newStringTable(modeCaseSensitive)
       for k, v in envPairs(): env[k] = v
-      env.del("LD_PRELOAD")
+      # The CLI puts the shim in front of whatever LD_PRELOAD holds.
+      env["LD_PRELOAD"] = linger
       env["REPRO_MONITOR_SHIM_LIB"] = shimLib
       var lateOpens = 0
       for attempt in 0 ..< 20:
