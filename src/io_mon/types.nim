@@ -826,6 +826,15 @@ type
       ## reaches the child, and whatever the child reads from it is an input
       ## nobody recorded. Executable resolution is unaffected (see `env`
       ## above), so pass an absolute `command[0]`.
+    unsetEnv*: seq[string]
+      ## Names removed from the hosting process's environment before `env` and
+      ## io-mon's injection are layered over it, for a child that inherits
+      ## (`isolateEnv` false). A host that must keep a variable away from the
+      ## monitored child, and cannot copy its whole environment across without
+      ## bypassing the injection rules `childEnv` owns, names it here. Matched
+      ## exactly, case-insensitively on Windows. Ignored when `isolateEnv` is
+      ## true, which already starts the child from `env` alone. A name also set
+      ## in `env` takes the `env` value.
     # IoMon-Decomposed-Host-API DH-1 — PER-CALL working directory for the
     # monitored child. Empty means "inherit the hosting process's cwd"
     # (the historical behaviour). Set per-call rather than by `chdir`-ing

@@ -1455,6 +1455,19 @@ proc addHostEnvEntry(dest: StringTableRef; key, value: string) =
 const ChildEnvMode =
   when defined(windows): modeCaseInsensitive else: modeCaseSensitive
 
+proc unsetEnvHas(names: openArray[string]; key: string;
+                 mode: StringTableMode): bool =
+  ## Is `key` one of the host names `FsSnoopRequest.unsetEnv` removes? Compared
+  ## the way the child's table compares names, so Windows folds case and POSIX
+  ## keeps it.
+  for name in names:
+    if mode == modeCaseInsensitive:
+      if cmpIgnoreCase(name, key) == 0:
+        return true
+    elif name == key:
+      return true
+  false
+
 proc childEnv(request: FsSnoopRequest;
               injected: openArray[(string, string)];
               mode: StringTableMode = ChildEnvMode): StringTableRef =
@@ -1492,7 +1505,12 @@ proc childEnv(request: FsSnoopRequest;
   result = newStringTable(mode)
   if not request.isolateEnv:
     for key, value in envPairs():
-      addHostEnvEntry(result, key, value)
+      # `unsetEnv` removes host names before anything is layered, so a name the
+      # caller removes is absent and a name it also sets comes from `env`. Only
+      # the host copy is filtered: the injection below still wins, and no
+      # needle is ever copied in from anywhere but this loop.
+      if not unsetEnvHas(request.unsetEnv, key, mode):
+        addHostEnvEntry(result, key, value)
   for (key, value) in request.env:
     result[key] = value
   for (key, value) in injected:
