@@ -189,12 +189,12 @@ jobs:
           env-flavor: ${{ matrix.env }}
           repro-from-source: ${{ matrix.env == 'reprobuild' }}
           # The same engine, and its own flake-lock RunQuota and io-mon
-          # bootstrap inputs, as ci-reprobuild.yml: reprobuild v0.2.18. An
+          # bootstrap inputs, as ci-reprobuild.yml: reprobuild v0.2.23. An
           # older engine rejects the committed v3 `repro.lock`
           # (tests/test_ci_engine_reads_committed_lock.py checks both files).
-          repro-build-pin: 413830138a7a73293dfc551d623f7bf2cb0ab62c
-          repro-runquota-pin: 35b9dfe4af6e18f3f2a2242ece7cff330eb581e2
-          repro-io-mon-pin: 6fccd929cb09da0bfc0844b93ced9ffb1ac0f74f
+          repro-build-pin: 9dbf4e710d7cc0b9a79a4bcd54c931afb6849dd0
+          repro-runquota-pin: 9818dc0c90be8ba7993424a7bbfbb6e009ffa965
+          repro-io-mon-pin: 7a9b2f331024f4bc0b952bcab89b1dc48525d804
           gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: Point sibling source overrides at the locked checkouts
