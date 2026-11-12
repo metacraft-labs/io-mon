@@ -855,6 +855,28 @@ int repro_linux_sockaddr_un_path(void *addr, unsigned int addrlen,
   return n;
 }
 
+/* `inet_ntop` under its own, unfortified name.
+ *
+ * glibc 2.42 added a `_FORTIFY_SOURCE` wrapper for `inet_ntop`
+ * (<bits/inet-fortified.h>) that redirects every call to `__inet_ntop_chk`, a
+ * symbol that exists only as `__inet_ntop_chk@GLIBC_2.42`. The Nix compiler
+ * wrapper fortifies by default, so calling `inet_ntop` here made the shim
+ * itself require GLIBC_2.42, and the dynamic loader then refuses to preload it
+ * into any process whose libc is older: on an Ubuntu 24.04 host (glibc 2.39)
+ * `/bin/sh` died with "version `GLIBC_2.42' not found" before running a
+ * single command. The shim is injected into whatever images a monitored
+ * action runs, host binaries included, so its glibc floor is the floor of
+ * every process it monitors, and a formatting call must not raise it.
+ *
+ * An asm label binds the call to the plain `inet_ntop` symbol
+ * (inet_ntop@GLIBC_2.2.5 on x86_64), which the fortify wrapper — an inline
+ * function named `inet_ntop` — never sees. Nothing is lost: the only caller
+ * passes a buffer of exactly INET6_ADDRSTRLEN bytes and its true size, so the
+ * object-size check the wrapper would add can never fire. */
+extern const char *repro_linux_inet_ntop_plain(int af, const void *src,
+                                               char *dst, socklen_t size)
+    __asm__("inet_ntop");
+
 /* The AF_INET / AF_INET6 destination a client dialled, as text — "a.b.c.d:port"
    or "[v6]:port", the spelling the macOS shim's `repro_macos_socket_describe`
    gives the same address, so a consumer compares one string on both. Returns the
@@ -872,12 +894,15 @@ int repro_linux_sockaddr_inet_dest(void *addr, unsigned int addrlen,
   if (family == AF_INET) {
     if (addrlen < sizeof(struct sockaddr_in)) return 0;
     struct sockaddr_in *in4 = (struct sockaddr_in *)addr;
-    if (inet_ntop(AF_INET, &in4->sin_addr, ip, sizeof ip) == NULL) return 0;
+    if (repro_linux_inet_ntop_plain(AF_INET, &in4->sin_addr, ip, sizeof ip) == NULL)
+      return 0;
     port = ntohs(in4->sin_port);
   } else if (family == AF_INET6) {
     if (addrlen < sizeof(struct sockaddr_in6)) return 0;
     struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
-    if (inet_ntop(AF_INET6, &in6->sin6_addr, ip, sizeof ip) == NULL) return 0;
+    if (repro_linux_inet_ntop_plain(AF_INET6, &in6->sin6_addr, ip, sizeof ip) ==
+        NULL)
+      return 0;
     port = ntohs(in6->sin6_port);
     out[n++] = '[';
   } else {
