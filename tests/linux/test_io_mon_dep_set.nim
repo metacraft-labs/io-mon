@@ -135,6 +135,14 @@ proc goldenProjection(dep: MonitorDepFile; workPrefix: string): seq[byte] =
   ## per-run launcher-noise field. The resulting canonical iomon bytes depend only
   ## on the observed dependency identities the SET transport must preserve — a
   ## committable golden.
+  ##
+  ## A process-start's `path` is its image, resolved by the kernel (symlinks
+  ## followed). It is kept only for the workload's OWN images, under
+  ## `workPrefix` (spelled or physical); a system tool's image depends on the
+  ## host's layout (a Nix `true` resolves to the `coreutils` multicall binary,
+  ## a distribution's to `true`), so it is projected to "" like the
+  ## system-library reads.
+  let physicalWork = expandFilename(workPrefix)
   var norm: seq[MonitorRecord]
   for r in dep.records:
     case r.kind
@@ -154,6 +162,9 @@ proc goldenProjection(dep: MonitorDepFile; workPrefix: string): seq[byte] =
     n.result = 0
     n.probeResult = prUnknown
     n.detail = ""
+    if r.kind == mrProcessStart and not (r.path.startsWith(workPrefix) or
+        r.path.startsWith(physicalWork)):
+      n.path = ""
     if n.path.len > 0:
       n.path = extractFilename(n.path)
     norm.add n

@@ -10,9 +10,10 @@ it did not repair loading two distinct shim copies into one process.
 The transparency and completeness contracts in
 `docs/contributors/architecture.md` require a monitored program to retain its
 behavior and uncertainty to be reported explicitly. Nested monitoring must not
-hang a child before `main`. The authorized
-[local follow-up requirements](https://github.com/metacraft-labs/metacraft-pm/blob/d731cdeae22cd2953dd8057bac3dbc3f4167ccd2/infrastructure/tool-release-local-followups.md)
-require a bounded reproducer and preserved independent session evidence.
+hang a child before `main`. The release
+follow-up requirements ask for a bounded real-process reproducer, and require
+independent inner and outer sessions to keep their own evidence and terminate
+normally.
 
 ## Reproduction
 

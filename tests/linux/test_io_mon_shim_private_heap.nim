@@ -33,9 +33,11 @@
 ##      `io-mon run`, with every child exiting, within its time limit.
 ##   3. A mismatched `REPRO_MONITOR_SHIM_LIB` on the preloaded timeout
 ##      wrapper injects a second distinct shim at exec. Both images must let
-##      the stress host's raw-clone children finish. The host reports its
-##      actual loaded-image count so this cannot silently become a one-image
-##      test. Same-path, unset and nonexistent overrides are controls.
+##      the stress host's raw-clone children finish; under `io-mon run` only
+##      the first records, so the capture carries no second writer's marker.
+##      The host reports its actual loaded-image count so this cannot
+##      silently become a one-image test. Same-path, unset and nonexistent
+##      overrides are controls.
 ##
 ## Mocks: none. The hosts are real programs and the shim is the built
 ## library; the selftest forges lock states because the races it stands in
@@ -412,10 +414,18 @@ suite "io-mon shim's private heap stays live":
       check captured.code == 0
       check countAfter(captured.output, "shim_images=") == 2
       let dep = readMonitorDepFile(depfile)
+      let losses = dep.records.filterIt(it.kind == mrEventLoss)
+      checkpoint(mode & ", monitored mismatch losses: " &
+        $losses.mapIt(it.detail))
+      # Both images are loaded, but only the first preload (the one that owns
+      # the program's symbols) records; the second stands down. So the capture
+      # has one writer, and the mismatch marker a recording second image would
+      # add is absent. The raw-clone children of this multi-threaded host
+      # still make it incomplete, through the active image's own report.
       check dep.completeness == mcIncomplete
-      check dep.records.anyIt(it.kind == mrEventLoss and
-        "distinct loaded shim subscriber" in it.detail and
-        "REPRO_MONITOR_SHIM_LIB mismatch" in it.detail)
+      check losses.anyIt(
+        "linux fork child skipped evidence before exec" in it.detail)
+      check not losses.anyIt("distinct loaded shim subscriber" in it.detail)
 
   test "t_private_heap_survives_signals_forks_and_raw_clones":
     let bare = runHost(@[stressHost, marker, "2"], baseEnv())

@@ -6,18 +6,16 @@
 ## finds `*.nimble` files in a project's parent directories with `walkFiles`,
 ## which is glob on POSIX: adding or removing a `.nimble` file there changes
 ## how the compile resolves packages, yet nothing the monitor recorded named
-## those directories, so the cached compile was never invalidated on Linux
-## (reprobuild-pm issue 2026-10-16-io-mon-linux-shim-misses-directory-scans-
-## made-through-glob). The macOS backend already records these scans, because
+## those directories, so the cached compile was never invalidated on Linux.
+## The macOS backend already records these scans, because
 ## Darwin's glob reaches the interposed `opendir`.
 ##
 ## A scan is PATTERN-SCOPED: glob keeps only the entries that match one
 ## component of the pattern, so the enumeration carries that component
 ## (detail `GlobPatternDetailPrefix & <component>`) and a consumer can key on
 ## the matching entries alone. Without it, every unrelated file created beside
-## a project's sources would invalidate each Nim compile in the project
-## (reprobuild-pm issue 2026-10-17-nimble-glob-keys-nim-edges-on-the-full-
-## membership-of-tracked-directories). Where the component cannot be named
+## a project's sources would invalidate each Nim compile in the project.
+## Where the component cannot be named
 ## with certainty the scan must stay a FULL enumeration, because a pattern
 ## narrower than glob's would drop a dependency.
 ##

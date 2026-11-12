@@ -110,6 +110,24 @@ three nesting levels, inner loss, interruption and real filesystem failures.
 ### Linux
 
 - **`LD_PRELOAD` Shim**: Injects wrapper symbols that route filesystem activity to the monitor.
+- **One active shim per process**: nested monitors can preload two distinct
+  shim builds into one child (an inner host puts its shim in front of the
+  list it inherited, or an outer exec hook meets a route that names another
+  shim). glibc loads both, and the first image's forwarders reach the
+  second's wrappers, so both would record every call into the same
+  fragments. Only the image that owns the program's symbols records: each
+  image looks up a symbol only io-mon shims define through the program's
+  `dlopen(NULL)` handle, which searches the startup objects in load order
+  ([POSIX `dlopen`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/dlopen.html)).
+  `RTLD_DEFAULT` would not do: the shim links with `-Bsymbolic`, and glibc
+  answers an `RTLD_DEFAULT` lookup from such a library with its own
+  definition first. Every other image initialises nothing and forwards
+  unrecorded. The exec and spawn wrappers also put an inner route's own
+  `REPRO_MONITOR_SHIM_LIB` into the child's `LD_PRELOAD` instead of the
+  parent's shim, so the run that asked for a shim is recorded by it. The
+  enclosing run sees that child through the nested handoff
+  (`src/io_mon/nested_capture.nim`). Test:
+  `tests/linux/test_io_mon_linux_nested_distinct_shims.nim`.
 - **Raw Syscall Hooking**: Uses a raw-syscall SIGTRAP substrate to intercept inline `0f 05` assembly instructions inside main executable pages and custom dynamic libraries. Only the image's executable sections (`SHF_EXECINSTR`, read from its ELF section table through `linux_image_code_ranges`) are scanned: an `R E` segment can also carry `.rodata`/`.eh_frame` (BOLT output, `-z noseparate-code`), and decoding that data once INT3-patched a jump-table entry of rustc 1.94.0. An image whose section table cannot be read is left unscanned and reported as event loss (`skipped image without a readable executable-section table`).
 - **Library-Load Observation (`dl_iterate_phdr`)**: `ld.so` maps a shared object through
   internal `__mmap` / `__open64_nocancel` calls that do **not** traverse `LD_PRELOAD`
@@ -173,4 +191,4 @@ three nesting levels, inner loss, interruption and real filesystem failures.
 
 - It maintains zero dependency on `reprobuild`.
 - It depends solely on `nim-stackable-hooks`.
-- The binary depfile format (`IOMN` version 1) is io-mon's own; the shim ABI names (`repro_monitor_shim_*`) are kept byte-identical so the observation stack remains a drop-in replacement across the suite.
+- The binary depfile format (`IOMN` version 2; see `IomonVersion` for when it is bumped) is io-mon's own; the shim ABI names (`repro_monitor_shim_*`) are kept byte-identical so the observation stack remains a drop-in replacement across the suite.

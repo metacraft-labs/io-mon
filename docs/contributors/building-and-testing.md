@@ -80,9 +80,11 @@ after a task exception.
 `repro build .#test-monitor-isolation --write-report=build/monitor-isolation-repeat.json`
 reruns the programs whose fixture must own its monitor environment. Their
 compilation stays monitored and their execution stays uncached. CI requires
-all selected programs to launch and succeed on the repeat: 48 on macOS, 21
-on Linux and eight on Windows. Update that explicit inventory when adding an
-isolated program; keep the complete report among failure artifacts.
+all selected programs to launch and succeed on the repeat: 51 on macOS
+(every `tests/macos` program plus eight named ones), 27 on Linux and eleven
+on Windows. Update that explicit inventory when adding an isolated program,
+including a new `tests/macos` program, which is isolated by directory; keep
+the complete report among failure artifacts.
 
 The Linux uninjectable-image oracle also owns its shim: its disabled-thread
 controls require an unnamed loss, which an enclosing monitor changes by
@@ -102,6 +104,24 @@ passes under `just test` and fails under `repro test`. Its bare and
 (`tests/helpers/unmonitored_env.nim`), which drops `LD_PRELOAD` and every
 `REPRO_MONITOR_*` variable, and set `REPRO_MONITOR_SHIM_LIB` explicitly in each
 monitored arm.
+
+On Windows the same holds for a test that grades a record only the current
+shim writes. Its capture finds the shim through `findShimLibrary`, which
+honours an inherited `REPRO_MONITOR_SHIM_LIB` before discovery, and under
+`repro test` the enclosing monitor sets that variable to the engine's own
+shim. The capture then injects the io-mon the engine was built with, not this
+checkout's, and a record newer than that io-mon is missing. Such a test must
+be in the isolation list too, so discovery finds `build/lib`.
+
+A Windows test that sets `REPRO_MONITOR_SHIM_LIB` to `build/lib` itself, or to
+any shim other than the inherited one, belongs on the list as well. Its inner
+capture parks the root's main thread to call `repro_runtime_init` on it, while
+the enclosing shim has already injected itself into that suspended root from
+its `CreateProcessW` hook. The borrowed call then fails with
+`repro_runtime_init could not be called on its parked main thread`. A test
+that only runs with an MSYS2 or Cygwin `sh` can hide this for a long time:
+it skips wherever `sh` has no `msys-2.0.dll` beside it, as Git for Windows'
+`bin/sh.exe` launcher does not.
 
 At `40a0adc` plus the workflow inventory repair, the macOS repeat passes all
 137 actions and launches all 45 isolated programs. The previous expectation

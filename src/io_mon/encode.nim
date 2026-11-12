@@ -173,9 +173,9 @@ proc decodeFramesTolerant*(bytes: openArray[byte]; cleanEof: var bool):
   ## ``cleanEof`` reports whether decoding consumed the WHOLE buffer with
   ## no leftover bytes. ``false`` means the fragment ended with bytes that
   ## could not be decoded as a complete frame — a partial iomon write (e.g.
-  ## a SIGKILL'd shim) or outright corruption. Per Monitor-Hook-Shim.md
-  ## §"Failure Semantics" ("partial iomon writes MUST fail reader
-  ## validation"; "shim crash MUST reject cache publication"), the caller
+  ## a SIGKILL'd shim) or outright corruption. The monitor's failure contract
+  ## says partial iomon writes MUST fail reader validation and a shim crash
+  ## MUST reject cache publication, so the caller
   ## MUST treat ``cleanEof == false`` as monitor-evidence incompleteness so
   ## the action fails closed and is not published to the cache. We still
   ## recover every complete leading frame so diagnostics/streaming can show

@@ -1,9 +1,10 @@
 # Releasing io-mon
 
-The [tool release specification](https://github.com/metacraft-labs/metacraft-specs/blob/latest/infrastructure/gosti-io-mon-runquota-releases.md)
-sets the release scope. `.github/release.json` defines the exact asset matrix;
-`.github/workflows/release.yml` calls an immutable shared workflow revision.
-Update both `uses` and `tooling-ref` together when changing shared tooling.
+The release scope (which targets ship, which are deferred, and what each
+payload must prove) is set out in the sections below. `.github/release.json`
+defines the exact asset matrix; `.github/workflows/release.yml` calls an
+immutable shared workflow revision. Update both `uses` and `tooling-ref`
+together when changing shared tooling.
 
 ## Targets and checks
 

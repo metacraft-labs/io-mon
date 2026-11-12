@@ -9,7 +9,7 @@
 ## around the probe, assert the read is captured) lives in
 ## `tests/posix/test_io_mon_snoop_cli_capture.nim`.
 
-import std/[os, osproc, streams, strutils, tempfiles, unittest]
+import std/[os, osproc, strutils, tempfiles, unittest]
 
 import io_mon  # writeCanonical, MonitorRecord, observation kinds
 import fixture_cleanup
@@ -25,7 +25,12 @@ proc run(cmd: string; args: seq[string]):
     tuple[output: string; code: int] =
   let p = startProcess(cmd, args = args,
     options = {poStdErrToStdOut, poUsePath})
-  let output = p.outputStream.readAll()
+  # Drain the pipe to EOF. `Stream.readAll` stops at the first read shorter
+  # than its buffer, and on Windows a pipe read returns only what the child
+  # has written so far, so a compiler diagnostic could be cut short.
+  var output = ""
+  for line in p.lines(keepNewLines = true):
+    output.add(line)
   let code = p.waitForExit()
   p.close()
   (output, code)

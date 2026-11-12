@@ -1,7 +1,7 @@
 ## Entering an image the loader will not inject the shim into is event-loss.
 ##
-## THE DEFECT THIS PINS (reprobuild-pm issue
-## 2026-10-22-linux-process-whose-loader-ignores-the-shim-is-graded-complete).
+## THE DEFECT THIS PINS: a Linux process whose loader ignores the shim was
+## graded complete.
 ## glibc's loader refuses a 64-bit `LD_PRELOAD` object in a 32-bit process
 ## ("wrong ELF class: ignored") and runs the program anyway, and a static
 ## binary has no loader at all. Either way that image runs with no shim and

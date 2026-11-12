@@ -25,6 +25,7 @@ proc recordKindName(record: MonitorRecord): string =
   of mrTimeRead: "time-read"
   of mrExternalContent: "external-content"
   of mrPathMutation: "path-mutation"
+  of mrConnectAttempt: "connect-attempt"
 
 proc observationKindName(record: MonitorRecord): string =
   case record.observationKind
@@ -45,6 +46,7 @@ proc observationKindName(record: MonitorRecord): string =
   of moTimeRead: "time-read"
   of moExternalContent: "external-content"
   of moPathMutation: "path-mutation"
+  of moConnectAttempt: "connect-attempt"
 
 proc itemKindName(kind: FsSnoopStreamItemKind): string =
   case kind

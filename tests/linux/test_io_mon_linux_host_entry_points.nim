@@ -3,8 +3,8 @@
 ## mean for dependency evidence (Linux).
 ##
 ## WHY. Under monitoring every Node 24 and Chromium run was `mcIncomplete`
-## (reprobuild-pm issue 2026-10-02-action-monitor-prevents-declared-browser-
-## launch, Grafana addendum), for reasons that were not evidence of anything
+## (a monitored action that launches a browser), for reasons that were not
+## evidence of anything
 ## missing — and, once those were gone, some of the runs would have been
 ## `mcComplete` with dependencies silently missing. Each case below is one
 ## measured cause, reproduced deterministically in C:

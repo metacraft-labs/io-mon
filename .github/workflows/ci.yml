@@ -28,8 +28,8 @@ concurrency:
 jobs:
   choose-macos:
     # Native macOS jobs retain their full gates while the fleet repair lands.
-    # Owner: zah. Follow-up: metacraft-specs/issues/
-    # 2026-09-28-shared-macos-host-has-no-headroom-for-runquota-measurements.md
+    # Owner: zah. Follow-up (internal tracker):
+    # 2026-09-28-shared-macos-host-has-no-headroom-for-runquota-measurements
     uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@146ea35853f859bcf78cc5da7fa53705a825da30
     with:
       preferred: macos-26
@@ -60,7 +60,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@9456226e58b7db8538c96936136fe73a1a12974d
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
@@ -83,7 +83,7 @@ jobs:
       - name: Mirror logs to S3 (non-blocking)
         if: always()
         continue-on-error: true
-        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@9456226e58b7db8538c96936136fe73a1a12974d
         with:
           path: lint.log
           prefix: lint-logs/${{ github.run_id }}
@@ -122,7 +122,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@9456226e58b7db8538c96936136fe73a1a12974d
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
@@ -142,7 +142,7 @@ jobs:
       - name: Mirror logs to S3 (non-blocking)
         if: always()
         continue-on-error: true
-        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@9456226e58b7db8538c96936136fe73a1a12974d
         with:
           path: build.log
           prefix: build-logs-${{ matrix.slug }}/${{ github.run_id }}
@@ -184,17 +184,17 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@9456226e58b7db8538c96936136fe73a1a12974d
         with:
           env-flavor: ${{ matrix.env }}
           repro-from-source: ${{ matrix.env == 'reprobuild' }}
           # The same engine, and its own flake-lock RunQuota and io-mon
-          # bootstrap inputs, as ci-reprobuild.yml: reprobuild v0.2.18. An
+          # bootstrap inputs, as ci-reprobuild.yml: reprobuild v0.2.23. An
           # older engine rejects the committed v3 `repro.lock`
           # (tests/test_ci_engine_reads_committed_lock.py checks both files).
-          repro-build-pin: 413830138a7a73293dfc551d623f7bf2cb0ab62c
-          repro-runquota-pin: 35b9dfe4af6e18f3f2a2242ece7cff330eb581e2
-          repro-io-mon-pin: 6fccd929cb09da0bfc0844b93ced9ffb1ac0f74f
+          repro-build-pin: 9dbf4e710d7cc0b9a79a4bcd54c931afb6849dd0
+          repro-runquota-pin: 9818dc0c90be8ba7993424a7bbfbb6e009ffa965
+          repro-io-mon-pin: 7a9b2f331024f4bc0b952bcab89b1dc48525d804
           gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: Point sibling source overrides at the locked checkouts
@@ -255,7 +255,7 @@ jobs:
       - name: Mirror logs to S3 (non-blocking)
         if: always()
         continue-on-error: true
-        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@9456226e58b7db8538c96936136fe73a1a12974d
         with:
           path: test.log
           prefix: test-logs-${{ matrix.env }}-${{ matrix.slug }}/${{ github.run_id }}
@@ -301,8 +301,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: metacraft-labs/nim-shm-gset
-          # Same revision as .github/sibling-repos and shm-gset-src in flake.nix.
-          ref: 43a61120ae54b542c3e3038453094cca707a6c05
+          # Same revision as .github/sibling-repos and shm-gset-src in flake.nix:
+          # src/io_mon/writer.nim calls `emitNoGrow`, which arrived in 7bc81ad2.
+          ref: 7bc81ad2440860a8a9254eb2757c585df9652438
           path: nim-shm-gset
           token: ${{ steps.app-token.outputs.token }}
 

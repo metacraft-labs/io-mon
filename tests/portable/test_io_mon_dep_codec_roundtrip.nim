@@ -52,7 +52,7 @@ const
   FactScopedKinds = {mrLibraryLoad, mrEnvRead, mrSysctlRead, mrTimeRead}
   ProcessScopedKinds = {mrProcessStart, mrProcessExec, mrProcessSpawn,
     mrFileWrite, mrEventLoss, mrBackendProfile, mrCapabilityGap, mrIpcConnect,
-    mrNonDeterministic, mrExternalContent, mrPathMutation}
+    mrNonDeterministic, mrExternalContent, mrPathMutation, mrConnectAttempt}
 
 proc representativeRecords(): seq[MonitorRecord] =
   result = @[

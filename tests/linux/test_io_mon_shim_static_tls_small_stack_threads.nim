@@ -2,8 +2,7 @@
 ## neither make a host's small-stack `pthread_create` fail nor overflow a
 ## small-stack thread inside a hook (Linux).
 ##
-## THE DEFECT (reprobuild-pm issue
-## 2026-10-02-action-monitor-prevents-declared-browser-launch): under full
+## THE DEFECT (a monitored action could not launch a browser): under full
 ## action monitoring Node 24 printed `pthread_create: Invalid argument` and
 ## Playwright's Chromium launch then timed out. Without the monitor it worked.
 ##

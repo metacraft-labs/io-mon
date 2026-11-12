@@ -22,7 +22,7 @@
 ##     while the FILE says something different. Only frozen bytes catch it, and
 ##     only frozen bytes whose fields differ from one another.
 ##
-## The three fields the format PINS to small values (`kind` 1..19, `obs` 1..17,
+## The three fields the format PINS to small values (`kind` 1..20, `obs` 1..18,
 ## `probe` 0..4) plus `seq` (which the reader requires to be exactly 1..N) can
 ## never be made informative by any legal file. They are the other half of the
 ## oracle and live in `test_io_mon_wire_negative_oracle.nim`.

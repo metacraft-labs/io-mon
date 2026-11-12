@@ -92,7 +92,11 @@ short-lived children with a chdir file action will almost never be cached.
    otherwise. Costs: a new record shape or detail, and merge logic that must
    never discharge a marker for a child that ran an uninjectable image first
    (the case this re-check exists for: an uninjectable image that exec'd on
-   into a monitored one in the same pid).
+   into a monitored one in the same pid). Since every process-start now
+   carries the image its process runs (`/proc/self/exe`, read at shim init;
+   docs/usage.md, "The process-start image"), the merge has the "expected
+   image" to compare against without any new child-side record; the marker
+   and the merge rule remain.
 
 Neither is a local fix; both change the shim/host contract and need a human
 decision before implementation.

@@ -40,8 +40,9 @@
 ## include probes, and the new lexical companions must add matchable negative deps
 ## WITHOUT downgrading or flooding.
 ##
-## See reprobuild-specs/MacOS-Monitoring-Adversarial-Hardening.milestones.org
-## (ROUND 5) and reprobuild-specs/io-mon-hardening-protocol.md.
+## Round 5 of the macOS adversarial-hardening campaign (probes that look for a
+## dependency the monitor misses while still reporting mcComplete). Its rule:
+## never claim mcComplete when a real dependency may have been missed.
 
 import std/[os, strutils, unittest]
 import io_mon

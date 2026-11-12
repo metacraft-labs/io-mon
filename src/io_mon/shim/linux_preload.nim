@@ -27,6 +27,8 @@ from io_mon/paths import anchoredRelativePath, extendedPath,
   startsWithParentRef
 
 import io_mon/types
+import io_mon/tree_ledger
+import io_mon/posix_connect
 import io_mon/writer
 import io_mon/hooks/linux_preload_runtime
 import io_mon/shim/linux_pod_tables
@@ -47,6 +49,10 @@ import stackable_hooks/platform/linux_raw_syscalls
 when defined(amd64):
   const
     LinuxSysRead                  = 0.clong
+    LinuxSysWrite                 = 1.clong
+    LinuxSysPwrite64              = 18.clong
+    LinuxSysWritev                = 20.clong
+    LinuxSysPwritev               = 296.clong
     LinuxSysOpen                  = 2.clong
     LinuxSysClose                 = 3.clong
     LinuxSysStat                  = 4.clong
@@ -110,6 +116,10 @@ when defined(amd64):
 elif defined(arm64):
   const
     LinuxSysRead                  = 63.clong
+    LinuxSysWrite                 = 64.clong
+    LinuxSysPwrite64              = 68.clong
+    LinuxSysWritev                = 66.clong
+    LinuxSysPwritev               = 70.clong
     LinuxSysOpen                  = -1001.clong  # no SYS_open on this architecture
     LinuxSysClose                 = 57.clong
     LinuxSysStat                  = -1002.clong  # no SYS_stat on this architecture
@@ -177,6 +187,10 @@ elif defined(arm):
   # by the `_Static_assert`s below on every build.
   const
     LinuxSysRead                  = 3.clong
+    LinuxSysWrite                 = 4.clong
+    LinuxSysPwrite64              = 181.clong
+    LinuxSysWritev                = 146.clong
+    LinuxSysPwritev               = 362.clong
     LinuxSysOpen                  = 5.clong
     LinuxSysClose                 = 6.clong
     LinuxSysStat                  = 106.clong
@@ -338,6 +352,26 @@ _Static_assert(""", LinuxSysAccess, """ < 0, "LinuxSysAccess: SYS_access is abse
 _Static_assert(""", LinuxSysGetpid, """ == SYS_getpid, "LinuxSysGetpid != SYS_getpid");
 #else
 _Static_assert(""", LinuxSysGetpid, """ < 0, "LinuxSysGetpid: SYS_getpid is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_write
+_Static_assert(""", LinuxSysWrite, """ == SYS_write, "LinuxSysWrite != SYS_write");
+#else
+_Static_assert(""", LinuxSysWrite, """ < 0, "LinuxSysWrite: SYS_write is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_pwrite64
+_Static_assert(""", LinuxSysPwrite64, """ == SYS_pwrite64, "LinuxSysPwrite64 != SYS_pwrite64");
+#else
+_Static_assert(""", LinuxSysPwrite64, """ < 0, "LinuxSysPwrite64: SYS_pwrite64 is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_writev
+_Static_assert(""", LinuxSysWritev, """ == SYS_writev, "LinuxSysWritev != SYS_writev");
+#else
+_Static_assert(""", LinuxSysWritev, """ < 0, "LinuxSysWritev: SYS_writev is absent, so the Nim value must be a negative sentinel");
+#endif
+#ifdef SYS_pwritev
+_Static_assert(""", LinuxSysPwritev, """ == SYS_pwritev, "LinuxSysPwritev != SYS_pwritev");
+#else
+_Static_assert(""", LinuxSysPwritev, """ < 0, "LinuxSysPwritev: SYS_pwritev is absent, so the Nim value must be a negative sentinel");
 #endif
 #ifdef SYS_sendfile
 _Static_assert(""", LinuxSysSendfile, """ == SYS_sendfile, "LinuxSysSendfile != SYS_sendfile");
@@ -595,6 +629,11 @@ var
   # byte-identical (a Nix gcc/rustc bash-wrapper that re-execs the real compiler
   # in-place) remain DISTINCT elements instead of deduping down to mcIncomplete.
   currentExecGen: clong = 0
+  # The file THIS image runs, as `readlink("/proc/self/exe")` named it at init
+  # (empty when it could not be read whole). Recorded as the `path` of every
+  # `mrProcessStart` this image emits, its fork children's included: a fork
+  # child runs the same file. See `recordProcessStart`.
+  selfImagePath: string
   nextProcessSeq: uint64 = 0
   rawSyscallCoverageRecorded = false
   inlineSyscallCoverageRecorded = false
@@ -643,6 +682,7 @@ var
 #include <sys/un.h>
 #include <stddef.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -748,8 +788,18 @@ void repro_linux_set_errno(int value) {
   errno = value;
 }
 
+/* Whether a failed connect(2) may still reach its peer, so that it is recorded
+ * as a connection (`mrIpcConnect`) rather than as an attempt that reached
+ * nobody. EINPROGRESS / EALREADY / EWOULDBLOCK: a non-blocking connect still
+ * in flight. EINTR: a BLOCKING connect interrupted by a caught signal, which
+ * POSIX says "shall not be aborted, and the connection shall be established
+ * asynchronously" (connect(), ERRORS / DESCRIPTION,
+ * https://pubs.opengroup.org/onlinepubs/9799919799/functions/connect.html).
+ * Leaving it out recorded nothing at all for it, so a signal handler installed
+ * without SA_RESTART made an undeclared connection invisible. */
 int repro_linux_errno_is_connect_in_progress(int value) {
-  return value == EINPROGRESS || value == EALREADY || value == EWOULDBLOCK;
+  return value == EINPROGRESS || value == EALREADY || value == EWOULDBLOCK ||
+         value == EINTR;
 }
 
 int repro_linux_sockaddr_family(void *addr, unsigned int addrlen) {
@@ -801,6 +851,70 @@ int repro_linux_sockaddr_un_path(void *addr, unsigned int addrlen,
       out[n++] = c;
     }
   }
+  out[n] = '\0';
+  return n;
+}
+
+/* `inet_ntop` under its own, unfortified name.
+ *
+ * glibc 2.42 added a `_FORTIFY_SOURCE` wrapper for `inet_ntop`
+ * (<bits/inet-fortified.h>) that redirects every call to `__inet_ntop_chk`, a
+ * symbol that exists only as `__inet_ntop_chk@GLIBC_2.42`. The Nix compiler
+ * wrapper fortifies by default, so calling `inet_ntop` here made the shim
+ * itself require GLIBC_2.42, and the dynamic loader then refuses to preload it
+ * into any process whose libc is older: on an Ubuntu 24.04 host (glibc 2.39)
+ * `/bin/sh` died with "version `GLIBC_2.42' not found" before running a
+ * single command. The shim is injected into whatever images a monitored
+ * action runs, host binaries included, so its glibc floor is the floor of
+ * every process it monitors, and a formatting call must not raise it.
+ *
+ * An asm label binds the call to the plain `inet_ntop` symbol
+ * (inet_ntop@GLIBC_2.2.5 on x86_64), which the fortify wrapper — an inline
+ * function named `inet_ntop` — never sees. Nothing is lost: the only caller
+ * passes a buffer of exactly INET6_ADDRSTRLEN bytes and its true size, so the
+ * object-size check the wrapper would add can never fire. */
+extern const char *repro_linux_inet_ntop_plain(int af, const void *src,
+                                               char *dst, socklen_t size)
+    __asm__("inet_ntop");
+
+/* The AF_INET / AF_INET6 destination a client dialled, as text — "a.b.c.d:port"
+   or "[v6]:port", the spelling the macOS shim's `repro_macos_socket_describe`
+   gives the same address, so a consumer compares one string on both. Returns the
+   length written (excluding the terminator), 0 for any other family, a short
+   address, or an output buffer too small. Never reads past `addrlen`; calls only
+   `inet_ntop` (pure formatting, no allocation, no locale) — safe in a hook. */
+int repro_linux_sockaddr_inet_dest(void *addr, unsigned int addrlen,
+                                   char *out, int cap) {
+  if (addr == NULL || out == NULL || cap < 64) return 0;
+  if (addrlen < sizeof(sa_family_t)) return 0;
+  sa_family_t family = ((struct sockaddr *)addr)->sa_family;
+  char ip[INET6_ADDRSTRLEN];
+  unsigned port;
+  int n = 0;
+  if (family == AF_INET) {
+    if (addrlen < sizeof(struct sockaddr_in)) return 0;
+    struct sockaddr_in *in4 = (struct sockaddr_in *)addr;
+    if (repro_linux_inet_ntop_plain(AF_INET, &in4->sin_addr, ip, sizeof ip) == NULL)
+      return 0;
+    port = ntohs(in4->sin_port);
+  } else if (family == AF_INET6) {
+    if (addrlen < sizeof(struct sockaddr_in6)) return 0;
+    struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
+    if (repro_linux_inet_ntop_plain(AF_INET6, &in6->sin6_addr, ip, sizeof ip) ==
+        NULL)
+      return 0;
+    port = ntohs(in6->sin6_port);
+    out[n++] = '[';
+  } else {
+    return 0;
+  }
+  for (const char *c = ip; *c && n < cap - 9; c++) out[n++] = *c;
+  if (family == AF_INET6) out[n++] = ']';
+  out[n++] = ':';
+  char digits[6];
+  int d = 0;
+  do { digits[d++] = (char)('0' + port % 10); port /= 10; } while (port && d < 5);
+  while (d > 0) out[n++] = digits[--d];
   out[n] = '\0';
   return n;
 }
@@ -944,6 +1058,11 @@ extern int repro_monitor_shim_shutdown(void);
  * reads (no allocation, no lock acquisition) — see the writer-side
  * signature.
  *
+ * Trapped inline syscalls still queued for classification are reported as
+ * event-loss before the marker is written (see
+ * repro_linux_sig_safe_flush_at_signal_death): a signal ends the image at
+ * none of the points that classify them.
+ *
  * SIGKILL and SIGSTOP are uncatchable by design; losses through those
  * paths remain inherent event-loss (correctly counted by mergeFragments).
  */
@@ -967,15 +1086,16 @@ extern void repro_linux_sig_safe_mark_slot_closed(void);
 static struct sigaction repro_prev_sigaction[32];
 static int repro_prev_sigaction_valid[32];
 
-/* Exported so the inline-syscall SIGTRAP handler in
- * `linux_preload_runtime.nim` can invoke the same async-signal-safe flush
- * before replaying an inline-asm SYS_exit_group / SYS_exit that would
- * otherwise terminate the process with an un-flushed read batch (the
- * M9.R.62.4 pixman residual, closed by M9.R.63.3). All other callers
- * remain inside this translation unit; the external symbol is only
- * consumed by the runtime's SIGTRAP handler through a matching extern
- * declaration. */
-void repro_linux_sig_safe_flush(void) {
+extern int ct_linux_report_inline_events_into_fragment(int fd);
+
+/* `commit` is 0 when the image ends with trapped inline events whose loss
+ * could not be reported to a file of its own (see
+ * repro_linux_sig_safe_flush_at_signal_death). The batch is still written,
+ * then the loss frame goes into this fragment through the open descriptor;
+ * only if that fails too is the committed marker withheld, so that a pending
+ * sentinel this batch armed stays unretired and the merge grades the capture
+ * incomplete. */
+static void repro_linux_sig_safe_flush_impl(int commit) {
   int fd;
   long saved_errno = errno;
   if (!repro_linux_sig_safe_slot_is_open())
@@ -1009,10 +1129,14 @@ void repro_linux_sig_safe_flush(void) {
       }
     }
   }
+  /* Inline events left unreported: put their loss frame into this
+   * fragment, after the batch, through the descriptor checked above. */
+  if (!commit)
+    commit = ct_linux_report_inline_events_into_fragment(fd);
   /* Write the pre-encoded committed marker. Retires the ROUND-5 F pending
    * sentinel; mergeFragments' netting then sees a clean pending/committed
    * pair and doesn't inject a false kill-before-flush event-loss. */
-  {
+  if (commit) {
     long len = repro_linux_sig_safe_committed_len();
     if (len > 0) {
       void *p = repro_linux_sig_safe_committed_ptr();
@@ -1035,6 +1159,38 @@ void repro_linux_sig_safe_flush(void) {
   errno = (int)saved_errno;
 }
 
+/* Exported so the inline-syscall SIGTRAP handler in
+ * `linux_preload_runtime.nim` can invoke the same async-signal-safe flush
+ * before replaying an inline-asm SYS_exit_group / SYS_exit that would
+ * otherwise terminate the process with an un-flushed read batch (the
+ * M9.R.62.4 pixman residual, closed by M9.R.63.3). All other callers
+ * remain inside this translation unit; the external symbol is only
+ * consumed by the runtime's SIGTRAP handler through a matching extern
+ * declaration. */
+void repro_linux_sig_safe_flush(void) {
+  repro_linux_sig_safe_flush_impl(1);
+}
+
+/* linux_preload_runtime.nim: reports this process's trapped inline syscalls
+ * that are still queued as event-loss; 0 when some are queued and no loss
+ * could be written. Async-signal-safe. */
+extern int ct_linux_report_inline_events_at_signal_death(void);
+
+/* The flush for an image a signal is about to terminate. A process killed by
+ * a signal reaches none of the points that classify trapped inline syscalls
+ * (the exit destructor, an exec, an inline exit_group), so what is still
+ * queued would otherwise vanish under a committed marker and the capture
+ * would read complete without it. Report it first, to a file of its own or,
+ * when none can be created, into the fragment; when neither can be written,
+ * withhold the marker instead. Async-signal-safe, lock-free and
+ * allocation-free like the plain flush, and errno is preserved. Exported for
+ * the runtime's trap handler, which ends a genuine trap-signal crash the
+ * same way. */
+void repro_linux_sig_safe_flush_at_signal_death(void) {
+  repro_linux_sig_safe_flush_impl(
+      ct_linux_report_inline_events_at_signal_death());
+}
+
 extern void repro_linux_sig_safe_note_signal(long signum);
 
 static void repro_linux_terminating_signal_handler(int signum) {
@@ -1042,7 +1198,18 @@ static void repro_linux_terminating_signal_handler(int signum) {
    * signals we installed for. The signum-bounds check is defensive —
    * we register for signums < 32 only. */
   repro_linux_sig_safe_note_signal((long)signum);
-  repro_linux_sig_safe_flush();
+  /* The image dies here unless the disposition restored below ignores the
+   * signal. When it does, the process carries on and later drains its
+   * trapped events normally, so reporting them as lost would only make a
+   * sound capture incomplete. A previous user handler may or may not end the
+   * process, so it gets the report: a spurious loss is safe, a capture that
+   * reads complete without the events is not. */
+  if (signum > 0 && signum < 32 && repro_prev_sigaction_valid[signum] &&
+      (repro_prev_sigaction[signum].sa_flags & SA_SIGINFO) == 0 &&
+      repro_prev_sigaction[signum].sa_handler == SIG_IGN)
+    repro_linux_sig_safe_flush();
+  else
+    repro_linux_sig_safe_flush_at_signal_death();
   if (signum > 0 && signum < 32 && repro_prev_sigaction_valid[signum]) {
     /* Restore the previously-installed handler + re-raise. If the
      * previous handler was SIG_DFL for a default-terminating signal
@@ -1138,6 +1305,100 @@ int repro_linux_install_terminating_signal_handlers(void) {
   return installed;
 }
 
+/* ONE ACTIVE SHIM PER PROCESS.
+ *
+ * Nested monitoring can preload two distinct io-mon shim images into one
+ * process: a monitored host starts an inner monitor whose own shim (say an
+ * installed build) is added to the LD_PRELOAD list the host inherited from
+ * the outer monitor (a development build), or a parent's exec hook adds its
+ * shim to the inner route's list. glibc loads both, because it identifies a
+ * preload by its file, not by its SONAME. Both constructors would then
+ * initialise from the same REPRO_MONITOR_* route, both would install raw and
+ * inline syscall patches, and both would append to the same per-thread
+ * fragment: the first image owns the program's symbols, and its
+ * dlsym(RTLD_NEXT) forwarders reach the second image's interposers, which
+ * would record every call a second time.
+ *
+ * So exactly one image is active: the one that owns the program's symbols.
+ * The dynamic linker binds a symbol to the first definition in the global
+ * lookup scope (the executable, then the LD_PRELOAD list in order, then the
+ * initial dependencies; see ld.so(8) and the "Shared Object Dependencies"
+ * section of the System V gABI,
+ * https://refspecs.linuxfoundation.org/elf/gabi4+/ch5.dynamic.html). A
+ * lookup of a symbol only shims define, through the handle `dlopen(NULL)`
+ * returns for the program, searches exactly that scope in that order (POSIX
+ * dlopen: "the original program image file, and objects loaded at program
+ * start-up",
+ * https://pubs.opengroup.org/onlinepubs/9799919799/functions/dlopen.html),
+ * so it names the owner whatever order the constructors run in. It must be
+ * that handle and not RTLD_DEFAULT: this image links with -Bsymbolic, which
+ * marks it DT_SYMBOLIC, and glibc searches a DT_SYMBOLIC caller's own
+ * definitions first for RTLD_DEFAULT, so each image would find itself
+ * (measured: with two preloads, each answered that the last image in the
+ * dlsym forwarding chain owned the scope). Every other image stands down:
+ * its constructor initialises nothing, and its interposers forward straight
+ * to the next definition. An image outside the global scope (dlopen'd
+ * RTLD_LOCAL) interposes nothing, and stands down too when a global shim
+ * exists; with no global shim it is the only one, and stays active.
+ *
+ * The lookup goes through the real dlopen and dlsym, which are the next
+ * images' interposers when another shim follows this one. Those images come
+ * later in the scope, so they never own it, and they forward it unrecorded.
+ *
+ * The marker is a function, not data: -Bsymbolic binds this image's own
+ * reference to its own definition, so `&marker` is this image's address. */
+__attribute__((visibility("default"), noinline))
+void repro_linux_monitor_shim_image_marker(void) {
+  __asm__ volatile("");
+}
+
+extern void *ct_linux_preload_real_dlsym(void *handle, char *name);
+extern void *ct_linux_preload_real_dlopen(char *path, int flags);
+
+enum {
+  REPRO_LINUX_IMAGE_UNDECIDED = 0,
+  REPRO_LINUX_IMAGE_ACTIVE = 1,
+  REPRO_LINUX_IMAGE_STANDING_DOWN = 2
+};
+static int repro_linux_image_state = REPRO_LINUX_IMAGE_UNDECIDED;
+/* The lookup enters the dynamic linker, which may call interposed functions
+ * (malloc, getenv) on this thread; those calls pass through unrecorded rather
+ * than recursing into the decision. Per thread, so another thread's hooks are
+ * never bypassed while one thread decides. */
+static __thread int repro_linux_image_deciding = 0;
+
+/* Whether this image is the process's active io-mon shim. Decided once, on
+ * first use: normally by the constructor below, earlier when another
+ * library's constructor reaches one of this image's interposers first. The
+ * answer cannot change: the global scope's preload order is fixed before any
+ * constructor runs, and a later dlopen appends after it. Concurrent first
+ * uses compute the same answer, so the race is benign. */
+__attribute__((visibility("hidden")))
+int ct_linux_preload_image_active(void) {
+  int state = __atomic_load_n(&repro_linux_image_state, __ATOMIC_ACQUIRE);
+  if (state != REPRO_LINUX_IMAGE_UNDECIDED)
+    return state == REPRO_LINUX_IMAGE_ACTIVE;
+  if (repro_linux_image_deciding) return 0;
+  repro_linux_image_deciding = 1;
+  /* The program's handle names an object that is never unloaded, so it is
+   * not closed: dlclose would only drop the reference dlopen added. */
+  void *program = ct_linux_preload_real_dlopen(NULL, RTLD_LAZY);
+  void *owner = program == NULL ? NULL : ct_linux_preload_real_dlsym(
+      program, (char *)"repro_linux_monitor_shim_image_marker");
+  repro_linux_image_deciding = 0;
+  state = owner == NULL ||
+          owner == (void *)&repro_linux_monitor_shim_image_marker
+    ? REPRO_LINUX_IMAGE_ACTIVE : REPRO_LINUX_IMAGE_STANDING_DOWN;
+  __atomic_store_n(&repro_linux_image_state, state, __ATOMIC_RELEASE);
+  return state == REPRO_LINUX_IMAGE_ACTIVE;
+}
+
+/* Public query: whether the image it is looked up in records this process. */
+__attribute__((visibility("default")))
+int repro_linux_monitor_shim_is_active(void) {
+  return ct_linux_preload_image_active();
+}
+
 /* M9.R.62.2 addendum — interpose libc's `syscall(3)` wrapper so raw
  * `syscall(SYS_exit_group, N)` and `syscall(SYS_exit, N)` calls flush
  * the fragment slot before the kernel tears the process down. Phase A
@@ -1189,8 +1450,11 @@ long syscall(long number, ...) {
   a0 = va_arg(ap, long); a1 = va_arg(ap, long); a2 = va_arg(ap, long);
   a3 = va_arg(ap, long); a4 = va_arg(ap, long); a5 = va_arg(ap, long);
   va_end(ap);
+  /* A standing-down image records nothing and has nothing to flush: it only
+   * forwards, still recognising its own raw-fork child below. */
+  int active = ct_linux_preload_image_active();
 #ifdef SYS_exit_group
-  if (number == SYS_exit_group) {
+  if (active && number == SYS_exit_group) {
     /* Classify trapped inline syscalls first; when some cannot be (this
      * thread is inside a hook), withhold the commit so the loss shows. */
     if (ct_linux_drain_inline_events_before_image_end())
@@ -1198,15 +1462,15 @@ long syscall(long number, ...) {
   }
 #endif
 #ifdef SYS_exit
-  if (number == SYS_exit) {
+  if (active && number == SYS_exit) {
     repro_linux_sig_safe_flush();
   }
 #endif
-  if (number == SYS_execve
+  if (active && (number == SYS_execve
 #ifdef SYS_execveat
       || number == SYS_execveat
 #endif
-      ) {
+      )) {
     ct_linux_drain_inline_events_before_image_end();
     /* A raw exec reaches no exec hook: classify its target here. When this
      * image patched libc's syscall(2), this body is redirected to the
@@ -1247,7 +1511,10 @@ static void repro_linux_monitor_constructor(void) {
   ct_linux_preload_prime_real_functions();
   repro_linux_resolve_libc_syscall();
   repro_linux_prepare_thread_exit_key();
-  repro_monitor_shim_init(NULL);
+  /* Only the image that owns the program's symbols records it (see "ONE
+   * ACTIVE SHIM PER PROCESS"); the forwarders resolved above are all a
+   * standing-down image needs. */
+  if (ct_linux_preload_image_active()) repro_monitor_shim_init(NULL);
   ct_linux_preload_prepare_real_connect();
 }
 
@@ -1259,7 +1526,9 @@ static void repro_linux_monitor_destructor(void) {
      on process exit (via the registry sweep in repro_monitor_shim_shutdown)
      so a short-lived process (or the trailing batch of any process) does
      not drop its records — which would otherwise make a fast child look
-     un-injected and downgrade completeness to mcIncomplete. */
+     un-injected and downgrade completeness to mcIncomplete. A standing-down
+     image opened nothing and trapped nothing. */
+  if (!ct_linux_preload_image_active()) return;
   repro_monitor_shim_shutdown();
   /* Report trapped events the shutdown drain could not classify, and from
    * now on any event trapped after it (other threads still running, later
@@ -1386,6 +1655,9 @@ proc c_socket_peer_uid(fd: cint): clong
 proc c_sockaddr_un_path(address: pointer; addrLen: uint32; buf: ptr char;
                         cap: cint): cint
   {.importc: "repro_linux_sockaddr_un_path", raises: [].}
+proc c_sockaddr_inet_dest(address: pointer; addrLen: uint32; buf: ptr char;
+                          cap: cint): cint
+  {.importc: "repro_linux_sockaddr_inet_dest", raises: [].}
 proc c_fd_identity_kind(fd: cint; dev, ino: ptr uint64; kind: ptr cint): cint
   {.importc: "repro_linux_fd_identity_kind", raises: [].}
 proc c_fd_proc_path(fd: cint; buf: pointer; len: csize_t): cint
@@ -1558,6 +1830,87 @@ proc armThreadExitFlush() {.raises: [].} =
   ## right after it first opens its fragment slot (see emitRecord).
   repro_linux_arm_thread_exit_flush_c()
 
+var ledgerPidNsMarked: uint64 = 0
+  ## The pid namespace this process last wrote a tree-ledger marker for. A
+  ## fork child inherits it and still compares its own namespace, which
+  ## differs after `unshare(CLONE_NEWPID)` + fork. Racing threads at worst
+  ## both write the marker, and the second write is an "already there".
+var forkChildLedgerPid: cint = 0
+  ## The pid whose own entry the libc atfork child handler just wrote, so the
+  ## hooked fork's child does not write it again in `recordProcessStart`.
+  ## Written only in a fork child (private memory) and consumed by the same
+  ## process; keyed by pid so a value left behind by an internal fork that
+  ## never reached the fork hook is never taken for another process's.
+
+type LedgerWrite = object
+  err: cint          ## 0, or the errno of the failed write
+  nsUnknown: bool    ## the failure is that this process's pid namespace
+                     ## could not be read (`linuxPidNamespaceSys`)
+
+# The ledger writes below run in fork children in any state and, for a
+# CLONE_VM process, in its creator while the child already runs on the
+# creator's TLS: raw system calls only, and no Nim stack-trace frame.
+{.push stackTrace: off, lineTrace: off.}
+proc ledgerSyscall(nr, a1, a2, a3, a4, a5, a6: clong): clong
+    {.cdecl, gcsafe, raises: [].} =
+  c_raw_syscall6(nr, a1, a2, a3, a4, a5, a6)
+
+proc writeTreeLedgerEntryRaw(pid: int; startTicks: uint64): LedgerWrite
+    {.raises: [].} =
+  ## Write the entry for (pid, startTicks) and the marker of THIS process's
+  ## pid namespace (the namespace `pid` is relative to), through raw system
+  ## calls. Touches no thread-local state and takes no lock, so it is safe
+  ## in a fork child before anything in it is consistent, in a signal
+  ## handler, and beside a CLONE_VM child. A namespace that cannot be read is
+  ## a failure: the entry would carry a pid the guard cannot place (see
+  ## `linuxPidNamespaceSys`).
+  result.err = markTreeLedgerSys(ledgerSyscall, cstring(fragmentDir), pid,
+    startTicks)
+  var ns = 0'u64
+  let nsErr = linuxPidNamespaceSys(ledgerSyscall, ns)
+  if result.err == 0 and nsErr != 0:
+    result.err = nsErr
+    result.nsUnknown = true
+  if result.err == 0 and ns != 0 and ns != ledgerPidNsMarked:
+    result.err = markTreeLedgerPidNamespaceSys(ledgerSyscall,
+      cstring(fragmentDir), ns)
+    if result.err == 0:
+      ledgerPidNsMarked = ns
+{.pop.}
+
+proc markForkChildInTreeLedger() {.raises: [].} =
+  ## This fork child's own tree-ledger entry (and its pid-namespace marker),
+  ## written in ANY fork child before it runs program code: from the libc
+  ## atfork child handler, which runs for every libc fork including the ones
+  ## glibc makes internally through `__fork` (`daemon(3)`, `forkpty(3)`),
+  ## which never reach `repro_hook_fork`; and from the raw-fork child
+  ## callback (`syscall(SYS_fork / SYS_clone)`, a trapped inline clone,
+  ## glibc's `clone(3)` without CLONE_VM, `_Fork(3)`), which runs no atfork
+  ## handler and whose parent writes no entry either. Without it such a child
+  ## had no entry at all, and once it cleared its `REPRO_MONITOR_*` needles
+  ## the guard could not see it outlive the root.
+  ##
+  ## Allocation- and lock-free (`writeTreeLedgerEntryRaw`): the child may
+  ## hold a lock image of another thread, and the private heap's own atfork
+  ## handler may not have run yet. A failed write (including a pid namespace
+  ## this child cannot read) cannot be recorded normally here, so it is
+  ## reported through the pre-encoded fork-child loss frame
+  ## (`reportForkChildSkippedEvidence`, raw syscalls): the capture is graded
+  ## incomplete rather than missing the entry silently. A written entry is
+  ## remembered (`forkChildLedgerPid`) so the hooked fork's child does not
+  ## write it again in `recordProcessStart`.
+  if not initialized or fragmentDir.len == 0:
+    return
+  let pid = c_getpid()
+  if pid <= 0:
+    return
+  let w = writeTreeLedgerEntryRaw(int(pid),
+    linuxProcStartTicksSys(ledgerSyscall, int(pid)))
+  if w.err != 0:
+    reportForkChildSkippedEvidence()
+  else:
+    forkChildLedgerPid = pid
+
 proc repro_linux_atfork_prepare() {.cdecl, raises: [].} =
   # The shared table is atomic; its process-local mapped-shard sequence is
   # mutable. Fork must copy that view only between complete publications.
@@ -1589,6 +1942,11 @@ proc repro_linux_atfork_child() {.exportc, cdecl, raises: [].} =
     # bookkeeping until exec and reports evidence it skips (`bypassEvidence`).
     inForkChild = true
   resetIdentityCaches()
+  # Before anything else that could allocate, and before the program's own
+  # atfork handlers and code: the needle sweep covers the child until then.
+  inc disabled
+  markForkChildInTreeLedger()
+  dec disabled
   withShimMuted:
     try: discardFragmentSlotAfterFork()
     except CatchableError: discard
@@ -1774,9 +2132,73 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
     if mainThreadId != 0 and record.threadId != mainThreadId:
       flushFragmentBatch()
 
+proc markTreeLedgerEntry(pid: cint; startTicks: uint64) {.raises: [].} =
+  ## Write the tree-ledger entry for (pid, startTicks) (`io_mon/tree_ledger`):
+  ## the evidence the host's descendant guard checks for
+  ## liveness after the root exits, which, unlike this process's
+  ## `/proc/<pid>/environ` (its own stack), the program cannot overwrite.
+  ## Synchronous and NOT gated by the event interest. A failed write is
+  ## published as a loss and flushed at once, so a capture whose ledger may be
+  ## short is never graded complete.
+  ##
+  ## The entry's pid is relative to this process's pid namespace, so the
+  ## namespace is recorded too (`markTreeLedgerPidNamespace`), once per
+  ## process and namespace: a guard in another namespace cannot check the pid
+  ## and must say so instead of matching it against an unrelated process.
+  if not initialized or fragmentDir.len == 0 or pid <= 0:
+    return
+  let w = writeTreeLedgerEntryRaw(int(pid), startTicks)
+  if w.err != 0:
+    var loss = baseRecord(mrEventLoss, moEventLoss)
+    loss.detail = "linux tree ledger write failed errno=" & $w.err &
+      " pid=" & $pid
+    if w.nsUnknown:
+      loss.detail.add " (this process's pid namespace could not be read, " &
+        "so the guard could not place the pid)"
+    emitRecord(loss)
+    withShimMuted:
+      try: flushFragmentBatch()
+      except CatchableError: discard
+
+proc markSelfInTreeLedger() {.raises: [].} =
+  let selfPid = c_getpid()
+  markTreeLedgerEntry(selfPid, linuxProcStartTicksSys(ledgerSyscall,
+    int(selfPid)))
+
+proc markChildInTreeLedger(childPid: int) {.raises: [].} =
+  ## The child's entry, written by the PARENT before fork / posix_spawn
+  ## returns to the program: the child may not have run yet, and by the time
+  ## it does the parent may have exited.
+  if childPid <= 0:
+    return
+  markTreeLedgerEntry(cint(childPid), linuxProcStartTicksSys(ledgerSyscall,
+    childPid))
+
 proc recordProcessStart() {.raises: [].} =
+  # The tree-ledger entry first: it is the guard's liveness evidence, and it
+  # must exist before this process runs any program code (shim init runs
+  # before `main`; the fork child's call runs before `fork` returns there).
+  # In the child of a hooked fork the atfork child handler has just written
+  # it (`markForkChildInTreeLedger`), so it is not written a second time.
+  let selfPid = c_getpid()
+  if forkChildLedgerPid != 0 and forkChildLedgerPid == selfPid:
+    forkChildLedgerPid = 0
+  else:
+    markSelfInTreeLedger()
   var record = baseRecord(mrProcessStart, moProcessStart)
   record.detail = "linux-preload-hooks"
+  # THE RESOLVED IMAGE (docs/usage.md, "The process-start image"). The exec
+  # and spawn records carry what the program PASSED: a bare name looked up in
+  # the program's own PATH, or a path relative to its working directory, which
+  # nothing records. The kernel's answer is `/proc/self/exe`: the absolute,
+  # physical path of the file this image runs, symlinks resolved, read at
+  # init. It covers every way in, `posix_spawnp`, the `execvp` family,
+  # `fexecve`, `posix_spawn` with file actions, alike. An unreadable or
+  # over-long link is recorded as an empty path plus `image=unresolved`, so a
+  # consumer can tell it from a shim that predates the field.
+  record.path = selfImagePath
+  if selfImagePath.len == 0:
+    record.detail.add " image=unresolved"
   emitRecord(record)
 
 proc emitEventLoss(detail: string; result: int64 = 0) {.raises: [].} =
@@ -1911,6 +2333,35 @@ proc scanLoadedLibraries(reason: cstring) {.raises: [].} =
       "being observed, so its bytes are an input this capture cannot name")
 
 proc drainInlineRawSyscallEvents() {.raises: [].}
+proc ctRetractInlineLossIfDrained()
+  {.importc: "ct_linux_retract_inline_loss_if_drained", cdecl, raises: [].}
+proc ctInlineClassifyBegin()
+  {.importc: "ct_linux_inline_classify_begin", cdecl, raises: [].}
+proc ctInlineClassifyEnd()
+  {.importc: "ct_linux_inline_classify_end", cdecl, raises: [].}
+proc ctInlineExecArmRetire()
+  {.importc: "ct_linux_inline_exec_arm_retire", cdecl, raises: [].}
+when defined(ioMonInlineWindowTest):
+  proc c_window_test_usleep(us: cuint): cint
+    {.importc: "usleep", header: "<unistd.h>", raises: [].}
+  proc c_window_test_getenv(name: cstring): cstring
+    {.importc: "getenv", header: "<stdlib.h>", raises: [].}
+  proc windowTestClaimMicros(): cuint {.raises: [].} =
+    ## Test-only: how long a drain holds a claimed event before recording it.
+    ## 20 ms unless `IO_MON_INLINE_WINDOW_TEST_CLAIM_US` names another length
+    ## in microseconds, so a test can hold the window open for as long as it
+    ## needs to act inside it instead of racing a fixed 20 ms.
+    let raw = c_window_test_getenv("IO_MON_INLINE_WINDOW_TEST_CLAIM_US")
+    if raw == nil or raw[0] == '\0':
+      return 20000
+    var micros: uint64 = 0
+    var i = 0
+    while raw[i] != '\0':
+      if raw[i] notin {'0' .. '9'} or micros > 100_000_000'u64:
+        return 20000
+      micros = micros * 10 + uint64(ord(raw[i]) - ord('0'))
+      inc i
+    cuint(micros)
 proc installLinuxVdsoPatches() {.raises: [].}
 proc emitLinuxVdsoPatchFailures(source: string) {.raises: [].}
 # Defined next to the other `record*` helpers, below the vDSO block; forward
@@ -2036,6 +2487,10 @@ proc observerLibraryScan(reason: cstring) {.cdecl, raises: [].} =
 
 proc repro_monitor_shim_init*(configPath: cstring): cint
     {.exportc, dynlib, raises: [].}
+
+proc ct_linux_preload_image_active(): cint {.importc, cdecl, raises: [].}
+  ## Whether this image is the process's one active io-mon shim (the C note
+  ## "ONE ACTIVE SHIM PER PROCESS" above the constructor).
 
 proc ensureInitialized() {.raises: [].} =
   if not initialized:
@@ -2301,9 +2756,9 @@ proc kernelPathForFd(fd: cint): string {.raises: [].} =
 proc pathForAt(dirfd: cint; path: cstring): string {.raises: [].} =
   ## `path` made absolute against the directory it resolved against at the
   ## time of the call -- the working directory for `AT_FDCWD`, else
-  ## `dirfd`'s directory -- as the kernel resolved it. Spec: reprobuild-pm/
-  ## spec/Monitor-Hook-Shim.md § CWD And Path Context and § "Metadata, Probe,
-  ## And Symlink APIs". An absolute path is returned as is (the kernel
+  ## `dirfd`'s directory -- as the kernel resolved it, walking a symlink's
+  ## `..` the way `anchoredRelativePath` documents. An absolute path is
+  ## returned as is (the kernel
   ## ignores `dirfd` for it); a relative one stays relative only when
   ## nothing can name the anchor directory.
   ##
@@ -2311,8 +2766,8 @@ proc pathForAt(dirfd: cint; path: cstring): string {.raises: [].} =
   ## the anchor, and a `..` after a component of `path` is kept, because in
   ## `link/../x` it applies to where `link` points. Nim's `os./` folded that
   ## one too, and recorded `<cwd>/x` for a process that read the file beside
-  ## the link's target (reprobuild-pm issue 2026-10-21-linux-shim-folds-
-  ## dotdot-after-a-symlink-lexically). The macOS shim's
+  ## the link's target (regression test
+  ## `tests/linux/test_io_mon_linux_dotdot_after_symlink`). The macOS shim's
   ## `repro_macos_anchored_path` records the same string.
   ##
   ## Popping is exact only on a symlink-free anchor. `getcwd` is one. For a
@@ -2404,6 +2859,18 @@ const
     "uninjectable image: an exec or spawn entered an image the loader will " &
     "not inject the shim into, where the shim could not record it by name " &
     "(inside a hook, or a fork child skipping bookkeeping)"
+  VmProcessLossDetail =
+    "linux CLONE_VM process (not a thread or vfork child): it shares its " &
+    "creator's memory and thread state, which the shim cannot keep apart, " &
+    "so its evidence may be missing or carry the creator's identity"
+  VmProcessLedgerLossPrefix =
+    "linux tree ledger write failed in the creator of a CLONE_VM process "
+  VmProcessLedgerLossDetail = VmProcessLedgerLossPrefix &
+    "(the entry of the process it created could not be written, so the " &
+    "guard may not see that process outlive the root)"
+  VmProcessLedgerPidNsLossDetail = VmProcessLedgerLossPrefix &
+    "(the creator's pid namespace could not be read, so the guard could " &
+    "not place the pid of the process it created)"
   LossFramePidMarker = 0x5A17C0DE5A17C0DE'u64
   LossFrameTidMarker = 0x7E1DC0DE7E1DC0DE'u64
 
@@ -2425,6 +2892,7 @@ var
   inlineLossReportArmed = true
   forkSkipLossReportArmed = true
   uninjectableExecReportArmed = true
+  vmProcessReportArmed = true
 
 proc encodeLossFrame(detail: string): tuple[frame: seq[byte];
                                             pidOffset, tidOffset: int] =
@@ -2478,6 +2946,31 @@ proc armUninjectableExecReport(): bool {.raises: [].} =
   except CatchableError:
     result = false
 
+proc armVmProcessReport(): bool {.raises: [].} =
+  ## Pre-encode the event-loss frames the creator of a CLONE_VM process
+  ## writes: the process itself (see "A CLONE_VM PROCESS IS EVENT-LOSS" in
+  ## the runtime), and a failed write of its tree-ledger entry (one frame
+  ## for the entry, one for the pid namespace). False when any could not be
+  ## armed; the caller reports that.
+  if fragmentDir.len == 0:
+    return true
+  try:
+    let encoded = encodeLossFrame(VmProcessLossDetail)
+    result = armVmProcessLossReport(encoded.frame, encoded.pidOffset,
+      encoded.tidOffset)
+    # The creator's failed write of that process's ledger entry
+    # (`repro_linux_vm_process_parent`): frames of their own, so the loss
+    # names that cause and not a fork child's skipped evidence, and one per
+    # failure, as the hooked writer tells them apart (`markTreeLedgerEntry`).
+    let ledger = encodeLossFrame(VmProcessLedgerLossDetail)
+    result = armVmProcessLedgerLossReport(false, ledger.frame,
+      ledger.pidOffset, ledger.tidOffset) and result
+    let ledgerNs = encodeLossFrame(VmProcessLedgerPidNsLossDetail)
+    result = armVmProcessLedgerLossReport(true, ledgerNs.frame,
+      ledgerNs.pidOffset, ledgerNs.tidOffset) and result
+  except CatchableError:
+    result = false
+
 proc armUnclassifiedInlineLossReport(): bool {.raises: [].} =
   ## Pre-encode the event-loss frame the runtime writes, with raw syscalls,
   ## when trapped inline syscalls cannot be classified before the image ends
@@ -2498,6 +2991,11 @@ proc armUnclassifiedInlineLossReport(): bool {.raises: [].} =
 
 proc repro_monitor_shim_init*(configPath: cstring): cint
     {.exportc, dynlib, raises: [].} =
+  # A standing-down image never initialises, however it is reached: through
+  # its constructor, or lazily through a hook. Its `initialized` stays false,
+  # so nothing it might still be handed is recorded (`emitRecord`).
+  if ct_linux_preload_image_active() == 0:
+    return 0
   if not locksReady:
     initLock(initLockVar)
     initLock(recordLock)
@@ -2525,10 +3023,15 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     if fragmentDir.len > 0:
       createDir(extendedPath(fragmentDir))
     inlineLossReportArmed = armUnclassifiedInlineLossReport()
+    if inlineLossReportArmed:
+      # An inline exec of the previous image of this process succeeded:
+      # withdraw the loss it armed for the exec.
+      ctInlineExecArmRetire()
     forkSkipLossReportArmed =
       inlineLossReportArmed and armForkChildSkipLossReport()
     uninjectableExecReportArmed =
       inlineLossReportArmed and armUninjectableExecReport()
+    vmProcessReportArmed = inlineLossReportArmed and armVmProcessReport()
     # DEP-SHM-2 — attach the process to the edge's shared-memory dependency
     # queue (the FAST PATH in front of the file fragments). The engine created
     # the segment before launching us and named it via REPRO_MONITOR_DEP_SHM;
@@ -2567,6 +3070,10 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
       if n > 0:
         img = newString(n)
         for i in 0 ..< n: img[i] = exeBuf[i]
+      # A full buffer may be a truncated name: never record a prefix as the
+      # image (it could name a different file). The incarnation identity
+      # below only needs distinct bytes, so it keeps them.
+      selfImagePath = if n > 0 and n < cint(exeBuf.len) - 1: img else: ""
       # Separator (0x1f, unit-separator) cannot occur in a path; the generation
       # suffix keeps same-image re-execs on one pid distinct. Opaque identity
       # bytes only — `decodeDepRecord` ignores everything past the framed record.
@@ -2596,6 +3103,9 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
     # Likewise, an exec into an image the shim cannot enter, made where the
     # shim cannot record, could not be reported.
     emitEventLoss("uninjectable-image loss report unavailable")
+  if not vmProcessReportArmed:
+    # Likewise, the creation of a CLONE_VM process could not be reported.
+    emitEventLoss("CLONE_VM process loss report unavailable")
   let collection = getEnv("REPRO_MONITOR_COLLECTION_EVIDENCE")
   if collection.len > 0 and collection != "full:" & runId:
     emitEventLoss("invalid internal collection scope for active capture route")
@@ -2982,6 +3492,31 @@ proc recordRawWrite(fd: cint; callResult: clong;
   emitRecord(record)
   true
 
+proc recordRawFdWrite(fd: cint; callResult: clong;
+                      paths = RawFdPaths()): bool {.raises: [].} =
+  ## `write`/`pwrite64`/`writev`/`pwritev` reached through `syscall(2)` or an
+  ## inline trap, recorded exactly as the libc `write` hook records the call
+  ## (`recordFdWrite`): a write to a descriptor that names a file is an
+  ## `mrFileWrite` output fact on that path, and a write to one that names no
+  ## path (a pipe, a socket, a tty) is no filesystem event at all. Unlike
+  ## `recordRawWrite`, an unnamed descriptor is NOT a loss: the zero-copy
+  ## calls there move file bytes, while these are how a process talks to its
+  ## peers. LD_PRELOADed tracers report process events this way — agent-
+  ## harbor's command-trace shim writes one `syscall(SYS_write)` to its
+  ## socket per `waitpid` — and each one made the whole capture incomplete,
+  ## which made every action monitored in that session uncacheable.
+  if callResult < 0 or fd <= 2:
+    return true
+  let path = rawFdPath(fd, paths)
+  if path.len == 0:
+    return true
+  var record = baseRecord(mrFileWrite, moFileWrite)
+  record.path = path
+  record.result = callResult.int64
+  record.flags = uint32(fd)
+  emitRecord(record)
+  true
+
 proc recordRawFileCopy(inFd, outFd: cint; callResult: clong;
                        paths = RawFdPaths()): bool {.raises: [].} =
   if callResult <= 0:
@@ -3176,13 +3711,23 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
   let trackFd = inlineTrap == 0
   case number
   of LinuxSysOpen:
-    if callResult < 0 or resultLooksFaulted(callResult):
+    # A failed open is a probe (a missing path is a negative dependency), and
+    # it is recorded as the libc `open` hook records one: result -1. Only a
+    # bad pathname pointer (EFAULT) names nothing to record.
+    if resultLooksFaulted(callResult):
+      return true
+    if callResult < 0:
+      recordOpen(cstringArg(a1), intArg(a2), intArg(a3), -1, trackFd = false)
       return true
     recordOpen(cstringArg(a1), intArg(a2), intArg(a3), cint(callResult),
       trackFd = trackFd)
     true
   of LinuxSysOpenat:
-    if callResult < 0 or resultLooksFaulted(callResult):
+    if resultLooksFaulted(callResult):
+      return true
+    if callResult < 0:
+      recordOpen(cstringArg(a2), intArg(a3), intArg(a4), -1, intArg(a1),
+        trackFd = false)
       return true
     recordOpen(cstringArg(a2), intArg(a3), intArg(a4), cint(callResult),
       intArg(a1), trackFd)
@@ -3196,6 +3741,8 @@ proc classifyRawFileSyscall(number, a1, a2, a3, a4, a5, a6, callResult: clong;
     true
   of LinuxSysRead:
     recordRawRead(intArg(a1), callResult, fdPaths)
+  of LinuxSysWrite, LinuxSysPwrite64, LinuxSysWritev, LinuxSysPwritev:
+    recordRawFdWrite(intArg(a1), callResult, fdPaths)
   of LinuxSysSendfile:
     recordRawFileCopy(intArg(a2), intArg(a1), callResult, fdPaths)
   of LinuxSysCopyFileRange:
@@ -3444,9 +3991,8 @@ proc classifyTrappedInlineEvent(index: int; number: clong;
   # or the kernel's `/proc/self/fd` name, an absolute spelling with no
   # symlink in it, so `anchoredRelativePath` may pop a leading `..` off it.
   # It keeps a `..` that follows a component of the caller's path, which
-  # `os./` folded (`link/../x` recorded as `<base>/x`; reprobuild-pm issue
-  # 2026-10-21-linux-shim-folds-dotdot-after-a-symlink-lexically), exactly
-  # as `pathForAt` does for an interposed call.
+  # `os./` folded (`link/../x` recorded as `<base>/x`), exactly as
+  # `pathForAt` does for an interposed call.
   let absolute =
     if raw.ok and base.ok and raw.text.len > 0 and not raw.text.isAbsolute:
       anchoredRelativePath(base.text, raw.text)
@@ -3510,7 +4056,8 @@ proc classifyTrappedInlineEvent(index: int; number: clong;
     a[0] = targetArg()
     a[1] = clong(LinuxAtFdcwd)
     a[2] = pathArg()
-  of LinuxSysRead, LinuxSysGetdents64:
+  of LinuxSysRead, LinuxSysGetdents64, LinuxSysWrite, LinuxSysPwrite64,
+      LinuxSysWritev, LinuxSysPwritev:
     overrideFds(a[0], -1)
   of LinuxSysSendfile:
     overrideFds(a[1], a[0])   # sendfile(out_fd, in_fd, ...)
@@ -3534,6 +4081,10 @@ proc drainInlineRawSyscallEvents() {.raises: [].} =
   ## shared buffer) is left to that process.
   if shouldBypass():
     return
+  # Counted as in flight from before the first claim until the last record:
+  # a claimed event no longer shows as pending, so a concurrent drain must not
+  # withdraw the armed loss while this one has not emitted its record yet.
+  ctInlineClassifyBegin()
   if rawSyscallEventOverflowed():
     emitEventLoss("inline raw syscall event buffer overflow")
   let pid = rawCurrentPid()
@@ -3541,6 +4092,9 @@ proc drainInlineRawSyscallEvents() {.raises: [].} =
   for i in 0 ..< count:
     case rawSyscallEventClaim(i, pid)
     of 1:
+      when defined(ioMonInlineWindowTest):
+        # Test-only: widen the window between the claim and the record.
+        discard c_window_test_usleep(windowTestClaimMicros())
       let event = rawSyscallEventAt(i)
       if not event.ok:
         emitEventLoss("inline raw syscall event read failed index=" & $i)
@@ -3554,6 +4108,12 @@ proc drainInlineRawSyscallEvents() {.raises: [].} =
       emitEventLoss("inline raw syscall event still being written index=" & $i)
     else:
       discard
+  ctInlineClassifyEnd()
+  # Everything this process trapped is classified (or reported): withdraw the
+  # loss armed at its first trap. The runtime re-checks under its own protocol
+  # and keeps the loss when a call or another drain is still in flight, or an
+  # event is queued.
+  ctRetractInlineLossIfDrained()
 
 proc repro_linux_drain_inline_events() {.cdecl, raises: [].} =
   ## Registered with the runtime as the drain the exit/exec trap paths run.
@@ -3614,9 +4174,9 @@ proc repro_hook_opendir*(ctx: var OpendirContext) {.raises: [].} =
     # Storing the caller's spelling left `chdir("repo");
     # opendir(".git/objects/pack")` (what `git -C repo` does) recorded as a
     # relative path, which a consumer can only resolve against the action's
-    # cwd: a directory the process never looked at (reprobuild-pm issue
-    # 2026-10-20-linux-shim-anchors-relative-directory-enumerations-on-the-
-    # action-cwd). `pathForAt` keeps the spelling relative when getcwd cannot
+    # cwd: a directory the process never looked at (regression test
+    # `tests/linux/test_io_mon_linux_relative_directory_enumeration_anchor`).
+    # `pathForAt` keeps the spelling relative when getcwd cannot
     # name the cwd; the kernel's name for the DIR*'s descriptor is the
     # fallback then, and only a directory nothing can name stays as spelled.
     var anchored = pathForAt(LinuxAtFdcwd, ctx.path)
@@ -3844,7 +4404,8 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32) {.raises: [].
     # The address the client DIALLED. On a socket-activated host every peer is
     # the activator (pid 1), so the pid cannot say which service was reached;
     # the endpoint can, and it is what a daemon trust declaration names
-    # (reprobuild Dev-Env-Warm-Entry.md §3). Carried in `path`, where the macOS
+    # (a declared trusted daemon is identified by its socket address, not by a
+    # pid). Carried in `path`, where the macOS
     # shim already records its endpoint.
     var buf: array[256, char]
     let n = c_sockaddr_un_path(address, addrLen, addr buf[0], cint(buf.len))
@@ -3853,6 +4414,17 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32) {.raises: [].
       copyMem(addr endpoint[0], addr buf[0], n)
   of 2, 10: # AF_INET / AF_INET6
     familyName = "af_inet"
+    # The destination ("a.b.c.d:port" / "[v6]:port"), as the macOS and Windows
+    # shims record it. The peer of an INET socket has no pid to name, so the
+    # address is the only thing that says WHERE the client went: a consumer
+    # that allows some destinations (a sandbox's declared egress) can tell
+    # them from the rest, and the merge keys each out-of-tree peer on its own
+    # destination instead of folding every INET peer into one loss.
+    var buf: array[64, char]
+    let n = c_sockaddr_inet_dest(address, addrLen, addr buf[0], cint(buf.len))
+    if n > 0:
+      endpoint = newString(n)
+      copyMem(addr endpoint[0], addr buf[0], n)
   else:
     discard
 
@@ -3865,6 +4437,23 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32) {.raises: [].
     (if peerUid >= 0: " peeruid=" & $peerUid else: "")
   emitRecord(record)
 
+proc recordConnectAttempt(address: pointer; addrLen: uint32;
+                          callResult: cint; err: cint) {.raises: [].} =
+  ## A FAILED AF_INET/AF_INET6 connect: an attempt that reached no peer.
+  ## Recorded as its own kind (`mrConnectAttempt`, see types.nim) so it never
+  ## feeds the out-of-tree-peer downgrade an `mrIpcConnect` does. Any other
+  ## family is skipped (a failed AF_UNIX probe is daemon-discovery noise).
+  var buf: array[64, char]
+  let n = c_sockaddr_inet_dest(address, addrLen, addr buf[0], cint(buf.len))
+  if n <= 0:
+    return
+  var record = baseRecord(mrConnectAttempt, moConnectAttempt)
+  record.path = newString(n)
+  copyMem(addr record.path[0], addr buf[0], n)
+  record.result = int64(callResult)
+  record.detail = "connect-attempt af_inet errno=" & $err
+  emitRecord(record)
+
 proc repro_hook_connect*(ctx: var ConnectContext) {.raises: [].} =
   if bypassEvidence():
     callNext(ctx)
@@ -3872,8 +4461,16 @@ proc repro_hook_connect*(ctx: var ConnectContext) {.raises: [].} =
   ensureInitializedPreservingErrno()
   callNext(ctx)
   let savedErrno = c_get_errno()
+  # A connect that was made, or that may still complete (in flight, or
+  # interrupted by a signal: `repro_linux_errno_is_connect_in_progress`), is a
+  # connection; the merge treats an INET or unresolved peer as out of tree. A
+  # failure the protocol returned reached nobody and is an attempt. Any other
+  # failure (EFAULT, EINVAL, EBADF, ...) may mean the address was never
+  # readable, so it is not touched (`io_mon/posix_connect`).
   if ctx.result == 0 or c_errno_is_connect_in_progress(savedErrno) != 0:
     recordIpcConnect(ctx.fd, ctx.address, ctx.addrLen)
+  elif connectFailureReadAddress(savedErrno):
+    recordConnectAttempt(ctx.address, ctx.addrLen, ctx.result, savedErrno)
   c_set_errno(savedErrno)
 
 proc repro_hook_pipe*(ctx: var PipeContext) {.raises: [].} =
@@ -4613,6 +5210,7 @@ proc repro_hook_fork*(ctx: var ForkContext) {.raises: [].} =
   callNext(ctx)
   let savedErrno = c_get_errno()
   if ctx.result > 0:
+    markChildInTreeLedger(int(ctx.result))
     var record = baseRecord(mrProcessSpawn, moExecute)
     record.childOsPid = uint64(ctx.result)
     record.result = ctx.result.int64
@@ -4677,11 +5275,49 @@ proc repro_linux_raw_fork_child(parentSingleThreaded: cint)
     # shim has not necessarily received its own child notification yet.
     # Diagnostics here could enter that image through an interposed helper
     # before it knows to avoid the parent's inherited locks.
+  # The child's own tree-ledger entry: no atfork handler ran and the parent
+  # wrote none. Allocation-free; libc's getpid/open/read/readlink/close are
+  # thin syscall wrappers that take no lock.
+  inc disabled
+  markForkChildInTreeLedger()
+  dec disabled
 
 proc ct_linux_preload_register_raw_fork(sample, child: pointer)
   {.importc, cdecl, raises: [].}
 ct_linux_preload_register_raw_fork(cast[pointer](repro_linux_raw_fork_sample),
   cast[pointer](repro_linux_raw_fork_child))
+
+{.push stackTrace: off, lineTrace: off.}
+proc repro_linux_vm_process_parent(childPid: clong) {.cdecl, raises: [].} =
+  ## The creator of a CLONE_VM process that is neither a thread nor a vfork
+  ## child writes that process's tree-ledger entry (see
+  ## `ct_linux_preload_register_vm_process`): the child shares this memory
+  ## and gets no fork-child notification, so it cannot write its own.
+  ##
+  ## The child is ALREADY RUNNING, in this memory and, unless it was created
+  ## with CLONE_SETTLS, on this thread's TLS. So nothing here may touch shim
+  ## state the child's own hooks read: not `disabled` (a muted section would
+  ## make the child's hooks skip recording, silently), not the hook depth,
+  ## not errno. `writeTreeLedgerEntryRaw` issues raw system calls only. It
+  ## also runs in a fork child skipping bookkeeping (no lock is taken), so
+  ## that child's CLONE_VM process gets its entry too. A failed write is
+  ## reported through its own pre-encoded loss frame (raw syscalls, errno
+  ## untouched), which names this cause rather than a fork child's skipped
+  ## evidence: `VmProcessLedgerLossDetail` when the entry could not be
+  ## written, `VmProcessLedgerPidNsLossDetail` when it was written but this
+  ## process's pid namespace could not be read. Neither can carry an errno
+  ## or the child's pid: the frame is encoded at init.
+  if not initialized or fragmentDir.len == 0 or childPid <= 0:
+    return
+  let w = writeTreeLedgerEntryRaw(int(childPid),
+    linuxProcStartTicksSys(ledgerSyscall, int(childPid)))
+  if w.err != 0:
+    reportVmProcessLedgerWriteFailed(w.nsUnknown)
+{.pop.}
+
+proc ct_linux_preload_register_vm_process(fn: pointer)
+  {.importc, cdecl, raises: [].}
+ct_linux_preload_register_vm_process(cast[pointer](repro_linux_vm_process_parent))
 
 proc repro_linux_exec_env_for(envp: cstringArray): cstringArray
     {.cdecl, raises: [].} =
@@ -4740,6 +5376,11 @@ proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
     callNext(ctx)
     return
   ensureInitializedPreservingErrno()
+  # The tree-ledger entry for THIS pid, before the image is replaced: an exec
+  # keeps the pid and start time, so the entry stays valid for the new image
+  # even if it never loads the shim. Usually already there (shim init or the
+  # fork hook wrote it); a `vfork` child runs no fork hook and gets it here.
+  markSelfInTreeLedger()
   emitExecAttempt(ctx.path, ctx.envp)
   # io-mon-Lossless-Event-Capture M3 — inject LD_PRELOAD AND an INCREMENTED exec
   # generation into the child env. exec replaces the address space in the SAME
@@ -4828,6 +5469,8 @@ proc recordPosixSpawn(ctx: var PosixSpawnContext; usePath: bool)
   if ctx.result == 0 and ctx.fileActions != nil and childPid > 0 and
       uninjectable.len == 0:
     uninjectable = spawnImageUninjectable(ctx.path, usePath, childPid)
+  if ctx.result == 0 and childPid > 0:
+    markChildInTreeLedger(childPid)
   if ctx.result == 0 and ctx.pid != nil:
     var record = baseRecord(mrProcessSpawn, moExecute)
     record.childOsPid = uint64(ctx.pid[])

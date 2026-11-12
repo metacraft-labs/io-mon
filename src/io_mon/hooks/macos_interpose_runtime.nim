@@ -255,8 +255,9 @@ int repro_macos_real_renameat_syscall(int fromfd, char *from, int tofd,
 }
 
 /*
- * T2 content/metadata-dependency forwarders (see reprobuild-specs/
- * MacOS-Monitoring-Adversarial-Hardening.milestones.org breaks #3/#5/#7).
+ * T2 content/metadata-dependency forwarders: the calls through which a process
+ * can learn a file's contents or metadata (directory listings, attribute
+ * queries, library loads) without an open/stat the shim already records.
  *
  * Each reaches the kernel via the RAW syscall, exactly like the stat/rename
  * forwarders above, so a body-patched libsystem entry of the same name is never
@@ -595,6 +596,24 @@ unsigned long long repro_macos_proc_start_usec(int pid) {
 }
 
 /*
+ * The file this process image runs, for its `mrProcessStart` (docs/usage.md,
+ * "The process-start image"): proc_pidpath(getpid()), which names the
+ * executable vnode the kernel activated, as an absolute path with symlinks
+ * resolved (the kernel builds it from the vnode, not from the spelling the
+ * exec was given). Writes a NUL-terminated path into `out` and returns its
+ * length, or 0 when it cannot be read whole. proc_pidpath is a proc_info
+ * system call wrapper, not hooked, so this is reentrancy-free.
+ */
+int repro_macos_self_image_path(void *out_buf, int cap) {
+  char *out = (char *)out_buf;
+  if (out == NULL || cap < PROC_PIDPATHINFO_MAXSIZE) return 0;
+  int n = proc_pidpath(getpid(), out, (uint32_t)cap);
+  if (n <= 0 || n >= cap) return 0;
+  out[n] = '\0';
+  return n;
+}
+
+/*
  * ROUND-2 R8 (trusted-daemon report authentication): a cryptographically random
  * per-connection nonce stamped into each `mrIpcConnect` record (and offered to a
  * cooperating daemon via the ticket sidecar). The merge rejects a breakaway
@@ -686,8 +705,8 @@ static int repro_macos_anchor_base(int dirfd, char *base) {
 /*
  * The path a hooked call named, made ABSOLUTE as the kernel resolved it at the
  * time of the call -- the macOS counterpart of the Linux shim's `pathForAt`.
- * Spec: reprobuild-pm/spec/Monitor-Hook-Shim.md § CWD And Path Context ("CWD
- * tracking is required for relative path normalization").
+ * The shim tracks the cwd because a relative path can only be normalized
+ * against the directory it resolved against when the call was made.
  *
  * A relative path is joined onto the directory it resolved against
  * (repro_macos_anchor_base: the cwd for AT_FDCWD, else `dirfd`'s directory);
@@ -703,8 +722,7 @@ static int repro_macos_anchor_base(int dirfd, char *base) {
  *
  * Without this the caller's relative string was recorded verbatim, and a
  * consumer could only re-anchor it on a cwd the process might already have
- * left (reprobuild-pm issue 2026-10-18,
- * "macos-shim-records-relative-paths-the-engine-anchors-on-the-action-cwd").
+ * left (regression test `tests/macos/test_io_mon_macos_relative_path_anchor`).
  *
  * The result is built directly in `out` (>= MAXPATHLEN bytes; a larger buffer
  * admits a deep cwd plus a long relative path), so a hook pays no stack
@@ -3070,6 +3088,17 @@ proc ct_macos_proc_start_usec*(pid: cint): uint64 =
   proc impl(pid: cint): uint64
     {.importc: "repro_macos_proc_start_usec", cdecl.}
   impl(pid)
+
+proc ct_macos_self_image_path*(): string =
+  ## The absolute, physical path of the file this process image runs
+  ## (`proc_pidpath`), or "" when it cannot be read. See the C helper.
+  proc impl(outBuf: pointer; cap: cint): cint
+    {.importc: "repro_macos_self_image_path", cdecl.}
+  var buf: array[4096, char]   # PROC_PIDPATHINFO_MAXSIZE (4 * MAXPATHLEN)
+  let n = impl(addr buf[0], cint(buf.len))
+  if n > 0:
+    result = newString(int(n))
+    copyMem(addr result[0], addr buf[0], int(n))
 
 proc ct_macos_random_u64*(): uint64 =
   ## ROUND-2 R8 — an unguessable per-connection nonce (arc4random_buf) stamped on

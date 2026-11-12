@@ -20,6 +20,7 @@ import stackable_hooks/platform/macos_bodypatch
 import io_mon/types
 import io_mon/writer
 import io_mon/tree_ledger
+import io_mon/posix_connect
 
 {.emit: """
 #include <copyfile.h>
@@ -212,6 +213,7 @@ const
   AfInet = 2.cint
   AfInet6 = 30.cint
   EInProgress = 36.cint
+  EIntr = 4.cint
   # ROUND-2 R4 — `fstatat`'s AT_FDCWD sentinel (<fcntl.h>, -2 on Darwin). The
   # fstatat canonicalisation is applied only for ABSOLUTE paths or AT_FDCWD, since
   # realpath resolves a relative path against the CWD, not an arbitrary `dirfd`.
@@ -425,6 +427,11 @@ var
   # retaining descriptors or registry pointers after they exit. This closes the threaded-write
   # capture gap without a teardown-time Nim call.
   mainThreadId: uint64 = 0
+  # The file THIS image runs (`ct_macos_self_image_path`, read once at init;
+  # empty when it could not be read). The `path` of every `mrProcessStart`
+  # this image emits, its fork children's included. See `recordProcessStart`.
+  selfImagePath: string
+  selfImagePathRead = false
   # ROUND-2 R8 — this invocation's RUN ID, read once from REPRO_MONITOR_SESSION at
   # init. Stamped (as a `run=` token) onto every process-start and IPC-connect
   # record so the merge can scope trusted-daemon breakaway reports to THIS run and
@@ -544,6 +551,20 @@ proc recordProcessStart() {.raises: [].} =
   # before `main`; the fork child's call runs before `fork` returns there).
   markTreeLedgerEntry(selfPid, selfStart)
   record.detail = "shim-loaded start=" & $selfStart & runIdToken()
+  # THE RESOLVED IMAGE (docs/usage.md, "The process-start image"). The exec
+  # and spawn records carry what the program PASSED: a bare name looked up in
+  # the program's own PATH, or a path relative to its working directory, which
+  # nothing records. `proc_pidpath` is the kernel's answer: the absolute,
+  # physical path of the executable it activated, symlinks resolved. Read once,
+  # at the first process-start of this image (init, single-threaded); a fork
+  # child runs the same file, so it reuses the value. An unreadable path is
+  # recorded as an empty path plus `image=unresolved`.
+  if not selfImagePathRead:
+    selfImagePath = ct_macos_self_image_path()
+    selfImagePathRead = true
+  record.path = selfImagePath
+  if selfImagePath.len == 0:
+    record.detail.add " image=unresolved"
   emitRecord(record)
 
 proc observationForOpen(flags: cint): MonitorObservationKind =
@@ -880,15 +901,14 @@ proc anchoredPath(dirfd: cint; path: cstring): string {.raises: [].} =
   ## kept). An absolute path is returned as is (no syscall), so the common case
   ## costs nothing.
   ##
-  ## Spec: reprobuild-pm/spec/Monitor-Hook-Shim.md § CWD And Path Context
-  ## ("CWD tracking is required for relative path normalization"); the Linux
-  ## shim does the same in `pathForAt`. A relative string recorded verbatim
-  ## can only be re-anchored later on a cwd the process may have LEFT: after
-  ## `git -C repo` chdir()s and opens `.git/HEAD`, a consumer joining that
-  ## onto the action's cwd keys on a phantom `<cwd>/.git/HEAD` (reprobuild-pm
-  ## issue 2026-10-18-macos-shim-records-relative-paths-the-engine-anchors-on-
-  ## the-action-cwd). It also keeps `canonicalPathFor`'s memo, keyed on the
-  ## raw string, from serving a realpath computed under an earlier cwd.
+  ## The shim tracks the cwd because a relative path can only be normalized
+  ## against the directory it resolved against at the time of the call; the
+  ## Linux shim does the same in `pathForAt`. A relative string recorded
+  ## verbatim can only be re-anchored later on a cwd the process may have LEFT:
+  ## after `git -C repo` chdir()s and opens `.git/HEAD`, a consumer joining that
+  ## onto the action's cwd keys on a phantom `<cwd>/.git/HEAD`. It also keeps
+  ## `canonicalPathFor`'s memo, keyed on the raw string, from serving a realpath
+  ## computed under an earlier cwd.
   ##
   ## No firmlink rewrite: this is the as-passed record. The canonical
   ## companions (F_GETPATH, realpath, the lexical form) keep that job.
@@ -1173,7 +1193,8 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32;
   ## cardinal-sin guard for legitimate intra-tree IPC); a peer pid NOT in the set,
   ## or an UNKNOWN peer, is an out-of-tree breakaway that may have read files on
   ## our behalf ⇒ the merge injects an event-loss ⇒ mcIncomplete (a conservative
-  ## RE-RUN, never a false skip — Monitor-Hook-Shim.md §Failure Semantics).
+  ## RE-RUN, never a false skip: missing child propagation MUST emit event-loss
+  ## evidence).
   if address == nil:
     return
   var dest: array[1024, char]
@@ -1220,6 +1241,31 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32;
   dec disabled
   d.add " nonce=" & $nonce
   record.detail = d
+  emitRecord(record)
+
+proc recordConnectAttempt(fd: cint; address: pointer; addrLen: uint32;
+    callResult: cint; err: cint) {.raises: [].} =
+  ## A FAILED connect(2) to an AF_INET/AF_INET6 destination: an
+  ## attempt that reached nobody, recorded as `mrConnectAttempt` with the
+  ## destination in the same "ip:port" spelling `recordIpcConnect` uses. Not
+  ## an `mrIpcConnect` — there is no peer to be out of tree — so the merge
+  ## never derives a loss from it. Other families are skipped.
+  if address == nil:
+    return
+  var dest: array[1024, char]
+  dest[0] = '\0'
+  var peerPid: cint = 0
+  let family = ct_macos_socket_describe(fd, address, addrLen,
+    addr dest[0], csize_t(dest.len), addr peerPid)
+  if family != AfInet and family != AfInet6:
+    return
+  var record = baseRecord(mrConnectAttempt, moConnectAttempt)
+  record.result = callResult.int64
+  record.flags = uint32(family)
+  record.path = $cast[cstring](addr dest[0])
+  if record.path.len == 0:
+    return
+  record.detail = "connect-attempt af_inet errno=" & $err
   emitRecord(record)
 
 # --- ROUND-3 S0 — Mach/XPC service-name discrimination ----------------------
@@ -1502,8 +1548,11 @@ proc repro_hook_dyld_add_image*(mh: pointer; slide: int)
     # seen and discarded, and an edge with no blessing published over it, while
     # the Linux preload shim reports the very same draw. The startup baseline
     # the cardinal-sin guard exists for lives in /usr/lib and the shared cache,
-    # never in a registered image, so it stays excluded. See
-    # reprobuild-pm `spec/MacOS-Monitoring.md` §"Entropy Caller Attribution".
+    # never in a registered image, so it stays excluded. The rule: an entropy
+    # draw is reported as non-deterministic when its return address lies in
+    # a non-system image (the main executable, or any image not under
+    # /usr/lib or /System, not in the shared cache and not this shim), and no
+    # install prefix such as /nix/store or /opt/homebrew is exempt.
     # getsegmentdata is a lock-free memory walk, safe in the dyld add-image
     # callback.
     ct_macos_register_nonsystem_image(mh)
@@ -3368,12 +3417,28 @@ proc repro_hook_connect*(fd: cint; address: pointer; addrLen: uint32): cint
   result = ct_macos_real_connect(fd, address, addrLen)
   let savedErrno = getErrno()
   # Record an ESTABLISHED connection (result == 0 — the blocking daemon/sccache
-  # case) or an in-flight NON-BLOCKING one (result < 0 && EINPROGRESS — the
+  # case), an in-flight NON-BLOCKING one (result < 0 && EINPROGRESS — the
   # connection will complete asynchronously; the peer pid may not be resolvable
-  # yet, which the merge treats conservatively as out-of-tree). A hard failure
-  # (ECONNREFUSED, …) reached no peer and is NOT recorded.
-  if result == 0 or (result < 0 and savedErrno == EInProgress):
+  # yet, which the merge treats conservatively as out-of-tree), or a BLOCKING
+  # one interrupted by a caught signal (EINTR), which POSIX says is not aborted
+  # but "established asynchronously"
+  # (https://pubs.opengroup.org/onlinepubs/9799919799/functions/connect.html),
+  # so it is in flight exactly as EINPROGRESS is. Leaving EINTR out recorded
+  # nothing at all for it, so a handler installed without SA_RESTART made an
+  # undeclared connection invisible. A hard failure (ECONNREFUSED, …) reached
+  # no peer and is NOT an `mrIpcConnect`.
+  if result == 0 or (result < 0 and
+      (savedErrno == EInProgress or savedErrno == EIntr)):
     recordIpcConnect(fd, address, addrLen, result)
+  elif result < 0 and connectFailureReadAddress(savedErrno):
+    # Only a failure the protocol returned: after EFAULT, EINVAL, EBADF, ...
+    # the address may never have been readable, and reading it here would
+    # crash the program (`io_mon/posix_connect`).
+    # A failed AF_INET/AF_INET6 connect is recorded as an ATTEMPT
+    # (`mrConnectAttempt`), never as an `mrIpcConnect`: it reached no peer,
+    # so it must not downgrade, but it is the evidence that the process
+    # tried (the Linux and Windows shims record the same).
+    recordConnectAttempt(fd, address, addrLen, result, savedErrno)
   setErrno(savedErrno)
 
 # --- ROUND-4 IP1 — local-IPC-fd CREATE hooks (pipe/socket/socketpair/accept) ---
