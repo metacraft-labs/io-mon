@@ -1,12 +1,14 @@
-# Cross-repo siblings cloned by setup-dev-env at workspace-lock-pinned
-# revisions. They are io-mon's `uses:` library producers in repro.nim
-# (reprobuild builds each from source and threads its `src/` root onto
+# Cross-repo siblings cloned by setup-dev-env at the revisions this commit's
+# committed `repro.lock` pins. They are io-mon's `uses:` library producers in
+# repro.nim (reprobuild builds each from source and threads its `src/` root onto
 # io-mon's compile); they are also the `--path` siblings config.nims
 # resolves for the plain `nim c` / `nimble` build.
 #
 # nim-stackable-hooks is a bare name: `clone-siblings` resolves it from this
-# commit's own committed `repro.lock` (`lock-store: committed`, reprobuild-pm
-# Unified-Locking-And-Hooks.md §14.5), which pins c1d55ce3 — the same revision
+# commit's own committed `repro.lock` (`lock-store: committed`, the default:
+# the lock's `deps` entry of that name, which must be a full commit id, and a
+# sibling the lock does not pin is refused rather than cloned at a branch
+# tip), which pins c1d55ce3 — the same revision
 # `flake.nix` pins `stackable-hooks-src` to. Keep the two in step: a `nim c` in
 # the dev shell resolves `stackable_hooks/...` through the sibling checkout,
 # while `nix build .#default` resolves it through the flake input, and a build

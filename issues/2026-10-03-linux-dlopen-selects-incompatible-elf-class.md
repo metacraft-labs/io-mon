@@ -38,7 +38,8 @@ but cannot qualify glibc behavior.
 
 Before filing, fetched `agents`/`dev` and searched current issues plus deleted
 issue history for dlopen, RUNPATH and ELF; no existing owner issue covers this.
-Consumer evidence: [Reprobuild loader issue](../../reprobuild-specs/issues/2026-10-03-source-interface-extraction-cannot-load-openssl-in-codetracer-ci.md).
+Consumer evidence: Reprobuild's source-interface extraction could not load
+OpenSSL under the monitor in a downstream CI job (2026-10-03).
 
 ## Verified repair
 

@@ -32,15 +32,16 @@
 ## action rather than re-deriving the build graph in the DSL:
 ##
 ##   * the shim (``scripts/build_shim.sh``) is an ``--app:lib`` shared-library
-##     build with platform-specific arm64/arm64e fat-binary flags — a Mode-B
-##     ("crude") shape per ``reprobuild-specs/Language-Conventions/Nim.md`` that
-##     the fine-grained ``nim c --compileOnly`` Mode-A split cannot express, so a
-##     faithful script wrap is the correct cut;
+##     build with platform-specific arm64/arm64e fat-binary flags. Reprobuild's
+##     Nim conventions treat ``--app:lib`` output as the coarse Mode-B
+##     ("crude") shape, one action that compiles and links in-process, because
+##     the fine-grained ``nim c --compileOnly`` Mode-A split cannot express it;
+##     a faithful script wrap is the correct cut;
 ##   * the CLI (``nimble buildSnoop``) and the test suite (``nimble test``) both
 ##     resolve the sibling ``nim-stackable-hooks`` checkout through
 ##     ``--path:../nim-stackable-hooks/src`` and the test task is a NimScript
-##     ``task`` block (also a Mode-B trigger), so they are wrapped one-for-one as
-##     well.
+##     ``task`` block (a ``.nimble`` task is also a Mode-B trigger), so they
+##     are wrapped one-for-one as well.
 ##
 ## This is the same option-A approach runquota's ``repro.nim`` and the
 ## tcc-chain recipes take: preserve today's behaviour exactly, defer the
@@ -319,7 +320,8 @@ package io_mon:
       # Keep their compilation monitored and execute every assertion. The
       # generated depfile orders the known artifacts but does not discover all
       # runtime reads, so these execute edges MUST remain non-cacheable.
-      # Monitor-Hook-Shim.md / Failure Semantics permits this disposition.
+      # The monitor's failure contract permits this disposition: incomplete
+      # monitoring must fail the action or make it non-cacheable.
       # macOS fixtures also install their own interposers. A distinct outer
       # dylib can recurse during dyld initialization, before main is reached.
       # Linux's nested-monitor programs must also own their transport and

@@ -3,17 +3,17 @@ name: CI (reprobuild)
 # Additive side-by-side CI run that re-plays io-mon's deterministic dev
 # env through reprobuild instead of `nix develop`. Runs alongside the
 # existing `ci.yml` (`nix`) so regressions in either path still gate
-# merges — see
-# `metacraft-dev-guidelines/policies/ci-workflow-standards.md`
-# (all supported hosts, plus the manual Linux ARM64 port diagnostic) and
-# `metacraft-dev-guidelines/policies/ci-shared-dev-env.md` for the
-# rollout shape.
+# merges. The matrix covers every supported host (Linux x64, macOS ARM64,
+# Windows x64, and Windows ARM64 under x64 emulation); Linux ARM64 is an
+# unfinished port and runs only as a manual diagnostic. Both dev-env paths
+# stay required until the reprobuild one is the documented developer path
+# on every host, after which the `nix` path can be retired.
 #
-# The `setup-dev-env` composite action accepts `env-flavor: reprobuild`
-# (target state per the policy). It clones the workspace siblings listed
-# in `.github/sibling-repos` at the workspace-lock-pinned revisions, then
-# materialises the env so `repro build` / `repro test` can drive the
-# recipe in `repro.nim` end-to-end on every supported host.
+# The `setup-dev-env` composite action accepts `env-flavor: reprobuild`.
+# It clones the siblings listed in `.github/sibling-repos` at the
+# revisions this commit's committed `repro.lock` pins, then materialises
+# the env so `repro build` / `repro test` can drive the recipe in
+# `repro.nim` end-to-end on every supported host.
 
 on:
   merge_group:
@@ -47,8 +47,8 @@ jobs:
 
   choose-windows-arm:
     # Existing x64-emulation suite on a native ARM64 host; no backend port.
-    # Temporary migration owner: zah. Follow-up: metacraft-specs/issues/
-    # 2026-09-29-windows-arm64-release-runner-migration.md
+    # Temporary migration owner: zah. Follow-up (internal tracker):
+    # 2026-09-29-windows-arm64-release-runner-migration
     uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@146ea35853f859bcf78cc5da7fa53705a825da30
     with:
       preferred: windows-11-arm
@@ -56,8 +56,8 @@ jobs:
 
   choose-macos:
     # Native macOS jobs retain their full gates while the fleet repair lands.
-    # Owner: zah. Follow-up: metacraft-specs/issues/
-    # 2026-09-28-shared-macos-host-has-no-headroom-for-runquota-measurements.md
+    # Owner: zah. Follow-up (internal tracker):
+    # 2026-09-28-shared-macos-host-has-no-headroom-for-runquota-measurements
     uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@146ea35853f859bcf78cc5da7fa53705a825da30
     with:
       preferred: macos-26
@@ -84,10 +84,10 @@ jobs:
           '[{"os":"linux","arch":"x64","runner":["self-hosted","linux","x64"]},{"os":"macos","arch":"arm64","runner":["self-hosted","macos","arm64","nix-darwin"]},{"os":"windows","arch":"x64","runner":["self-hosted","windows","x64"]},{"os":"windows","arch":"arm64","runner":["self-hosted","windows","arm64"]},{"os":"linux","arch":"arm64","runner":["self-hosted","linux","arm64"]}]' ||
           '[{"os":"linux","arch":"x64","runner":["self-hosted","linux","x64"]},{"os":"macos","arch":"arm64","runner":["self-hosted","macos","arm64","nix-darwin"]},{"os":"windows","arch":"x64","runner":["self-hosted","windows","x64"]},{"os":"windows","arch":"arm64","runner":["self-hosted","windows","arm64"]}]') }}
     # Source bootstrap exceeds the current Tart guest's writable storage.
-    # The native nix-darwin class retains every test; owner zah, follow-up:
-    # metacraft-specs/issues/2026-09-29-macos-tart-source-bootstrap-exhausts-guest-disk.md
+    # The native nix-darwin class retains every test; owner zah, follow-up (internal tracker):
+    # 2026-09-29-macos-tart-source-bootstrap-exhausts-guest-disk
     # Temporary native Linux ARM64 migration for this build/test job; owner: zah.
-    # Follow-up: metacraft-specs/issues/2026-09-28-release-linux-arm64-runner-migration.md
+    # Follow-up (internal tracker): 2026-09-28-release-linux-arm64-runner-migration
     runs-on: ${{ contains(matrix.runner, 'windows') && contains(matrix.runner, 'x64') && fromJSON(needs.choose-windows.outputs.runs_on) || contains(matrix.runner, 'windows') && contains(matrix.runner, 'arm64') && fromJSON(needs.choose-windows-arm.outputs.runs_on) || contains(matrix.runner, 'macos') && fromJSON(needs.choose-macos.outputs.runs_on) || contains(matrix.runner, 'linux') && contains(matrix.runner, 'x64') && fromJSON(needs.choose-linux.outputs.runs_on) || (contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner) }}
     env:
       # Reprobuild and its monitor currently target x64 on Windows, including
@@ -116,8 +116,9 @@ jobs:
 
       - name: Setup dev env (reprobuild flavor)
         # setup-dev-env clones the siblings listed in .github/sibling-repos
-        # (nim-stackable-hooks, nim-shm-queue) at the workspace-lock-pinned
-        # revisions before materialising the env. Those two are io-mon's
+        # (nim-stackable-hooks, nim-shm-queue, and nim-shm-gset at the explicit
+        # pin that file gives) at the revisions this commit's committed
+        # repro.lock pins before materialising the env. The first two are io-mon's
         # `uses:` library producers in repro.nim; reprobuild builds each
         # from source and threads their `src/` roots onto io-mon's compile.
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@9456226e58b7db8538c96936136fe73a1a12974d

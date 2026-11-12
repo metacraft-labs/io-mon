@@ -28,8 +28,9 @@ Host-load binary SHA256:
 as an observation layer. `FsSnoopResult.exitCode` in `src/io_mon/fs_snoop.nim`
 is the monitored command's exit status. Preserve that command's execution;
 do not reinterpret its failed monitored run as success because its assertions
-passed. The [monitor failure contract](../../reprobuild-specs/Monitor-Hook-Shim.md#failure-semantics)
-also requires a shim crash to reject cache publication.
+passed. The monitor's failure contract
+also requires a shim crash to reject cache publication, and a successful child
+exit must not hide a monitor failure.
 
 Capture full Windows process exit codes without Bash truncation, real crash
 events and minidumps, and the resolved bootstrap source identities. Compare

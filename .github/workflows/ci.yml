@@ -28,8 +28,8 @@ concurrency:
 jobs:
   choose-macos:
     # Native macOS jobs retain their full gates while the fleet repair lands.
-    # Owner: zah. Follow-up: metacraft-specs/issues/
-    # 2026-09-28-shared-macos-host-has-no-headroom-for-runquota-measurements.md
+    # Owner: zah. Follow-up (internal tracker):
+    # 2026-09-28-shared-macos-host-has-no-headroom-for-runquota-measurements
     uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@146ea35853f859bcf78cc5da7fa53705a825da30
     with:
       preferred: macos-26

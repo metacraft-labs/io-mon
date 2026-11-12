@@ -98,8 +98,7 @@ Linux it cannot tell which process read the file, so it accepts a read of a
 path ending in that name by any process (`osPid = 0`). That fails closed: it
 can withhold a goal whose processes run a program by name and, separately,
 read a file outside the closure that happens to have the same name. No run
-has hit this so far (reprobuild-pm `spec/Distributed-Execution-Threat-Model.md`
-§7.5b, "What ran is judged by its image").
+has hit this so far.
 
 ## Suggested direction
 
@@ -113,10 +112,11 @@ Either of these, each with a cost:
    attributing all reads and does not touch the dedup key.
 
 Putting the pid back into the path-scoped key would undo the dedup the set
-transport was chosen for (reprobuild-pm `spec/Dependency-Observation-Attribution.md`,
-"The bigger lever: representation, not attribution").
+transport was chosen for: in a measured `nim c`, about half of all records
+were the same few facts re-observed by thousands of processes and differing
+only in their pid, and keying path-scoped records without the pid is what
+collapses them.
 
 ## Related
 
 - `2026-11-09-process-start-image-names-the-interpreter-of-a-script-started-by-name.md`
-- reprobuild-pm `spec/Distributed-Execution-Threat-Model.md` §7.5b

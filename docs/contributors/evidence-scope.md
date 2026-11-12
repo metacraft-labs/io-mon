@@ -321,9 +321,9 @@ were absent.
 
 The table is normative and must appear in the same shape everywhere it appears:
 here, in [`docs/usage.md`](../usage.md) where an operator meets the flag, and in
-reprobuild's `CLI/build.md` §"Dependency Evidence Scope". The framing that must
-survive editing: this degrades _"is this build up to date?"_, **not** _"are
-these bytes usable?"_.
+reprobuild's public `docs/dependency-collection.md` §"Dependency Evidence
+Scope". The framing that must survive editing: this degrades _"is this build up
+to date?"_, **not** _"are these bytes usable?"_.
 
 ## 9. Tests
 

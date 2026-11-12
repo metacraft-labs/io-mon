@@ -562,9 +562,7 @@ macOS through its kernel census (the paragraph after it). Both run at the same
 point of the same funnel.
 
 **The Windows tree-lifetime guard (normative).** Windows has a kernel
-primitive for this: the Job Object. The full design, with its failure
-modes and interactions, is reprobuild-pm
-`spec/io-mon-Windows-Tree-Lifetime-Guard.md`. What a host can rely on:
+primitive for this: the Job Object. What a host can rely on:
 
 - Every monitored root gets a fresh job. The launcher assigns the root to it
   while the root is still suspended, before the loader, the shim or the
