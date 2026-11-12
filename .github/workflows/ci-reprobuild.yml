@@ -120,7 +120,7 @@ jobs:
         # revisions before materialising the env. Those two are io-mon's
         # `uses:` library producers in repro.nim; reprobuild builds each
         # from source and threads their `src/` roots onto io-mon's compile.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@e2b9947768dccce6de2687a495c8286df4d6de96
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@9456226e58b7db8538c96936136fe73a1a12974d
         with:
           env-flavor: reprobuild
           # Reprobuild v0.2.23. The engine reads the committed v3 lock on
@@ -161,7 +161,7 @@ jobs:
         run: dev-exec python3 tests/test_ci_engine_reads_committed_lock.py --reprobuild .reprobuild-src
 
       - name: Refresh authentication before repro build
-        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bcd29c631ff01fbd0e577c5f96e5f9d5211fed26
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@9456226e58b7db8538c96936136fe73a1a12974d
         with:
           app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
@@ -175,7 +175,7 @@ jobs:
         run: dev-exec repro build --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }}
 
       - name: Refresh authentication before repro test
-        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bcd29c631ff01fbd0e577c5f96e5f9d5211fed26
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@9456226e58b7db8538c96936136fe73a1a12974d
         with:
           app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
@@ -265,7 +265,7 @@ jobs:
           PYCODE
 
       - name: Refresh authentication before just build (cross-check)
-        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bcd29c631ff01fbd0e577c5f96e5f9d5211fed26
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@9456226e58b7db8538c96936136fe73a1a12974d
         with:
           app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
@@ -278,7 +278,7 @@ jobs:
         run: dev-exec just build
 
       - name: Refresh authentication before just test (cross-check)
-        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bcd29c631ff01fbd0e577c5f96e5f9d5211fed26
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@9456226e58b7db8538c96936136fe73a1a12974d
         with:
           app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
@@ -336,7 +336,7 @@ jobs:
         # build/nimcache for five hours and held the macOS runner until the
         # job was cancelled.
         timeout-minutes: 15
-        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@9456226e58b7db8538c96936136fe73a1a12974d
         with:
           path: build/
           prefix: reprobuild-logs-${{ matrix.os }}-${{ matrix.arch }}/${{ github.run_id }}

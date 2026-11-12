@@ -60,7 +60,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@9456226e58b7db8538c96936136fe73a1a12974d
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
@@ -83,7 +83,7 @@ jobs:
       - name: Mirror logs to S3 (non-blocking)
         if: always()
         continue-on-error: true
-        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@9456226e58b7db8538c96936136fe73a1a12974d
         with:
           path: lint.log
           prefix: lint-logs/${{ github.run_id }}
@@ -122,7 +122,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@2f1abf5e4e2102f2a9abe1ea9a0f3b4097ec9717
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@9456226e58b7db8538c96936136fe73a1a12974d
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
@@ -142,7 +142,7 @@ jobs:
       - name: Mirror logs to S3 (non-blocking)
         if: always()
         continue-on-error: true
-        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@9456226e58b7db8538c96936136fe73a1a12974d
         with:
           path: build.log
           prefix: build-logs-${{ matrix.slug }}/${{ github.run_id }}
@@ -184,7 +184,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@9456226e58b7db8538c96936136fe73a1a12974d
         with:
           env-flavor: ${{ matrix.env }}
           repro-from-source: ${{ matrix.env == 'reprobuild' }}
@@ -255,7 +255,7 @@ jobs:
       - name: Mirror logs to S3 (non-blocking)
         if: always()
         continue-on-error: true
-        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@ad0535e1305cf59fa2f52dddb1b0cdc6787a0e21
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@9456226e58b7db8538c96936136fe73a1a12974d
         with:
           path: test.log
           prefix: test-logs-${{ matrix.env }}-${{ matrix.slug }}/${{ github.run_id }}
