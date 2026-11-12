@@ -81,7 +81,7 @@ after a task exception.
 reruns the programs whose fixture must own its monitor environment. Their
 compilation stays monitored and their execution stays uncached. CI requires
 all selected programs to launch and succeed on the repeat: 51 on macOS
-(every `tests/macos` program plus eight named ones), 27 on Linux and ten
+(every `tests/macos` program plus eight named ones), 27 on Linux and eleven
 on Windows. Update that explicit inventory when adding an isolated program,
 including a new `tests/macos` program, which is isolated by directory; keep
 the complete report among failure artifacts.
@@ -112,6 +112,16 @@ honours an inherited `REPRO_MONITOR_SHIM_LIB` before discovery, and under
 shim. The capture then injects the io-mon the engine was built with, not this
 checkout's, and a record newer than that io-mon is missing. Such a test must
 be in the isolation list too, so discovery finds `build/lib`.
+
+A Windows test that sets `REPRO_MONITOR_SHIM_LIB` to `build/lib` itself, or to
+any shim other than the inherited one, belongs on the list as well. Its inner
+capture parks the root's main thread to call `repro_runtime_init` on it, while
+the enclosing shim has already injected itself into that suspended root from
+its `CreateProcessW` hook. The borrowed call then fails with
+`repro_runtime_init could not be called on its parked main thread`. A test
+that only runs with an MSYS2 or Cygwin `sh` can hide this for a long time:
+it skips wherever `sh` has no `msys-2.0.dll` beside it, as Git for Windows'
+`bin/sh.exe` launcher does not.
 
 At `40a0adc` plus the workflow inventory repair, the macOS repeat passes all
 137 actions and launches all 45 isolated programs. The previous expectation

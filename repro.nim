@@ -425,7 +425,19 @@ package io_mon:
         # connect recorded no attempt (io-mon run 43122211901, Windows x64 and
         # arm64), while the same programs pass directly at 83eb364.
         "test_io_mon_windows_ipc_connect.nim",
-        "test_io_mon_windows_process_start_image.nim"])
+        "test_io_mon_windows_process_start_image.nim",
+        # Its nested case injects THIS checkout's shim (`build/lib`, set
+        # explicitly) into a root it spawns, then parks that root's main
+        # thread to call `repro_runtime_init`. Under `repro test` the spawning
+        # probe already carries the engine's shim, whose CreateProcessW hook
+        # injects that shim into the same suspended root first, and the
+        # borrowed init call fails ("repro_runtime_init could not be called
+        # on its parked main thread"). The case never ran under Reprobuild
+        # before 0.2.23: the `sh` tool was Git's `bin/sh.exe` launcher, with
+        # no `msys-2.0.dll` beside it, so both cases skipped. Reprobuild
+        # 53ddb5bc names the MSYS `usr/bin/sh.exe` instead (io-mon run
+        # 43289512869, Windows x64).
+        "test_io_mon_windows_msys_fallback.nim"])
       var executeAfter = after
       var executePolicy = automaticMonitorPolicy()
       if isolatesMonitor:
