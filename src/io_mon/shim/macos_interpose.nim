@@ -427,6 +427,18 @@ var
   # retaining descriptors or registry pointers after they exit. This closes the threaded-write
   # capture gap without a teardown-time Nim call.
   mainThreadId: uint64 = 0
+  # Set only in a fork child, by the atfork child handler, when a thread of the
+  # parent held one of the table locks below at the fork instant (see
+  # `repro_macos_atfork_child`). That thread does not exist in the child, so the
+  # lock stays held forever and the table it guards may be half-updated: every
+  # hook then forwards without touching shim tables until exec replaces the image.
+  # Process-wide rather than per-thread because the suspect tables are, and it
+  # is written only in the child, which has one thread when it is written.
+  forkChildBypass = false
+  # Whether this bypassed fork child already reported the evidence it skipped
+  # (`reportForkChildSkippedEvidence`): once per process is enough to grade the
+  # capture incomplete.
+  forkChildLossReported = false
   # The file THIS image runs (`ct_macos_self_image_path`, read once at init;
   # empty when it could not be read). The `path` of every `mrProcessStart`
   # this image emits, its fork children's included. See `recordProcessStart`.
@@ -512,6 +524,147 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
       # Flush and release the descriptor AND registry pointer while worker TLS
       # is valid. A flush alone leaks one handle for every exited worker.
       closeFragmentSlot(retainIdentity = true)
+
+# --- Fork children of multi-threaded processes -------------------------------
+#
+# POSIX lets the child of a multi-threaded `fork` call only async-signal-safe
+# functions until it execs, because every lock another thread held at the fork
+# is copied into the child held, with no thread left to release it
+# (https://pubs.opengroup.org/onlinepubs/9799919799/functions/fork.html, and the
+# RATIONALE of
+# https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_atfork.html).
+# The shim's hooks run in that window: Rust's `Command::spawn` closes and
+# `dup2`s descriptors between its fork and exec, and so does Go's
+# `syscall.forkExec`. Each of those reached `removeFdPath` / `copyFdPath`, and
+# when another thread of the parent held `fdLock` at the fork, the child waited
+# on it forever.
+#
+# The textbook remedy -- take every lock in a `pthread_atfork` prepare handler
+# and release it in the parent and child handlers -- is not safe here. On macOS
+# the client prepare handlers run FIRST, and libsystem's own (`_dyld_atfork_prepare`,
+# xpc, dispatch, malloc) run after them while ours would still hold the shim's
+# locks. A thread inside `dlopen` holds dyld's API lock and calls the shim's
+# add-image callback, which takes `recordLock`; holding `recordLock` across
+# `_dyld_atfork_prepare` would deadlock the PARENT against that thread instead.
+#
+# So, as the Linux shim does, nothing is held across the fork. The prepare
+# handler mutes the forking thread, so that hooks reached from libsystem's own
+# fork handlers (which run before ours in the child, and read the environment)
+# forward without taking a lock. The child handler then looks at each lock:
+#
+#  * `recordLock` guards only the process sequence counter, and the fragment
+#    registry lock guards the registry the child discards anyway
+#    (`discardFragmentSlotAfterFork`). Both are re-initialised when held. POSIX
+#    leaves re-initialising a locked mutex undefined
+#    (https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_mutex_init.html);
+#    Darwin's `pthread_mutex_init` rewrites the mutex in place, and in a child
+#    with a single thread nothing else can be using the old state.
+#  * every other lock guards a table a vanished thread may have left
+#    half-updated. When all of them are free the tables are as some complete
+#    update left them, and the child records like the child of a
+#    single-threaded parent. When one is held, the child stops using shim
+#    tables until exec (`forkChildBypass`), and a hook that would have produced
+#    evidence reports the skip once (`bypassEvidence`), so the capture is graded
+#    incomplete instead of silently missing what the child did.
+
+proc lockIsFree(lock: var Lock): bool {.raises: [].} =
+  ## Whether `lock` is unheld: take it and give it straight back. Meant for a
+  ## fork child, the only thread of its process, where a lock found taken was
+  ## held by a parent thread that does not exist here.
+  if not tryAcquire(lock):
+    return false
+  release(lock)
+  true
+
+proc shimTableLocksFreeInForkChild(): bool {.raises: [].} =
+  ## In a fork child: whether no parent thread held any lock guarding a shim
+  ## table at the fork instant. `recordLock` and the fragment registry lock are
+  ## not checked; the child handler re-initialises them (see above). The
+  ## held-lock test (`repro_test_fork_hold_lock`) covers each lock checked here.
+  lockIsFree(initLockVar) and lockIsFree(fdLock) and lockIsFree(dirLock) and
+    lockIsFree(mmapLock) and lockIsFree(canonicalLock) and
+    lockIsFree(observedLock) and lockIsFree(machServiceLock)
+
+proc reportForkChildSkippedEvidence() {.raises: [].} =
+  ## Once per bypassed fork child: an event-loss record saying the child made a
+  ## call the shim would have recorded, and did not. `emitRecord` touches only
+  ## `recordLock`, the fragment registry and this thread's own fragment slot,
+  ## all of which the atfork child handler left usable; a record from a thread
+  ## other than the parent's main thread is flushed at once, so the record
+  ## survives an exec that follows.
+  if forkChildLossReported:
+    return
+  forkChildLossReported = true
+  var loss = baseRecord(mrEventLoss, moEventLoss)
+  loss.detail = "macos fork child skipped evidence before exec"
+  emitRecord(loss)
+
+proc shouldBypass(): bool {.inline, raises: [].} =
+  ## Whether a hook must forward without touching shim state: the calling
+  ## thread is muted, or this is a fork child whose tables are suspect. For
+  ## hooks that only maintain bookkeeping (close, dup, closedir, munmap) and for
+  ## the fork hook. (`repro_hook_execve` reports its skip; see there.)
+  disabled > 0 or forkChildBypass
+
+proc bypassEvidence(): bool {.raises: [].} =
+  ## `shouldBypass` for a hook that produces evidence: in a bypassed fork child
+  ## it also reports, once, that evidence was skipped.
+  if disabled > 0:
+    return true
+  if forkChildBypass:
+    reportForkChildSkippedEvidence()
+    return true
+  false
+
+proc repro_macos_atfork_prepare() {.cdecl, raises: [].} =
+  ## Runs on the forking thread, before libsystem's own fork prepare handlers.
+  ## Mute it: the hooks libsystem's fork handlers reach (in the parent and,
+  ## before our child handler runs, in the child) then forward without a lock.
+  inc disabled
+
+proc repro_macos_atfork_parent() {.cdecl, raises: [].} =
+  dec disabled
+
+proc repro_macos_atfork_child() {.cdecl, raises: [].} =
+  ## Runs in the child, after libsystem's own fork child handlers and before
+  ## `fork` returns to the program, on the child's only thread.
+  if not lockIsFree(recordLock):
+    initLock(recordLock)
+  resetFragmentRegistryLockAfterFork()
+  # The once-per-process report is per process: a child of a bypassed child
+  # reports its own skips.
+  forkChildLossReported = false
+  if not shimTableLocksFreeInForkChild():
+    forkChildBypass = true
+  dec disabled
+
+proc pthread_atfork(prepare, parent, child: pointer): cint
+  {.importc: "pthread_atfork", header: "<pthread.h>", raises: [].}
+
+when defined(ioMonShimForkLockTest):
+  proc repro_test_fork_hold_lock(which, hold: cint): cint
+      {.exportc, cdecl, dynlib, raises: [].} =
+    ## Test-only (`-d:ioMonShimForkLockTest`): take (`hold` != 0) or give back
+    ## shim lock `which` on the calling thread, so a test can fork while
+    ## another thread holds it: 0 init, 1 fd, 2 dir, 3 mmap, 4 canonical,
+    ## 5 observed, 6 mach service (the table locks the child checks), 7 record
+    ## and 8 the fragment registry (the two the child re-initialises). 1 on
+    ## success, 0 for an unknown index.
+    let take = hold != 0
+    template toggle(lock: untyped) =
+      if take: acquire(lock) else: release(lock)
+    case which
+    of 0: toggle(initLockVar)
+    of 1: toggle(fdLock)
+    of 2: toggle(dirLock)
+    of 3: toggle(mmapLock)
+    of 4: toggle(canonicalLock)
+    of 5: toggle(observedLock)
+    of 6: toggle(machServiceLock)
+    of 7: toggle(recordLock)
+    of 8: fragmentRegistryTestHoldLock(take)
+    else: return 0
+    1
 
 proc runIdToken(): string {.raises: [].} =
   ## ROUND-2 R8 — the ` run=<id>` detail suffix (empty when no run id). Single
@@ -1519,7 +1672,7 @@ proc repro_hook_dyld_add_image*(mh: pointer; slide: int)
   ##   * deadlock: all work is MINIMAL and dyld-free — the C classifier uses dladdr
   ##     + a raw stat (never the `_dyld` image walk), and the emit is plain file
   ##     I/O. No heavy work, no dlopen, no symbol resolution here.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return
   var buf: array[1024, char]
   buf[0] = '\0'
@@ -1564,6 +1717,13 @@ proc repro_monitor_shim_init*(configPath: cstring): cint {.exportc, dynlib.} =
     initLock(canonicalLock)   # ROUND-2 R4 — guards the realpath memo
     initLock(observedLock)    # ROUND-2 R-D — guards the observed-input dedup set
     initLock(machServiceLock) # ROUND-3 S0 — guards the SIP Apple-service set/memo
+    # Keeps a fork child of a multi-threaded process off the locks a vanished
+    # parent thread held at the fork (see `repro_macos_atfork_child`). Once per
+    # process: a fork child inherits the registration. A failed registration
+    # leaves the shim as it was before these handlers existed.
+    discard pthread_atfork(cast[pointer](repro_macos_atfork_prepare),
+      cast[pointer](repro_macos_atfork_parent),
+      cast[pointer](repro_macos_atfork_child))
     locksReady = true
   acquire(initLockVar)
   defer: release(initLockVar)
@@ -2018,13 +2178,13 @@ proc recordMmap(callResult: pointer; length: csize_t; prot, flags, fd: cint)
 
 proc repro_hook_mprotect_promote*(adr: pointer; length: csize_t; prot: cint)
     {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0 or (prot and ProtWrite) == 0:
+  if not initialized or bypassEvidence() or (prot and ProtWrite) == 0:
     return
   emitMprotectPromotions(adr, length)
 
 proc repro_hook_munmap_cleanup*(adr: pointer; length: csize_t)
     {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or shouldBypass():
     return
   forgetSharedMmaps(adr, length)
 
@@ -2457,7 +2617,7 @@ proc recordTimeRead(source: string) {.raises: [].} =
 # flagged, or declare the dependency) — far cheaper than the false positive.
 
 proc repro_hook_open*(path: cstring; flags, mode: cint): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_interpose_real_open(path, flags, mode)
   result = ct_macos_interpose_real_open(path, flags, mode)
   let savedErrno = getErrno()
@@ -2483,7 +2643,7 @@ proc repro_hook_open*(path: cstring; flags, mode: cint): cint {.exportc, cdecl, 
 
 proc repro_hook_openat*(dirfd: cint; path: cstring; flags, mode: cint): cint
     {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_interpose_real_openat(dirfd, path, flags, mode)
   result = ct_macos_interpose_real_openat(dirfd, path, flags, mode)
   let savedErrno = getErrno()
@@ -2507,7 +2667,7 @@ proc repro_hook_openat*(dirfd: cint; path: cstring; flags, mode: cint): cint
   setErrno(savedErrno)
 
 proc repro_hook_read*(fd: cint; buf: pointer; count: csize_t): int {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_interpose_real_read(fd, buf, count)
   result = ct_macos_interpose_real_read(fd, buf, count)
   let savedErrno = getErrno()
@@ -2519,7 +2679,7 @@ proc repro_hook_read*(fd: cint; buf: pointer; count: csize_t): int {.exportc, cd
   setErrno(savedErrno)
 
 proc repro_hook_write*(fd: cint; buf: pointer; count: csize_t): int {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_interpose_real_write(fd, buf, count)
   result = ct_macos_interpose_real_write(fd, buf, count)
   if result >= 0:
@@ -2528,7 +2688,7 @@ proc repro_hook_write*(fd: cint; buf: pointer; count: csize_t): int {.exportc, c
     recordFdWrite(fd, result)
 
 proc repro_hook_close*(fd: cint): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or shouldBypass():
     return ct_macos_interpose_real_close(fd)
   result = ct_macos_interpose_real_close(fd)
   removeFdPath(fd)
@@ -2537,7 +2697,7 @@ proc repro_hook_dup*(fd: cint): cint {.exportc, cdecl, dynlib.} =
   ## ROUND-3 S2d — dup(2): the new fd refers to the SAME open file as `fd`. Mirror
   ## the source's path onto it so a read/write via the duplicate is attributed to
   ## the right file (r3_fd p_dup). Errno is preserved across the bookkeeping.
-  if not initialized or disabled > 0:
+  if not initialized or shouldBypass():
     return ct_macos_real_dup(fd)
   result = ct_macos_real_dup(fd)
   let savedErrno = getErrno()
@@ -2550,7 +2710,7 @@ proc repro_hook_dup2*(oldfd, newfd: cint): cint {.exportc, cdecl, dynlib.} =
   ## the hooked close) and made to refer to `oldfd`'s file. copyFdPath clears the
   ## stale destination entry first, so a read of A via a swapped fd B is attributed
   ## to A, not B's old file (r3_fd p_dup2 / p_dup2swap). On success result == newfd.
-  if not initialized or disabled > 0:
+  if not initialized or shouldBypass():
     return ct_macos_real_dup2(oldfd, newfd)
   result = ct_macos_real_dup2(oldfd, newfd)
   let savedErrno = getErrno()
@@ -2565,7 +2725,7 @@ proc repro_hook_fcntl*(fd, cmd: cint; arg: pointer): cint
   ## r3_fd p_fdupfd). EVERY other command is forwarded and PASSED THROUGH untouched
   ## (the raw fcntl forwarder is faithful for all commands). The variadic third
   ## argument is read as a void* by the interpose thunk and forwarded verbatim.
-  if not initialized or disabled > 0:
+  if not initialized or shouldBypass():
     return ct_macos_real_fcntl(fd, cmd, arg)
   result = ct_macos_real_fcntl(fd, cmd, arg)
   let savedErrno = getErrno()
@@ -2588,7 +2748,7 @@ proc repro_hook_getxattr*(path, name: cstring; value: pointer; size: csize_t;
   ## ROUND-3 S1a — getxattr(2): reads an extended-attribute VALUE (codesign /
   ## quarantine / ditto / custom build metadata). Recorded as a (resolved path,
   ## attr name, value length) dependency so a consumer folds the value into its key.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_getxattr(path, name, value, size, position, options)
   result = ct_macos_real_getxattr(path, name, value, size, position, options)
   let savedErrno = getErrno()
@@ -2603,7 +2763,7 @@ proc repro_hook_fgetxattr*(fd: cint; name: cstring; value: pointer;
     {.exportc, cdecl, dynlib.} =
   ## ROUND-3 S1a — fgetxattr(2): the fd variant. Resolve fd→path (the open's
   ## recorded path, else F_GETPATH) so the dependency names the real file.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_fgetxattr(fd, name, value, size, position, options)
   result = ct_macos_real_fgetxattr(fd, name, value, size, position, options)
   let savedErrno = getErrno()
@@ -2621,7 +2781,7 @@ proc repro_hook_listxattr*(path: cstring; namebuf: pointer; size: csize_t;
     options: cint): int {.exportc, cdecl, dynlib.} =
   ## ROUND-3 S1a — listxattr(2): a NAMESET dependency on the file (the output may
   ## branch on whether an attr is present, as in r3_xattr/list_read.c).
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_listxattr(path, namebuf, size, options)
   result = ct_macos_real_listxattr(path, namebuf, size, options)
   let savedErrno = getErrno()
@@ -2634,7 +2794,7 @@ proc repro_hook_listxattr*(path: cstring; namebuf: pointer; size: csize_t;
 proc repro_hook_flistxattr*(fd: cint; namebuf: pointer; size: csize_t;
     options: cint): int {.exportc, cdecl, dynlib.} =
   ## ROUND-3 S1a — flistxattr(2): the fd variant of the nameset dependency.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_flistxattr(fd, namebuf, size, options)
   result = ct_macos_real_flistxattr(fd, namebuf, size, options)
   let savedErrno = getErrno()
@@ -2653,7 +2813,7 @@ proc repro_hook_setxattr*(path, name: cstring; value: pointer; size: csize_t;
   ## ROUND-3 S1a (output side) — setxattr(2) writes an xattr VALUE: an OUTPUT write
   ## on the file keyed on the attr name (so a build that emits a dep into an xattr
   ## is matchable too).
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_setxattr(path, name, value, size, position, options)
   result = ct_macos_real_setxattr(path, name, value, size, position, options)
   let savedErrno = getErrno()
@@ -2667,7 +2827,7 @@ proc repro_hook_fsetxattr*(fd: cint; name: cstring; value: pointer;
     size: csize_t; position: uint32; options: cint): cint
     {.exportc, cdecl, dynlib.} =
   ## ROUND-3 S1a (output side) — fsetxattr(2): the fd variant.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_fsetxattr(fd, name, value, size, position, options)
   result = ct_macos_real_fsetxattr(fd, name, value, size, position, options)
   let savedErrno = getErrno()
@@ -2684,7 +2844,7 @@ proc repro_hook_fsetxattr*(fd: cint; name: cstring; value: pointer;
 proc repro_hook_removexattr*(path, name: cstring; options: cint): cint
     {.exportc, cdecl, dynlib.} =
   ## ROUND-3 S1a (output side) — removexattr(2): an OUTPUT mutation of the file.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_removexattr(path, name, options)
   result = ct_macos_real_removexattr(path, name, options)
   let savedErrno = getErrno()
@@ -2697,7 +2857,7 @@ proc repro_hook_removexattr*(path, name: cstring; options: cint): cint
 proc repro_hook_fremovexattr*(fd: cint; name: cstring; options: cint): cint
     {.exportc, cdecl, dynlib.} =
   ## ROUND-3 S1a (output side) — fremovexattr(2): the fd variant.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_fremovexattr(fd, name, options)
   result = ct_macos_real_fremovexattr(fd, name, options)
   let savedErrno = getErrno()
@@ -2717,7 +2877,7 @@ proc repro_hook_shm_open*(name: cstring; oflag, mode: cint): cint
   ## shm_open(O_CREAT) for that name) is an OUT-OF-TREE content source the merge
   ## downgrades on; a self-produced shm (create AND consume in-tree) is paired and
   ## stays mcComplete (the cardinal-sin guard). See recordShmOpen.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_shm_open(name, oflag, mode)
   result = ct_macos_real_shm_open(name, oflag, mode)
   let savedErrno = getErrno()
@@ -2730,7 +2890,7 @@ proc repro_hook_sendfile*(fd, s: cint; offset: int64; len: ptr int64;
   ## (arg 1) and writes it to the socket with NO read(2). Record a content read on
   ## the source so its classification matches a normal read (today the source left
   ## only its open record). research/.../r3_channel/probeB_sendfile.c.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_sendfile(fd, s, offset, len, hdtr, flags)
   result = ct_macos_real_sendfile(fd, s, offset, len, hdtr, flags)
   let savedErrno = getErrno()
@@ -2743,7 +2903,7 @@ proc repro_hook_pread*(fd: cint; buf: pointer; count: csize_t;
     offset: int64): int {.exportc, cdecl, dynlib.} =
   ## ROUND-3 S1d — pread(2) positioned read: content via the source fd with NO
   ## read(2). Record an mrFileRead on the fd's path (probeA_pread.c).
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_pread(fd, buf, count, offset)
   result = ct_macos_real_pread(fd, buf, count, offset)
   let savedErrno = getErrno()
@@ -2754,7 +2914,7 @@ proc repro_hook_pread*(fd: cint; buf: pointer; count: csize_t;
 proc repro_hook_preadv*(fd: cint; iov: pointer; iovcnt: cint;
     offset: int64): int {.exportc, cdecl, dynlib.} =
   ## ROUND-3 S1d — preadv(2): positioned scatter read.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_preadv(fd, iov, iovcnt, offset)
   result = ct_macos_real_preadv(fd, iov, iovcnt, offset)
   let savedErrno = getErrno()
@@ -2765,7 +2925,7 @@ proc repro_hook_preadv*(fd: cint; iov: pointer; iovcnt: cint;
 proc repro_hook_readv*(fd: cint; iov: pointer; iovcnt: cint): int
     {.exportc, cdecl, dynlib.} =
   ## ROUND-3 S1d — readv(2): scatter read (NOT the hooked read(2)). probeA_pread.c.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_readv(fd, iov, iovcnt)
   result = ct_macos_real_readv(fd, iov, iovcnt)
   let savedErrno = getErrno()
@@ -2797,7 +2957,7 @@ proc repro_hook_pwrite*(fd: cint; buf: pointer; count: csize_t;
   ## idiom (open O_RDWR, pwrite the changed page) mutates a pre-existing file's
   ## content with NO write(2); r4_write rdwr_pwrite.c / clean_pwrite.c recorded it
   ## as a pure INPUT. recordFdWrite marks the path written (INPUT→OUTPUT).
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_pwrite(fd, buf, count, offset)
   result = ct_macos_real_pwrite(fd, buf, count, offset)
   let savedErrno = getErrno()
@@ -2808,7 +2968,7 @@ proc repro_hook_pwrite*(fd: cint; buf: pointer; count: csize_t;
 proc repro_hook_pwritev*(fd: cint; iov: pointer; iovcnt: cint;
     offset: int64): int {.exportc, cdecl, dynlib.} =
   ## ROUND-4 RW1 — pwritev(2): positioned scatter/gather write (macOS 11+).
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_pwritev(fd, iov, iovcnt, offset)
   result = ct_macos_real_pwritev(fd, iov, iovcnt, offset)
   let savedErrno = getErrno()
@@ -2820,7 +2980,7 @@ proc repro_hook_writev*(fd: cint; iov: pointer; iovcnt: cint): int
     {.exportc, cdecl, dynlib.} =
   ## ROUND-4 RW1 — writev(2): vectored write (NOT the hooked write(2)). The
   ## linker/archiver/log-writer idiom; r4_write rdwr_writev.c recorded it as INPUT.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_writev(fd, iov, iovcnt)
   result = ct_macos_real_writev(fd, iov, iovcnt)
   let savedErrno = getErrno()
@@ -2835,7 +2995,7 @@ proc repro_hook_ftruncate*(fd: cint; length: int64): cint
   ## mmap region but a ftruncate-only shrink (destroying tail bytes) or zero-extend
   ## escaped (r4_write rdwr_ftruncate.c / clean_ftruncate.c). Record a write on the
   ## fd's path; `length` (the new size) is stamped for provenance.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_ftruncate(fd, length)
   result = ct_macos_real_ftruncate(fd, length)
   let savedErrno = getErrno()
@@ -2849,7 +3009,7 @@ proc repro_hook_truncate*(path: cstring; length: int64): cint
   ## no write(2). r4_write path_truncate.c / clean_truncate.c left ZERO records
   ## referencing the mutated output. Record a write on the CANONICAL path
   ## (mirroring the rename-dest output handling).
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_truncate(path, length)
   result = ct_macos_real_truncate(path, length)
   let savedErrno = getErrno()
@@ -2891,7 +3051,7 @@ proc repro_hook_mmap*(adr: pointer; length: csize_t; prot, flags, fd: cint;
   # libmalloc and this hook — and its threadvar — only runs in a re-entrancy-safe
   # context. `inMmapHook` still guards the recording path's own allocations
   # (recordMmap → baseRecord/emitRecord mmap → this hook) from recursion.
-  if not initialized or disabled > 0 or inMmapHook > 0:
+  if not initialized or bypassEvidence() or inMmapHook > 0:
     return ct_macos_real_mmap(adr, length, prot, flags, fd, offset)
   inc inMmapHook
   result = ct_macos_real_mmap(adr, length, prot, flags, fd, offset)
@@ -2901,7 +3061,7 @@ proc repro_hook_mmap*(adr: pointer; length: csize_t; prot, flags, fd: cint;
   dec inMmapHook
 
 proc repro_hook_opendir*(path: cstring): pointer {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_interpose_real_opendir(path)
   inc disabled
   try:
@@ -2920,7 +3080,7 @@ proc repro_hook_opendir*(path: cstring): pointer {.exportc, cdecl, dynlib.} =
     setErrno(savedErrno)
 
 proc repro_hook_readdir*(dirp: pointer): pointer {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_interpose_real_readdir(dirp)
   let dirPath = pathForDir(dirp)
   # ROUND-4 RW2 (break D1) — the dir's mtime+size, captured once at opendir (NOT
@@ -2940,7 +3100,7 @@ proc repro_hook_readdir*(dirp: pointer): pointer {.exportc, cdecl, dynlib.} =
     emitRecord(record)
 
 proc repro_hook_closedir*(dirp: pointer): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or shouldBypass():
     return ct_macos_interpose_real_closedir(dirp)
   inc disabled
   try:
@@ -2968,7 +3128,7 @@ proc repro_hook_closedir*(dirp: pointer): cint {.exportc, cdecl, dynlib.} =
 # expects (see macos_interpose_runtime.nim).
 
 proc repro_hook_stat*(path: cstring; buf: pointer): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_bodypatch_real_stat(path, buf)
   result = ct_macos_bodypatch_real_stat(path, buf)
   let savedErrno = getErrno()
@@ -2984,7 +3144,7 @@ proc repro_hook_stat*(path: cstring; buf: pointer): cint {.exportc, cdecl, dynli
   setErrno(savedErrno)
 
 proc repro_hook_lstat*(path: cstring; buf: pointer): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_bodypatch_real_lstat(path, buf)
   result = ct_macos_bodypatch_real_lstat(path, buf)
   let savedErrno = getErrno()
@@ -3007,7 +3167,7 @@ proc repro_hook_lstat*(path: cstring; buf: pointer): cint {.exportc, cdecl, dynl
 
 proc repro_hook_fstatat*(dirfd: cint; path: cstring; buf: pointer;
     flag: cint): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_bodypatch_real_fstatat(dirfd, path, buf, flag)
   result = ct_macos_bodypatch_real_fstatat(dirfd, path, buf, flag)
   let savedErrno = getErrno()
@@ -3025,7 +3185,7 @@ proc repro_hook_fstatat*(dirfd: cint; path: cstring; buf: pointer;
 
 proc repro_hook_access*(path: cstring; mode: cint): cint
     {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_bodypatch_real_access(path, mode)
   result = ct_macos_bodypatch_real_access(path, mode)
   let savedErrno = getErrno()
@@ -3058,7 +3218,7 @@ proc repro_hook_statfs*(path: cstring; buf: pointer): cint
   ## Phase-1 lexical helper for the missing-path case) so a canonical-keying
   ## consumer matches. `struct statfs` is NOT a `struct stat`, so no (dev,ino) is
   ## extracted; the detail tags the source.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_bodypatch_real_statfs(path, buf)
   result = ct_macos_bodypatch_real_statfs(path, buf)
   let savedErrno = getErrno()
@@ -3074,7 +3234,7 @@ proc repro_hook_fstatfs*(fd: cint; buf: pointer): cint
   ## F_GETPATH (a raw fcntl, reentrancy-free) and record it as an mrPathProbe so
   ## the filesystem probe names the same canonical path the by-path form would.
   ## An fd with no recoverable path (e.g. a socket/pipe) records nothing.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_bodypatch_real_fstatfs(fd, buf)
   result = ct_macos_bodypatch_real_fstatfs(fd, buf)
   let savedErrno = getErrno()
@@ -3099,7 +3259,7 @@ proc repro_hook_fstatfs*(fd: cint; buf: pointer): cint
 
 proc repro_hook_rename*(fromPath, toPath: cstring): cint
     {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_rename(fromPath, toPath)
   result = ct_macos_real_rename(fromPath, toPath)
   let savedErrno = getErrno()
@@ -3112,7 +3272,7 @@ proc repro_hook_rename*(fromPath, toPath: cstring): cint
 
 proc repro_hook_renameat*(fromfd: cint; fromPath: cstring; tofd: cint;
     toPath: cstring): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_renameat(fromfd, fromPath, tofd, toPath)
   result = ct_macos_real_renameat(fromfd, fromPath, tofd, toPath)
   let savedErrno = getErrno()
@@ -3139,7 +3299,7 @@ proc repro_hook_renameat*(fromfd: cint; fromPath: cstring; tofd: cint;
 
 proc repro_hook_mkdir*(path: cstring; mode: cint): cint
     {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_mkdir(path, mode)
   result = ct_macos_real_mkdir(path, mode)
   let savedErrno = getErrno()
@@ -3150,7 +3310,7 @@ proc repro_hook_mkdir*(path: cstring; mode: cint): cint
 
 proc repro_hook_mkdirat*(dirfd: cint; path: cstring; mode: cint): cint
     {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_mkdirat(dirfd, path, mode)
   result = ct_macos_real_mkdirat(dirfd, path, mode)
   let savedErrno = getErrno()
@@ -3160,7 +3320,7 @@ proc repro_hook_mkdirat*(dirfd: cint; path: cstring; mode: cint): cint
   setErrno(savedErrno)
 
 proc repro_hook_rmdir*(path: cstring): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_rmdir(path)
   result = ct_macos_real_rmdir(path)
   let savedErrno = getErrno()
@@ -3170,7 +3330,7 @@ proc repro_hook_rmdir*(path: cstring): cint {.exportc, cdecl, dynlib.} =
   setErrno(savedErrno)
 
 proc repro_hook_unlink*(path: cstring): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_unlink(path)
   result = ct_macos_real_unlink(path)
   let savedErrno = getErrno()
@@ -3181,7 +3341,7 @@ proc repro_hook_unlink*(path: cstring): cint {.exportc, cdecl, dynlib.} =
 
 proc repro_hook_unlinkat*(dirfd: cint; path: cstring; flags: cint): cint
     {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_unlinkat(dirfd, path, flags)
   result = ct_macos_real_unlinkat(dirfd, path, flags)
   let savedErrno = getErrno()
@@ -3207,7 +3367,7 @@ proc repro_hook_unlinkat*(dirfd: cint; path: cstring; flags: cint): cint
 
 proc repro_hook_symlink*(target, linkpath: cstring): cint
     {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_symlink(target, linkpath)
   result = ct_macos_real_symlink(target, linkpath)
   let savedErrno = getErrno()
@@ -3218,7 +3378,7 @@ proc repro_hook_symlink*(target, linkpath: cstring): cint
 
 proc repro_hook_symlinkat*(target: cstring; dirfd: cint; linkpath: cstring): cint
     {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_symlinkat(target, dirfd, linkpath)
   result = ct_macos_real_symlinkat(target, dirfd, linkpath)
   let savedErrno = getErrno()
@@ -3237,7 +3397,7 @@ proc repro_hook_symlinkat*(target: cstring; dirfd: cint; linkpath: cstring): cin
 
 proc repro_hook_clonefile*(src, dst: cstring; flags: cint): cint
     {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_clonefile(src, dst, flags)
   result = ct_macos_real_clonefile(src, dst, flags)
   let savedErrno = getErrno()
@@ -3247,7 +3407,7 @@ proc repro_hook_clonefile*(src, dst: cstring; flags: cint): cint
 
 proc repro_hook_clonefileat*(srcfd: cint; src: cstring; dstfd: cint;
     dst: cstring; flags: cint): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_clonefileat(srcfd, src, dstfd, dst, flags)
   result = ct_macos_real_clonefileat(srcfd, src, dstfd, dst, flags)
   let savedErrno = getErrno()
@@ -3257,7 +3417,7 @@ proc repro_hook_clonefileat*(srcfd: cint; src: cstring; dstfd: cint;
 
 proc repro_hook_fclonefileat*(srcfd, dstfd: cint; dst: cstring;
     flags: cint): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_fclonefileat(srcfd, dstfd, dst, flags)
   result = ct_macos_real_fclonefileat(srcfd, dstfd, dst, flags)
   let savedErrno = getErrno()
@@ -3267,7 +3427,7 @@ proc repro_hook_fclonefileat*(srcfd, dstfd: cint; dst: cstring;
   setErrno(savedErrno)
 
 proc repro_hook_link*(src, dst: cstring): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_link(src, dst)
   result = ct_macos_real_link(src, dst)
   let savedErrno = getErrno()
@@ -3277,7 +3437,7 @@ proc repro_hook_link*(src, dst: cstring): cint {.exportc, cdecl, dynlib.} =
 
 proc repro_hook_linkat*(fd1: cint; src: cstring; fd2: cint; dst: cstring;
     flag: cint): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_linkat(fd1, src, fd2, dst, flag)
   result = ct_macos_real_linkat(fd1, src, fd2, dst, flag)
   let savedErrno = getErrno()
@@ -3287,7 +3447,7 @@ proc repro_hook_linkat*(fd1: cint; src: cstring; fd2: cint; dst: cstring;
 
 proc repro_hook_copyfile*(src, dst: cstring; state: pointer;
     flags: uint32): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_copyfile(src, dst, state, flags)
   result = ct_macos_real_copyfile(src, dst, state, flags)
   let savedErrno = getErrno()
@@ -3298,7 +3458,7 @@ proc repro_hook_copyfile*(src, dst: cstring; state: pointer;
 
 proc repro_hook_fcopyfile*(srcfd, dstfd: cint; state: pointer;
     flags: uint32): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_fcopyfile(srcfd, dstfd, state, flags)
   result = ct_macos_real_fcopyfile(srcfd, dstfd, state, flags)
   let savedErrno = getErrno()
@@ -3315,7 +3475,7 @@ proc repro_hook_fcopyfile*(srcfd, dstfd: cint; state: pointer;
 
 proc repro_hook_getattrlist*(path: cstring; al, buf: pointer; size: csize_t;
     opts: culong): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_getattrlist(path, al, buf, size, opts)
   result = ct_macos_real_getattrlist(path, al, buf, size, opts)
   let savedErrno = getErrno()
@@ -3326,7 +3486,7 @@ proc repro_hook_getattrlist*(path: cstring; al, buf: pointer; size: csize_t;
 
 proc repro_hook_getattrlistat*(fd: cint; path: cstring; al, buf: pointer;
     size: csize_t; opts: culong): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_getattrlistat(fd, path, al, buf, size, opts)
   result = ct_macos_real_getattrlistat(fd, path, al, buf, size, opts)
   let savedErrno = getErrno()
@@ -3342,7 +3502,7 @@ proc repro_hook_getattrlistat*(fd: cint; path: cstring; al, buf: pointer;
 
 proc repro_hook_fgetattrlist*(fd: cint; al, buf: pointer; size: csize_t;
     opts: culong): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_fgetattrlist(fd, al, buf, size, opts)
   result = ct_macos_real_fgetattrlist(fd, al, buf, size, opts)
   let savedErrno = getErrno()
@@ -3359,7 +3519,7 @@ proc repro_hook_fgetattrlist*(fd: cint; al, buf: pointer; size: csize_t;
 
 proc repro_hook_getattrlistbulk*(dirfd: cint; al, buf: pointer; size: csize_t;
     opts: uint64): cint {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_getattrlistbulk(dirfd, al, buf, size, opts)
   result = ct_macos_real_getattrlistbulk(dirfd, al, buf, size, opts)
   if result > 0:
@@ -3371,7 +3531,7 @@ proc repro_hook_getdirentries*(fd: cint; buf: pointer; nbytes: cint;
   ## the matching legacy raw syscall so a 32-bit-inode caller's buffer keeps the
   ## layout it expects. NOTE: modern `readdir`/`readdir_r`/`scandir` do NOT reach
   ## here — they use `__getdirentries64` (see repro_hook_getdirentries64).
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_getdirentries(fd, buf, nbytes, basep)
   result = ct_macos_real_getdirentries(fd, buf, nbytes, basep)
   if result > 0:
@@ -3394,7 +3554,7 @@ proc repro_hook_getdirentries64*(fd: cint; buf: pointer; bufsize: csize_t;
   ## returned garbage). Forwarding via the matching `SYS_getdirentries64` here
   ## makes the buffer BYTE-IDENTICAL to an unmonitored call while still recording
   ## the directory-enumerate dependency.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_getdirentries64(fd, buf, bufsize, basep)
   result = ct_macos_real_getdirentries64(fd, buf, bufsize, basep)
   if result > 0:
@@ -3409,7 +3569,7 @@ proc repro_hook_getdirentries64*(fd: cint; buf: pointer; bufsize: csize_t;
 
 proc repro_hook_connect*(fd: cint; address: pointer; addrLen: uint32): cint
     {.exportc, cdecl, dynlib.} =
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_connect(fd, address, addrLen)
   result = ct_macos_real_connect(fd, address, addrLen)
   let savedErrno = getErrno()
@@ -3470,7 +3630,7 @@ proc repro_hook_pipe*(fds: ptr cint): cint {.exportc, cdecl, dynlib.} =
   ## ROUND-4 IP1 — pipe(2). On success records BOTH fds as in-tree local-fd
   ## creates (the two ends have DISTINCT inodes on macOS, and the inherited READ
   ## end is what a downstream consumer fstats, so both must be paired).
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_pipe(fds)
   result = ct_macos_real_pipe(fds)
   let savedErrno = getErrno()
@@ -3485,7 +3645,7 @@ proc repro_hook_socketpair*(domain, typ, protocol: cint; sv: ptr cint): cint
   ## ROUND-4 IP1 — socketpair(2). Records BOTH ends as in-tree local-fd creates
   ## (distinct inodes), so an inherited end read in-tree pairs and does not
   ## downgrade while an out-of-tree socketpair inherited by a monitored child does.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_socketpair(domain, typ, protocol, sv)
   result = ct_macos_real_socketpair(domain, typ, protocol, sv)
   let savedErrno = getErrno()
@@ -3502,7 +3662,7 @@ proc repro_hook_socket*(domain, typ, protocol: cint): cint
   ## reading its peer's reply, etc.) is paired — the IPC-connect machinery still
   ## owns the out-of-tree-PEER downgrade decision; this only suppresses a SPURIOUS
   ## IP1 opaque-read downgrade of an in-tree-created socket.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_socket(domain, typ, protocol)
   result = ct_macos_real_socket(domain, typ, protocol)
   let savedErrno = getErrno()
@@ -3516,7 +3676,7 @@ proc repro_hook_accept*(s: cint; address: pointer; addrLen: ptr uint32): cint
   ## a monitored SERVER created itself; recording it keeps an in-tree server's
   ## read of an accepted connection mcComplete (the cardinal-sin guard for the
   ## intra-tree IPC pair probe, whose parent accept()s then read()s).
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_accept(s, address, addrLen)
   result = ct_macos_real_accept(s, address, addrLen)
   let savedErrno = getErrno()
@@ -3545,7 +3705,7 @@ proc repro_hook_bootstrap_look_up*(bp: uint32; serviceName: cstring;
   ## returned port) of a NON-`com.apple.*` service as an out-of-tree breakaway
   ## (see recordMachLookup / the cardinal-sin filter). A failed lookup reached no
   ## peer and is not recorded.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_bootstrap_look_up(bp, serviceName, sp)
   result = ct_macos_real_bootstrap_look_up(bp, serviceName, sp)
   let savedErrno = getErrno()
@@ -3598,7 +3758,7 @@ proc repro_hook_xpc_connection_create_mach_service*(name: cstring;
   ## monitored program's own traffic establishes it: the create-time exemption
   ## trusts the NAME, and S0' showed an attacker can register a genuine declared
   ## name, so the name-trust is provisional pending an owner check.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_xpc_create_mach_service(name, targetq, flags)
   result = ct_macos_real_xpc_create_mach_service(name, targetq, flags)
   if result != nil and (flags and XpcMachServiceListener) == 0:
@@ -3625,7 +3785,7 @@ proc repro_hook_xpc_connection_send_message_with_reply_sync*(conn: pointer;
   ## or any UNCERTAIN result (-1: no peer yet / csops failed) is the fail-safe — NO
   ## downgrade — so a normal build talking to a real com.apple.* service is never
   ## falsely re-run. Recorded once per connection (the entry is consumed).
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_xpc_reply_sync(conn, message)
   result = ct_macos_real_xpc_reply_sync(conn, message)
   let name = pendingAppleXpcName(conn)
@@ -3678,7 +3838,7 @@ proc repro_hook_syscall*(number, a1, a2, a3, a4, a5, a6, a7: clong): clong
   ## Forwarded via the raw `svc` (ct_macos_real_syscall), never a patched named
   ## symbol, so there is no re-entry. (An INLINE svc in the program's own code never
   ## reaches here — it is caught at load by the main-__text scan.)
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_syscall(number, a1, a2, a3, a4, a5, a6, a7)
   if ct_macos_syscall_is_file_op(number) and not rawSyscallFileOpFlagged:
     rawSyscallFileOpFlagged = true
@@ -3691,7 +3851,7 @@ proc repro_hook_syscall*(number, a1, a2, a3, a4, a5, a6, a7: clong): clong
 proc repro_hook_getenv*(name: cstring): cstring {.exportc, cdecl, dynlib.} =
   ## Observed declared input (env). Forwards via the genuine getenv (environ walk)
   ## then records the queried NAME (deduped, denylisted). Does NOT downgrade.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_getenv(name)
   result = ct_macos_real_getenv(name)
   let savedErrno = getErrno()
@@ -3701,7 +3861,7 @@ proc repro_hook_getenv*(name: cstring): cstring {.exportc, cdecl, dynlib.} =
 proc repro_hook_sysctlbyname*(name: cstring; oldp: pointer; oldlenp: ptr csize_t;
     newp: pointer; newlen: csize_t): cint {.exportc, cdecl, dynlib.} =
   ## Observed declared input (sysctl by name, e.g. "hw.ncpu"). Does NOT downgrade.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_sysctlbyname(name, oldp, oldlenp, newp, newlen)
   result = ct_macos_real_sysctlbyname(name, oldp, oldlenp, newp, newlen)
   let savedErrno = getErrno()
@@ -3714,7 +3874,7 @@ proc repro_hook_sysctl*(name: ptr cint; namelen: cuint; oldp: pointer;
     {.exportc, cdecl, dynlib.} =
   ## Observed declared input (integer-MIB sysctl form). The MIB ints are rendered
   ## to a stable "mib:6.5" identity for the cache key. Does NOT downgrade.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_sysctl(name, namelen, oldp, oldlenp, newp, newlen)
   result = ct_macos_real_sysctl(name, namelen, oldp, oldlenp, newp, newlen)
   let savedErrno = getErrno()
@@ -3726,7 +3886,7 @@ proc repro_hook_sysctl*(name: ptr cint; namelen: cuint; oldp: pointer;
 
 proc repro_hook_uname*(buf: pointer): cint {.exportc, cdecl, dynlib.} =
   ## Observed declared input (machine config). Does NOT downgrade.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_uname(buf)
   result = ct_macos_real_uname(buf)
   let savedErrno = getErrno()
@@ -3736,7 +3896,7 @@ proc repro_hook_uname*(buf: pointer): cint {.exportc, cdecl, dynlib.} =
 proc repro_hook_gethostname*(name: cstring; namelen: csize_t): cint
     {.exportc, cdecl, dynlib.} =
   ## Observed declared input (host identity). Does NOT downgrade.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_gethostname(name, namelen)
   result = ct_macos_real_gethostname(name, namelen)
   let savedErrno = getErrno()
@@ -3746,7 +3906,7 @@ proc repro_hook_gethostname*(name: cstring; namelen: csize_t): cint
 proc repro_hook_gethostuuid*(uuid: pointer; timeout: pointer): cint
     {.exportc, cdecl, dynlib.} =
   ## Observed declared input (host uuid). Does NOT downgrade.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_gethostuuid(uuid, timeout)
   result = ct_macos_real_gethostuuid(uuid, timeout)
   let savedErrno = getErrno()
@@ -3782,7 +3942,7 @@ proc repro_hook_getentropy*(buf: pointer; len: csize_t; caller: pointer): cint
   ## NON-DETERMINISM (entropy) evidence, but ONLY for the program's own use
   ## (ROUND-3 S3b: caller in ANY non-system image — the main exe OR a dylib/plugin).
   ## Forward genuine, conditionally flag.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_getentropy(buf, len)
   result = ct_macos_real_getentropy(buf, len)
   let savedErrno = getErrno()
@@ -3792,7 +3952,7 @@ proc repro_hook_getentropy*(buf: pointer; len: csize_t; caller: pointer): cint
 
 proc repro_hook_arc4random*(caller: pointer): cuint {.exportc, cdecl, dynlib.} =
   ## NON-DETERMINISM (entropy) evidence for the program's own use only.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_arc4random()
   result = ct_macos_real_arc4random()
   if ct_macos_addr_in_nonsystem(caller):
@@ -3804,7 +3964,7 @@ proc repro_hook_arc4random_buf*(buf: pointer; n: csize_t; caller: pointer)
   ## shim's OWN nonce randomness bypasses this wrapper (repro_macos_random_u64
   ## resolves the genuine entry); the libsystem/libobjc/libswift startup baseline is
   ## excluded by the caller-image check (its caller is in /usr/lib).
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     ct_macos_real_arc4random_buf(buf, n)
     return
   ct_macos_real_arc4random_buf(buf, n)
@@ -3814,7 +3974,7 @@ proc repro_hook_arc4random_buf*(buf: pointer; n: csize_t; caller: pointer)
 proc repro_hook_arc4random_uniform*(upper: cuint; caller: pointer): cuint
     {.exportc, cdecl, dynlib.} =
   ## NON-DETERMINISM (entropy) evidence for the program's own use only.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_arc4random_uniform(upper)
   result = ct_macos_real_arc4random_uniform(upper)
   if ct_macos_addr_in_nonsystem(caller):
@@ -3828,7 +3988,7 @@ proc repro_hook_secrandom*(rnd: pointer; count: csize_t; bytes: pointer;
   ## NON-SYSTEM image (caller attribution), so a libsystem/framework startup
   ## baseline is excluded and a normal cc/clang compile is never falsely flagged
   ## (the cardinal-sin guard). Deduped once per process.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_secrandom(rnd, count, bytes)
   result = ct_macos_real_secrandom(rnd, count, bytes)
   let savedErrno = getErrno()
@@ -3841,7 +4001,7 @@ proc repro_hook_ccrandom*(bytes: pointer; count: csize_t;
   ## ROUND-5 P2 — CCRandomGenerateBytes (CommonCrypto). NON-DETERMINISM (entropy)
   ## evidence, recorded like SecRandomCopyBytes with the same caller attribution +
   ## per-process dedup.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_ccrandom(bytes, count)
   result = ct_macos_real_ccrandom(bytes, count)
   let savedErrno = getErrno()
@@ -3854,7 +4014,7 @@ proc repro_hook_clock_gettime*(clk: cint; ts: pointer): cint
   ## WALL-CLOCK read — RECORD but do NOT downgrade (the cardinal-sin guard: almost
   ## every program times a loop benignly). The shim's own monoNowNs clock reads run
   ## under `disabled` (during emit), so they forward without recording.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_clock_gettime(clk, ts)
   result = ct_macos_real_clock_gettime(clk, ts)
   let savedErrno = getErrno()
@@ -3864,7 +4024,7 @@ proc repro_hook_clock_gettime*(clk: cint; ts: pointer): cint
 proc repro_hook_gettimeofday*(tp: pointer; tzp: pointer): cint
     {.exportc, cdecl, dynlib.} =
   ## WALL-CLOCK read — RECORD but do NOT downgrade.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_gettimeofday(tp, tzp)
   result = ct_macos_real_gettimeofday(tp, tzp)
   let savedErrno = getErrno()
@@ -3873,7 +4033,7 @@ proc repro_hook_gettimeofday*(tp: pointer; tzp: pointer): cint
 
 proc repro_hook_time*(tloc: pointer): clonglong {.exportc, cdecl, dynlib.} =
   ## WALL-CLOCK read — RECORD but do NOT downgrade.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     return ct_macos_real_time(tloc)
   result = ct_macos_real_time(tloc)
   let savedErrno = getErrno()
@@ -3952,6 +4112,16 @@ proc repro_hook_execve*(path: cstring; argv, envp: cstringArray): cint
   ## (The fork+exec case is the important one: a forked child's exec record lives
   ## only in that child's buffer, which exec would otherwise discard.)
   if not initialized or disabled > 0:
+    return ct_macos_interpose_real_execve(path, argv, envp)
+  if forkChildBypass:
+    # A fork child that bypasses shim tables records no exec. When the new
+    # image loads the shim it records itself, but when it cannot (a binary
+    # without a drop-in that strips the injection, a static one) the missing
+    # exec record is the only trace of an unmonitored subtree: the merge's
+    # exec-coverage check needs it to see the loss. So report the skip, and
+    # flush it now, because the exec discards this image's buffer.
+    reportForkChildSkippedEvidence()
+    discard repro_monitor_shim_flush()
     return ct_macos_interpose_real_execve(path, argv, envp)
   # The tree-ledger entry for THIS pid, before the image is replaced: an exec
   # keeps the pid and start time, so the entry stays valid for the new image
@@ -4049,14 +4219,17 @@ proc repro_hook_fork*(): PidT {.exportc, cdecl, dynlib.} =
   ## (spec §16.7.8 process-tree accounting). When no trampoline was built
   ## (interpose-only, or the build was skipped) the C forwarder falls back to a
   ## re-entry-free path (the named entry is not patched there).
-  if not initialized or disabled > 0:
+  if not initialized or shouldBypass():
     return ct_macos_bodypatch_call_fork(bodypatchForkTramp)
   result = ct_macos_bodypatch_call_fork(bodypatchForkTramp)
   if result > 0:
     recordSpawn(result, result, nil, "fork")
   elif result == 0:
     # (The child's first record drops the inherited fragment slot without
-    # flushing it: `writer.slotInheritedAcrossFork`.)
+    # flushing it: `writer.slotInheritedAcrossFork`.) Also in a child that
+    # bypasses shim tables (`forkChildBypass`): the process-start and its
+    # tree-ledger entry use only `recordLock`, the fragment registry and this
+    # thread's own slot, which the atfork child handler left usable.
     recordProcessStart()
 
 var inSpawnForward {.threadvar.}: int
@@ -4177,7 +4350,7 @@ proc repro_hook_posix_spawn*(pid: ptr PidT; path: cstring;
   ## real (interpose-only / re-entry), record the spawn. The detail tag reflects
   ## which forward was taken so downstream can tell a body-patch-intercepted
   ## internal spawn from an interpose-visible one.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     # Muted: forward only (no record), via the depth-guarded muted forwarder so
     # the trampoline path cannot re-enter itself at depth 0 (see
     # `spawnForwardMuted` / `inSpawnForward`).
@@ -4211,7 +4384,7 @@ proc repro_hook_posix_spawnp*(pid: ptr PidT; path: cstring;
     {.exportc, cdecl, dynlib.} =
   ## Unified posix_spawnp hook: as `repro_hook_posix_spawn` for the
   ## PATH-searching variant.
-  if not initialized or disabled > 0:
+  if not initialized or bypassEvidence():
     # Muted: forward only (no record), via the depth-guarded muted forwarder
     # (see `spawnForwardMuted` / `inSpawnForward`).
     return spawnForwardMuted(bodypatchPosixSpawnpTramp, pid, path, fileActions,
