@@ -411,7 +411,19 @@ package io_mon:
         "test_io_mon_windows_read_capture.nim",
         "test_io_mon_windows_root_guard.nim",
         "test_io_mon_windows_spawn_abandoned_injection.nim",
-        "test_io_mon_windows_spawn_resume_invariant.nim"])
+        "test_io_mon_windows_spawn_resume_invariant.nim",
+        # These grade records only the CURRENT shim writes: the resolved
+        # process-start image and the refused-connect attempt. Their captures
+        # find the shim through `findShimLibrary`, which honours an inherited
+        # `REPRO_MONITOR_SHIM_LIB` first, and an enclosing monitor seeds that
+        # with the ENGINE's own shim. Under `repro test` the inner run then
+        # injects the engine's io-mon, not this checkout's. Reprobuild
+        # 413830138a ships io-mon 6fccd929, which predates both records: every
+        # process-start read `shim-loaded` with an empty path and the refused
+        # connect recorded no attempt (io-mon run 43122211901, Windows x64 and
+        # arm64), while the same programs pass directly at 83eb364.
+        "test_io_mon_windows_ipc_connect.nim",
+        "test_io_mon_windows_process_start_image.nim"])
       var executeAfter = after
       var executePolicy = automaticMonitorPolicy()
       if isolatesMonitor:

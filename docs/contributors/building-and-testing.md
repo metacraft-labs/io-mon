@@ -81,7 +81,7 @@ after a task exception.
 reruns the programs whose fixture must own its monitor environment. Their
 compilation stays monitored and their execution stays uncached. CI requires
 all selected programs to launch and succeed on the repeat: 51 on macOS
-(every `tests/macos` program plus eight named ones), 27 on Linux and eight
+(every `tests/macos` program plus eight named ones), 27 on Linux and ten
 on Windows. Update that explicit inventory when adding an isolated program,
 including a new `tests/macos` program, which is isolated by directory; keep
 the complete report among failure artifacts.
@@ -104,6 +104,14 @@ passes under `just test` and fails under `repro test`. Its bare and
 (`tests/helpers/unmonitored_env.nim`), which drops `LD_PRELOAD` and every
 `REPRO_MONITOR_*` variable, and set `REPRO_MONITOR_SHIM_LIB` explicitly in each
 monitored arm.
+
+On Windows the same holds for a test that grades a record only the current
+shim writes. Its capture finds the shim through `findShimLibrary`, which
+honours an inherited `REPRO_MONITOR_SHIM_LIB` before discovery, and under
+`repro test` the enclosing monitor sets that variable to the engine's own
+shim. The capture then injects the io-mon the engine was built with, not this
+checkout's, and a record newer than that io-mon is missing. Such a test must
+be in the isolation list too, so discovery finds `build/lib`.
 
 At `40a0adc` plus the workflow inventory repair, the macOS repeat passes all
 137 actions and launches all 45 isolated programs. The previous expectation
