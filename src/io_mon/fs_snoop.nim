@@ -576,8 +576,8 @@ when defined(windows):
   import stackable_hooks/windows_injector
   # The Windows tree-lifetime guard's Job Object mechanics. Its DECISIONS stay
   # in this module, private, inside the evidence funnel (DH-3): see
-  # `settleMonitorDescendants` and reprobuild-pm
-  # spec/io-mon-Windows-Tree-Lifetime-Guard.md.
+  # `settleMonitorDescendants`, and docs/usage.md "The Windows tree-lifetime
+  # guard (normative)" for the user contract.
   import io_mon/windows_job_guard
 
   const
@@ -592,8 +592,7 @@ when defined(windows):
 # rewrites SIP-protected exec paths to these drop-ins (``rewriteExecPathForSip``
 # → ``rewriteSipPath``) so that DYLD_INSERT_LIBRARIES is not stripped on the way
 # into /bin/sh, /bin/cat and friends — the path-rewriting bypass documented in
-# codetracer-native-recorder/ct_interpose/src/ct_interpose/library_init.nim and
-# in reprobuild-specs/Portable-Macos-Sandbox-Tools.milestones.org.
+# codetracer-native-recorder/ct_interpose/src/ct_interpose/library_init.nim.
 #
 # WHY a drop-in and not a copy (SIP/AMFI rationale): on macOS 26 / Apple
 # Silicon, System Integrity Protection strips DYLD_INSERT_LIBRARIES when a
@@ -1939,8 +1938,8 @@ proc settleMonitorDescendants(h: var MonitorHandle) =
     waitForLinuxInjectedDescendants(h.fragmentDir, h.runId, h.rootPid,
       h.rootStartTicks, launcherLossPath0, h.rootUninjectable)
   elif defined(windows):
-    # THE WINDOWS TREE-LIFETIME GUARD (reprobuild-pm
-    # spec/io-mon-Windows-Tree-Lifetime-Guard.md). The root was assigned,
+    # THE WINDOWS TREE-LIFETIME GUARD (user contract: docs/usage.md, "The
+    # Windows tree-lifetime guard (normative)"). The root was assigned,
     # suspended, to a fresh job that refuses breakaway, so the job holds every
     # process the tree created; `ActiveProcesses == 0` after the root exited
     # is therefore a PROOF that nothing is still working outside the evidence.

@@ -1,7 +1,7 @@
 ## test_io_mon_macos_endpoint_security — unit coverage for the EndpointSecurity
 ## backend SKELETON's PURE logic (T3c), independent of the entitlement-restricted
 ## ES SDK. Exercises the three pure pieces the production backend is built on and
-## that the design doc (MacOS-EndpointSecurity-Backend.md) specifies:
+## that the backend's design specifies:
 ##   - the process-subtree filter (EsProcessTree) — ES is system-global, so only
 ##     the build's own root pid + descendants (grown via FORK/EXEC) are kept;
 ##   - the event-loss detector (EsSeqTracker.observeSeq) — a `global_seq_num` gap

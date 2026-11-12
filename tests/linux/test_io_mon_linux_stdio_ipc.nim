@@ -119,11 +119,12 @@ int main(int argc, char **argv) {
     check dep.records.anyIt(it.kind == mrFileRead and marker in it.path)
 
   test "an AF_UNIX connect records the dialled path and the peer uid":
-    # reprobuild Dev-Env-Warm-Entry.md §3. On a socket-activated host the peer
-    # pid of every service is the activator (pid 1), so the pid alone cannot
-    # say which service a client reached. The dialled path can, and the peer
-    # uid is what a root-owned-endpoint trust needs. Both must come from the
-    # real shim hook, not only from hand-built records.
+    # A consumer identifies a trusted daemon by its socket address. On a
+    # socket-activated host the peer pid of every service is the activator (pid
+    # 1), so the pid alone cannot say which service a client reached. The
+    # dialled path can, and the peer uid is what a root-owned-endpoint trust
+    # needs. Both must come from the real shim hook, not only from hand-built
+    # records.
     let snoopBin = work / "io-mon-connect"
     let cli = run("nim", @[
       "c", "--hints:off", "--warnings:off", "--threads:on",

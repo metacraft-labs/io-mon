@@ -23,8 +23,11 @@ when not defined(windows):
 ##      function pointer. Sits at the tail of the chain; the snoop
 ##      callback's ``callNext`` ultimately reaches it.
 ##
-## See ``reprobuild-specs/Standard-Provider-Implementation.milestones.org``
-## §M26 for the spec and §M11 (outstanding tasks) for the rationale.
+## The registry is the single point of interpose maintenance: a co-resident
+## consumer (for example a CodeTracer recorder) registers its own callback at a
+## different priority on the same API instead of patching the IAT a second
+## time. The IAT trampoline still saves and restores ``GetLastError`` around
+## the snoop callbacks, because they run inside the post-call body.
 
 import std/tables
 import stackable_hooks/hook_registry
@@ -99,8 +102,8 @@ const
   # where the shim gets its last chance to make buffered records durable. See
   # `windows_interpose.snoopNtTerminateProcess`.
   HookNtTerminateProcess* = "NtTerminateProcess"
-  # M73 Phase 5 — additional Win32 entry points from
-  # Monitor-Hook-Shim.md §Windows Hook Surface.
+  # M73 Phase 5 — additional Win32 entry points of the Windows hook surface
+  # (file deletion, directory creation, copy and move).
   HookDeleteFileW* = "DeleteFileW"
   HookDeleteFileA* = "DeleteFileA"
   HookCreateDirectoryW* = "CreateDirectoryW"

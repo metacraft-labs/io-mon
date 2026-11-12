@@ -1,6 +1,6 @@
 ## test_io_mon_windows_tree_lifetime_guard — the Windows Job Object guard.
 ##
-## THE CLAIM (reprobuild-pm spec/io-mon-Windows-Tree-Lifetime-Guard.md): a
+## THE CLAIM: a
 ## Windows capture is `mcComplete` only when the monitored root was assigned,
 ## while still suspended, to a job that refuses breakaway, AND that job's
 ## active-process count reached zero after the root exited, within the grace

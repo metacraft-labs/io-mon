@@ -80,8 +80,7 @@ const
 
   MacosInterposeKnownUnsupportedCapabilities* = {
     # T3c (adversarial-hardening break #6): the EndpointSecurity backend is now
-    # DESIGNED + FEASIBILITY-PROBED + SKELETONED — see
-    # reprobuild-specs/MacOS-EndpointSecurity-Backend.md and the integration stub
+    # DESIGNED + FEASIBILITY-PROBED + SKELETONED — see the integration stub
     # at src/io_mon/backends/endpoint_security.nim (behind the off-by-default
     # `-d:ioMonEndpointSecurity` define). It stays UNSUPPORTED here until the
     # entitled production client ships, because the kernel-sourced ES client
@@ -622,8 +621,8 @@ proc parseCapabilityList(value: string; unnamable: var seq[string]):
 proc unsupportedReason(capability: MonitorCapability): string =
   case capability
   of mcapEndpointSecurity:
-    # Designed + skeletoned under T3c (MacOS-EndpointSecurity-Backend.md;
-    # src/io_mon/backends/endpoint_security.nim, behind -d:ioMonEndpointSecurity).
+    # Designed + skeletoned under T3c (src/io_mon/backends/endpoint_security.nim,
+    # behind -d:ioMonEndpointSecurity).
     # Still unsupported here: the production client needs the Apple-granted
     # endpoint-security.client entitlement + signing/notarization + root.
     "EndpointSecurity backend is designed + skeletoned (T3c) but not yet shipped; " &

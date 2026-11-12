@@ -408,9 +408,10 @@ type
       ## (`unscannedImageAlreadyNoted`), not once per scan. The scanner
       ## decodes only `SHF_EXECINSTR` sections: a BOLT or `-z noseparate-code`
       ## image keeps `.rodata`/`.eh_frame` in its executable segment, and
-      ## sweeping those bytes INT3-patched a jump-table entry of rustc 1.94.0
-      ## (reprobuild-pm issue 2026-10-30-io-mon-shim-kills-upstream-rustc-1.94.0-
-      ## on-crates-with-macro-rules). An unreadable table is a coverage gap
+      ## sweeping those bytes INT3-patched a jump-table entry of rustc 1.94.0,
+      ## which then died on any crate with a `macro_rules!` (regression test
+      ## `tests/linux/test_io_mon_linux_rustc_crates_under_shim`). An
+      ## unreadable table is a coverage gap
       ## reported as event loss, never a reason to sweep the whole mapping.
     firstUnscannedImage*: array[256, char]
       ## The first such mapping's path with the diagnostic and errno, for the

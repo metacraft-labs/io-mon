@@ -1,6 +1,7 @@
 ## test_io_mon_macos_library_load — T3b: capture LIBRARY-LOAD dependencies — the
-## dependent-dylib closure (findings-doc break #4) and the dlopen arm of break #7.
-## See reprobuild-specs/MacOS-Monitoring-Adversarial-Hardening.milestones.org §T3b.
+## dependent-dylib closure (findings-doc break #4) and the dlopen arm of break
+## #7. Phase T3b of the macOS adversarial-hardening campaign (probes that look
+## for a dependency the monitor misses while still reporting mcComplete).
 ##
 ## # The break (research/adversarial-2026-06/adv_realbuild/)
 ##

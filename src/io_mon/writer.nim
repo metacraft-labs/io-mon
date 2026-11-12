@@ -369,8 +369,7 @@ const fragmentSlotOnHeap = not (defined(macosx) or defined(windows))
   ## So the shim made every host thread created with an explicit stack of
   ## 64 KiB or less fail — Node 24 printed `pthread_create: Invalid argument`
   ## and a Playwright Chromium launch timed out under monitoring
-  ## (reprobuild-pm issue 2026-10-02-action-monitor-prevents-declared-browser-
-  ## launch; regression test
+  ## (regression test
   ## `tests/linux/test_io_mon_shim_static_tls_small_stack_threads`). And the
   ## cost was paid by every thread of every monitored process even though the
   ## Linux shim publishes through the shared-memory set and never opens a
@@ -2389,9 +2388,8 @@ proc childIsMonitored(childPid: uint64; childStart: string;
 
 proc unmonitoredSubtreeLossDetails*(records: openArray[MonitorRecord];
     trustedPeerPids: HashSet[uint64] = initHashSet[uint64]()): seq[string] =
-  ## T0 — EARN mcComplete (MacOS-Monitoring-Adversarial-Hardening.milestones.org
-  ## §"T0 — Earn mcComplete"; Monitor-Hook-Shim.md §"Failure Semantics":
-  ## "successful child exit MUST NOT hide monitor failure").
+  ## T0 — EARN mcComplete. A successful child exit MUST NOT hide a monitor
+  ## failure: a capture is complete only when the evidence shows it is.
   ##
   ## The monitor must not ASSERT `mcComplete`; it must EARN it. The cross-process
   ## merge sees every monitored process's fragments, so it can PROVE the process
@@ -2778,8 +2776,7 @@ const
     ## Required first non-empty line of a trusted-daemon breakaway report.
   IoMonBreakawayReportDirEnv* = "IO_MON_BREAKAWAY_REPORT_DIR"
     ## Env var naming the directory a trusted daemon drops breakaway reports into
-    ## (and that the merge folds them from). See `loadBreakawayReports` and the
-    ## T3a design notes in MacOS-Monitoring-Adversarial-Hardening.milestones.org.
+    ## (and that the merge folds them from). See `loadBreakawayReports`.
 
 type
   BreakawayFold = object
@@ -3428,10 +3425,10 @@ proc mergeFragments*(fragmentDir, outputPath: string;
   closeFragmentSlot()
   var records: seq[MonitorRecord] = @[]
   # Fail-closed accounting: any fragment that does not decode cleanly to EOF
-  # is a partial or corrupt iomon write. Per Monitor-Hook-Shim.md §"Failure
-  # Semantics" ("partial iomon writes MUST fail reader validation"; "shim
-  # crash MUST reject cache publication"; "successful child exit MUST NOT
-  # hide monitor failure"), such evidence MUST NOT be published. We surface
+  # is a partial or corrupt iomon write. The monitor's failure contract says
+  # partial iomon writes MUST fail reader validation, a shim crash MUST reject
+  # cache publication, and a successful child exit MUST NOT hide a monitor
+  # failure, so such evidence MUST NOT be published. We surface
   # it in-band as event-loss so the existing completeness machinery
   # (``summarizeRecords`` → ``depFileFromRecords``) marks the depfile
   # ``mcIncomplete``, which the build engine already rejects for caching.
@@ -3629,7 +3626,7 @@ proc mergeFragments*(fragmentDir, outputPath: string;
   # piece of evidence forces `mcIncomplete` via the SAME event-loss machinery as
   # the corrupt-fragment path, so the breakaway becomes a conservative re-run
   # rather than a false skip — self-flagged by io-mon, not left solely to the
-  # consumer (Monitor-Hook-Shim.md §"Failure Semantics"). See
+  # consumer. See
   # unmonitoredSubtreeLossCount.
   let subtreeLosses = unmonitoredSubtreeLossDetails(records, trustedPeerPids)
   for loss in subtreeLosses:

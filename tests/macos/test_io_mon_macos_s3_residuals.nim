@@ -1,7 +1,8 @@
 ## test_io_mon_macos_s3_residuals — ROUND 3 phase S3: close the weaponized
-## earned-completeness RESIDUALS on the REAL shim. See
-## reprobuild-specs/MacOS-Monitoring-Adversarial-Hardening.milestones.org (ROUND 3,
-## S3) and research/adversarial-2026-06-round3/r3_residual.
+## earned-completeness RESIDUALS on the REAL shim. Round 3, phase S3 of the
+## macOS adversarial-hardening campaign (probes that look for a dependency the
+## monitor misses while still reporting mcComplete); corpus in
+## research/adversarial-2026-06-round3/r3_residual.
 ##
 ## S3b — DYLIB/PLUGIN ENTROPY ATTRIBUTION (break: a dlopen'd plugin's arc4random was
 ##   not flagged). The round-2 R-D caller-attribution flagged entropy ONLY from the

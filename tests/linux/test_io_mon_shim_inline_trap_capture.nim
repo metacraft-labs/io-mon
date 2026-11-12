@@ -240,8 +240,8 @@ suite "io-mon Linux shim: trapped inline syscalls are captured when they trap":
         check dep.records.anyIt(it.kind == mrPathProbe and
           it.path == tree / "input-a.txt")
         # A `..` after a symlink is kept as spelled: `os./` folded it and
-        # named the decoy (reprobuild-pm issue 2026-10-21-linux-shim-folds-
-        # dotdot-after-a-symlink-lexically). Spelled with `&`, not `/`,
+        # named the decoy (see test_io_mon_linux_dotdot_after_symlink.nim).
+        # Spelled with `&`, not `/`,
         # which would fold it here too.
         check dep.records.anyIt(it.kind == mrFileOpen and
           it.path == tree & "/link/../input-e.txt")

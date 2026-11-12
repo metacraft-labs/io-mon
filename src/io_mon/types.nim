@@ -49,8 +49,8 @@ type
     #    a build that read SOURCE_DATE_EPOCH / $CFLAGS / hw.ncpu / uname re-runs iff
     #    that value changed — PRECISE, with NO false downgrade (a program that reads
     #    PATH benignly just adds PATH to the key; unchanged ⇒ no re-run). These
-    #    NEVER downgrade completeness. See the consumer contract in the R-D design
-    #    note (MacOS-Monitoring-Adversarial-Hardening.milestones.org §R-D).
+    #    NEVER downgrade completeness. That is the consumer contract for these
+    #    two kinds.
     mrEnvRead = 14
     mrSysctlRead = 15
     # 2. mrNonDeterministic — OBSERVED ENTROPY INPUT.
@@ -821,8 +821,9 @@ type
       ## variables are still layered last, so monitoring cannot be switched
       ## off. Negative-sense so the zero value keeps the historical behaviour.
       ##
-      ## For a host that composes the action's whole environment (reprobuild
-      ## Dev-Env-Warm-Entry.md §2): otherwise a variable nobody declared still
+      ## For a host that composes the action's whole environment, so the
+      ## action does not inherit the caller's shell: otherwise a variable nobody
+      ## declared still
       ## reaches the child, and whatever the child reads from it is an input
       ## nobody recorded. Executable resolution is unaffected (see `env`
       ## above), so pass an absolute `command[0]`.
@@ -1162,8 +1163,8 @@ func recordIsFailedExistenceLookup*(record: MonitorRecord): bool =
   ## the lookups that FOUND SOMETHING USABLE — the evidence a compiler-emitted
   ## depfile carries — and an errored lookup found nothing usable. The
   ## consequence is a staleness blind spot, and it is written down as such: ROW 4
-  ## of the normative hazard table (`docs/usage.md`,
-  ## `docs/contributors/evidence-scope.md`, and reprobuild's `CLI/build.md`) says
+  ## of the normative hazard table (`docs/usage.md` and
+  ## `docs/contributors/evidence-scope.md`) says
   ## that a file which exists but could not be OPENED, later becoming openable (a
   ## `chmod`, a directory replaced by a file), is invisible under `reads-only` —
   ## for the same reason row 3's added file is: **it is not recorded at all**, so

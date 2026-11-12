@@ -19,8 +19,9 @@
  * records no exec, so the starts/execs accounting balances. The only point
  * that knows an uninjectable image was entered is the monitored context that
  * starts it, so that context classifies the target with this file and
- * records event-loss there (spec: reprobuild-pm Monitor-Hook-Shim.md,
- * "Failure Semantics").
+ * records event-loss there: entering an image the shim cannot be injected
+ * into must emit event-loss evidence at the point of entry, naming the image
+ * and the reason, exactly as a failed injection or a lost child does.
  *
  * WHAT IS UNINJECTABLE (deliberately conservative: a false verdict makes an
  * action uncacheable, a missed one publishes an incomplete capture):

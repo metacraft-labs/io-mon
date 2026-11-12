@@ -1,10 +1,10 @@
 ## test_io_mon_t0_completeness — unit coverage for the T0 earned-completeness
-## logic (`unmonitoredSubtreeLossCount`) on SYNTHETIC record sets, independent of
-## any platform/shim. Locks in the exact downgrade algorithm
-## (MacOS-Monitoring-Adversarial-Hardening.milestones.org §"T0 — Earn
-## mcComplete"): an un-injected spawn child, or an exec/SETEXEC into an
-## un-injectable image, each yields one event-loss so `mergeFragments` downgrades
-## completeness to `mcIncomplete` — while a fully-monitored tree stays clean.
+## logic (`unmonitoredSubtreeLossCount`) on SYNTHETIC record sets, independent
+## of any platform/shim. Locks in the exact downgrade algorithm (phase T0 of the
+## macOS adversarial hardening, "Earn mcComplete"): an un-injected spawn child,
+## or an exec/SETEXEC into an un-injectable image, each yields one event-loss so
+## `mergeFragments` downgrades completeness to `mcIncomplete` — while a
+## fully-monitored tree stays clean.
 ##
 ## ── DA-1d: TEETH, NOT A RENAME ────────────────────────────────────────────
 ##
@@ -293,7 +293,8 @@ suite "io-mon T3a IPC-breakaway downgrade (unmonitoredSubtreeLossCount)":
     # activates, so SO_PEERCRED names pid 1 for all of them. Keyed on the pid
     # alone these collapsed into ONE loss, and a consumer that forgave one
     # endpoint (a trusted daemon's) forgave the other with it. Keyed per
-    # endpoint, each stays its own loss (reprobuild Dev-Env-Warm-Entry.md §3).
+    # endpoint, each stays its own loss, because a consumer identifies a
+    # trusted daemon by its socket address.
     let records = @[start(100),
       ipc(100, 1, "/nix/var/nix/daemon-socket/socket"),
       ipc(100, 1, "/run/some-other-service.sock")]

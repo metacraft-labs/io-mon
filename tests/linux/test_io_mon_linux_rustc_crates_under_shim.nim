@@ -1,7 +1,6 @@
 ## rustc compiles the two crates of the rustc 1.94.0 SIGILL issue under the shim.
 ##
-## WHY. reprobuild-pm issue 2026-10-30-io-mon-shim-kills-upstream-rustc-1.94.0-
-## on-crates-with-macro-rules: under the Linux shim, with a monitor session
+## WHY. Under the Linux shim, with a monitor session
 ## set, the upstream Rust 1.94.0 x86-64 tarball's `rustc` died with SIGILL on
 ## any crate containing a `macro_rules!`, and compiled a trivial crate fine.
 ## The tarball's `librustc_driver` is BOLT-optimised: its executable segment

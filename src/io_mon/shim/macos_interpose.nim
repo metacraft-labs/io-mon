@@ -901,15 +901,14 @@ proc anchoredPath(dirfd: cint; path: cstring): string {.raises: [].} =
   ## kept). An absolute path is returned as is (no syscall), so the common case
   ## costs nothing.
   ##
-  ## Spec: reprobuild-pm/spec/Monitor-Hook-Shim.md § CWD And Path Context
-  ## ("CWD tracking is required for relative path normalization"); the Linux
-  ## shim does the same in `pathForAt`. A relative string recorded verbatim
-  ## can only be re-anchored later on a cwd the process may have LEFT: after
-  ## `git -C repo` chdir()s and opens `.git/HEAD`, a consumer joining that
-  ## onto the action's cwd keys on a phantom `<cwd>/.git/HEAD` (reprobuild-pm
-  ## issue 2026-10-18-macos-shim-records-relative-paths-the-engine-anchors-on-
-  ## the-action-cwd). It also keeps `canonicalPathFor`'s memo, keyed on the
-  ## raw string, from serving a realpath computed under an earlier cwd.
+  ## The shim tracks the cwd because a relative path can only be normalized
+  ## against the directory it resolved against at the time of the call; the
+  ## Linux shim does the same in `pathForAt`. A relative string recorded
+  ## verbatim can only be re-anchored later on a cwd the process may have LEFT:
+  ## after `git -C repo` chdir()s and opens `.git/HEAD`, a consumer joining that
+  ## onto the action's cwd keys on a phantom `<cwd>/.git/HEAD`. It also keeps
+  ## `canonicalPathFor`'s memo, keyed on the raw string, from serving a realpath
+  ## computed under an earlier cwd.
   ##
   ## No firmlink rewrite: this is the as-passed record. The canonical
   ## companions (F_GETPATH, realpath, the lexical form) keep that job.
@@ -1194,7 +1193,8 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32;
   ## cardinal-sin guard for legitimate intra-tree IPC); a peer pid NOT in the set,
   ## or an UNKNOWN peer, is an out-of-tree breakaway that may have read files on
   ## our behalf ⇒ the merge injects an event-loss ⇒ mcIncomplete (a conservative
-  ## RE-RUN, never a false skip — Monitor-Hook-Shim.md §Failure Semantics).
+  ## RE-RUN, never a false skip: missing child propagation MUST emit event-loss
+  ## evidence).
   if address == nil:
     return
   var dest: array[1024, char]
@@ -1548,8 +1548,11 @@ proc repro_hook_dyld_add_image*(mh: pointer; slide: int)
     # seen and discarded, and an edge with no blessing published over it, while
     # the Linux preload shim reports the very same draw. The startup baseline
     # the cardinal-sin guard exists for lives in /usr/lib and the shared cache,
-    # never in a registered image, so it stays excluded. See
-    # reprobuild-pm `spec/MacOS-Monitoring.md` §"Entropy Caller Attribution".
+    # never in a registered image, so it stays excluded. The rule: an entropy
+    # draw is reported as non-deterministic when its return address lies in
+    # a non-system image (the main executable, or any image not under
+    # /usr/lib or /System, not in the shared cache and not this shim), and no
+    # install prefix such as /nix/store or /opt/homebrew is exempt.
     # getsegmentdata is a lock-free memory walk, safe in the dyld add-image
     # callback.
     ct_macos_register_nonsystem_image(mh)

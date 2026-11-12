@@ -2756,9 +2756,9 @@ proc kernelPathForFd(fd: cint): string {.raises: [].} =
 proc pathForAt(dirfd: cint; path: cstring): string {.raises: [].} =
   ## `path` made absolute against the directory it resolved against at the
   ## time of the call -- the working directory for `AT_FDCWD`, else
-  ## `dirfd`'s directory -- as the kernel resolved it. Spec: reprobuild-pm/
-  ## spec/Monitor-Hook-Shim.md § CWD And Path Context and § "Metadata, Probe,
-  ## And Symlink APIs". An absolute path is returned as is (the kernel
+  ## `dirfd`'s directory -- as the kernel resolved it, walking a symlink's
+  ## `..` the way `anchoredRelativePath` documents. An absolute path is
+  ## returned as is (the kernel
   ## ignores `dirfd` for it); a relative one stays relative only when
   ## nothing can name the anchor directory.
   ##
@@ -2766,8 +2766,8 @@ proc pathForAt(dirfd: cint; path: cstring): string {.raises: [].} =
   ## the anchor, and a `..` after a component of `path` is kept, because in
   ## `link/../x` it applies to where `link` points. Nim's `os./` folded that
   ## one too, and recorded `<cwd>/x` for a process that read the file beside
-  ## the link's target (reprobuild-pm issue 2026-10-21-linux-shim-folds-
-  ## dotdot-after-a-symlink-lexically). The macOS shim's
+  ## the link's target (regression test
+  ## `tests/linux/test_io_mon_linux_dotdot_after_symlink`). The macOS shim's
   ## `repro_macos_anchored_path` records the same string.
   ##
   ## Popping is exact only on a symlink-free anchor. `getcwd` is one. For a
@@ -3504,9 +3504,7 @@ proc recordRawFdWrite(fd: cint; callResult: clong;
   ## peers. LD_PRELOADed tracers report process events this way — agent-
   ## harbor's command-trace shim writes one `syscall(SYS_write)` to its
   ## socket per `waitpid` — and each one made the whole capture incomplete,
-  ## which disabled caching for the session (reprobuild-pm issue
-  ## 2026-11-10-raw-syscall-write-is-unclassified-and-disables-caching-for-
-  ## the-test-fixtures-collection).
+  ## which made every action monitored in that session uncacheable.
   if callResult < 0 or fd <= 2:
     return true
   let path = rawFdPath(fd, paths)
@@ -3993,9 +3991,8 @@ proc classifyTrappedInlineEvent(index: int; number: clong;
   # or the kernel's `/proc/self/fd` name, an absolute spelling with no
   # symlink in it, so `anchoredRelativePath` may pop a leading `..` off it.
   # It keeps a `..` that follows a component of the caller's path, which
-  # `os./` folded (`link/../x` recorded as `<base>/x`; reprobuild-pm issue
-  # 2026-10-21-linux-shim-folds-dotdot-after-a-symlink-lexically), exactly
-  # as `pathForAt` does for an interposed call.
+  # `os./` folded (`link/../x` recorded as `<base>/x`), exactly as
+  # `pathForAt` does for an interposed call.
   let absolute =
     if raw.ok and base.ok and raw.text.len > 0 and not raw.text.isAbsolute:
       anchoredRelativePath(base.text, raw.text)
@@ -4177,9 +4174,9 @@ proc repro_hook_opendir*(ctx: var OpendirContext) {.raises: [].} =
     # Storing the caller's spelling left `chdir("repo");
     # opendir(".git/objects/pack")` (what `git -C repo` does) recorded as a
     # relative path, which a consumer can only resolve against the action's
-    # cwd: a directory the process never looked at (reprobuild-pm issue
-    # 2026-10-20-linux-shim-anchors-relative-directory-enumerations-on-the-
-    # action-cwd). `pathForAt` keeps the spelling relative when getcwd cannot
+    # cwd: a directory the process never looked at (regression test
+    # `tests/linux/test_io_mon_linux_relative_directory_enumeration_anchor`).
+    # `pathForAt` keeps the spelling relative when getcwd cannot
     # name the cwd; the kernel's name for the DIR*'s descriptor is the
     # fallback then, and only a directory nothing can name stays as spelled.
     var anchored = pathForAt(LinuxAtFdcwd, ctx.path)
@@ -4407,7 +4404,8 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32) {.raises: [].
     # The address the client DIALLED. On a socket-activated host every peer is
     # the activator (pid 1), so the pid cannot say which service was reached;
     # the endpoint can, and it is what a daemon trust declaration names
-    # (reprobuild Dev-Env-Warm-Entry.md §3). Carried in `path`, where the macOS
+    # (a declared trusted daemon is identified by its socket address, not by a
+    # pid). Carried in `path`, where the macOS
     # shim already records its endpoint.
     var buf: array[256, char]
     let n = c_sockaddr_un_path(address, addrLen, addr buf[0], cint(buf.len))

@@ -1,7 +1,8 @@
 ## test_io_mon_macos_ipc_breakaway — T3a: close the DAEMON-OVER-SOCKET /
 ## out-of-tree breakaway escape (findings-doc break #1), the CRITICAL break that
-## DEFEATS the subtree fail-safe. See
-## reprobuild-specs/MacOS-Monitoring-Adversarial-Hardening.milestones.org §T3a.
+## DEFEATS the subtree fail-safe. Phase T3a of the macOS adversarial-hardening
+## campaign (probes that look for a dependency the monitor misses while still
+## reporting mcComplete).
 ##
 ## # The escape (research/adversarial-2026-06/adv_proctree/)
 ##

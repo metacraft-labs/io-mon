@@ -8,8 +8,7 @@
 ## ...). A child that inherits them is not bare, and when
 ## `REPRO_MONITOR_SHIM_LIB` names a different shim than the one the test
 ## preloads, the experiment changes: raw-clone children of the private-heap
-## stress host hang (reprobuild-pm issue
-## 2026-10-20-linux-raw-clone-children-hang-when-monitor-shim-lib-names-another-shim.md).
+## stress host hang.
 ## So every `REPRO_MONITOR_*` variable is dropped too, and a monitored arm
 ## sets the ones it needs explicitly (at least `REPRO_MONITOR_SHIM_LIB`);
 ## `io-mon run` adds the rest.

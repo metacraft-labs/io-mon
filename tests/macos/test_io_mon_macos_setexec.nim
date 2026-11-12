@@ -1,6 +1,6 @@
 ## test_io_mon_macos_setexec — POSIX_SPAWN_SETEXEC recording + env override (T1)
 ## and the EARNED-completeness downgrade (T0), closing findings-doc break #2 and
-## making `mcComplete` conservative (MacOS-Monitoring-Adversarial-Hardening).
+## making `mcComplete` conservative (macOS adversarial hardening).
 ##
 ## # The gaps these prove
 ##
