@@ -88,6 +88,12 @@ const
   FaultVar = "IO_MON_TEST_MACOS_TREE_GUARD_FAULT"
   VanishVar = "IO_MON_TEST_MACOS_TREE_GUARD_VANISH_PID"
   StillLive = "macos descendants still live after root exit"
+  # OS-shipped tools are named by absolute path, as the sibling guard test
+  # does for /bin/ps: under `repro test` the action's PATH holds only the
+  # tools repro.nim declares, so a bare `launchctl` is not found there (the
+  # shell exits 127), and neither tool is anything but the OS's own.
+  LaunchctlExe = "/bin/launchctl"
+  PsExe = "/bin/ps"
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
 
 proc readPidFile(path: string): Pid =
@@ -133,32 +139,68 @@ if paramCount() == 2 and paramStr(1) == SleepArg:
   quit(0)
 
 if paramCount() == 5 and paramStr(1) == ChurnArg:
-  # Run as a copy named `tgslow`. For <duration> ms, every <interval> ms,
-  # create an ORPHAN that lives <life> ms: fork a child that forks the orphan
-  # and exits at once, so the orphan's parent is launchd and the census's
-  # parent rule cannot classify it. Fork keeps the name, so every orphan is
-  # a `tgslow` too. Writes <ready> after the third orphan, so orphans are
-  # alive when the caller goes on.
+  # Run as a copy named `tgslow`. Every <interval> ms, create an ORPHAN: fork
+  # a child that forks the orphan and exits at once, so the orphan's parent
+  # is launchd and the census's parent rule cannot classify it. Fork keeps the
+  # name, so every orphan is a `tgslow` too. Writes <ready> after the third
+  # orphan, so orphans are alive when the caller goes on, and keeps creating
+  # them for <duration> ms after that.
+  #
+  # The cases grade how the guard's window ends against this churn, so the
+  # churn must hold its shape on a host of any speed, not only on an idle one:
+  #  * <duration> is wall-clock time (a monotonic deadline). Counting it in
+  #    intervals let a slow fork or an oversleep stretch a 2 s churn past the
+  #    5 s ceiling (CI: the capture completed after 5059 ms).
+  #  * An orphan lives at least <life> ms AND until the next orphan exists,
+  #    so some orphan is alive at every instant until the churn stops. With a
+  #    fixed life only, a churner descheduled for longer than <life> left an
+  #    instant with no orphan; a sweep there was conclusive and empty, and a
+  #    churn meant to outlast the ceiling graded the capture complete (CI).
+  # Orphan k waits, after its <life>, for EOF on pipe k. The churner holds the
+  # only write end of pipe k and closes it once orphan k+1 exists (its creator
+  # forked it before exiting, and a fork lists the child before it returns);
+  # a SIGKILLed churner closes it too, so no orphan outlives the churn by
+  # more than <life>. Any failed fork or pipe ends the churner with an error
+  # rather than leaving a gap.
   let duration = parseInt(paramStr(2))
   let life = parseInt(paramStr(3))
   let interval = parseInt(paramStr(4))
-  var waited = 0
+  var prevWrite: cint = -1
   var made = 0
-  while waited < duration:
+  var deadline: MonoTime
+  while made < 3 or getMonoTime() < deadline:
+    var fds: array[2, cint]
+    if pipe(fds) != 0: quit(2)
     let child = fork()
+    if child < 0: quit(3)
     if child == 0:
-      if fork() == 0:
+      # The intermediate: the orphan keeps only the new pipe's read end, so
+      # the churner's close is the last close of its write end.
+      if prevWrite >= 0: discard close(prevWrite)
+      discard close(fds[1])
+      let orphan = fork()
+      if orphan == 0:
         discard usleep(Useconds(life * 1000))
+        var b: char
+        while true:
+          let n = read(fds[0], addr b, 1)
+          if n == 0 or (n < 0 and errno != EINTR): break
         exitnow(0)
-      exitnow(0)
-    if child > 0:
-      var st: cint
-      discard waitpid(child, st, 0)
+      exitnow(if orphan > 0: cint(0) else: cint(4))
+    discard close(fds[0])
+    var st: cint
+    if waitpid(child, st, 0) != child or not WIFEXITED(st) or
+        WEXITSTATUS(st) != 0:
+      quit(4)
+    # The new orphan exists, so the previous one may end.
+    if prevWrite >= 0: discard close(prevWrite)
+    prevWrite = fds[1]
     inc made
     if made == 3:
       writeFile(paramStr(5), $getpid() & "\n")
+      deadline = getMonoTime() + initDuration(milliseconds = duration)
     sleep(interval)
-    waited += interval
+  discard close(prevWrite)
   sleep(life + 50)
   quit(0)
 
@@ -649,7 +691,7 @@ suite "macOS tree-lifetime guard: a starved host":
         command: @[getAppFilename(), WriterArg, dir / "out.txt"],
         depFilePath: dir / "evidence.iomon"))
       while not pollMonitor(h): sleep(2)
-      let submit = execCmdEx("launchctl submit -l " & quoteShell(label) &
+      let submit = execCmdEx(LaunchctlExe & " submit -l " & quoteShell(label) &
         " -- " & quoteShell(slow) & " " & HoldArg & " " &
         quoteShell(dir / "job.pid") & " 8000")
       require submit.exitCode == 0
@@ -664,7 +706,7 @@ suite "macOS tree-lifetime guard: a starved host":
         ("," & $job & ",") in ("," & it.split("pids=")[1].
           splitWhitespace()[0] & ","))
     finally:
-      discard execCmdEx("launchctl remove " & quoteShell(label))
+      discard execCmdEx(LaunchctlExe & " remove " & quoteShell(label))
       if job != Pid(0): discard posix.kill(job, SIGKILL)
       removeDir(dir)
 
@@ -706,10 +748,14 @@ suite "macOS tree-lifetime guard: a starved host":
         if order == "orphan-first":
           # U execs only after launchd adopted it; wait for that exec, so
           # the census meets U as `tgslow`, not as a fork of this binary.
+          var uExecSeen = false
           for _ in 0 ..< 1000:
-            if execCmdEx("ps -o comm= -p " & $u).output.strip().endsWith(
-                SlowName): break
+            if execCmdEx(PsExe & " -o comm= -p " & $u).output.strip().endsWith(
+                SlowName):
+              uExecSeen = true
+              break
             sleep(5)
+          require uExecSeen
         armSlow(SlowName, 60_000)
         if not withRule: putEnv(NoCreatorVar, "1")
         let res = try: finishMonitor(move(h))
