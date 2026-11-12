@@ -1170,8 +1170,14 @@ extern void repro_linux_sig_safe_flush(void);
 /* Provided by shim/linux_preload.nim beside it: the same flush for an image
  * a signal is about to terminate. It first reports trapped inline events
  * still queued (ct_linux_report_inline_events_at_signal_death) and writes
- * the committed marker only when nothing is left unreported. */
-extern void repro_linux_sig_safe_flush_at_signal_death(void);
+ * the committed marker only when nothing is left unreported. Weak: a hook
+ * library that builds this runtime without the shim supplies only
+ * repro_linux_sig_safe_flush, and a strong reference here left it with an
+ * undefined symbol at load. Without it the trap handler still reports the
+ * queued inline events itself before the plain flush; only the shim's
+ * fragment second channel and its withheld marker are absent. */
+extern void repro_linux_sig_safe_flush_at_signal_death(void)
+    __attribute__((weak));
 /* Provided by shim/linux_preload.nim (Nim exportc, hence weak, as for
  * repro_linux_sig_safe_note_signal below): the calling thread's fragment slot,
  * read as plain data. Async-signal-safe. */
@@ -2968,7 +2974,12 @@ static void ct_linux_inline_syscall_sigtrap_handler(
        * the slot is closed. */
       if (repro_linux_sig_safe_note_signal != NULL)
         repro_linux_sig_safe_note_signal((long)signum);
-      repro_linux_sig_safe_flush_at_signal_death();
+      if (repro_linux_sig_safe_flush_at_signal_death != NULL) {
+        repro_linux_sig_safe_flush_at_signal_death();
+      } else {
+        (void)ct_linux_report_inline_events_at_signal_death();
+        repro_linux_sig_safe_flush();
+      }
       signal(signum, SIG_DFL);
       raise(signum);
     }
