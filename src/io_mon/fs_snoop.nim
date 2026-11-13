@@ -620,6 +620,45 @@ when defined(windows):
 # the monitored action re-runs — never a fabricated/false "captured nothing"
 # skip. Coverage only ever makes MORE of the tree observable; it never makes a
 # previously-correct capture wrong.
+
+proc renderAppleToolchainDropIn*(shell, tool, defaultSdk: string): string =
+  ## The body of one Apple toolchain drop-in (see
+  ## ``populateAppleToolchainDropIns``): a POSIX shell script, run by the
+  ## non-SIP ``shell``, that applies the environment the ``xcode_select`` shim
+  ## at ``/usr/bin/<tool>`` would have applied and then execs ``tool``, the
+  ## compiler, linker or assembler that shim would have exec'd.
+  ##
+  ## What the shim applies, measured through ``/usr/bin/xcrun env`` (the same
+  ## code path) with Xcode 26.6 selected on macOS 26.5; a Command Line Tools
+  ## selection has not been measured:
+  ##
+  ## * ``SDKROOT`` unset or empty: ``SDKROOT`` becomes the active developer
+  ##   directory's default SDK (``xcrun --show-sdk-path``), and
+  ##   ``/usr/local/include`` / ``/usr/local/lib`` are APPENDED to ``CPATH`` /
+  ##   ``LIBRARY_PATH``, keeping any value already there in front.
+  ## * ``SDKROOT`` set: it is kept, and nothing else changes.
+  ##
+  ## The toolchain binaries have no built-in SDK of their own, so without the
+  ## first case a compile run with ``SDKROOT`` unset cannot find
+  ## ``<stdlib.h>``. ``defaultSdk`` is that default SDK, resolved once by the
+  ## caller. A non-path ``SDKROOT`` (an SDK *name* such as ``macosx``, which
+  ## xcrun would turn into a path) is passed through unchanged; resolving it
+  ## would mean running xcrun inside the monitored action.
+  ##
+  ## Platform-neutral so the shell semantics can be exercised on any POSIX
+  ## host; only macOS populates drop-ins with it.
+  result = "#!" & shell & "\n" &
+    "# io-mon Apple toolchain drop-in. Generated; do not edit.\n" &
+    "# Applies the SDK selection of the /usr/bin xcode_select shim, then\n" &
+    "# execs the toolchain binary that shim would have run.\n" &
+    "if [ -z \"${SDKROOT:-}\" ]; then\n" &
+    "  SDKROOT=" & quoteShellPosix(defaultSdk) & "\n" &
+    "  CPATH=\"${CPATH:+$CPATH:}/usr/local/include\"\n" &
+    "  LIBRARY_PATH=\"${LIBRARY_PATH:+$LIBRARY_PATH:}/usr/local/lib\"\n" &
+    "  export SDKROOT CPATH LIBRARY_PATH\n" &
+    "fi\n" &
+    "exec " & quoteShellPosix(tool) & " \"$@\"\n"
+
 when defined(macosx):
   import stackable_hooks/propagation as ct_propagation
   # The macOS tree-lifetime guard's census. Its DECISIONS stay in
@@ -774,20 +813,114 @@ when defined(macosx):
       return ""
     resolved
 
+  proc resolveAppleDefaultSdk(): string =
+    ## The SDK the ``/usr/bin`` shims select when the environment names none:
+    ## the active developer directory's default, ``xcrun --show-sdk-path``
+    ## with ``SDKROOT`` removed from the probe's environment (an ``SDKROOT``
+    ## inherited by the monitor host says nothing about the action, whose
+    ## own ``SDKROOT``, if any, the drop-in honours at run time).
+    ##
+    ## Empty when there is no developer directory or no SDK in it.
+    var resolved = ""
+    try:
+      let probe = execCmdEx("/usr/bin/env -u SDKROOT /usr/bin/xcrun " &
+        "--show-sdk-path 2>/dev/null")
+      if probe.exitCode != 0:
+        return ""
+      resolved = probe.output.strip()
+    except CatchableError, Defect:
+      return ""
+    if resolved.len == 0 or not resolved.isAbsolute or
+        not dirExists(extendedPath(resolved)):
+      return ""
+    resolved
+
+  proc resolveAppleDropInShell(sandboxDir: string): string =
+    ## A non-SIP POSIX shell to run the drop-in scripts, by canonical path.
+    ## The shebang must name it directly: the kernel, not the shim, resolves
+    ## a script's interpreter, so a ``#!/bin/sh`` would run the SIP shell,
+    ## strip the injection, and leave the compile it then execs unobserved.
+    ## The sandbox's own ``/bin/sh`` drop-in, the operator bundle and the
+    ## shipped bundle are tried first (``resolveSipReplacement``), then the
+    ## caller's ``PATH``, as ``populateReproSandboxTools`` does. Empty when
+    ## there is none.
+    var candidates: seq[string] = @[]
+    let replacement = ct_propagation.resolveSipReplacement("/bin/sh",
+      sandboxDir)
+    if replacement != "/bin/sh":
+      candidates.add(replacement)
+    candidates.add(findNonSipAlternative("sh"))
+    candidates.add(findNonSipAlternative("bash"))
+    for candidate in candidates:
+      if candidate.len == 0 or
+          not ct_propagation.isValidSipReplacement(candidate):
+        continue
+      try:
+        let canonical = expandFilename(candidate)
+        # A path with whitespace cannot be named on a `#!` line.
+        if canonical.len > 0 and not canonical.contains({' ', '\t', '\n'}):
+          return canonical
+      except OSError:
+        discard
+    ""
+
+  # Separates the staging names of concurrent populates of one sandbox: an
+  # operator's CT_SANDBOX_TOOLS_DIR is shared by every monitor that names it,
+  # including monitors running concurrently in this process.
+  var dropInStagingNonce: Atomic[uint64]
+
+  proc writeAppleToolchainDropIn(destPath, body: string): bool =
+    ## Write one drop-in script, executable, or report failure. The file is
+    ## written beside its final name and renamed into place, so a monitored
+    ## process that resolves the drop-in never execs a partial script, and a
+    ## concurrent populate never writes into this one's staging file.
+    let nonce = dropInStagingNonce.fetchAdd(1'u64) + 1'u64
+    let staging = destPath & ".partial-" & $getCurrentProcessId() & "-" &
+      $nonce
+    try:
+      writeFile(extendedPath(staging), body)
+      setFilePermissions(extendedPath(staging), {fpUserRead, fpUserWrite,
+        fpUserExec, fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
+      moveFile(extendedPath(staging), extendedPath(destPath))
+      true
+    except OSError, IOError:
+      try:
+        removeFile(extendedPath(staging))
+      except OSError:
+        discard
+      false
+
   proc populateAppleToolchainDropIns*(sandboxDir: string) =
-    ## Symlink each Apple toolchain tool into the sandbox at its /usr/bin
+    ## Drop each Apple toolchain tool into the sandbox at its /usr/bin
     ## spelling, so ``rewriteSipPath("/usr/bin/cc", dir)`` resolves.
     ##
-    ## These are SYMLINKS TO APPLE'S OWN BINARY, which is what makes this
-    ## sound where a substitution would not be: the monitored action runs the
-    ## same compiler, linker and assembler it would have run through the shim,
-    ## with the same SDK resolution and the same defaults. Nothing about the
-    ## build changes; only whether we can see it. Substituting a DIFFERENT
-    ## compiler (a nixpkgs clang, say) would change what gets built, and is
-    ## deliberately not what happens here.
+    ## Each drop-in runs APPLE'S OWN BINARY, the one the shim would have
+    ## exec'd, which is what makes this sound where a substitution would not
+    ## be: the monitored action runs the same compiler, linker and assembler
+    ## it would have run through the shim, with the same SDK resolution and
+    ## the same defaults. Nothing about the build changes; only whether we can
+    ## see it. Substituting a DIFFERENT compiler (a nixpkgs clang, say) would
+    ## change what gets built, and is deliberately not what happens here.
+    ##
+    ## "The same SDK resolution" is the reason a drop-in is a script and not
+    ## a symlink. The shim sets ``SDKROOT`` before exec'ing the toolchain
+    ## binary, and that binary has no default SDK of its own: a symlink
+    ## straight to it, run with ``SDKROOT`` unset (as an action environment
+    ## that scrubs ``SDKROOT`` runs it), fails on the first libc header. The
+    ## script applies what the shim applies (``renderAppleToolchainDropIn``)
+    ## and then execs the binary. The default SDK path in it is resolved once
+    ## here. The SDK stays visible to the monitor the ordinary way: the
+    ## compiler opens its headers and the linker its stubs, and those reads
+    ## are recorded like any other.
     ##
     ## Absent toolchain, absent entry: a host with no developer directory
     ## simply gets no drop-in, exactly as for any other unresolvable tool.
+    ## With a toolchain but no SDK, the drop-in is a plain symlink: there is
+    ## no SDK for it to carry, and the shim would supply none either. With an
+    ## SDK but no non-SIP shell to run the script, the tool gets no drop-in:
+    ## its exec then goes through the shim, which builds correctly but
+    ## unobserved, and the capture reports that loss instead of a compile
+    ## that cannot find its headers.
     if sandboxDir.len == 0:
       return
     let destDir = sandboxDir / "usr" / "bin"
@@ -795,6 +928,9 @@ when defined(macosx):
       createDir(extendedPath(destDir))
     except OSError, IOError:
       return
+    var sdkResolved = false
+    var defaultSdk = ""
+    var shell = ""
     for name in appleToolchainDropIns:
       let destPath = destDir / name
       if fileExists(destPath) or symlinkExists(destPath):
@@ -802,10 +938,20 @@ when defined(macosx):
       let resolved = resolveAppleToolchainTool(name)
       if resolved.len == 0:
         continue
-      try:
-        createSymlink(resolved, destPath)
-      except OSError, IOError:
-        discard
+      if not sdkResolved:
+        # Once per populate, and only when some tool needs a drop-in.
+        sdkResolved = true
+        defaultSdk = resolveAppleDefaultSdk()
+        if defaultSdk.len > 0:
+          shell = resolveAppleDropInShell(sandboxDir)
+      if defaultSdk.len == 0:
+        try:
+          createSymlink(resolved, destPath)
+        except OSError, IOError:
+          discard
+      elif shell.len > 0:
+        discard writeAppleToolchainDropIn(destPath,
+          renderAppleToolchainDropIn(shell, resolved, defaultSdk))
 
   proc populateReproSandboxTools(sandboxDir: string) =
     ## Drop in a non-SIP instance of every entry in ``reproSandboxBinaries``
