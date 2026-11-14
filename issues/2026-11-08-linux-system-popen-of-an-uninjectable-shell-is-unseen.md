@@ -2,7 +2,7 @@
 
 |             |                                                                                                                                   |
 | ----------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| Status      | open                                                                                                                              |
+| Status | in-progress (nixos-ci-bare-002:fix-linux-system-popen-uninjectable) |
 | Recorded    | 2026-11-08                                                                                                                        |
 | Observed in | io-mon @ `ac06360` plus the Linux tree-ledger change; by reading glibc 2.40 `stdlib/system.c` and `libio/iopopen.c`, not measured |
 | Area        | `src/io_mon/shim/linux_preload.nim` (posix_spawn hooks), `src/io_mon/tree_ledger.nim`                                             |
