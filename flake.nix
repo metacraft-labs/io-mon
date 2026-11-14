@@ -179,6 +179,19 @@
                 extraPackages = map (p: if p.outPath == crt.outPath then patched else p) old.extraPackages;
               }
           );
+          # A C compiler that targets musl, for
+          # tests/linux/test_io_mon_linux_shim_refuses_non_glibc.nim. A CROSS
+          # compiler (it runs on glibc, targets musl), not pkgsMusl's native
+          # one: a musl-hosted gcc cannot start under a glibc LD_PRELOAD, such
+          # as a command tracer that re-injects itself into every child. The
+          # test only compiles, so the compiler's own host libc is irrelevant.
+          muslTestCc =
+            if system == "x86_64-linux" then
+              "${pkgs.pkgsCross.musl64.stdenv.cc}/bin/x86_64-unknown-linux-musl-gcc"
+            else if system == "aarch64-linux" then
+              "${pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc}/bin/aarch64-unknown-linux-musl-gcc"
+            else
+              null;
           # The dev shell's `cc`/`clang`, and so the sanitizer arm's, is
           # darwinSanitizerCc on Darwin.
           mkDevShell =
@@ -252,6 +265,15 @@
               mkdir -p "$out/bin"
               ln -s ${pkgs.pkgsi686Linux.bash}/bin/bash "$out/bin/io-mon-test-i686-sh"
             '';
+          }
+          // pkgs.lib.optionalAttrs (system == "x86_64-linux" || system == "aarch64-linux") {
+            # A musl C compiler, for the test that the Linux shim refuses a
+            # libc other than glibc. A distinct name keeps it from shadowing
+            # the glibc `gcc` every other edge compiles with.
+            io-mon-test-musl-cc = pkgs.runCommand "io-mon-test-musl-cc" { } ''
+              mkdir -p "$out/bin"
+              ln -s ${muslTestCc} "$out/bin/io-mon-test-musl-cc"
+            '';
           };
 
           devShells.default = mkDevShell {
@@ -271,6 +293,10 @@
             # there) and skips on every other system, where it is empty.
             IO_MON_TEST_I686_SH =
               if system == "x86_64-linux" then "${pkgs.pkgsi686Linux.bash}/bin/bash" else "";
+            # A musl C compiler. tests/linux/test_io_mon_linux_shim_refuses_non_glibc.nim
+            # requires it on x86_64-linux and aarch64-linux (a missing value
+            # fails that test there) and skips elsewhere, where it is empty.
+            IO_MON_TEST_MUSL_CC = if muslTestCc == null then "" else "${muslTestCc}";
             # Paired workspace editing keeps using siblings. Release scripts
             # explicitly select the immutable inputs exported above.
             shellHook = ''

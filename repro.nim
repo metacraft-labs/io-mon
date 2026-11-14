@@ -89,6 +89,8 @@ when defined(linux):
   import ./repro_support/getconf
   when defined(amd64):
     import ./repro_support/i686_shell
+  when defined(amd64) or defined(arm64):
+    import ./repro_support/musl_cc
   import ./repro_support/shim_publication_tools
   import ./repro_support/strace
 
@@ -136,6 +138,9 @@ package io_mon:
       "patchelf"
       when defined(amd64):
         "io-mon-test-i686-sh"
+      when defined(amd64) or defined(arm64):
+        # tests/linux/test_io_mon_linux_shim_refuses_non_glibc.nim
+        "io-mon-test-musl-cc"
     # The C-family compiler ``nim c`` shells out to for the C backend. macOS
     # builds (and the shim's arm64/arm64e fat link) use Apple ``clang``; Linux
     # and Windows (``--cc:gcc`` for the shim DLL) use ``gcc``. The user supplies
@@ -438,6 +443,10 @@ package io_mon:
               ["io-mon-test-i686-sh"])
         if stem == "test_io_mon_shim_static_tls_small_stack_threads":
           appendRegisteredActionToolIdentityRefs(executeEdge.id, ["node"])
+        when defined(amd64) or defined(arm64):
+          if stem == "test_io_mon_linux_shim_refuses_non_glibc":
+            appendRegisteredActionToolIdentityRefs(executeEdge.id,
+              ["io-mon-test-musl-cc"])
       testExecuteActions.add(executeEdge)
 
     # Portable tests — always in the graph.

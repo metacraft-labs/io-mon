@@ -110,6 +110,22 @@ three nesting levels, inner loss, interruption and real filesystem failures.
 ### Linux
 
 - **`LD_PRELOAD` Shim**: Injects wrapper symbols that route filesystem activity to the monitor.
+- **glibc only**: the Linux shim supports glibc, the C library of every
+  supported Linux target (x86_64, AArch64, armhf), and refuses to compile
+  against any other. Both of the shim's C translation units check it: the
+  hook runtime (`src/io_mon/hooks/linux_preload_runtime.nim`) and the private
+  heap (`src/io_mon/shim/linux_private_heap.c`), each with an `#error` that
+  names the reason, so the build stops on that message and not on an
+  unrelated glibc-only type. The check reads `__GLIBC__` from the libc
+  headers the compiler uses, not from the build host, so a musl compiler on a
+  glibc host is refused too. The refusal is deliberate: nothing builds or tests the
+  shim against another libc, and the one path once written for one found the
+  real `dlsym` through the shim's own exported `dlsym`, which never returns.
+  The shim reaches the real `dlsym` with glibc's `dlvsym`, which avoids that
+  loop. Supporting a second libc is a spec change: it needs a way to find the
+  real `dlsym` without going through the shim's own exports, and a build and
+  test arm for that libc. Test:
+  `tests/linux/test_io_mon_linux_shim_refuses_non_glibc.nim`.
 - **One active shim per process**: nested monitors can preload two distinct
   shim builds into one child (an inner host puts its shim in front of the
   list it inherited, or an outer exec hook meets a route that names another

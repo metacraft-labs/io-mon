@@ -659,6 +659,21 @@ when defined(ioMonInlineWindowTest):
 #include <time.h>
 #include <unistd.h>
 
+/* The Linux shim is built for glibc only (docs/contributors/architecture.md,
+ * "glibc only"). Every supported Linux target is glibc, and nothing builds or
+ * tests the shim against another libc, so a path written for one would ship
+ * unexercised. That has already gone wrong once: the real dlsym was found
+ * through ct_resolve on a non-glibc libc, which reaches the shim's own
+ * exported dlsym and recursed without end. The refusal is made here, from the
+ * libc headers the compiler actually uses (<features.h>, included by every
+ * header above, defines __GLIBC__), rather than from the build host, so a
+ * cross or musl compiler on a glibc host is refused too. It also comes before
+ * the first glibc-only type below, so the build fails with this message and
+ * not with an unrelated "unknown type name". */
+#ifndef __GLIBC__
+#error "io-mon: the Linux shim supports glibc only; this compiler's C library is not glibc (see docs/contributors/architecture.md)"
+#endif
+
 extern char **environ;
 """.}
 
@@ -5200,13 +5215,13 @@ void *ct_linux_preload_dlsym_entry_real = NULL;
 
 static ct_dlsym_real_fn ct_real_dlsym_fn(void) {
   if (real_dlsym_ptr == NULL) {
-#ifdef __GLIBC__
+    /* dlvsym does not pass through the shim's exported dlsym. Never fall
+     * back to ct_resolve: it calls dlsym(RTLD_NEXT, ...), which the shim's
+     * own calls bind to the shim's export, whose entry stub calls back here
+     * while the pointer is unpublished -- unbounded recursion. That is why
+     * the shim refuses any libc but glibc (the glibc-only #error at the top
+     * of this file). ARM64's baseline is 2.17, not x86_64's 2.2.5. */
     real_dlsym_ptr = (ct_dlsym_real_fn)dlvsym(RTLD_NEXT, "dlsym", CT_DLSYM_GLIBC_BASE);
-    /* Never retry through ct_resolve on glibc: that calls our interposed
-     * dlsym again. ARM64's baseline is 2.17, not x86_64's 2.2.5. */
-#else
-    real_dlsym_ptr = (ct_dlsym_real_fn)ct_resolve("dlsym");
-#endif
     if (real_dlsym_ptr != NULL)
       __atomic_store_n(&ct_linux_preload_dlsym_entry_real,
                        (void *)real_dlsym_ptr, __ATOMIC_RELEASE);
@@ -5938,7 +5953,7 @@ ssize_t pread(int fd, void *buf, size_t count, off_t offset) {
 
 /* ILP32 glibc: pread64 is not pread there (off64_t), so it is defined with
  * the other ILP32 entry points below. */
-#if defined(__LP64__) || !defined(__GLIBC__)
+#ifdef __LP64__
 ssize_t pread64(int fd, void *buf, size_t count, off64_t offset)
     __attribute__((visibility("default")));
 ssize_t pread64(int fd, void *buf, size_t count, off64_t offset) {
@@ -5967,7 +5982,7 @@ ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset) {
 }
 
 /* ILP32 glibc: defined with the other ILP32 entry points below. */
-#if defined(__LP64__) || !defined(__GLIBC__)
+#ifdef __LP64__
 ssize_t preadv64(int fd, const struct iovec *iov, int iovcnt, off64_t offset)
     __attribute__((visibility("default")));
 ssize_t preadv64(int fd, const struct iovec *iov, int iovcnt, off64_t offset) {
@@ -6472,7 +6487,6 @@ __asm__(
 /* The aliases and versions the C definition below gives an architecture
  * without a stub. GCC rejects an alias attribute whose target only assembly
  * defines, so they are made in assembly too. */
-#ifdef __GLIBC__
 __asm__(
   ".globl ct_linux_preload_public_dlsym_glibc_base\n"
   ".type ct_linux_preload_public_dlsym_glibc_base, %function\n"
@@ -6482,19 +6496,12 @@ __asm__(
   ".set ct_linux_preload_public_dlsym_glibc_2_34, ct_linux_preload_public_dlsym\n"
   ".symver ct_linux_preload_public_dlsym_glibc_base,dlsym@" CT_DLSYM_GLIBC_BASE "\n"
   ".symver ct_linux_preload_public_dlsym_glibc_2_34,dlsym@@GLIBC_2.34\n");
-#else
-__asm__(
-  ".globl dlsym\n"
-  ".type dlsym, %function\n"
-  ".set dlsym, ct_linux_preload_public_dlsym\n");
-#endif
 #else /* !CT_DLSYM_ENTRY_STUB */
 void *ct_linux_preload_public_dlsym(void *handle, const char *name)
     __attribute__((visibility("default")));
 void *ct_linux_preload_public_dlsym(void *handle, const char *name) {
   return ct_linux_preload_hooked_dlsym(handle, name);
 }
-#ifdef __GLIBC__
 void *ct_linux_preload_public_dlsym_glibc_base(void *handle, const char *name)
     __attribute__((alias("ct_linux_preload_public_dlsym"),
                    visibility("default")));
@@ -6503,11 +6510,6 @@ void *ct_linux_preload_public_dlsym_glibc_2_34(void *handle, const char *name)
                    visibility("default")));
 __asm__(".symver ct_linux_preload_public_dlsym_glibc_base,dlsym@" CT_DLSYM_GLIBC_BASE);
 __asm__(".symver ct_linux_preload_public_dlsym_glibc_2_34,dlsym@@GLIBC_2.34");
-#else
-void *dlsym(void *handle, const char *name)
-    __attribute__((alias("ct_linux_preload_public_dlsym"),
-                   visibility("default")));
-#endif
 #endif /* CT_DLSYM_ENTRY_STUB */
 
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
