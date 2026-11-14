@@ -1002,6 +1002,7 @@ typedef int (*ct_pkey_mprotect_real_fn)(void *, size_t, int, int);
 typedef char *(*ct_realpath_chk_real_fn)(const char *, char *, size_t);
 typedef int (*ct_eventfd_real_fn)(unsigned int, int);
 typedef int (*ct_timerfd_create_real_fn)(int, int);
+typedef int (*ct_socket_real_fn)(int, int, int);
 typedef ssize_t (*ct_readlink_chk_real_fn)(const char *, char *, size_t, size_t);
 typedef ssize_t (*ct_readlinkat_chk_real_fn)(int, const char *, char *, size_t,
                                              size_t);
@@ -1027,6 +1028,7 @@ static ct_pkey_mprotect_real_fn real_pkey_mprotect_ptr = NULL;
 static ct_realpath_chk_real_fn real_realpath_chk_ptr = NULL;
 static ct_eventfd_real_fn real_eventfd_ptr = NULL;
 static ct_timerfd_create_real_fn real_timerfd_create_ptr = NULL;
+static ct_socket_real_fn real_socket_ptr = NULL;
 static ct_readlink_chk_real_fn real_readlink_chk_ptr = NULL;
 static ct_readlinkat_chk_real_fn real_readlinkat_chk_ptr = NULL;
 typedef int (*ct_unlink_real_fn)(const char *);
@@ -5493,6 +5495,7 @@ void ct_linux_preload_prime_real_functions(void) {
   CT_PRIME(real_realpath_chk_ptr, ct_realpath_chk_real_fn, "__realpath_chk");
   CT_PRIME(real_eventfd_ptr, ct_eventfd_real_fn, "eventfd");
   CT_PRIME(real_timerfd_create_ptr, ct_timerfd_create_real_fn, "timerfd_create");
+  CT_PRIME(real_socket_ptr, ct_socket_real_fn, "socket");
 #if !defined(__LP64__) && defined(__GLIBC__)
   CT_PRIME(real_stat64_ptr, ct_ilp32_path_buf_fn, "stat64");
   CT_PRIME(real_lstat64_ptr, ct_ilp32_path_buf_fn, "lstat64");
@@ -7229,6 +7232,33 @@ int timerfd_create(int clockid, int flags) {
   CT_OBSERVED_REAL(real_timerfd_create_ptr, ct_timerfd_create_real_fn,
                    "timerfd_create", -1);
   int rc = real_timerfd_create_ptr(clockid, flags);
+  if (rc >= 0) CT_OBSERVE(ct_localfd_create_observer, rc);
+  return rc;
+}
+
+/* In-tree creation of a socket by `socket(2)`. This is the same IM-3 create
+ * record as for pipe/socketpair/eventfd. Without it a read of a socket the monitored tree made
+ * itself, through an inherited descriptor number (bash `read <&4` dup2s the
+ * socket onto fd 0, which was open when the shim initialised), is classed as
+ * an out-of-tree content channel. The remote peer, when out of tree, is
+ * judged separately by the connect record, so recording the create does not
+ * hide an out-of-tree producer.
+ *
+ * `accept`/`accept4` are deliberately NOT hooked: the connection they return
+ * has a peer the tree did not necessarily create (an inetd-style server
+ * accepting from an inherited listener), and a create record would pair the
+ * read and hide that out-of-tree producer. An accepted AF_UNIX connection is
+ * judged by tree membership (SO_PEERCRED) instead; an accepted TCP connection
+ * read through an inherited descriptor number stays a conservative downgrade.
+ *
+ * Only a successful call records: a failed one returns -1 and creates
+ * nothing. A missing create can only leave a read unpaired (a conservative
+ * re-run), so the failure direction is safe. */
+int socket(int domain, int type, int protocol)
+    __attribute__((visibility("default")));
+int socket(int domain, int type, int protocol) {
+  CT_OBSERVED_REAL(real_socket_ptr, ct_socket_real_fn, "socket", -1);
+  int rc = real_socket_ptr(domain, type, protocol);
   if (rc >= 0) CT_OBSERVE(ct_localfd_create_observer, rc);
   return rc;
 }

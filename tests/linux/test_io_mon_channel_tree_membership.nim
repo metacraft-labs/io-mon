@@ -7,8 +7,8 @@
 ## the monitored process that made the channel. That pairing is a PROXY for the
 ## question that actually decides the grade — "was the producer one of us?" — and it
 ## is only as good as the set of channel-creating calls somebody has interposed.
-## IM-3 hooked `pipe`/`pipe2`/`socketpair`; Linux still records NO create for
-## `socket`/`accept` (macOS does), so a monitored process that hands an accepted
+## IM-3 hooked `pipe`/`pipe2`/`socketpair`; `socket` is hooked too now, but Linux
+## still records NO create for `accept` (an accepted peer may be out of tree), so a monitored process that hands an accepted
 ## unix socket to a monitored child re-broke the exact failure IM-3 had just fixed,
 ## and the next uninterposed channel class would break it again.
 ##
@@ -300,13 +300,12 @@ suite "io-mon Linux content-channel tree membership (IoMon-Pipeline-Capture IM-4
     let consumed = opaqueReads(dep)
     check consumed.len >= 1
 
-    # …and NOT via IM-3's pairing: no create exists for the consumed key, so the
-    # only thing that can have suppressed the downgrade is tree membership.
-    let created = localFdCreateKeys(dep)
+    # The producer is named by the kernel-attested peer pid and that pid is one
+    # of the run's monitored processes (tree membership, whether or not the
+    # `socket` create also paired the read).
     let started = monitoredStartPids(dep.records)
     var attributedInTree = 0
     for r in consumed:
-      check r.path notin created
       if r.childOsPid != 0 and r.childOsPid in started:
         inc attributedInTree
         # The detail carries the same pid, so `io-mon inspect` shows the reason.
@@ -352,11 +351,10 @@ suite "io-mon Linux content-channel tree membership (IoMon-Pipeline-Capture IM-4
     let consumed = opaqueReads(dep)
     check consumed.len >= 2
 
-    # Neither is paired — this whole class has no create hook — so the ONLY thing
-    # separating them is who produced them.
+    # The out-of-tree one has no in-tree create; what separates the two is who
+    # produced them.
     let created = localFdCreateKeys(dep)
     let started = monitoredStartPids(dep.records)
-    for r in consumed:
-      check r.path notin created
+    check consumed.anyIt(it.path notin created)
     check consumed.anyIt(it.childOsPid != 0 and it.childOsPid in started)
     check consumed.anyIt(it.childOsPid == 0 or it.childOsPid notin started)
