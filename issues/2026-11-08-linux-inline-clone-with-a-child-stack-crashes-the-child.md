@@ -2,7 +2,7 @@
 
 |             |                                                                                                        |
 | ----------- | ------------------------------------------------------------------------------------------------------ |
-| Status | in-progress (gpu-server-002:fix-linux-inline-clone-with-a-child-stack-cr) |
+| Status | open |
 | Recorded    | 2026-11-08                                                                                             |
 | Observed in | io-mon @ `75a4ccb`, and the same with the change that follows it; x86_64 Linux, kernel 7.2             |
 | Area        | `src/io_mon/hooks/linux_preload_runtime.nim` (inline-syscall trap handler), nim-stackable-hooks replay |
