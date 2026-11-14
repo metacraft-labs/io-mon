@@ -4428,6 +4428,15 @@ proc repro_hook_connect*(ctx: var ConnectContext) {.raises: [].} =
   # readable, so it is not touched (`io_mon/posix_connect`).
   if ctx.result == 0 or c_errno_is_connect_in_progress(savedErrno) != 0:
     recordIpcConnect(ctx.fd, ctx.address, ctx.addrLen)
+    # The socket this process made and connected is now a local channel whose
+    # remote peer the record above has just judged (an out-of-tree peer is a
+    # loss of its own), so a later read of it through an inherited descriptor
+    # number (bash `read <&4` after `exec 4<>/dev/tcp/…`) pairs with this
+    # create instead of being graded an out-of-tree content channel. The create
+    # is recorded HERE and not at `socket(2)`: a socket that was only bound
+    # (UDP, a datagram AF_UNIX socket) has no judged peer, and a create at
+    # `socket` would pair its reads and hide an out-of-tree sender.
+    recordLocalFdCreate(ctx.fd)
   elif connectFailureReadAddress(savedErrno):
     recordConnectAttempt(ctx.address, ctx.addrLen, ctx.result, savedErrno)
   c_set_errno(savedErrno)

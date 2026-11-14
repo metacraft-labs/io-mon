@@ -189,18 +189,21 @@ A read of a descriptor the monitored tree did not open (an inherited pipe or
 socket, or any fd whose number was open when the shim initialised) is graded
 as an out-of-tree content channel unless the merge finds a
 `chan=localfd role=create` record for the same kernel object, `(dev,ino)`.
-The Linux shim records that create for every local-IPC fd the tree makes itself:
-`pipe`, `pipe2`, `socketpair` and `socket`, plus `eventfd` and `timerfd_create`
-on Linux. A read through any descriptor number, including
-one `dup2`ed onto fd 0 (as bash does for `read <&4`), therefore pairs. The
-remote peer of a socket is judged separately by the connect record, so
-recording the create never hides an out-of-tree producer. A failed call
-records nothing. `accept`/`accept4` record no create on Linux: the accepted
-connection's peer may be out of tree (a server accepting from an inherited
-listener), which a create would hide. An accepted AF_UNIX connection is judged
-by the kernel-attested peer pid (`SO_PEERCRED`) against the monitored tree, and
-an accepted TCP connection read through an inherited descriptor number stays a
-conservative out-of-tree downgrade.
+The Linux shim records that create for `pipe`, `pipe2`, `socketpair`, `eventfd`
+and `timerfd_create`, and for a socket at the moment a `connect` on it is made
+or in flight, which is also when the connect record judges its peer. A read
+through any descriptor number, including one `dup2`ed onto fd 0 (as bash does
+for `read <&4`), therefore pairs.
+
+A create is recorded only where the channel's peer is judged. `socket(2)`
+alone records none: a socket that is only bound (UDP, a datagram AF_UNIX
+socket) has no judged peer, and a create there would pair its reads and hide an
+out-of-tree sender. `accept`/`accept4` record none either: the accepted peer
+may be out of tree (a server accepting from an inherited listener). An accepted
+AF_UNIX connection is judged by the kernel-attested peer pid (`SO_PEERCRED`)
+against the monitored tree, and an accepted TCP connection, or a bound-only
+socket, read through an inherited descriptor number stays a conservative
+out-of-tree downgrade. A failed call records nothing.
 
 ---
 
