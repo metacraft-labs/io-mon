@@ -2,7 +2,7 @@
 
 |             |                                                                                       |
 | ----------- | ------------------------------------------------------------------------------------- |
-| Status      | open                                                                                  |
+| Status | in-progress (nixos-ci-bare-002:fix-linux-nonglibc-dlsym) |
 | Observed in | io-mon `23556a3` (`agents`), by reading the code; not run (no non-glibc build exists) |
 | Recorded    | 2026-11-08                                                                            |
 | Area        | `src/io_mon/hooks/linux_preload_runtime.nim`, `ct_real_dlsym_fn` (the `#else` branch) |
