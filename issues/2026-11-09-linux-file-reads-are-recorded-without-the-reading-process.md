@@ -2,7 +2,7 @@
 
 |             |                                                                                                               |
 | ----------- | ------------------------------------------------------------------------------------------------------------- |
-| Status      | open                                                                                                          |
+| Status | in-progress (nixos-ci-bare-002:fix-linux-file-reads-no-process) |
 | Recorded    | 2026-11-09                                                                                                    |
 | Observed in | io-mon `c9e4dbd`                                                                                              |
 | Area        | `src/io_mon/shm/dep_queue.nim` (`encodeDepRecordWithSeq`, `encodeDepRecordIdentity`), the Linux set transport |
