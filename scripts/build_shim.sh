@@ -217,6 +217,26 @@ case "${io_mon_host_platform_name}" in
     linux_private_cache="${linux_cache_parent}/build-${linux_build_id}"
     linux_publish_dir="${out_dir}/.io-mon-publish-${linux_build_id}"
     mkdir "$linux_private_cache" "$linux_publish_dir"
+    # No search path of the linker wrapper's making. The shim is LD_PRELOADed
+    # into programs built elsewhere, so its C-runtime dependencies must
+    # resolve through the program that loads it, and ANY DT_RUNPATH on it
+    # stops that: glibc's loader consults the DT_RPATHs of the requesting
+    # object's loaders (the program included) only when the requesting
+    # object has no DT_RUNPATH (ld.so(8),
+    # https://man7.org/linux/man-pages/man8/ld.so.8.html). A program that
+    # finds its own glibc through its DT_RPATH then dies before main with
+    # "libm.so.6: cannot open shared object file". A nixpkgs dev shell adds
+    # two runpaths to every link: the `ld` wrapper's entry for each `-L`
+    # directory, the C runtime's included (NIX_DONT_SET_RPATH=1 stops it),
+    # and stdenv's `-rpath $out/lib` in NIX_LDFLAGS, `$out` being the
+    # nonexistent `<checkout>/outputs/out` (removed with every NIX_LDFLAGS*
+    # variable; the shim's link needs nothing they carry). Both are inert
+    # under other toolchains; the check after the link is the guarantee.
+    linux_link_env=(NIX_DONT_SET_RPATH=1)
+    for linux_ldflags_var in ${!NIX_LDFLAGS@}; do
+      linux_link_env=(-u "$linux_ldflags_var" "${linux_link_env[@]}")
+    done
+    env "${linux_link_env[@]}" \
     nim c \
       ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
       ${nim_shim_alloc_flags[@]+"${nim_shim_alloc_flags[@]}"} \
@@ -231,6 +251,20 @@ case "${io_mon_host_platform_name}" in
       --out:"${linux_publish_dir}/librepro_monitor_shim.so" \
       "$@" \
       src/io_mon/shim/linux_preload.nim
+    # Refuse to publish a shim that carries a DT_RUNPATH, whatever it names
+    # (see above). `readelf` names the tag; when it is missing the check is
+    # refused rather than skipped, because a shim with a runpath loads fine
+    # into every program built here and fails only in somebody else's.
+    if ! command -v readelf >/dev/null 2>&1; then
+      echo "build_shim.sh: readelf is not on PATH, so the built shim cannot be checked for a DT_RUNPATH" >&2
+      exit 1
+    fi
+    linux_runpath="$(LC_ALL=C readelf -d -W "${linux_publish_dir}/librepro_monitor_shim.so" |
+      sed -n 's/.*(RUNPATH).*Library runpath: \[\(.*\)\]/\1/p')"
+    if [ -n "$linux_runpath" ]; then
+      echo "build_shim.sh: the built shim carries DT_RUNPATH ${linux_runpath}; a preloaded library must carry none, or programs that find their C runtime through their own DT_RPATH cannot load it. The link must not add one." >&2
+      exit 1
+    fi
     mv --no-copy -f -- "${linux_publish_dir}/librepro_monitor_shim.so" "${out_dir}/librepro_monitor_shim.so"
     rmdir -- "$linux_publish_dir"
     ;;
