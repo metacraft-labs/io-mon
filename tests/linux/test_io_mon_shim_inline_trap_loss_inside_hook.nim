@@ -25,10 +25,11 @@
 ##
 ## THE SECOND TEST grades events trapped after the process's final drain: a
 ## thread keeps opening files through the inline `syscall` while `main`
-## returns, so some of its opens land after the exit destructor drained.
-## Every open it made must be in the capture, or the capture must report the
-## loss and not be complete; and at least two of up to twenty runs must have
-## had such a late open, so the case was exercised at all.
+## returns, and a stdio stream flushed after every library destructor makes
+## one more open, so an open lands after the exit destructor drained on every
+## run, whatever the scheduler does. Every open must be in the capture, or the
+## capture must report the loss and not be complete; the run fails if the
+## late open did not happen, so the case cannot go ungraded.
 ##
 ## THE THIRD TEST grades a process killed by a signal. A forked child opens
 ## and reads a file through its own inline `syscall` and then dies of SIGSEGV,
@@ -205,6 +206,24 @@ raw6(long nr, long a0, long a1, long a2, long a3, long a4, long a5) {
 static volatile int opened = 0;
 static int limit;
 
+/* The deterministic late open. glibc's exit() runs the atexit handlers, then
+ * _dl_fini (every library destructor, the shim's exit destructor and its
+ * final drain among them), and only then flushes stdio. A stream made with
+ * fopencookie and holding unflushed data is flushed in that last step, so its
+ * write callback runs strictly after the final drain, on every run, and the
+ * open it makes through the inline `syscall` is trapped after it. */
+static ssize_t late_write(void *cookie, const char *buf, size_t size) {
+  (void)cookie;
+  long fd = raw6(SYS_openat, AT_FDCWD, (long)"input-late.txt", O_RDONLY,
+                 0, 0, 0);
+  if (fd < 0) _exit(32);
+  close((int)fd);
+  /* Raw write: the line says the open happened, and must not depend on
+   * stdio, which is being flushed. */
+  raw6(SYS_write, 1, (long)"late\n", 5, 0, 0, 0);
+  return (ssize_t)size;
+}
+
 static void *opener(void *arg) {
   (void)arg;
   for (int i = 0; i < limit; i++) {
@@ -228,6 +247,9 @@ int main(int argc, char **argv) {
   if (argc < 3 || chdir(argv[1]) != 0) return 2;
   limit = 0;
   for (const char *p = argv[2]; *p; p++) limit = limit * 10 + (*p - '0');
+  cookie_io_functions_t io = {NULL, late_write, NULL, NULL};
+  FILE *late = fopencookie(NULL, "w", io);
+  if (late == NULL || fputc('x', late) == EOF) return 4;   /* left unflushed */
   pthread_t thread;
   if (pthread_create(&thread, NULL, opener, NULL) != 0) return 3;
   while (__atomic_load_n(&opened, __ATOMIC_ACQUIRE) < 20) {
@@ -623,47 +645,55 @@ suite "io-mon Linux shim: trapped inline syscalls when the image ends inside a h
       for k, v in envPairs(): env[k] = v
       env.del("LD_PRELOAD")
       env["REPRO_MONITOR_SHIM_LIB"] = shimLib
-      var lateOpens = 0
-      for attempt in 0 ..< 20:
-        if lateOpens >= 2:
-          break
-        let tree = work / ("tree-" & $attempt)
-        createDir(tree)
-        for i in 0 ..< limit:
-          writeFile(tree / ("input-" & $i & ".txt"), "x\n")
-        let depfile = work / ("late-" & $attempt & ".iomon")
-        let cap = run(snoopBin, @["run", "--depfile", depfile, "--", host,
-          tree, $limit], env)
-        check cap.code == 0
-        var printed = 0
-        for line in cap.output.splitLines():
-          if line.len > 0 and line.allIt(it in {'0' .. '9'}):
-            printed = max(printed, parseInt(line) + 1)
-        check printed >= 20
-        check printed < limit
-        let dep = readMonitorDepFile(depfile)
-        var missing = 0
-        for i in 0 ..< printed:
-          let path = tree / ("input-" & $i & ".txt")
-          if not dep.records.anyIt(it.kind == mrFileOpen and it.path == path):
-            inc missing
-        let lossReported = dep.records.anyIt(it.kind == mrEventLoss and
-          it.detail.startsWith(
-            "inline raw syscall events unclassified at image end"))
-        checkpoint("attempt " & $attempt & ": printed " & $printed &
-          ", missing " & $missing & ", loss reported: " & $lossReported &
-          ", completeness: " & $dep.completeness)
-        for r in dep.records:
-          if r.kind == mrEventLoss:
-            checkpoint("event-loss " & r.detail)
-        if missing > 0:
-          inc lateOpens
-          check lossReported
-          check dep.completeness != mcComplete
-      # The thread must actually have outlived the drain at least once, or
-      # nothing above was graded.
-      checkpoint("runs with opens after the final drain: " & $lateOpens)
-      check lateOpens >= 2
+      # One run is enough: the host makes a late open on every run (see
+      # `late_write`), so nothing here depends on the scheduler. The thread's
+      # own opens are graded as well; any of them that landed after the drain
+      # must be reported the same way.
+      let tree = work / "tree"
+      createDir(tree)
+      for i in 0 ..< limit:
+        writeFile(tree / ("input-" & $i & ".txt"), "x\n")
+      writeFile(tree / "input-late.txt", "x\n")
+      let depfile = work / "late.iomon"
+      let cap = run(snoopBin, @["run", "--depfile", depfile, "--", host,
+        tree, $limit], env)
+      check cap.code == 0
+      var printed = 0
+      var lateRan = false
+      for line in cap.output.splitLines():
+        if line == "late":
+          lateRan = true
+        elif line.len > 0 and line.allIt(it in {'0' .. '9'}):
+          printed = max(printed, parseInt(line) + 1)
+      check printed >= 20
+      check printed < limit
+      # The open after the final drain happened, so it is graded: it is in the
+      # capture, or the capture reports the loss and is not complete.
+      check lateRan
+      let dep = readMonitorDepFile(depfile)
+      var missing = 0
+      for i in 0 ..< printed:
+        let path = tree / ("input-" & $i & ".txt")
+        if not dep.records.anyIt(it.kind == mrFileOpen and it.path == path):
+          inc missing
+      if not dep.records.anyIt(it.kind == mrFileOpen and
+          it.path == tree / "input-late.txt"):
+        inc missing
+      let lossReported = dep.records.anyIt(it.kind == mrEventLoss and
+        it.detail.startsWith(
+          "inline raw syscall events unclassified at image end"))
+      checkpoint("printed " & $printed & ", missing " & $missing &
+        ", loss reported: " & $lossReported & ", completeness: " &
+        $dep.completeness)
+      for r in dep.records:
+        if r.kind == mrEventLoss:
+          checkpoint("event-loss " & r.detail)
+      if missing > 0:
+        check lossReported
+        check dep.completeness != mcComplete
+      else:
+        # Everything was recorded, so the capture may be complete.
+        check dep.completeness == mcComplete or lossReported
       removeDir(work)
 
   test "t_inline_events_of_a_process_killed_by_a_signal_are_reported":
