@@ -2,7 +2,7 @@
 
 |             |                                                                                                                               |
 | ----------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| Status | in-progress (gpu-server-001:fix-linux-inline-trap-control-needs-two-late) |
+| Status | open |
 | Observed in | io-mon `95ca754` (`dev`), CI (reprobuild) job 126587113787 `linux-x64 — repro build/test`                                     |
 | Recorded    | 2026-11-04                                                                                                                    |
 | Area        | `tests/linux/test_io_mon_shim_inline_trap_loss_inside_hook.nim`, `t_inline_events_trapped_after_the_final_drain_are_reported` |
