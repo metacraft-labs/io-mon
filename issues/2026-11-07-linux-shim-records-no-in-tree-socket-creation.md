@@ -2,7 +2,7 @@
 
 |             |                                                                                                                                                                       |
 | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Status      | open                                                                                                                                                                  |
+| Status | in-progress (nixos-ci-bare-004:fix-linux-shim-records-no-in-tree-socket-cre) |
 | Recorded    | 2026-11-07                                                                                                                                                            |
 | Observed in | io-mon @ `3d47bb1` plus the change that records the AF_INET destination and failed connects; x86_64 Linux                                                             |
 | Area        | `src/io_mon/shim/linux_preload.nim` (`recordLocalFdCreate`, `classifyEmptyFdRead`), `src/io_mon/hooks/linux_preload_runtime.nim` (no `socket`/`accept` interposition) |
