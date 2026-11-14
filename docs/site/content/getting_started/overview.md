@@ -37,7 +37,10 @@ When a monitored root process runs, `io-mon` tracks the full lifetime of all des
 - `execve`, `execveat`, `fexecve`, and `posix_spawn`
 - Windows process creation (`CreateProcessW`)
 
-Every event records the exact originating `osPid`, `parentOsPid`, and `threadId`, producing a complete tree of execution.
+Every process record (start, exec, spawn) carries the originating `osPid`, `parentOsPid`, and `threadId`, producing a
+complete tree of execution. A file read or probe is recorded once per distinct observation rather than once per
+process, so it does not always name the process that made it; see
+[Observer Attribution](/reference/depfile-format#observer-attribution).
 
 ---
 

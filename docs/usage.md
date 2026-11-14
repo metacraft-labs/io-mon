@@ -235,7 +235,11 @@ importable API.)
   `profile`, `capabilityGaps`, `summary`, and `records: seq[MonitorRecord]`.
 - `MonitorRecord` — one observation: `kind: MonitorRecordKind`,
   `observationKind`, `seq`, `osPid`, `parentOsPid`, `threadId`, `childOsPid`,
-  `result`, `flags`, `probeResult`, `path`, `detail`.
+  `result`, `flags`, `probeResult`, `path`, `detail`. The observer fields
+  (`osPid`, `parentOsPid`, `threadId`, `childOsPid`) are `0` on library loads,
+  environment, sysctl and clock reads everywhere, and on file opens, reads,
+  probes and directory enumerations that travelled Linux's set transport; see
+  "Observer Attribution" in `docs/site/content/reference/depfile-format.md`.
 - `MonitorRecordKind` — `mrProcessStart`, `mrProcessExec`, `mrProcessSpawn`,
   `mrFileOpen`, `mrFileRead`, `mrPathProbe`, `mrFileWrite`, `mrEventLoss`,
   `mrDirectoryEnumerate`, `mrBackendProfile`, `mrCapabilityGap`,
