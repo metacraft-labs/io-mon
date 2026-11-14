@@ -2990,8 +2990,8 @@ static int ct_raw_process_is_single_threaded(void) {
  * (clone, clone3) and class of child (below), at index
  * CT_INLINE_CLONE_STUBS_PER_SITE * site + CT_INLINE_CLONE_CLASSES * kind +
  * class, CT_INLINE_CLONE_STUB_SIZE bytes each. The table is part of the
- * shim's own text, which the inline scanner never patches
- * (isMonitorShimMappingPath).
+ * shim's own text, which the inline scanner never patches (the image that
+ * contains this file's trap handler: OwnImage / isOwnImageMapping).
  *
  * The child's stop at the stub's `int3` runs this file's SIGTRAP handler in
  * the child. A clone3 with CLONE_CLEAR_SIGHAND resets the child's handlers to
@@ -9719,6 +9719,13 @@ proc scanInlineSyscallPatchesForTrackedMprotectRange*(start: pointer;
 # regression. See the M9.R.64.2 note at the (former) call site in
 # `installInlineSyscallPatches` below.
 
+proc runtimeOwnImage(mappings: openArray[LinuxExecutableMapping]): OwnImage
+    {.raises: [].} =
+  ## The image this runtime was loaded from, located by the address of its
+  ## SIGTRAP handler: the shim under whatever name it was preloaded as, or the
+  ## hook library that embeds the runtime. The scan never patches it.
+  ownImageOf(mappings, cast[uint](cInlineSyscallHandlerAddress()))
+
 proc installInlineSyscallPatches*(): InlineSyscallPatchStatus {.raises: [].} =
   if inlineSyscallPatchAttempted:
     return inlineSyscallPatchStatus
@@ -9756,8 +9763,9 @@ proc installInlineSyscallPatches*(): InlineSyscallPatchStatus {.raises: [].} =
     inlineSyscallPatchStatus = status
     return status
 
+  let own = runtimeOwnImage(mappings.mappings)
   for mapping in mappings.mappings:
-    if not shouldPatchInlineSyscallMapping(mapping, executablePath):
+    if not shouldPatchInlineSyscallMapping(mapping, executablePath, own):
       continue
     patchInlineSyscallMapping(mapping, status)
   # M9.R.64.2 revert of M9.R.63.5 — the targeted INT3 patch on libc's
@@ -9812,8 +9820,9 @@ proc scanInlineSyscallPatchesForNewMappings*(): InlineSyscallPatchStatus
   if mappings.diagnostic != lrsOk:
     inlineSyscallPatchStatus = status
     return status
+  let own = runtimeOwnImage(mappings.mappings)
   for mapping in mappings.mappings:
-    if not shouldPatchInlineSyscallMapping(mapping, executablePath):
+    if not shouldPatchInlineSyscallMapping(mapping, executablePath, own):
       continue
     patchInlineSyscallMapping(mapping, status)
   status.patchedSites = int(cInlineSyscallSiteCount())

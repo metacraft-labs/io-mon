@@ -38,7 +38,8 @@ import stackable_hooks/platform/linux_raw_syscalls
 
 proc mapping(path: string; writable = false; privateMapping = true;
              readable = true; executable = true;
-             start = 0x1000'u; stop = 0x2000'u): LinuxExecutableMapping =
+             start = 0x1000'u; stop = 0x2000'u;
+             device = "fd:01"; inode = 0'u64): LinuxExecutableMapping =
   LinuxExecutableMapping(
     path: path,
     start: start,
@@ -47,7 +48,13 @@ proc mapping(path: string; writable = false; privateMapping = true;
     writable: writable,
     executable: executable,
     privateMapping: privateMapping,
+    device: device,
+    inode: inode,
   )
+
+# The cases below test the path policy, so no running image is identified:
+# exactly what the scan sees when `ownImageOf` finds no mapping.
+const noOwn = OwnImage()
 
 suite "M9.R.67.1 inline-syscall patch predicate precedence":
 
@@ -82,9 +89,8 @@ suite "M9.R.67.1 inline-syscall patch predicate precedence":
     check isMonitorShimMappingPath(
       "/opt/repro/reprobuild/build/lib/librepro_monitor_shim.so (deleted)")
     check isMonitorShimMappingPath("/tmp/librepro_monitor_shim.debug")
-    # Non-canonical variants MUST NOT match (renaming the shim to any
-    # other filename lifts the "self" exemption, as the M9.R.67 Phase B
-    # bisection observed):
+    # Non-canonical variants do not match the NAME test. A renamed shim is
+    # excluded by the address test instead (`OwnImage`, the suite below):
     check not isMonitorShimMappingPath(
       "/opt/repro/reprobuild/build/lib/shim.so")
     check not isMonitorShimMappingPath(
@@ -101,13 +107,13 @@ suite "M9.R.67.1 inline-syscall patch predicate precedence":
     let cc1 = "/nix/store/kzq78n13l8w24jn8bx4djj79k5j717f1-gcc-14.3.0" &
       "/libexec/gcc/x86_64-unknown-linux-gnu/14.3.0/cc1"
     let m = mapping(cc1)
-    check not shouldPatchInlineSyscallMapping(m, executablePath = cc1)
+    check not shouldPatchInlineSyscallMapping(m, executablePath = cc1, own = noOwn)
 
   test "shim's own mapping is EXCLUDED regardless of executablePath":
     let shim = "/opt/repro/reprobuild/build/lib/librepro_monitor_shim.so"
     check not shouldPatchInlineSyscallMapping(
       mapping(shim),
-      executablePath = "/opt/repro/reprobuild/build/bin/repro")
+      executablePath = "/opt/repro/reprobuild/build/bin/repro", own = noOwn)
 
   test "user-app executable outside system-runtime prefixes IS patched":
     ## The M9.R.63.2 inline-asm exit_group pin lives under `/tmp/`.
@@ -115,32 +121,97 @@ suite "M9.R.67.1 inline-syscall patch predicate precedence":
     ## the shim can still catch that class of inline syscalls.
     let userApp = "/tmp/probe_dir/inline_asm_exit_group"
     check shouldPatchInlineSyscallMapping(mapping(userApp),
-      executablePath = userApp)
+      executablePath = userApp, own = noOwn)
 
   test "arbitrary user-owned .so (not shim, not system runtime) IS patched":
     let libFoo = "/opt/repro/reprobuild/build/lib/libfoo.so"
     check shouldPatchInlineSyscallMapping(mapping(libFoo),
-      executablePath = "/opt/repro/reprobuild/build/bin/repro")
+      executablePath = "/opt/repro/reprobuild/build/bin/repro", own = noOwn)
 
   test "system-runtime .so is EXCLUDED":
     let libc = "/nix/store/xx7cm72qy2c0643cm1ipngd87aqwkcdp-glibc-2.40-66" &
       "/lib/libc.so.6"
     check not shouldPatchInlineSyscallMapping(mapping(libc),
-      executablePath = "/opt/repro/reprobuild/build/bin/repro")
+      executablePath = "/opt/repro/reprobuild/build/bin/repro", own = noOwn)
 
   test "source-built glibc runtime is EXCLUDED":
     let sourceGlibc = "/home/user/reprobuild/recipes/packages/source/glibc" &
       "/.repro/output/install/usr/lib/libc.so.6"
     check not shouldPatchInlineSyscallMapping(mapping(sourceGlibc),
-      executablePath = "/opt/repro/reprobuild/build/bin/repro")
+      executablePath = "/opt/repro/reprobuild/build/bin/repro", own = noOwn)
 
   test "writable / shared / anonymous mappings are always EXCLUDED":
     let userApp = "/tmp/probe_dir/foo"
     check not shouldPatchInlineSyscallMapping(
-      mapping(userApp, writable = true), executablePath = userApp)
+      mapping(userApp, writable = true), executablePath = userApp, own = noOwn)
     check not shouldPatchInlineSyscallMapping(
-      mapping(userApp, privateMapping = false), executablePath = userApp)
+      mapping(userApp, privateMapping = false), executablePath = userApp, own = noOwn)
     check not shouldPatchInlineSyscallMapping(
-      mapping("[heap]"), executablePath = userApp)
+      mapping("[heap]"), executablePath = userApp, own = noOwn)
     check not shouldPatchInlineSyscallMapping(
-      mapping(""), executablePath = userApp)
+      mapping(""), executablePath = userApp, own = noOwn)
+
+suite "the running image is excluded by address, not by file name":
+  ## Issue 2026-11-14-the-linux-shim-recognizes-its-own-mapping-by-file-name-
+  ## so-a-renamed-copy-traps-on-its-own-syscalls: a copy of the shim under any
+  ## other file name patched its own raw-syscall sites and died of SIGTRAP.
+  ## `tests/linux/test_io_mon_shim_renamed_copy_runs.nim` drives the real
+  ## shim; these cases pin the policy that decides it.
+  let renamed = "/tmp/x/other-name.so"
+  let shimText = mapping(renamed, start = 0x7f0000001000'u,
+                         stop = 0x7f0000080000'u, inode = 4242)
+  let shimOtherText = mapping(renamed, start = 0x7f0000100000'u,
+                              stop = 0x7f0000110000'u, inode = 4242)
+  let libFoo = mapping("/opt/app/lib/libfoo.so", start = 0x7f0000200000'u,
+                       stop = 0x7f0000210000'u, inode = 77)
+  let mappings = [libFoo, shimText, shimOtherText]
+  let handler = 0x7f0000002345'u
+  let exe = "/opt/app/bin/app"
+
+  test "ownImageOf finds the mapping that contains the address":
+    let own = ownImageOf(mappings, handler)
+    check own.known
+    check own.start == shimText.start
+    check own.stop == shimText.stop
+    check own.inode == 4242
+    check not ownImageOf(mappings, 0x10'u).known
+    check not ownImageOf(mappings, 0'u).known
+    # `stop` is exclusive, as in /proc/self/maps.
+    check not ownImageOf([shimText], shimText.stop).known
+
+  test "a renamed shim is not patched, though the name test misses it":
+    let own = ownImageOf(mappings, handler)
+    check not isMonitorShimMappingPath(renamed)
+    check shouldPatchInlineSyscallMapping(shimText, exe, own = noOwn)
+    check not shouldPatchInlineSyscallMapping(shimText, exe, own)
+    # Every mapping of the same file is the same image.
+    check not shouldPatchInlineSyscallMapping(shimOtherText, exe, own)
+    # Other libraries are still patched.
+    check shouldPatchInlineSyscallMapping(libFoo, exe, own)
+
+  test "the running image is excluded even when it is the executable":
+    let own = ownImageOf(mappings, handler)
+    check not shouldPatchInlineSyscallMapping(shimText, renamed, own)
+
+  test "a different file with the same inode on another device is patched":
+    let own = ownImageOf(mappings, handler)
+    let elsewhere = mapping("/mnt/b/libbar.so", start = 0x7f0000300000'u,
+                            stop = 0x7f0000310000'u, device = "fd:02",
+                            inode = 4242)
+    check shouldPatchInlineSyscallMapping(elsewhere, exe, own)
+
+  test "an image without an inode is matched by its range only":
+    let anonShim = mapping(renamed, start = 0x7f0000001000'u,
+                           stop = 0x7f0000080000'u, inode = 0)
+    let other = mapping("/opt/app/lib/libz.so", start = 0x7f0000400000'u,
+                        stop = 0x7f0000410000'u, inode = 0)
+    let own = ownImageOf([anonShim, other], handler)
+    check not shouldPatchInlineSyscallMapping(anonShim, exe, own)
+    check shouldPatchInlineSyscallMapping(other, exe, own)
+
+  test "the name test still excludes a canonical shim the address missed":
+    let shim = mapping("/opt/repro/lib/librepro_monitor_shim.so",
+                       start = 0x7f0000500000'u, stop = 0x7f0000510000'u,
+                       inode = 9)
+    check not shouldPatchInlineSyscallMapping(shim, exe,
+      ownImageOf(mappings, handler))
