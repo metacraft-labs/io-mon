@@ -4346,10 +4346,14 @@ proc repro_hook_fclose*(ctx: var FcloseContext) {.raises: [].} =
     removeFdPath(fd)
   c_set_errno(savedErrno)
 
-proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32) {.raises: [].} =
+proc recordIpcConnect(fd: cint; address: pointer;
+                      addrLen: uint32): bool {.raises: [].} =
+  ## Records the connect and returns whether it did: false when the address
+  ## names no family (AF_UNSPEC, which dissolves a datagram socket's peer, or
+  ## an unreadable or short address), where no peer was judged.
   let family = c_sockaddr_family(address, addrLen)
   if family == 0:
-    return
+    return false
   var peerPid: uint64 = 0
   var peerUid: clong = -1
   var endpoint = ""
@@ -4395,6 +4399,7 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32) {.raises: [].
     (if peerPid == 0: " peer=unknown" else: " peer=" & $peerPid) &
     (if peerUid >= 0: " peeruid=" & $peerUid else: "")
   emitRecord(record)
+  true
 
 proc recordConnectAttempt(address: pointer; addrLen: uint32;
                           callResult: cint; err: cint) {.raises: [].} =
@@ -4427,7 +4432,7 @@ proc repro_hook_connect*(ctx: var ConnectContext) {.raises: [].} =
   # failure (EFAULT, EINVAL, EBADF, ...) may mean the address was never
   # readable, so it is not touched (`io_mon/posix_connect`).
   if ctx.result == 0 or c_errno_is_connect_in_progress(savedErrno) != 0:
-    recordIpcConnect(ctx.fd, ctx.address, ctx.addrLen)
+    let judged = recordIpcConnect(ctx.fd, ctx.address, ctx.addrLen)
     # The socket this process made and connected is now a local channel whose
     # remote peer the record above has just judged (an out-of-tree peer is a
     # loss of its own), so a later read of it through an inherited descriptor
@@ -4435,8 +4440,11 @@ proc repro_hook_connect*(ctx: var ConnectContext) {.raises: [].} =
     # create instead of being graded an out-of-tree content channel. The create
     # is recorded HERE and not at `socket(2)`: a socket that was only bound
     # (UDP, a datagram AF_UNIX socket) has no judged peer, and a create at
-    # `socket` would pair its reads and hide an out-of-tree sender.
-    recordLocalFdCreate(ctx.fd)
+    # `socket` would pair its reads and hide an out-of-tree sender. A connect
+    # that named no family (`connect(AF_UNSPEC)` un-associates a UDP socket)
+    # judged no peer, so it records no create either.
+    if judged:
+      recordLocalFdCreate(ctx.fd)
   elif connectFailureReadAddress(savedErrno):
     recordConnectAttempt(ctx.address, ctx.addrLen, ctx.result, savedErrno)
   c_set_errno(savedErrno)

@@ -327,6 +327,14 @@ int main(int argc, char **argv) {
   a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   a.sin_port = htons((unsigned short)atoi(argv[1]));
   if (bind(u, (struct sockaddr *)&a, sizeof a) != 0) return 2;
+  /* argv[3] == "unspec": connect(AF_UNSPEC) dissolves a datagram socket's peer
+   * and returns 0 without naming any peer, so it must not count as one. */
+  if (argc > 3) {
+    struct sockaddr un;
+    memset(&un, 0, sizeof un);
+    un.sa_family = AF_UNSPEC;
+    if (connect(u, &un, sizeof un) != 0) return 6;
+  }
   /* Signal readiness, then block until the out-of-tree sender delivers. */
   FILE *f = fopen(argv[2], "w"); if (!f) return 3; fputs("ready", f); fclose(f);
   if (dup2(u, 0) != 0) return 4;
@@ -340,18 +348,20 @@ suite "io-mon Linux socket(2) alone records no create":
   let work = getTempDir() / ("io-mon-chan-create-udp-" & $getCurrentProcessId())
   createDir(work)
 
-  test "bound_udp_socket_fed_from_outside_the_tree_still_downgrades":
+  for unspec in [false, true]:
+   test "bound_udp_socket_fed_from_outside_the_tree_still_downgrades" &
+       (if unspec: "_after_connect_af_unspec" else: ""):
     let snoopBin = ensureSnoop(work)
     let shimLib = ensureShim()
     let client = buildC(work, "bound_udp_client", boundUdpSrc.replace(
       "#include <stdio.h>", "#include <stdio.h>\n#include <stdlib.h>"))
-    let depfile = work / "bound-udp.iomon"
-    let ready = work / "udp.ready"
-    const port = "47613"
+    let depfile = work / ("bound-udp" & $unspec & ".iomon")
+    let ready = work / ("udp" & $unspec & ".ready")
+    let port = if unspec: "47614" else: "47613"
     removeFile(ready)
 
     let p = startProcess(snoopBin, args = @["run", "--depfile", depfile, "--",
-      client, port, ready], env = monitorEnv(shimLib),
+      client, port, ready] & (if unspec: @["unspec"] else: @[]), env = monitorEnv(shimLib),
       options = {poStdErrToStdOut})
     var waited = 0
     while not fileExists(ready) and waited < 200:

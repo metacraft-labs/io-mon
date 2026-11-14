@@ -191,7 +191,9 @@ as an out-of-tree content channel unless the merge finds a
 `chan=localfd role=create` record for the same kernel object, `(dev,ino)`.
 The Linux shim records that create for `pipe`, `pipe2`, `socketpair`, `eventfd`
 and `timerfd_create`, and for a socket at the moment a `connect` on it is made
-or in flight, which is also when the connect record judges its peer. A read
+or in flight, which is also when the connect record judges its peer. A connect that names
+no address family (`connect(AF_UNSPEC)`, which dissolves a datagram socket's
+peer) judges no peer and records no create. A read
 through any descriptor number, including one `dup2`ed onto fd 0 (as bash does
 for `read <&4`), therefore pairs.
 
