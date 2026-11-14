@@ -95,15 +95,83 @@ const hostSource = """
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <wordexp.h>
 
 extern char **environ;
+
+/* Declared here: <spawn.h> has them only on a glibc 2.39 or later. */
+int pidfd_spawn(int *, const char *, const posix_spawn_file_actions_t *,
+                const posix_spawnattr_t *, char *const[], char *const[]);
+int pidfd_spawnp(int *, const char *, const posix_spawn_file_actions_t *,
+                 const posix_spawnattr_t *, char *const[], char *const[]);
+
+/* pidfd_spawn{,p} TARGET and wait on the descriptor it returns. ENV is the
+ * child's environment: the caller's, or (`bare`) one with no LD_PRELOAD and
+ * nothing else the shim sets. NO_FD passes a NULL pidfd and waits for any
+ * child. */
+static int pidfd_spawn_and_wait(int use_path, int bare, int no_fd,
+                                char *target, char **argv) {
+  int pidfd = -1;
+  char *bare_env[] = {"PATH=/run/current-system/sw/bin:/usr/bin:/bin", NULL};
+  char **envp = bare ? bare_env : environ;
+  int rc = use_path ? pidfd_spawnp(no_fd ? NULL : &pidfd, target, NULL, NULL,
+                                   argv, envp)
+                    : pidfd_spawn(no_fd ? NULL : &pidfd, target, NULL, NULL,
+                                  argv, envp);
+  if (rc != 0) return 30;
+  int status = 0;
+  if (no_fd) {
+    if (waitpid(-1, &status, 0) < 0) return 31;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 32;
+  }
+  siginfo_t info;
+  memset(&info, 0, sizeof(info));
+  if (waitid(P_PIDFD, (id_t)pidfd, &info, WEXITED) != 0) return 31;
+  close(pidfd);
+  return info.si_code == CLD_EXITED ? info.si_status : 32;
+}
+
+static int write_file(const char *path, const char *text) {
+  int fd = open(path, O_WRONLY);
+  if (fd < 0) return -1;
+  ssize_t n = write(fd, text, strlen(text));
+  close(fd);
+  return n == (ssize_t)strlen(text) ? 0 : -1;
+}
+
+/* wordexp WORDS with flags FLAGS in private user and mount namespaces whose
+ * /bin/sh is SH, the image wordexp runs for a command substitution. Exit 5
+ * when the namespaces cannot be made. */
+static int wordexp_with_sh(const char *sh, const char *words, int flags) {
+  if (sh != NULL) {
+    char map[64];
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) return 5;
+    if (write_file("/proc/self/setgroups", "deny") != 0) return 5;
+    snprintf(map, sizeof(map), "0 %u 1", (unsigned)uid);
+    if (write_file("/proc/self/uid_map", map) != 0) return 5;
+    snprintf(map, sizeof(map), "0 %u 1", (unsigned)gid);
+    if (write_file("/proc/self/gid_map", map) != 0) return 5;
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) return 5;
+    if (mount(sh, "/bin/sh", NULL, MS_BIND, NULL) != 0) return 5;
+  }
+  wordexp_t we;
+  int rc = wordexp(words, &we, flags);
+  if (rc != 0) return 30;
+  wordfree(&we);
+  return 0;
+}
 
 #ifdef __x86_64__
 /* An inline `syscall` instruction, which the shim patches to trap. */
@@ -220,6 +288,27 @@ int main(int argc, char **argv) {
     return spawn_and_wait(0, target, targv);
   } else if (strcmp(mode, "posix_spawnp") == 0) {
     return spawn_and_wait(1, target, targv);
+  } else if (strcmp(mode, "pidfd_spawn") == 0) {
+    return pidfd_spawn_and_wait(0, 0, 0, target, targv);
+  } else if (strcmp(mode, "pidfd_spawnp") == 0) {
+    return pidfd_spawn_and_wait(1, 0, 0, target, targv);
+  } else if (strcmp(mode, "pidfd_spawn-bare-env") == 0) {
+    return pidfd_spawn_and_wait(0, 1, 0, target, targv);
+  } else if (strcmp(mode, "pidfd_spawn-null-fd") == 0) {
+    return pidfd_spawn_and_wait(0, 0, 1, target, targv);
+  } else if (strcmp(mode, "unrecorded-pidfd_spawn") == 0) {
+    if (!disable_shim_recording()) return 5;
+    return pidfd_spawn_and_wait(0, 0, 0, target, targv);
+  } else if (strncmp(mode, "wordexp-sh=", 11) == 0) {
+    /* TARGET is the words to expand; the rest of the mode names /bin/sh. */
+    return wordexp_with_sh(mode + 11, target, 0);
+  } else if (strncmp(mode, "wordexp-nocmd-sh=", 17) == 0) {
+    return wordexp_with_sh(mode + 17, target, WRDE_NOCMD);
+  } else if (strcmp(mode, "wordexp") == 0) {
+    return wordexp_with_sh(NULL, target, 0);
+  } else if (strncmp(mode, "unrecorded-wordexp-sh=", 22) == 0) {
+    if (!disable_shim_recording()) return 5;
+    return wordexp_with_sh(mode + 22, target, 0);
   } else if (strncmp(mode, "posix_spawn-chdir=", 18) == 0) {
     return spawn_in_dir_and_wait(mode + 18, target, targv);
   } else if (strncmp(mode, "posix_spawn-chdir-held=", 23) == 0) {
@@ -545,6 +634,121 @@ suite "io-mon Linux: entry into an image the shim cannot enter":
       setFilePermissions(dir / "xonly-static", {fpUserExec})
       checkUninjectable(capture(@[host, "execvp", "xonly-static", helper,
         input], extraPath = dir), dir / "xonly-static")
+
+  # --- pidfd_spawn / pidfd_spawnp ------------------------------------------
+  # glibc starts these through the internal __spawni, which no exported
+  # posix_spawn hook reaches, so the shim interposes them itself.
+
+  for mode in ["pidfd_spawn", "pidfd_spawn-null-fd"]:
+    test "descendant via " & mode & ": an i686 dynamic shell":
+      if requireI686():
+        checkUninjectable(capture(@[host, mode, i686Sh, "-c",
+          helper & " " & input]), i686Sh)
+
+  template checkUninjectableUnnamed(depExpr: MonitorDepFile) =
+    ## The entry could not be recorded by name (the calling thread is inside
+    ## a hook), and is reported through the unnamed frame.
+    let dep = depExpr
+    check helperRanMonitored(dep)
+    check dep.completeness == mcIncomplete
+    check lossDetails(dep).anyIt("uninjectable image" in it and
+      "could not record it by name" in it)
+
+  test "descendant via unrecorded-pidfd_spawn from a thread that cannot record":
+    if requireI686():
+      checkUninjectableUnnamed(capture(@[host, "unrecorded-pidfd_spawn",
+        i686Sh, "-c", helper & " " & input]))
+
+  test "descendant via pidfd_spawnp PATH search: an i686 dynamic shell":
+    if requireI686():
+      let dir = work / "path-pidfd_spawnp"
+      createDir(dir)
+      createSymlink(i686Sh, dir / "sh32-pidfd_spawnp")
+      checkUninjectable(capture(@[host, "pidfd_spawnp", "sh32-pidfd_spawnp",
+        "-c", helper & " " & input], extraPath = dir),
+        dir / "sh32-pidfd_spawnp")
+
+  test "pidfd_spawn: a child started with an environment lacking LD_PRELOAD":
+    # The shim adds the capture route to the child's environment, as it does
+    # for posix_spawn, so the helper's read is recorded although the caller
+    # passed an environment that names no shim.
+    checkComplete(capture(@[host, "pidfd_spawn-bare-env", helper, input]))
+
+  test "pidfd_spawn: the spawn is recorded with the child's pid":
+    let dep = capture(@[host, "pidfd_spawn", helper, input])
+    let spawns = dep.records.filterIt(it.kind == mrProcessSpawn and
+      "pidfd_spawn" in it.detail)
+    check spawns.len == 1
+    if spawns.len == 1:
+      check spawns[0].childOsPid > 0
+      check dep.records.anyIt(it.kind == mrProcessStart and
+        it.osPid == spawns[0].childOsPid)
+
+  for mode in ["pidfd_spawn", "pidfd_spawnp", "pidfd_spawn-null-fd",
+               "unrecorded-pidfd_spawn"]:
+    test "control: " & mode & " of an ordinary 64-bit dynamic image":
+      checkComplete(capture(@[host, mode, helper, input], extraPath =
+        helper.parentDir))
+
+  # --- wordexp --------------------------------------------------------------
+  # glibc runs a command substitution as `/bin/sh -c`; the test binds the i686
+  # shell over /bin/sh in private user and mount namespaces.
+
+  for mode in ["wordexp-sh=", "unrecorded-wordexp-sh="]:
+    test mode & ": a command substitution run by an i686 /bin/sh":
+      if requireI686():
+        let captured = runCapture(@[host, mode & i686Sh,
+          "$(" & helper & " " & input & ")"], "")
+        if captured.code == 5:
+          checkpoint("skipped: user and mount namespaces are unavailable")
+          skip()
+        else:
+          check captured.code == 0
+          require captured.ok
+          if mode.startsWith("unrecorded"):
+            checkUninjectableUnnamed(captured.dep)
+          else:
+            checkUninjectable(captured.dep, "/bin/sh")
+
+  test "wordexp: a backquote command substitution under an i686 /bin/sh":
+    if requireI686():
+      let captured = runCapture(@[host, "wordexp-sh=" & i686Sh,
+        "`" & helper & " " & input & "`"], "")
+      if captured.code == 5:
+        checkpoint("skipped: user and mount namespaces are unavailable")
+        skip()
+      else:
+        check captured.code == 0
+        require captured.ok
+        checkUninjectable(captured.dep, "/bin/sh")
+
+  test "control: wordexp with no command substitution under an i686 /bin/sh":
+    if requireI686():
+      let captured = runCapture(@[host, "wordexp-sh=" & i686Sh, "~ $HOME x*"],
+        "")
+      if captured.code == 5:
+        checkpoint("skipped: user and mount namespaces are unavailable")
+        skip()
+      else:
+        check captured.code == 0
+        require captured.ok
+        check lossDetails(captured.dep).len == 0
+
+  test "control: WRDE_NOCMD under an i686 /bin/sh starts no shell":
+    if requireI686():
+      let captured = runCapture(@[host, "wordexp-nocmd-sh=" & i686Sh,
+        "plain"], "")
+      if captured.code == 5:
+        checkpoint("skipped: user and mount namespaces are unavailable")
+        skip()
+      else:
+        check captured.code == 0
+        require captured.ok
+        check lossDetails(captured.dep).len == 0
+
+  test "control: a command substitution run by the ordinary /bin/sh":
+    checkComplete(capture(@[host, "wordexp",
+      "$(" & helper & " " & input & ")"]))
 
   # --- negative controls: no false loss ----------------------------------
 

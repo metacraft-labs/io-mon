@@ -29,7 +29,8 @@ type
   LinuxHookSymbol = enum
     lhsOpen, lhsOpen64, lhsOpenat, lhsOpenat64, lhsClose, lhsRead, lhsWrite,
     lhsStat, lhsLstat, lhsOpendir, lhsReaddir, lhsClosedir, lhsFork,
-    lhsExecve, lhsPosixSpawn, lhsPosixSpawnp, lhsFopen, lhsFopen64, lhsConnect,
+    lhsExecve, lhsPosixSpawn, lhsPosixSpawnp, lhsPidfdSpawn, lhsPidfdSpawnp,
+    lhsWordexp, lhsFopen, lhsFopen64, lhsConnect,
     lhsDlopen, lhsDlmopen, lhsPread, lhsReadv, lhsPreadv, lhsSendfile,
     lhsCopyFileRange, lhsSplice, lhsLink, lhsLinkat, lhsRename, lhsRenameat,
     lhsRenameat2, lhsGetenv, lhsUname, lhsSysconf, lhsClockGettime,
@@ -362,6 +363,16 @@ type
     symbol: LinuxHookSymbol
     nextIndex: int
 
+  WordexpContext* = object
+    ## `wordexp(words, pwordexp, flags)`. glibc runs each command
+    ## substitution in `words` as `/bin/sh -c`, through an internal spawn no
+    ## exported spawn hook reaches.
+    words*: cstring
+    pwordexp*: pointer
+    flags*: cint
+    result*: cint
+    nextIndex: int
+
   ExitContext* = object
     status*: cint
     nextIndex: int
@@ -464,6 +475,9 @@ type
   ForkHook* = proc(ctx: var ForkContext) {.raises: [].}
   ExecveHook* = proc(ctx: var ExecveContext) {.raises: [].}
   PosixSpawnHook* = proc(ctx: var PosixSpawnContext) {.raises: [].}
+    ## Also the shape of a `pidfd_spawn{,p}` hook, whose context `pid` points
+    ## at the caller's pidfd result rather than a pid.
+  WordexpHook* = proc(ctx: var WordexpContext) {.raises: [].}
   ExitHook* = proc(ctx: var ExitContext) {.raises: [].}
   RawSyscallHook* = proc(number, a1, a2, a3, a4, a5, a6, result: clong;
                          inlineTrap: cint) {.raises: [].}
@@ -600,6 +614,9 @@ type
   PosixSpawnHookEntry = object
     priority: int
     callback: PosixSpawnHook
+  WordexpHookEntry = object
+    priority: int
+    callback: WordexpHook
   ExitHookEntry = object
     priority: int
     callback: ExitHook
@@ -710,6 +727,9 @@ typedef pid_t (*ct_fork_hook_fn)(void);
 typedef int (*ct_execve_hook_fn)(char *, char **, char **);
 typedef int (*ct_posix_spawn_hook_fn)(pid_t *, char *, void *, void *,
                                       char **, char **);
+/* pidfd_spawn/pidfd_spawnp (glibc 2.39+) take posix_spawn's arguments, but
+ * return a pidfd through the first one; `int *` is `pid_t *` in the type. */
+typedef int (*ct_wordexp_hook_fn)(char *, void *, int);
 typedef void (*ct_exit_hook_fn)(int);
 
 typedef int (*ct_open_real_fn)(const char *, int, ...);
@@ -768,6 +788,7 @@ typedef int (*ct_execvpe_real_fn)(const char *, char *const [], char *const []);
 typedef int (*ct_fexecve_real_fn)(int, char *const [], char *const []);
 typedef int (*ct_execveat_real_fn)(int, const char *, char *const [],
                                    char *const [], int);
+typedef int (*ct_wordexp_real_fn)(const char *, void *, int);
 typedef int (*ct_posix_spawn_real_fn)(pid_t *, const char *,
                                       const posix_spawn_file_actions_t *,
                                       const posix_spawnattr_t *,
@@ -828,6 +849,9 @@ static ct_fork_hook_fn ct_fork_hook = NULL;
 static ct_execve_hook_fn ct_execve_hook = NULL;
 static ct_posix_spawn_hook_fn ct_posix_spawn_hook = NULL;
 static ct_posix_spawn_hook_fn ct_posix_spawnp_hook = NULL;
+static ct_posix_spawn_hook_fn ct_pidfd_spawn_hook = NULL;
+static ct_posix_spawn_hook_fn ct_pidfd_spawnp_hook = NULL;
+static ct_wordexp_hook_fn ct_wordexp_hook = NULL;
 static ct_exit_hook_fn ct_exit_hook = NULL;
 typedef void (*ct_raw_syscall_hook_fn)(long, long, long, long, long, long, long,
                                        long, int);
@@ -984,6 +1008,9 @@ static ct_fexecve_real_fn real_fexecve_ptr = NULL;
 static ct_execveat_real_fn real_execveat_ptr = NULL;
 static ct_posix_spawn_real_fn real_posix_spawn_ptr = NULL;
 static ct_posix_spawn_real_fn real_posix_spawnp_ptr = NULL;
+static ct_posix_spawn_real_fn real_pidfd_spawn_ptr = NULL;
+static ct_posix_spawn_real_fn real_pidfd_spawnp_ptr = NULL;
+static ct_wordexp_real_fn real_wordexp_ptr = NULL;
 
 /* Entry points that are only OBSERVED (no hook chain): the real call runs,
  * then one observer callback records what it means. See "OBSERVE-ONLY
@@ -3853,6 +3880,9 @@ void ct_linux_preload_register_fork_hook(ct_fork_hook_fn hook) { ct_fork_hook = 
 void ct_linux_preload_register_execve_hook(ct_execve_hook_fn hook) { ct_execve_hook = hook; }
 void ct_linux_preload_register_posix_spawn_hook(ct_posix_spawn_hook_fn hook) { ct_posix_spawn_hook = hook; }
 void ct_linux_preload_register_posix_spawnp_hook(ct_posix_spawn_hook_fn hook) { ct_posix_spawnp_hook = hook; }
+void ct_linux_preload_register_pidfd_spawn_hook(ct_posix_spawn_hook_fn hook) { ct_pidfd_spawn_hook = hook; }
+void ct_linux_preload_register_pidfd_spawnp_hook(ct_posix_spawn_hook_fn hook) { ct_pidfd_spawnp_hook = hook; }
+void ct_linux_preload_register_wordexp_hook(ct_wordexp_hook_fn hook) { ct_wordexp_hook = hook; }
 void ct_linux_preload_register_exit_hook(ct_exit_hook_fn hook) { ct_exit_hook = hook; }
 void ct_linux_preload_register_raw_syscall_hook(ct_raw_syscall_hook_fn hook) {
   __atomic_store_n(&ct_raw_user_hook, hook, __ATOMIC_RELEASE);
@@ -5604,6 +5634,75 @@ int ct_linux_preload_real_posix_spawnp(pid_t *pid, char *file,
   return real_posix_spawnp_ptr(pid, file, file_actions, attrp, argv, envp);
 }
 
+/* The pid a pidfd names, read from the "Pid:" line of /proc/self/fdinfo/<fd>
+ * (proc(5)) with raw system calls, as the posix_spawn hooks need the child's
+ * pid and pidfd_spawn returns only a descriptor. 0 when it cannot be read.
+ * Allocation-free; errno is preserved. */
+long ct_linux_pidfd_child_pid(int pidfd)
+    __attribute__((visibility("hidden")));
+long ct_linux_pidfd_child_pid(int pidfd) {
+  static const char prefix[] = "/proc/self/fdinfo/";
+  char path[sizeof(prefix) + 12];
+  char buf[512];
+  int saved_errno = errno;
+  long pid = 0;
+  size_t n = sizeof(prefix) - 1;
+  if (pidfd < 0) return 0;
+  memcpy(path, prefix, n);
+  {
+    char digits[12];
+    int count = 0;
+    unsigned int v = (unsigned int)pidfd;
+    do { digits[count++] = (char)('0' + v % 10); v /= 10; } while (v != 0);
+    while (count > 0) path[n++] = digits[--count];
+    path[n] = '\0';
+  }
+  long fd = ct_raw_syscall6(SYS_openat, AT_FDCWD, (long)path,
+                            O_RDONLY | O_CLOEXEC, 0, 0, 0);
+  if (fd < 0) { errno = saved_errno; return 0; }
+  long got = ct_raw_syscall6(SYS_read, fd, (long)buf, sizeof(buf) - 1, 0, 0, 0);
+  ct_raw_syscall6(SYS_close, fd, 0, 0, 0, 0, 0);
+  if (got > 0) {
+    buf[got] = '\0';
+    for (long i = 0; i + 4 < got; i++) {
+      if ((i == 0 || buf[i - 1] == '\n') && memcmp(buf + i, "Pid:", 4) == 0) {
+        long j = i + 4;
+        while (buf[j] == ' ' || buf[j] == '\t') j++;
+        int negative = buf[j] == '-';
+        if (negative) j++;
+        while (buf[j] >= '0' && buf[j] <= '9') pid = pid * 10 + (buf[j++] - '0');
+        if (negative) pid = 0;
+        break;
+      }
+    }
+  }
+  errno = saved_errno;
+  return pid;
+}
+
+/* pidfd_spawn/pidfd_spawnp exist only in glibc 2.39+; on a libc without them
+ * the slot stays NULL, CT_REAL fails the call with ENOSYS (the shim exports
+ * the names, so a caller that probes for them must see the same answer the
+ * kernel-less libc would give) and no hook ever runs. */
+int ct_linux_preload_real_pidfd_spawn(int *pidfd, char *path,
+                                      void *file_actions, void *attrp,
+                                      char **argv, char **envp) {
+  CT_REAL("pidfd_spawn", real_pidfd_spawn_ptr, ct_posix_spawn_real_fn);
+  return real_pidfd_spawn_ptr(pidfd, path, file_actions, attrp, argv, envp);
+}
+
+int ct_linux_preload_real_pidfd_spawnp(int *pidfd, char *file,
+                                       void *file_actions, void *attrp,
+                                       char **argv, char **envp) {
+  CT_REAL("pidfd_spawnp", real_pidfd_spawnp_ptr, ct_posix_spawn_real_fn);
+  return real_pidfd_spawnp_ptr(pidfd, file, file_actions, attrp, argv, envp);
+}
+
+int ct_linux_preload_real_wordexp(char *words, void *pwordexp, int flags) {
+  CT_REAL("wordexp", real_wordexp_ptr, ct_wordexp_real_fn);
+  return real_wordexp_ptr(words, pwordexp, flags);
+}
+
 /* Resolve EVERY real_*_ptr slot now, from the shim's constructor, instead of
  * on the first hooked call.
  *
@@ -5693,6 +5792,9 @@ void ct_linux_preload_prime_real_functions(void) {
   CT_PRIME(real_execveat_ptr, ct_execveat_real_fn, "execveat");
   CT_PRIME(real_posix_spawn_ptr, ct_posix_spawn_real_fn, "posix_spawn");
   CT_PRIME(real_posix_spawnp_ptr, ct_posix_spawn_real_fn, "posix_spawnp");
+  CT_PRIME(real_pidfd_spawn_ptr, ct_posix_spawn_real_fn, "pidfd_spawn");
+  CT_PRIME(real_pidfd_spawnp_ptr, ct_posix_spawn_real_fn, "pidfd_spawnp");
+  CT_PRIME(real_wordexp_ptr, ct_wordexp_real_fn, "wordexp");
   CT_PRIME(real_access_ptr, ct_access_real_fn, "access");
   CT_PRIME(real_faccessat_ptr, ct_faccessat_real_fn, "faccessat");
   CT_PRIME(real_readlink_ptr, ct_readlink_real_fn, "readlink");
@@ -7902,6 +8004,45 @@ int posix_spawnp(pid_t *pid, const char *file, const posix_spawn_file_actions_t 
                                            (void *)attrp, (char **)argv, (char **)envp));
 }
 
+/* glibc's pidfd_spawn/pidfd_spawnp (2.39+) start a process through the
+ * internal __spawni, which no exported posix_spawn hook reaches. They are
+ * interposed so the spawn is classified, given the capture route and
+ * recorded as posix_spawn is. Declared here, not taken from <spawn.h>, which
+ * has them only on a glibc that provides them. */
+int pidfd_spawn(int *pidfd, const char *path, const posix_spawn_file_actions_t *file_actions,
+                const posix_spawnattr_t *attrp, char *const argv[], char *const envp[])
+    __attribute__((visibility("default")));
+int pidfd_spawn(int *pidfd, const char *path, const posix_spawn_file_actions_t *file_actions,
+                const posix_spawnattr_t *attrp, char *const argv[], char *const envp[]) {
+  if (CT_BYPASS() || ct_pidfd_spawn_hook == NULL)
+    return ct_linux_preload_real_pidfd_spawn(pidfd, (char *)path, (void *)file_actions,
+                                             (void *)attrp, (char **)argv, (char **)envp);
+  return CT_CALL_HOOK(ct_pidfd_spawn_hook((pid_t *)pidfd, (char *)path, (void *)file_actions,
+                                          (void *)attrp, (char **)argv, (char **)envp));
+}
+
+int pidfd_spawnp(int *pidfd, const char *file, const posix_spawn_file_actions_t *file_actions,
+                 const posix_spawnattr_t *attrp, char *const argv[], char *const envp[])
+    __attribute__((visibility("default")));
+int pidfd_spawnp(int *pidfd, const char *file, const posix_spawn_file_actions_t *file_actions,
+                 const posix_spawnattr_t *attrp, char *const argv[], char *const envp[]) {
+  if (CT_BYPASS() || ct_pidfd_spawnp_hook == NULL)
+    return ct_linux_preload_real_pidfd_spawnp(pidfd, (char *)file, (void *)file_actions,
+                                              (void *)attrp, (char **)argv, (char **)envp);
+  return CT_CALL_HOOK(ct_pidfd_spawnp_hook((pid_t *)pidfd, (char *)file, (void *)file_actions,
+                                           (void *)attrp, (char **)argv, (char **)envp));
+}
+
+/* glibc's wordexp runs each command substitution as `/bin/sh -c` through an
+ * internal posix_spawn call, which no exported spawn hook reaches. */
+int wordexp(const char *words, void *pwordexp, int flags)
+    __attribute__((visibility("default")));
+int wordexp(const char *words, void *pwordexp, int flags) {
+  if (CT_BYPASS() || ct_wordexp_hook == NULL)
+    return ct_linux_preload_real_wordexp((char *)words, pwordexp, flags);
+  return CT_CALL_HOOK(ct_wordexp_hook((char *)words, pwordexp, flags));
+}
+
 void _exit(int status) __attribute__((visibility("default"), noreturn));
 void _exit(int status) {
   if (!CT_BYPASS() && ct_exit_hook != NULL) {
@@ -8143,6 +8284,14 @@ proc realPosixSpawn*(pid: ptr PidT; path: cstring; fileActions, attrp: pointer;
 proc realPosixSpawnp*(pid: ptr PidT; path: cstring; fileActions, attrp: pointer;
                       argv, envp: cstringArray): cint
   {.importc: "ct_linux_preload_real_posix_spawnp", raises: [].}
+proc realPidfdSpawn*(pidfd: ptr PidT; path: cstring; fileActions, attrp: pointer;
+                     argv, envp: cstringArray): cint
+  {.importc: "ct_linux_preload_real_pidfd_spawn", raises: [].}
+proc realPidfdSpawnp*(pidfd: ptr PidT; path: cstring; fileActions, attrp: pointer;
+                      argv, envp: cstringArray): cint
+  {.importc: "ct_linux_preload_real_pidfd_spawnp", raises: [].}
+proc realWordexp*(words: cstring; pwordexp: pointer; flags: cint): cint
+  {.importc: "ct_linux_preload_real_wordexp", raises: [].}
 proc realExit*(status: cint) {.importc: "ct_linux_preload_real_exit",
   raises: [], noreturn.}
 
@@ -8230,6 +8379,8 @@ type
     {.cdecl, raises: [].}
   PosixSpawnDispatch = proc(pid: ptr PidT; path: cstring; fileActions,
                            attrp: pointer; argv, envp: cstringArray): cint
+    {.cdecl, raises: [].}
+  WordexpDispatch = proc(words: cstring; pwordexp: pointer; flags: cint): cint
     {.cdecl, raises: [].}
   ExitDispatch = proc(status: cint) {.cdecl, raises: [].}
   RawSyscallDispatch = proc(number, a1, a2, a3, a4, a5, a6, result: clong;
@@ -8336,6 +8487,8 @@ proc cSpawnEntryUnrecordedPre(file: cstring; usePath: cint): cint
 proc cSpawnEntryUnrecordedPost(file: cstring; usePath, preFlagged, succeeded,
                                hasFileActions: cint; childPid: clong)
   {.importc: "ct_linux_spawn_entry_unrecorded_post", nodecl, raises: [].}
+proc cPidfdChildPid(pidfd: cint): clong
+  {.importc: "ct_linux_pidfd_child_pid", nodecl, raises: [].}
 proc cReportForkChildSkippedEvidence()
   {.importc: "ct_linux_report_fork_child_skipped_evidence", nodecl,
     raises: [].}
@@ -8446,6 +8599,12 @@ proc installPosixSpawnDispatcher(dispatch: PosixSpawnDispatch)
   {.importc: "ct_linux_preload_register_posix_spawn_hook", raises: [].}
 proc installPosixSpawnpDispatcher(dispatch: PosixSpawnDispatch)
   {.importc: "ct_linux_preload_register_posix_spawnp_hook", raises: [].}
+proc installPidfdSpawnDispatcher(dispatch: PosixSpawnDispatch)
+  {.importc: "ct_linux_preload_register_pidfd_spawn_hook", raises: [].}
+proc installPidfdSpawnpDispatcher(dispatch: PosixSpawnDispatch)
+  {.importc: "ct_linux_preload_register_pidfd_spawnp_hook", raises: [].}
+proc installWordexpDispatcher(dispatch: WordexpDispatch)
+  {.importc: "ct_linux_preload_register_wordexp_hook", raises: [].}
 proc installExitDispatcher(dispatch: ExitDispatch)
   {.importc: "ct_linux_preload_register_exit_hook", raises: [].}
 proc installRawSyscallDispatcher(dispatch: RawSyscallDispatch)
@@ -8507,6 +8666,9 @@ var
   execveHooks: seq[ExecveHookEntry] = @[]
   posixSpawnHooks: seq[PosixSpawnHookEntry] = @[]
   posixSpawnpHooks: seq[PosixSpawnHookEntry] = @[]
+  pidfdSpawnHooks: seq[PosixSpawnHookEntry] = @[]
+  pidfdSpawnpHooks: seq[PosixSpawnHookEntry] = @[]
+  wordexpHooks: seq[WordexpHookEntry] = @[]
   exitHooks: seq[ExitHookEntry] = @[]
   rawSyscallHook: RawSyscallHook = nil
   rawSyscallPatchAttempted = false
@@ -8893,6 +9055,27 @@ proc registerPosixSpawnpHook*(hook: PosixSpawnHook; priority = 100) {.raises: []
   posixSpawnpHooks.sort(proc(a, b: PosixSpawnHookEntry): int =
     cmp(a.priority, b.priority))
 
+proc registerPidfdSpawnHook*(hook: PosixSpawnHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  pidfdSpawnHooks.add(PosixSpawnHookEntry(priority: priority, callback: hook))
+  pidfdSpawnHooks.sort(proc(a, b: PosixSpawnHookEntry): int =
+    cmp(a.priority, b.priority))
+
+proc registerPidfdSpawnpHook*(hook: PosixSpawnHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  pidfdSpawnpHooks.add(PosixSpawnHookEntry(priority: priority, callback: hook))
+  pidfdSpawnpHooks.sort(proc(a, b: PosixSpawnHookEntry): int =
+    cmp(a.priority, b.priority))
+
+proc registerWordexpHook*(hook: WordexpHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  wordexpHooks.add(WordexpHookEntry(priority: priority, callback: hook))
+  wordexpHooks.sort(proc(a, b: WordexpHookEntry): int =
+    cmp(a.priority, b.priority))
+
 proc registerExitHook*(hook: ExitHook; priority = 100) {.raises: [].} =
   if hook == nil:
     return
@@ -9103,6 +9286,11 @@ proc reportSpawnEntryUnrecorded*(file: cstring; usePath, preFlagged,
   ## and started an image the shim cannot enter. Allocation-free.
   cSpawnEntryUnrecordedPost(file, cint(usePath), cint(preFlagged),
     cint(succeeded), cint(hasFileActions), clong(childPid))
+
+proc pidfdChildPid*(pidfd: cint): int {.raises: [].} =
+  ## The pid the pidfd `pidfd_spawn{,p}` returned names, or 0 when it cannot
+  ## be read. Raw system calls only; errno is preserved.
+  int(cPidfdChildPid(pidfd))
 
 proc reportForkChildSkippedEvidence*() {.raises: [].} =
   ## Report, once per process, that this fork child skipped a hook that
@@ -10010,8 +10198,17 @@ proc callReal*(ctx: var ForkContext) {.raises: [].} =
 proc callReal*(ctx: var ExecveContext) {.raises: [].} =
   ctx.result = realExecve(ctx.path, ctx.argv, ctx.envp)
 
+proc callReal*(ctx: var WordexpContext) {.raises: [].} =
+  ctx.result = realWordexp(ctx.words, ctx.pwordexp, ctx.flags)
+
 proc callReal*(ctx: var PosixSpawnContext) {.raises: [].} =
   case ctx.symbol
+  of lhsPidfdSpawn:
+    ctx.result = realPidfdSpawn(ctx.pid, ctx.path, ctx.fileActions,
+                                ctx.attrp, ctx.argv, ctx.envp)
+  of lhsPidfdSpawnp:
+    ctx.result = realPidfdSpawnp(ctx.pid, ctx.path, ctx.fileActions,
+                                 ctx.attrp, ctx.argv, ctx.envp)
   of lhsPosixSpawnp:
     ctx.result = realPosixSpawnp(ctx.pid, ctx.path, ctx.fileActions,
                                  ctx.attrp, ctx.argv, ctx.envp)
@@ -10411,8 +10608,30 @@ proc callNext*(ctx: var ExecveContext) {.raises: [].} =
   else:
     callReal(ctx)
 
+proc callNext*(ctx: var WordexpContext) {.raises: [].} =
+  if ctx.nextIndex < wordexpHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    wordexpHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
 proc callNext*(ctx: var PosixSpawnContext) {.raises: [].} =
   case ctx.symbol
+  of lhsPidfdSpawn:
+    if ctx.nextIndex < pidfdSpawnHooks.len:
+      let index = ctx.nextIndex
+      inc ctx.nextIndex
+      pidfdSpawnHooks[index].callback(ctx)
+    else:
+      callReal(ctx)
+  of lhsPidfdSpawnp:
+    if ctx.nextIndex < pidfdSpawnpHooks.len:
+      let index = ctx.nextIndex
+      inc ctx.nextIndex
+      pidfdSpawnpHooks[index].callback(ctx)
+    else:
+      callReal(ctx)
   of lhsPosixSpawnp:
     if ctx.nextIndex < posixSpawnpHooks.len:
       let index = ctx.nextIndex
@@ -10767,6 +10986,29 @@ proc dispatchPosixSpawnp(pid: ptr PidT; path: cstring; fileActions, attrp: point
   callNext(ctx)
   result = ctx.result
 
+proc dispatchPidfdSpawn(pid: ptr PidT; path: cstring; fileActions, attrp: pointer;
+                        argv, envp: cstringArray): cint {.cdecl, raises: [].} =
+  var ctx = PosixSpawnContext(pid: pid, path: path, fileActions: fileActions,
+                              attrp: attrp, argv: argv, envp: envp, result: -1,
+                              symbol: lhsPidfdSpawn)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchPidfdSpawnp(pid: ptr PidT; path: cstring; fileActions, attrp: pointer;
+                         argv, envp: cstringArray): cint {.cdecl, raises: [].} =
+  var ctx = PosixSpawnContext(pid: pid, path: path, fileActions: fileActions,
+                              attrp: attrp, argv: argv, envp: envp, result: -1,
+                              symbol: lhsPidfdSpawnp)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchWordexp(words: cstring; pwordexp: pointer; flags: cint): cint
+    {.cdecl, raises: [].} =
+  var ctx = WordexpContext(words: words, pwordexp: pwordexp, flags: flags,
+                           result: -1)
+  callNext(ctx)
+  result = ctx.result
+
 proc dispatchExit(status: cint) {.cdecl, raises: [].} =
   var ctx = ExitContext(status: status)
   callNext(ctx)
@@ -10824,6 +11066,9 @@ installForkDispatcher(dispatchFork)
 installExecveDispatcher(dispatchExecve)
 installPosixSpawnDispatcher(dispatchPosixSpawn)
 installPosixSpawnpDispatcher(dispatchPosixSpawnp)
+installPidfdSpawnDispatcher(dispatchPidfdSpawn)
+installPidfdSpawnpDispatcher(dispatchPidfdSpawnp)
+installWordexpDispatcher(dispatchWordexp)
 installExitDispatcher(dispatchExit)
 installRawSyscallDispatcher(rawSyscallDispatcher)
 

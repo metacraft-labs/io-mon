@@ -5407,10 +5407,21 @@ proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
   emitRecord(failRecord)
   c_set_errno(execFailedErrno)
 
-proc recordPosixSpawn(ctx: var PosixSpawnContext; usePath: bool)
-    {.raises: [].} =
+proc spawnEntryName(usePath, pidfd: bool): string =
+  ## The name a spawn record and a loss detail give the entry point.
+  if pidfd:
+    (if usePath: "pidfd_spawnp" else: "pidfd_spawn")
+  else:
+    (if usePath: "posix_spawnp" else: "posix_spawn")
+
+proc recordPosixSpawn(ctx: var PosixSpawnContext; usePath: bool;
+                      pidfd = false) {.raises: [].} =
   ## The body of the posix_spawn and posix_spawnp hooks (`usePath`: the
-  ## latter, which searches the caller's PATH).
+  ## latter, which searches the caller's PATH) and of pidfd_spawn and
+  ## pidfd_spawnp (`pidfd`), which take the same arguments but return a pidfd
+  ## through `ctx.pid` instead of a pid. The child's pid is then read from
+  ## the descriptor, and a descriptor lent to a caller that asked for none is
+  ## closed again.
   ensureInitializedPreservingErrno()
   let routeStatus = childCaptureRouteStatus(ctx.envp)
   if routeStatus != 0:
@@ -5432,7 +5443,13 @@ proc recordPosixSpawn(ctx: var PosixSpawnContext; usePath: bool)
     ctx.pid = addr lentPid
   callNext(ctx)
   let savedErrno = c_get_errno()
-  let childPid = int(ctx.pid[])
+  let pidfdResult = if pidfd and ctx.result == 0: ctx.pid[] else: -1
+  let childPid = if pidfd:
+    (if pidfdResult >= 0: pidfdChildPid(pidfdResult) else: 0)
+  else:
+    int(ctx.pid[])
+  if pidfd and callerPid == nil and pidfdResult >= 0:
+    discard realClose(pidfdResult)
   ctx.pid = callerPid
   freeOwnedEnv(preparedEnv, originalEnv)
   ctx.envp = originalEnv
@@ -5447,24 +5464,27 @@ proc recordPosixSpawn(ctx: var PosixSpawnContext; usePath: bool)
     uninjectable = spawnImageUninjectable(ctx.path, usePath, childPid)
   if ctx.result == 0 and childPid > 0:
     markChildInTreeLedger(childPid)
-  if ctx.result == 0 and ctx.pid != nil:
+  if ctx.result == 0 and pidfd and childPid <= 0:
+    # Without the pid there is no ledger entry or spawn record for the child.
+    emitEventLoss("pidfd spawn child pid unreadable: " &
+      spawnEntryName(usePath, pidfd))
+  if ctx.result == 0 and (ctx.pid != nil or pidfd) and childPid > 0:
     var record = baseRecord(mrProcessSpawn, moExecute)
-    record.childOsPid = uint64(ctx.pid[])
+    record.childOsPid = uint64(childPid)
     record.result = ctx.result.int64
     if ctx.path != nil:
       record.path = $ctx.path
-    record.detail = if usePath: "posix_spawnp" else: "posix_spawn"
+    record.detail = spawnEntryName(usePath, pidfd)
     emitRecord(record)
   # Not inside the branch above: a caller may pass a NULL pid pointer, and
   # the child it started is just as unobserved.
   if ctx.result == 0 and uninjectable.len > 0:
-    emitEventLoss("uninjectable image: " &
-      (if usePath: "posix_spawnp" else: "posix_spawn") & ": " & uninjectable &
-      (if ctx.pid != nil: " child=" & $ctx.pid[] else: ""))
+    emitEventLoss("uninjectable image: " & spawnEntryName(usePath, pidfd) &
+      ": " & uninjectable & (if childPid > 0: " child=" & $childPid else: ""))
   c_set_errno(savedErrno)
 
-proc spawnWithoutRecording(ctx: var PosixSpawnContext; usePath: bool)
-    {.raises: [].} =
+proc spawnWithoutRecording(ctx: var PosixSpawnContext; usePath: bool;
+                           pidfd = false) {.raises: [].} =
   ## The posix_spawn hooks when this context cannot record (see
   ## `repro_hook_execve`): a spawn into an image the shim cannot enter is
   ## still reported, through the unnamed frame, once the spawn succeeded.
@@ -5476,7 +5496,13 @@ proc spawnWithoutRecording(ctx: var PosixSpawnContext; usePath: bool)
     ctx.pid = addr lentPid
   callNext(ctx)
   let savedErrno = c_get_errno()
-  let childPid = int(ctx.pid[])
+  let pidfdResult = if pidfd and ctx.result == 0: ctx.pid[] else: -1
+  let childPid = if pidfd:
+    (if pidfdResult >= 0: pidfdChildPid(pidfdResult) else: 0)
+  else:
+    int(ctx.pid[])
+  if pidfd and callerPid == nil and pidfdResult >= 0:
+    discard realClose(pidfdResult)
   ctx.pid = callerPid
   reportSpawnEntryUnrecorded(ctx.path, usePath, preFlagged,
     succeeded = ctx.result == 0, hasFileActions = ctx.fileActions != nil,
@@ -5494,6 +5520,62 @@ proc repro_hook_posix_spawnp*(ctx: var PosixSpawnContext) {.raises: [].} =
     spawnWithoutRecording(ctx, usePath = true)
     return
   recordPosixSpawn(ctx, usePath = true)
+
+proc repro_hook_pidfd_spawn*(ctx: var PosixSpawnContext) {.raises: [].} =
+  if shouldBypass():
+    spawnWithoutRecording(ctx, usePath = false, pidfd = true)
+    return
+  recordPosixSpawn(ctx, usePath = false, pidfd = true)
+
+proc repro_hook_pidfd_spawnp*(ctx: var PosixSpawnContext) {.raises: [].} =
+  if shouldBypass():
+    spawnWithoutRecording(ctx, usePath = true, pidfd = true)
+    return
+  recordPosixSpawn(ctx, usePath = true, pidfd = true)
+
+const
+  wordexpNoCmd = 1 shl 2
+    ## WRDE_NOCMD (<wordexp.h>): the expansion refuses a command
+    ## substitution and starts nothing.
+  wordexpShell = cstring("/bin/sh")
+    ## `_PATH_BSHELL`, the image glibc's exec_comm runs for a substitution.
+
+proc wordsHaveCommandSubstitution(words: cstring): bool {.raises: [].} =
+  ## Whether `words` can make wordexp start its shell: a backquote or `$(`
+  ## anywhere in it. Conservative on purpose (a quoted or escaped one is
+  ## counted, as is the `$((` of an arithmetic expansion): the answer only
+  ## decides whether the shell image is classified, and a classified shell
+  ## that the shim can enter records nothing.
+  if words == nil:
+    return false
+  let text = cast[ptr UncheckedArray[char]](words)
+  var i = 0
+  while text[i] != '\0':
+    if text[i] == '`' or (text[i] == '$' and text[i + 1] == '('):
+      return true
+    inc i
+  false
+
+proc repro_hook_wordexp*(ctx: var WordexpContext) {.raises: [].} =
+  ## wordexp(3) runs every command substitution as `/bin/sh -c` through an
+  ## internal spawn that reaches no exported spawn hook, so a shell the shim
+  ## cannot enter would run unobserved. Classify it at the entry, as the
+  ## spec's "Entering An Image The Shim Cannot Enter" requires of every
+  ## entry; a shell the shim can enter records itself.
+  if (ctx.flags and wordexpNoCmd) == 0 and
+      wordsHaveCommandSubstitution(ctx.words):
+    if shouldBypass():
+      let preFlagged = spawnEntryUnrecordedPre(wordexpShell, false)
+      reportSpawnEntryUnrecorded(wordexpShell, false, preFlagged,
+        succeeded = true, hasFileActions = false, childPid = 0)
+    else:
+      ensureInitializedPreservingErrno()
+      let uninjectable = spawnImageUninjectable(wordexpShell, false)
+      if uninjectable.len > 0:
+        let savedErrno = c_get_errno()
+        emitEventLoss("uninjectable image: wordexp: " & uninjectable)
+        c_set_errno(savedErrno)
+  callNext(ctx)
 
 proc repro_hook_exit*(ctx: var ExitContext) {.raises: [].} =
   sampleKillDiag("exit-enter")
@@ -5916,6 +5998,9 @@ registerForkHook(repro_hook_fork)
 registerExecveHook(repro_hook_execve)
 registerPosixSpawnHook(repro_hook_posix_spawn)
 registerPosixSpawnpHook(repro_hook_posix_spawnp)
+registerPidfdSpawnHook(repro_hook_pidfd_spawn)
+registerPidfdSpawnpHook(repro_hook_pidfd_spawnp)
+registerWordexpHook(repro_hook_wordexp)
 registerExitHook(repro_hook_exit)
 registerRawSyscallHook(repro_hook_raw_syscall)
 registerInlineRawSyscallDrain(repro_linux_drain_inline_events)
