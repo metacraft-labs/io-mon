@@ -82,7 +82,7 @@ On Linux, `io-mon` enters each program through the dynamic loader (`LD_PRELOAD`)
 - a statically linked program (including static-pie), which has no loader at all;
 - a program `io-mon` may run but not read (execute-only, mode `--x`): it cannot check which kind it is, so it treats it as one it cannot enter.
 
-A `#!` script whose interpreter is one of these is in the same position. Whenever the build starts such a program (as the command itself, or through `exec`, `posix_spawn`, `pidfd_spawn`, a raw `execve`, or a `wordexp` command substitution, which runs `/bin/sh`), `io-mon` records an event-loss naming it, for example `uninjectable image: exec: statically linked, … image=/path/to/tool`, and the run is `mcIncomplete`. This holds even when that program goes on to run a monitored one in the same process. A consumer such as a build cache should then re-run the step rather than trust its dependency set. To keep such a step cacheable, use a dynamically linked build of the tool for the same architecture as `io-mon`.
+A `#!` script whose interpreter is one of these is in the same position. Whenever the build starts such a program (as the command itself, or through `exec`, `posix_spawn`, `pidfd_spawn`, a raw `execve`, or as the `/bin/sh` that `system`, `popen` and a `wordexp` command substitution start), `io-mon` records an event-loss naming it, for example `uninjectable image: exec: statically linked, … image=/path/to/tool`, and the run is `mcIncomplete`. This holds even when that program goes on to run a monitored one in the same process. A consumer such as a build cache should then re-run the step rather than trust its dependency set. To keep such a step cacheable, use a dynamically linked build of the tool for the same architecture as `io-mon`.
 
 ---
 

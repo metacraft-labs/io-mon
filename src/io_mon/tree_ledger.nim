@@ -69,10 +69,10 @@
 ## and `popen(3)` (glibc spawns with CLONE_VM | CLONE_VFORK, its parent
 ## suspended until the child execs) exec an image that writes its own entry
 ## at shim init. An image the shim cannot enter is reported where the shim
-## sees the spawn (the public posix_spawn hooks); `system(3)` and `popen(3)`
-## spawn internally, so for them that holds only while `/bin/sh` is an image
-## the shim can enter (issue
-## `2026-11-08-linux-system-popen-of-an-uninjectable-shell-is-unseen`).
+## sees the spawn: the public posix_spawn hooks, and for `system(3)` and
+## `popen(3)`, which spawn internally, the shim's `system` and `popen`
+## wrappers, which classify `/bin/sh` (see "SYSTEM(3) AND POPEN(3) START A
+## SHELL NO OTHER HOOK SEES" in `hooks/linux_preload_runtime.nim`).
 
 import std/[algorithm, os, strutils]
 

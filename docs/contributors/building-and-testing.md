@@ -88,7 +88,16 @@ The Linux uninjectable-image oracle also owns its shim: its disabled-thread
 controls require an unnamed loss, which an enclosing monitor changes by
 recording the same entry by name. Its execute edge therefore follows the
 same non-cacheable isolation policy and declares both the ELF editor and,
-on x86_64, the real i686 shell it needs.
+on x86_64, the real i686 shell it needs. Its `system(3)` and `popen(3)`
+cases need `/bin/sh` itself to be that i686 shell, so they bind-mount it over
+`/bin/sh` inside an unprivileged user and mount namespace. On a host that
+refuses unprivileged user namespaces they report an explicit skip. Run them
+with no outer preload either: an enclosing shim that exports its own
+`system` or `popen` (agent-harbor's command-trace shim does, and re-injects
+itself even when `LD_PRELOAD` is unset unless
+`AH_CMDTRACE_DISABLE_AUTO_PROPAGATION=1`) routes the shell through the public
+`posix_spawn`, where the posix_spawn hook already reports it, so those cases
+pass without the fix they guard.
 
 A Linux test that runs a bare (shim-free) control, or loads a shim under test
 into its own children, must be in the isolation list (`isolatesMonitor` in

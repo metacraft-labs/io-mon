@@ -901,7 +901,9 @@ execs a monitored image in the same pid (`i686-bash -c 'gcc …'`, a static
 satisfied. So the spawn site classifies the root image before starting it and
 records an event-loss naming it (`uninjectable image: root spawn: <reason>
 image=<path>`); the shim does the same for every exec, `posix_spawn` and raw
-`execve` it sees. The built-in launchers do this; a custom Linux launcher must
+`execve` it sees, and for the `/bin/sh` that `system(3)` and `popen(3)` start
+(`uninjectable image: system: …` / `popen: …`), which libc spawns through an
+internal call no exported hook reaches. The built-in launchers do this; a custom Linux launcher must
 classify its root with `io_mon/exec_image_injectability.uninjectableImageDetail`
 (resolving the command with `resolveSpawnTarget` when it searches `PATH`) and
 record a non-empty answer as an event-loss for the run.

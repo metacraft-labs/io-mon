@@ -638,6 +638,7 @@ when defined(ioMonInlineWindowTest):
 #include <glob.h>
 #include <limits.h>
 #include <link.h>
+#include <paths.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdarg.h>
@@ -966,6 +967,10 @@ static ct_xstat_real_fn real_lxstat_ptr = NULL;
 static ct_opendir_real_fn real_opendir_ptr = NULL;
 static ct_readdir_real_fn real_readdir_ptr = NULL;
 static ct_closedir_real_fn real_closedir_ptr = NULL;
+typedef int (*ct_system_real_fn)(const char *);
+typedef FILE *(*ct_popen_real_fn)(const char *, const char *);
+static ct_system_real_fn real_system_ptr = NULL;
+static ct_popen_real_fn real_popen_ptr = NULL;
 static ct_fopen_real_fn real_fopen_ptr = NULL;
 static ct_fopen_real_fn real_fopen64_ptr = NULL;
 static ct_fread_real_fn real_fread_ptr = NULL;
@@ -1952,6 +1957,9 @@ void ct_linux_report_fork_child_skipped_evidence(void) {
  *     for execvp): ct_linux_exec_hook_image_uninjectable;
  *   - posix_spawn/posix_spawnp, through their hooks, after a successful
  *     spawn: ct_linux_spawn_image_uninjectable;
+ *   - system(3) and popen(3), whose `/bin/sh` libc starts through its own
+ *     internal spawn, which reaches none of the hooks above:
+ *     ct_report_shell_entry, below;
  *   - a raw execve/execveat (syscall(2), its patched replacement, and an
  *     inline `syscall` instruction the trap handler replays), which reach no
  *     exec hook: ct_linux_check_raw_exec_entry, below.
@@ -2145,6 +2153,48 @@ static void ct_report_uninjectable_exec(const char *entry,
     errno = saved_errno;
   }
   ct_linux_report_uninjectable_exec_frame();
+}
+
+/* SYSTEM(3) AND POPEN(3) START A SHELL NO OTHER HOOK SEES.
+ *
+ * Both run `/bin/sh -c COMMAND`, and libc starts that shell from inside
+ * itself: glibc's do_system and popen call posix_spawn by a direct,
+ * PLT-less call (glibc 2.42: `call posix_spawn@@GLIBC_2.15` in do_system),
+ * and musl's do the same, so the exported posix_spawn hook never runs. When
+ * /bin/sh loads this shim, the shell records itself at shim init and nothing
+ * is missed. When it cannot (a static shell, or one of another ELF class),
+ * the shell and everything it starts ran unobserved and the capture could be
+ * graded complete. So system and popen are interposed (their exported
+ * wrappers, beside posix_spawn's) and classify the shell first, as every
+ * other entry does.
+ *
+ * The shell is the file libc names, `_PATH_BSHELL` from <paths.h> of the
+ * same libc, looked up as the kernel will (a symlink is followed, a `#!`
+ * file's interpreter classified). A missing or non-executable /bin/sh is not
+ * flagged: the spawn fails and nothing ran.
+ *
+ * system() reports at its entry, before the shell starts, the way the execve
+ * hook does: the caller then waits for the whole shell, and a process killed
+ * in that wait would otherwise never report it. A spawn that then fails (no
+ * memory, no pids) leaves a loss for a shell that never ran, which grades the
+ * capture incomplete without cause but never complete with one. popen()
+ * reports once it has returned a stream: it returns as soon as the shell
+ * started, and it can fail without spawning (an invalid mode), which a
+ * report at the entry would turn into a false loss. errno is preserved. */
+static void ct_report_shell_entry(const char *entry) {
+  /* Nothing to report to: a shim family or test program that registered no
+   * recorder and armed no frame. */
+  if (__atomic_load_n(&ct_uninjectable_exec_observer, __ATOMIC_ACQUIRE) ==
+          NULL &&
+      __atomic_load_n(&ct_uninjectable_exec_loss.len, __ATOMIC_ACQUIRE) <= 0)
+    return;
+  int saved_errno = errno;
+  char detail[CT_EXEC_DETAIL_CAP];
+  if (iomon_exec_image_classify(&ct_exec_raw_io, AT_FDCWD, _PATH_BSHELL, 0,
+                                NULL, detail, sizeof(detail)) !=
+      IOMON_EXEC_INJECTABLE)
+    ct_report_uninjectable_exec(entry, detail);
+  errno = saved_errno;
 }
 
 /* A raw execve(path, ...) or execveat(dirfd, path, ..., flags) is about to
@@ -5795,6 +5845,8 @@ void ct_linux_preload_prime_real_functions(void) {
   CT_PRIME(real_pidfd_spawn_ptr, ct_posix_spawn_real_fn, "pidfd_spawn");
   CT_PRIME(real_pidfd_spawnp_ptr, ct_posix_spawn_real_fn, "pidfd_spawnp");
   CT_PRIME(real_wordexp_ptr, ct_wordexp_real_fn, "wordexp");
+  CT_PRIME(real_system_ptr, ct_system_real_fn, "system");
+  CT_PRIME(real_popen_ptr, ct_popen_real_fn, "popen");
   CT_PRIME(real_access_ptr, ct_access_real_fn, "access");
   CT_PRIME(real_faccessat_ptr, ct_faccessat_real_fn, "faccessat");
   CT_PRIME(real_readlink_ptr, ct_readlink_real_fn, "readlink");
@@ -8041,6 +8093,38 @@ int wordexp(const char *words, void *pwordexp, int flags) {
   if (CT_BYPASS() || ct_wordexp_hook == NULL)
     return ct_linux_preload_real_wordexp((char *)words, pwordexp, flags);
   return CT_CALL_HOOK(ct_wordexp_hook((char *)words, pwordexp, flags));
+}
+
+/* system(3) and popen(3): see "SYSTEM(3) AND POPEN(3) START A SHELL NO OTHER
+ * HOOK SEES". Only a standing-down image skips the report, leaving it to the
+ * active one, whose wrapper the real call below reaches (the next
+ * definition). A thread inside a hook still reports, through the unnamed
+ * frame (ct_report_uninjectable_exec): this shim never calls either, so such
+ * a call is a host signal handler's. */
+static int ct_shell_entry_reportable(void) {
+  ct_restore_vfork_exec_guard();
+  return ct_linux_preload_image_active == NULL ||
+         ct_linux_preload_image_active();
+}
+
+int system(const char *command) __attribute__((visibility("default")));
+int system(const char *command) {
+  /* system(NULL) asks whether a shell is available by running one. */
+  if (ct_shell_entry_reportable()) ct_report_shell_entry("system");
+  CT_REAL("system", real_system_ptr, ct_system_real_fn);
+  return real_system_ptr(command);
+}
+
+FILE *popen(const char *command, const char *mode)
+    __attribute__((visibility("default")));
+FILE *popen(const char *command, const char *mode) {
+  if (real_popen_ptr == NULL)
+    real_popen_ptr = (ct_popen_real_fn)ct_resolve("popen");
+  if (real_popen_ptr == NULL) { errno = ENOSYS; return NULL; }
+  int reportable = ct_shell_entry_reportable();
+  FILE *stream = real_popen_ptr(command, mode);
+  if (stream != NULL && reportable) ct_report_shell_entry("popen");
+  return stream;
 }
 
 void _exit(int status) __attribute__((visibility("default"), noreturn));

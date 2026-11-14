@@ -20,7 +20,9 @@
 ## and the raw `execve`
 ## system call through syscall(2) and through an inline `syscall`
 ## instruction, and an execve from a raw-clone child that skips monitor
-## bookkeeping and so can only report the loss unnamed -- is driven into an
+## bookkeeping and so can only report the loss unnamed, and system(3) and
+## popen(3), whose `/bin/sh` glibc starts through its internal posix_spawn
+## that no exported hook sees -- is driven into an
 ## image the shim cannot enter: an i686
 ## dynamic shell, a static and a static-pie x86_64 binary, an execute-only
 ## (mode --x) static binary whose header cannot be read, and a `#!` script
@@ -35,6 +37,21 @@
 ## chdir file action is re-checked from the child's /proc entries; its control
 ## holds the child alive across that re-check, and a child whose entries
 ## cannot be read must be graded as a loss (the fail-closed arm).
+##
+## system(3) and popen(3) always run `/bin/sh` (glibc's `_PATH_BSHELL`), so
+## their cases run the capture in a private user and mount namespace whose
+## `/bin/sh` is the i686 shell, bind-mounted over the file it resolves to
+## (`shellSwapSource`); the host's own `/bin/sh` is never touched. A control
+## swaps in the 64-bit shell the same way and must stay `mcComplete`, so the
+## namespace itself cannot be what grades those captures incomplete. Where
+## the host refuses unprivileged user namespaces, those cases report an
+## explicit skip, as test_io_mon_linux_tree_ledger does. Like the rest of
+## this oracle they must run with no outer preload (repro.nim isolates the
+## monitor for this test): an outer shim that exports its own `system` or
+## `popen` and spawns through the public `posix_spawn` would let the
+## posix_spawn hook report the shell, so these cases could not fail without
+## the fix (measured with agent-harbor's command-trace shim at io-mon
+## f9e8ccca5).
 ##
 ## The i686 shell comes from io-mon's dev shell (`IO_MON_TEST_I686_SH`,
 ## `pkgsi686Linux.bash`) or the recipe's declared `io-mon-test-i686-sh`
@@ -270,7 +287,29 @@ static int disable_shim_recording(void) {
   return 1;
 }
 
-/* exec-host MODE TARGET ARG...: start TARGET with argv TARGET ARG... */
+/* system(3) COMMAND, which glibc runs as `/bin/sh -c COMMAND` through its
+ * internal posix_spawn. The command's exit code, or 50 + how it failed. */
+static int system_and_status(const char *command) {
+  int status = system(command);
+  if (status == -1) return 50;
+  return WIFEXITED(status) ? WEXITSTATUS(status) : 51;
+}
+
+/* popen(3) COMMAND for reading, drained to EOF, then pclose(3): glibc starts
+ * `/bin/sh -c COMMAND` through the same internal posix_spawn. */
+static int popen_and_status(const char *command) {
+  FILE *pipe = popen(command, "r");
+  if (pipe == NULL) return 52;
+  char buf[256];
+  while (fread(buf, 1, sizeof(buf), pipe) > 0) {
+  }
+  int status = pclose(pipe);
+  if (status == -1) return 53;
+  return WIFEXITED(status) ? WEXITSTATUS(status) : 54;
+}
+
+/* exec-host MODE TARGET ARG...: start TARGET with argv TARGET ARG...
+ * (for the system and popen modes TARGET is the shell command). */
 int main(int argc, char **argv) {
   if (argc < 3) return 2;
   const char *mode = argv[1];
@@ -331,6 +370,16 @@ int main(int argc, char **argv) {
   } else if (strncmp(mode, "unrecorded-posix_spawn-chdir-held=", 34) == 0) {
     if (!disable_shim_recording()) return 5;
     return spawn_in_dir_held_and_wait(mode + 34, target, targv);
+  } else if (strcmp(mode, "system") == 0) {
+    return system_and_status(target);
+  } else if (strcmp(mode, "popen") == 0) {
+    return popen_and_status(target);
+  } else if (strcmp(mode, "unrecorded-system") == 0) {
+    if (!disable_shim_recording()) return 5;
+    return system_and_status(target);
+  } else if (strcmp(mode, "unrecorded-popen") == 0) {
+    if (!disable_shim_recording()) return 5;
+    return popen_and_status(target);
   } else if (strcmp(mode, "clone-child-execve") == 0) {
     return clone_child_exec(target, targv);
   } else if (strcmp(mode, "fail-then-execve") == 0) {
@@ -340,6 +389,79 @@ int main(int argc, char **argv) {
     execve(argv[3], &argv[3], environ);
   }
   return 10;
+}
+"""
+
+const ShellSwapRefused = 77
+  ## shell-swap's exit code when the host refuses an unprivileged user or
+  ## mount namespace: the system/popen cases then skip, explicitly.
+
+const shellSwapSource = """
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <limits.h>
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mount.h>
+#include <unistd.h>
+
+/* shell-swap SHELL COMMAND ARG...: run COMMAND in a new user and mount
+ * namespace in which /bin/sh is SHELL. glibc's system(3) and popen(3) run
+ * /bin/sh by that fixed name, so this is the only way to make them start an
+ * image of the test's choosing. The bind mount covers the file /bin/sh
+ * resolves to (on NixOS /bin/sh is a symlink into the store); it is private
+ * to the namespace and gone when the namespace's last process exits.
+ * Exits 77 when the host refuses the namespace. */
+static int write_file(const char *path, const char *text) {
+  int fd = open(path, O_WRONLY | O_CLOEXEC);
+  if (fd < 0) return -1;
+  ssize_t len = (ssize_t)strlen(text);
+  ssize_t n = write(fd, text, (size_t)len);
+  close(fd);
+  return n == len ? 0 : -1;
+}
+
+int main(int argc, char **argv) {
+  if (argc < 3) return 2;
+  uid_t uid = getuid();
+  gid_t gid = getgid();
+  if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) {
+    perror("shell-swap: unshare");
+    return 77;
+  }
+  char map[64];
+  snprintf(map, sizeof(map), "0 %u 1", (unsigned)uid);
+  if (write_file("/proc/self/uid_map", map) != 0) {
+    perror("shell-swap: uid_map");
+    return 77;
+  }
+  if (write_file("/proc/self/setgroups", "deny") != 0) {
+    perror("shell-swap: setgroups");
+    return 77;
+  }
+  snprintf(map, sizeof(map), "0 %u 1", (unsigned)gid);
+  if (write_file("/proc/self/gid_map", map) != 0) {
+    perror("shell-swap: gid_map");
+    return 77;
+  }
+  if (mount("none", "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+    perror("shell-swap: make / private");
+    return 77;
+  }
+  char target[PATH_MAX];
+  if (realpath("/bin/sh", target) == NULL) {
+    perror("shell-swap: realpath /bin/sh");
+    return 3;
+  }
+  if (mount(argv[1], target, NULL, MS_BIND, NULL) != 0) {
+    perror("shell-swap: bind mount");
+    return 4;
+  }
+  execv(argv[2], &argv[2]);
+  perror("shell-swap: execv");
+  return 5;
 }
 """
 
@@ -453,8 +575,11 @@ suite "io-mon Linux: entry into an image the shim cannot enter":
   spawnEnv["REPRO_MONITOR_SHIM_LIB"] = shimLib
 
   var captureIndex = 0
-  proc runCapture(argv: seq[string]; extraPath: string):
+  proc runCapture(argv: seq[string]; extraPath: string;
+                  wrapper: seq[string] = @[]):
       tuple[dep: MonitorDepFile; code: int; ok: bool] =
+    ## `wrapper` (shell-swap and its shell) runs the capture, `io-mon run`
+    ## included, in the namespace it makes.
     inc captureIndex
     let depfile = work / ("capture-" & $captureIndex & ".iomon")
     let env = newStringTable(modeCaseSensitive)
@@ -462,7 +587,10 @@ suite "io-mon Linux: entry into an image the shim cannot enter":
     if extraPath.len > 0:
       env["PATH"] = extraPath & ":" & spawnEnv.getOrDefault("PATH")
     checkpoint("argv: " & argv.join(" "))
-    let res = run(snoopBin, @["run", "--depfile", depfile, "--"] & argv, env)
+    let snoopArgv = @[snoopBin, "run", "--depfile", depfile, "--"] & argv
+    let res =
+      if wrapper.len == 0: run(snoopArgv[0], snoopArgv[1 .. ^1], env)
+      else: run(wrapper[0], wrapper[1 .. ^1] & snoopArgv, env)
     checkpoint(res.output)
     result.code = res.code
     result.ok = fileExists(depfile)
@@ -575,6 +703,65 @@ suite "io-mon Linux: entry into an image the shim cannot enter":
         check dep.completeness == mcIncomplete
         check lossDetails(dep).anyIt("uninjectable image" in it and
           "could not record it by name" in it)
+
+  # --- system(3) and popen(3) of an i686 /bin/sh ------------------------
+  #
+  # glibc starts their `/bin/sh` through its internal posix_spawn, which no
+  # exported hook sees, so before io-mon interposed system and popen the
+  # shell ran unobserved and the capture was graded complete (io-mon issue
+  # 2026-11-08-linux-system-popen-of-an-uninjectable-shell-is-unseen). The
+  # shell `exec`s the monitored helper in its own pid, the shape the counting
+  # signals cannot see.
+
+  let shellSwap = compile("shell-swap", shellSwapSource)
+  template shellSwapAvailable(): bool =
+    ## True when shell-swap can make its namespace here; an explicit skip
+    ## when the host refuses unprivileged user namespaces. The probe swaps
+    ## the helper in as /bin/sh and runs it, so a pass also proves the bind
+    ## mount works.
+    let probe = run(shellSwap, @[helper, helper, input])
+    checkpoint("shell-swap probe: " & $probe.code & " " & probe.output)
+    if probe.code == ShellSwapRefused:
+      echo "    SKIP: unprivileged user namespaces are unavailable: ",
+        probe.output
+      skip()
+      false
+    else:
+      require probe.code == 0
+      true
+
+  template swappedCapture(shell: string; argv: seq[string]): MonitorDepFile =
+    ## `capture`, run in a namespace whose /bin/sh is `shell`.
+    let captured = runCapture(argv, "", @[shellSwap, shell])
+    check captured.code == 0
+    require captured.ok
+    captured.dep
+
+  let shellCommand = helper & " " & input
+  for mode in ["system", "popen"]:
+    test "descendant via " & mode & ": /bin/sh is an i686 dynamic shell":
+      if requireI686() and shellSwapAvailable():
+        checkUninjectable(swappedCapture(i686Sh,
+          @[host, mode, shellCommand]), "/bin/sh")
+
+    test "descendant via " & mode & " from a thread that cannot record":
+      if requireI686() and shellSwapAvailable():
+        let dep = swappedCapture(i686Sh,
+          @[host, "unrecorded-" & mode, shellCommand])
+        check helperRanMonitored(dep)
+        check dep.completeness == mcIncomplete
+        check lossDetails(dep).anyIt("uninjectable image" in it and
+          "could not record it by name" in it)
+
+    test "control: " & mode & " of a 64-bit /bin/sh":
+      # The host's own /bin/sh, then the 64-bit bash swapped in through the
+      # same namespace the cases above use: neither may report a loss.
+      checkComplete(capture(@[host, mode, shellCommand]))
+      checkComplete(capture(@[host, "unrecorded-" & mode, shellCommand]))
+      if shellSwapAvailable():
+        let bash64 = findExe("bash")
+        require elfClass(bash64) == 2
+        checkComplete(swappedCapture(bash64, @[host, mode, shellCommand]))
 
   # --- #! script whose interpreter is the i686 shell ---------------------
 
