@@ -2956,10 +2956,211 @@ static int ct_raw_process_is_single_threaded(void) {
   return p[1] == '1' && p[2] == ' ';
 }
 
+#if defined(__x86_64__)
+/* A TRAPPED CLONE THAT NAMES A CHILD STACK RUNS OUTSIDE THE HANDLER.
+ *
+ * Every other trapped call is replayed inside the SIGTRAP handler. A
+ * `clone` / `clone3` that names a child stack cannot be: the kernel starts
+ * the child at the instruction after the system call, which would be inside
+ * the handler, on the stack the program passed, where none of the handler's
+ * frames are; the child crashed as soon as the handler returned. (A clone
+ * without a child stack is not affected: its child continues on a copy of
+ * the handler's stack, as a fork child does.)
+ *
+ * So the handler does not replay such a call. It does the bookkeeping that
+ * precedes the call, then returns from the signal to a RESUME STUB that
+ * belongs to the trapped site: `syscall; int3`. The kernel restores the
+ * program's complete state on the way (every register, the FPU/SIMD state,
+ * the signal mask), the stub's `syscall` issues the call with it, and both
+ * the parent and the child (the child on its new stack, with the program's
+ * registers, as unmonitored) stop at the stub's `int3`. That second trap
+ * (ct_inline_clone_stub_trap) finishes the call: the parent records it and,
+ * for a CLONE_VM process, writes the child's tree-ledger entry; a fork-like
+ * child reclaims the shim state it inherited; a child that shares the
+ * parent's memory touches nothing. Each then resumes after the trapped
+ * site's `syscall` instruction.
+ *
+ * The stub must be the SITE'S own, and must say what the call was: at the
+ * second trap nothing in the registers names the site (the call's result
+ * replaced the number in rax, and `syscall` overwrote rcx and r11), the
+ * child cannot be given a pointer to per-call memory (a CLONE_VM child
+ * shares memory the parent reuses at once), and a clone3's flags live in
+ * program memory that a child sharing it may already have changed. Only the
+ * address the stub trapped at survives. So there is one stub per site, call
+ * (clone, clone3) and class of child (below), at index
+ * CT_INLINE_CLONE_STUBS_PER_SITE * site + CT_INLINE_CLONE_CLASSES * kind +
+ * class, CT_INLINE_CLONE_STUB_SIZE bytes each. The table is part of the
+ * shim's own text, which the inline scanner never patches
+ * (isMonitorShimMappingPath).
+ *
+ * The child's stop at the stub's `int3` runs this file's SIGTRAP handler in
+ * the child. A clone3 with CLONE_CLEAR_SIGHAND resets the child's handlers to
+ * the default first, so that child is killed by SIGTRAP instead (issue
+ * 2026-11-14-linux-inline-clone3-clear-sighand-child-dies-at-the-resume-stub).
+ * It did not survive the in-handler replay either. */
+#define CT_INLINE_CLONE_STUB_SIZE 4
+#define CT_INLINE_CLONE_STUB_TRAP_OFFSET 3 /* after `syscall` (2) + `int3` */
+#define CT_INLINE_CLONE_KIND_CLONE 0
+#define CT_INLINE_CLONE_KIND_CLONE3 1
+/* The class of child, decided from the flags before the call runs: */
+#define CT_INLINE_CLONE_FORK 0       /* no CLONE_VM: a private copy */
+#define CT_INLINE_CLONE_VM_PROCESS 1 /* ct_clone_flags_make_vm_process */
+#define CT_INLINE_CLONE_VM_SHARED 2  /* a CLONE_VM thread or vfork child */
+#define CT_INLINE_CLONE_CLASSES 3
+#define CT_INLINE_CLONE_STUBS_PER_SITE (2 * CT_INLINE_CLONE_CLASSES)
+#define CT_INLINE_CLONE_STUB_COUNT \
+  (CT_INLINE_CLONE_STUBS_PER_SITE * CT_INLINE_SYSCALL_SITE_CAP)
+#define CT_STR2(x) #x
+#define CT_STR(x) CT_STR2(x)
+extern const unsigned char ct_inline_clone_stubs[]
+    __attribute__((visibility("hidden")));
+__asm__(
+  ".pushsection .text.ct_inline_clone_stubs, \"ax\", @progbits\n"
+  ".p2align 4\n"
+  ".globl ct_inline_clone_stubs\n"
+  ".hidden ct_inline_clone_stubs\n"
+  ".type ct_inline_clone_stubs, @function\n"
+  "ct_inline_clone_stubs:\n"
+  ".rept 6 * " CT_STR(CT_INLINE_SYSCALL_SITE_CAP) "\n"
+  "  syscall\n"
+  "  int3\n"
+  "  int3\n"
+  ".endr\n"
+  ".size ct_inline_clone_stubs, .-ct_inline_clone_stubs\n"
+  ".popsection\n");
+_Static_assert(CT_INLINE_CLONE_STUBS_PER_SITE == 6,
+               "the .rept count above spells CT_INLINE_CLONE_STUBS_PER_SITE");
+
+/* Per site and kind, the tid of the thread that last sent a fork-like clone
+ * through it if that thread was its process's only one, else 0. The child
+ * reads it from its copy of the parent's memory, taken when the call ran: it
+ * equals the child's getppid() only when the parent was single-threaded (its
+ * only thread's tid is its pid), so any other value (a sibling's write, a
+ * CLONE_PARENT child) takes the conservative multi-threaded path. */
+static volatile long ct_inline_clone_single_tid[2 * CT_INLINE_SYSCALL_SITE_CAP];
+
+/* `struct clone_args` (clone(2)): the fields this file reads. */
+#define CT_CLONE3_ARGS_SIZE_VER0 64
+#define CT_CLONE3_FLAGS_OFFSET 0
+#define CT_CLONE3_STACK_OFFSET 40
+
+/* Whether this trapped call is a clone that names a child stack, and its
+ * kind and class of child, read before the call as the kernel reads them.
+ * A clone3 whose argument block is smaller than the first version the
+ * kernel accepts is replayed in place: the kernel refuses it (EINVAL), and
+ * its stack field may not be part of it. */
+static int ct_inline_clone_names_child_stack(long nr, const long *args,
+                                             int *kind, int *child_class) {
+  unsigned long long flags = 0;
+  int named = 0;
+#ifdef SYS_clone
+  if (nr == SYS_clone) {
+    *kind = CT_INLINE_CLONE_KIND_CLONE;
+    flags = (unsigned long)args[0];
+    named = args[1] != 0;
+  }
+#endif
+#ifdef SYS_clone3
+  if (nr == SYS_clone3 && args[0] != 0 &&
+      (unsigned long)args[1] >= CT_CLONE3_ARGS_SIZE_VER0) {
+    unsigned long long stack = 0;
+    memcpy(&flags, (const char *)args[0] + CT_CLONE3_FLAGS_OFFSET,
+           sizeof(flags));
+    memcpy(&stack, (const char *)args[0] + CT_CLONE3_STACK_OFFSET,
+           sizeof(stack));
+    *kind = CT_INLINE_CLONE_KIND_CLONE3;
+    named = stack != 0;
+  }
+#endif
+  if (!named) return 0;
+  *child_class = (flags & CLONE_VM) == 0 ? CT_INLINE_CLONE_FORK
+                 : ct_clone_flags_make_vm_process(flags)
+                     ? CT_INLINE_CLONE_VM_PROCESS
+                     : CT_INLINE_CLONE_VM_SHARED;
+  return 1;
+}
+
+/* The stub index a trap at `trap_rip` came from, or -1. */
+static long ct_inline_clone_stub_index(unsigned long trap_rip) {
+  unsigned long base = (unsigned long)ct_inline_clone_stubs;
+  if (trap_rip < base + CT_INLINE_CLONE_STUB_TRAP_OFFSET) return -1;
+  unsigned long offset = trap_rip - CT_INLINE_CLONE_STUB_TRAP_OFFSET - base;
+  if (offset % CT_INLINE_CLONE_STUB_SIZE != 0) return -1;
+  unsigned long index = offset / CT_INLINE_CLONE_STUB_SIZE;
+  if (index >= (unsigned long)CT_INLINE_CLONE_STUB_COUNT) return -1;
+  return (long)index;
+}
+
+/* The second trap of a clone sent through its site's stub (see above).
+ * `stub_regs` was captured at the stub: its `nr` is the call's result (rax),
+ * and its arguments are the call's own, which `syscall` preserves. */
+static void ct_inline_clone_stub_trap(
+    const struct stackable_linux_syscall_regs *stub_regs, long index,
+    void *ucontext) {
+  long site = index / CT_INLINE_CLONE_STUBS_PER_SITE;
+  int kind = (int)(index % CT_INLINE_CLONE_STUBS_PER_SITE) /
+             CT_INLINE_CLONE_CLASSES;
+  int child_class = (int)(index % CT_INLINE_CLONE_CLASSES);
+  long nr = kind == CT_INLINE_CLONE_KIND_CLONE3 ? SYS_clone3 : SYS_clone;
+  long result = stub_regs->nr;
+  unsigned long site_address = ct_inline_syscall_sites[site];
+  unsigned long resume = site_address + 2; /* past the `0f 05` it replaced */
+  if (result == 0 && child_class != CT_INLINE_CLONE_FORK) {
+    /* A child sharing the parent's memory (a thread, a vfork child or a
+     * CLONE_VM process) and, without CLONE_SETTLS, its thread-local state
+     * too: the parent does all the bookkeeping, and the child touches
+     * nothing, not even a counter. */
+    stackable_linux_write_syscall_result_to_ucontext(ucontext, 0, resume);
+    return;
+  }
+  if (result == 0) {
+    /* A fork-like child, as the in-place replay's child (the trap handler
+     * below): reclaim inherited locks, then the fork-child callback with the
+     * parent's thread count sampled before the call. Its memory is a private
+     * copy taken when the call ran, so the clone3 flags
+     * ct_raw_owner_after_raw_fork reads are the ones the call used. */
+    long ppid = ct_raw_syscall6(SYS_getppid, 0, 0, 0, 0, 0, 0);
+    int parent_single =
+        ppid > 0 && ct_inline_clone_single_tid[2 * site + kind] == ppid;
+    ct_raw_owner_after_raw_fork(nr, stub_regs->args[0], 0);
+    if (ct_raw_fork_child != NULL) ct_raw_fork_child(parent_single);
+    /* This thread, still in flight, is the only one: drop the counts the
+     * parent's other threads held at the call. */
+    __atomic_store_n(&ct_inline_in_flight, 1, __ATOMIC_SEQ_CST);
+    ct_inline_arm_loss();
+  } else if (result > 0 && child_class == CT_INLINE_CLONE_VM_PROCESS) {
+    /* Before the clone returns to its creator, as on the syscall(2) route
+     * (ct_linux_preload_after_raw_fork_syscall). */
+    ct_note_vm_process_parent(result);
+  }
+  long args[6];
+  memcpy(args, stub_regs->args, sizeof(args));
+  ct_record_raw_syscall_event(nr, args, result, CT_RAW_SYSCALL_SOURCE_INLINE,
+                              site_address);
+  __atomic_sub_fetch(&ct_inline_in_flight, 1, __ATOMIC_RELEASE);
+  if (stackable_linux_write_syscall_result_to_ucontext(ucontext, result,
+                                                       resume) == 0) {
+    ct_inline_syscall_trap_count_value++;
+  } else {
+    ct_inline_syscall_failure_count_value++;
+  }
+}
+#endif /* __x86_64__ */
+
 static void ct_linux_inline_syscall_sigtrap_handler(
     int signum, siginfo_t *info, void *ucontext) {
   struct stackable_linux_syscall_regs regs;
   int rc = stackable_linux_capture_syscall_regs_from_ucontext(ucontext, &regs);
+#if defined(__x86_64__)
+  if (rc == 0) {
+    long stub = ct_inline_clone_stub_index(regs.trap_rip);
+    if (stub >= 0 && stub / CT_INLINE_CLONE_STUBS_PER_SITE <
+                         (long)ct_inline_syscall_site_count_value) {
+      ct_inline_clone_stub_trap(&regs, stub, ucontext);
+      return;
+    }
+  }
+#endif
   if (rc != 0 || ct_inline_syscall_site_index(regs.syscall_address) < 0) {
     rc = stackable_linux_chain_sigtrap(signum, info, ucontext);
     if (rc != 0) {
@@ -3067,6 +3268,29 @@ static void ct_linux_inline_syscall_sigtrap_handler(
     trap_pid = ct_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
     exec_starttime = ct_inline_exec_arm(trap_pid);
   }
+#if defined(__x86_64__)
+  /* A clone that names a child stack is issued from the site's resume stub,
+   * outside this handler (see "A TRAPPED CLONE THAT NAMES A CHILD STACK RUNS
+   * OUTSIDE THE HANDLER"). It stays in flight and armed until the stub's
+   * trap finishes it. rax still holds the call's number. */
+  int clone_kind = 0, clone_class = 0;
+  if (!read_only && ct_inline_clone_names_child_stack(
+                        regs.nr, regs.args, &clone_kind, &clone_class)) {
+    long site = ct_inline_syscall_site_index(regs.syscall_address);
+    long stub = CT_INLINE_CLONE_STUBS_PER_SITE * site +
+                CT_INLINE_CLONE_CLASSES * clone_kind + clone_class;
+    ct_inline_clone_single_tid[2 * site + clone_kind] =
+        forks && parent_single
+            ? ct_raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0)
+            : 0;
+    rc = stackable_linux_write_syscall_result_to_ucontext(
+        ucontext, regs.nr,
+        (unsigned long)ct_inline_clone_stubs +
+            (unsigned long)stub * CT_INLINE_CLONE_STUB_SIZE);
+    if (rc != 0) ct_inline_syscall_failure_count_value++;
+    return;
+  }
+#endif
 #ifdef CT_INLINE_WINDOW_TEST
   /* Test-only (-d:ioMonInlineWindowTest): a marker `close(-4242)` holds its
    * in-flight count for 100 ms, so a test can fork while another thread is
