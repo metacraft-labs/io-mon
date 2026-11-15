@@ -1,8 +1,10 @@
 ## test_io_mon_dep_flush — milestone io-mon-DEP-FLUSH integration tests.
 ##
 ## Closes the "exit/thread-exit/fork-before-flush loses buffered iomon records"
-## gap in the file-based dependency channel (see
-## reprobuild-specs/io-mon-Dependency-Flush-Robustness.md). Each test drives the
+## gap in the file-based dependency channel: the writer batches records per
+## thread and used to flush only when a batch filled, its fragment directory
+## changed or it aged past 100 ms, so a short-lived process or thread that
+## exited first lost its records. Each test drives the
 ## LIVE Linux LD_PRELOAD shim (rebuilt from source) against a short-lived C
 ## child and asserts the merged depfile is COMPLETE — i.e. every record the
 ## child appended survived process/thread/fork teardown.

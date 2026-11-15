@@ -18,7 +18,7 @@ measurement. The local machine reports SIP enabled.
 
 ## Expected
 
-[io-mon hardening protocol](../../reprobuild-specs/io-mon-hardening-protocol.md)
+The io-mon hardening protocol
 requires both failing closed for unobserved processes and avoiding false
 downgrades for complete evidence. Make the unobserved-root control explicit
 by launching a real child without injection, retaining every existing absence,

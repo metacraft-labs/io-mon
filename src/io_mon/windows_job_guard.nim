@@ -9,9 +9,8 @@
 ## process the tree will ever create. Its active-process count reaching zero
 ## after the root has exited therefore proves the tree is empty.
 ##
-## Normative design: `reprobuild-pm/spec/io-mon-Windows-Tree-Lifetime-Guard.md`
-## (WG-1..WG-11, failure modes F1..F9). User contract: `docs/usage.md`, "The
-## Windows tree-lifetime guard (normative)".
+## User contract: `docs/usage.md`, "The Windows tree-lifetime guard
+## (normative)".
 ##
 ## This module holds ONLY the Win32 mechanics: create and verify the job, read
 ## its census, name its members. The DECISIONS — when the guard runs, how long

@@ -1,5 +1,5 @@
-## test_io_mon_dep_set_element_key — DA-1d
-## (reprobuild-specs/Dependency-Attribution.milestones.org).
+## test_io_mon_dep_set_element_key — one shared rule for what identifies a
+## dependency-set element.
 ##
 ## THE DEFECT THIS FILE CLOSES. Three sites encoded "what goes in a dep-set
 ## element key", and only ONE consulted the predicate that decides it:
@@ -70,7 +70,7 @@ const
   KeepsIncarnationKinds = {mrFileOpen, mrFileRead, mrPathProbe,
     mrDirectoryEnumerate, mrProcessStart, mrProcessExec, mrProcessSpawn,
     mrFileWrite, mrEventLoss, mrBackendProfile, mrCapabilityGap, mrIpcConnect,
-    mrNonDeterministic, mrExternalContent, mrPathMutation}
+    mrNonDeterministic, mrExternalContent, mrPathMutation, mrConnectAttempt}
   DropsIncarnationKinds = {mrLibraryLoad, mrEnvRead, mrSysctlRead, mrTimeRead}
 
   # DA-1d — the result/flags normalisation decision table, likewise restated.
@@ -81,7 +81,7 @@ const
   OutcomeVerbatimKinds = {mrDirectoryEnumerate, mrLibraryLoad, mrEnvRead,
     mrSysctlRead, mrTimeRead, mrProcessStart, mrProcessExec, mrProcessSpawn,
     mrEventLoss, mrBackendProfile, mrCapabilityGap, mrIpcConnect,
-    mrNonDeterministic, mrExternalContent, mrPathMutation}
+    mrNonDeterministic, mrExternalContent, mrPathMutation, mrConnectAttempt}
 
 proc sampleRecord(kind: MonitorRecordKind): MonitorRecord =
   ## One representative record per kind, with every identity-bearing field

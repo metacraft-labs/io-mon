@@ -17,8 +17,8 @@ through the interposed resolver.
 
 ## Expected
 
-[Release payload verification](https://github.com/metacraft-labs/metacraft-specs/blob/latest/infrastructure/gosti-io-mon-runquota-releases.md)
-requires native Linux ARM64 capture. glibc's
+Release payload verification requires native Linux ARM64 capture: each
+released payload must record a real file read on its own architecture. glibc's
 [ARM64 ABI list](https://github.com/bminor/glibc/blob/release/2.31/master/sysdeps/unix/sysv/linux/aarch64/libdl.abilist)
 defines dlsym at GLIBC_2.17. Lookup and the public wrapper must use the target's
 ABI and must not recurse when resolution fails.

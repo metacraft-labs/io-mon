@@ -36,8 +36,8 @@ For io-mon's dependency channel, **dropping a record is data loss, and data loss
 is the cardinal sin.** There is no reprobuild use case in which silently dropping
 a discovered input is acceptable: the whole point of the channel is completeness.
 
-The historical design (milestone `io-mon-DEP-SHM`, see
-`reprobuild-specs/io-mon-Dependency-Shm-Queue.md`) nonetheless shipped a
+The historical design (milestone `io-mon-DEP-SHM`, which moved dependency
+records from per-process files onto a shared-memory ring) nonetheless shipped a
 **bounded, drop-on-full** ring. That was only self-consistent because it was
 paired with a **file fallback**: `dep_queue.tryPushRecord` returns `dpsDropped`
 on a full ring, and the caller was _required_ to re-emit the dropped record to a
@@ -119,16 +119,15 @@ transport decision in §3.
 ## 3. Transport (open design decision)
 
 > **Status: decided by benchmark.** Three candidate transports are on the table.
-> They all satisfy the loss-freedom requirements (§1); they differ in how, and in
-> how much mechanism the "capture everything without dropping" property costs. The
-> decision is that **both principal models are implemented and benchmarked
-> head-to-head under a real probe storm** before one is chosen — Candidate A (the
-> `nim-shm-queue` ring + backpressure) and Candidate C (a **new
-> `nim-shm-gset` library**), with the small ordered side channel (§2) built
-> on Candidate B. See the corrective campaign
-> `reprobuild-specs/io-mon-Lossless-Event-Capture.milestones.org` (M1 spike). This
-> section records the candidates and their trade-offs so the decision is made in
-> the open.
+> They all satisfy the loss-freedom requirements (§1); they differ in how, and
+> in how much mechanism the "capture everything without dropping" property
+> costs. The decision is that **both principal models are implemented and
+> benchmarked head-to-head under a real probe storm** before one is chosen —
+> Candidate A (the `nim-shm-queue` ring + backpressure) and Candidate C (a **new
+> `nim-shm-gset` library**), with the small ordered side channel (§2) built on
+> Candidate B. The head-to-head benchmark is the M1 spike of the
+> lossless-event-capture work. This section records the candidates and their
+> trade-offs so the decision is made in the open.
 
 ### Candidate A — SHM ring + compile-time backpressure policy
 
@@ -218,8 +217,7 @@ slot's `ready` word is published via a release-store only after the blob is
 fully written, so the consumer skips an unpublished/torn slot (`drEmpty`) rather
 than reading garbage. A producer killed _before_ the release-store loses only
 that one in-flight record — which becomes an `mcIncomplete` downgrade if it was
-material, per the flush-robustness invariant
-(`reprobuild-specs/io-mon-Dependency-Flush-Robustness.md`).
+material: an accounted loss, never a silent one.
 
 **Known weakness of Candidate A.** Loss-freedom on a lock-free ring means bolting
 a _blocking_ discipline onto a structure designed to be _non-blocking_. The
@@ -351,10 +349,10 @@ it.
 
 **Concurrency verification.** This is a lock-free, **multi-process**, weak-memory,
 crash-exposed structure; functional tests pass for months while a missing fence
-waits to fault on ARM64. The plan (design spec **§4.5**, the authoritative list)
-requires: a **TLA+** protocol model + **stateless model checking**
-(GenMC/CDSChecker) of the _shipped_ C11 atomics core on a tiny forced-collision
-table + **litmus tests** (herd7) for every release→acquire pair;
+waits to fault on ARM64. The verification plan requires: a **TLA+** protocol
+model + **stateless model checking** (GenMC/CDSChecker) of the _shipped_ C11
+atomics core on a tiny forced-collision table + **litmus tests** (herd7) for
+every release→acquire pair;
 **position-independence** (map at different bases in producer vs consumer, offsets
 only — no absolute pointer may live in shared memory); structure-specific
 adversarial interleavings (slot-claim race, torn key, the intern arena as its own
@@ -364,7 +362,7 @@ races) via deterministic schedule hooks _and_ stress; **real multi-process
 publish-before-return** shim test; a `final == union(intended)` oracle + a
 multi-hour `rr`-chaos **soak**; a **real-build completeness oracle** (ninja-cmake /
 cargo validated against the toolchain's own dep data + `strace` — the under-capture
-/ cardinal-sin gate, §4.5(h)); TSAN (thread harness only — it does not cross
+/ cardinal-sin gate); TSAN (thread harness only — it does not cross
 processes) + ASan/UBSan + DRD. **Mandatory on x86 AND ARM64.**
 
 ### Comparison and leaning
@@ -414,8 +412,8 @@ treated as a **hard error, not a reason to write a file**:
 > **LF-2 (no orphan spill).** If a producer finds no ring to attach, it was not
 > launched under a real io-mon consumer. There is therefore no one to read
 > anything it produces. It MUST NOT create a spill file; it fails fast (and, if
-> monitoring was required for the edge, the edge is `mcIncomplete` / the action
-> fails per `Sandbox-And-Monitoring.md`).
+> monitoring was required for the edge, the edge is `mcIncomplete`, and a
+> consumer that requires complete monitoring refuses to cache or publish it).
 
 ### 4.1 The incident this closes
 
@@ -447,9 +445,8 @@ platform once that platform's ring producer exists.
 
 `depQueueSupported = defined(linux) or defined(macosx)`; on any other platform the
 ring is a no-op and the producer must degrade to an explicit `mcIncomplete`
-(never a silent capture). The corrective milestones campaign
-(`reprobuild-specs/io-mon-Lossless-Event-Capture.milestones.org`) tracks one
-milestone per OS.
+(never a silent capture). The lossless-event-capture work lands one platform
+at a time, and the table above is updated as each producer arm lands.
 
 ---
 
@@ -492,18 +489,18 @@ library API**, not only a CLI:
   proof (public-surface-only: `mcComplete`, inputs captured, no `.iomon-frag`
   spill).
 
-  `FsSnoopRequest` also carries a per-call `env` and `cwd`
-  (IoMon-Decomposed-Host-API DH-1). On **all three** arms the injection
-  variables travel through the spawn and `runMonitored` mutates nothing
-  process-global, so N monitors can run concurrently in one host process without
-  clobbering each other's `LD_PRELOAD` / `REPRO_MONITOR_*`. Windows was the last
-  arm to get there: `stackable_hooks.runWithMonitorShim` now takes an `env`
-  (a non-nil table being the child's _complete_ environment, encoded into an
-  explicit `CreateProcessW` environment block), so its four injection variables
-  no longer need a scope-restored `putEnv`. One `childEnv` helper composes the
-  child environment for every arm, so there is a single layering rule (host env,
-  then `request.env`, then io-mon's injection, injection winning) rather than
-  three that can drift.
+  `FsSnoopRequest` also carries a per-call `env` and `cwd` (DH-1). On **all
+  three** arms the injection variables travel through the spawn and
+  `runMonitored` mutates nothing process-global, so N monitors can run
+  concurrently in one host process without clobbering each other's `LD_PRELOAD`
+  / `REPRO_MONITOR_*`. Windows was the last arm to get there:
+  `stackable_hooks.runWithMonitorShim` now takes an `env` (a non-nil table being
+  the child's _complete_ environment, encoded into an explicit `CreateProcessW`
+  environment block), so its four injection variables no longer need a
+  scope-restored `putEnv`. One `childEnv` helper composes the child environment
+  for every arm, so there is a single layering rule (host env, then
+  `request.env`, then io-mon's injection, injection winning) rather than three
+  that can drift.
 
   The **decomposed** form has landed (DH-2): `startMonitor` → `pollMonitor` →
   `finishMonitor`, so a caller can own the wait and interleave N monitors in one
@@ -561,8 +558,7 @@ module's only Windows spawn site and waited on inside
 `settleMonitorDescendants`, so the DH-3 argument above holds unchanged: no
 exported proc creates, assigns, polls or skips it. Its contract (knobs, the
 named-survivor loss, the failure diagnostics, what it does not cover) is
-normative in `docs/usage.md`, "The Windows tree-lifetime guard (normative)";
-the design is reprobuild-pm `spec/io-mon-Windows-Tree-Lifetime-Guard.md`.
+normative in `docs/usage.md`, "The Windows tree-lifetime guard (normative)".
 
 **macOS: a kernel census, in the same funnel.** macOS has no Job Object and no
 subreaper, so it proves the property the way Linux does, by scanning, with one
@@ -589,8 +585,9 @@ batched until the producer flushes, which a quiet live process never does, and
 they are gated by `ecProcessTree`. Which mechanism catches which descendant,
 and the one residual case (a raw-syscall fork whose child also overwrites its
 area), is argued in the header of `src/io_mon/macos_tree_guard.nim`. Linux's
-`/proc/<pid>/environ` scan reads live memory too and has no ledger yet (io-mon
-issue `2026-10-30-linux-descendant-guard-misses-an-overwritten-environment`).
+`/proc/<pid>/environ` scan reads live memory too, so the Linux guard checks the
+same ledger (`waitForLinuxInjectedDescendants`; the Linux writers are listed in
+the header of `src/io_mon/tree_ledger.nim`).
 
 The census and the ledger check run inside `settleMonitorDescendants`, so the
 DH-3 argument above holds unchanged. While SIP is on, platform (SIP) binaries

@@ -179,7 +179,7 @@ accepted as an alias for `--format` here.)
 Sample `text` output:
 
 ```
-iomon version=1 records=4 completeness=mcComplete
+iomon version=2 records=4 completeness=mcComplete
 #0 mrProcessStart pid=54321 tid=1
 #1 mrFileRead pid=54321 tid=1 path=/usr/include/stdio.h
 #2 mrLibraryLoad pid=54321 tid=1 path=/usr/lib/libfoo.dylib detail=...
@@ -244,6 +244,73 @@ importable API.)
 - `MonitorCompleteness` — `mcComplete` | `mcIncomplete`.
 - `FsSnoopRequest` — the capture request the CLI driver consumes (`command`,
   `depFilePath`, `eventStreamPath`, `streamMode`, the stdio-capture fields).
+
+### The process-start image
+
+Every monitored process image emits one `mrProcessStart` (and a fork child
+that keeps recording emits its own). Its `path` is the file that image runs,
+as the kernel resolved it, not as the program spelled it:
+
+| OS      | Source                                                      | Form                                           |
+| ------- | ----------------------------------------------------------- | ---------------------------------------------- |
+| Linux   | `readlink("/proc/self/exe")`, read once at shim init        | absolute, every symlink resolved (physical)    |
+| macOS   | `proc_pidpath(getpid())`, read once at shim init            | absolute, every symlink resolved (physical)    |
+| Windows | `QueryFullProcessImageNameW` of the process, flag 0 (Win32) | absolute `C:\dir\tool.exe`, a symlink's target |
+
+The `mrProcessExec` and `mrProcessSpawn` records carry what the program
+PASSED, and that does not locate the file: `posix_spawnp` and the `execvp`
+family pass a bare name that the program's own `PATH` resolves (the program may
+have changed it); a relative path resolves against the working directory at the
+exec, which nothing records; `fexecve` and `posix_spawn` with a `chdir` file
+action pass a descriptor or a directory the exec record does not name; and
+`CreateProcessW` without an application name searches for the command line's
+first token. The child's process-start answers all of these the same way.
+
+What a consumer should know:
+
+- **Physical, so judge it as one.** Symlinks are resolved and there is no `..`,
+  unlike the path spelling of file records (see `docs/site/content/reference/depfile-format.md`).
+  A program reached through a symlink is recorded as the link's target, never
+  as the link.
+- **The image is the file the kernel runs.** For a `#!` script that is the
+  interpreter; the script itself is the exec record's path. A fork child that
+  does not exec records its parent's image, which is the file it runs.
+- **Linux spellings to expect.** The link is read at shim init, before the
+  program's `main`. An image already unlinked or replaced by then (a program
+  run through `fexecve` of a file it deleted, for example) reads
+  `<path> (deleted)`, and an image run from a memory file descriptor reads
+  `/memfd:<name> (deleted)`. Both are recorded verbatim. The first CAN sit
+  under the directory the file was in, so a prefix test would place it there;
+  it does not name a file that exists. Such captures are graded `mcIncomplete`
+  anyway: the shim's inline-syscall scan cannot open the image's executable
+  sections ("skipped image without a readable executable-section table") and
+  reports that as a loss.
+- **Trust: self-reported, like every shim record.** The value is read and
+  written by the monitored process itself, through the same channel as its
+  exec, spawn and file records. Code that tampers with io-mon's own evidence
+  (emitting records itself, writing the fragment directory, raw system calls,
+  or, on Linux, `prctl(PR_SET_MM_EXE_FILE)` with `CAP_SYS_RESOURCE`) can forge
+  or suppress it, exactly as it can every other record. That is within
+  io-mon's stated scope (accidental behaviour, not a tree that tampers with
+  its own monitor), and it opens no channel the exec records did not already
+  have. A consumer that must be sound against a hostile action needs an exec
+  observer outside the monitored process: on Linux an eBPF
+  `sched_process_exec` probe, seccomp user notification or ptrace; on macOS
+  EndpointSecurity's exec event; on Windows ETW's kernel process provider or a
+  kernel process-notify callback.
+- **Unresolved is explicit.** When the image cannot be read whole, `path` is
+  empty and `detail` carries the token `image=unresolved`. An empty `path`
+  WITHOUT that token comes from a shim that predates the field.
+- **No wire version change.** `path` already exists on every record and older
+  readers decode it unchanged, so the envelope version (`IomonVersion`) stays
+  2; see the rule on `IomonVersion` in `src/io_mon/types.nim`.
+
+Pinned by `tests/posix/test_io_mon_process_start_image.nim` (Linux and macOS:
+`posix_spawnp` and `execvp` of a bare name through a `PATH` the program set,
+with a decoy on the inherited `PATH`; a relative path after `chdir`;
+`posix_spawn` with a `chdir` file action; a symlinked executable; `fexecve` on
+Linux) and `tests/windows/test_io_mon_windows_process_start_image.nim` (a bare
+name through a `PATH` the root set, a relative path, a symlink).
 
 ### Reading a captured depfile (`io_mon/reader`)
 
@@ -449,7 +516,39 @@ can leave a DETACHED DESCENDANT behind — the root exits, but a daemonized chil
 keeps reading and writing files outside the evidence. On Linux, io-mon detects that by
 scanning `/proc/*/environ` for this run's injection needles and, past a grace
 window (`IO_MON_LINUX_DESCENDANT_GRACE_MS`, default 500), publishing an
-event-loss marker that downgrades the edge to `mcIncomplete`. Reporting
+event-loss marker that downgrades the edge to `mcIncomplete`. Because
+`/proc/<pid>/environ` is the process's own stack, not a copy taken at exec, a
+descendant that overwrites its needles in place (or reuses the argv+environ
+area for a process title, as PostgreSQL does) is invisible to that scan; so
+the Linux guard also checks the **tree ledger** the shim keeps, exactly as the
+macOS guard does (see "The macOS tree-lifetime guard" below; on Linux an
+entry's start time is field 22 of `/proc/<pid>/stat`). A live ledger process
+that no longer carries the needles publishes
+`linux recorded descendants still live after root exit pids=<p,...> run=<id>`;
+a ledger that cannot be read, or has no entry for the root, publishes
+`linux descendant guard failed: …` (a root the spawn site already reported as
+`uninjectable image: root spawn: …` never loaded the shim, so its missing
+entry is not reported a second time). A ledger pid is relative to its writer's
+pid namespace, so a tree that runs a process in another pid namespace (for
+example `unshare --pid --fork`) publishes
+`linux descendant guard failed: the monitored tree ran processes in another pid namespace pidns=<ino,...> …`
+at once instead of checking those pids against unrelated host processes; a
+shim that cannot write an entry
+publishes `linux tree ledger write failed errno=<e> pid=<p>`, and one that
+cannot read its own pid namespace (no `/proc` in its mount namespace or
+chroot) reports the write as failed for that reason. A process created with
+CLONE_VM that is neither a thread nor a vfork child shares its creator's
+memory and thread state, which the shim cannot keep apart, so its creator
+publishes `linux CLONE_VM process (not a thread or vfork child): …` once per
+process, beside the child's ledger entry. The creator writes that entry, and
+when the write fails it publishes
+`linux tree ledger write failed in the creator of a CLONE_VM process (…)`
+instead of the `errno=`/`pid=` form: the parenthesis says either that the
+entry could not be written, or that it was written but the creator's pid
+namespace could not be read. It carries no errno and no pid, because the
+child already runs on the creator's memory and thread state, so the creator
+writes a frame encoded at shim init with raw system calls only (all pinned by
+`tests/linux/test_io_mon_linux_tree_ledger.nim`). Reporting
 `mcComplete` where the batch entry point reports `mcIncomplete` would be a false
 cache hit for the whole action, so the guard is **not** exported as a step you
 call: it is the first act of the single funnel every `MonitorResult`'s evidence
@@ -463,9 +562,7 @@ macOS through its kernel census (the paragraph after it). Both run at the same
 point of the same funnel.
 
 **The Windows tree-lifetime guard (normative).** Windows has a kernel
-primitive for this: the Job Object. The full design, with its failure
-modes and interactions, is reprobuild-pm
-`spec/io-mon-Windows-Tree-Lifetime-Guard.md`. What a host can rely on:
+primitive for this: the Job Object. What a host can rely on:
 
 - Every monitored root gets a fresh job. The launcher assigns the root to it
   while the root is still suspended, before the loader, the shim or the
@@ -578,11 +675,47 @@ can rely on:
   busy with unrelated short-lived processes could keep every sweep
   inconclusive; with it, a trivial capture taken under four loops of
   continuous process churn stayed complete in 100 out of 100 runs.
+- **An exiting parent is classified through its own parent.** A parent caught
+  in exit (or a zombie) still names the children it has not yet handed to
+  launchd, but its strings can no longer be read. It is classified through
+  its own snapshot parent by the same rule, and so on up the chain, stopping
+  (unclassified) at launchd and, when an exiting parent's own parent is the
+  monitoring process, there too: the monitoring process's children are where
+  the needles start. (A process whose direct parent is the monitoring process
+  is still classified through it, as before; the root, its only needle-bearing
+  child, has been reaped before any sweep.)
+- **An orphan is classified by its creator's unique id.** macOS keeps, for
+  every process, the kernel unique id of its parent as of its last fork or
+  exec, and does not rewrite it when an orphan is handed to launchd (read
+  with `proc_pidinfo` flavor 17, `PROC_PIDUNIQIDENTIFIERINFO`, which xnu
+  declares only in its private header and answers for any same-user
+  process). An unclassified process whose recorded parent's id is below the
+  root's, other than launchd and the monitoring process, was created by a
+  process older than the root, so it is a non-member: unique ids are assigned
+  in creation order and never reused. A failed read leaves the process
+  unclassified. Launchd's id (1) proves nothing: an orphan of the tree that
+  execs after launchd adopted it reads 1 too (measured), exactly like a job
+  launchd started, so a launchd job is not classified this way. (The one
+  process this rule could misjudge is a tree process that an older debugger
+  attached to, which makes the debugger its parent, caught mid-exec; it
+  becomes readable, carrying the needles, when the exec completes.)
 - The capture is `mcComplete` only after a conclusive empty sweep within the
   grace window: `IO_MON_MACOS_DESCENDANT_GRACE_MS` (default 500) and
   `IO_MON_MACOS_DESCENDANT_POLL_MS` (default 25). They are read like the Linux
   and Windows knobs. The first sweep runs immediately, so a tree that has
   already quiesced costs one sweep.
+- **The window stretches on a starved host.** When the only thing keeping the
+  last sweep inconclusive is young processes the census could not classify,
+  and that set is still changing (new young processes keep appearing), the
+  window is extended, up to `IO_MON_MACOS_DESCENDANT_GRACE_CEILING_MS`
+  (default 5000, never below the grace window). Once the set has stayed the
+  same for a whole grace window, the guard stops waiting. On a heavily loaded
+  host the set is rarely empty at a fixed instant even after the tree has
+  quiesced, because each new process takes long to become readable; the
+  stretch gives such a host more chances at a conclusive sweep. It cannot
+  complete a capture on its own: a live carrier, a live ledger process, a
+  ledger that keeps growing or a census that overflowed ends the window at
+  the plain grace, as before.
 - If carriers are still alive when the window ends, the capture publishes
   `macos descendants still live after root exit live=<n> pids=<p,...> images=<i,...> run=<id>`
   and grades `mcIncomplete`, as Linux and Windows do. If only ledger processes
@@ -590,9 +723,20 @@ can rely on:
   `macos recorded descendants still live after root exit live=<n> pids=<p,...> images=<i,...> run=<id>`.
   Those processes are **left running**. A long-lived server that a step leaves
   behind makes the step incomplete by design.
+- Every loss published after the window ends with
+  `grace-ms=<n> ceiling-ms=<c> [ceiling-reached] load1=<l>` (before `run=`):
+  how long the guard actually waited, the stretch's ceiling, whether the
+  window ran into that ceiling with the unclassified set still changing, and
+  the host's one-minute load average (`unknown` when the kernel does not
+  answer). A consumer can tell a starved host's unclassified census
+  from a surviving descendant.
 - If only unclassified processes remain at the end of the window, the capture
   publishes
-  `macos tree-lifetime guard could not classify young processes after root exit unresolved=<n> pids=… images=… run=<id>`.
+  `macos tree-lifetime guard could not classify young processes after root exit unresolved=<n> pids=… images=… grace-ms=<n> ceiling-ms=<c> load1=<l> run=<id>`.
+  This can still happen to a quiesced tree when an orphan whose creator was
+  younger than the root and has exited, or a job launchd started, stays
+  unreadable past the stretch. Nothing on macOS outside EndpointSecurity says
+  whether such a creator was in the tree, so the capture fails closed.
   If the census call itself fails, it publishes
   `macos tree-lifetime guard failed: sysctl(KERN_PROC_ALL) census failed errno=<e> run=<id>`.
   If the ledger cannot be listed, or has no entry for the root (a shim that
@@ -624,16 +768,14 @@ can rely on:
   boundary as on Linux and Windows. On macOS such requests travel over Mach,
   which `ipc-connect` records only in part (see the XPC/Mach breakaway tests).
 - Like the Linux scan and the Windows job, the guard runs inside
-  `collectMonitorEvidence` (DH-3), for `runMonitored` and for `startMonitor` /
+  `collectMonitorEvidence`, for `runMonitored` and for `startMonitor` /
   `pollMonitor` / `finishMonitor` alike. No exported proc runs, polls or skips
   it.
 - **Cost.** A sweep is one snapshot, one monotonic start-time read
   (`proc_pid_rusage`) for each live process, and one strings read for each
   process younger than the root. The shim creates one empty ledger file per
   process, plus one `open` per `fork` or `posix_spawn` in the parent (usually
-  finding the file the child already created, or creating it first). The
-  measured numbers are in reprobuild-pm's
-  `Distributed-Execution-Threat-Model.md`, G42.
+  finding the file the child already created, or creating it first).
 
 Pinned by `tests/macos/test_io_mon_macos_tree_lifetime_guard.nim`. It covers a
 quiesced control on both launch paths, nested children, an exec chain,
@@ -645,7 +787,14 @@ that overwrites its `REPRO_MONITOR_*` strings (on both launch paths, and under
 an interest without `proc`), one that sets a PostgreSQL-style process title
 over argv and environ, and one that does so and exits inside the window.
 Census failure, a wall clock stepped backwards, the needle scan of an empty
-`argv[0]`, and the vanished-process and parent rules, are pinned by
+`argv[0]`, the vanished-process, parent, exiting-parent and creator rules (an
+orphan of a creator older than the root is classified; an orphan of a younger
+creator that has exited, before and after it re-execs, and a real launchd
+job, stay unclassified), and the stretch
+on a starved host (a churn of unclassifiable orphans that completes once the
+churn stops, a surviving descendant that is unclassifiable too and is still
+caught at the plain grace, a set that stops changing, and a churn that never
+stops, which ends at the ceiling) are pinned by
 `tests/macos/test_io_mon_macos_tree_lifetime_guard_faults.nim`, through
 compile-gated seams. The retired macOS marker
 (`detached-descendant quiescence cannot be established: macos backend has no complete tree-lifetime guard`)

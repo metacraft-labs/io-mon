@@ -216,12 +216,12 @@ suite "io-mon parity with fs-snoop (record/encode/decode level)":
     check recoveredReads == toHashSet(reads)
     # The complete leading frames are recovered, but the truncated tail means
     # the fragment did NOT decode cleanly to EOF — the fail-closed signal that
-    # blocks cache publication (Monitor-Hook-Shim.md §"Failure Semantics":
+    # blocks cache publication (the monitor's failure contract:
     # "partial iomon writes MUST fail reader validation").
     check not cleanEof
 
   test "merge fails closed on a corrupt fragment (incomplete evidence)":
-    # Fail-closed contract (Monitor-Hook-Shim.md §"Failure Semantics":
+    # Fail-closed contract (the monitor's failure contract:
     # "partial iomon writes MUST fail reader validation"; "shim crash MUST
     # reject cache publication"; "successful child exit MUST NOT hide monitor
     # failure"). A fragment that does not decode cleanly — e.g. a shim that

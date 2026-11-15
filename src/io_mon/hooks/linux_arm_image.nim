@@ -14,8 +14,8 @@
 ## Thumb functions are possible here" (an ARMv6 hard-float image: GCC refuses
 ## Thumb-1 hard-float code). Hand-assembled `.thumb_func` code in such an image
 ## -- stripped of its symbols -- keeps the v6/Thumb-1/VFP attributes and no odd
-## symbol, and is NOT detected; that residual is recorded in reprobuild-pm's
-## armhf issue beside the literal-pool one.
+## symbol, and is NOT detected; that residual is a known, accepted gap, like
+## the literal-pool one.
 ##
 ## On other architectures the verdict is `atvNotApplicable`.
 

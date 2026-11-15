@@ -1,7 +1,7 @@
 ## test_io_mon_macos_content_hooks — the macOS shim records the SOURCE of an
 ## APFS clone / hardlink / copyfile-CLONE as a content (read) dependency, and a
 ## getattrlist existence probe as a path-probe, closing findings-doc breaks
-## #3 and #5 (MacOS-Monitoring-Adversarial-Hardening.milestones.org).
+## #3 and #5 of the macOS adversarial-hardening probes.
 ##
 ## # The gap this proves
 ##

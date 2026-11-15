@@ -391,6 +391,30 @@ proc fxPipeClientMissing(name: string): int =
     return 36
   0
 
+proc fxSocketConnectBadAddress(): int =
+  ## `connect` with an address pointer that is not readable must still fail
+  ## with WSAEFAULT under the monitor, never crash it. Winsock rejects the
+  ## pointer itself; a snoop that read the address after that failure would
+  ## take an access violation in this process instead. Exit 0 only for a
+  ## WSAEFAULT return.
+  var d: WsaData
+  if WSAStartup(0x0202'u16, addr d) != 0:
+    return 49
+  let s = socketRaw(2'i32, 1'i32, 6'i32)      # AF_INET, SOCK_STREAM, TCP
+  if s == high(uint):
+    return 50
+  let rc = connectRaw(s, cast[pointer](8), int32(sizeof(SockAddrIn)))
+  let err = WSAGetLastError()
+  discard closesocket(s)
+  if rc == 0:
+    stderr.writeLine "connect through an unreadable address SUCCEEDED"
+    return 51
+  if err != 10014'i32:                         # WSAEFAULT
+    stderr.writeLine "connect through an unreadable address failed with " &
+      "wsaerr=" & $err & ", expected WSAEFAULT (10014)"
+    return 52
+  0
+
 proc fxSocketConnectNonBlocking(port: int): int =
   ## A NON-BLOCKING connect to a live listener: the in-flight case.
   ##
@@ -976,6 +1000,7 @@ proc channelFixtureMain*(mode: string; arg: string): int =
   of "socket-connect": fxSocketConnect(parseInt(arg))
   of "socket-connect-refused": fxSocketConnectRefused(parseInt(arg))
   of "socket-connect-nonblocking": fxSocketConnectNonBlocking(parseInt(arg))
+  of "socket-connect-bad-address": fxSocketConnectBadAddress()
   of "map-file": fxMapFile(arg)
   of "shm-inproc": fxShmInProc(arg)
   of "shm-open": fxShmOpen(arg)

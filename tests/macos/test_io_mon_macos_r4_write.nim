@@ -33,8 +33,9 @@
 ## the break is CLOSED (each write API now records a write) AND no false
 ## classification (the read-only O_RDWR probe records NO write).
 ##
-## See reprobuild-specs/MacOS-Monitoring-Adversarial-Hardening.milestones.org
-## (ROUND 4, RW1) and research/adversarial-2026-06-round4/r4_write/.
+## Round 4, phase RW1 of the macOS adversarial-hardening campaign (probes that
+## look for a dependency the monitor misses while still reporting mcComplete);
+## corpus in research/adversarial-2026-06-round4/r4_write/.
 
 import std/[os, strutils, unittest]
 import io_mon

@@ -14,8 +14,7 @@
 ## under a recognized TOOLCHAIN prefix" (/nix/store, /opt/homebrew, /usr/local, the
 ## Xcode/Developer trees), so a link-time CUSTOM dylib in the build tree is attributed.
 ##
-## That prefix exemption was itself the next hole (reprobuild-pm issue
-## 2026-10-14-macos-monitoring-does-not-report-entropy-drawn-by-toolchain-dylibs): a
+## That prefix exemption was itself the next hole: a
 ## Nix clang's libLLVM draws arc4random for the name of the temporary it writes `-o`
 ## through, the shim saw it and DISCARDED it, and a consumer edge with no entropy
 ## blessing published over it -- while the Linux preload shim reports the same draw.
@@ -158,8 +157,8 @@ suite "io-mon macOS R4 S3b link-time dylib entropy attribution":
           return true
 
     test "REGRESSION: a toolchain dylib's entropy (clang's temp-file name in libLLVM) is reported":
-      # reprobuild-pm issue 2026-10-14-macos-monitoring-does-not-report-entropy-
-      # drawn-by-toolchain-dylibs. clang names the temporary it writes `-o`
+      # macOS monitoring did not report entropy drawn by toolchain dylibs.
+      # clang names the temporary it writes `-o`
       # through with `llvm::sys::Process::GetRandomNumber`, which calls
       # arc4random from libLLVM.dylib -- a LINK-TIME dylib under /nix/store.
       # The shim used to exempt every link-time dylib under a "toolchain" prefix

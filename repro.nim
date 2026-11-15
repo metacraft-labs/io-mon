@@ -32,15 +32,16 @@
 ## action rather than re-deriving the build graph in the DSL:
 ##
 ##   * the shim (``scripts/build_shim.sh``) is an ``--app:lib`` shared-library
-##     build with platform-specific arm64/arm64e fat-binary flags — a Mode-B
-##     ("crude") shape per ``reprobuild-specs/Language-Conventions/Nim.md`` that
-##     the fine-grained ``nim c --compileOnly`` Mode-A split cannot express, so a
-##     faithful script wrap is the correct cut;
+##     build with platform-specific arm64/arm64e fat-binary flags. Reprobuild's
+##     Nim conventions treat ``--app:lib`` output as the coarse Mode-B
+##     ("crude") shape, one action that compiles and links in-process, because
+##     the fine-grained ``nim c --compileOnly`` Mode-A split cannot express it;
+##     a faithful script wrap is the correct cut;
 ##   * the CLI (``nimble buildSnoop``) and the test suite (``nimble test``) both
 ##     resolve the sibling ``nim-stackable-hooks`` checkout through
 ##     ``--path:../nim-stackable-hooks/src`` and the test task is a NimScript
-##     ``task`` block (also a Mode-B trigger), so they are wrapped one-for-one as
-##     well.
+##     ``task`` block (a ``.nimble`` task is also a Mode-B trigger), so they
+##     are wrapped one-for-one as well.
 ##
 ## This is the same option-A approach runquota's ``repro.nim`` and the
 ## tcc-chain recipes take: preserve today's behaviour exactly, defer the
@@ -319,7 +320,8 @@ package io_mon:
       # Keep their compilation monitored and execute every assertion. The
       # generated depfile orders the known artifacts but does not discover all
       # runtime reads, so these execute edges MUST remain non-cacheable.
-      # Monitor-Hook-Shim.md / Failure Semantics permits this disposition.
+      # The monitor's failure contract permits this disposition: incomplete
+      # monitoring must fail the action or make it non-cacheable.
       # macOS fixtures also install their own interposers. A distinct outer
       # dylib can recurse during dyld initialization, before main is reached.
       # Linux's nested-monitor programs must also own their transport and
@@ -379,7 +381,30 @@ package io_mon:
           # compare with bare controls: the code-sections-only scan gate and
           # the rustc crate pair from the rustc 1.94.0 SIGILL issue.
           "test_io_mon_linux_inline_scan_code_sections_only.nim",
-          "test_io_mon_linux_rustc_crates_under_shim.nim"]) or
+          "test_io_mon_linux_rustc_crates_under_shim.nim",
+          # Compares the dlsym(RTLD_NEXT) answers of a bare control with
+          # those under a private shim; an outer shim is itself an
+          # interposer in the lookup order the test asserts.
+          "test_io_mon_foreign_preload_rtld_next.nim",
+          # Builds two distinct shims and asserts that a nested capture
+          # carries exactly one active image; an enclosing shim is a third
+          # image in that loader closure. It also needs `patchelf` (below).
+          "test_io_mon_linux_nested_distinct_shims.nim",
+          # These grade trapped inline syscalls over both dependency
+          # transports, or through a private shim built with a test-only
+          # define (`ioMonInlineWindowTest`). Under an enclosing shim the
+          # file-transport captures report every forked or threaded child as
+          # "spawn child missing process-start" and grade incomplete, and the
+          # outer image, not the private one, owns the process. At io-mon
+          # 7a9b2f3 with repro 0.2.19 all four fail under `repro test` with
+          # the owned monitor runtime and pass directly.
+          "test_io_mon_shim_inline_loss_windows.nim",
+          "test_io_mon_shim_inline_trap_capture.nim",
+          "test_io_mon_shim_inline_trap_loss_inside_hook.nim",
+          # Compares the alternate-stack depth of an unmonitored control with
+          # a monitored run; the outer monitor re-injects itself into the
+          # control, so both measured 8104 bytes at 7a9b2f3.
+          "test_io_mon_shim_inline_trap_small_sigaltstack.nim"]) or
         (defined(windows) and source.extractFilename in [
         "test_io_mon_cli_exit_status.nim",
         "test_io_mon_windows_exit_status.nim",
@@ -388,7 +413,31 @@ package io_mon:
         "test_io_mon_windows_read_capture.nim",
         "test_io_mon_windows_root_guard.nim",
         "test_io_mon_windows_spawn_abandoned_injection.nim",
-        "test_io_mon_windows_spawn_resume_invariant.nim"])
+        "test_io_mon_windows_spawn_resume_invariant.nim",
+        # These grade records only the CURRENT shim writes: the resolved
+        # process-start image and the refused-connect attempt. Their captures
+        # find the shim through `findShimLibrary`, which honours an inherited
+        # `REPRO_MONITOR_SHIM_LIB` first, and an enclosing monitor seeds that
+        # with the ENGINE's own shim. Under `repro test` the inner run then
+        # injects the engine's io-mon, not this checkout's. Reprobuild
+        # 413830138a ships io-mon 6fccd929, which predates both records: every
+        # process-start read `shim-loaded` with an empty path and the refused
+        # connect recorded no attempt (io-mon run 43122211901, Windows x64 and
+        # arm64), while the same programs pass directly at 83eb364.
+        "test_io_mon_windows_ipc_connect.nim",
+        "test_io_mon_windows_process_start_image.nim",
+        # Its nested case injects THIS checkout's shim (`build/lib`, set
+        # explicitly) into a root it spawns, then parks that root's main
+        # thread to call `repro_runtime_init`. Under `repro test` the spawning
+        # probe already carries the engine's shim, whose CreateProcessW hook
+        # injects that shim into the same suspended root first, and the
+        # borrowed init call fails ("repro_runtime_init could not be called
+        # on its parked main thread"). The case never ran under Reprobuild
+        # before 0.2.23: the `sh` tool was Git's `bin/sh.exe` launcher, with
+        # no `msys-2.0.dll` beside it, so both cases skipped. Reprobuild
+        # 53ddb5bc names the MSYS `usr/bin/sh.exe` instead (io-mon run
+        # 43289512869, Windows x64).
+        "test_io_mon_windows_msys_fallback.nim"])
       var executeAfter = after
       var executePolicy = automaticMonitorPolicy()
       if isolatesMonitor:
@@ -427,6 +476,9 @@ package io_mon:
       when defined(linux):
         appendRegisteredActionToolIdentityRefs(executeEdge.id,
           ["strace", "nm", "getconf", "grep", "mv", "rmdir"])
+        if stem == "test_io_mon_linux_nested_distinct_shims":
+          # Gives its second shim its own SONAME (`patchelf --set-soname`).
+          appendRegisteredActionToolIdentityRefs(executeEdge.id, ["patchelf"])
         if stem == "test_io_mon_uninjectable_image_entry":
           appendRegisteredActionToolIdentityRefs(executeEdge.id, ["patchelf"])
           when defined(amd64):

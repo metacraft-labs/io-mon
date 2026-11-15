@@ -53,7 +53,7 @@ engine asked for every category unconditionally, and its `captureNonDeterminism`
 The fix is not "more categories". It is that a category is now the unit a
 _single_ consumer reads, so a narrowing can be argued one consumer at a time.
 
-### 1.2 Two classes of kind have NO category and are never gated
+### 1.2 Three classes of kind have NO category and are never gated
 
 `categoryOf(kind: MonitorRecordKind): Option[EventCategory]` maps a record kind
 to its category, and `none` means **no interest set may suppress this record**:
@@ -70,6 +70,12 @@ to its category, and `none` means **no interest set may suppress this record**:
   `mcComplete` one. No granularity makes that safe, so there is no category:
   DA-5 retired `ecIpc` rather than renaming it. (The `ipc` token still _reads_;
   see §3.2.)
+- **DETECTION-BEARING** — `mrConnectAttempt` (a FAILED AF_INET/AF_INET6
+  connect). It derives no loss marker — the connection was
+  never made — but it is the only evidence that a process tried to reach a
+  destination a sandbox's network refused, and a detection a narrowing could
+  switch off is not one. One record per failed connect, so being always on
+  costs nothing measurable.
 
 Gating a loss marker is forbidden by construction: `categoryOf` answers `none`,
 and the gate only ever suppresses kinds whose category is _present and

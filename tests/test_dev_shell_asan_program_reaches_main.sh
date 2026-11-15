@@ -8,7 +8,7 @@
 # re-enters `AsanInitFromRtl`, which spins forever on the init mutex it already
 # holds. Every instrumented program, `puts` and `return 0` included, burns one
 # CPU before main, so `scripts/run_sanitizer_tests.sh` never runs a test
-# (metacraft-pm issues/2026-10-01-nix-compiler-rt-asan-startup-hangs-on-macos-26.md).
+# (observed on macOS 26 with nixpkgs' compiler-rt).
 # flake.nix gives the Darwin dev shell a compiler-rt carrying the upstream fix
 # (LLVM 2e7d07a33725, "Adopt _dyld_get_dyld_header").
 #

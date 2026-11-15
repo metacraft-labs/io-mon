@@ -40,6 +40,7 @@ import io_mon/writer
 import io_mon/shim/windows_iat_patcher
 import io_mon/shim/windows_hook_registry as hr
 import io_mon/shim/install_audit
+import io_mon/winsock_connect
 
 # Framework's safer grandchild-injection primitive — replaces the
 # bespoke INFINITE-wait inject_dll path with concurrent-injection cap
@@ -314,6 +315,9 @@ proc EnumProcessModulesEx(hProcess: HANDLE, lphModule: ptr pointer,
                           dwFilterFlag: DWORD): BOOL
   {.importc, stdcall, dynlib: "psapi".}
 proc GetCurrentProcess(): HANDLE
+  {.importc, stdcall, dynlib: "kernel32".}
+proc QueryFullProcessImageNameW(hProcess: HANDLE; dwFlags: DWORD;
+                                lpExeName: LPWSTR; lpdwSize: ptr DWORD): BOOL
   {.importc, stdcall, dynlib: "kernel32".}
 proc IsWow64Process2(hProcess: HANDLE; processMachine,
                      nativeMachine: ptr WORD): BOOL
@@ -1594,6 +1598,22 @@ proc emitIpcConnect(dest: string; peerPid: uint64; family: uint16;
     (if peerPid != 0'u64: " peer=" & $peerPid else: " peer=unknown")
   emitRecord(record)
 
+proc emitConnectAttempt(dest: string; family: uint16; callResult: int64;
+                        wsaError: uint32) {.raises: [].} =
+  ## A `connect`/`WSAConnect` to an AF_INET/AF_INET6 destination that FAILED:
+  ## an attempt that reached nobody, recorded as `mrConnectAttempt`
+  ## with the destination in the spelling `emitIpcConnect` uses. Never an
+  ## `mrIpcConnect` — the merge must not derive an out-of-tree-peer loss
+  ## from a connection that was refused (see `socketConnectReachedPeer`).
+  if dest.len == 0 or (family != AfInetW and family != AfInet6W):
+    return
+  var record = baseRecord(mrConnectAttempt, moConnectAttempt)
+  record.result = callResult
+  record.flags = uint32(family)
+  record.path = dest
+  record.detail = "connect-attempt af_inet errno=" & $wsaError
+  emitRecord(record)
+
 proc emitExternalContent(chan, role, identity: string; producerPid: uint64;
                          callResult: int64) {.raises: [].} =
   ## Describe one side of a content channel.
@@ -2042,9 +2062,38 @@ proc ensureFragmentDir() =
   except ValueError:
     discard
 
+proc selfImagePath(): string {.raises: [].} =
+  ## The file this process runs, as the kernel names it:
+  ## `QueryFullProcessImageNameW` on the current process, flag 0 (the Win32
+  ## form, `C:\dir\tool.exe`), UTF-8. That is the image `CreateProcessW`
+  ## resolved (application name, else the command line's first token searched
+  ## along the documented directories and `PATH`), taken from the image's
+  ## file object rather than from the caller's spelling. "" when it cannot be
+  ## read whole.
+  ## https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-queryfullprocessimagenamew
+  var buf: array[32768, uint16]
+  var size = DWORD(buf.len)
+  if QueryFullProcessImageNameW(GetCurrentProcess(), 0'u32,
+      cast[LPWSTR](addr buf[0]), addr size) == 0 or size == 0 or
+      size >= DWORD(buf.len):
+    return ""
+  buf[int(size)] = 0'u16
+  widePtrToString(cast[LPCWSTR](addr buf[0]))
+
 proc recordProcessStart() =
   var record = baseRecord(mrProcessStart, moProcessStart)
   record.detail = "shim-loaded"
+  # THE RESOLVED IMAGE (docs/usage.md, "The process-start image"). The spawn
+  # record carries what the caller passed to `CreateProcessW`: an application
+  # name, or a command line whose first token the loader searched for. This
+  # names the file that actually runs, the same field the Linux and macOS
+  # shims fill. An unreadable name is an empty path plus `image=unresolved`.
+  var image = ""
+  withShimMuted:
+    image = selfImagePath()
+  record.path = image
+  if image.len == 0:
+    record.detail.add " image=unresolved"
   emitRecord(record)
   # Flush immediately: this record is written from a thread that is about to
   # disappear.
@@ -3816,9 +3865,8 @@ proc snoopCreateProcessA(ctx: var hr.HookContext) {.raises: [].} =
 #   CopyFileW/A        -> TWO records per call: source (mrFileOpen +
 #                          moFileRead, detail = "CopyFileW:src") and dest
 #                          (mrFileWrite + moFileWrite,
-#                          detail = "CopyFileW:dst"). Mirrors
-#                          Monitor-Hook-Shim.md §"CopyFileW / CopyFileA |
-#                          Read source and create/write destination".
+#                          detail = "CopyFileW:dst"): a copy reads its
+#                          source and creates/writes its destination.
 #   MoveFileExW/A      -> TWO records: source (mrFileWrite + moFileWrite,
 #                          detail = "MoveFileExW:src") and dest (mrFileWrite +
 #                          moFileWrite, detail = "MoveFileExW:dst"). lpNewFileName
@@ -5139,45 +5187,6 @@ proc originalMsvcrtWGetenvS(ctx: var hr.HookContext) {.raises: [].} =
 
 # --- M5 snoop callbacks ----------------------------------------------------
 
-const
-  WSAEWOULDBLOCK = 10035'u32
-  WSAEINPROGRESS = 10036'u32
-
-proc socketConnectReachedPeer(rc: int32; wsaError: uint32): bool
-    {.inline, raises: [].} =
-  ## Did this `connect`/`WSAConnect` call actually reach a peer?
-  ##
-  ## THE SAME RULE `classifyOpenedPath` STATES FOR PIPES, applied to the socket
-  ## arm: only a connect that reached somebody is recorded. An `mrIpcConnect`
-  ## naming an UNKNOWN peer is a downgrade signal -- the merge cannot prove the
-  ## peer was in-tree, so the whole capture grades `mcIncomplete` and the action
-  ## loses its cache publication. Emitting one for a connect that was REFUSED
-  ## means a connection that never happened costs a build its cache hit: a
-  ## false re-run, which is the failure direction this machinery exists to
-  ## avoid. Windows programs probe localhost constantly (daemon discovery,
-  ## sccache and language-server probes, "is the server already up?" checks),
-  ## and every one of those probes ends in WSAECONNREFUSED by design.
-  ##
-  ## IN-FLIGHT CONNECTS ARE RECORDED, deliberately, matching the macOS arm's
-  ## `EInProgress` case. A non-blocking `connect` returns SOCKET_ERROR with
-  ## WSAEWOULDBLOCK (the Winsock spelling of EINPROGRESS; WSAEINPROGRESS is the
-  ## WinSock 1.1 blocking-call form and is accepted for completeness) and then
-  ## COMPLETES asynchronously -- that is the ordinary shape of an async client
-  ## talking to a daemon, so treating it as "reached nobody" would be a silent
-  ## false skip over a real peer. The two errors are not symmetric in cost: an
-  ## in-flight connect that later fails costs a conservative re-run, while a
-  ## refused connect recorded as a peer costs one too, and an in-flight connect
-  ## NOT recorded costs a false `mcComplete` over content that arrived from an
-  ## out-of-tree daemon. Only the last of those is unrecoverable, so the guard
-  ## is drawn to include exactly the states in which a peer may yet be reached.
-  ##
-  ## `GetLastError` is the source of `wsaError`: `WSAGetLastError` is documented
-  ## as returning the same thread-local value, and the snoops already capture it
-  ## immediately after `callNext` before anything can clobber it.
-  if rc == 0:
-    return true
-  wsaError == WSAEWOULDBLOCK or wsaError == WSAEINPROGRESS
-
 proc snoopConnect(ctx: var hr.HookContext) {.raises: [].} =
   hr.callNext(ctx)
   let savedLastError = GetLastError()
@@ -5198,6 +5207,14 @@ proc snoopConnect(ctx: var hr.HookContext) {.raises: [].} =
         # peer. The named-pipe arm, which is how Windows build daemons actually
         # talk, DOES supply the pid.
         emitIpcConnect(dest, 0'u64, family, int64(rc), "socket")
+    elif winsockConnectFailureReadAddress(savedLastError):
+      # Only a failure the transport returned about the destination: after
+      # WSAEFAULT / WSAEINVAL the address may be unreadable, and reading it
+      # would crash the program (`io_mon/winsock_connect`).
+      var family: uint16 = 0
+      let dest = sockaddrDestination(cast[pointer](ctx.args[1]),
+        cast[int32](uint32(ctx.args[2])), family)
+      emitConnectAttempt(dest, family, int64(rc), savedLastError)
   except CatchableError:
     discard
   SetLastError(savedLastError)
@@ -5216,6 +5233,14 @@ proc snoopWSAConnect(ctx: var hr.HookContext) {.raises: [].} =
         cast[int32](uint32(ctx.args[2])), family)
       if dest.len > 0:
         emitIpcConnect(dest, 0'u64, family, int64(rc), "socket")
+    elif winsockConnectFailureReadAddress(savedLastError):
+      # Only a failure the transport returned about the destination: after
+      # WSAEFAULT / WSAEINVAL the address may be unreadable, and reading it
+      # would crash the program (`io_mon/winsock_connect`).
+      var family: uint16 = 0
+      let dest = sockaddrDestination(cast[pointer](ctx.args[1]),
+        cast[int32](uint32(ctx.args[2])), family)
+      emitConnectAttempt(dest, family, int64(rc), savedLastError)
   except CatchableError:
     discard
   SetLastError(savedLastError)
@@ -6033,8 +6058,7 @@ proc registerMonitorSnoopCallbacks*() =
 
 # --- Unified install backend (M73 Phase 1) ---------------------------------
 #
-# Per Monitor-Hook-Shim.md §"Install Backend Requirement:
-# dispatch-mechanism-agnostic", the shim's install backend MUST catch every
+# The install backend must be dispatch-mechanism-agnostic: it MUST catch every
 # call to a hooked Win32 API regardless of how the caller resolved the entry
 # point (IAT-routed, runtime-resolved via GetProcAddress, late-bound from a
 # DLL loaded after init, CRT-forwarded). The only point where every
@@ -6691,7 +6715,7 @@ proc installIatFor(spec: HookSpec) =
 
 proc installAllHooks(): int =
   ## Install every entry in ``hookTable``. Inline is preferred for every
-  ## hook (dispatch-mechanism-agnostic, per Monitor-Hook-Shim.md spec);
+  ## hook (it is dispatch-mechanism-agnostic, see the install-backend note);
   ## the IAT path is only walked for hooks the inline backend rejected.
   ## All inline installs are grouped inside a single transaction so the
   ## thread-suspend window happens once for the whole table rather than
@@ -6996,9 +7020,8 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
       discard
   # M73 Phase 4: post-install audit. Walk the hookTable, resolve each
   # spec's kernel32 address, and classify the first five bytes at the
-  # target. The audit MUST run synchronously here — Monitor-Hook-Shim.md
-  # §"Install Backend Requirement" requires the post-install state be
-  # captured before any other code can uninstall hooks. Cost is ~11 *
+  # target. The audit MUST run synchronously here: the post-install state
+  # must be captured before any other code can uninstall hooks. Cost is ~11 *
   # (GetProcAddress + 5-byte read) = microseconds, well within the
   # loader's critical-path budget.
   block:

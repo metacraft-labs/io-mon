@@ -43,8 +43,9 @@
 ## This file proves each break is CLOSED, the round-4 caught negative-dependency
 ## case is PRESERVED, and a real cc compile + a stat-storm stay mcComplete + fast.
 ##
-## See reprobuild-specs/MacOS-Monitoring-Adversarial-Hardening.milestones.org
-## (ROUND 4, RW2) and research/adversarial-2026-06-round4/r4_dir/.
+## Round 4, phase RW2 of the macOS adversarial-hardening campaign (probes that
+## look for a dependency the monitor misses while still reporting mcComplete);
+## corpus in research/adversarial-2026-06-round4/r4_dir/.
 
 import std/[os, strutils, unittest]
 import io_mon

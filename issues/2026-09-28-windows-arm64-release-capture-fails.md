@@ -3,8 +3,8 @@
 Observed at `c4f6fe0` with stackable-hooks pinned to `72f5782`, 2026-09-28:
 <https://github.com/metacraft-labs/io-mon/actions/runs/36363621856/job/108745731691>.
 
-The [release specification](https://github.com/metacraft-labs/metacraft-specs/blob/50776b8/infrastructure/gosti-io-mon-runquota-releases.md)
-requires native Windows ARM64 execution and real file capture. Both the CLI
+The release requirements
+require native Windows ARM64 execution and real file capture. Both the CLI
 and shim compile and pass PE architecture checks, but `io-mon run` around
 the native read/write probe returns 1 instead of the probe's expected 7,
 with no standard-output/error diagnostic. The x64 version of the same test

@@ -471,9 +471,9 @@ suite "macOS tree-lifetime guard":
     # If the child flushed that batch (its first record sees a new pid), the
     # root's frames would land in the root's fragment twice, through the same
     # file offset the root is writing at: duplicated records always, and an
-    # interleaved, corrupt fragment when the writes race (io-mon issue
-    # 2026-10-29-macos-fork-child-outliving-its-parent-corrupts-the-parent-
-    # fragment). Duplicates are deterministic, so count them.
+    # interleaved, corrupt fragment when the writes race (the writer now drops
+    # a slot opened by another pid instead of flushing it,
+    # `slotInheritedAcrossFork`). Duplicates are deterministic, so count them.
     for round in 0 ..< 3:
       let req = request("fork-burst", input, "40", "120")
       let res = capture(req, round mod 2 == 1)

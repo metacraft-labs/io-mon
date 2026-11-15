@@ -128,6 +128,13 @@ func preDA5ShimKinds(value: string): set[MonitorRecordKind] =
   # The three META kinds belonged to no category in EITHER vocabulary.
   result.incl({mrEventLoss, mrBackendProfile, mrCapabilityGap})
 
+const KindsNoLegacyShimHasAHookFor = {mrConnectAttempt}
+  ## Kinds added after DA-5 whose HOOK a pre-DA-5 shim does not have at all
+  ## (`mrConnectAttempt`: the failed-connect arm). No interest value
+  ## can make an old shim emit them, so their absence from its output is
+  ## version skew, not the narrowing this file grades; they are ungate-able,
+  ## so a current shim always emits them.
+
 ## Assertion helpers are TEMPLATES, never procs: a failing `check` inside a
 ## plain `proc` prints "Check failed" and the enclosing case still reports
 ## `[OK]`, because `unittest`'s failure flag is bound per test body.
@@ -159,7 +166,8 @@ template checkChildIsTold(argv: seq[string]; want: set[EventCategory];
     #     the defect: every kind the host asked for must be a kind the old shim
     #     would still emit. Superset is fine — the host filter removes the
     #     extras — a SUBSET is the false `mcComplete`.
-    check (wantedKinds(want) - preDA5ShimKinds(value)) == {}
+    check (wantedKinds(want) - preDA5ShimKinds(value) -
+      KindsNoLegacyShimHasAHookFor) == {}
 
 suite "io-mon CLI event-interest flag":
   test "with no flag the child is told FullInterest — every existing caller is unchanged":
@@ -309,7 +317,8 @@ suite "io-mon CLI event-interest flag":
     # arm that measured 14 records / `mcComplete` before this fix, and which now
     # measures 20 / `mcIncomplete`, byte-identical to the current shim's.
     check preDA5ShimKinds(childInterest(allArgv)) ==
-      {MonitorRecordKind.low .. MonitorRecordKind.high}
+      {MonitorRecordKind.low .. MonitorRecordKind.high} -
+        KindsNoLegacyShimHasAHookFor
 
   test "t_a_value_naming_only_retired_categories_is_refused_with_the_reason":
     # `--interest ipc` used to be a legal request. `mrIpcConnect` is now

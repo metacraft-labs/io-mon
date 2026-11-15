@@ -49,8 +49,8 @@ type
     #    a build that read SOURCE_DATE_EPOCH / $CFLAGS / hw.ncpu / uname re-runs iff
     #    that value changed — PRECISE, with NO false downgrade (a program that reads
     #    PATH benignly just adds PATH to the key; unchanged ⇒ no re-run). These
-    #    NEVER downgrade completeness. See the consumer contract in the R-D design
-    #    note (MacOS-Monitoring-Adversarial-Hardening.milestones.org §R-D).
+    #    NEVER downgrade completeness. That is the consumer contract for these
+    #    two kinds.
     mrEnvRead = 14
     mrSysctlRead = 15
     # 2. mrNonDeterministic — OBSERVED ENTROPY INPUT.
@@ -157,6 +157,36 @@ type
     # NOT a determinism input: the merge does not downgrade on it (a normal build
     # creates dirs + removes temp files), so a NORMAL build stays mcComplete.
     mrPathMutation = 19
+    # A FAILED `connect(2)` to an AF_INET / AF_INET6 destination — a
+    # connection ATTEMPT that reached no peer (ECONNREFUSED, ENETUNREACH,
+    # EACCES, ETIMEDOUT, …). Only a failure the transport returned is recorded:
+    # after EFAULT, EINVAL, EBADF or ENOTSOCK (Windows: WSAEFAULT, WSAEINVAL)
+    # the caller's address may be unreadable, and the shims never read it then
+    # (`io_mon/posix_connect`, `io_mon/winsock_connect`). APPENDED AT THE
+    # END for iomon wire-compat (never renumber). `path` is the destination in
+    # the same spelling `mrIpcConnect` uses for an AF_INET peer ("a.b.c.d:port",
+    # "[v6]:port"), `result` is the failed call's return value, and `detail` is
+    # `connect-attempt af_inet errno=<n>` (Windows: the WSA error).
+    #
+    # A DISTINCT KIND, NOT AN `mrIpcConnect` WITH A FAILURE FLAG, because the
+    # two mean opposite things to the completeness machinery. An `mrIpcConnect`
+    # names a peer that may have served content, so an out-of-tree one is a
+    # synthetic `mrEventLoss` (`unmonitoredSubtreeLossDetails` signal (c)); an
+    # attempt reached nobody and carried no content, so it must NEVER downgrade
+    # — a refused localhost probe costing a cache hit is the false re-run every
+    # backend's connect hook was written to avoid. Every consumer that reads
+    # `mrIpcConnect` (the merge, breakaway-report authentication, reprobuild's
+    # peer attribution) therefore ignores an attempt without having to be
+    # taught to, and a consumer that wants attempts asks for this kind by
+    # name. That consumer is typically a sandbox that judges network use: when
+    # the sandbox's network DENIES undeclared egress, every such connect
+    # fails in the kernel, and the attempt is the only evidence that the
+    # program tried.
+    #
+    # Only AF_INET/AF_INET6: a failed AF_UNIX connect is already not a breach
+    # (nothing answered), and recording every failed local-socket probe would
+    # flood captures with daemon-discovery noise no consumer reads.
+    mrConnectAttempt = 20
 
   MonitorObservationKind* = enum
     moProcessStart = 1
@@ -192,6 +222,10 @@ type
     # path (the dir/file was created or removed); it is recorded for output-tree
     # state tracking and is NOT a determinism downgrade.
     moPathMutation = 17
+    # The observation kind for the failed-connect record (appended for
+    # wire-compat, see mrConnectAttempt). Not a file observation and not a
+    # completeness signal: a connection that was never made.
+    moConnectAttempt = 18
 
   EventCategory* = enum
     ## The classes of observation a consumer can opt in / out of. See
@@ -215,12 +249,15 @@ type
     ## INERT. A category is now the unit a single consumer reads, so a narrowing
     ## can be argued one consumer at a time.
     ##
-    ## TWO CLASSES OF KIND BELONG TO NO CATEGORY AND ARE THEREFORE NEVER GATED —
+    ## THREE CLASSES OF KIND BELONG TO NO CATEGORY AND ARE THEREFORE NEVER GATED —
     ## `categoryOf` answers `none` for both, and `recordWanted` keeps whatever
     ## `categoryOf` cannot place:
     ##
     ##   * META — `mrEventLoss` / `mrBackendProfile` / `mrCapabilityGap`. A
     ##     suppressed loss marker would manufacture a false `mcComplete` (LF-1).
+    ##   * DETECTION-BEARING — `mrConnectAttempt`. It derives no loss
+    ##     marker, but it is the only evidence of an attempted connection in a
+    ##     sandbox that denies the network, so no narrowing may switch it off.
     ##   * COMPLETENESS-BEARING — `mrIpcConnect` and `mrExternalContent`.
     ##     `mergeFragments` DERIVES a synthetic `mrEventLoss` from them
     ##     (`unmonitoredSubtreeLossDetails`, `externalContentLossCount`), and the
@@ -784,8 +821,9 @@ type
       ## variables are still layered last, so monitoring cannot be switched
       ## off. Negative-sense so the zero value keeps the historical behaviour.
       ##
-      ## For a host that composes the action's whole environment (reprobuild
-      ## Dev-Env-Warm-Entry.md §2): otherwise a variable nobody declared still
+      ## For a host that composes the action's whole environment, so the
+      ## action does not inherit the caller's shell: otherwise a variable nobody
+      ## declared still
       ## reaches the child, and whatever the child reads from it is an input
       ## nobody recorded. Executable resolution is unaffected (see `env`
       ## above), so pass an absolute `command[0]`.
@@ -815,7 +853,44 @@ type
     evidenceScope*: EvidenceScope
 
 const
-  IomonVersion* = 1'u16
+  IomonVersion* = 2'u16
+    ## The `.iomon` envelope version this build WRITES.
+    ##
+    ## THE RULE: bump it whenever a writer can emit bytes a reader built
+    ## before the change would reject. Appending a `MonitorRecordKind` or
+    ## `MonitorObservationKind` is such a change, even though no existing
+    ## value is renumbered: `decodeRecordPayload` rejects an ordinal past
+    ## `high(...)`, so an older reader handed the new kind fails the whole
+    ## file as `mrSemanticValidationFailed` ("unknown iomon record kind"),
+    ## which reads as a corrupt capture. The bump turns that into
+    ## `mrUnsupportedVersion`, which says what actually happened: the file is
+    ## newer than the reader. A new token inside a record's `detail` (the
+    ## profile stamps, see `encode.observedInterestFromRecords`) is NOT such a
+    ## change, because readers skip tokens they do not know.
+    ##
+    ## `iomonVersionIntroducing` records the version that first wrote each
+    ## kind, and is exhaustive by construction, so a new kind does not compile
+    ## until it names one; the static check below it then refuses a kind
+    ## newer than `IomonVersion`.
+    ##
+    ## History:
+    ##   1 — kinds `mrProcessStart` .. `mrPathMutation` (1..19) and
+    ##       observations `moProcessStart` .. `moPathMutation` (1..17). Kinds
+    ##       12..19 were appended without a bump, so a reader built before one
+    ##       of them rejects a v1 file that carries it as a semantic error.
+    ##   2 — adds `mrConnectAttempt` (20) / `moConnectAttempt` (18), the
+    ##       failed AF_INET/AF_INET6 connect.
+    ##
+    ## Not bumps, by the rule above: `mrProcessStart`'s `path`, empty until
+    ## then, carries the process image's resolved physical path (and its
+    ## `detail` the token `image=unresolved` when that cannot be read;
+    ## docs/usage.md, "The process-start image"). Every reader already
+    ## decodes a `path` on every kind, so an older reader reads such a file
+    ## unchanged and merely ignores the value.
+  IomonMinReadableVersion* = 1'u16
+    ## The oldest envelope version this build READS. Every version up to
+    ## `IomonVersion` only appended kinds, so a reader that knows the newest
+    ## decodes every older file unchanged.
   IomonMagic* = "IOMN"
   IomonTrailerMagic* = "IOMT"
   IoMonDepfileProducer* = "iomon_depfile_v1"
@@ -897,9 +972,64 @@ proc raiseMonitorDepFileReaderError*(kind: MonitorDepFileReaderErrorKind;
   err.kind = kind
   raise err
 
+func iomonVersionReadable*(version: uint16): bool =
+  ## Whether this build's reader decodes an `.iomon` envelope of `version`.
+  version >= IomonMinReadableVersion and version <= IomonVersion
+
+func iomonVersionIntroducing*(kind: MonitorRecordKind): uint16 =
+  ## The `.iomon` envelope version that first wrote `kind` (see the rule on
+  ## `IomonVersion`). Exhaustive on purpose: a newly appended kind is a
+  ## compile error here until it names the version that introduces it.
+  case kind
+  of mrProcessStart, mrProcessExec, mrProcessSpawn, mrFileOpen, mrFileRead,
+     mrPathProbe, mrFileWrite, mrEventLoss, mrDirectoryEnumerate,
+     mrBackendProfile, mrCapabilityGap, mrIpcConnect, mrLibraryLoad,
+     mrEnvRead, mrSysctlRead, mrNonDeterministic, mrTimeRead,
+     mrExternalContent, mrPathMutation:
+    1'u16
+  of mrConnectAttempt:
+    2'u16
+
+func iomonVersionIntroducing*(kind: MonitorObservationKind): uint16 =
+  ## The observation-kind counterpart of the record-kind table above.
+  case kind
+  of moProcessStart, moExecute, moFileOpen, moFileRead, moPathProbe,
+     moFileWrite, moEventLoss, moDirectoryEnumerate, moBackendProfile,
+     moCapabilityGap, moIpcConnect, moEnvRead, moSysctlRead,
+     moNonDeterministic, moTimeRead, moExternalContent, moPathMutation:
+    1'u16
+  of moConnectAttempt:
+    2'u16
+
+static:
+  # A kind introduced by a version newer than the one this build writes would
+  # put bytes into a file whose header promises an older reader can decode
+  # them: the skew `IomonVersion`'s rule exists to prevent.
+  for kind in MonitorRecordKind:
+    doAssert iomonVersionIntroducing(kind) <= IomonVersion,
+      $kind & " is introduced by iomon version " &
+      $iomonVersionIntroducing(kind) & " but IomonVersion is " & $IomonVersion
+  for kind in MonitorObservationKind:
+    doAssert iomonVersionIntroducing(kind) <= IomonVersion,
+      $kind & " is introduced by iomon version " &
+      $iomonVersionIntroducing(kind) & " but IomonVersion is " & $IomonVersion
+
 # ---------------------------------------------------------------------------
 # Event-interest categories — docs/contributors/event-interest-filter.md
 # ---------------------------------------------------------------------------
+
+const
+  UnmonitoredSubtreeLossPrefix* =
+    "unmonitored subtree/peer (un-injectable spawn child, SETEXEC into a " &
+    "hardened image, or IPC connect to an out-of-tree breakaway daemon): "
+    ## The text `mergeFragments` (writer.nim) prepends to each entry
+    ## `unmonitoredSubtreeLossDetails` returns, in the synthetic `mrEventLoss`
+    ## it injects. Exported so a consumer that attributes a loss (e.g. a
+    ## sandbox recognising its own egress forwarder as the peer) matches the
+    ## exact text rather than a guess at it.
+  IpcPeerLossPrefix* = "ipc peer outside monitored tree "
+    ## The (c) arm's own prefix inside that text; ` path=<destination>` is its
+    ## last token.
 
 const FullInterest* = {EventCategory.low .. EventCategory.high}
   ## Every category — io-mon's default, and what an empty request interest is
@@ -937,6 +1067,14 @@ func categoryOf*(kind: MonitorRecordKind): Option[EventCategory] =
     some(ecEntropy)
   of mrTimeRead, mrSysctlRead:
     some(ecAmbientReads)
+  of mrConnectAttempt:
+    # UNGATE-ABLE, and for a third reason: DETECTION-BEARING. It derives no
+    # loss marker (a failed connect reached nobody), but it is the only
+    # evidence of an attempted connection in a sandbox whose network denies
+    # it, and a detection that a narrowing could silently switch off is not a
+    # detection. Rare by construction (one record per failed AF_INET connect),
+    # so being always on costs nothing a consumer would notice.
+    none(EventCategory)
   of mrIpcConnect, mrExternalContent:
     # UNGATE-ABLE, not uncategorised. `mergeFragments` turns each out-of-tree
     # IPC peer and each unpaired external-content channel into a synthetic
@@ -1025,8 +1163,8 @@ func recordIsFailedExistenceLookup*(record: MonitorRecord): bool =
   ## the lookups that FOUND SOMETHING USABLE — the evidence a compiler-emitted
   ## depfile carries — and an errored lookup found nothing usable. The
   ## consequence is a staleness blind spot, and it is written down as such: ROW 4
-  ## of the normative hazard table (`docs/usage.md`,
-  ## `docs/contributors/evidence-scope.md`, and reprobuild's `CLI/build.md`) says
+  ## of the normative hazard table (`docs/usage.md` and
+  ## `docs/contributors/evidence-scope.md`) says
   ## that a file which exists but could not be OPENED, later becoming openable (a
   ## `chmod`, a directory replaced by a file), is invisible under `reads-only` —
   ## for the same reason row 3's added file is: **it is not recorded at all**, so
@@ -1139,7 +1277,7 @@ func recordIsFailedExistenceLookup*(record: MonitorRecord): bool =
     false
   of mrProcessStart, mrProcessExec, mrProcessSpawn, mrLibraryLoad,
      mrNonDeterministic, mrTimeRead, mrEnvRead, mrSysctlRead,
-     mrExternalContent, mrIpcConnect:
+     mrExternalContent, mrIpcConnect, mrConnectAttempt:
     # Not lookups at all. `mrIpcConnect` and `mrExternalContent` are also
     # COMPLETENESS-BEARING (`mergeFragments` derives a synthetic `mrEventLoss`
     # from them), so dropping either would move the grade — which this axis must
@@ -1747,7 +1885,7 @@ static:
           emitted.incl(legacyMemberKinds(legacy))
     for kind in MonitorRecordKind:
       if categoryOf(kind).isNone and kind notin {mrIpcConnect, mrExternalContent}:
-        emitted.incl(kind)          # META: never gated by any vocabulary
+        emitted.incl(kind)          # META / detection: never gated by any vocabulary
     doAssert (wanted - emitted) == {},
       "interestToShimTokens(" & $s & ") = `" & wire & "` leaves " &
       $(wanted - emitted) & " outside every legacy category it names, so a " &

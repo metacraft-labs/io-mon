@@ -6,9 +6,7 @@
 ## enumeration and mutation through this join. It used Nim's `os./`, which
 ## folds every `..` lexically, so `link/../file` (with `link -> sub/target`)
 ## was recorded `<root>/file` while the kernel opened `<root>/sub/file`
-## (reprobuild-pm issue 2026-10-21-linux-shim-folds-dotdot-after-a-symlink-
-## lexically; spec reprobuild-pm/spec/Monitor-Hook-Shim.md § "Metadata,
-## Probe, And Symlink APIs": "`..` after a link applies to where the link
+## (the monitor contract: "`..` after a link applies to where the link
 ## points"). Only a LEADING `..` may be applied to the anchor, and only when
 ## the anchor is symlink-free; the live shim behaviour is covered by
 ## tests/linux/test_io_mon_linux_dotdot_after_symlink.nim.

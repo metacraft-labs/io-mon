@@ -17,8 +17,7 @@ pass because the missing symbol is resolved dynamically.
 
 ## Expected
 
-[Release scope and payload verification](https://github.com/metacraft-labs/metacraft-specs/blob/5f364d0/infrastructure/gosti-io-mon-runquota-releases.md)
-requires functioning Linux capture in clean distro images. The release
+Release scope and payload verification require functioning Linux capture in clean distro images. The release
 runbook includes Debian 11, and the build selects glibc 2.28 as its floor.
 
 ## Evidence

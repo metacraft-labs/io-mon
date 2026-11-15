@@ -41,7 +41,7 @@
 ##       DH-2 exists to enable (`seq[MonitorHandle]`, `pollMonitor` on an
 ##       element, `finishMonitor(move(…))` out of it).
 
-import std/[os, osproc, streams, strutils, unittest]
+import std/[os, osproc, strutils, unittest]
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
@@ -94,7 +94,15 @@ proc compileProbe(name, source: string): tuple[output: string; code: int] =
   ]
   let p = startProcess(getEnv("NIM", "nim"), workingDir = repoRoot, args = args,
     options = {poStdErrToStdOut, poUsePath})
-  let output = p.outputStream.readAll()
+  # Drain the pipe to EOF. `Stream.readAll` stops at the first read shorter
+  # than its buffer, and a Windows pipe read returns whatever the writer has
+  # produced so far. The Windows Nim 2.2.10 that Reprobuild 0.2.23 provisions
+  # delivers a diagnostic's first byte on its own, so this probe kept only
+  # "D" (of "D:\...") and never saw the `=copy` needle the compiler printed
+  # (io-mon run 43289512869, Windows x64).
+  var output = ""
+  for line in p.lines(keepNewLines = true):
+    output.add(line)
   let code = p.waitForExit()
   p.close()
   (output, code)

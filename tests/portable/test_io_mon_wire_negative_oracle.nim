@@ -12,12 +12,12 @@
 ## WHY A POSITIVE FIXTURE CANNOT DO THIS JOB. Four header fields are pinned to
 ## small values by the format itself:
 ##
-##   `kind`  1 .. 19   (`MonitorRecordKind`)
-##   `obs`   1 .. 17   (`MonitorObservationKind`)
+##   `kind`  1 .. 20   (`MonitorRecordKind`)
+##   `obs`   1 .. 18   (`MonitorObservationKind`)
 ##   `probe` 0 ..  4   (`ProbeResult`)
 ##   `seq`   exactly 1 .. N in file order (`reader.validateSequenceOrder`)
 ##
-## For `kind`, `obs` and `probe` this is absolute: 19, 17 and 4 all fit in a
+## For `kind`, `obs` and `probe` this is absolute: 20, 18 and 4 all fit in a
 ## single byte, so no legal capture — however informative its other fields —
 ## can put a non-zero byte above their low byte. `seq` is bounded differently
 ## and the difference is worth stating exactly rather than rounding off: it is
@@ -205,8 +205,8 @@ proc negativeCases(): seq[NegCase] =
       "kind=0 — all-zero leading bytes; below low(MonitorRecordKind)=1.",
       p.patched(OffKind, 0x0000'u16), eeUnknownType, mrSemanticValidationFailed),
     payloadCase("kind_one_past_high",
-      "kind=20 — one past high(MonitorRecordKind)=19; an off-by-one bound.",
-      p.patched(OffKind, 20'u16), eeUnknownType, mrSemanticValidationFailed),
+      "kind=21 — one past high(MonitorRecordKind)=20; an off-by-one bound.",
+      p.patched(OffKind, 21'u16), eeUnknownType, mrSemanticValidationFailed),
     payloadCase("kind_all_bits",
       "kind=0xFFFF — every bit set; a sign/width slip reads -1 or 255.",
       p.patched(OffKind, 0xFFFF'u16), eeUnknownType, mrSemanticValidationFailed),
@@ -222,8 +222,8 @@ proc negativeCases(): seq[NegCase] =
       "obs=0 — below low(MonitorObservationKind)=1.",
       p.patched(OffObs, 0x0000'u16), eeUnknownType, mrSemanticValidationFailed),
     payloadCase("obs_one_past_high",
-      "obs=18 — one past high(MonitorObservationKind)=17.",
-      p.patched(OffObs, 18'u16), eeUnknownType, mrSemanticValidationFailed),
+      "obs=19 — one past high(MonitorObservationKind)=18.",
+      p.patched(OffObs, 19'u16), eeUnknownType, mrSemanticValidationFailed),
     payloadCase("probe_high_byte_set",
       "probe=0x01000002 — narrowed to 8/16/24 bits this is prExistingFile, " &
       "which is LEGAL; the u32 load must see the high byte.",

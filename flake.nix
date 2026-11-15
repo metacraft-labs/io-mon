@@ -25,7 +25,12 @@
       # inline raw-syscall scanner decodes code and never the `.rodata` /
       # `.eh_frame` a BOLT or `-z noseparate-code` executable segment carries
       # (the rustc 1.94.0 jump-table SIGILL).
-      url = "github:metacraft-labs/nim-stackable-hooks/c1d55ce33fb2a29e4cf8d8bdbe1713f355370d0a";
+      # c1d55ce -> c34e325 (2026-11-15): the raw syscall entries are
+      # hand-written on x86-64 and 32-bit ARM, so nothing runs between the
+      # syscall instruction and the return; a CLONE_VM clone forwarded by
+      # this shim's syscall(2) replacement no longer writes into its
+      # parent's frame when the library is built at -O0.
+      url = "github:metacraft-labs/nim-stackable-hooks/c34e3252d413361a0f250d8921e00c119d30e114";
       flake = false;
     };
     shm-queue-src = {
@@ -41,7 +46,10 @@
       # directory makes the dependency set unavailable (and the shim fall back to
       # its file transport) instead of killing the monitor root with SIGBUS --
       # the ~1-in-5 cold `repro infra plan` failure measured on rpi2.
-      url = "github:metacraft-labs/nim-shm-gset/6333cc915689559b00f81371734783c2e894ca45";
+      # Bumped 6333cc9 -> 7bc81ad (`agents`): `emitNoGrow`, the
+      # async-signal-safe set insert the Linux shim's inline-syscall loss
+      # report uses when no armed-loss file can be created.
+      url = "github:metacraft-labs/nim-shm-gset/7bc81ad2440860a8a9254eb2757c585df9652438";
       flake = false;
     };
   };
@@ -128,8 +136,7 @@
           # get_dyld_hdr walks the shared cache with
           # dyld_shared_cache_iterate_text, whose _Block_copy mallocs, and that
           # malloc re-enters AsanInitFromRtl and spins on the init mutex it
-          # holds. scripts/run_sanitizer_tests.sh then never runs a test
-          # (metacraft-pm issues/2026-10-01-nix-compiler-rt-asan-startup-hangs-on-macos-26.md).
+          # holds. scripts/run_sanitizer_tests.sh then never runs a test.
           # Upstream LLVM 2e7d07a33725 ("Adopt _dyld_get_dyld_header", first
           # released in 22.1.3) asks dyld for its header instead; this is that
           # change backported to 21.x, minus its lib/tsan/go/buildgo.sh hunk

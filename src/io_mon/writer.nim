@@ -369,8 +369,7 @@ const fragmentSlotOnHeap = not (defined(macosx) or defined(windows))
   ## So the shim made every host thread created with an explicit stack of
   ## 64 KiB or less fail — Node 24 printed `pthread_create: Invalid argument`
   ## and a Playwright Chromium launch timed out under monitoring
-  ## (reprobuild-pm issue 2026-10-02-action-monitor-prevents-declared-browser-
-  ## launch; regression test
+  ## (regression test
   ## `tests/linux/test_io_mon_shim_static_tls_small_stack_threads`). And the
   ## cost was paid by every thread of every monitored process even though the
   ## Linux shim publishes through the shared-memory set and never opens a
@@ -435,9 +434,11 @@ var
   # the process's real on-disk image path (`/proc/self/exe`, set by the shim via
   # `setDepSetIncarnationImage` at init and re-captured after every exec). This is
   # the REAL exec identity, NOT a synthetic nonce. It exists to keep the pre-exec
-  # and post-exec `process-start` of ONE pid distinct: those two records are
-  # byte-identical (both reset `seq` to 1, same pid/ppid/tid, empty path), so the
-  # identity element-key alone would DEDUP the second and break the completeness
+  # and post-exec `process-start` of ONE pid distinct: those two records share
+  # `seq` (both reset to 1) and pid/ppid/tid, and their `path` (the resolved
+  # image) differs only when the image does — a same-image re-exec, or a shim
+  # that predates the image field (empty path), makes them byte-identical — so
+  # the identity element-key alone could DEDUP the second and break the completeness
   # invariant `startCount == 1 + execCount` — the exec-collision part 1 patched with
   # a random tag. Because the image is per-INCARNATION-constant, a probe storm
   # WITHIN one incarnation still collapses (Candidate-C source-dedup), while a
@@ -695,11 +696,35 @@ proc rebuildDepSetLossElem*() =
   # distinct mrEventLoss element forces mcIncomplete), so a suffix clipped to
   # the small pre-encoded buffer is harmless — unlike a real record's.
   let total = encodeDepSetElement(lossRec, buf, dseTruncateSuffix)
-  setLossElemLen = 0
+  # The length is published last, with release order: a signal handler that
+  # reads it (`repro_dep_set_signal_loss`) sees either 0 or the whole element.
+  atomicStoreN(addr setLossElemLen, 0, ATOMIC_RELEASE)
   if total < 0: return
   for k in 0 ..< total:
     setLossElem[k] = buf[k]
-  setLossElemLen = total
+  atomicStoreN(addr setLossElemLen, total, ATOMIC_RELEASE)
+
+proc repro_dep_set_signal_loss*(): cint {.exportc, cdecl, raises: [].} =
+  ## Publish the pre-encoded event-loss element into the edge's shared-memory
+  ## SET without growing it (`emitNoGrow`), for the Linux shim's inline-syscall
+  ## loss reports when no file descriptor can be opened. When shard0 cannot
+  ## take the element, the set's growth-failure counter is bumped instead,
+  ## which the consumer also grades `mcIncomplete`; in that case the counter
+  ## means "the set lacks an element a producer had", not only an OOM growth
+  ## failure. Returns 1 when the capture will now read incomplete, 0 when this
+  ## process has no set to publish to (file transport, never attached, or the
+  ## consumer is gone).
+  ##
+  ## Async-signal-safe: it reads two plain globals and the producer's cached
+  ## shard0 mapping. No allocation, lock, descriptor or system call.
+  if not atomicLoadN(addr setProducerAttached, ATOMIC_ACQUIRE):
+    return 0
+  let n = atomicLoadN(addr setLossElemLen, ATOMIC_ACQUIRE)
+  if n <= 0 or n > setLossElem.len:
+    return 0
+  case setProducer.emitNoGrow(setLossElem.toOpenArray(0, n - 1))
+  of emInserted, emExists, emSaturated: 1
+  of emConsumerGone, emOversize, emUnavailable: 0
 
 proc depSetLossElement*(): seq[byte] =
   ## Test/introspection — a copy of the currently pre-encoded event-loss SET
@@ -746,7 +771,9 @@ proc attachDepQueueForShim*(segmentPath: string) =
     if setProducerAttached and setProducer.available:
       return
     setProducer = shmset.attachProducer(segmentPath)
-    setProducerAttached = true
+    # Release order: `repro_dep_set_signal_loss` may run in a signal handler
+    # and must see the whole producer once it sees the flag.
+    atomicStoreN(addr setProducerAttached, true, ATOMIC_RELEASE)
     rebuildDepSetLossElem()
 
 proc discardDepQueueAfterFork*(segmentPath: string) =
@@ -755,8 +782,8 @@ proc discardDepQueueAfterFork*(segmentPath: string) =
   ## the parent's inherited fd. Coordinated with the DEP-FLUSH atfork handler
   ## (`discardFragmentSlotAfterFork`) on the platforms that still use the file arm.
   if setProducerAttached:
+    atomicStoreN(addr setProducerAttached, false, ATOMIC_RELEASE)
     setProducer.detach()
-    setProducerAttached = false
   attachDepQueueForShim(segmentPath)
 
 proc depSetIsActive*(): bool =
@@ -2361,9 +2388,8 @@ proc childIsMonitored(childPid: uint64; childStart: string;
 
 proc unmonitoredSubtreeLossDetails*(records: openArray[MonitorRecord];
     trustedPeerPids: HashSet[uint64] = initHashSet[uint64]()): seq[string] =
-  ## T0 — EARN mcComplete (MacOS-Monitoring-Adversarial-Hardening.milestones.org
-  ## §"T0 — Earn mcComplete"; Monitor-Hook-Shim.md §"Failure Semantics":
-  ## "successful child exit MUST NOT hide monitor failure").
+  ## T0 — EARN mcComplete. A successful child exit MUST NOT hide a monitor
+  ## failure: a capture is complete only when the evidence shows it is.
   ##
   ## The monitor must not ASSERT `mcComplete`; it must EARN it. The cross-process
   ## merge sees every monitored process's fragments, so it can PROVE the process
@@ -2601,7 +2627,7 @@ proc unmonitoredSubtreeLossDetails*(records: openArray[MonitorRecord];
         continue
       flaggedPeers.incl key
       let peerUid = trustedDetailToken(r.detail, PeerUidToken)
-      result.add("ipc peer outside monitored tree pid=" & $r.osPid &
+      result.add(IpcPeerLossPrefix & "pid=" & $r.osPid &
         " peer=" & $peer & " peerstart=" & peerStart &
         (if peerUid.len > 0: " peeruid=" & peerUid else: "") &
         " path=" & r.path)
@@ -2750,8 +2776,7 @@ const
     ## Required first non-empty line of a trusted-daemon breakaway report.
   IoMonBreakawayReportDirEnv* = "IO_MON_BREAKAWAY_REPORT_DIR"
     ## Env var naming the directory a trusted daemon drops breakaway reports into
-    ## (and that the merge folds them from). See `loadBreakawayReports` and the
-    ## T3a design notes in MacOS-Monitoring-Adversarial-Hardening.milestones.org.
+    ## (and that the merge folds them from). See `loadBreakawayReports`.
 
 type
   BreakawayFold = object
@@ -3176,6 +3201,40 @@ proc dropStaleRunRecords(records: seq[MonitorRecord];
       detail: "duplicate identity token in fragment record for run " &
         currentRunId)
 
+const
+  ArmedInlineLossSuffix* = "-armed-inline-loss.iomon-frag"
+    ## Suffix of the Linux shim's ARMED inline-syscall loss files,
+    ## `repro-monitor-<pid>-<epoch>-armed-inline-loss.iomon-frag` and
+    ## `repro-monitor-<pid>-s<starttime>-exec-armed-inline-loss.iomon-frag`.
+    ## A process creates one before it replays a trapped inline syscall and
+    ## deletes it once a drain has classified everything it trapped
+    ## (`linux_preload_runtime.nim`, "AN ARMED LOSS"). One left behind means
+    ## the process died with trapped calls it never classified. It is created
+    ## empty, with `mknodat` on its absolute path (no descriptor needed), so
+    ## the merge reads its existence, not its contents.
+  ArmedInlineLossDetail* = "inline raw syscall events unclassified at image end"
+    ## Detail of the loss an armed file stands for: the same text the shim's
+    ## immediate report writes, so either form reads the same downstream.
+
+proc armedInlineLossRecord*(fileName: string): MonitorRecord =
+  ## The event-loss an armed inline-loss file stands for. The pid comes from
+  ## the name (`repro-monitor-<pid>-...`), so the run scoping in
+  ## `mergeFragments` keeps it for a pid of this run and drops it for a pid
+  ## seen only in a prior run's leftovers; an unparsable name keeps pid 0 and
+  ## is kept (fail closed).
+  result = MonitorRecord(kind: mrEventLoss, observationKind: moEventLoss,
+    detail: ArmedInlineLossDetail & " (armed " & fileName & ")")
+  const prefix = "repro-monitor-"
+  if fileName.startsWith(prefix):
+    var pid = 0'u64
+    var i = prefix.len
+    while i < fileName.len and fileName[i] in {'0' .. '9'}:
+      pid = pid * 10 + uint64(ord(fileName[i]) - ord('0'))
+      inc i
+    if i > prefix.len and i < fileName.len and fileName[i] == '-':
+      result.osPid = pid
+      result.threadId = pid
+
 proc foldObservationIdentity*(records: openArray[MonitorRecord]):
     seq[MonitorRecord] =
   ## DA-10 — THE IDENTITY FOLD ON THE FILE/MERGE PATH, so a backend that has no
@@ -3366,10 +3425,10 @@ proc mergeFragments*(fragmentDir, outputPath: string;
   closeFragmentSlot()
   var records: seq[MonitorRecord] = @[]
   # Fail-closed accounting: any fragment that does not decode cleanly to EOF
-  # is a partial or corrupt iomon write. Per Monitor-Hook-Shim.md §"Failure
-  # Semantics" ("partial iomon writes MUST fail reader validation"; "shim
-  # crash MUST reject cache publication"; "successful child exit MUST NOT
-  # hide monitor failure"), such evidence MUST NOT be published. We surface
+  # is a partial or corrupt iomon write. The monitor's failure contract says
+  # partial iomon writes MUST fail reader validation, a shim crash MUST reject
+  # cache publication, and a successful child exit MUST NOT hide a monitor
+  # failure, so such evidence MUST NOT be published. We surface
   # it in-band as event-loss so the existing completeness machinery
   # (``summarizeRecords`` → ``depFileFromRecords``) marks the depfile
   # ``mcIncomplete``, which the build engine already rejects for caching.
@@ -3387,6 +3446,11 @@ proc mergeFragments*(fragmentDir, outputPath: string;
         # skip it rather than abort the WHOLE merge (which would fail the entire
         # monitored run on a benign cleanup race). OSError covers a directory
         # entry that disappeared underneath the walk.
+        # An armed inline-syscall loss (the Linux shim): its EXISTENCE is the
+        # loss, whatever it holds -- it is created empty, with no descriptor.
+        let fragName = extractFilename(path)
+        if fragName.endsWith(ArmedInlineLossSuffix):
+          records.add armedInlineLossRecord(fragName)
         try:
           var cleanEof = true
           records.add readFragmentRecordsForMerge(path, cleanEof)
@@ -3562,15 +3626,13 @@ proc mergeFragments*(fragmentDir, outputPath: string;
   # piece of evidence forces `mcIncomplete` via the SAME event-loss machinery as
   # the corrupt-fragment path, so the breakaway becomes a conservative re-run
   # rather than a false skip — self-flagged by io-mon, not left solely to the
-  # consumer (Monitor-Hook-Shim.md §"Failure Semantics"). See
+  # consumer. See
   # unmonitoredSubtreeLossCount.
   let subtreeLosses = unmonitoredSubtreeLossDetails(records, trustedPeerPids)
   for loss in subtreeLosses:
     records.add MonitorRecord(kind: mrEventLoss,
       observationKind: moEventLoss,
-      detail: "unmonitored subtree/peer (un-injectable spawn child, SETEXEC " &
-        "into a hardened image, or IPC connect to an out-of-tree breakaway " &
-        "daemon): " & loss)
+      detail: UnmonitoredSubtreeLossPrefix & loss)
   # ROUND-3 S1 — DOWNGRADE on out-of-tree CONTENT CHANNELS: a POSIX shm object not
   # created in-tree, or a FIFO with no in-tree writer. The producer is outside the
   # monitored tree so the consumed content is an invisible input. One synthetic

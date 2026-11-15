@@ -48,13 +48,16 @@ const
     ## The META kinds. Restated here so the case below is an INDEPENDENT
     ## statement of what META means rather than a tautology over the
     ## implementation it is grading.
-  UngateableKinds = MetaKinds + {mrIpcConnect, mrExternalContent}
+  UngateableKinds = MetaKinds + {mrIpcConnect, mrExternalContent,
+                                 mrConnectAttempt}
     ## Every kind `categoryOf` answers `none` for. DA-5 added the two
     ## COMPLETENESS-BEARING kinds to that answer: `mergeFragments` derives a
     ## synthetic `mrEventLoss` from them after the shim's gate has run, so a
     ## narrowing that could suppress either would delete a loss marker one step
     ## before it existed. This axis inherits their protection from the same
-    ## `categoryOf` guard that protects META.
+    ## `categoryOf` guard that protects META. The
+    ## DETECTION-BEARING `mrConnectAttempt` (a failed connect, the only
+    ## evidence of a denied attempt) is equally never gated.
 
 proc lookupRecord(kind: MonitorRecordKind; obs: MonitorObservationKind;
                   path: string; res: int64;

@@ -23,13 +23,15 @@ import io_mon/types
 
 const
   Ungateable = {mrEventLoss, mrBackendProfile, mrCapabilityGap,
-                mrIpcConnect, mrExternalContent}
+                mrIpcConnect, mrExternalContent, mrConnectAttempt}
     ## Every kind `categoryOf` must answer `none` for, restated here
     ## INDEPENDENTLY of `categoryOf` so the assertions below are not a tautology
     ## over the thing they grade. Two classes, one property: META (LF-1) and
     ## completeness-bearing (`mergeFragments` derives a synthetic `mrEventLoss`
     ## from `mrIpcConnect` / `mrExternalContent` AFTER the shim's gate has run,
-    ## so a category holding them converts `mcIncomplete` into `mcComplete`).
+    ## so a category holding them converts `mcIncomplete` into `mcComplete`),
+    ## plus the detection-bearing `mrConnectAttempt` (a failed connect: the
+    ## only evidence of an attempt a sandbox denied).
 
 func expectedCategory(kind: MonitorRecordKind): Option[EventCategory] =
   ## THE MEMBERSHIP TABLE, WRITTEN OUT BY HAND AND EXHAUSTIVELY. Deliberately
@@ -57,6 +59,7 @@ func expectedCategory(kind: MonitorRecordKind): Option[EventCategory] =
   of mrEventLoss: none(EventCategory)         # META (LF-1)
   of mrBackendProfile: none(EventCategory)    # META
   of mrCapabilityGap: none(EventCategory)     # META
+  of mrConnectAttempt: none(EventCategory)    # detection-bearing
 
 func oldReaderCategories(s: string): set[LegacyEventCategory] =
   ## THE PRE-DA-5 DECODER, in the pre-DA-5 vocabulary. Not a reimplementation
@@ -95,6 +98,12 @@ func preDA5ShimKinds(value: string): set[MonitorRecordKind] =
   # The three META kinds belonged to no category in EITHER vocabulary.
   result.incl({mrEventLoss, mrBackendProfile, mrCapabilityGap})
 
+const KindsNoLegacyShimHasAHookFor = {mrConnectAttempt}
+  ## Kinds added after DA-5 whose HOOK a pre-DA-5 shim does not have at all
+  ## (`mrConnectAttempt`). No token can make an old shim emit them, so
+  ## their absence from its output is version skew, not under-capture by the
+  ## wire encoding graded below; they are ungate-able in a current shim.
+
 suite "event-interest categories (DA-5: one category per consumer)":
 
   test "t_categoryOf_is_exhaustive_and_every_kind_states_its_own_answer":
@@ -115,7 +124,7 @@ suite "event-interest categories (DA-5: one category per consumer)":
       check categoryOf(kind) == expectedCategory(kind)
     # A count, so a `MonitorRecordKind` that stopped being iterable (a hole cut
     # into the enum) cannot quietly shrink this case to nothing.
-    check checkedKinds == 19
+    check checkedKinds == 20
 
   test "t_the_ungateable_kinds_are_exactly_the_meta_and_completeness_bearing_ones":
     # The set equality in BOTH directions, because either inclusion alone is
@@ -129,6 +138,7 @@ suite "event-interest categories (DA-5: one category per consumer)":
     check mrIpcConnect in actual
     check mrExternalContent in actual
     check mrEventLoss in actual
+    check mrConnectAttempt in actual        # detection-bearing
 
   test "t_every_category_is_reachable_from_some_record_kind":
     # A category no kind maps to is a token a consumer can ask for that gates
@@ -462,19 +472,23 @@ suite "event-interest env channel (the value a SHIM is told)":
       var wanted: set[MonitorRecordKind] = {}
       for kind in MonitorRecordKind:
         if recordWanted(s, kind): wanted.incl(kind)
-      let missing = wanted - preDA5ShimKinds(interestToShimTokens(s))
+      let missing = wanted - preDA5ShimKinds(interestToShimTokens(s)) -
+        KindsNoLegacyShimHasAHookFor
       if missing != {}:
         checkpoint($s & " -> `" & interestToShimTokens(s) & "` loses " & $missing)
         inc underCaptured
-      if (wanted - preDA5ShimKinds(interestToTokens(s))) != {}:
+      if (wanted - preDA5ShimKinds(interestToTokens(s)) -
+          KindsNoLegacyShimHasAHookFor) != {}:
         inc underCapturedControl
     check underCaptured == 0
     check underCapturedControl == 193
     # And the default — no flag at all — is the arm the issue was filed on.
     check preDA5ShimKinds(interestToShimTokens(FullInterest)) ==
-      {MonitorRecordKind.low .. MonitorRecordKind.high}
+      {MonitorRecordKind.low .. MonitorRecordKind.high} -
+        KindsNoLegacyShimHasAHookFor
     check (wantedKinds(FullInterest) -
-           preDA5ShimKinds(interestToTokens(FullInterest))) ==
+           preDA5ShimKinds(interestToTokens(FullInterest)) -
+           KindsNoLegacyShimHasAHookFor) ==
       {mrFileOpen, mrFileRead, mrPathProbe, mrDirectoryEnumerate, mrFileWrite,
        mrPathMutation, mrEnvRead, mrNonDeterministic, mrTimeRead, mrSysctlRead,
        mrIpcConnect, mrExternalContent}

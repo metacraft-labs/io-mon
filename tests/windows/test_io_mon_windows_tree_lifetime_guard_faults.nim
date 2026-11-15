@@ -1,7 +1,7 @@
 ## test_io_mon_windows_tree_lifetime_guard_faults — the guard's failure modes
 ## that have no honest trigger on a healthy host.
 ##
-## reprobuild-pm spec/io-mon-Windows-Tree-Lifetime-Guard.md §3 requires every
+## The guard's contract requires every
 ## way the Windows tree-lifetime guard can fail to FAIL CLOSED with its own
 ## diagnostic: never silently complete, and never the old blanket marker. F4
 ## (an inherited job that cannot nest) is provoked for real in

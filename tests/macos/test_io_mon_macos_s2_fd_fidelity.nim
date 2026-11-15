@@ -1,10 +1,11 @@
 ## test_io_mon_macos_s2_fd_fidelity — ROUND-3 S2 fd→path / PATH-FIDELITY holes,
-## LIVE under the macOS interpose+body-patch shim, against the round-3 adversarial
-## corpus (research/adversarial-2026-06-round3/r3_fd). See
-## reprobuild-specs/MacOS-Monitoring-Adversarial-Hardening.milestones.org (ROUND 3,
-## S2). Each break is a dependency captured under a path that would NOT match a
-## consumer's canonical cache key, or attributed to the wrong file via fd
-## duplication — a false cache hit / stale artifact.
+## LIVE under the macOS interpose+body-patch shim, against the round-3
+## adversarial corpus (research/adversarial-2026-06-round3/r3_fd): round 3,
+## phase S2 of the macOS adversarial-hardening campaign (probes that look for a
+## dependency the monitor misses while still reporting mcComplete). Each break
+## is a dependency captured under a path that would NOT match a consumer's
+## canonical cache key, or attributed to the wrong file via fd duplication — a
+## false cache hit / stale artifact.
 ##
 ## S2a dirfd-relative stat — `fstatat(dirfd, "rel", …)` / `getattrlistat` with a
 ##   REAL dirfd recorded only the BARE relative component (the round-2 residual).

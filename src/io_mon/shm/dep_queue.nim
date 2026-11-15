@@ -93,8 +93,9 @@ proc getU64(buf: openArray[byte]; pos: var int): uint64 =
 
 type
   DepIdentityScope* = enum
-    ## DA-1b (reprobuild-specs/Dependency-Attribution.milestones.org) — WHAT
-    ## MAKES TWO OBSERVATIONS THE SAME FACT, decided per record kind. The
+    ## WHAT MAKES TWO OBSERVATIONS THE SAME FACT, decided per record kind, so
+    ## a fact observed by many processes is written down once rather than
+    ## once per process. The
     ## argument for every kind's answer is in `depIdentityScope` below.
     disProcessScoped   ## the OBSERVING PROCESS is part of the observed fact
     disPathScoped      ## the observed PATH is the fact; the observer is not
@@ -132,7 +133,9 @@ func depIdentityScope*(kind: MonitorRecordKind): DepIdentityScope =
   ##   `mrExternalContent` producer is inside the monitored tree. Zeroing the
   ##   pid here would not weaken the decision, it would delete it — measured,
   ##   the 4,059 process-starts of that `nim c` collapse to ONE element,
-  ##   because on Linux their `detail` is the same constant string. The record
+  ##   because on Linux their `detail` was the same constant string (measured
+  ##   before process-starts carried their image path; most of them run the
+  ##   same compiler image, so they would still collapse). The record
   ##   COUNT is load-bearing too: signal (b) is
   ##   `execCount(pid) >= startCount(pid)`.
   ## `mrProcessExec` — the other half of signal (b). One post-exec start per
@@ -253,7 +256,9 @@ func depIdentityScope*(kind: MonitorRecordKind): DepIdentityScope =
     disFactScoped
   of mrProcessStart, mrProcessExec, mrProcessSpawn, mrFileWrite, mrEventLoss,
      mrBackendProfile, mrCapabilityGap, mrIpcConnect, mrNonDeterministic,
-     mrExternalContent, mrPathMutation:
+     mrExternalContent, mrPathMutation, mrConnectAttempt:
+    # `mrConnectAttempt`: the pid is evidence, because a consumer judging
+    # network use names the process that tried the connection.
     disProcessScoped
 
 func depIdentityKeepsIncarnation*(kind: MonitorRecordKind): bool =
@@ -277,10 +282,13 @@ func depIdentityKeepsIncarnation*(kind: MonitorRecordKind): bool =
   ##
   ## It must NOT be dropped for the other two classes, and for different
   ## reasons. PROCESS-scoped: a pid's pre-exec and post-exec `mrProcessStart`
-  ## are byte-identical after decode (same pid/ppid/tid, empty path, `seq`
-  ## forced to 0), and the incarnation suffix is the ONLY thing keeping them
-  ## two elements — which is what the `startCount == 1 + execCount` invariant
-  ## counts. PATH-scoped: `encodeDepRecordIdentity` records the decided position
+  ## share pid/ppid/tid and `seq` (forced to 0). Their `path` is each image's
+  ## resolved file, so it tells them apart unless the pid re-execs the SAME
+  ## image (a Nix wrapper re-exec'ing in place), where they decode
+  ## byte-identical; and on a shim that predates the image field the path was
+  ## empty for both. The incarnation suffix (image plus exec generation) is
+  ## what keeps them two elements in every case — which is what the
+  ## `startCount == 1 + execCount` invariant counts. PATH-scoped: `encodeDepRecordIdentity` records the decided position
   ## that observations from distinct executable incarnations do not collapse,
   ## and this milestone has no evidence against it (measured: file-opens dedup
   ## at 1.0x, so there is nothing there to win by revisiting it).
@@ -365,7 +373,7 @@ func identityNormalizedOutcome*(kind: MonitorRecordKind; rawResult: int64;
   of mrDirectoryEnumerate, mrLibraryLoad, mrEnvRead, mrSysctlRead, mrTimeRead,
      mrProcessStart, mrProcessExec, mrProcessSpawn, mrEventLoss,
      mrBackendProfile, mrCapabilityGap, mrIpcConnect, mrNonDeterministic,
-     mrExternalContent, mrPathMutation:
+     mrExternalContent, mrPathMutation, mrConnectAttempt:
     (rawResult, rawFlags)
 
 proc encodeDepRecordWithSeq(record: MonitorRecord; buf: var openArray[byte];

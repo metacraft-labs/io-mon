@@ -4,11 +4,13 @@
 ## `test_io_mon_macos_rd.nim`; the macOS LIVE-capture half (the hooks proven
 ## against the r2_implicit corpus) stays in `tests/macos/test_io_mon_macos_rd.nim`.
 ##
-## Why this lives in `tests/portable/`: non-file observation handling and the R-D
-## branch of `mergeFragments` are pure `src/io_mon/writer.nim` logic, identical on
-## every OS. Running these assertions on Linux / *BSD / Windows catches a
-## regression in the (env / time / randomness) classification — not just on macOS.
-## See reprobuild-specs/MacOS-Monitoring-Adversarial-Hardening.milestones.org (R-D).
+## Why this lives in `tests/portable/`: non-file observation handling and the
+## R-D branch of `mergeFragments` are pure `src/io_mon/writer.nim` logic,
+## identical on every OS. Running these assertions on Linux / *BSD / Windows
+## catches a regression in the (env / time / randomness) classification — not
+## just on macOS. Round 2, phase R-D of the macOS adversarial-hardening campaign
+## (probes that look for a dependency the monitor misses while still reporting
+## mcComplete).
 ##
 ## # The split (the crux — record evidence without confusing caller policy with
 ## # monitoring completeness):

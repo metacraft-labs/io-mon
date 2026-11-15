@@ -230,7 +230,7 @@ suite "Windows ipc-connect: sockets":
       check sawSocketPeer
       check subsystemEvidence(res).completeness == mcIncomplete)
 
-  test "a REFUSED socket connect reaches no peer and must not be recorded":
+  test "a REFUSED socket connect reaches no peer: an attempt, never an IPC peer":
     ## The case the live-listener test above cannot see, and the one a build
     ## host actually runs thousands of times: a probe to a port with nothing
     ## behind it.
@@ -266,6 +266,29 @@ suite "Windows ipc-connect: sockets":
       check ipcRecords(res).len == 0
       check unmonitoredSubtreeLossCount(res.records) == 0
       check subsystemEvidence(res).summary.eventLossCount == 0'u64
+      check subsystemEvidence(res).completeness == mcComplete
+      # The refused connect IS an observation — an ATTEMPT
+      # (`mrConnectAttempt`, which the merge never derives a loss from) naming
+      # the destination, as on Linux and macOS.
+      var attempts: seq[MonitorRecord] = @[]
+      for r in res.records:
+        if r.kind == mrConnectAttempt: attempts.add r
+      check attempts.len == 1
+      if attempts.len == 1:
+        check attempts[0].path == "127.0.0.1:" & $port
+        check attempts[0].detail.startsWith("connect-attempt af_inet errno="))
+
+  test "a connect through an unreadable address still fails with WSAEFAULT and records nothing":
+    ## The address of a failed connect is read to name the destination of an
+    ## `mrConnectAttempt`. After WSAEFAULT that address is exactly what
+    ## Winsock could not read, so reading it would turn the error return into
+    ## an access violation in the monitored program. The fixture exits 0 only
+    ## when it saw WSAEFAULT, so a crash or a changed error fails here.
+    withTempDir(proc(dir: string) =
+      let res = runFixture(dir, "socket-connect-bad-address")
+      check res.exitCode == 0
+      for r in res.records:
+        check r.kind notin {mrConnectAttempt, mrIpcConnect}
       check subsystemEvidence(res).completeness == mcComplete)
 
 suite "Windows ipc-connect: what must NOT be recorded":
