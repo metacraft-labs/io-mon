@@ -74,7 +74,8 @@ reproduced with any program that `fopen`s a missing file under
 
 ## Related
 
-- reprobuild-pm `milestones/Dependency-Attribution.milestones.org`, DA-1d,
-  "THREE FINDINGS RECORDED RATHER THAN FIXED", item 1. That is where this
-  finding was first written down, as belonging to DA-1i's (evidence-scope)
-  axis.
+- [`docs/contributors/evidence-scope.md`](../docs/contributors/evidence-scope.md):
+  the finding was first written down while working on Reprobuild's
+  dependency attribution, as belonging to the evidence-scope axis, the one
+  that decides which failed lookups (`recordIsFailedExistenceLookup`) are
+  written down.

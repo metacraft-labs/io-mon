@@ -24,8 +24,8 @@
 ## a stdenv role variable (`NIX_BINTOOLS_WRAPPER_TARGET_HOST_<suffix>`) is
 ## set. A plain shell, and every `repro` action launched from one, sets none,
 ## so the wrapper added the C runtime's directory and the builder refused its
-## own shim (reprobuild-pm issue
-## 2026-11-15-io-mon-shim-build-from-a-plain-shell-gets-a-glibc-runpath-and-is-refused.md).
+## own shim: a shim build launched from a plain shell, or from a `repro`
+## action started from one, could not publish a shim at all.
 ##
 ## NO MOCKS: the real builder, compiler, linker wrapper and `readelf`. The
 ## fabricated inputs are environments: `NIX_LDFLAGS="-rpath

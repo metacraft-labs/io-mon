@@ -19,8 +19,7 @@
 ## environment the parent passed, unless the shim was told not to when it was
 ## initialised. The test then measures two interposers. Measured on
 ## nixos-ci-bare-001, io-mon `e774151`, agent-harbor-cli 0.6.17: eleven tests
-## in seven files fail that way and pass once the shim is gone (reprobuild-pm
-## issue 2026-11-15-linux-eleven-io-mon-tests-fail-on-the-agents-baseline):
+## in seven files fail that way and pass once the shim is gone:
 ##
 ##   * its `close` hook registers a thread-local destructor
 ##     (`__cxa_thread_atexit_impl`), which calls `calloc` and takes the
@@ -35,12 +34,8 @@
 ##   * its own I/O (`/proc/<pid>` probes, connects to its trace socket) shows
 ##     up in io-mon's evidence and differs between launch paths.
 ##
-## The first three are defects in that shim, recorded in agent-harbor-pm
-## (`issues/2026-11-15-the-command-trace-shims-close-hook-allocates-and-takes-the-loader-lock-on-a-threads-first-close.md`,
-## `...-connect-hook-crashes-on-an-address-the-kernel-would-reject-with-efault.md`,
-## `...-the-command-trace-shim-grows-a-vfork-and-exec-loop-by-about-28-kib-per-exec.md`),
-## and so is its coming back after `LD_PRELOAD` is unset
-## (`issues/2026-11-14-the-command-trace-shim-comes-back-in-children-after-ld-preload-is-unset.md`).
+## The first three are defects in that shim, and so is its coming back after
+## `LD_PRELOAD` is unset; they are agent-harbor's to fix, not io-mon's.
 ## Isolation is still needed once they are fixed: a test started from an
 ## agent shell inherits the shim in its own `LD_PRELOAD`, and a second
 ## interposer's own I/O and memory are noise in an exact evidence comparison,

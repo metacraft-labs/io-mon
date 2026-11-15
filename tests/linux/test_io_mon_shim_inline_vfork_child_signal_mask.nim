@@ -8,19 +8,17 @@
 ## the handler: SIGTRAP blocked. Its first trapped `syscall` then made the
 ## kernel force the default action of the blocked synchronous trap, and the
 ## child died by SIGTRAP with a core dump (wait status 0x85), where it exits
-## normally unmonitored. (reprobuild-pm issue
-## 2026-11-15-a-clone-vm-child-of-a-trapped-inline-clone-inherits-a-blocked-
-## sigtrap.) The trapped clone now runs from the site's resume stub after
-## the signal returns (linux_preload_runtime.nim, "A TRAPPED CLONE THAT
-## NAMES A CHILD STACK RUNS OUTSIDE THE HANDLER").
+## normally unmonitored. The trapped clone now runs from the site's resume
+## stub after the signal returns (linux_preload_runtime.nim, "A TRAPPED
+## CLONE THAT NAMES A CHILD STACK RUNS OUTSIDE THE HANDLER").
 ##
 ## test_io_mon_shim_inline_clone_child_stack.nim grades a CLONE_VM process
 ## and a thread whose child exits through libc. This file grades the shape
-## the issue reported: a CLONE_VM|CLONE_VFORK child on its own stack, created
+## that failed: a CLONE_VM|CLONE_VFORK child on its own stack, created
 ## through and leaving through one hand-written `syscall; ret` entry, with
 ## the parent blocked in the kernel until the child exits.
 ##
-## WHAT THIS TEST GRADES. The issue's program, in three modes:
+## WHAT THIS TEST GRADES. The program that showed the defect, in three modes:
 ##   raw-raw   clone through the entry, child exits through the entry
 ##   raw-libc  clone through the entry, child exits through syscall(3)
 ##   libc-raw  clone through clone(3), child exits through the entry
@@ -56,9 +54,9 @@ proc run(cmd: string; args: seq[string]; env: StringTableRef = nil):
   p.close()
   (output, code)
 
-## The issue's reproduction program, unchanged apart from this comment's
-## absence. It is compiled at -O0, as the issue measured it: `child` must
-## really call the entry rather than have it inlined.
+## The program that showed the defect, unchanged apart from this comment's
+## absence. It is compiled at -O0, as it was when the defect was found:
+## `child` must really call the entry rather than have it inlined.
 const hostSource = """
 #define _GNU_SOURCE
 #include <sched.h>
@@ -157,7 +155,8 @@ suite "io-mon Linux shim: a vfork child of a trapped inline clone":
         checkpoint("unmonitored: " & plain.output)
         let expected = mode & ": status=0x700 exited=1 code=7 signaled=0 " &
           "sig=0 core=0 child_mask=0x0 (SIGTRAP bit clear)"
-        # The control: the fixture behaves as the issue's bare column.
+        # The control: unmonitored, the fixture exits normally with SIGTRAP
+        # unblocked in the child.
         check plain.code == 0
         check resultLine(plain.output, mode) == expected
         let depfile = work / (mode & ".iomon")

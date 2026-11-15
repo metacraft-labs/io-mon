@@ -7,8 +7,7 @@
 ## parent passed. io-mon's `unmonitored_env` removes `LD_PRELOAD` for a bare
 ## control, but the shim came back, so "bare" controls were not bare and
 ## monitored runs had two interposers. Eleven tests in seven files failed on
-## that alone (reprobuild-pm issue
-## 2026-11-15-linux-eleven-io-mon-tests-fail-on-the-agents-baseline): the
+## that alone in an agent session, and passed once the shim was gone: the
 ## shim's `close` hook re-entered the allocator host's lock, its `connect`
 ## hook deadlocked under the loader lock and crashed on an unreadable
 ## address, and its own I/O showed up as evidence that differed between

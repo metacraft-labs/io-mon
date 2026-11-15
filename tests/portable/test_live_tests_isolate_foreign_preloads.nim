@@ -6,9 +6,8 @@
 ## `tests/linux/test_io_mon_foreign_preload_isolation.nim`). It only works
 ## when it is initialised first, and Nim initialises modules in import order.
 ## A test added without it passes everywhere except in an agent session,
-## which is how eleven tests came to fail there (reprobuild-pm issue
-## 2026-11-15-linux-eleven-io-mon-tests-fail-on-the-agents-baseline). So the
-## rule is checked here, over the source, on every OS.
+## which is how eleven tests in seven files came to fail there. So the rule
+## is checked here, over the source, on every OS.
 ##
 ## The directories are the ones the suite runs on Linux (`tests/README.md`):
 ## `portable/`, `posix/` and `linux/`.

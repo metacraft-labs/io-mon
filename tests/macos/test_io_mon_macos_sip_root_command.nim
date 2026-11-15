@@ -13,10 +13,10 @@
 ## for the root", and a consumer (reprobuild) withheld the result from its
 ## cache (`cache-skip-monitor-loss`).
 ##
-## Spec: reprobuild-pm `spec/MacOS-Monitoring.md`, "Packaged SIP replacements
-## without an ambient shell" — the root spawn uses the same propagation
-## resolver as the spawn hook, and a tool without a valid replacement keeps its
-## original path and the fail-incomplete accounting.
+## The rule: the root spawn uses the same propagation resolver as the spawn
+## hook (the invocation's sandbox, then `STACKABLE_HOOKS_TOOLS_DIR`, then the
+## packaged bundle, so no ambient shell is needed), and a tool without a valid
+## replacement keeps its original path and the fail-incomplete accounting.
 ##
 ## # What it asserts
 ##

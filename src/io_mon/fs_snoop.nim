@@ -1119,9 +1119,9 @@ when defined(macosx):
     ##
     ## A SIP root with no valid replacement (for itself or, for a script, for
     ## its interpreter) keeps its original path, so the
-    ## merge's missing-root accounting still reports the run incomplete
-    ## (reprobuild-pm spec/MacOS-Monitoring.md, "Packaged SIP replacements
-    ## without an ambient shell").
+    ## merge's missing-root accounting still reports the run incomplete:
+    ## a root the monitor cannot observe fails closed rather than being
+    ## spawned some other way.
     if command.len == 0 or sandboxDir.len == 0:
       return command
     let resolved = resolveExecutableInPath(command[0])
