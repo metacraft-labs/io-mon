@@ -41,6 +41,26 @@ Windows build keeps `--mm:orc`, and its trace settings are unchanged.
 - `--mm:arc` — deterministic reference counting, no background cycle-collector
   thread; more C-like than `orc`. The shim's data has no reference cycles.
 - `--threads:on` — required: the shim records from every host thread.
+- **C optimisation level `-O0` in debug (`IO_MON_BUILD_MODE=debug`, the
+  default) and `-O3` in release, with `_FORTIFY_SOURCE` off in both** — stated
+  by `scripts/build_shim.sh` for every shim image, never left to the compiler
+  wrapper. nixpkgs' cc-wrapper turns its `fortify`/`fortify3` hardening flags
+  into `-O2` plus `_FORTIFY_SOURCE`, and applies them only where a stdenv
+  shell has activated its roles, so before this rule the same `repro build`
+  compiled the debug shim at -O2 from `nix develop` and at -O0 from a plain
+  shell. The -O0 build crashed on a nim-stackable-hooks raw-syscall defect
+  (a `CLONE_VM` child overwrote its parent's stack frame) that the -O2 build
+  hid. The debug lane therefore stays at -O0 everywhere: it is the lane that
+  catches code relying on what the optimiser keeps in registers. Fortify is
+  off because it does nothing at -O0, so enabling it only in release would
+  give the two lanes different libc entry points (`__read_chk` for `read`);
+  the non-Nix toolchains never enabled it. The wrapper appends its
+  `-D_FORTIFY_SOURCE=<n>` after the caller's arguments, so the script removes
+  `fortify`/`fortify3` from `NIX_HARDENING_ENABLE*` instead of overriding the
+  macro; the wrapper's other hardening flags stay as the toolchain sets them.
+  `tests/linux/test_io_mon_shim_optimisation_level_is_stated.nim` builds the
+  shim in both modes with and without the wrapper's fortify hardening and
+  requires identical code and no fortified libc imports.
 
 On Linux, a successful exec in a `vfork` child cannot unwind Nim trace frames.
 The suspended parent shares the child's TLS, so retaining `framePtr` can leave

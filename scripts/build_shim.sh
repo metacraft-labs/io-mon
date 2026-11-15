@@ -62,13 +62,68 @@ fi
 
 nim_mode_flags=()
 case "${IO_MON_BUILD_MODE:-debug}" in
-  debug) ;;
-  release) nim_mode_flags+=("-d:release") ;;
+  debug)
+    c_optimisation_level=0
+    ;;
+  release)
+    nim_mode_flags+=("-d:release")
+    c_optimisation_level=3
+    ;;
   *)
     echo "unsupported IO_MON_BUILD_MODE=${IO_MON_BUILD_MODE}; expected debug or release" >&2
     exit 2
     ;;
 esac
+
+# The C compiler's optimisation level and _FORTIFY_SOURCE are stated here,
+# for every shim image, because otherwise the compiler wrapper picks them.
+#
+# nixpkgs' cc-wrapper turns its `fortify`/`fortify3` hardening flags into
+# `-O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=<n>` placed BEFORE the caller's
+# arguments (`hardeningCFlagsBefore` in pkgs/build-support/cc-wrapper/
+# add-hardening.sh), and it reads NIX_HARDENING_ENABLE only for the roles a
+# stdenv shell activates. A debug build passes Nim no `-O` at all, so the
+# same `repro build` produced a shim at -O2 with fortify from a `nix
+# develop` shell and at -O0 without either from a plain shell: the -O0 one
+# crashed on a nim-stackable-hooks raw-syscall defect the -O2 one hid.
+#
+#   * debug is -O0. It is the lane that exposes code relying on what the
+#     optimiser happens to keep in registers, so it stays unoptimised.
+#   * release is -O3, the level Nim's -d:release (--opt:speed) already asks
+#     for; it is restated so the level is read here, not from a config file.
+#   * _FORTIFY_SOURCE is off in both. It has no effect at -O0, so leaving it
+#     to the toolchain in release would make the two lanes call different
+#     libc entry points (`__read_chk` for `read`, ...). The non-Nix
+#     toolchains the shim is also built with never enabled it. It is set to
+#     0 rather than only undefined because Apple's SDK headers define it
+#     themselves when it is absent.
+#
+# The `-O` level is a compiler argument: the wrapper's `-O2` comes before
+# ours, and the last `-O` wins. `_FORTIFY_SOURCE` cannot be settled that way,
+# because the wrapper appends its `-D_FORTIFY_SOURCE=<n>` AFTER the caller's
+# arguments (`hardeningCFlagsAfter`). So `fortify` and `fortify3` are removed
+# from every NIX_HARDENING_ENABLE* variable for the shim's compiles, which
+# also withdraws the wrapper's `-O2`. The other hardening flags are left as
+# the toolchain sets them; they do not change what the code computes.
+#
+# tests/linux/test_io_mon_shim_optimisation_level_is_stated.nim builds the
+# shim with and without the wrapper's fortify hardening and requires the
+# same code from both.
+nim_c_level_flags=(
+  "--passC:-O${c_optimisation_level}"
+  "--passC:-U_FORTIFY_SOURCE"
+  "--passC:-D_FORTIFY_SOURCE=0"
+)
+for hardening_var in ${!NIX_HARDENING_ENABLE@}; do
+  hardening_kept=()
+  for hardening_flag in ${!hardening_var}; do
+    case "$hardening_flag" in
+      fortify|fortify3) ;;
+      *) hardening_kept+=("$hardening_flag") ;;
+    esac
+  done
+  export "$hardening_var=${hardening_kept[*]-}"
+done
 
 # The shim runs on threads it does not own, so it must not own a heap per
 # thread.
@@ -170,6 +225,7 @@ case "${io_mon_host_platform_name}" in
     nim c \
       ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
       ${nim_shim_alloc_flags[@]+"${nim_shim_alloc_flags[@]}"} \
+      ${nim_c_level_flags[@]+"${nim_c_level_flags[@]}"} \
       ${macos_shim_arch_flags[@]+"${macos_shim_arch_flags[@]}"} \
       --app:lib \
       --threads:on \
@@ -276,6 +332,7 @@ case "${io_mon_host_platform_name}" in
     nim c \
       ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
       ${nim_shim_alloc_flags[@]+"${nim_shim_alloc_flags[@]}"} \
+      ${nim_c_level_flags[@]+"${nim_c_level_flags[@]}"} \
       ${linux_shim_link_flags[@]+"${linux_shim_link_flags[@]}"} \
       --app:lib \
       --threads:on \
@@ -317,6 +374,7 @@ case "${io_mon_host_platform_name}" in
     nim c \
       ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
       ${nim_shim_alloc_flags[@]+"${nim_shim_alloc_flags[@]}"} \
+      ${nim_c_level_flags[@]+"${nim_c_level_flags[@]}"} \
       --app:lib \
       --threads:on \
       --mm:orc \
@@ -390,6 +448,7 @@ case "${io_mon_host_platform_name}" in
       nim c \
         ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
         ${nim_shim_alloc_flags[@]+"${nim_shim_alloc_flags[@]}"} \
+        ${nim_c_level_flags[@]+"${nim_c_level_flags[@]}"} \
         --app:lib \
         --threads:on \
         --mm:orc \
