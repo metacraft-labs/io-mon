@@ -40,6 +40,8 @@
 ##
 ## Mocks: none. Real program, real shim, real kernel.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, posix, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon

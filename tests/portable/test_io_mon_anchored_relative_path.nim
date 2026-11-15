@@ -15,6 +15,8 @@
 ##
 ## Mocks: none; the join is a pure function over two strings.
 
+import foreign_preload_isolation
+
 import std/unittest
 
 import io_mon/paths

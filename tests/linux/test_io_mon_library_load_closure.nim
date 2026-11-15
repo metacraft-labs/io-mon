@@ -25,6 +25,8 @@
 ## than hard-coded, so the assertions state the invariant instead of a snapshot
 ## of one machine.
 
+import foreign_preload_isolation
+
 import std/[algorithm, os, osproc, sequtils, sets, streams, strtabs, strutils, unittest]
 
 import io_mon

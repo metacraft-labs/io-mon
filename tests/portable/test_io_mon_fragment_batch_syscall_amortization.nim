@@ -28,6 +28,8 @@
 ##
 ## No mocks: both cases drive the real writer against real files in a temp dir.
 
+import foreign_preload_isolation
+
 import std/[os, strutils, tempfiles, unittest]
 
 when defined(posix):

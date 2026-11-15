@@ -40,6 +40,8 @@
 ## No mocks: the live `LD_PRELOAD` shim is rebuilt from source and the assertions
 ## read the canonical depfile the monitor writes.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon

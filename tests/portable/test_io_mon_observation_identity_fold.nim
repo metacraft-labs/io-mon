@@ -41,6 +41,8 @@
 ## write side is imported deliberately: DA-1j's stamp is WRITTEN there, and a
 ## milestone graded only on the read side survived deleting the writer entirely.
 
+import foreign_preload_isolation
+
 import std/[algorithm, options, os, strutils, unittest]
 
 import io_mon/types

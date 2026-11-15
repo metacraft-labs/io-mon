@@ -21,6 +21,8 @@
 ##
 ## No mocks: the test drives the real writer against real files in a temp dir.
 
+import foreign_preload_isolation
+
 import std/[os, tempfiles, unittest]
 
 import io_mon

@@ -73,6 +73,8 @@
 ## ignores the ledger) — 3, 4, 5 come back `mcComplete` and 6 loses the
 ## daemon's read; `noshimmark` (the shim writes no entry) — every case fails
 ## closed with "the tree ledger has no entry for the root".
+import foreign_preload_isolation
+
 import std/[monotimes, os, osproc, posix, sequtils, streams, strutils, tempfiles,
   times, unittest]
 import io_mon

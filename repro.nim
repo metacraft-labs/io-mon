@@ -388,7 +388,11 @@ package io_mon:
           # Compares the dlsym(RTLD_NEXT) answers of a bare control with
           # those under a private shim; an outer shim is itself an
           # interposer in the lookup order the test asserts.
-          "test_io_mon_foreign_preload_rtld_next.nim"]) or
+          "test_io_mon_foreign_preload_rtld_next.nim",
+          # Preloads a stand-in for agent-harbor's self-propagating shim into
+          # probe children and asserts their exact LD_PRELOAD and mappings;
+          # an outer shim re-injected across exec would be one more entry.
+          "test_io_mon_foreign_preload_isolation.nim"]) or
         (defined(windows) and source.extractFilename in [
         "test_io_mon_cli_exit_status.nim",
         "test_io_mon_windows_exit_status.nim",

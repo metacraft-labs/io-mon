@@ -14,6 +14,8 @@
 ##   DEP-FLUSH-4  t_fork_child_does_not_duplicate_parent_batch
 ##   DEP-FLUSH-5  t_exit_flush_depfile_byte_identical_to_lazy
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon

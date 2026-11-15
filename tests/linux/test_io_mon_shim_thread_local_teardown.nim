@@ -23,6 +23,8 @@
 ## On the OLD shim this SIGSEGVs within a handful of iterations; on the fixed
 ## shim (fixed-capacity POD table, no cross-thread allocation) it is stable.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, streams, strtabs, unittest]
 
 import io_mon

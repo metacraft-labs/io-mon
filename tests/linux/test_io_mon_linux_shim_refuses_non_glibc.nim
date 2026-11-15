@@ -36,6 +36,8 @@
 ## value FAILS the test there), and the test skips on other systems, where it
 ## is not provisioned.
 
+import foreign_preload_isolation
+
 import std/[json, os, osproc, streams, strtabs, strutils, unittest]
 
 const

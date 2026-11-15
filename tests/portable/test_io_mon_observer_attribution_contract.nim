@@ -29,6 +29,8 @@
 ## two Markdown files in this repository. No shim, no shared memory, no
 ## platform API, so nothing here is mocked.
 
+import foreign_preload_isolation
+
 import std/[os, strutils, unittest]
 
 import io_mon/types

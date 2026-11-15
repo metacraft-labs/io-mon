@@ -18,6 +18,8 @@
 ## compiles, which is the only construction that keeps a new kind from
 ## inheriting a category — or an ungate-able status — by default.
 
+import foreign_preload_isolation
+
 import std/[unittest, options, strutils, sequtils]
 import io_mon/types
 

@@ -1,6 +1,8 @@
 ## Execute the actual runtime ownership helpers against the genuine production
 ## shared shim. Linking the real flush callback avoids embedding a second shim
 ## constructor; no callback or allocation implementation is replaced.
+import foreign_preload_isolation
+
 import std/[os, osproc, strutils, unittest]
 import ../helpers/[capture_control_fixtures, build_test_shim]
 

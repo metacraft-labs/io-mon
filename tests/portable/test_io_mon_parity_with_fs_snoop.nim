@@ -27,6 +27,8 @@
 ## then any front-end (reprobuild's fs-snoop OR the codetracer runner) that
 ## feeds the SAME observations gets the SAME captured file sets.
 
+import foreign_preload_isolation
+
 import std/[algorithm, os, sets, strutils, tempfiles, unittest]
 
 import io_mon

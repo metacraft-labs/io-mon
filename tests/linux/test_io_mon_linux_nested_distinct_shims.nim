@@ -29,6 +29,8 @@
 ##
 ## No mocks: the production shim, real processes, real captures. Every launch
 ## is bounded by the 30-second wait below.
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, strutils, tempfiles,
             unittest]
 import io_mon

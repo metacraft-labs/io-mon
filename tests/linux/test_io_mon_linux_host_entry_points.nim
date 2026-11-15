@@ -47,6 +47,8 @@
 ## `io-mon run` CLI injects it into C programs built here, and every
 ## assertion reads the depfile the real merge wrote.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon

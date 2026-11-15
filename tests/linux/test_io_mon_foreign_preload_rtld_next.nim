@@ -34,6 +34,8 @@
 ## object after the caller that defines the symbol, and the unmonitored run is
 ## measured in the same test as the ground truth for the hook library.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, streams, strtabs, strutils, tempfiles, unittest]
 
 import io_mon

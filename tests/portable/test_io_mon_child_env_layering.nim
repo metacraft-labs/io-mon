@@ -69,6 +69,8 @@
 ## No mocks: this drives the real `childEnv` against the real process
 ## environment.
 
+import foreign_preload_isolation
+
 import std/[strtabs, unittest]
 
 include io_mon/fs_snoop

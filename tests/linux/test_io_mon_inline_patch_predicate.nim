@@ -27,6 +27,8 @@
 ## probe lives under `/tmp/`, outside every `isSystemRuntimeMappingPath`
 ## prefix, so its executable IS still patched.
 
+import foreign_preload_isolation
+
 import std/[unittest]
 
 import io_mon/hooks/linux_mapping_policy

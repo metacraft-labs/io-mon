@@ -29,6 +29,8 @@
 ## only a target that reports its environment can show that; no part of
 ## io-mon is mocked, and the macOS test runs the real compiler.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, streams, strtabs, strutils, tempfiles, unittest]
 
 import io_mon/fs_snoop

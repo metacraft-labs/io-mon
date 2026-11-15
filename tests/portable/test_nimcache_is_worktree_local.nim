@@ -29,6 +29,8 @@
 ##
 ## NO MOCKS: the real compiler, the real config files, the real checkout.
 
+import foreign_preload_isolation
+
 import std/[compilesettings, json, os, osproc, streams, strtabs, strutils]
 
 const

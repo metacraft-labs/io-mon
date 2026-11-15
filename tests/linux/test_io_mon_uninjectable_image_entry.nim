@@ -63,6 +63,8 @@
 ##
 ## Mocks: none. Real programs, the real shim, the real `io-mon run` driver.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 from std/posix import geteuid
 

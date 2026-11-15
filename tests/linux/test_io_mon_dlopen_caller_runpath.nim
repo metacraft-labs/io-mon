@@ -24,6 +24,8 @@
 ## so the test states the invariant ("observation does not perturb") rather than
 ## a hard-coded expectation.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, streams, strtabs, strutils, unittest]
 
 import io_mon

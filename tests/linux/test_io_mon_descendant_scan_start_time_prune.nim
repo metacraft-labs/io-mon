@@ -44,6 +44,8 @@
 ##       past: the case still reddens, because a spelling the assignment
 ##       reader misses is a spelling the reads reader counts.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strutils, unittest]
 
 import io_mon

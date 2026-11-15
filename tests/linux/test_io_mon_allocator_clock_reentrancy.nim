@@ -1,6 +1,8 @@
 ## Real process/allocator integration; no mocks. The C executable interposes
 ## malloc with a real mutex and clock read, reproducing rustc's lock ordering.
 ## The second case exercises the actual compiler supplied by the dev shell.
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, strutils, tempfiles, unittest]
 import io_mon
 

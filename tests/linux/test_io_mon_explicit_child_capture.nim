@@ -1,5 +1,7 @@
 ## Genuine public runMonitored controls compile their own child and production
 ## shim with the declared tools. Every named route assertion runs without argv.
+import foreign_preload_isolation
+
 import std/[os, sequtils, strutils, unittest]
 import io_mon
 import ../helpers/capture_control_fixtures

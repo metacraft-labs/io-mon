@@ -30,6 +30,8 @@
 ## complete 2-byte instruction. A ``0f 05`` consumed by a longer instruction
 ## is never presented as a candidate boundary, so it is never patched.
 
+import foreign_preload_isolation
+
 import std/[unittest]
 
 import stackable_hooks/platform/linux_raw_syscalls

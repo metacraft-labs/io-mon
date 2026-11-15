@@ -38,6 +38,8 @@
 ## record-building heap churn makes the cross-thread free reliably fatal on
 ## the OLD shim within a few child runs; on the fixed shim it is stable.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, streams, strtabs, unittest]
 
 import io_mon

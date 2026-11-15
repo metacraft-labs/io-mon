@@ -102,6 +102,8 @@
 ## Assertion helpers are `template`s, never `proc`s: a `check` inside a plain
 ## `proc` prints "Check failed" and the enclosing test still reports `[OK]`.
 
+import foreign_preload_isolation
+
 import descendant_guard_expectations
 import std/[algorithm, os, osproc, sequtils, sets, streams, strtabs, strutils,
             tables, times, unittest]

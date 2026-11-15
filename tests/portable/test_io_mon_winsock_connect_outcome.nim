@@ -15,6 +15,8 @@
 ## no record at all, so a connection a signal-like interruption cut short was
 ## invisible to the capture.
 
+import foreign_preload_isolation
+
 import std/unittest
 
 import io_mon/winsock_connect

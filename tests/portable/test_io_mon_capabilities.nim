@@ -2,6 +2,8 @@
 ## checks: they do not depend on a live shim, but they exercise the same
 ## backend-profile records that merged depfiles carry.
 
+import foreign_preload_isolation
+
 import std/[sequtils, unittest]
 
 import io_mon

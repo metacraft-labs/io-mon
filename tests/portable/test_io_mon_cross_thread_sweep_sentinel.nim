@@ -31,6 +31,8 @@
 ##                      makes its batch durable. The loss is STILL
 ##                      reported, under that thread's own identity.
 
+import foreign_preload_isolation
+
 import std/[atomics, os, strutils, tempfiles, unittest]
 
 import io_mon

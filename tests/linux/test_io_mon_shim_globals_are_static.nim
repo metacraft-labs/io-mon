@@ -29,6 +29,8 @@
 ## `= default(...)` spelling would make it do. A new constructor-owned global
 ## is added to the list below when it is introduced.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, re, streams, strutils, unittest]
 
 const

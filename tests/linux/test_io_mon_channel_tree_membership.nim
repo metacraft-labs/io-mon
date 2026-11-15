@@ -49,6 +49,8 @@
 ## real C programs making real `socket`/`accept` calls, and every assertion reads
 ## the canonical depfile the monitor writes.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, sets, streams, strtabs, strutils, unittest]
 
 import io_mon

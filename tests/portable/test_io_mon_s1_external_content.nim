@@ -12,6 +12,8 @@
 ## is caught here on every OS. ROUND-4 IP1 added the `opaque`/`localfd` pairing (an
 ## inherited pipe/socket with no in-tree create downgrades; an in-tree one pairs).
 
+import foreign_preload_isolation
+
 import std/[os, sets, unittest]
 import io_mon
 

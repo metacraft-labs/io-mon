@@ -48,6 +48,8 @@
 ##       root exit pids=<the peer's child>". The lingering peer makes it
 ##       DETERMINISTIC rather than a race: 3s of linger against a 500ms grace.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strutils, unittest]
 
 import io_mon                            # runMonitored / FsSnoopRequest (PUBLIC)

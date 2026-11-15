@@ -38,6 +38,8 @@
 ##   t_orphan_producer_bounded      — LF-4: a producer that OUTLIVES its monitor
 ##                                    cannot grow the consumer-owned set.
 
+import foreign_preload_isolation
+
 import std/[algorithm, os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon

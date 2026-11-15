@@ -37,6 +37,8 @@
 ## file `include`s the module, exactly as `test_io_mon_child_env_layering.nim`
 ## and `test_io_mon_windows_child_env_block.nim` do.
 
+import foreign_preload_isolation
+
 import std/[strtabs, unittest]
 
 include io_mon/fs_snoop

@@ -12,6 +12,8 @@
 ## On top of that compile-time proof, the runtime checks below exercise the
 ## public API end-to-end so "builds" also means "works".
 
+import foreign_preload_isolation
+
 import std/[os, tempfiles, unittest]
 
 import io_mon

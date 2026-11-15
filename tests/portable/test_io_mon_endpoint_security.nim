@@ -13,6 +13,8 @@
 ## Platform-independent and SDK-free: the entitlement-gated ES client lives behind
 ## the off-by-default `-d:ioMonEndpointSecurity` define and is NOT exercised here.
 
+import foreign_preload_isolation
+
 import std/[strutils, unittest]
 import io_mon/types
 import io_mon/backends/endpoint_security

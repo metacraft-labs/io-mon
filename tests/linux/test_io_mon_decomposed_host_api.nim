@@ -55,6 +55,8 @@
 ## `tests/portable/test_io_mon_monitor_handle_exclusivity.nim`, which drives the
 ## real compiler at it.
 
+import foreign_preload_isolation
+
 import std/[monotimes, os, osproc, sequtils, streams, strutils, times, unittest]
 
 import io_mon                            # the PUBLIC host API

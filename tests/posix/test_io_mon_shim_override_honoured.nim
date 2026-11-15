@@ -15,6 +15,8 @@
 ## NO MOCKS: the real `findShimLibrary` against the real filesystem, plus the
 ## real `io-mon run` driver for the end-to-end arm.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, streams, strtabs, strutils, unittest]
 
 import io_mon

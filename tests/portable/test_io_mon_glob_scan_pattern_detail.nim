@@ -11,6 +11,8 @@
 ##
 ## Mocks: none; the parser is a pure function over the detail text.
 
+import foreign_preload_isolation
+
 import std/unittest
 
 import io_mon/types

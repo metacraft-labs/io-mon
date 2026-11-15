@@ -62,6 +62,8 @@
 ## cannot be obtained any other way — it is built from this repo's own sources by
 ## this repo's own compiler, differing by one deleted gate.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon

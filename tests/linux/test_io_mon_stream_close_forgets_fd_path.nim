@@ -26,6 +26,8 @@
 ## MOCKS: none. A real program under the real shim and the real `io-mon run`,
 ## with records read back from the real depfile.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, streams, strtabs, unittest]
 
 import io_mon

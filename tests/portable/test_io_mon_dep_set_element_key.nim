@@ -35,6 +35,8 @@
 ## Portable: pure `io_mon/types` + `io_mon/writer` + `io_mon/shm/dep_queue`. No
 ## shim, no shared memory, no platform API.
 
+import foreign_preload_isolation
+
 import std/[algorithm, os, strutils, unittest]
 
 import io_mon/types

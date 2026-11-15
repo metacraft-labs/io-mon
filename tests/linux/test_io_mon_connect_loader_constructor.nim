@@ -2,6 +2,8 @@
 ## connect through the production monitor. The child library is a trigger for
 ## the observed LTTng ordering; no monitor callback or resolver is substituted.
 ## Genuine .NET lease/monitor acceptance remains a separate integration gate.
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, unittest]
 import ../../src/io_mon/[fs_snoop, types]
 import ../helpers/[capture_control_fixtures, build_test_shim]

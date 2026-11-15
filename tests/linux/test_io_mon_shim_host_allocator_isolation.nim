@@ -81,6 +81,8 @@
 ## adding Chromium to the dev shell would put a several-hundred-MB closure in
 ## every contributor's shell.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon

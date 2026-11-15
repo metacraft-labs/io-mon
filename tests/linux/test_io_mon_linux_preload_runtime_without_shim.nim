@@ -16,6 +16,8 @@
 ## than on the first call that happens to reach it. The preload must succeed
 ## and the program must exit 0.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, streams, strtabs, strutils, unittest]
 
 const repoRoot = currentSourcePath().parentDir().parentDir().parentDir()

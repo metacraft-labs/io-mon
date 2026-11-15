@@ -15,6 +15,8 @@
 ##       orphaned fragment directory behind (the host owns + tears down the
 ##       whole lifecycle). The depfile it wrote on disk decodes to the same.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strutils, unittest]
 
 import io_mon                            # runMonitored / MonitorResult (PUBLIC)

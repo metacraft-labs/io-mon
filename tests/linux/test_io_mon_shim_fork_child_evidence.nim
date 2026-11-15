@@ -44,6 +44,8 @@
 ## Mocks: none. Real programs, real shim, real files. The held-lock case
 ## adds one test-only export to the shim and nothing else.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon

@@ -55,6 +55,13 @@ no matter how deep a test file lives because the suite always runs from the repo
 root. Adding a `test_*.nim` to a selected directory makes it run with **no edit
 to the task**.
 
+A test in `portable/`, `posix/` or `linux/` must start with
+`import foreign_preload_isolation`, before any other import. It keeps an
+agent-harbor session's self-propagating preload out of the test (see
+`docs/contributors/building-and-testing.md`, "Tests run without agent-harbor's
+command-trace shim"), and `portable/test_live_tests_isolate_foreign_preloads.nim`
+enforces it.
+
 Convenience commands: `just test-portable` (only the every-OS tests) and
 `just test-platform` (only the host-OS platform-specific tests). Just invokes
 Nim directly so a test failure reaches the caller even on Windows, where the

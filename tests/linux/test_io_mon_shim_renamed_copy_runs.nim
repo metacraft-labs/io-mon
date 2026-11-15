@@ -28,6 +28,8 @@
 ## Mocks: none. Real shim (built by the real builder), real programs, real
 ## files.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, unittest]
 
 import io_mon

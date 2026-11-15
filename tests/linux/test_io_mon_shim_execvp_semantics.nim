@@ -27,6 +27,8 @@
 ##
 ## Mocks: none. The probe and the PATH entries are real programs.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, streams, strtabs, strutils, unittest]
 
 import io_mon

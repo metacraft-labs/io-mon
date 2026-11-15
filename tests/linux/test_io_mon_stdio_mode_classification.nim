@@ -22,6 +22,8 @@
 ## mode it happens to use: a `"w+"`-only workload leaves the plain `"w"` and
 ## `"a"` paths unverified, and a mutation there survives silently.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon

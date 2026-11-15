@@ -1,6 +1,8 @@
 ## Real pthread, filesystem, fork/exec and shared-memory capture; no mocks.
 ## Every worker probes distinct paths so the shared set must grow. The test
 ## checks the entire observed path set, not just successful process exit.
+import foreign_preload_isolation
+
 import std/[os, osproc, sets, strutils, tempfiles, unittest]
 import io_mon
 import build_test_shim

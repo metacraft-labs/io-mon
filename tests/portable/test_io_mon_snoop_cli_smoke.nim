@@ -9,6 +9,8 @@
 ## around the probe, assert the read is captured) lives in
 ## `tests/posix/test_io_mon_snoop_cli_capture.nim`.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, streams, strutils, tempfiles, unittest]
 
 import io_mon  # writeCanonical, MonitorRecord, observation kinds

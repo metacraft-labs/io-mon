@@ -17,6 +17,8 @@
 ## `childEnv` is deliberately unexported, so this file `include`s the module,
 ## as `test_io_mon_child_env_layering.nim` does.
 
+import foreign_preload_isolation
+
 import std/[strtabs, unittest]
 
 include io_mon/fs_snoop

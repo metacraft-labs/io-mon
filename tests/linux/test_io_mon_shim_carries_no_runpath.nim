@@ -23,6 +23,8 @@
 ## value a dev shell holds, set explicitly so the case does not depend on the
 ## shell it was started from.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, strutils, tempfiles, unittest]
 
 import build_test_shim

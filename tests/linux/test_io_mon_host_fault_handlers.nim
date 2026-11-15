@@ -5,6 +5,8 @@
 ## with its signal mask intact. A distinct image exercises initialization
 ## even under an enclosing monitor. These are controlled signals in real
 ## processes, with alarm deadlines; no mocks or genuine invalid memory access.
+import foreign_preload_isolation
+
 import std/[os, osproc, strutils, tempfiles, unittest]
 import build_test_shim
 

@@ -24,6 +24,8 @@
 ##     blanket downgrade of every ARM capture;
 ##   * `t_verdict_reads_the_attributes`: the judgement itself, on both images.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 import io_mon
 import io_mon/hooks/linux_arm_image

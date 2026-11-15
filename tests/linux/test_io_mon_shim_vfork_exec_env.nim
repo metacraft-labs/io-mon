@@ -21,6 +21,8 @@
 ## Mocks: none. The host is a real program, the shim the built library, and
 ## the children real executables.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, streams, strtabs, strutils, unittest]
 
 import io_mon
