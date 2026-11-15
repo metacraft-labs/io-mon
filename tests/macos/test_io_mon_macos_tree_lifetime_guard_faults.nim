@@ -448,6 +448,10 @@ suite "macOS tree-lifetime guard: census failure":
       putEnv(VanishVar, $helper)
       let res = try: finishMonitor(move(h)) finally: delEnv(VanishVar)
       child = readPidFile(dir / "child.pid")
+      # The verdict is the releasing sweep's. The helper is this process's
+      # child and stays a zombie until the `finally` below reaps it, so any
+      # later sweep of the capture (one an unrelated process left
+      # inconclusive) lists it as dead; the seam does not report that.
       check faultVanishVerdict() == "nonmember"
       check res.exitCode == 0
       check res.completeness == mcComplete
