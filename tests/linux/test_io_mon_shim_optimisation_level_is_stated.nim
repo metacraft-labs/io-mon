@@ -19,6 +19,12 @@
 ## neither image imports a fortified libc entry (`__*_chk`) and that their
 ## `.text` sections are byte-identical. Before the fix the hardened debug
 ## build was -O2 and fortified while its twin was -O0, so both checks fail.
+## Equal twins alone would not pin the level itself (two -O2 builds are
+## equal too), so the case also reads every C compile command Nim issued
+## (`--listCmd`) and requires the last `-O` on each to be the mode's stated
+## level, -O0 for debug and -O3 for release. The last one is the one the
+## compiler obeys, and the wrapper places its own `-O2` before the caller's
+## arguments.
 ##
 ## NO MOCKS: the real builder, the real Nix cc-wrapper on `PATH` and the real
 ## compiler. The fabricated inputs are the two wrapper role variables a stdenv
@@ -114,9 +120,13 @@ proc ccWrapperSalt(gcc: string): string =
                         matches) >= 0:
     result = matches[0]
 
-proc buildShim(work, mode, hardening, salt: string): string =
+type ShimBuild = tuple[image, output: string]
+
+proc buildShim(work, mode, hardening, salt: string): ShimBuild =
   ## Build the production shim with `scripts/build_shim.sh` into `work`,
-  ## under the stdenv wrapper roles and the given hardening set.
+  ## under the stdenv wrapper roles and the given hardening set. Returns the
+  ## image path and the builder's output, which carries Nim's `--listCmd`
+  ## listing of every C compile (`CC: <module>: <command>`).
   var env = newStringTable(modeCaseSensitive)
   for key, value in envPairs(): env[key] = value
   env["IO_MON_BUILD_MODE"] = mode
@@ -125,11 +135,25 @@ proc buildShim(work, mode, hardening, salt: string): string =
   env["NIX_CC_WRAPPER_TARGET_HOST_" & salt] = "1"
   env["NIX_BINTOOLS_WRAPPER_TARGET_HOST_" & salt] = "1"
   env["NIX_HARDENING_ENABLE"] = hardening
-  let built = execCmdEx("bash " & quoteShell(repoRoot / "scripts/build_shim.sh"),
-    env = env)
+  let built = execCmdEx("bash " &
+    quoteShell(repoRoot / "scripts/build_shim.sh") & " --listCmd", env = env)
   doAssert built.exitCode == 0, "build_shim.sh failed: " & built.output
-  result = work / "lib" / "librepro_monitor_shim.so"
-  doAssert fileExists(result), "shim not produced at " & result
+  result.image = work / "lib" / "librepro_monitor_shim.so"
+  result.output = built.output
+  doAssert fileExists(result.image), "shim not produced at " & result.image
+
+proc compileLevels(output: string): seq[string] =
+  ## The optimisation level each listed C compile ends up with: the last
+  ## `-O<level>` word of each `CC:` line, or "none" when a command states
+  ## none (the compiler's default, which is not a stated level either).
+  for line in output.splitLines():
+    if not line.startsWith("CC: "):
+      continue
+    var level = "none"
+    for word in line.splitWhitespace():
+      if word.len >= 2 and word.startsWith("-O"):
+        level = word
+    result.add level
 
 suite "io-mon Linux shim optimisation level":
   let gcc = findExe("gcc")
@@ -150,10 +174,23 @@ suite "io-mon Linux shim optimisation level":
       defer:
         removeDir(hardenedWork)
         removeDir(plainWork)
-      let hardened = readFile(buildShim(hardenedWork, mode,
-        devShellHardening, salt))
-      let plain = readFile(buildShim(plainWork, mode,
-        unfortifiedHardening, salt))
+      let hardenedBuild = buildShim(hardenedWork, mode, devShellHardening,
+        salt)
+      let plainBuild = buildShim(plainWork, mode, unfortifiedHardening, salt)
+      let expectedLevel = if mode == "debug": "-O0" else: "-O3"
+      for build in [hardenedBuild, plainBuild]:
+        let levels = compileLevels(build.output)
+        var stray: seq[string]
+        for level in levels:
+          if level != expectedLevel and level notin stray:
+            stray.add level
+        checkpoint($levels.len & " C compiles listed; levels other than " &
+          expectedLevel & ": " & stray.join(", "))
+        # A listing with no compiles would make the level check vacuous.
+        check levels.len > 0
+        check stray.len == 0
+      let hardened = readFile(hardenedBuild.image)
+      let plain = readFile(plainBuild.image)
       let hardenedChk = fortifiedImports(hardened)
       let plainChk = fortifiedImports(plain)
       checkpoint("fortified imports with dev-shell hardening: " &

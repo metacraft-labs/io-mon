@@ -60,7 +60,13 @@ Windows build keeps `--mm:orc`, and its trace settings are unchanged.
   macro; the wrapper's other hardening flags stay as the toolchain sets them.
   `tests/linux/test_io_mon_shim_optimisation_level_is_stated.nim` builds the
   shim in both modes with and without the wrapper's fortify hardening and
-  requires identical code and no fortified libc imports.
+  requires identical code, no fortified libc imports, and the mode's level as
+  the last `-O` of every C compile Nim lists (`--listCmd`).
+- **Each Linux build's private compiler cache and staging directory are
+  removed when `scripts/build_shim.sh` exits**, whether the build succeeded,
+  failed to compile, or was refused for carrying a `DT_RUNPATH`. Both are
+  named by a random build id, so no later build reuses them; kept, they piled
+  up one object tree per build and one staged image per failed build.
 
 On Linux, a successful exec in a `vfork` child cannot unwind Nim trace frames.
 The suspended parent shares the child's TLS, so retaining `framePtr` can leave

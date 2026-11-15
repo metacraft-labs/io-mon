@@ -273,6 +273,16 @@ case "${io_mon_host_platform_name}" in
     linux_private_cache="${linux_cache_parent}/build-${linux_build_id}"
     linux_publish_dir="${out_dir}/.io-mon-publish-${linux_build_id}"
     mkdir "$linux_private_cache" "$linux_publish_dir"
+    # Both directories belong to this run alone: the build id is random, so
+    # no later run reuses the cache, and the publish directory exists only
+    # to stage the image before its atomic rename. Remove them however the
+    # run ends; otherwise every build leaves its object files behind and
+    # every failed or refused link leaves a staged image in the output
+    # directory.
+    linux_discard_private_dirs() {
+      rm -rf -- "$linux_private_cache" "$linux_publish_dir"
+    }
+    trap linux_discard_private_dirs EXIT
     # No search path of the linker wrapper's making. The shim is LD_PRELOADed
     # into programs built elsewhere, so its C-runtime dependencies must
     # resolve through the program that loads it, and ANY DT_RUNPATH on it
