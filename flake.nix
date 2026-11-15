@@ -25,14 +25,14 @@
       # inline raw-syscall scanner decodes code and never the `.rodata` /
       # `.eh_frame` a BOLT or `-z noseparate-code` executable segment carries
       # (the rustc 1.94.0 jump-table SIGILL).
-      url = "github:metacraft-labs/nim-stackable-hooks/c1d55ce33fb2a29e4cf8d8bdbe1713f355370d0a";
+      url = "github:metacraft-labs/nim-stackable-hooks/c34e3252d413361a0f250d8921e00c119d30e114";
       flake = false;
     };
     shm-queue-src = {
       # Bumped a3564c13 -> 84fd76b (2026-10-30, `agents`): a new segment file is
       # preallocated, so a full filesystem is ENOSPC at creation instead of
       # SIGBUS at the first header store.
-      url = "github:metacraft-labs/nim-shm-queue/84fd76b174d4868e703ba3d599668ee340e0b6ea";
+      url = "github:metacraft-labs/nim-shm-queue/0d6049997d77421b6e4748f819657cf6042e9508";
       flake = false;
     };
     shm-gset-src = {
