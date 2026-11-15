@@ -25,7 +25,12 @@
       # inline raw-syscall scanner decodes code and never the `.rodata` /
       # `.eh_frame` a BOLT or `-z noseparate-code` executable segment carries
       # (the rustc 1.94.0 jump-table SIGILL).
-      url = "github:metacraft-labs/nim-stackable-hooks/c1d55ce33fb2a29e4cf8d8bdbe1713f355370d0a";
+      # c1d55ce -> c34e325 (2026-11-15): the raw syscall entries are
+      # hand-written on x86-64 and 32-bit ARM, so nothing runs between the
+      # syscall instruction and the return; a CLONE_VM clone forwarded by
+      # this shim's syscall(2) replacement no longer writes into its
+      # parent's frame when the library is built at -O0.
+      url = "github:metacraft-labs/nim-stackable-hooks/c34e3252d413361a0f250d8921e00c119d30e114";
       flake = false;
     };
     shm-queue-src = {
