@@ -1100,6 +1100,45 @@ when defined(macosx):
     if command.len > 1:
       result.add(command[1 .. ^1])
 
+  proc rewriteRootCommandForSip(command: seq[string];
+                                sandboxDir: string): seq[string] =
+    ## The monitored ROOT's spawn boundary. The shim's spawn hook rewrites
+    ## every SIP-protected exec *inside* the monitored tree to its non-SIP
+    ## drop-in, but the root is spawned here, by the host, where no hook
+    ## runs. So the same rewrite is applied to the root itself:
+    ##
+    ## * ``command[0]`` (after PATH resolution, as ``posix_spawnp`` would
+    ##   resolve it) is itself a SIP-protected executable — ``/bin/sh``,
+    ##   ``/bin/cat``, ``/usr/bin/env`` … — so the kernel would strip
+    ##   ``DYLD_INSERT_LIBRARIES`` and the root, with its whole tree, would
+    ##   run unobserved. It is replaced by the drop-in the propagation
+    ##   resolver names (``resolveSipReplacement``: this invocation's
+    ##   sandbox, then ``STACKABLE_HOOKS_TOOLS_DIR``, then the shipped
+    ##   bundle), keeping the remaining arguments.
+    ## * otherwise ``command[0]`` may be a script whose shebang names a SIP
+    ##   interpreter; ``rewriteScriptCommandForSip`` handles that.
+    ##
+    ## A SIP root with no valid replacement (for itself or, for a script, for
+    ## its interpreter) keeps its original path, so the
+    ## merge's missing-root accounting still reports the run incomplete
+    ## (reprobuild-pm spec/MacOS-Monitoring.md, "Packaged SIP replacements
+    ## without an ambient shell").
+    if command.len == 0 or sandboxDir.len == 0:
+      return command
+    let resolved = resolveExecutableInPath(command[0])
+    if resolved.len > 0 and ct_propagation.isSipProtected(resolved):
+      let replacement = ct_propagation.resolveSipReplacement(resolved,
+        sandboxDir)
+      if replacement != resolved:
+        result = @[replacement]
+        if command.len > 1:
+          result.add(command[1 .. ^1])
+        return
+    # Not SIP, or SIP without a drop-in of its own: a SIP-protected script
+    # (``/usr/bin/<tool>`` with ``#!/bin/sh``) is still observable through
+    # its interpreter's drop-in.
+    rewriteScriptCommandForSip(command, sandboxDir)
+
 type
   ParsedFsSnoopCommand = object
     inspectMode: bool
@@ -2295,16 +2334,16 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
       spawnEnv["REPRO_MONITOR_INTEREST"] = interestToShimTokens(FullInterest)
       # Keep the requesting child's public evidence scope unchanged.
 
-    # SIP shebang bypass: if the target is a shell script whose
-    # interpreter (``#!/bin/sh`` etc.) lives under a SIP-protected
-    # prefix, ``posix_spawnp`` would let the kernel re-exec into the
-    # SIP-protected interpreter, stripping ``DYLD_INSERT_LIBRARIES`` so
-    # the shim never loads. Rewriting the invocation to the non-SIP
-    # sandbox interpreter (typically a symlink to a Nix or Homebrew
-    # shell, dropped into ``CT_SANDBOX_TOOLS_DIR`` by
-    # ``populateReproSandboxTools``) sidesteps that strip — the shim
-    # loads in the interpreter and observes the script's reads/writes.
-    let effectiveCommand = rewriteScriptCommandForSip(request.command,
+    # SIP root bypass: if the root is itself a SIP-protected executable
+    # (``/bin/sh -c …``), or a script whose interpreter (``#!/bin/sh``
+    # etc.) lives under a SIP-protected prefix, ``posix_spawnp`` would
+    # exec — directly or through the kernel's shebang re-exec — a SIP
+    # image, stripping ``DYLD_INSERT_LIBRARIES`` so the shim never loads
+    # anywhere in the tree. Rewriting the invocation to the non-SIP
+    # drop-in (typically a symlink to a Nix or Homebrew tool, dropped into
+    # ``CT_SANDBOX_TOOLS_DIR`` by ``populateReproSandboxTools``) sidesteps
+    # that strip, exactly as the shim's spawn hook does for descendants.
+    let effectiveCommand = rewriteRootCommandForSip(request.command,
       sandboxDir)
     let childArgs =
       if effectiveCommand.len > 1:
