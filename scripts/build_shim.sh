@@ -260,7 +260,7 @@ case "${io_mon_host_platform_name}" in
       linux_driver_path="$(command -v -- "$linux_driver" 2>/dev/null)" || continue
       [ -f "$linux_driver_path" ] && [ -r "$linux_driver_path" ] || continue
       # Wrappers are bash scripts; skip compiled drivers without scanning them.
-      # Bash builtins only: the shim action declares neither grep nor sed.
+      # Bash builtins only: the shim action does not declare grep.
       IFS= read -r linux_line <"$linux_driver_path" || true
       [ "${linux_line:0:2}" = '#!' ] || continue
       while IFS= read -r linux_line || [ -n "$linux_line" ]; do

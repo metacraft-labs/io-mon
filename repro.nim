@@ -133,6 +133,11 @@ package io_mon:
       "node"
       "getconf"
       "grep"
+      # scripts/build_shim.sh reads the Linux shim's dynamic section with
+      # `readelf` and extracts any DT_RUNPATH with `sed`, and refuses to
+      # publish when either is missing.
+      "sed"
+      "readelf"
       "nm"
       "strace"
       "patchelf"
@@ -230,7 +235,8 @@ package io_mon:
     when defined(macosx):
       appendRegisteredActionToolIdentityRefs(shimBuild.id, ["cctools"])
     when defined(linux):
-      appendRegisteredActionToolIdentityRefs(shimBuild.id, ["getconf", "mv", "rmdir"])
+      appendRegisteredActionToolIdentityRefs(shimBuild.id,
+        ["getconf", "mv", "rmdir", "sed", "readelf"])
     discard collect("shim", @[shimBuild])
     when defined(linux):
       # Keep the monitor used for this project's tests separate from the
@@ -244,7 +250,8 @@ package io_mon:
           ("IO_MON_SHIM_OUT_DIR", "build/monitor-test-runtime"),
           ("IO_MON_SHIM_NIMCACHE_DIR", "build/nimcache/monitor-test-runtime")])
       appendRegisteredActionToolIdentityRefs(testMonitor.id,
-        ["bash", "nim", backendCompiler, "mkdir", "dirname", "uname", "getconf", "mv", "rmdir"])
+        ["bash", "nim", backendCompiler, "mkdir", "dirname", "uname", "getconf", "mv", "rmdir",
+         "sed", "readelf"])
       discard collect("test-monitor-runtime", @[testMonitor])
 
     # ---- Standalone CLI (``io-mon`` / the ``default`` collection) -----------
@@ -439,7 +446,7 @@ package io_mon:
           appendRegisteredActionToolIdentityRefs(executeEdge.id, ["python3"])
       when defined(linux):
         appendRegisteredActionToolIdentityRefs(executeEdge.id,
-          ["strace", "nm", "getconf", "grep", "mv", "rmdir"])
+          ["strace", "nm", "getconf", "grep", "mv", "rmdir", "sed", "readelf"])
         if stem == "test_io_mon_uninjectable_image_entry":
           appendRegisteredActionToolIdentityRefs(executeEdge.id, ["patchelf"])
           when defined(amd64):
