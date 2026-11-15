@@ -232,7 +232,43 @@ case "${io_mon_host_platform_name}" in
     # nonexistent `<checkout>/outputs/out` (removed with every NIX_LDFLAGS*
     # variable; the shim's link needs nothing they carry). Both are inert
     # under other toolchains; the check after the link is the guarantee.
+    #
+    # The wrapper does not read NIX_DONT_SET_RPATH itself. It reads
+    # NIX_DONT_SET_RPATH_<suffix>, <suffix> being its target triple with `-`
+    # and `.` turned into `_`, and its add-flags.sh copies the unsuffixed
+    # value there only for the roles a stdenv shell activates
+    # (NIX_BINTOOLS_WRAPPER_TARGET_{BUILD,HOST,TARGET}_<suffix>). A plain
+    # shell activates none, nor does a `repro` action launched from one, so
+    # there the unsuffixed name alone is ignored and the runpath comes back.
+    # Set the suffixed name too, for every wrapper this link can run: each
+    # names its own suffix in its script, as the guard
+    # NIX_BINTOOLS_WRAPPER_FLAGS_SET_<suffix> (the compiler wrapper sources
+    # the linker wrapper's add-flags.sh under that guard, so the compiler's
+    # script carries the linker's suffix). A suffix no wrapper of this link
+    # reads is harmless, which is why the candidate list may over-approximate.
     linux_link_env=(NIX_DONT_SET_RPATH=1)
+    linux_link_drivers=(gcc clang cc ld)
+    [ -n "${CC:-}" ] && linux_link_drivers+=("$CC")
+    for linux_arg in "$@"; do
+      # The compiler and linker executables the caller binds explicitly:
+      # `--gcc.exe:gcc`, `--clang.linkerexe:/path/clang`, ...
+      case "$linux_arg" in
+        --*.exe:*|--*.linkerexe:*) linux_link_drivers+=("${linux_arg#*:}") ;;
+      esac
+    done
+    for linux_driver in "${linux_link_drivers[@]}"; do
+      linux_driver_path="$(command -v -- "$linux_driver" 2>/dev/null)" || continue
+      [ -f "$linux_driver_path" ] && [ -r "$linux_driver_path" ] || continue
+      # Wrappers are bash scripts; skip compiled drivers without scanning them.
+      # Bash builtins only: the shim action declares neither grep nor sed.
+      IFS= read -r linux_line <"$linux_driver_path" || true
+      [ "${linux_line:0:2}" = '#!' ] || continue
+      while IFS= read -r linux_line || [ -n "$linux_line" ]; do
+        if [[ "$linux_line" =~ NIX_BINTOOLS_WRAPPER_FLAGS_SET_([A-Za-z0-9_]+) ]]; then
+          linux_link_env+=("NIX_DONT_SET_RPATH_${BASH_REMATCH[1]}=1")
+        fi
+      done <"$linux_driver_path"
+    done
     for linux_ldflags_var in ${!NIX_LDFLAGS@}; do
       linux_link_env=(-u "$linux_ldflags_var" "${linux_link_env[@]}")
     done
