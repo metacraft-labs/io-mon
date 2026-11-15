@@ -18,7 +18,7 @@
 ##   WRITE/RENAME/LINK/CLONE/EXEC/FORK/…` for EVERY process's REAL file activity,
 ##   including direct-syscall, shared-cache-internal, and SIP/hardened processes
 ##   that strip dyld injection. ES is therefore the complete-coverage macOS
-##   "endgame" backend the project already names (MacOS-Monitoring.md).
+##   "endgame" backend for macOS monitoring.
 ##
 ## HONEST GATE (proven on this host, macOS 26.3.1, see the design doc):
 ##   - A minimal C ES client compiles against the present SDK but
@@ -31,9 +31,10 @@
 ##     phase ships design + feasibility + this skeleton only.
 ##
 ## References:
-##   - reprobuild-specs/MacOS-EndpointSecurity-Backend.md (the full design).
-##   - reprobuild-specs/MacOS-Monitoring-Adversarial-Hardening.milestones.org §T3c.
-##   - reprobuild-specs/Monitoring-Backend-Abstraction.md (the backend contract).
+##   - The backend contract this skeleton fills in: every monitoring backend
+##     (this kernel-sourced one, the interpose shim) produces the same
+##     dependency-evidence records, so the consumer's path-set and policy
+##     model does not depend on which backend observed an action.
 ##   - Apple ES docs: https://developer.apple.com/documentation/endpointsecurity
 ##   - BuildXL's lossy-ES prior art (cross-platform.md / ESClient.mm) — ES can
 ##     DROP events under load; a detected drop MUST conservatively invalidate.
@@ -77,7 +78,7 @@ type
     ## types). A GAP in either sequence means the kernel DROPPED messages because
     ## the client could not keep up — ES is lossy under high probe volume, exactly
     ## the failure mode that made BuildXL's ES prototype "too lossy for high-volume
-    ## absent-file probes" (MacOS-Monitoring.md §BuildXL Lessons). A detected gap
+    ## absent-file probes". A detected gap
     ## MUST be mapped to `mrEventLoss` → `mcIncomplete` (a conservative re-run),
     ## consistent with the T0 earned-completeness contract.
     lastGlobalSeq*: uint64
@@ -248,11 +249,10 @@ proc esCloneRecord*(pid, ppid: uint64; sourcePath: string): MonitorRecord =
 proc esLookupRecord*(pid, ppid: uint64; path: string;
                      existed: bool): MonitorRecord =
   ## ES_EVENT_TYPE_NOTIFY_LOOKUP → an existence/metadata PROBE (break #5's
-  ## getattrlist family arrives here too). Absent-path probe fidelity is one of
-  ## the validation criteria (MacOS-Monitoring.md §Validation Criteria); ES sees
-  ## these natively. NOTE: lookups are extremely high-volume — this is the exact
-  ## probe storm BuildXL found ES too lossy for, so the loss detector above is
-  ## load-bearing here.
+  ## getattrlist family arrives here too). Absent-path probes must be recorded
+  ## faithfully, and ES sees them natively. NOTE: lookups are extremely
+  ## high-volume — this is the exact probe storm BuildXL found ES too lossy for,
+  ## so the loss detector above is load-bearing here.
   result = esBaseRecord(mrPathProbe, moPathProbe, pid, ppid)
   result.path = path
   result.probeResult = if existed: prExistingFile else: prAbsent

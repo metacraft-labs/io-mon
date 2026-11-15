@@ -419,9 +419,10 @@ type
       ## (`unscannedImageAlreadyNoted`), not once per scan. The scanner
       ## decodes only `SHF_EXECINSTR` sections: a BOLT or `-z noseparate-code`
       ## image keeps `.rodata`/`.eh_frame` in its executable segment, and
-      ## sweeping those bytes INT3-patched a jump-table entry of rustc 1.94.0
-      ## (reprobuild-pm issue 2026-10-30-io-mon-shim-kills-upstream-rustc-1.94.0-
-      ## on-crates-with-macro-rules). An unreadable table is a coverage gap
+      ## sweeping those bytes INT3-patched a jump-table entry of rustc 1.94.0,
+      ## which then died on any crate with a `macro_rules!` (regression test
+      ## `tests/linux/test_io_mon_linux_rustc_crates_under_shim`). An
+      ## unreadable table is a coverage gap
       ## reported as event loss, never a reason to sweep the whole mapping.
     firstUnscannedImage*: array[256, char]
       ## The first such mapping's path with the diagnostic and errno, for the
@@ -3964,62 +3965,67 @@ void ct_linux_preload_real_exit(int status) {
   __builtin_unreachable();
 }
 
-/* Raw (un-interposed) syscall entry. On x86_64 this is nim-stackable-hooks'
- * hand-written ``syscall`` instruction wrapper, which returns the kernel's
- * ``-errno`` convention directly. On other architectures that substrate does
- * not exist (see the ``__x86_64__`` note above the extern block), so fall back
- * to libc ``syscall(2)`` and re-encode its ``-1``/``errno`` convention into the
- * kernel convention the callers below expect.
+/* Raw (un-interposed) syscall entry, returning the kernel's -errno
+ * convention directly -- the convention every caller below tests against.
  *
- * It must NOT fall back to libc ``syscall(2)``. ``shim/linux_preload.nim``
- * DEFINES ``long syscall(long, ...)`` with default visibility -- that is the
- * LD_PRELOAD interposer for libc's ``syscall``. Since this shim is preloaded it
- * is first in the lookup scope, so a call to ``syscall`` from anywhere inside
- * it binds back to that interposer: unbounded recursion in every monitored
- * process. The non-amd64 arm therefore issues the syscall instruction directly,
- * exactly as nim-stackable-hooks does for x86_64.
+ * It must NOT fall back to libc syscall(2). shim/linux_preload.nim DEFINES
+ * long syscall(long, ...) with default visibility -- that is the LD_PRELOAD
+ * interposer for libc's syscall. Since this shim is preloaded it is first in
+ * the lookup scope, so a call to syscall from anywhere inside it binds back to
+ * that interposer: unbounded recursion in every monitored process.
  *
- * aarch64 Linux ABI: number in x8, args in x0-x5, ``svc #0``, result in x0
- * under the kernel ``-errno`` convention -- which is already the convention the
- * callers below test against, so there is nothing to re-encode. */
+ * The instruction itself is issued by a hand-written function, never by C
+ * with an inline syscall instruction. The syscall(2) replacement below
+ * forwards clone and clone3 through here, and a CLONE_VM child with a new
+ * stack resumes after the instruction with its own stack pointer but the
+ * parent's frame registers; whatever runs between the instruction and the
+ * return runs in both, in one address space. A C body stored its result into
+ * the parent's frame at -O0 (x86-64, a SIGSEGV at address 0 in the parent),
+ * or restored sp from the parent's frame pointer at every level (32-bit ARM).
+ *
+ *   x86-64 and 32-bit ARM: nim-stackable-hooks' stackable_linux_raw_syscall6
+ *     (see the extern block above for why it exists on exactly these two).
+ *   aarch64: ct_linux_aarch64_raw_syscall6 below, the same shape as glibc's
+ *     sysdeps/unix/sysv/linux/aarch64/syscall.S: number in x8, args in
+ *     x0-x5, svc #0, result in x0; nothing touches memory between svc and
+ *     ret. It is hidden: shim/linux_preload.nim, linked into the same image,
+ *     is its only other user. bti c (a hint) is emitted only for a
+ *     branch-protected build, whose objects are marked BTI-compatible. */
+#if defined(__aarch64__)
+long ct_linux_aarch64_raw_syscall6(long nr, long a1, long a2, long a3,
+                                   long a4, long a5, long a6)
+    __attribute__((visibility("hidden")));
+__asm__(
+  ".text\n"
+  ".p2align 2\n"
+  ".globl ct_linux_aarch64_raw_syscall6\n"
+  ".hidden ct_linux_aarch64_raw_syscall6\n"
+  ".type  ct_linux_aarch64_raw_syscall6, %function\n"
+  "ct_linux_aarch64_raw_syscall6:\n"
+  "    .cfi_startproc\n"
+#if defined(__ARM_FEATURE_BTI_DEFAULT) && __ARM_FEATURE_BTI_DEFAULT
+  "    hint  #34\n"
+#endif
+  "    mov   x8, x0\n"
+  "    mov   x0, x1\n"
+  "    mov   x1, x2\n"
+  "    mov   x2, x3\n"
+  "    mov   x3, x4\n"
+  "    mov   x4, x5\n"
+  "    mov   x5, x6\n"
+  "    svc   #0\n"
+  "    ret\n"
+  "    .cfi_endproc\n"
+  ".size ct_linux_aarch64_raw_syscall6, .-ct_linux_aarch64_raw_syscall6\n"
+);
+#endif
+
 static long ct_raw_syscall6(long nr, long a1, long a2, long a3, long a4,
                             long a5, long a6) {
-#if defined(__x86_64__)
+#if defined(__x86_64__) || (defined(__arm__) && defined(__ARM_EABI__))
   return stackable_linux_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
 #elif defined(__aarch64__)
-  register long x8 __asm__("x8") = nr;
-  register long x0 __asm__("x0") = a1;
-  register long x1 __asm__("x1") = a2;
-  register long x2 __asm__("x2") = a3;
-  register long x3 __asm__("x3") = a4;
-  register long x4 __asm__("x4") = a5;
-  register long x5 __asm__("x5") = a6;
-  __asm__ volatile("svc #0"
-                   : "+r"(x0)
-                   : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
-                   : "memory", "cc");
-  return x0;
-#elif defined(__arm__) && defined(__ARM_EABI__)
-  /* 32-bit ARM EABI: number in r7, args in r0-r5, ``svc #0``, result in r0
-   * under the same ``-errno`` convention. r7 is the frame pointer in Thumb
-   * code, so it cannot be named as an asm register variable: the number
-   * travels in r6 and is swapped into r7 around the trap, which restores
-   * the frame pointer before anything can unwind through it. */
-  register long r0 __asm__("r0") = a1;
-  register long r1 __asm__("r1") = a2;
-  register long r2 __asm__("r2") = a3;
-  register long r3 __asm__("r3") = a4;
-  register long r4 __asm__("r4") = a5;
-  register long r5 __asm__("r5") = a6;
-  register long r6 __asm__("r6") = nr;
-  __asm__ volatile("push {r7}\n\t"
-                   "mov r7, r6\n\t"
-                   "svc #0\n\t"
-                   "pop {r7}"
-                   : "+r"(r0)
-                   : "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5), "r"(r6)
-                   : "memory", "cc");
-  return r0;
+  return ct_linux_aarch64_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
 #else
 #error "io-mon: no raw syscall primitive for this architecture. Add one here \
 rather than routing through libc syscall(2) -- this shim interposes that \

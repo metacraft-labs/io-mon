@@ -28,9 +28,10 @@
 ## a SIP exec to the matching drop-in (``rewriteExecPathForSip`` →
 ## ``rewriteSipPath``). A GNU ``cat`` is a DIFFERENT binary, not a copy of
 ## Apple's ``/bin/cat``, so AMFI does not kill it; the shim loads in it, and its
-## read of ``/etc/services`` IS captured. (See
-## reprobuild-specs/Portable-Macos-Sandbox-Tools.milestones.org "Validated
-## premises" and codetracer-specs §16.7.8.)
+## read of ``/etc/services`` IS captured. (Validated on macOS 26.3.1 with SIP
+## on: with an own-build ``cat`` as the drop-in, a ``posix_spawn`` of
+## ``/bin/cat /etc/services`` under the shim ran the drop-in, injected it and
+## captured the read; with no drop-in directory the read was not captured.)
 ##
 ## # What this test asserts (present-vs-absent contrast)
 ##
@@ -97,8 +98,7 @@ when defined(macosx):
     ## (``reprobuild/recipes/sandbox-tools/bundle``, produced by
     ## ``repro build recipes/sandbox-tools/<tool>`` + ``assemble-bundle.sh``),
     ## proving the SIP redirect works with reprobuild-built tools rather than the
-    ## interim nix-symlink bundle. See
-    ## reprobuild-specs/Portable-Macos-Sandbox-Tools.milestones.org M3.
+    ## interim nix-symlink bundle.
     ##
     ## Otherwise it builds the interim self-contained bundle into ``dest`` via
     ## ``scripts/build-sandbox-tools.sh`` (a DEDICATED output dir, so the test

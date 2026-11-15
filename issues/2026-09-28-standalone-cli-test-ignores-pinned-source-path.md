@@ -10,7 +10,7 @@ through `STACKABLE_HOOKS_SRC`. The fixture hardcodes a sibling checkout while
 The subsequent CLI compile succeeds, demonstrating that the compiler can
 resolve the supplied source and the preflight checked a different path.
 
-The [standalone CLI contract](../../reprobuild-specs/io-mon-hardening-protocol.md)
+The standalone CLI contract
 requires io-mon and nim-stackable-hooks, not
 a particular checkout layout. Match the configured-source selection already
 used by `test_io_mon_shim_builds_standalone.nim`; retain the real standalone

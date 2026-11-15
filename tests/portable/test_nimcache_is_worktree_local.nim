@@ -31,7 +31,7 @@
 
 import foreign_preload_isolation
 
-import std/[compilesettings, json, os, osproc, streams, strtabs, strutils]
+import std/[compilesettings, json, os, osproc, strtabs, strutils]
 
 const
   SelfNimcache = querySetting(nimcacheDir)
@@ -110,7 +110,11 @@ proc nimcacheOf(workDir, project: string; extra: seq[string] = @[];
   try:
     let p = startProcess(nimExe, workingDir = workDir, args = args, env = env,
                          options = {poStdErrToStdOut})
-    output = p.outputStream.readAll()
+    # Drain the pipe to EOF. `Stream.readAll` stops at the first read shorter
+    # than its buffer, and on Windows a pipe read returns only what `nim` has
+    # written so far, so the JSON line could be cut short or missed.
+    for line in p.lines(keepNewLines = true):
+      output.add(line)
     code = p.waitForExit()
     p.close()
   except CatchableError as e:

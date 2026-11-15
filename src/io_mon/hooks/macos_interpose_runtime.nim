@@ -255,8 +255,9 @@ int repro_macos_real_renameat_syscall(int fromfd, char *from, int tofd,
 }
 
 /*
- * T2 content/metadata-dependency forwarders (see reprobuild-specs/
- * MacOS-Monitoring-Adversarial-Hardening.milestones.org breaks #3/#5/#7).
+ * T2 content/metadata-dependency forwarders: the calls through which a process
+ * can learn a file's contents or metadata (directory listings, attribute
+ * queries, library loads) without an open/stat the shim already records.
  *
  * Each reaches the kernel via the RAW syscall, exactly like the stat/rename
  * forwarders above, so a body-patched libsystem entry of the same name is never
@@ -704,8 +705,8 @@ static int repro_macos_anchor_base(int dirfd, char *base) {
 /*
  * The path a hooked call named, made ABSOLUTE as the kernel resolved it at the
  * time of the call -- the macOS counterpart of the Linux shim's `pathForAt`.
- * Spec: reprobuild-pm/spec/Monitor-Hook-Shim.md § CWD And Path Context ("CWD
- * tracking is required for relative path normalization").
+ * The shim tracks the cwd because a relative path can only be normalized
+ * against the directory it resolved against when the call was made.
  *
  * A relative path is joined onto the directory it resolved against
  * (repro_macos_anchor_base: the cwd for AT_FDCWD, else `dirfd`'s directory);
@@ -721,8 +722,7 @@ static int repro_macos_anchor_base(int dirfd, char *base) {
  *
  * Without this the caller's relative string was recorded verbatim, and a
  * consumer could only re-anchor it on a cwd the process might already have
- * left (reprobuild-pm issue 2026-10-18,
- * "macos-shim-records-relative-paths-the-engine-anchors-on-the-action-cwd").
+ * left (regression test `tests/macos/test_io_mon_macos_relative_path_anchor`).
  *
  * The result is built directly in `out` (>= MAXPATHLEN bytes; a larger buffer
  * admits a deep cwd plus a long relative path), so a hook pays no stack

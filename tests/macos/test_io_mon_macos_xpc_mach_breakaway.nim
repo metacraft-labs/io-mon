@@ -1,7 +1,8 @@
-## test_io_mon_macos_xpc_mach_breakaway — ROUND-2 phase R-C: close the
-## XPC / Mach-port breakaway false negative (round-2 break R2), the CRITICAL
-## escape that DEFEATS the connect(2) breakaway fail-safe. See
-## reprobuild-specs/MacOS-Monitoring-Adversarial-Hardening.milestones.org §R-C.
+## test_io_mon_macos_xpc_mach_breakaway — ROUND-2 phase R-C: close the XPC /
+## Mach-port breakaway false negative (round-2 break R2), the CRITICAL escape
+## that DEFEATS the connect(2) breakaway fail-safe. Round 2, phase R-C of the
+## macOS adversarial-hardening campaign (probes that look for a dependency the
+## monitor misses while still reporting mcComplete).
 ##
 ## # The escape (research/adversarial-2026-06-round2/r2_xpc/)
 ##

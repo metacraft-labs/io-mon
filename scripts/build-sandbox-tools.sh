@@ -3,9 +3,7 @@
 # drop-in replacements for the SIP-protected system binaries that a monitored
 # process tree shells out to (/bin/sh, /bin/cat, /usr/bin/grep, …).
 #
-# WHY THIS EXISTS (SIP / AMFI rationale — see
-# reprobuild-specs/Portable-Macos-Sandbox-Tools.milestones.org and
-# codetracer-specs §16.7.8):
+# WHY THIS EXISTS (SIP / AMFI rationale, validated on macOS 26 with SIP on):
 #   On macOS 26 / Apple Silicon, System Integrity Protection strips
 #   DYLD_INSERT_LIBRARIES when a binary under /bin, /sbin, /usr/bin, /usr/sbin
 #   is exec'd, and AMFI SIGKILLs a *copy* of a restricted platform binary on
@@ -31,8 +29,8 @@
 # recipe (symlinkJoin of bash/coreutils/findutils/grep/awk/sed/tar/gzip + copy
 # real binaries out of /nix/store + bundle dylibs + install_name_tool -change
 # … @executable_path/../lib/…), but as a standalone script so io-mon does not
-# need a nix flake. The from-source reprobuild build of these same tools is the
-# tracked follow-up (Portable-Macos-Sandbox-Tools.milestones.org M1–M3).
+# need a nix flake. Building these same tools from source with reprobuild is
+# planned follow-up work.
 #
 # SOURCE OF TOOLS: by default the non-SIP tools currently on PATH (the nix dev
 # shell's coreutils/bash/…). Override the lookup with $SANDBOX_TOOLS_PATH.

@@ -3865,9 +3865,8 @@ proc snoopCreateProcessA(ctx: var hr.HookContext) {.raises: [].} =
 #   CopyFileW/A        -> TWO records per call: source (mrFileOpen +
 #                          moFileRead, detail = "CopyFileW:src") and dest
 #                          (mrFileWrite + moFileWrite,
-#                          detail = "CopyFileW:dst"). Mirrors
-#                          Monitor-Hook-Shim.md §"CopyFileW / CopyFileA |
-#                          Read source and create/write destination".
+#                          detail = "CopyFileW:dst"): a copy reads its
+#                          source and creates/writes its destination.
 #   MoveFileExW/A      -> TWO records: source (mrFileWrite + moFileWrite,
 #                          detail = "MoveFileExW:src") and dest (mrFileWrite +
 #                          moFileWrite, detail = "MoveFileExW:dst"). lpNewFileName
@@ -6059,8 +6058,7 @@ proc registerMonitorSnoopCallbacks*() =
 
 # --- Unified install backend (M73 Phase 1) ---------------------------------
 #
-# Per Monitor-Hook-Shim.md §"Install Backend Requirement:
-# dispatch-mechanism-agnostic", the shim's install backend MUST catch every
+# The install backend must be dispatch-mechanism-agnostic: it MUST catch every
 # call to a hooked Win32 API regardless of how the caller resolved the entry
 # point (IAT-routed, runtime-resolved via GetProcAddress, late-bound from a
 # DLL loaded after init, CRT-forwarded). The only point where every
@@ -6717,7 +6715,7 @@ proc installIatFor(spec: HookSpec) =
 
 proc installAllHooks(): int =
   ## Install every entry in ``hookTable``. Inline is preferred for every
-  ## hook (dispatch-mechanism-agnostic, per Monitor-Hook-Shim.md spec);
+  ## hook (it is dispatch-mechanism-agnostic, see the install-backend note);
   ## the IAT path is only walked for hooks the inline backend rejected.
   ## All inline installs are grouped inside a single transaction so the
   ## thread-suspend window happens once for the whole table rather than
@@ -7022,9 +7020,8 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
       discard
   # M73 Phase 4: post-install audit. Walk the hookTable, resolve each
   # spec's kernel32 address, and classify the first five bytes at the
-  # target. The audit MUST run synchronously here — Monitor-Hook-Shim.md
-  # §"Install Backend Requirement" requires the post-install state be
-  # captured before any other code can uninstall hooks. Cost is ~11 *
+  # target. The audit MUST run synchronously here: the post-install state
+  # must be captured before any other code can uninstall hooks. Cost is ~11 *
   # (GetProcAddress + 5-byte read) = microseconds, well within the
   # loader's critical-path budget.
   block:

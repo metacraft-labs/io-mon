@@ -233,7 +233,9 @@ client that goes through `CreateFileW`, which is nearly all of them.
 ## The tree-lifetime guard
 
 `test_io_mon_windows_tree_lifetime_guard.nim` pins the Job Object guard
-(reprobuild-pm `spec/io-mon-Windows-Tree-Lifetime-Guard.md`) with real
+(a Windows capture is complete only when the monitored root ran, from its
+suspended start, in a job that refuses breakaway and whose process count
+reached zero within the grace window) with real
 processes: a quiesced control, a detached descendant named by pid and image, a
 descendant that dies inside the window, a refused `CREATE_BREAKAWAY_FROM_JOB`,
 a real nesting refusal (a helper host nests itself into jobs until the

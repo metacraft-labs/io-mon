@@ -4,13 +4,10 @@
 ##
 ## # The break
 ##
-## Issue: `reprobuild-pm/issues/2026-10-21-linux-shim-folds-dotdot-after-a-
-## symlink-lexically.md`. Spec: `reprobuild-pm/spec/Monitor-Hook-Shim.md`
-## § "Metadata, Probe, And Symlink APIs" — "Relative paths are walked as
-## spelled: `..` after a link applies to where the link points, not to the
-## text before it" and "Never pop a symlink component lexically" — and § CWD
-## And Path Context ("CWD tracking is required for relative path
-## normalization").
+## The monitor contract: relative paths are walked as spelled, so `..`
+## after a link applies to where the link points, not to the text before it,
+## and a symlink component is never popped lexically; and CWD tracking is
+## required for relative path normalization.
 ##
 ## `pathForAt` made a relative path absolute with Nim's `/` (`joinPath`),
 ## which folds every `..` lexically: `"<root>" / "link/../file"` is

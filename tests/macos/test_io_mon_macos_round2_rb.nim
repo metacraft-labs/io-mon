@@ -1,7 +1,8 @@
 ## test_io_mon_macos_round2_rb — ROUND 2 phase R-B: four content/metadata
 ## hook-coverage false-negatives, each closed and proven against the round-2
-## adversarial corpora (research/adversarial-2026-06-round2/). See
-## reprobuild-specs/MacOS-Monitoring-Adversarial-Hardening.milestones.org (R-B).
+## adversarial corpora (research/adversarial-2026-06-round2/): round 2, phase
+## R-B of the macOS adversarial-hardening campaign (probes that look for a
+## dependency the monitor misses while still reporting mcComplete).
 ##
 ## R3 — O_RDWR-opened INPUT classification. Round 1 classified ANY O_RDWR open as
 ##   a WRITE, so a file opened O_RDWR but only READ (SQLite db, lockfile, editor;

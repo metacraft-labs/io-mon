@@ -170,9 +170,16 @@ int iomon_tg_fault_census = 0;
  * can only make a sweep less conclusive, never more. */
 int32_t iomon_tg_fault_vanish_pid = 0;
 static int32_t tg_fault_vanished_pid = 0;
-/* How the census classified the released pid (a TG_* value, -1 = not met),
- * so the test can tell "this sweep distrusted the vanished member" apart
- * from "some unrelated process kept this sweep inconclusive". */
+/* How the census classified the released pid in the sweep that released it
+ * (a TG_* value, -1 = not met), so the test can tell "this sweep distrusted
+ * the vanished member" apart from "some unrelated process kept this sweep
+ * inconclusive". Only that first classification is kept. A later sweep of the
+ * same capture can list the pid again, as a zombie its parent has not reaped
+ * yet (a test helper started by the test process itself stays one until the
+ * test reaps it after the capture), and classify it TG_DEAD. That is correct
+ * for the sweep, but it is not the verdict the seam reports, and on a busy
+ * host, where unrelated processes leave the first sweep inconclusive, it
+ * overwrote the verdict. */
 int iomon_tg_fault_vanish_verdict = -1;
 static void tg_fault_vanish(void) {
   int32_t pid = iomon_tg_fault_vanish_pid;
@@ -478,7 +485,8 @@ static int classify(tg_ctx *c, long idx, int depth) {
   }
   c->memo[idx] = (unsigned char)result;
 #ifdef IOMON_TG_FAULT_TEST
-  if (pid > 0 && pid == tg_fault_vanished_pid)
+  if (pid > 0 && pid == tg_fault_vanished_pid &&
+      iomon_tg_fault_vanish_verdict == -1)
     iomon_tg_fault_vanish_verdict = result;
 #endif
   return result;

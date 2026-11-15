@@ -25,6 +25,11 @@
       # inline raw-syscall scanner decodes code and never the `.rodata` /
       # `.eh_frame` a BOLT or `-z noseparate-code` executable segment carries
       # (the rustc 1.94.0 jump-table SIGILL).
+      # c1d55ce -> c34e325 (2026-11-15): the raw syscall entries are
+      # hand-written on x86-64 and 32-bit ARM, so nothing runs between the
+      # syscall instruction and the return; a CLONE_VM clone forwarded by
+      # this shim's syscall(2) replacement no longer writes into its
+      # parent's frame when the library is built at -O0.
       url = "github:metacraft-labs/nim-stackable-hooks/c34e3252d413361a0f250d8921e00c119d30e114";
       flake = false;
     };
@@ -131,8 +136,7 @@
           # get_dyld_hdr walks the shared cache with
           # dyld_shared_cache_iterate_text, whose _Block_copy mallocs, and that
           # malloc re-enters AsanInitFromRtl and spins on the init mutex it
-          # holds. scripts/run_sanitizer_tests.sh then never runs a test
-          # (metacraft-pm issues/2026-10-01-nix-compiler-rt-asan-startup-hangs-on-macos-26.md).
+          # holds. scripts/run_sanitizer_tests.sh then never runs a test.
           # Upstream LLVM 2e7d07a33725 ("Adopt _dyld_get_dyld_header", first
           # released in 22.1.3) asks dyld for its header instead; this is that
           # change backported to 21.x, minus its lib/tsan/go/buildgo.sh hunk

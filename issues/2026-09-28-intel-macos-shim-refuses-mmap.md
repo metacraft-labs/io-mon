@@ -4,7 +4,7 @@ Observed at `1b17d71` on 2026-09-28, in release job
 <https://github.com/metacraft-labs/io-mon/actions/runs/36362490802/job/108742379730>.
 The same failure reproduces under Rosetta locally.
 
-The initial [release specification](https://github.com/metacraft-labs/metacraft-specs/blob/1056f9f/infrastructure/gosti-io-mon-runquota-releases.md)
+The initial release requirements
 retained the old workflow's Intel macOS target and required extracted-payload
 file capture. The x86_64 probe exits 7 normally; injecting the x86_64 monitor
 changes this to exit 1 and `out of memory` before it reads the file.

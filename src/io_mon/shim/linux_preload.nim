@@ -695,76 +695,49 @@ var
 #include <linux/stat.h>   /* struct statx: see repro_linux_fd_identity_kind */
 #endif
 
-/* nim-stackable-hooks emits ``stackable_linux_raw_syscall6`` (and the rest of
- * its raw-syscall substrate) only under
- * ``when defined(linux) and defined(amd64)``. This file is LD_PRELOADed, so an
- * undefined symbol here is not a dormant reference — the loader binds it
- * eagerly and the process dies before ``main``. See the matching guard in
- * ``hooks/linux_preload_runtime.nim``.
+/* nim-stackable-hooks emits stackable_linux_raw_syscall6 (and the rest of its
+ * raw-syscall substrate) only under
+ * when defined(linux) and (defined(amd64) or defined(arm)). This file is
+ * LD_PRELOADed, so an undefined symbol here is not a dormant reference -- the
+ * loader binds it eagerly and the process dies before main. See the matching
+ * guard in hooks/linux_preload_runtime.nim.
  *
- * ``repro_raw_syscall6`` is the arch-portable spelling every call site below
- * uses. On x86_64 it is a direct passthrough, so nothing about the amd64 build
- * changes. Elsewhere it issues the syscall instruction directly.
+ * repro_raw_syscall6 is the arch-portable spelling every call site below
+ * uses. It forwards to the same hand-written entries as that file's
+ * ct_raw_syscall6: nim-stackable-hooks' on x86-64 and 32-bit ARM, and the
+ * runtime's hidden ct_linux_aarch64_raw_syscall6 on aarch64. Never C with an
+ * inline syscall instruction: the libc-less fallback of the syscall
+ * interposer below forwards clone and clone3 through here, and a CLONE_VM
+ * child with a new stack would run that C body's post-syscall code against
+ * the parent's frame (see ct_raw_syscall6).
  *
- * It must NOT fall back to libc ``syscall(2)``. THIS FILE defines
- * ``long syscall(long number, ...)`` with default visibility a few hundred
- * lines below — that is the LD_PRELOAD interposer for libc's ``syscall``.
- * Because the shim is preloaded it sits first in the lookup scope, so a call to
- * ``syscall`` from inside it binds back to that interposer and recurses until
- * the stack is gone. Several call sites here are also on the async-signal-safe
- * flush path, where that would be especially unpleasant.
- *
- * aarch64 Linux ABI: number in x8, args in x0-x5, ``svc #0``, result in x0
- * under the kernel ``-errno`` convention — already the convention every call
- * site here tests against (``!= 0``, ``< 0``), so nothing is re-encoded.
- * Issuing the instruction directly is also strictly more async-signal-safe than
- * any libc route. */
-#if defined(__x86_64__)
+ * It must NOT fall back to libc syscall(2). THIS FILE defines
+ * long syscall(long number, ...) with default visibility a few hundred lines
+ * below -- that is the LD_PRELOAD interposer for libc's syscall. Because the
+ * shim is preloaded it sits first in the lookup scope, so a call to syscall
+ * from inside it binds back to that interposer and recurses until the stack
+ * is gone. Several call sites here are also on the async-signal-safe flush
+ * path, where that would be especially unpleasant. Every entry returns the
+ * kernel's -errno convention, which every call site here tests against
+ * (!= 0, < 0). */
+#if defined(__x86_64__) || (defined(__arm__) && defined(__ARM_EABI__))
 extern long stackable_linux_raw_syscall6(long nr, long a1, long a2, long a3,
                                          long a4, long a5, long a6);
+#elif defined(__aarch64__)
+extern long ct_linux_aarch64_raw_syscall6(long nr, long a1, long a2, long a3,
+                                          long a4, long a5, long a6)
+    __attribute__((visibility("hidden")));
 #endif
 
 static long repro_raw_syscall6(long nr, long a1, long a2, long a3, long a4,
                                long a5, long a6) {
-#if defined(__x86_64__)
+#if defined(__x86_64__) || (defined(__arm__) && defined(__ARM_EABI__))
   return stackable_linux_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
 #elif defined(__aarch64__)
-  register long x8 __asm__("x8") = nr;
-  register long x0 __asm__("x0") = a1;
-  register long x1 __asm__("x1") = a2;
-  register long x2 __asm__("x2") = a3;
-  register long x3 __asm__("x3") = a4;
-  register long x4 __asm__("x4") = a5;
-  register long x5 __asm__("x5") = a6;
-  __asm__ volatile("svc #0"
-                   : "+r"(x0)
-                   : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
-                   : "memory", "cc");
-  return x0;
-#elif defined(__arm__) && defined(__ARM_EABI__)
-  /* 32-bit ARM EABI: number in r7, args in r0-r5, ``svc #0``, result in r0
-   * under the same ``-errno`` convention. r7 is the frame pointer in Thumb
-   * code, so it cannot be named as an asm register variable: the number
-   * travels in r6 and is swapped into r7 around the trap, which restores
-   * the frame pointer before anything can unwind through it. */
-  register long r0 __asm__("r0") = a1;
-  register long r1 __asm__("r1") = a2;
-  register long r2 __asm__("r2") = a3;
-  register long r3 __asm__("r3") = a4;
-  register long r4 __asm__("r4") = a5;
-  register long r5 __asm__("r5") = a6;
-  register long r6 __asm__("r6") = nr;
-  __asm__ volatile("push {r7}\n\t"
-                   "mov r7, r6\n\t"
-                   "svc #0\n\t"
-                   "pop {r7}"
-                   : "+r"(r0)
-                   : "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5), "r"(r6)
-                   : "memory", "cc");
-  return r0;
+  return ct_linux_aarch64_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
 #else
 #error "io-mon: no raw syscall primitive for this architecture. Add one here \
-rather than routing through libc syscall(2) — this shim interposes that \
+rather than routing through libc syscall(2) -- this shim interposes that \
 symbol, so calling it would recurse forever."
 #endif
 }
@@ -855,6 +828,28 @@ int repro_linux_sockaddr_un_path(void *addr, unsigned int addrlen,
   return n;
 }
 
+/* `inet_ntop` under its own, unfortified name.
+ *
+ * glibc 2.42 added a `_FORTIFY_SOURCE` wrapper for `inet_ntop`
+ * (<bits/inet-fortified.h>) that redirects every call to `__inet_ntop_chk`, a
+ * symbol that exists only as `__inet_ntop_chk@GLIBC_2.42`. The Nix compiler
+ * wrapper fortifies by default, so calling `inet_ntop` here made the shim
+ * itself require GLIBC_2.42, and the dynamic loader then refuses to preload it
+ * into any process whose libc is older: on an Ubuntu 24.04 host (glibc 2.39)
+ * `/bin/sh` died with "version `GLIBC_2.42' not found" before running a
+ * single command. The shim is injected into whatever images a monitored
+ * action runs, host binaries included, so its glibc floor is the floor of
+ * every process it monitors, and a formatting call must not raise it.
+ *
+ * An asm label binds the call to the plain `inet_ntop` symbol
+ * (inet_ntop@GLIBC_2.2.5 on x86_64), which the fortify wrapper — an inline
+ * function named `inet_ntop` — never sees. Nothing is lost: the only caller
+ * passes a buffer of exactly INET6_ADDRSTRLEN bytes and its true size, so the
+ * object-size check the wrapper would add can never fire. */
+extern const char *repro_linux_inet_ntop_plain(int af, const void *src,
+                                               char *dst, socklen_t size)
+    __asm__("inet_ntop");
+
 /* The AF_INET / AF_INET6 destination a client dialled, as text — "a.b.c.d:port"
    or "[v6]:port", the spelling the macOS shim's `repro_macos_socket_describe`
    gives the same address, so a consumer compares one string on both. Returns the
@@ -872,12 +867,15 @@ int repro_linux_sockaddr_inet_dest(void *addr, unsigned int addrlen,
   if (family == AF_INET) {
     if (addrlen < sizeof(struct sockaddr_in)) return 0;
     struct sockaddr_in *in4 = (struct sockaddr_in *)addr;
-    if (inet_ntop(AF_INET, &in4->sin_addr, ip, sizeof ip) == NULL) return 0;
+    if (repro_linux_inet_ntop_plain(AF_INET, &in4->sin_addr, ip, sizeof ip) == NULL)
+      return 0;
     port = ntohs(in4->sin_port);
   } else if (family == AF_INET6) {
     if (addrlen < sizeof(struct sockaddr_in6)) return 0;
     struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
-    if (inet_ntop(AF_INET6, &in6->sin6_addr, ip, sizeof ip) == NULL) return 0;
+    if (repro_linux_inet_ntop_plain(AF_INET6, &in6->sin6_addr, ip, sizeof ip) ==
+        NULL)
+      return 0;
     port = ntohs(in6->sin6_port);
     out[n++] = '[';
   } else {
@@ -2319,6 +2317,24 @@ proc ctInlineExecArmRetire()
 when defined(ioMonInlineWindowTest):
   proc c_window_test_usleep(us: cuint): cint
     {.importc: "usleep", header: "<unistd.h>", raises: [].}
+  proc c_window_test_getenv(name: cstring): cstring
+    {.importc: "getenv", header: "<stdlib.h>", raises: [].}
+  proc windowTestClaimMicros(): cuint {.raises: [].} =
+    ## Test-only: how long a drain holds a claimed event before recording it.
+    ## 20 ms unless `IO_MON_INLINE_WINDOW_TEST_CLAIM_US` names another length
+    ## in microseconds, so a test can hold the window open for as long as it
+    ## needs to act inside it instead of racing a fixed 20 ms.
+    let raw = c_window_test_getenv("IO_MON_INLINE_WINDOW_TEST_CLAIM_US")
+    if raw == nil or raw[0] == '\0':
+      return 20000
+    var micros: uint64 = 0
+    var i = 0
+    while raw[i] != '\0':
+      if raw[i] notin {'0' .. '9'} or micros > 100_000_000'u64:
+        return 20000
+      micros = micros * 10 + uint64(ord(raw[i]) - ord('0'))
+      inc i
+    cuint(micros)
 proc installLinuxVdsoPatches() {.raises: [].}
 proc emitLinuxVdsoPatchFailures(source: string) {.raises: [].}
 # Defined next to the other `record*` helpers, below the vDSO block; forward
@@ -2713,9 +2729,9 @@ proc kernelPathForFd(fd: cint): string {.raises: [].} =
 proc pathForAt(dirfd: cint; path: cstring): string {.raises: [].} =
   ## `path` made absolute against the directory it resolved against at the
   ## time of the call -- the working directory for `AT_FDCWD`, else
-  ## `dirfd`'s directory -- as the kernel resolved it. Spec: reprobuild-pm/
-  ## spec/Monitor-Hook-Shim.md § CWD And Path Context and § "Metadata, Probe,
-  ## And Symlink APIs". An absolute path is returned as is (the kernel
+  ## `dirfd`'s directory -- as the kernel resolved it, walking a symlink's
+  ## `..` the way `anchoredRelativePath` documents. An absolute path is
+  ## returned as is (the kernel
   ## ignores `dirfd` for it); a relative one stays relative only when
   ## nothing can name the anchor directory.
   ##
@@ -2723,8 +2739,8 @@ proc pathForAt(dirfd: cint; path: cstring): string {.raises: [].} =
   ## the anchor, and a `..` after a component of `path` is kept, because in
   ## `link/../x` it applies to where `link` points. Nim's `os./` folded that
   ## one too, and recorded `<cwd>/x` for a process that read the file beside
-  ## the link's target (reprobuild-pm issue 2026-10-21-linux-shim-folds-
-  ## dotdot-after-a-symlink-lexically). The macOS shim's
+  ## the link's target (regression test
+  ## `tests/linux/test_io_mon_linux_dotdot_after_symlink`). The macOS shim's
   ## `repro_macos_anchored_path` records the same string.
   ##
   ## Popping is exact only on a symlink-free anchor. `getcwd` is one. For a
@@ -3461,9 +3477,7 @@ proc recordRawFdWrite(fd: cint; callResult: clong;
   ## peers. LD_PRELOADed tracers report process events this way — agent-
   ## harbor's command-trace shim writes one `syscall(SYS_write)` to its
   ## socket per `waitpid` — and each one made the whole capture incomplete,
-  ## which disabled caching for the session (reprobuild-pm issue
-  ## 2026-11-10-raw-syscall-write-is-unclassified-and-disables-caching-for-
-  ## the-test-fixtures-collection).
+  ## which made every action monitored in that session uncacheable.
   if callResult < 0 or fd <= 2:
     return true
   let path = rawFdPath(fd, paths)
@@ -3950,9 +3964,8 @@ proc classifyTrappedInlineEvent(index: int; number: clong;
   # or the kernel's `/proc/self/fd` name, an absolute spelling with no
   # symlink in it, so `anchoredRelativePath` may pop a leading `..` off it.
   # It keeps a `..` that follows a component of the caller's path, which
-  # `os./` folded (`link/../x` recorded as `<base>/x`; reprobuild-pm issue
-  # 2026-10-21-linux-shim-folds-dotdot-after-a-symlink-lexically), exactly
-  # as `pathForAt` does for an interposed call.
+  # `os./` folded (`link/../x` recorded as `<base>/x`), exactly as
+  # `pathForAt` does for an interposed call.
   let absolute =
     if raw.ok and base.ok and raw.text.len > 0 and not raw.text.isAbsolute:
       anchoredRelativePath(base.text, raw.text)
@@ -4054,7 +4067,7 @@ proc drainInlineRawSyscallEvents() {.raises: [].} =
     of 1:
       when defined(ioMonInlineWindowTest):
         # Test-only: widen the window between the claim and the record.
-        discard c_window_test_usleep(20000)
+        discard c_window_test_usleep(windowTestClaimMicros())
       let event = rawSyscallEventAt(i)
       if not event.ok:
         emitEventLoss("inline raw syscall event read failed index=" & $i)
@@ -4134,9 +4147,9 @@ proc repro_hook_opendir*(ctx: var OpendirContext) {.raises: [].} =
     # Storing the caller's spelling left `chdir("repo");
     # opendir(".git/objects/pack")` (what `git -C repo` does) recorded as a
     # relative path, which a consumer can only resolve against the action's
-    # cwd: a directory the process never looked at (reprobuild-pm issue
-    # 2026-10-20-linux-shim-anchors-relative-directory-enumerations-on-the-
-    # action-cwd). `pathForAt` keeps the spelling relative when getcwd cannot
+    # cwd: a directory the process never looked at (regression test
+    # `tests/linux/test_io_mon_linux_relative_directory_enumeration_anchor`).
+    # `pathForAt` keeps the spelling relative when getcwd cannot
     # name the cwd; the kernel's name for the DIR*'s descriptor is the
     # fallback then, and only a directory nothing can name stays as spelled.
     var anchored = pathForAt(LinuxAtFdcwd, ctx.path)
@@ -4368,7 +4381,8 @@ proc recordIpcConnect(fd: cint; address: pointer;
     # The address the client DIALLED. On a socket-activated host every peer is
     # the activator (pid 1), so the pid cannot say which service was reached;
     # the endpoint can, and it is what a daemon trust declaration names
-    # (reprobuild Dev-Env-Warm-Entry.md §3). Carried in `path`, where the macOS
+    # (a declared trusted daemon is identified by its socket address, not by a
+    # pid). Carried in `path`, where the macOS
     # shim already records its endpoint.
     var buf: array[256, char]
     let n = c_sockaddr_un_path(address, addrLen, addr buf[0], cint(buf.len))

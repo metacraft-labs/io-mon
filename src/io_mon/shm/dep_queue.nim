@@ -93,8 +93,9 @@ proc getU64(buf: openArray[byte]; pos: var int): uint64 =
 
 type
   DepIdentityScope* = enum
-    ## DA-1b (reprobuild-specs/Dependency-Attribution.milestones.org) — WHAT
-    ## MAKES TWO OBSERVATIONS THE SAME FACT, decided per record kind. The
+    ## WHAT MAKES TWO OBSERVATIONS THE SAME FACT, decided per record kind, so
+    ## a fact observed by many processes is written down once rather than
+    ## once per process. The
     ## argument for every kind's answer is in `depIdentityScope` below.
     disProcessScoped   ## the OBSERVING PROCESS is part of the observed fact
     disPathScoped      ## the observed PATH is the fact; the observer is not

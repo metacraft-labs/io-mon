@@ -10,9 +10,8 @@
 ## `.rodata` (file offset 0x7ac40c5) holds the entry bytes `fa 0f 05 fe`. The
 ## sweep reported that entry as a syscall site and patched it to
 ## `fa cc 05 fe`; the next `switch` through the table jumped mid-instruction,
-## and rustc died with SIGILL on any crate with a `macro_rules!` (reprobuild-pm
-## issue 2026-10-30-io-mon-shim-kills-upstream-rustc-1.94.0-on-crates-with-
-## macro-rules). Flipping that single byte in a copy of the library, with no
+## and upstream rustc 1.94.0 died with SIGILL on any crate with a
+## `macro_rules!`. Flipping that single byte in a copy of the library, with no
 ## shim loaded, reproduces the crash; the 16 real `syscall` instructions of
 ## the image all lie in `.bolt.org.text` and the 7 false sites all in
 ## `.eh_frame` and `.rodata` (measured 2026-10-31 on nixos-ci-bare-004).

@@ -25,11 +25,13 @@
 ##
 ## THE SECOND TEST grades events trapped after the process's final drain: a
 ## thread keeps opening files through the inline `syscall` while `main`
-## returns, and a stdio stream flushed after every library destructor makes
-## one more open, so an open lands after the exit destructor drained on every
-## run, whatever the scheduler does. Every open must be in the capture, or the
-## capture must report the loss and not be complete; the run fails if the
-## late open did not happen, so the case cannot go ungraded.
+## returns. Two holds make an open land after the exit destructor drained on
+## every run, whatever the scheduler does: the exiting main thread waits after
+## that drain until the thread has opened more files, and a stdio stream
+## flushed after every exit handler makes one more open. Every open must be in
+## the capture, or the capture must report the loss and not be complete; and
+## each of five runs must have had both late opens, so the case is exercised
+## on every run rather than when the scheduler happens to produce it.
 ##
 ## THE THIRD TEST grades a process killed by a signal. A forked child opens
 ## and reads a file through its own inline `syscall` and then dies of SIGSEGV,
@@ -181,11 +183,35 @@ int main(int argc, char **argv) {
 # every index printed was opened before the process died. The thread sleeps
 # between opens so the trap buffer cannot overflow (that would report a
 # different loss and hide the case).
+#
+# The main thread holds the image open after the final drain until the
+# thread has completed two more opens, so every run has an open trapped after
+# that drain instead of only the runs the scheduler happens to produce one in.
+# The shim drains in its ELF destructor, which glibc's `_dl_fini` runs; `exit`
+# runs `_dl_fini` as an exit handler registered before `main`. A handler
+# registered while `_dl_fini` is running is still run, after `_dl_fini`
+# returns and before the process ends (glibc stdlib/exit.c restarts its walk
+# when a handler registers another:
+# https://sourceware.org/git/?p=glibc.git;a=blob;f=stdlib/exit.c). So this
+# program's own destructor, which `_dl_fini` runs before the shim's (the
+# executable is finalised first), registers `hold_after_final_drain`. It is
+# registered with `on_exit`, not `atexit`: an `atexit` handler carries the
+# executable's DSO handle, and the executable's own `__cxa_finalize`, run from
+# its last destructor, would call it at once, before the shim's drain. If the
+# handler nonetheless ran before the drain, the drain would classify the
+# opens and the test would see no late open and fail, so a wrong ordering
+# cannot pass silently.
+#
+# Independently of the thread, a stdio stream left with unflushed data makes
+# one more open when glibc flushes stdio, after every exit handler (the hold
+# above included) has run; see `late_write`. It prints `late` so the test can
+# require it.
 const lateThreadSource = """
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -218,7 +244,7 @@ static ssize_t late_write(void *cookie, const char *buf, size_t size) {
   (void)cookie;
   long fd = raw6(SYS_openat, AT_FDCWD, (long)"input-late.txt", O_RDONLY,
                  0, 0, 0);
-  if (fd < 0) _exit(32);
+  if (fd < 0) _exit(33);
   close((int)fd);
   /* Raw write: the line says the open happened, and must not depend on
    * stdio, which is being flushed. */
@@ -243,6 +269,27 @@ static void *opener(void *arg) {
   }
   for (;;) pause();
   return NULL;
+}
+
+/* Runs after _dl_fini, i.e. after the shim's final drain (see above). Two
+ * more completed opens guarantee one that STARTED after this point: the one
+ * in progress when it began may have trapped before the drain. Bounded, so a
+ * thread that stopped opening ends the run (which the test then reports as
+ * one without a late open) instead of hanging it. */
+static void hold_after_final_drain(int status, void *arg) {
+  (void)status;
+  (void)arg;
+  int start = __atomic_load_n(&opened, __ATOMIC_ACQUIRE);
+  for (int waited = 0; waited < 10000; waited++) {
+    if (__atomic_load_n(&opened, __ATOMIC_ACQUIRE) >= start + 2) return;
+    struct timespec pause = {0, 1000000};
+    nanosleep(&pause, NULL);
+  }
+}
+
+__attribute__((destructor))
+static void register_hold_after_final_drain(void) {
+  if (on_exit(hold_after_final_drain, NULL) != 0) _exit(32);
 }
 
 int main(int argc, char **argv) {
@@ -647,55 +694,68 @@ suite "io-mon Linux shim: trapped inline syscalls when the image ends inside a h
       for k, v in envPairs(): env[k] = v
       env.del("LD_PRELOAD")
       env["REPRO_MONITOR_SHIM_LIB"] = shimLib
-      # One run is enough: the host makes a late open on every run (see
-      # `late_write`), so nothing here depends on the scheduler. The thread's
-      # own opens are graded as well; any of them that landed after the drain
-      # must be reported the same way.
-      let tree = work / "tree"
-      createDir(tree)
-      for i in 0 ..< limit:
-        writeFile(tree / ("input-" & $i & ".txt"), "x\n")
-      writeFile(tree / "input-late.txt", "x\n")
-      let depfile = work / "late.iomon"
-      let cap = run(snoopBin, @["run", "--depfile", depfile, "--", host,
-        tree, $limit], env)
-      check cap.code == 0
-      var printed = 0
-      var lateRan = false
-      for line in cap.output.splitLines():
-        if line == "late":
-          lateRan = true
-        elif line.len > 0 and line.allIt(it in {'0' .. '9'}):
-          printed = max(printed, parseInt(line) + 1)
-      check printed >= 20
-      check printed < limit
-      # The open after the final drain happened, so it is graded: it is in the
-      # capture, or the capture reports the loss and is not complete.
-      check lateRan
-      let dep = readMonitorDepFile(depfile)
-      var missing = 0
-      for i in 0 ..< printed:
-        let path = tree / ("input-" & $i & ".txt")
-        if not dep.records.anyIt(it.kind == mrFileOpen and it.path == path):
+      # The host holds its image open after the final drain until the thread
+      # has opened past it, and its fopencookie stream opens `input-late.txt`
+      # when stdio is flushed after that (see lateThreadSource). So EVERY
+      # attempt must have a late open of both kinds; an attempt without one
+      # means a hold did not run after the drain, and nothing in that attempt
+      # was graded.
+      const attempts = 5
+      var lateOpens = 0
+      for attempt in 0 ..< attempts:
+        let tree = work / ("tree-" & $attempt)
+        createDir(tree)
+        for i in 0 ..< limit:
+          writeFile(tree / ("input-" & $i & ".txt"), "x\n")
+        writeFile(tree / "input-late.txt", "x\n")
+        let depfile = work / ("late-" & $attempt & ".iomon")
+        let cap = run(snoopBin, @["run", "--depfile", depfile, "--", host,
+          tree, $limit], env)
+        check cap.code == 0
+        var printed = 0
+        var lateRan = false
+        for line in cap.output.splitLines():
+          if line == "late":
+            lateRan = true
+          elif line.len > 0 and line.allIt(it in {'0' .. '9'}):
+            printed = max(printed, parseInt(line) + 1)
+        check printed >= 20
+        check printed < limit
+        # The stdio-flush open after the final drain happened, so it is
+        # graded below together with the thread's opens.
+        check lateRan
+        let dep = readMonitorDepFile(depfile)
+        var threadMissing = 0
+        for i in 0 ..< printed:
+          let path = tree / ("input-" & $i & ".txt")
+          if not dep.records.anyIt(it.kind == mrFileOpen and it.path == path):
+            inc threadMissing
+        var missing = threadMissing
+        if not dep.records.anyIt(it.kind == mrFileOpen and
+            it.path == tree / "input-late.txt"):
           inc missing
-      if not dep.records.anyIt(it.kind == mrFileOpen and
-          it.path == tree / "input-late.txt"):
-        inc missing
-      let lossReported = dep.records.anyIt(it.kind == mrEventLoss and
-        it.detail.startsWith(
-          "inline raw syscall events unclassified at image end"))
-      checkpoint("printed " & $printed & ", missing " & $missing &
-        ", loss reported: " & $lossReported & ", completeness: " &
-        $dep.completeness)
-      for r in dep.records:
-        if r.kind == mrEventLoss:
-          checkpoint("event-loss " & r.detail)
-      if missing > 0:
-        check lossReported
-        check dep.completeness != mcComplete
-      else:
-        # Everything was recorded, so the capture may be complete.
-        check dep.completeness == mcComplete or lossReported
+        let lossReported = dep.records.anyIt(it.kind == mrEventLoss and
+          it.detail.startsWith(
+            "inline raw syscall events unclassified at image end"))
+        checkpoint("attempt " & $attempt & ": printed " & $printed &
+          ", thread opens missing " & $threadMissing & ", late open ran: " &
+          $lateRan & ", missing " & $missing & ", loss reported: " &
+          $lossReported & ", completeness: " & $dep.completeness)
+        for r in dep.records:
+          if r.kind == mrEventLoss:
+            checkpoint("event-loss " & r.detail)
+        # The hold after the drain lets the thread open past it, so a passing
+        # attempt always has an unrecorded open, and the capture must report
+        # that loss and not claim to be complete.
+        check threadMissing > 0
+        if threadMissing > 0:
+          inc lateOpens
+        if missing > 0:
+          check lossReported
+          check dep.completeness != mcComplete
+      checkpoint("runs with opens after the final drain: " & $lateOpens &
+        " of " & $attempts)
+      check lateOpens == attempts
       removeDir(work)
 
   test "t_inline_events_of_a_process_killed_by_a_signal_are_reported":

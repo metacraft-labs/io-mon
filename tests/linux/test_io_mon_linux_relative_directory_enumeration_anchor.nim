@@ -4,10 +4,9 @@
 ##
 ## # The break
 ##
-## Issue: `reprobuild-pm/issues/2026-10-20-linux-shim-anchors-relative-
-## directory-enumerations-on-the-action-cwd.md`. Spec:
-## `reprobuild-pm/spec/Monitor-Hook-Shim.md` § CWD And Path Context — "CWD
-## tracking is required for relative path normalization."
+## The monitor contract: CWD tracking is required for relative path
+## normalization, so a relative path is recorded against the cwd the process
+## had when it made the call, never against the action's starting cwd.
 ##
 ## The Linux shim anchors a relative OPEN on the live cwd (`pathForAt`), but
 ## `repro_hook_opendir` stored the caller's path string verbatim and

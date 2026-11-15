@@ -18,7 +18,7 @@ reader both pass. Job `109411742855` retains the evidence.
 
 ## Expected
 
-The [hardening protocol](../../reprobuild-specs/io-mon-hardening-protocol.md)
+The hardening protocol
 requires preserving observations across image replacement and earning complete
 capture. Keep the existing fail-closed loss guard. Attribute the unmatched
 batch to its image and actual records, then flush at the correct non-returning

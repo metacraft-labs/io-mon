@@ -3,10 +3,9 @@
 ##
 ## # The break
 ##
-## Issue: `reprobuild-pm/issues/2026-10-18-macos-shim-records-relative-paths-
-## the-engine-anchors-on-the-action-cwd.md`. Spec:
-## `reprobuild-pm/spec/Monitor-Hook-Shim.md` § CWD And Path Context — "CWD
-## tracking is required for relative path normalization."
+## The monitor contract: CWD tracking is required for relative path
+## normalization, so a relative path is recorded against the cwd the process
+## had when it made the call, never against the action's starting cwd.
 ##
 ## The macOS shim stored the caller's path string verbatim (`record.path =
 ## $path` in recordOpen, recordPathProbe and the other recorders), so after

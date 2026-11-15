@@ -17,8 +17,8 @@ The test currently omits the loss record's details, so the cause is unknown.
 
 ## Expected
 
-[IoMon-Pipeline-Capture IM-2](../../reprobuild-specs/IoMon-Pipeline-Capture.milestones.org)
-requires monitoring throughout the descendant tree. This test explicitly
+Pipeline capture requires monitoring throughout the descendant tree: every
+process a monitored command starts, at any depth, is observed. This test explicitly
 requires complete capture for a shell/child-shell/reader tree. Inspect the
 loss before changing either the monitor or the fixture; retain completeness,
 file-read and process-depth assertions.

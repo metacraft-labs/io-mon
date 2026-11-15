@@ -1,5 +1,5 @@
-## test_io_mon_dep_set_element_key — DA-1d
-## (reprobuild-specs/Dependency-Attribution.milestones.org).
+## test_io_mon_dep_set_element_key — one shared rule for what identifies a
+## dependency-set element.
 ##
 ## THE DEFECT THIS FILE CLOSES. Three sites encoded "what goes in a dep-set
 ## element key", and only ONE consulted the predicate that decides it:

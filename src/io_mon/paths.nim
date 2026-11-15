@@ -65,11 +65,11 @@ proc anchoredRelativePath*(anchor, relative: string;
   ## the kernel resolves it, WITHOUT resolving any symlink. The Linux
   ## counterpart of the macOS shim's `repro_macos_anchored_path`
   ## (`hooks/macos_interpose_runtime.nim`), and the join `pathForAt` uses.
-  ## Spec: reprobuild-pm/spec/Monitor-Hook-Shim.md § CWD And Path Context
-  ## ("CWD tracking is required for relative path normalization") and
-  ## § "Metadata, Probe, And Symlink APIs" ("Relative paths are walked as
-  ## spelled: `..` after a link applies to where the link points, not to the
-  ## text before it"; "Never pop a symlink component lexically").
+  ## The rules it implements: a relative path is normalized against the
+  ## directory it resolved against at the time of the call (hence CWD
+  ## tracking), and it is walked as spelled -- a `..` after a link applies to
+  ## where the link points, not to the text before it, so a symlink component
+  ## is never popped lexically.
   ##
   ## While joining, empty components (`//`) and `.` are squeezed out, and
   ## each LEADING `..` of `relative` removes one component of `anchor`
@@ -84,8 +84,8 @@ proc anchoredRelativePath*(anchor, relative: string;
   ## `link/../x` it applies to where `link` points, which only a resolution
   ## of the path (the realpath companion) may decide. Nim's `os./` folds it
   ## lexically, and recorded `<cwd>/x` for a process that read the file
-  ## beside the link's target (reprobuild-pm issue 2026-10-21-linux-shim-
-  ## folds-dotdot-after-a-symlink-lexically).
+  ## beside the link's target (regression test
+  ## `tests/linux/test_io_mon_linux_dotdot_after_symlink`).
   ##
   ## `anchor` is used as spelled apart from its trailing slashes. A trailing
   ## slash on `relative` is kept (it asks for a directory, and `os./` kept

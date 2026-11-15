@@ -282,8 +282,9 @@ when defined(ioMonMacosTreeGuardFaultTest):
   var iomon_tg_fault_vanish_verdict {.importc.}: cint
   proc faultVanishVerdict*(): string =
     ## TEST SEAM: how the last capture's census classified the pid the
-    ## `vanish` seam released ("vanished", "nonmember", ...; "unseen" if the
-    ## census never classified it).
+    ## `vanish` seam released, in the sweep that released it ("vanished",
+    ## "nonmember", ...; "unseen" if the census never classified it). Later
+    ## sweeps of the capture do not change it (see the C side).
     case iomon_tg_fault_vanish_verdict
     of 1: "nonmember"
     of 2: "member"

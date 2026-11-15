@@ -60,8 +60,8 @@
 ##   is written exactly once during that critical section and read
 ##   without a lock by ``repro_monitor_shim_audit_failures`` /
 ##   ``repro_monitor_shim_audit_failing_names`` afterwards. This is the
-##   read-after-init pattern Monitor-Hook-Shim.md §"Install Backend
-##   Requirement" mandates: the accessor MUST NOT contend with the
+##   read-after-init pattern the install backend requires: the
+##   accessor MUST NOT contend with the
 ##   snoop hot-path, so it takes no lock at all. Callers from a thread
 ##   other than the init thread observe a fully-written snapshot
 ##   because the init thread released the shim-init mutex before
@@ -172,8 +172,7 @@ proc runInstallAudit*(targets: openArray[(string, pointer)];
   ## pairs from windows_interpose's hookTable) and classify each. On
   ## failure, append the name to ``gAuditFailingNames`` and increment
   ## ``gAuditFailureCount``. Emit one per-failure log line plus a
-  ## final summary line per Monitor-Hook-Shim.milestones.org §"M73
-  ## Phase 4".
+  ## final summary line.
   ##
   ## Idempotent on re-entry: a second call clears the prior state
   ## before re-walking. This matters for the test harness which can

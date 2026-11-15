@@ -1,8 +1,9 @@
 ## test_io_mon_macos_rd — ROUND 2 phase R-D: NON-FILE DETERMINISM INPUTS
-## (findings-doc break R10). A build whose output depends on a NON-FILE input that
-## changed — producing different output but an IDENTICAL depfile — is a false cache
-## hit a file-monitor cannot see. See
-## reprobuild-specs/MacOS-Monitoring-Adversarial-Hardening.milestones.org (R-D).
+## (findings-doc break R10). A build whose output depends on a NON-FILE input
+## that changed — producing different output but an IDENTICAL depfile — is a
+## false cache hit a file-monitor cannot see. Round 2, phase R-D of the macOS
+## adversarial-hardening campaign (probes that look for a dependency the monitor
+## misses while still reporting mcComplete).
 ##
 ## # The split (the crux — record evidence without confusing caller policy with
 ## # monitoring completeness):

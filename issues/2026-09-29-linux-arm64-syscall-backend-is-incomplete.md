@@ -36,7 +36,7 @@ the completeness assertions.
 
 [Architecture: Correctness Contract](../docs/contributors/architecture.md)
 requires uncertainty to remain incomplete. The
-[approved release scope](../../metacraft-specs/infrastructure/gosti-io-mon-runquota-releases.md)
+approved release scope
 defers Linux ARM64 from io-mon 0.1.0 by the user's 2026-09-29 decision.
 This issue stays open for that future port; all included release targets still
 require their existing product checks before publication. A release smoke
