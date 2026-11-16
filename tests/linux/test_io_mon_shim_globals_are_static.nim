@@ -43,7 +43,10 @@ const
     "rawSyscallPatchStatus", "rawSyscallPatchAttempted",
     # The startup scan's table of images counted as unscanned; a later scan
     # reads it to count each image once.
-    "unscannedImageKeys", "unscannedImageKeyCount"]
+    "unscannedImageKeys", "unscannedImageKeyCount",
+    # The host's inline site table, mapped by the constructor and read by
+    # every later scan.
+    "siteTableView"]
 
 proc siblingPath(envName, relative: string): string =
   let override = getEnv(envName)

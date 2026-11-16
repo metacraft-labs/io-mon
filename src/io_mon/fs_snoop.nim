@@ -41,6 +41,7 @@ when defined(linux) or defined(windows) or defined(macosx):
 when defined(linux):
   import std/[algorithm, monotimes, posix, sequtils]
   import io_mon/tree_ledger
+  import io_mon/inline_site_table
   from io_mon/proc_start_time import predatesRoot
   import io_mon/exec_image_injectability
 
@@ -1417,6 +1418,11 @@ proc parseRun(args: seq[string]): ParsedFsSnoopCommand =
       result.request.streamMode = parseOutputMode(requireValue(args, i, "--format"))
     of "--event-stream":
       result.request.eventStreamPath = requireValue(args, i, "--event-stream")
+    of "--inline-site-tables":
+      # A sealed inline site table produced by the caller, which is not
+      # monitored (`FsSnoopRequest.inlineSiteTables`).
+      result.request.inlineSiteTables =
+        requireValue(args, i, "--inline-site-tables")
     of "--interest":
       # The consumer's event-interest categories. Without this the request
       # carried `{}` -> `FullInterest` and `childEnv` then wrote that over
@@ -1959,6 +1965,11 @@ type
                                ## descendants — see `liveInjectedDescendants`.
                                ## `0` means "unknown", which disables the skip
                                ## and restores the exhaustive sweep.
+      siteTableFd: cint        ## This host's descriptor of the sealed inline
+                               ## site table it names to the tree, -1 (or 0
+                               ## in a default handle, never opened) when none.
+      siteTableIdentity: string ## `<dev>:<ino>` of that table: the only table
+                               ## whose served-records the merge accepts.
       rootUninjectable: bool   ## The root image is one the loader will not
                                ## preload the shim into, and that loss is
                                ## already published: its shim init cannot have
@@ -2218,6 +2229,9 @@ proc releaseMonitor(h: var MonitorHandle) =
     return
   h.active = false
   when defined(linux):
+    if h.siteTableFd > 0:
+      discard posix.close(h.siteTableFd)
+      h.siteTableFd = -1
     if h.depSetLive:
       h.depSetLive = false
       # Announce the consumer is gone (a late orphan `emit` then fast-fails with
@@ -2430,6 +2444,25 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
         # host owning the whole structure lifecycle, not just naming it.
         injected.add ("REPRO_MONITOR_APP_ID", depSetAppId)
     injected.add ("REPRO_MONITOR_SHIM_LIB", shimLib)
+    # The inline site table, when the caller supplied a usable one: opened by
+    # THIS process, checked to be sealed and of this build's scanner, and named
+    # to the tree through this process's own descriptor, so what the tree
+    # reads cannot change while it runs. A table the host cannot use is not
+    # named at all: the shim then decodes every image, as without one.
+    h.siteTableFd = -1
+    when defined(amd64):
+      if request.inlineSiteTables.len > 0:
+        let fd = posix.open(cstring(request.inlineSiteTables),
+                            O_RDONLY or O_CLOEXEC)
+        if fd >= 0:
+          let identity = sealedSiteTableIdentity(fd)
+          if identity.ok:
+            h.siteTableFd = fd
+            h.siteTableIdentity = $identity.dev & ":" & $identity.ino
+            injected.add (SiteTableEnv,
+              "/proc/" & $getCurrentProcessId() & "/fd/" & $fd)
+          else:
+            discard posix.close(fd)
     let spawnEnv = childEnv(request, injected)
     if h.nestedCapture.active:
       # Observe the enclosing run's full evidence before the existing inner
@@ -2733,7 +2766,8 @@ proc collectMonitorEvidence(h: var MonitorHandle): MonitorDepFile =
       expectedRootPid = h.rootPid, currentRunId = h.runId,
       setRecords = depDrained,
       observedInterest = normalizeInterest(h.request.interest),
-      observedEvidenceScope = h.request.evidenceScope)
+      observedEvidenceScope = h.request.evidenceScope,
+      acceptedSiteTable = h.siteTableIdentity)
   elif defined(windows):
     var launcherRecords: seq[MonitorRecord] = @[]
     if h.injection.monitoringSkipped:

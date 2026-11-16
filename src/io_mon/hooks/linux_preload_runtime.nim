@@ -9,6 +9,7 @@ import stackable_hooks/platform/linux_image_code_ranges
 import io_mon/hooks/linux_arm_image
 import ./linux_mapping_policy
 import ../exec_image_header
+import ../inline_site_table
 
 export linux_mapping_policy
 
@@ -427,6 +428,11 @@ type
     firstUnscannedImage*: array[256, char]
       ## The first such mapping's path with the diagnostic and errno, for the
       ## loss record. A fixed buffer for the same reason as `firstThumbPath`.
+    tableServedMappings*: int
+      ## How many file-backed mappings were patched from the inline site table
+      ## the host handed this process (`io_mon/inline_site_table`) instead of
+      ## being decoded. Each one received exactly the sites a decode would
+      ## have found; the shim reports the table it used once per process.
 
   AnonymousExecutableRange = object
     start: uint
@@ -9804,6 +9810,30 @@ proc noteUnscannedImage(mapping: LinuxExecutableMapping;
     if n > 0: copyMem(addr status.firstUnscannedImage[0], unsafeAddr text[0], n)
     status.firstUnscannedImage[n] = '\0'
 
+var siteTableView: SiteTableView
+  ## The sealed site table the host named in `REPRO_MONITOR_SITE_TABLES`, mapped
+  ## by the constructor (`useInlineSiteTable`); `base` nil when there is none.
+  ## Plain old data with a zero initializer, like the patch-status globals
+  ## (`tests/linux/test_io_mon_shim_globals_are_static`).
+
+proc useInlineSiteTable*(path: string) {.raises: [].} =
+  ## Map the table at `path` for every later scan of this process. Called by
+  ## the shim's constructor, before the startup scan, with the process's own
+  ## libc hooks muted. A path that does not name a sealed table of this
+  ## build's scanner leaves the process without one: every mapping is decoded.
+  when defined(linux) and defined(amd64):
+    if siteTableView.base == nil:
+      siteTableView = openSiteTableView(path)
+  else:
+    discard path
+
+proc inlineSiteTableIdentity*(): string {.raises: [].} =
+  ## `<dev>:<ino>` of the table this process uses, "" when none.
+  when defined(linux) and defined(amd64):
+    if siteTableView.base != nil:
+      return identityText(siteTableView)
+  ""
+
 proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
                                status: var InlineSyscallPatchStatus)
     {.raises: [].} =
@@ -9832,6 +9862,27 @@ proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
   # `syscall`; patching one corrupted the table and killed rustc 1.94.0 with
   # SIGILL. See `linux_image_code_ranges` for the ELF facts. No table, no scan:
   # the gap is reported as event loss (`emitUnscannedImagesLoss`).
+  when defined(amd64):
+    if siteTableView.base != nil:
+      # Same section table, read through the same calls, plus the identity of
+      # the file it came from: a table is served only for that file, and only
+      # when its ranges, its identity and the untouched code pages show that
+      # memory holds the bytes the table was computed from
+      # (`serveSitesFromTable`). Anything else falls through to the decode.
+      let probed = imageCodeRangesWithIdentity(mapping)
+      if probed.ranges.diagnostic != licrOk:
+        noteUnscannedImage(mapping, probed.ranges, status)
+        return
+      if probed.statOk and serveSitesFromTable(siteTableView, mapping,
+          probed.st, probed.ranges.ranges, patchSite):
+        inc status.tableServedMappings
+        return
+      for r in probed.ranges.ranges:
+        if r.stop <= r.start:
+          continue
+        visitLinuxX8664SyscallMemory(cast[pointer](r.start),
+                                     int(r.stop - r.start), patchSite)
+      return
   let ranges = linuxImageCodeRanges(mapping)
   if ranges.diagnostic != licrOk:
     noteUnscannedImage(mapping, ranges, status)

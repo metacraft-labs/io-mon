@@ -3397,7 +3397,14 @@ proc mergeFragments*(fragmentDir, outputPath: string;
     currentRunId = "";
     setRecords: openArray[MonitorRecord] = @[];
     observedInterest: set[EventCategory] = {};
-    observedEvidenceScope: EvidenceScope = esFull): MonitorDepFile =
+    observedEvidenceScope: EvidenceScope = esFull;
+    acceptedSiteTable = ""): MonitorDepFile =
+  ## `acceptedSiteTable` is the `<dev>:<ino>` of the sealed inline site table
+  ## this capture's host issued (`FsSnoopRequest.inlineSiteTables`). A shim
+  ## that patched a mapping from a table reports it with an event-loss record
+  ## (`SiteTableServedDetail`); the record is dropped when it names this table
+  ## and kept, as a loss, when it names any other or the host issued none.
+  ##
   ## io-mon-Lossless-Event-Capture M3 — `setRecords` are the DISTINCT records the
   ## consumer decoded from the edge's shared-memory SET (nim-shm-gset) snapshot
   ## (the sole Linux dependency transport; see fs_snoop). They are folded into the
@@ -3522,6 +3529,14 @@ proc mergeFragments*(fragmentDir, outputPath: string;
   let runScope =
     if currentRunId.len > 0: currentRunId else: getEnv("REPRO_MONITOR_SESSION")
   records = dropStaleRunRecords(records, runScope)
+  if acceptedSiteTable.len > 0:
+    var kept = newSeqOfCap[MonitorRecord](records.len)
+    for r in records:
+      if not (r.kind == mrEventLoss and
+          r.detail.startsWith(SiteTableServedDetail & " ") and
+          detailToken(r.detail, "table") == acceptedSiteTable):
+        kept.add r
+    records = move(kept)
   # DA-10 — FOLD THE FACT-SCOPED OBSERVATIONS, whichever transport carried them.
   # The `.iomon-frag` writer has no dedup step at all, so every backend without a
   # set producer wrote one record per observing process; `foldObservationIdentity`

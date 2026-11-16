@@ -31,6 +31,7 @@ import io_mon/tree_ledger
 import io_mon/posix_connect
 import io_mon/writer
 import io_mon/hooks/linux_preload_runtime
+import io_mon/inline_site_table
 import io_mon/shim/linux_pod_tables
 import stackable_hooks/platform/linux_raw_syscalls
 
@@ -2397,10 +2398,23 @@ var lateUnscannedImagesReported = 0
   ## an image reported at startup is not reported a second time on the first
   ## `dlopen`.
 
+var inlineSiteTableServedReported = false
+
+proc reportInlineSiteTableServed(status: InlineSyscallPatchStatus) {.raises: [].} =
+  ## Once per process, when a mapping was patched from a site table: name the
+  ## table. The record is an event loss unless the host recognises the table
+  ## as the one it issued (`mergeFragments`' `acceptedSiteTable`), so a table
+  ## any other party supplied leaves the capture incomplete.
+  if status.tableServedMappings <= 0 or inlineSiteTableServedReported:
+    return
+  inlineSiteTableServedReported = true
+  emitEventLoss(SiteTableServedDetail & " table=" & inlineSiteTableIdentity())
+
 proc recordInlineSyscallCoverage(status: InlineSyscallPatchStatus) {.raises: [].} =
   if inlineSyscallCoverageRecorded:
     return
   inlineSyscallCoverageRecorded = true
+  reportInlineSiteTableServed(status)
   emitThumbUnscannedLoss(status, "startup")
   emitUnscannedImagesLoss(status, "startup")
   lateUnscannedImagesReported = status.imagesUnscanned
@@ -2418,6 +2432,7 @@ var lateThumbUnscannedReported = 0
 
 proc recordLateInlineSyscallScanCoverage(status: InlineSyscallPatchStatus;
                                          source: string) {.raises: [].} =
+  reportInlineSiteTableServed(status)
   # A late scan carries the cumulative count; report only what is new.
   if status.thumbUnscanned > lateThumbUnscannedReported:
     lateThumbUnscannedReported = status.thumbUnscanned
@@ -3052,6 +3067,12 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
       # bytes only — `decodeDepRecord` ignores everything past the framed record.
       setDepSetIncarnationImage(img & '\x1f' & $int(currentExecGen))
     rememberInheritedOpenFds()
+    # The host's inline site table, mapped before the startup scan below uses
+    # it. Read here, muted, so neither the variable nor the table's descriptor
+    # becomes evidence (the table is opened with raw system calls as well).
+    let siteTablePath = getEnv(SiteTableEnv)
+    if siteTablePath.len > 0:
+      useInlineSiteTable(siteTablePath)
   initialized = true
   mainThreadId = currentThreadId()
   # M9.R.64.1 — publish the deep shim-state bitmap early so a
