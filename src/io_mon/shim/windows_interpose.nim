@@ -3557,7 +3557,16 @@ proc injectSpawnedChild(record: var MonitorRecord;
       record.detail.add(" inject=unknown-process-machine")
       return false
     machine = if processMachine == 0: nativeMachine else: processMachine
-  if machine notin [0x8664'u16, 0x014c'u16]:
+  # The shim injects children of its own machine (reprobuild-pm
+  # spec/Monitor-Hook-Shim.md, "Windows on Arm64 install backend": "The
+  # engine never injects a shim of the wrong machine"). The x64 build also
+  # serves 32-bit children through its WOW64 helper; the ARM64 build serves
+  # native ARM64 children, and an x64-emulated child of an ARM64 parent is
+  # refused here, since no x64 shim ships beside it.
+  const injectableMachines =
+    when defined(arm64): [0xAA64'u16, 0xAA64'u16]
+    else: [0x8664'u16, 0x014c'u16]
+  if machine notin injectableMachines:
     record.detail.add(" inject=unsupported-process-machine:" & toHex(machine))
     return false
   let report = shProp.injectShimIntoChildReport(pi[].hProcess,
