@@ -52,6 +52,15 @@
       url = "github:metacraft-labs/nim-shm-gset/7bc81ad2440860a8a9254eb2757c585df9652438";
       flake = false;
     };
+    cli-spec-src = {
+      # The clispec library (the `cli:` description language, its generated
+      # parser and help) the `io-mon` binary's command line is declared in
+      # (`src/io_mon/cli_description.nim`, `src/io_mon/cli.nim`). A leaf
+      # library: it depends on nothing but the standard library. f6065a9 is
+      # the revision reprobuild pins, which mounts the same description.
+      url = "github:metacraft-labs/nim-cli-spec/f6065a9c6f3b56ab7c1d7e24750f7b9cb27c5661";
+      flake = false;
+    };
   };
 
   outputs =
@@ -236,6 +245,7 @@
               STACKABLE_HOOKS_SRC = "${inputs.stackable-hooks-src}/src";
               SHM_QUEUE_SRC = "${inputs.shm-queue-src}/src";
               SHM_GSET_SRC = "${inputs.shm-gset-src}/src";
+              CLI_SPEC_SRC = "${inputs.cli-spec-src}/src";
 
               postPatch = ''
                 patchShebangs scripts/build_shim.sh
@@ -289,6 +299,7 @@
             RELEASE_STACKABLE_HOOKS_SRC = "${inputs.stackable-hooks-src}/src";
             RELEASE_SHM_QUEUE_SRC = "${inputs.shm-queue-src}/src";
             RELEASE_SHM_GSET_SRC = "${inputs.shm-gset-src}/src";
+            RELEASE_CLI_SPEC_SRC = "${inputs.cli-spec-src}/src";
             # A dynamically linked 32-bit (i686) shell. glibc's loader refuses a
             # 64-bit LD_PRELOAD object in it ("wrong ELF class: ignored") and
             # runs it anyway, so it is the canonical image the shim cannot
@@ -324,6 +335,13 @@
                   export SHM_GSET_SRC="$(cd ../nim-shm-gset/src && pwd)"
                 else
                   export SHM_GSET_SRC="$RELEASE_SHM_GSET_SRC"
+                fi
+              fi
+              if [ -z "''${CLI_SPEC_SRC:-}" ]; then
+                if [ -d ../nim-cli-spec/src ]; then
+                  export CLI_SPEC_SRC="$(cd ../nim-cli-spec/src && pwd)"
+                else
+                  export CLI_SPEC_SRC="$RELEASE_CLI_SPEC_SRC"
                 fi
               fi
             '';

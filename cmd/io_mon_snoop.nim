@@ -7,22 +7,18 @@
 ## a thin
 ## dispatcher that calls `runFsSnoopCli` (the in-process driver that injects the
 ## interpose shim around a command and writes the captured RMDF depfile — see
-## reprobuild's `repro_cli_support.nim`). io-mon already relocated that driver
-## into `io_mon/fs_snoop.nim` (`runFsSnoopCli` / `findShimLibrary`); this module
+## reprobuild's `repro_cli_support.nim`). io-mon relocated that driver into
+## `io_mon/cli.nim` (`runFsSnoopCli`, over `io_mon/fs_snoop`); this module
 ## is the missing *binary entry point* that exposes it on PATH so out-of-process
 ## consumers (the CodeTracer incremental test runner's live read-file capture,
 ## `codetracer/src/ct_test/incremental/io_mon_capture.nim`) can drive a live
 ## capture in a clean subprocess instead of in-process.
 ##
-## It is a faithful relocation: the dispatch + argument grammar is `fs_snoop`'s
-## own (`run [--depfile PATH] [--events MODE] [--event-stream PATH] -- <command>`,
-## plus `inspect <depfile> [--format text|jsonl|json]`), reusing io-mon's
-## modules with NO new vendoring and NO reprobuild import.
-##
-## # Usage
-##
-##   io-mon run --depfile <out.rdep> -- <command> [args...]
-##   io-mon inspect <depfile> [--format text|jsonl|json]
+## It is a faithful relocation, reusing io-mon's modules with NO new vendoring
+## and NO reprobuild import. The command line is declared once, in clispec
+## (`io_mon/cli_description`), and parsed by the parser clispec generates from
+## it (`io_mon/cli`); `io-mon --help`, `io-mon run --help` and
+## `io-mon inspect --help` print the help generated from the same declaration.
 ##
 ## On `run`, the shim shared library (`librepro_monitor_shim.{dylib,so,dll}`) is
 ## injected around `<command>` via `DYLD_INSERT_LIBRARIES` (macOS) /
@@ -47,16 +43,17 @@
 
 import std/os
 
-import io_mon  # re-exports fs_snoop.runFsSnoopCli + findShimLibrary
+import io_mon/cli  # the generated parser and `runFsSnoopCli`
 
 const ProgramName = "io-mon"
 
 when isMainModule:
-  # Delegate the entire command grammar to the relocated driver. `runFsSnoopCli`
-  # never raises (it converts every error into a non-zero exit + a stderr
-  # diagnostic), so the binary's exit code mirrors the monitored command's exit
-  # status on success and a non-zero failure code otherwise — exactly what an
-  # out-of-process caller (the runner) needs to fail-safe on.
+  # Delegate the entire command line to the driver. `runFsSnoopCli` never
+  # raises (help and completion requests exit 0, a usage error 2, any other
+  # error 1 with a stderr diagnostic), so the binary's exit code mirrors the
+  # monitored command's exit status on success and a non-zero failure code
+  # otherwise — exactly what an out-of-process caller (the runner) needs to
+  # fail-safe on.
   let args = commandLineParams()
   let code = runFsSnoopCli(ProgramName, args)
   # Nim quit saturates to the signed native range. Pass the same native bits

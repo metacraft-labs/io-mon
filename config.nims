@@ -22,6 +22,15 @@ switch("path", shmQueueSrc)
 let shmGSetSrc = getEnv("SHM_GSET_SRC", "../nim-shm-gset/src")
 switch("path", shmGSetSrc)
 
+# The command line of the `io-mon` binary (`io_mon/cli`) is described in
+# clispec (metacraft-labs/nim-cli-spec, a leaf library that depends on nothing
+# but the standard library, so io-mon's one-way dependency rule holds: io-mon
+# depends on neither reprobuild nor codetracer). Same sibling-checkout /
+# $CLI_SPEC_SRC override discipline as $SHM_QUEUE_SRC above. The library API
+# (`import io_mon`) does not import it; only `io_mon/cli` and the binary do.
+let cliSpecSrc = getEnv("CLI_SPEC_SRC", "../nim-cli-spec/src")
+switch("path", cliSpecSrc)
+
 ## Worktree-local nimcache: every Nim compile inside this checkout keeps its
 ## intermediate files (its nimcache) INSIDE this checkout.
 ##

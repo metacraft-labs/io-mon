@@ -466,6 +466,23 @@
         "type": "github"
       }
     },
+    "cli-spec-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794980850,
+        "narHash": "sha256-yYLlj8ZDdesOSzLynFpouy+r9xYSjvAgR/Xw97esa+8=",
+        "owner": "metacraft-labs",
+        "repo": "nim-cli-spec",
+        "rev": "f6065a9c6f3b56ab7c1d7e24750f7b9cb27c5661",
+        "type": "github"
+      },
+      "original": {
+        "owner": "metacraft-labs",
+        "repo": "nim-cli-spec",
+        "rev": "f6065a9c6f3b56ab7c1d7e24750f7b9cb27c5661",
+        "type": "github"
+      }
+    },
     "codetracer-src": {
       "flake": false,
       "locked": {
@@ -4846,6 +4863,7 @@
     },
     "root": {
       "inputs": {
+        "cli-spec-src": "cli-spec-src",
         "flake-parts": [
           "nixos-modules",
           "flake-parts"

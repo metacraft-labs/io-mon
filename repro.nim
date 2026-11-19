@@ -170,6 +170,12 @@ package io_mon:
     # shim edge still resolves ``$STACKABLE_HOOKS_SRC`` itself.
     "nim-stackable-hooks"
     "nim-shm-queue"
+    # The clispec library (its ``library clispec``): ``src/io_mon/cli.nim``
+    # generates the ``io-mon`` binary's parser and help from the description
+    # in ``src/io_mon/cli_description.nim``. A leaf library that depends on
+    # nothing but the standard library, so io-mon still depends on neither
+    # of its consumers.
+    "nim-cli-spec"
 
   # The package itself — every ``.nim`` under ``src`` is importable when a
   # consumer expresses ``uses: "io-mon"``; ``src/io_mon.nim`` is the umbrella

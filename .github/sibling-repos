@@ -62,3 +62,12 @@ nim-shm-queue
 # drop this entry as the paragraph above says, rather than keep an
 # acknowledged override.
 nim-shm-gset!=7bc81ad2440860a8a9254eb2757c585df9652438
+
+# nim-cli-spec (the clispec library) is required by `src/io_mon/cli.nim`, the
+# generated parser and help of the `io-mon` binary. Like nim-shm-gset above it
+# is not in io-mon's develop set, so the committed `repro.lock` pins nothing
+# for it, and it is pinned here explicitly, to f6065a9c, the revision
+# `flake.nix` pins `cli-spec-src` to (keep the two in step). Drop this pin once
+# the workspace manifest lists nim-cli-spec among io-mon's `depends` and
+# `repro lock refresh` pins it.
+nim-cli-spec!=f6065a9c6f3b56ab7c1d7e24750f7b9cb27c5661

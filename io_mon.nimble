@@ -21,6 +21,11 @@ skipDirs      = @["tests"]
 # would fight the sibling checkout the workspace already provides (pulling a
 # second, divergent copy into ~/.nimble). CI runs from the workspace and uses
 # the same sibling path.
+#
+# The same holds for nim-cli-spec (the clispec library, `../nim-cli-spec/src`
+# or $CLI_SPEC_SRC, see config.nims), which the `io-mon` binary's command line
+# (`io_mon/cli`) is declared in. It is a leaf library: io-mon still depends on
+# neither reprobuild nor codetracer.
 requires "nim >= 2.0.0"
 
 include "scripts/test_catalog.nims"

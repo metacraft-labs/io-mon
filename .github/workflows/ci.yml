@@ -210,7 +210,7 @@ jobs:
         shell: bash
         run: |
           parent="$(cd .. && pwd)"
-          for pair in nim-stackable-hooks:STACKABLE_HOOKS_SRC nim-shm-queue:SHM_QUEUE_SRC nim-shm-gset:SHM_GSET_SRC; do
+          for pair in nim-stackable-hooks:STACKABLE_HOOKS_SRC nim-shm-queue:SHM_QUEUE_SRC nim-shm-gset:SHM_GSET_SRC nim-cli-spec:CLI_SPEC_SRC; do
             dir="$parent/${pair%%:*}/src"
             test -d "$dir"
             echo "${pair##*:}=$dir" >> "$GITHUB_ENV"
@@ -305,6 +305,14 @@ jobs:
           # src/io_mon/writer.nim calls `emitNoGrow`, which arrived in 7bc81ad2.
           ref: 7bc81ad2440860a8a9254eb2757c585df9652438
           path: nim-shm-gset
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: metacraft-labs/nim-cli-spec
+          # Same revision as .github/sibling-repos and cli-spec-src in flake.nix:
+          # the `io-mon` binary's command line is a clispec description.
+          ref: f6065a9c6f3b56ab7c1d7e24750f7b9cb27c5661
+          path: nim-cli-spec
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Build payload and run every portable and Windows test

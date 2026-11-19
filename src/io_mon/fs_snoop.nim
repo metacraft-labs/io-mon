@@ -1139,14 +1139,6 @@ when defined(macosx):
     # its interpreter's drop-in.
     rewriteScriptCommandForSip(command, sandboxDir)
 
-type
-  ParsedFsSnoopCommand = object
-    inspectMode: bool
-    inspectPath: string
-    inspectFormat: string
-    request: FsSnoopRequest
-    depfileWasExplicit: bool
-
 # DH-1 — ATOMIC, because `runMonitored` is now a concurrently-callable host API.
 # Two monitors racing in one process must not be handed the same scratch name;
 # the timestamp alone does not separate them (two calls can land in the same
@@ -1154,14 +1146,18 @@ type
 var tempDirNonce: Atomic[uint64]
 tempDirNonce.store(uint64(getCurrentProcessId()))
 
-proc createLocalTempDir(prefix: string): string =
+proc createLocalTempDir*(prefix: string): string =
+  ## A fresh directory under the temporary directory, named `<prefix>-<pid>-
+  ## <time>-<nonce>` so concurrent callers in one process never share one.
+  ## Exported for the CLI (`io_mon/cli`), which keeps a `run` without
+  ## `--depfile` in such a directory.
   let nonce = tempDirNonce.fetchAdd(1'u64) + 1'u64
   let now = getTime()
   result = getTempDir() / (prefix & "-" & $getCurrentProcessId() & "-" &
     $now.toUnix & "-" & $now.nanosecond & "-" & $nonce)
   createDir(extendedPath(result))
 
-proc removeLocalTempDir(path: string) =
+proc removeLocalTempDir*(path: string) =
   ## Recursive deletion can race a recently-exited Windows producer or a file
   ## scanner that briefly holds a fragment without delete sharing. Cleanup must
   ## not replace the monitored command's result after evidence was finalized.
@@ -1195,7 +1191,10 @@ proc removeLocalTempDir(path: string) =
   else:
     removeDir(extendedPath(path))
 
-proc parseOutputMode(value: string): FsSnoopOutputMode =
+proc parseOutputMode*(value: string): FsSnoopOutputMode =
+  ## Decode a `--format` (`--events`) value of `io-mon run`: `none`, `text`,
+  ## `jsonl`, `binary` or its synonym `binary-stream`. The CLI declares the
+  ## same five values, so its parser refuses anything else first.
   case value
   of "none":
     fsoNone
@@ -1208,7 +1207,7 @@ proc parseOutputMode(value: string): FsSnoopOutputMode =
   else:
     raise newException(ValueError, "unsupported event mode: " & value)
 
-proc parseInterestFlag(value: string): set[EventCategory] =
+proc parseInterestFlag*(value: string): set[EventCategory] =
   ## Decode `--interest`'s value — the SAME comma-separated token vocabulary
   ## `REPRO_MONITOR_INTEREST` uses (`file-reads`, `path-probes`, `file-writes`,
   ## `proc`, `lib`, `env`, `entropy`, `ambient`, plus the pre-DA-5 aliases
@@ -1228,7 +1227,7 @@ proc parseInterestFlag(value: string): set[EventCategory] =
   ## which `normalizeInterest` already turns into "capture everything", so every
   ## caller that does not pass the flag keeps EXACTLY the behaviour it has today
   ## — `io-mon run`, the `run`-less legacy form, and every embedder of
-  ## `runFsSnoopCli`. The cost is that a consumer wanting a reduced set must SAY
+  ## `io_mon/cli.runFsSnoopCli`. The cost is that a consumer wanting a reduced set must SAY
   ## so on every invocation; that is the right way round, because the failure
   ## mode of forgetting is over-capture (a slower, larger, still-honest
   ## dependency set) and never under-capture (a missing input under
@@ -1303,7 +1302,7 @@ proc parseInterestFlag(value: string): set[EventCategory] =
       " (expected a comma-separated subset of " &
       interestToTokens(FullInterest) & ")")
 
-proc parseEvidenceScopeFlag(value: string): EvidenceScope =
+proc parseEvidenceScopeFlag*(value: string): EvidenceScope =
   ## Decode `--evidence`'s value — the SAME token vocabulary
   ## `REPRO_MONITOR_EVIDENCE` and the depfile's `evidence=` stamp use
   ## (`full`, `reads-only`), so the CLI, the env channel and the wire format are
@@ -1327,7 +1326,7 @@ proc parseEvidenceScopeFlag(value: string): EvidenceScope =
   ## AN EMPTY VALUE IS REFUSED TOO, AND IN THE SCOPE VOCABULARY. `--evidence=`
   ## and `--evidence ""` are not the absent flag: the operator WROTE the flag and
   ## named no scope, so the honest diagnostic is the one this flag owns rather
-  ## than the parser's generic "unsupported fs-snoop argument", which told them
+  ## than a generic "unsupported argument" refusal, which told them
   ## the flag does not exist when in fact only the value was missing. BOTH
   ## spellings, because the two forms of every other flag here mean the same
   ## thing and a diagnostic that depended on which one was typed would be its own
@@ -1359,174 +1358,6 @@ proc parseEvidenceScopeFlag(value: string): EvidenceScope =
       "--evidence names no known evidence scope: " & value &
       " (expected one of " & evidenceScopeToken(esFull) & ", " &
       evidenceScopeToken(esReadsOnly) & ")")
-
-proc requireValue(args: seq[string]; index: var int; flag: string): string =
-  if index + 1 >= args.len:
-    raise newException(ValueError, flag & " requires a value")
-  inc index
-  args[index]
-
-proc splitFlagValue(arg, flag: string): string =
-  let prefix = flag & "="
-  if arg.startsWith(prefix):
-    arg[prefix.len .. ^1]
-  else:
-    ""
-
-proc parseInspect(args: seq[string]): ParsedFsSnoopCommand =
-  if args.len < 2:
-    raise newException(ValueError, "inspect requires an iomon path")
-  result.inspectMode = true
-  result.inspectPath = args[1]
-  result.inspectFormat = "text"
-  var i = 2
-  while i < args.len:
-    let arg = args[i]
-    case arg
-    of "--format":
-      result.inspectFormat = requireValue(args, i, "--format")
-    of "--events":
-      result.inspectFormat = requireValue(args, i, "--events")
-    else:
-      let formatValue = splitFlagValue(arg, "--format")
-      if formatValue.len > 0:
-        result.inspectFormat = formatValue
-      else:
-        raise newException(ValueError, "unsupported inspect argument: " & arg)
-    inc i
-
-proc parseRun(args: seq[string]): ParsedFsSnoopCommand =
-  result.inspectMode = false
-  result.request.streamMode = fsoNone
-  result.request.passthroughChildStdout = true
-  result.request.passthroughChildStderr = true
-
-  var i = 0
-  var commandStart = -1
-  while i < args.len:
-    let arg = args[i]
-    if arg == "--":
-      commandStart = i + 1
-      break
-    case arg
-    of "--depfile":
-      result.request.depFilePath = requireValue(args, i, "--depfile")
-      result.depfileWasExplicit = true
-    of "--events":
-      result.request.streamMode = parseOutputMode(requireValue(args, i, "--events"))
-    of "--format":
-      result.request.streamMode = parseOutputMode(requireValue(args, i, "--format"))
-    of "--event-stream":
-      result.request.eventStreamPath = requireValue(args, i, "--event-stream")
-    of "--inline-site-tables":
-      # A sealed inline site table produced by the caller, which is not
-      # monitored (`FsSnoopRequest.inlineSiteTables`).
-      result.request.inlineSiteTables =
-        requireValue(args, i, "--inline-site-tables")
-    of "--interest":
-      # The consumer's event-interest categories. Without this the request
-      # carried `{}` -> `FullInterest` and `childEnv` then wrote that over
-      # whatever `REPRO_MONITOR_INTEREST` the caller had put in this process's
-      # environment, because the injection deliberately wins over any inherited
-      # value. So an out-of-process consumer had NO way to ask for a reduced
-      # set: the env channel is the shim's, not the CLI's. See
-      # `parseInterestFlag` for the absent-flag semantics.
-      result.request.interest =
-        parseInterestFlag(requireValue(args, i, "--interest"))
-    of "--evidence":
-      # DA-1i — how much of what the monitor observes gets written down.
-      # `--evidence=reads-only` records only lookups that FOUND something.
-      # HAZARD, named here because an operator choosing this flag is accepting a
-      # specific one: a file ADDED that shadows one earlier in a search path
-      # will NOT invalidate the action, so `repro build` can report "up to date"
-      # while the previous artefacts were compiled against the shadowed file.
-      # Modified and deleted inputs are still detected. This is ninja's own
-      # stale-build failure mode, reproduced deliberately so the two evidence
-      # models can be compared like for like.
-      result.request.evidenceScope =
-        parseEvidenceScopeFlag(requireValue(args, i, "--evidence"))
-    of "--capture-stdio":
-      # Flag form (no value) — turn capture on; subsequent
-      # ``--capture-stdio-path=…`` controls where the captured bytes
-      # are written.
-      result.request.captureChildStdio = true
-    of "--capture-stdio-path":
-      result.request.captureStdioPath = requireValue(args, i,
-        "--capture-stdio-path")
-      result.request.captureChildStdio = true
-    else:
-      let depValue = splitFlagValue(arg, "--depfile")
-      let eventsValue = splitFlagValue(arg, "--events")
-      let formatValue = splitFlagValue(arg, "--format")
-      let streamValue = splitFlagValue(arg, "--event-stream")
-      let interestValue = splitFlagValue(arg, "--interest")
-      let evidenceValue = splitFlagValue(arg, "--evidence")
-      # PRESENCE, not a non-empty value — for BOTH flags whose parser gives the
-      # empty value a MEANING of its own. `splitFlagValue` cannot tell
-      # `--interest=` / `--evidence=` (the flag written with no value) from an
-      # argument that is not that flag at all, so dispatching on
-      # `value.len > 0` sends the empty form to the catch-all, where it is
-      # refused as an "unsupported fs-snoop argument" — telling the operator the
-      # flag does not exist when only its value was missing.
-      #
-      # The arm decides only WHO ANSWERS; the two flags then answer differently,
-      # and that is the point rather than an inconsistency.
-      # `parseInterestFlag("")` widens to `FullInterest` (an empty value means
-      # the same as an absent flag — the documented back-compat rule, and
-      # `--interest` names a SET, of which the empty one is a legal value);
-      # `parseEvidenceScopeFlag("")` refuses in the scope vocabulary (there is
-      # no empty scope). MEASURED at the binary before this: `--interest ""`
-      # exited 0 and stamped full interest while `--interest=` exited 1 with
-      # "unsupported fs-snoop argument: --interest=", so one flag had two
-      # meanings decided by which spelling was typed — and the rule the graded
-      # case is named after held for only one of them.
-      #
-      # The other value-bearing flags here (`--depfile`, `--events`,
-      # `--format`, `--event-stream`, `--capture-stdio-path`) are deliberately
-      # NOT presence-dispatched: an empty path or an empty output mode is not a
-      # value their parsers give a meaning to, so there is nothing for them to
-      # answer and the generic refusal is the end of the matter.
-      let interestGiven = arg.startsWith("--interest=")
-      let evidenceGiven = arg.startsWith("--evidence=")
-      let stdioPathValue = splitFlagValue(arg, "--capture-stdio-path")
-      if depValue.len > 0:
-        result.request.depFilePath = depValue
-        result.depfileWasExplicit = true
-      elif eventsValue.len > 0:
-        result.request.streamMode = parseOutputMode(eventsValue)
-      elif formatValue.len > 0:
-        result.request.streamMode = parseOutputMode(formatValue)
-      elif streamValue.len > 0:
-        result.request.eventStreamPath = streamValue
-      elif interestGiven:
-        result.request.interest = parseInterestFlag(interestValue)
-      elif evidenceGiven:
-        result.request.evidenceScope = parseEvidenceScopeFlag(evidenceValue)
-      elif stdioPathValue.len > 0:
-        result.request.captureStdioPath = stdioPathValue
-        result.request.captureChildStdio = true
-      else:
-        raise newException(ValueError, "unsupported fs-snoop argument: " & arg)
-    inc i
-
-  if commandStart < 0 or commandStart >= args.len:
-    raise newException(ValueError, "missing command; use -- <command> [args...]")
-  result.request.command = args[commandStart .. ^1]
-
-proc parseFsSnoopCommand(args: seq[string]): ParsedFsSnoopCommand =
-  if args.len > 0 and args[0] == "inspect":
-    parseInspect(args)
-  elif args.len > 0 and args[0] == "run":
-    # Accept an explicit ``run`` subcommand so the snoop grammar reads
-    # ``io-mon run --depfile <out> -- <command>`` (the verb form the
-    # standalone CLI and the CodeTracer runner's live-capture call site use),
-    # while still supporting the bare ``--depfile … -- <command>`` form for
-    # backward compatibility with reprobuild's ``repro internal io monitor`` which
-    # dispatched the verb itself before delegating. The ``run`` token is
-    # stripped before the option parser sees it.
-    parseRun(args[1 .. ^1])
-  else:
-    parseRun(args)
 
 proc ensureParentDir(path: string) =
   let parent = parentDir(path)
@@ -2971,39 +2802,3 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
   ## child and Windows passes `lpCurrentDirectory`, so both are.
   finishMonitor(startMonitor(request))
 
-proc runFsSnoopCli*(programName: string; args: seq[string]): int =
-  try:
-    var parsed = parseFsSnoopCommand(args)
-    if parsed.inspectMode:
-      echo renderMonitorDepFile(parsed.inspectPath, parsed.inspectFormat)
-      return 0
-
-    var tempRoot = ""
-    if parsed.request.depFilePath.len == 0:
-      tempRoot = createLocalTempDir("repro-fs-snoop")
-      parsed.request.depFilePath = tempRoot / "evidence.iomon"
-    try:
-      # The CLI is a thin wrapper over the public batch host API — no duplicated
-      # lifecycle. `runMonitored` owns the shm/consumer setup; we only surface
-      # its exit code (the depfile it wrote is inspected out-of-band).
-      result = runMonitored(parsed.request).exitCode
-    finally:
-      if tempRoot.len > 0:
-        # Best-effort cleanup. On Windows the monitor shim's lingering
-        # handles (file-handle reuse, deferred delete on close) can
-        # leave directory entries that the regular ``removeDir`` cannot
-        # immediately unlink — Windows reports "the directory is not
-        # empty" even when the rdep / metadata files have already been
-        # opened+closed cleanly. Surfacing that as an action failure
-        # masks the underlying build's actual exit status (the cargo
-        # build that just succeeded), so suppress the diagnostic and
-        # let the OS reap the temp tree on the next scratch sweep. The
-        # temp directory's contents are evidence-only and never
-        # cross-process consumed.
-        try:
-          removeLocalTempDir(tempRoot)
-        except OSError:
-          discard
-  except CatchableError as err:
-    stderr.writeLine(programName & ": error: " & err.msg)
-    result = 1

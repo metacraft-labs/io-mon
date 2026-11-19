@@ -149,7 +149,7 @@ jobs:
         shell: bash
         run: |
           parent="$(cd .. && pwd)"
-          for pair in nim-stackable-hooks:STACKABLE_HOOKS_SRC nim-shm-queue:SHM_QUEUE_SRC nim-shm-gset:SHM_GSET_SRC; do
+          for pair in nim-stackable-hooks:STACKABLE_HOOKS_SRC nim-shm-queue:SHM_QUEUE_SRC nim-shm-gset:SHM_GSET_SRC nim-cli-spec:CLI_SPEC_SRC; do
             dir="$parent/${pair%%:*}/src"
             test -d "$dir"
             echo "${pair##*:}=$dir" >> "$GITHUB_ENV"

@@ -44,7 +44,9 @@ suite "io-mon CLI (M8) — portable build + inspect":
 
   test "the snoop CLI builds standalone (io-mon + nim-stackable-hooks only)":
     # The compile is the primary proof: a lingering reprobuild import would fail
-    # to resolve with only io-mon's src + nim-stackable-hooks on the path.
+    # to resolve with only io-mon's src + nim-stackable-hooks on the path (plus
+    # the leaf libraries config.nims adds: nim-shm-queue, nim-shm-gset and
+    # nim-cli-spec, whose clispec the command line is declared in).
     check fileExists(snoopSrc)
     check dirExists(hooksSrc)
     let (output, code) = run("nim", @[

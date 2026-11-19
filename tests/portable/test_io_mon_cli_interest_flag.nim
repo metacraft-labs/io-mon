@@ -33,15 +33,21 @@
 ## one body that all three arms call and the parser is platform-independent, so
 ## the rule holds wherever the suite runs.
 ##
-## `parseFsSnoopCommand` and `childEnv` are deliberately unexported, so this
-## file `include`s the module, exactly as `test_io_mon_child_env_layering.nim`
-## and `test_io_mon_windows_child_env_block.nim` do.
+## The command line is parsed by the parser clispec generates from io-mon's
+## description (`io_mon/cli.parseFsSnoopArgs`, what `runFsSnoopCli` runs).
+## `childEnv` is deliberately unexported, so this file `include`s
+## `io_mon/fs_snoop`, exactly as `test_io_mon_child_env_layering.nim` and
+## `test_io_mon_windows_child_env_block.nim` do; `io_mon/cli` re-exports none
+## of that module, so the two do not collide.
 
 import foreign_preload_isolation
 
 import std/[strtabs, unittest]
 
 include io_mon/fs_snoop
+
+import clispec/errors
+import io_mon/cli
 
 const
   BuildEdge = {ecFileReads, ecPathProbes, ecFileWrites, ecProcessTree,
@@ -144,10 +150,10 @@ template childInterest(argv: seq[string]): string =
   ## Parse `argv` the way `runFsSnoopCli` does, then compose the child
   ## environment the way all three spawn arms do, and read back the one
   ## variable the shim consults at init.
-  childEnv(parseFsSnoopCommand(argv).request, @[])["REPRO_MONITOR_INTEREST"]
+  childEnv(parseFsSnoopArgs(argv).request, @[])["REPRO_MONITOR_INTEREST"]
 
 template parsedInterest(argv: seq[string]): set[EventCategory] =
-  parseFsSnoopCommand(argv).request.interest
+  parseFsSnoopArgs(argv).request.interest
 
 template checkChildIsTold(argv: seq[string]; want: set[EventCategory];
                           canonical: string) =
@@ -183,7 +189,7 @@ suite "io-mon CLI event-interest flag":
     checkChildIsTold(argv, FullInterest, AllTokens)
 
   test "the requested set reaches the child — space form":
-    # THE PRIMARY ASSERTION. Deleting the `--interest` arm from `parseRun`
+    # THE PRIMARY ASSERTION. Dropping `interest` from `requestOf` (io_mon/cli)
     # leaves this reading `AllTokens`.
     let argv = @["run", "--interest", BuildEdgeTokens,
                  "--depfile", "d.iomon", "--", "true"]
@@ -228,7 +234,7 @@ suite "io-mon CLI event-interest flag":
     # injection overwrites the variable — so the flag is the ONLY channel, and
     # a caller trying both must get the flag's answer rather than a race
     # between two mechanisms.
-    var parsed = parseFsSnoopCommand(@["run", "--interest", BuildEdgeTokens,
+    var parsed = parseFsSnoopArgs(@["run", "--interest", BuildEdgeTokens,
                                        "--", "true"])
     parsed.request.env.add(("REPRO_MONITOR_INTEREST", "env,entropy"))
     let composed = childEnv(parsed.request, @[])["REPRO_MONITOR_INTEREST"]
@@ -273,19 +279,20 @@ suite "io-mon CLI event-interest flag":
     # very failure this flag exists to end — so it is a hard parse error, the
     # same class as `--events bogus`.
     expect ValueError:
-      discard parseFsSnoopCommand(@["run", "--interest", "flie,prcO",
+      discard parseFsSnoopArgs(@["run", "--interest", "flie,prcO",
                                     "--", "true"])
     # …and the diagnostic names the vocabulary, so the typo is fixable from the
     # message alone.
     try:
-      discard parseFsSnoopCommand(@["run", "--interest", "flie", "--", "true"])
+      discard parseFsSnoopArgs(@["run", "--interest", "flie", "--", "true"])
       check false        # unreachable: the line above must raise
     except ValueError as err:
       check AllTokens in err.msg
 
   test "--interest still requires a value":
-    expect ValueError:
-      discard parseFsSnoopCommand(@["run", "--interest"])
+    # A usage error of the generated parser now (exit 2 from the binary).
+    expect CliUsageError:
+      discard parseFsSnoopArgs(@["run", "--interest"])
 
   test "t_a_pre_DA5_command_line_still_works_and_is_re_encoded_for_the_child":
     # DA-5. An operator (or a caller's stored command line) that still says
@@ -335,9 +342,9 @@ suite "io-mon CLI event-interest flag":
     # hunt for a misspelling in a token that is spelled correctly is a worse
     # diagnostic than none.
     expect ValueError:
-      discard parseFsSnoopCommand(@["run", "--interest", "ipc", "--", "true"])
+      discard parseFsSnoopArgs(@["run", "--interest", "ipc", "--", "true"])
     try:
-      discard parseFsSnoopCommand(@["run", "--interest", "ipc", "--", "true"])
+      discard parseFsSnoopArgs(@["run", "--interest", "ipc", "--", "true"])
       check false        # unreachable: the line above must raise
     except ValueError as err:
       checkpoint("message: " & err.msg)
@@ -349,7 +356,7 @@ suite "io-mon CLI event-interest flag":
     # A genuine typo still gets the typo message, so the two branches are
     # distinguishable and the case above is not passing for a generic reason.
     try:
-      discard parseFsSnoopCommand(@["run", "--interest", "ipcc", "--", "true"])
+      discard parseFsSnoopArgs(@["run", "--interest", "ipcc", "--", "true"])
       check false
     except ValueError as err:
       check "names no known event category" in err.msg
@@ -396,9 +403,9 @@ suite "io-mon CLI event-interest flag":
                   "file-reads," & LegacyPaddingToken]:
       checkpoint("value: " & value)
       expect ValueError:
-        discard parseFsSnoopCommand(@["run", "--interest", value, "--", "true"])
+        discard parseFsSnoopArgs(@["run", "--interest", value, "--", "true"])
     try:
-      discard parseFsSnoopCommand(
+      discard parseFsSnoopArgs(
         @["run", "--interest", LegacyPaddingToken, "--", "true"])
       check false        # unreachable: the line above must raise
     except ValueError as err:
