@@ -168,7 +168,7 @@ static int write_file(const char *path, const char *text) {
   return n == (ssize_t)strlen(text) ? 0 : -1;
 }
 
-/* wordexp WORDS with flags FLAGS in private user and mount namespaces whose
+/* wordexp WORDS with flags FLAGS in user and mount namespaces of its own whose
  * /bin/sh is SH, the image wordexp runs for a command substitution. Exit 5
  * when the namespaces cannot be made. */
 static int wordexp_with_sh(const char *sh, const char *words, int flags) {
@@ -182,7 +182,10 @@ static int wordexp_with_sh(const char *sh, const char *words, int flags) {
     if (write_file("/proc/self/uid_map", map) != 0) return 5;
     snprintf(map, sizeof(map), "0 %u 1", (unsigned)gid);
     if (write_file("/proc/self/gid_map", map) != 0) return 5;
-    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) return 5;
+    /* Slave, not private: a private copy keeps every host mount it copied
+       mounted after the host unmounts it, for as long as this process
+       lives. The bind below cannot reach the host either way. */
+    if (mount(NULL, "/", NULL, MS_REC | MS_SLAVE, NULL) != 0) return 5;
     if (mount(sh, "/bin/sh", NULL, MS_BIND, NULL) != 0) return 5;
   }
   wordexp_t we;
@@ -448,8 +451,10 @@ int main(int argc, char **argv) {
     perror("shell-swap: gid_map");
     return 77;
   }
-  if (mount("none", "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
-    perror("shell-swap: make / private");
+  /* Slave, not private (see wordexp_with_sh): the bind below stays here
+     either way, and a slave copy lets the host's unmounts through. */
+  if (mount("none", "/", NULL, MS_REC | MS_SLAVE, NULL) != 0) {
+    perror("shell-swap: make / a slave");
     return 77;
   }
   char target[PATH_MAX];

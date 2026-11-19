@@ -3,7 +3,8 @@
 ## ES SDK. Exercises the three pure pieces the production backend is built on and
 ## that the backend's design specifies:
 ##   - the process-subtree filter (EsProcessTree) — ES is system-global, so only
-##     the build's own root pid + descendants (grown via FORK/EXEC) are kept;
+##     the build's own subtree, keyed on the audit token and grown from a seeded
+##     spawn helper via FORK/EXEC, is kept;
 ##   - the event-loss detector (EsSeqTracker.observeSeq) — a `global_seq_num` gap
 ##     maps to dropped events → an `mrEventLoss` record → `mcIncomplete`;
 ##   - the ES-event → iomon-record mapping (classifyOpenFlags + es*Record), which
@@ -19,36 +20,36 @@ import std/[strutils, unittest]
 import io_mon/types
 import io_mon/backends/endpoint_security
 
+proc tok(pid: uint64; pidversion = 1'u32): EsAuditToken =
+  EsAuditToken(pid: pid, pidversion: pidversion)
+
 suite "io-mon EndpointSecurity skeleton — process-subtree filter":
-  test "the root pid is in the subtree; an unrelated pid is not":
-    let tree = initEsProcessTree(1000)
-    check tree.inSubtree(1000)
-    check not tree.inSubtree(2000)
+  # The audit-token key, the hold rule and the end-of-capture fence have their
+  # own adversarial regression test:
+  # test_io_mon_es_subtree_audit_token_and_fence.nim.
+  test "the seeded helper is in the subtree; an unrelated process is not":
+    let tree = initEsProcessTree(tok(1000))
+    check tree.inSubtree(tok(1000))
+    check not tree.inSubtree(tok(2000))
 
   test "a fork child is admitted only when its parent is monitored":
-    var tree = initEsProcessTree(1000)
-    tree.onFork(1000, 1100)        # parent monitored → child admitted
-    tree.onFork(9999, 1200)        # parent NOT monitored → child ignored
-    check tree.inSubtree(1100)
-    check not tree.inSubtree(1200)
+    var tree = initEsProcessTree(tok(1000))
+    check tree.onFork(tok(1000), tok(1100)).len == 0  # parent monitored
+    check tree.onFork(tok(9999), tok(1200)).len == 0  # parent NOT monitored
+    check tree.inSubtree(tok(1100))
+    check not tree.inSubtree(tok(1200))
 
-  test "exec keeps the pid in the subtree (survives a hardened-image exec)":
-    var tree = initEsProcessTree(1000)
-    tree.onFork(1000, 1100)
-    tree.onExec(1100)              # exec replaces image, keeps pid
-    check tree.inSubtree(1100)
-
-  test "exit drops the pid (guards against later pid reuse out-of-tree)":
-    var tree = initEsProcessTree(1000)
-    tree.onFork(1000, 1100)
-    tree.onExit(1100)
-    check not tree.inSubtree(1100)
+  test "exec keeps the process in the subtree (survives a hardened-image exec)":
+    var tree = initEsProcessTree(tok(1000))
+    discard tree.onFork(tok(1000), tok(1100))
+    discard tree.onExec(tok(1100), tok(1100))   # same token across the exec
+    check tree.inSubtree(tok(1100))
 
   test "a grandchild is admitted transitively":
-    var tree = initEsProcessTree(1000)
-    tree.onFork(1000, 1100)
-    tree.onFork(1100, 1200)        # parent (1100) is monitored → grandchild in
-    check tree.inSubtree(1200)
+    var tree = initEsProcessTree(tok(1000))
+    discard tree.onFork(tok(1000), tok(1100))
+    discard tree.onFork(tok(1100), tok(1200))  # parent (1100) monitored
+    check tree.inSubtree(tok(1200))
 
 suite "io-mon EndpointSecurity skeleton — event-loss detection":
   test "a contiguous global_seq_num stream reports NO loss":
@@ -122,7 +123,7 @@ suite "io-mon EndpointSecurity skeleton — event → record mapping":
 suite "io-mon EndpointSecurity skeleton — honest default stub":
   test "the default build refuses to start with a clear gated reason":
     proc sink(r: MonitorRecord) {.gcsafe.} = discard
-    var b = newEsBackend(1000, sink)
+    var b = newEsBackend(tok(1000), sink)
     let res = b.start()
     check not res.ok
     check not b.started
