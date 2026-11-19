@@ -56,9 +56,11 @@
       # The clispec library (the `cli:` description language, its generated
       # parser and help) the `io-mon` binary's command line is declared in
       # (`src/io_mon/cli_description.nim`, `src/io_mon/cli.nim`). A leaf
-      # library: it depends on nothing but the standard library. f6065a9 is
-      # the revision reprobuild pins, which mounts the same description.
-      url = "github:metacraft-labs/nim-cli-spec/f6065a9c6f3b56ab7c1d7e24750f7b9cb27c5661";
+      # library: it depends on nothing but the standard library. fcd5b30 is
+      # the first revision with `clispec/splice` (`cliUnbound`), which the
+      # description uses, and the revision reprobuild pins, which mounts the
+      # same description.
+      url = "github:metacraft-labs/nim-cli-spec/fcd5b309c2cb38656d8d2c3b39a7c4e72b5dfb3a";
       flake = false;
     };
   };

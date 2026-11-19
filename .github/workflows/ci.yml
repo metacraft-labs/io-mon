@@ -311,7 +311,7 @@ jobs:
           repository: metacraft-labs/nim-cli-spec
           # Same revision as .github/sibling-repos and cli-spec-src in flake.nix:
           # the `io-mon` binary's command line is a clispec description.
-          ref: f6065a9c6f3b56ab7c1d7e24750f7b9cb27c5661
+          ref: fcd5b309c2cb38656d8d2c3b39a7c4e72b5dfb3a
           path: nim-cli-spec
           token: ${{ steps.app-token.outputs.token }}
 

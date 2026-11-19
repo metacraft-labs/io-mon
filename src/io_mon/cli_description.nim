@@ -22,9 +22,16 @@
 ## The description is a compile-time proc returning the `cli:` BODY of the
 ## command (no root `help` statement: the program that holds it gives its
 ## command one) rather than a macro call, so a consumer can place it anywhere
-## in its own tree. It imports only `std/macros`, so splicing it costs the
-## consumer no dependency on the parser; the clispec library is needed only
-## where a program is generated from it (`io_mon/cli`).
+## in its own tree. It imports only `std/macros` and clispec's
+## `clispec/splice` (which itself imports only `std/macros`), so splicing it
+## costs the consumer no dependency on the parser; the rest of the clispec
+## library is needed only where a program is generated from it (`io_mon/cli`).
+##
+## The body is built with `quote`, which binds every name to a symbol of this
+## module's scope; `cliUnbound` turns it back into the tree the `cli:`
+## language reads (`afterSeparator = true` names the literal `true`,
+## `seq[string]` is a bracket expression, the spliced `runParams` groups are
+## flattened into the command that holds them).
 ##
 ## The grammar (clispec: https://github.com/metacraft-labs/nim-cli-spec):
 ##
@@ -38,47 +45,7 @@
 
 import std/macros
 
-proc unbound(n: NimNode): NimNode {.compileTime.} =
-  ## `n` with every symbol `quote` bound turned back into the identifier it
-  ## was written as, line information kept. The `cli:` language is read as
-  ## written, the way a macro's untyped argument is (`afterSeparator = true`
-  ## names the literal `true`, `seq[string]` is a bracket expression), so
-  ## the body handed to a consumer must not carry symbols of this module's
-  ## scope.
-  if n.kind == nnkCall and n.len >= 2 and
-      n[0].kind in {nnkSym, nnkOpenSymChoice, nnkClosedSymChoice} and
-      (if n[0].kind == nnkSym: $n[0] else: $n[0][0]) == "[]":
-    # `quote` turns `seq[string]` into a call of the `[]` operator.
-    result = nnkBracketExpr.newNimNode(n)
-    for child in n[1 .. ^1]:
-      result.add(unbound(child))
-    return
-  case n.kind
-  of nnkSym:
-    result = ident($n)
-    result.copyLineInfo(n)
-  of nnkOpenSymChoice, nnkClosedSymChoice:
-    result = ident($n[0])
-    result.copyLineInfo(n)
-  of nnkNone, nnkEmpty, nnkIdent, nnkCharLit..nnkUInt64Lit,
-      nnkFloatLit..nnkFloat64Lit, nnkStrLit..nnkTripleStrLit, nnkNilLit:
-    result = n
-  of nnkStmtList:
-    # A shared group of declarations (`runParams`) is spliced in as a
-    # statement list of its own; its statements belong to the scope it is
-    # spliced into, which is where clispec reads them.
-    result = n.kind.newNimNode(n)
-    for child in n:
-      let converted = unbound(child)
-      if converted.kind == nnkStmtList:
-        for statement in converted:
-          result.add(statement)
-      else:
-        result.add(converted)
-  else:
-    result = n.kind.newNimNode(n)
-    for child in n:
-      result.add(unbound(child))
+import clispec/splice
 
 proc runParams(visibility: string): NimNode {.compileTime.} =
   ## The parameters of a monitored run, shared by `run` and by the bare form
@@ -116,7 +83,7 @@ proc ioMonCommandLineDescription*(): NimNode {.compileTime.} =
   ## any `cli:` description.
   let bare = runParams("internal")
   let run = runParams("shown")
-  result = unbound(quote do:
+  result = cliUnbound(quote do:
     subcmd "run", help = "Run a command under the monitor and write the dependency file it read and wrote":
       `run`
     subcmd "inspect", help = "Print a dependency file":
