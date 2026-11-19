@@ -3447,6 +3447,12 @@ long ct_linux_inline_syscall_site_count(void) {
   return (long)ct_inline_syscall_site_count_value;
 }
 
+/* The address of the `index`th site this process patched, 0 out of range. */
+unsigned long ct_linux_inline_syscall_site_at(long index) {
+  if (index < 0 || index >= (long)ct_inline_syscall_site_count_value) return 0;
+  return ct_inline_syscall_sites[index];
+}
+
 long ct_linux_inline_syscall_trap_count(void) {
   return (long)ct_inline_syscall_trap_count_value;
 }
@@ -8508,6 +8514,8 @@ proc cInlineSyscallHandlerAddress(): pointer
   {.importc: "ct_linux_inline_syscall_handler_address", raises: [].}
 proc cInlineSyscallSiteCount(): clong
   {.importc: "ct_linux_inline_syscall_site_count", raises: [].}
+proc cInlineSyscallSiteAt(index: clong): culong
+  {.importc: "ct_linux_inline_syscall_site_at", raises: [].}
 proc cInlineSyscallTrapCount(): clong
   {.importc: "ct_linux_inline_syscall_trap_count", raises: [].}
 proc cInlineSyscallFailureCount(): clong
@@ -9834,6 +9842,68 @@ proc inlineSiteTableIdentity*(): string {.raises: [].} =
       return identityText(siteTableView)
   ""
 
+when defined(amd64):
+  proc ctIldDecodeLength(code: pointer; maxLen: csize_t): cint
+    {.importc: "ct_ild_decode", cdecl, raises: [].}
+    ## The scanner's own length decoder (nim-stackable-hooks
+    ## `inline_hook/windows/length_decoder.c`, linked into the shim).
+
+proc visitAroundOwnPatches(start, stop: uint;
+                           visitor: proc(site: LinuxSyscallSite): bool
+                             {.closure, raises: [].}) {.raises: [].} =
+  ## Decode `[start, stop)` as it decoded before this process patched it.
+  ## A site the shim patched reads `cc 05` where the scan read `0f 05`; the
+  ## length decoder takes the `cc` as a one-byte `int3` and the `05` as a
+  ## five-byte `add eax, imm32`, so it would resume four bytes past the
+  ## original `syscall`, possibly inside the next instruction, and could
+  ## patch a `0f 05` there (reprobuild-pm issue 2026-11-16, "a late
+  ## inline-syscall scan decodes code it already patched").
+  ##
+  ## So a patched site cuts the range, but only where the sweep lands on it:
+  ## the registry outlives the code it describes (an unmapped image, a JIT
+  ## page rewritten in place), and a `cc 05` that happens to sit at a stale
+  ## address inside a new instruction must be decoded through, as before. A
+  ## walk with the scanner's own stepping (the decoded length, or one byte
+  ## when a byte does not decode) finds the landed sites. The range is then
+  ## decoded in pieces that end just past each landed site's `int3` (the
+  ## sweep stops there: fewer than three bytes remain) and restart two bytes
+  ## past it, where the sweep over the unpatched bytes resumed. The decoder
+  ## succeeds exactly when an instruction fits in its `maxLen`, so a piece
+  ## that ends at a landed site decodes every earlier instruction as the walk
+  ## did. The walk costs one more decode of a range that holds a patched
+  ## site, on late scans only.
+  if stop <= start:
+    return
+  when defined(amd64):
+    var candidates: seq[uint] = @[]
+    let count = int(cInlineSyscallSiteCount())
+    for k in 0 ..< count:
+      let site = uint(cInlineSyscallSiteAt(clong(k)))
+      if site < start or site + 2 > stop:
+        continue
+      let p = cast[ptr UncheckedArray[byte]](site)
+      if p[0] == linuxInt3Opcode and p[1] == linuxSyscallOpcode1:
+        candidates.add site
+    if candidates.len > 0:
+      candidates.sort()
+      var at = start
+      var i = start
+      for site in candidates:
+        while i < site:
+          let ilen = int(ctIldDecodeLength(cast[pointer](i),
+                                           csize_t(min(stop - i, 15'u))))
+          i += (if ilen <= 0: 1'u else: uint(ilen))
+        if i != site:
+          continue                   # the sweep steps over it: no cut
+        visitLinuxX8664SyscallMemory(cast[pointer](at), int(site + 2 - at),
+                                     visitor)
+        at = site + 2
+        i = at
+      if at < stop:
+        visitLinuxX8664SyscallMemory(cast[pointer](at), int(stop - at), visitor)
+      return
+  visitLinuxX8664SyscallMemory(cast[pointer](start), int(stop - start), visitor)
+
 proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
                                status: var InlineSyscallPatchStatus)
     {.raises: [].} =
@@ -9853,7 +9923,11 @@ proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
   if mapping.path.len == 0 or mapping.path[0] != '/':
     # An anonymous (JIT) range has no image to consult; the caller established
     # through the mmap wrapper that the program created it as code.
-    visitLinuxExecutableMappingSyscalls(mapping, patchSite)
+    when defined(amd64):
+      if mapping.readable and mapping.executable:
+        visitAroundOwnPatches(mapping.start, mapping.stop, patchSite)
+    else:
+      visitLinuxExecutableMappingSyscalls(mapping, patchSite)
     return
   # A file-backed mapping is scanned only over the image's executable
   # sections. The rest of an `R E` segment can be read-only data -- BOLT and
@@ -9878,20 +9952,14 @@ proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
         inc status.tableServedMappings
         return
       for r in probed.ranges.ranges:
-        if r.stop <= r.start:
-          continue
-        visitLinuxX8664SyscallMemory(cast[pointer](r.start),
-                                     int(r.stop - r.start), patchSite)
+        visitAroundOwnPatches(r.start, r.stop, patchSite)
       return
   let ranges = linuxImageCodeRanges(mapping)
   if ranges.diagnostic != licrOk:
     noteUnscannedImage(mapping, ranges, status)
     return
   for r in ranges.ranges:
-    if r.stop <= r.start:
-      continue
-    visitLinuxX8664SyscallMemory(cast[pointer](r.start), int(r.stop - r.start),
-                                 patchSite)
+    visitAroundOwnPatches(r.start, r.stop, patchSite)
 
 proc installInlineSyscallPatches*(): InlineSyscallPatchStatus {.raises: [].}
 
@@ -10095,7 +10163,7 @@ proc installInlineSyscallPatches*(): InlineSyscallPatchStatus {.raises: [].} =
     return status
 
   let own = runtimeOwnImage(mappings.mappings)
-  for mapping in mappings.mappings:
+  for mapping in coalesceSplitImageMappings(mappings.mappings):
     if not shouldPatchInlineSyscallMapping(mapping, executablePath, own):
       continue
     patchInlineSyscallMapping(mapping, status)
@@ -10152,7 +10220,7 @@ proc scanInlineSyscallPatchesForNewMappings*(): InlineSyscallPatchStatus
     inlineSyscallPatchStatus = status
     return status
   let own = runtimeOwnImage(mappings.mappings)
-  for mapping in mappings.mappings:
+  for mapping in coalesceSplitImageMappings(mappings.mappings):
     if not shouldPatchInlineSyscallMapping(mapping, executablePath, own):
       continue
     patchInlineSyscallMapping(mapping, status)

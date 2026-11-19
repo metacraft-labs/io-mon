@@ -217,3 +217,37 @@ suite "the running image is excluded by address, not by file name":
                        inode = 9)
     check not shouldPatchInlineSyscallMapping(shim, exe,
       ownImageOf(mappings, handler))
+
+suite "pieces of one file mapping are joined before a late scan":
+  # The startup patch `mprotect`s each patched page, which leaves it a mapping
+  # of its own; a late scan joins the pieces so its decoder starts where the
+  # startup scan's did, not at a page boundary inside an instruction
+  # (`test_io_mon_late_inline_scan_keeps_instruction_sync`).
+  proc piece(start, stop, offset: uint; path = "/opt/app/bin/app";
+             inode = 77'u64; device = "fd:01"; writable = false):
+      LinuxExecutableMapping =
+    result = mapping(path, start = start, stop = stop, inode = inode,
+                     device = device, writable = writable)
+    result.offset = offset
+
+  test "contiguous pieces of one file are joined":
+    let joined = coalesceSplitImageMappings([
+      piece(0x1000, 0x3000, 0x1000),
+      piece(0x3000, 0x4000, 0x3000),
+      piece(0x4000, 0x8000, 0x4000)])
+    check joined.len == 1
+    check joined[0].start == 0x1000'u
+    check joined[0].stop == 0x8000'u
+    check joined[0].offset == 0x1000'u
+
+  test "pieces that do not continue each other stay apart":
+    # A gap in the file offsets, another inode, another device, other
+    # permissions, a gap in the addresses, an anonymous range.
+    for second in [piece(0x3000, 0x4000, 0x5000),
+                   piece(0x3000, 0x4000, 0x3000, inode = 78),
+                   piece(0x3000, 0x4000, 0x3000, device = "fd:02"),
+                   piece(0x3000, 0x4000, 0x3000, writable = true),
+                   piece(0x3001, 0x4000, 0x3000),
+                   piece(0x3000, 0x4000, 0x3000, path = "", inode = 0)]:
+      check coalesceSplitImageMappings(
+        [piece(0x1000, 0x3000, 0x1000), second]).len == 2

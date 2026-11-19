@@ -76,6 +76,39 @@ type
       ## other mapping of the same file is the same image (a non-default
       ## layout can give an image more than one executable segment).
 
+proc coalesceSplitImageMappings*(mappings: openArray[LinuxExecutableMapping]):
+    seq[LinuxExecutableMapping] {.raises: [].} =
+  ## The mappings with every run of adjacent pieces of one file mapping joined
+  ## back into one: same path, device, inode and permissions, each piece
+  ## starting where the previous one stops and at the file offset that
+  ## continues it.
+  ##
+  ## WHY. Patching a site `mprotect`s its page writable and back, and the
+  ## kernel then keeps that page as a mapping of its own, so after the startup
+  ## scan one code mapping can show in `/proc/self/maps` as three. A later scan
+  ## (a `dlopen` or `dlmopen`) that decoded each piece on its own would
+  ## start the instruction-length decoder at a page boundary, which can fall
+  ## inside an instruction, and could patch a `0f 05` it then meets (reprobuild-pm
+  ## issue 2026-11-16, "a late inline-syscall scan decodes code it already
+  ## patched"). Joined, the pieces give back the mapping the startup scan
+  ## decoded, from the start of each executable section.
+  result = @[]
+  for mapping in mappings:
+    if result.len > 0:
+      let last = addr result[^1]
+      if mapping.path.len > 0 and mapping.path[0] == '/' and
+          mapping.path == last[].path and mapping.inode == last[].inode and
+          mapping.inode != 0 and mapping.device == last[].device and
+          mapping.readable == last[].readable and
+          mapping.writable == last[].writable and
+          mapping.executable == last[].executable and
+          mapping.privateMapping == last[].privateMapping and
+          mapping.start == last[].stop and last[].stop > last[].start and
+          mapping.offset == last[].offset + (last[].stop - last[].start):
+        last[].stop = mapping.stop
+        continue
+    result.add mapping
+
 proc ownImageOf*(mappings: openArray[LinuxExecutableMapping];
                  address: uint): OwnImage {.raises: [].} =
   ## The image among `mappings` that contains `address`. The caller passes an
