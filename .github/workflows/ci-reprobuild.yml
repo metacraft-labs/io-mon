@@ -124,16 +124,16 @@ jobs:
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@9456226e58b7db8538c96936136fe73a1a12974d
         with:
           env-flavor: reprobuild
-          # Reprobuild v0.2.28 (098d08a6; its catalog is the one repro.lock
+          # Reprobuild v0.2.29 (99798461; its catalog is the one repro.lock
           # pins, 56ffd673). The engine reads the committed v3 lock on
           # every host and builds on Windows. Keep the
           # bootstrap libraries at that engine's own flake-lock revisions;
           # POSIX retains its monitor input without an older override.
           # Windows ARM64 keeps the existing emulated x64 Reprobuild tools.
           repro-from-source: true
-          repro-build-pin: 098d08a67f8781974ef674680b2fb4689dd8fa55
+          repro-build-pin: 9979846112d606818f13f5952d808cb4da5bba0b
           repro-runquota-pin: 6ff973131e7f715f0237cb0f08b8dd16cbeba0dc
-          repro-io-mon-pin: 735726963f48d91031463cbd9d1e9cf8f444f5ee
+          repro-io-mon-pin: 8b8faa81bb0cad5d2d91fae80ceaaa7092782ec2
           repro-stackable-hooks-pin: c34e3252d413361a0f250d8921e00c119d30e114
           gh-token: ${{ steps.ci_token.outputs.token }}
 
