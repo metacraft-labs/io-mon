@@ -75,10 +75,13 @@ since the public `struct link_map` does not expose glibc's private `l_info[]`), 
 replicates glibc's search order — **RPATH-if-no-RUNPATH → `LD_LIBRARY_PATH` →
 RUNPATH**, with `$ORIGIN` expanded — handing the real `dlopen` an absolute path. On a
 miss it passes the soname through unchanged, so glibc's caller-independent
-`ld.so.cache` + default paths still apply (never _worse_ than today). Runs under the
-shim's reentrancy guard so its own `getenv`/`access` don't recurse or record spurious
-deps. Only the path string handed to the real `dlopen` changes; hook bodies, dlmopen
-namespace handling, vdso handling and all recording are untouched.
+`ld.so.cache` + default paths still apply. glibc still attributes that call to the
+shim, so it also searches the shim's own `DT_RPATH`/`DT_RUNPATH`: the miss path
+matches unmonitored behaviour only while the shim carries no search path (see
+"Residual risks"). Runs under the shim's reentrancy guard so its own
+`getenv`/`access` don't recurse or record spurious deps. Only the path string
+handed to the real `dlopen` changes; hook bodies, dlmopen namespace handling, vdso
+handling and all recording are untouched.
 
 Chosen because it is surgical, verified, keeps the existing architecture, and is
 strictly more correct than the state of the art for in-tool `dlopen` interposition
@@ -153,8 +156,14 @@ candidate negative case. Native Linux qualification is required.
   low-risk follow-up could record the resolved path in `repro_hook_dlopen` (it would
   churn golden depfiles, so it was kept out of this transparency fix).
 - Resolves the caller's **own** RPATH/RUNPATH, not the full loader-chain RPATH that
-  glibc also consults; on a miss it falls through to unmodified glibc behavior, so it
-  cannot be worse than today.
+  glibc also consults; on a miss it falls through to glibc with the shim as the
+  caller. glibc then searches the shim's own search path as well, so the shim MUST be
+  installed with no `DT_RPATH`/`DT_RUNPATH`. A packaged shim that carried the engine's
+  runtime family (zstd, sqlite, openssl, blake3, xxhash, clingo) as `DT_RPATH` let a
+  monitored program `dlopen("libzstd.so.1")` that fails unmonitored (measured
+  2026-11-20 with the reprobuild 0.2.24 package; `LD_DEBUG=libs` names "RPATH from
+  file librepro_monitor_shim.so"). reprobuild's Nix packaging strips it and fails
+  the build if one remains, from reprobuild `2e30fcad08` on.
 - `$LIB` / `$PLATFORM` DT tokens are not expanded (only `$ORIGIN`); such dirs are
   skipped and left to glibc's fallback.
 - Arch scope: the `l_ld` `DT_STRTAB` read assumes `!DL_RO_DYN_SECTION` (true for
