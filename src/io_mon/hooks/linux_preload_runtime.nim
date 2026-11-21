@@ -1152,6 +1152,14 @@ static ct_ilp32_time64_fn real_time64_ptr = NULL;
 
 #define CT_INLINE_SYSCALL_SITE_CAP 4096
 static unsigned long ct_inline_syscall_sites[CT_INLINE_SYSCALL_SITE_CAP];
+/* Up to CT_INLINE_SYSCALL_TAIL_BYTES bytes that followed each site's two
+ * patched bytes when it was recorded, and how many were taken. A site is only
+ * a real patch while those bytes still follow it
+ * (ct_linux_inline_syscall_site_tail_matches). */
+#define CT_INLINE_SYSCALL_TAIL_BYTES 4
+static unsigned char ct_inline_syscall_tails[CT_INLINE_SYSCALL_SITE_CAP]
+                                            [CT_INLINE_SYSCALL_TAIL_BYTES];
+static unsigned char ct_inline_syscall_tail_lens[CT_INLINE_SYSCALL_SITE_CAP];
 static volatile sig_atomic_t ct_inline_syscall_site_count_value = 0;
 static volatile sig_atomic_t ct_inline_syscall_trap_count_value = 0;
 static volatile sig_atomic_t ct_inline_syscall_failure_count_value = 0;
@@ -3012,7 +3020,8 @@ void ct_linux_inline_syscall_reset(void) {
   ct_raw_syscall_event_overflow_value = 0;
 }
 
-int ct_linux_inline_syscall_record_site(unsigned long address) {
+int ct_linux_inline_syscall_record_site(unsigned long address,
+                                        unsigned long limit) {
   if (address == 0) return -1;
   if (ct_inline_syscall_site_index(address) >= 0) return 0;
   sig_atomic_t count = ct_inline_syscall_site_count_value;
@@ -3020,9 +3029,49 @@ int ct_linux_inline_syscall_record_site(unsigned long address) {
     ct_inline_syscall_overflow_value = 1;
     return -2;
   }
+  /* `limit` is the end of the mapping the site is in: the tail is read only
+   * below it. The bytes after the two patched ones are the original code's.
+   * Written before the count is raised, so the trap handler (which reads the
+   * count) never sees a half-recorded site. */
+  unsigned long tail_start = address + 2;
+  unsigned char tail_len = 0;
+  if (limit > tail_start) {
+    unsigned long avail = limit - tail_start;
+    tail_len = avail < CT_INLINE_SYSCALL_TAIL_BYTES
+                   ? (unsigned char)avail : CT_INLINE_SYSCALL_TAIL_BYTES;
+    memcpy(ct_inline_syscall_tails[count], (const void *)tail_start, tail_len);
+  }
+  ct_inline_syscall_tail_lens[count] = tail_len;
   ct_inline_syscall_sites[count] = address;
   ct_inline_syscall_site_count_value = count + 1;
   return 0;
+}
+
+/* Whether the site at registry `index` still has, in memory below `limit`, the
+ * bytes that followed it when it was patched. A registry entry outlives the
+ * code it describes (an unmapped image, a JIT page rewritten in place), and a
+ * real one-byte `int3` followed by `05 ...` reads like a patched site; the
+ * code after it is what tells them apart. Only bytes below `limit` are read,
+ * so a stale address is never read past the mapping the scan is in. */
+int ct_linux_inline_syscall_site_tail_matches(long index, unsigned long limit) {
+  if (index < 0 || index >= (long)ct_inline_syscall_site_count_value) return 0;
+  unsigned long tail_start = ct_inline_syscall_sites[index] + 2;
+  unsigned long n = ct_inline_syscall_tail_lens[index];
+  if (limit <= tail_start) return 1;
+  if (limit - tail_start < n) n = limit - tail_start;
+  const unsigned char *now = (const unsigned char *)tail_start;
+  for (unsigned long i = 0; i < n; i++) {
+    unsigned char was = ct_inline_syscall_tails[index][i];
+    if (now[i] == was) continue;
+    /* A site patched after this one was recorded (the scan patches in address
+     * order, and this tail was taken before it) turned its `0f` into `cc`:
+     * that is this site's own code, not a rewrite. */
+    if (was == 0x0f && now[i] == 0xcc &&
+        ct_inline_syscall_site_index(tail_start + i) >= 0)
+      continue;
+    return 0;
+  }
+  return 1;
 }
 
 #if defined(__x86_64__) || defined(__arm__)
@@ -8508,12 +8557,14 @@ proc cRawSyscallOwnerJoin(target: pointer): cint
   {.importc: "ct_linux_preload_raw_owner_join", raises: [].}
 proc cInlineSyscallReset()
   {.importc: "ct_linux_inline_syscall_reset", raises: [].}
-proc cInlineSyscallRecordSite(address: culong): cint
+proc cInlineSyscallRecordSite(address, limit: culong): cint
   {.importc: "ct_linux_inline_syscall_record_site", raises: [].}
 proc cInlineSyscallHandlerAddress(): pointer
   {.importc: "ct_linux_inline_syscall_handler_address", raises: [].}
 proc cInlineSyscallSiteCount(): clong
   {.importc: "ct_linux_inline_syscall_site_count", raises: [].}
+proc cInlineSyscallSiteTailMatches(index: clong; limit: culong): cint
+  {.importc: "ct_linux_inline_syscall_site_tail_matches", raises: [].}
 proc cInlineSyscallSiteAt(index: clong): culong
   {.importc: "ct_linux_inline_syscall_site_at", raises: [].}
 proc cInlineSyscallTrapCount(): clong
@@ -9871,7 +9922,10 @@ proc visitAroundOwnPatches(start, stop: uint;
   ## So a patched site cuts the range, but only where the sweep lands on it:
   ## the registry outlives the code it describes (an unmapped image, a JIT
   ## page rewritten in place), and a `cc 05` that happens to sit at a stale
-  ## address inside a new instruction must be decoded through, as before. A
+  ## address inside a new instruction must be decoded through, as before. So
+  ## must a real `int3` at a stale address that is an instruction boundary:
+  ## a site counts only while the bytes recorded after it when it was patched
+  ## still follow it (`ct_linux_inline_syscall_site_tail_matches`). A
   ## walk with the scanner's own stepping (the decoded length, or one byte
   ## when a byte does not decode) finds the landed sites. The range is then
   ## decoded in pieces that end just past each landed site's `int3` (the
@@ -9891,7 +9945,8 @@ proc visitAroundOwnPatches(start, stop: uint;
       if site < start or site + 2 > stop:
         continue
       let p = cast[ptr UncheckedArray[byte]](site)
-      if p[0] == linuxInt3Opcode and p[1] == linuxSyscallOpcode1:
+      if p[0] == linuxInt3Opcode and p[1] == linuxSyscallOpcode1 and
+         cInlineSyscallSiteTailMatches(clong(k), culong(stop)) != 0:
         candidates.add site
     if candidates.len > 0:
       candidates.sort()
@@ -9921,7 +9976,8 @@ proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
   let patchSite = proc(site: LinuxSyscallSite): bool {.closure, raises: [].} =
     let tx = installInt3SyscallPatchTransaction(cast[pointer](site.address))
     if tx.diagnostic == lrsOk and tx.patchLive:
-      if cInlineSyscallRecordSite(culong(site.address)) == 0:
+      if cInlineSyscallRecordSite(culong(site.address),
+                                  culong(mapping.stop)) == 0:
         inc statusPtr[].patchedSites
     elif statusPtr[].firstPatchDiagnostic == lrsOk:
       statusPtr[].firstPatchDiagnostic = tx.diagnostic

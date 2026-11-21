@@ -75,6 +75,12 @@
 ## registered site that reads `cc 05`, without the walk that checks the sweep
 ## lands on it, makes the `jit` call return 0x44332205cc05cc11.
 ##
+## A stale address can also be an instruction boundary holding a real `int3`
+## (mode `jit-int3`): the rewritten page jumps over `cc 05 0f 05 22 33`, an
+## `int3; add $imm32, %eax` whose immediate starts with `0f 05`. The registry
+## records the four bytes that followed each site when it was patched; a
+## late scan cuts only where they still follow, so the `0f 05` stays intact.
+##
 ## x86_64 only: no other architecture's scanner decodes variable-length
 ## instructions. Mocks: none. Real shim, real host program, real compiler.
 
@@ -155,6 +161,61 @@ static int jit(void) {
   return 0;
 }
 
+/* A stale registry entry that is itself an instruction boundary holding a
+ * real one-byte `int3`: the page's first code has a `syscall` at offset 5 (it
+ * is patched and registered), the rewrite puts
+ *   eb 09 90 90 90 cc 05 0f 05 22 33 c3
+ * there: a jump over `int3; add $0x3322050f, %eax` (the `add`'s immediate
+ * starts with `0f 05`). The walk with the scanner's stepping lands on the
+ * `cc`, so a cut at the registered site resumes the sweep inside the
+ * immediate and patches the `0f`. */
+static int jit_int3(void) {
+  typedef unsigned long (*fn)(void);
+  unsigned char *m = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (m == MAP_FAILED) return 2;
+  memset(m, 0xc3, 4096);
+  unsigned char first[] = {0xb8, 0x27, 0, 0, 0, 0x0f, 0x05, 0xc3};
+  memcpy(m, first, sizeof first);
+  mprotect(m, 4096, PROT_READ | PROT_EXEC);
+  printf("jit-first=%s jit-patched=%02x\n",
+         ((fn)m)() == (unsigned long)getpid() ? "ok" : "mismatch", m[5]);
+  mprotect(m, 4096, PROT_READ | PROT_WRITE);
+  unsigned char second[] = {0xeb, 0x09, 0x90, 0x90, 0x90, 0xcc, 0x05, 0x0f,
+                            0x05, 0x22, 0x33, 0xc3};
+  memcpy(m, second, sizeof second);
+  mprotect(m, 4096, PROT_READ | PROT_EXEC);
+  ((fn)m)();
+  printf("jit-int3-imm=%02x%02x\n", m[7], m[8]);
+  return 0;
+}
+
+/* Two adjacent `syscall`s: the scan patches the first, records the bytes after
+ * it (the second `0f 05`), then patches the second, so the first's recorded
+ * tail no longer matches memory by its own `0f` -> `cc`. A late scan (the same
+ * bytes, remapped executable) must still cut at the first: if it did not, it
+ * would resume at the second's `05` and decode `mov $imm32, %eax` from offset 9
+ * as part of a longer instruction, landing on the `0f 05` inside its
+ * immediate. The syscall number is unassigned, so both calls return -ENOSYS. */
+static int jit_adjacent(void) {
+  typedef long (*fn)(void);
+  unsigned char *m = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (m == MAP_FAILED) return 2;
+  memset(m, 0xc3, 4096);
+  unsigned char code[] = {0xb8, 0xff, 0xff, 0xff, 0x7f, 0x0f, 0x05, 0x0f, 0x05,
+                          0xb8, 0x99, 0x0f, 0x05, 0x11, 0xc3};
+  memcpy(m, code, sizeof code);
+  mprotect(m, 4096, PROT_READ | PROT_EXEC);
+  ((fn)m)();
+  printf("jit-adj-first=%02x%02x\n", m[5], m[7]);
+  mprotect(m, 4096, PROT_READ | PROT_WRITE);
+  mprotect(m, 4096, PROT_READ | PROT_EXEC);
+  ((fn)m)();
+  printf("jit-adj-imm=%02x%02x\n", m[11], m[12]);
+  return 0;
+}
+
 /* Every byte of this executable's executable mappings that reads `cc` in
  * memory where the file has `0f` (a patched `syscall`, or a patched byte that
  * was never one), as a file offset. */
@@ -193,6 +254,8 @@ static void print_sites(const char *label) {
 
 int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "jit") == 0) return jit();
+  if (argc > 1 && strcmp(argv[1], "jit-int3") == 0) return jit_int3();
+  if (argc > 1 && strcmp(argv[1], "jit-adjacent") == 0) return jit_adjacent();
   printf("before=%x\n", desync_probe());
   printf("page-before=%x\n", page_probe());
   print_sites("sites");
@@ -282,6 +345,24 @@ suite "a late inline-syscall scan keeps the startup scan's instruction sync":
       # and the call through the trap worked.
       check lineValue(r.output, "jit-first") == "ok jit-patched=cc"
       check lineValue(r.output, "jit-second") == "443322050f05cc11"
+
+    test "a stale patched address holding a real int3 does not cut the decode":
+      let r = run(snoopBin, @["run", "--depfile", work / "jit-int3.iomon", "--",
+                              host, "jit-int3"], env)
+      checkpoint(r.output)
+      check r.code == 0
+      check lineValue(r.output, "jit-first") == "ok jit-patched=cc"
+      # The `add`'s immediate still starts with `0f 05`.
+      check lineValue(r.output, "jit-int3-imm") == "0f05"
+
+    test "a site whose neighbour was patched later still cuts the decode":
+      let r = run(snoopBin, @["run", "--depfile", work / "jit-adj.iomon", "--",
+                              host, "jit-adjacent"], env)
+      checkpoint(r.output)
+      check r.code == 0
+      check lineValue(r.output, "jit-adj-first") == "cccc"
+      # The `mov`'s immediate still holds its `0f 05`.
+      check lineValue(r.output, "jit-adj-imm") == "0f05"
   else:
     test "late inline scan instruction sync (x86_64 INT3 backend only)":
       skip()
