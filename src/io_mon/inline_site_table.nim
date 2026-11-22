@@ -39,7 +39,13 @@
 ##     compiled from);
 ##   - the file the shim opened for the mapping (the one whose section table
 ##     gives the code ranges) has the table's device, inode, size, mtime and
-##     ctime, and the device agrees with `/proc/self/maps`;
+##     ctime, and its inode is the mapping's;
+##   - that file is the mapped one: its device agrees with `/proc/self/maps`,
+##     or, where maps prints another device than `stat` reports for every
+##     file (btrfs prints the superblock's and `stat` reports the
+##     subvolume's; an overlayfs reports its layer's), the code bytes of the
+##     ranges in memory equal the file's bytes at the same offsets, read with
+##     the file's identity unchanged across the read;
 ##   - the producer saw the file settled (its ctime at least
 ##     `defaultSettleNs` in the past) and unchanged across its read, so a write
 ##     within one timestamp tick cannot leave the identity equal;
@@ -480,6 +486,55 @@ when defined(linux) and defined(amd64):
         first += uint(count)
     true
 
+  proc codeBytesEqualFile(mapping: LinuxExecutableMapping; st: Stat;
+                          ranges: openArray[LinuxAddressRange]): bool =
+    ## True when the bytes of `ranges` in memory equal the bytes at the same
+    ## offsets of the file `mapping.path` names now, and that file kept the
+    ## identity `st` (the table's) across the read. For a mapping whose maps
+    ## device does not name the descriptor's (btrfs subvolumes, overlayfs):
+    ## there the inode alone does not tell the mapped file from another file
+    ## of the same superblock, so the decode's input is compared directly.
+    ## The ranges lie inside `mapping` (`linuxImageCodeRangesFromReader`
+    ## clips them to it), so each byte's file offset is its distance from the
+    ## mapping's start plus the mapping's offset. Raw system calls, as for the
+    ## pagemap: the image was already read through the probe, and this read
+    ## must not become evidence a second time. Any failure is false.
+    if mapping.path.len == 0 or mapping.path.len > 4000:
+      return false
+    var cpath = mapping.path
+    let fd = rawSyscall6(sysOpenat, atFdcwd, cast[int](cstring(cpath)),
+                         int(O_RDONLY or O_CLOEXEC), 0, 0, 0)
+    if not rawOk(fd):
+      return false
+    defer: discard rawSyscall6(sysClose, fd, 0, 0, 0, 0, 0)
+    var now: Stat
+    if not rawOk(rawSyscall6(sysFstat, fd, cast[int](addr now), 0, 0, 0, 0)) or
+        not sameIdentity(now, st):
+      return false
+    var buffer: array[16384, byte]
+    for r in ranges:
+      if r.stop <= r.start:
+        continue
+      if r.start < mapping.start or r.stop > mapping.stop:
+        return false
+      var at = r.start
+      while at < r.stop:
+        let count = int(min(uint(buffer.len), r.stop - at))
+        let offset = at - mapping.start + mapping.offset
+        var done = 0
+        while done < count:
+          let n = rawSyscall6(sysPread64, fd, cast[int](addr buffer[done]),
+                              count - done, int(offset) + done, 0, 0)
+          if n <= 0:
+            return false
+          done += n
+        if not equalMem(addr buffer[0], cast[pointer](at), count):
+          return false
+        at += uint(count)
+    # A write during the read would change the file's mtime and ctime.
+    rawOk(rawSyscall6(sysFstat, fd, cast[int](addr now), 0, 0, 0, 0)) and
+      sameIdentity(now, st)
+
   proc parseMapsDevice(text: string; major, minor: var uint64): bool =
     let colon = text.find(':')
     if colon <= 0:
@@ -516,8 +571,14 @@ when defined(linux) and defined(amd64):
     ## the caller then scans.
     if view.base == nil:
       return false
-    if not statDeviceMatchesMaps(uint64(st.st_dev), mapping.device):
-      return false
+    # Whether `/proc/self/maps` names the descriptor's device. It prints the
+    # superblock's device, and `stat` reports the same one on most file
+    # systems; there, with the inode, it proves the descriptor's file is the
+    # mapped one. btrfs reports each subvolume's own device in `stat`, and
+    # an overlayfs reports the layer's, while maps still prints the
+    # superblock's, so on those the identity cannot bind the two and the
+    # bytes have to (`codeBytesEqualFile`, below).
+    let deviceBound = statDeviceMatchesMaps(uint64(st.st_dev), mapping.device)
     let b = cast[ptr UncheckedArray[byte]](view.base)
     let total = view.len
     template u32(at: int): uint32 =
@@ -590,6 +651,8 @@ when defined(linux) and defined(amd64):
             return false
         # Memory must still hold the file's bytes.
         if not codePagesUnwritten(ranges):
+          return false
+        if not deviceBound and not codeBytesEqualFile(mapping, st, ranges):
           return false
         # Sites are stored in scan order; present them as the scan would. A
         # site outside the ranges cannot come from the producer, so the table
