@@ -9818,17 +9818,26 @@ proc noteUnscannedImage(mapping: LinuxExecutableMapping;
     if n > 0: copyMem(addr status.firstUnscannedImage[0], unsafeAddr text[0], n)
     status.firstUnscannedImage[n] = '\0'
 
-var siteTableView: SiteTableView
-  ## The sealed site table the host named in `REPRO_MONITOR_SITE_TABLES`, mapped
-  ## by the constructor (`useInlineSiteTable`); `base` nil when there is none.
-  ## Plain old data with a zero initializer, like the patch-status globals
-  ## (`tests/linux/test_io_mon_shim_globals_are_static`).
+when defined(linux) and defined(amd64):
+  # Site tables exist only where the inline `syscall` scan does: on x86-64.
+  # `SiteTableView` is declared under the same condition in
+  # `io_mon/inline_site_table`, so this global and every use of it stay inside
+  # that condition; elsewhere the two entry points below are no-ops.
+  # `tests/portable/test_linux_shim_compiles_for_every_target` type-checks the
+  # shim for each Linux target so a use outside the guard fails there.
+  var siteTableView: SiteTableView
+    ## The sealed site table the host named in `REPRO_MONITOR_SITE_TABLES`,
+    ## mapped by the constructor (`useInlineSiteTable`); `base` nil when there
+    ## is none. Plain old data with a zero initializer, like the patch-status
+    ## globals (`tests/linux/test_io_mon_shim_globals_are_static`).
 
 proc useInlineSiteTable*(path: string) {.raises: [].} =
   ## Map the table at `path` for every later scan of this process. Called by
   ## the shim's constructor, before the startup scan, with the process's own
   ## libc hooks muted. A path that does not name a sealed table of this
   ## build's scanner leaves the process without one: every mapping is decoded.
+  ## On targets other than x86-64 there is no inline scan to serve, so the
+  ## call ignores `path` (the host never names a table there either).
   when defined(linux) and defined(amd64):
     if siteTableView.base == nil:
       siteTableView = openSiteTableView(path)
@@ -9936,7 +9945,7 @@ proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
   # `syscall`; patching one corrupted the table and killed rustc 1.94.0 with
   # SIGILL. See `linux_image_code_ranges` for the ELF facts. No table, no scan:
   # the gap is reported as event loss (`emitUnscannedImagesLoss`).
-  when defined(amd64):
+  when defined(linux) and defined(amd64):
     if siteTableView.base != nil:
       # Same section table, read through the same calls, plus the identity of
       # the file it came from: a table is served only for that file, and only

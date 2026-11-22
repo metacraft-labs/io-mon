@@ -54,7 +54,14 @@
 ## the file region the producer decoded, from the same starting offsets, with
 ## the same decoder, so the site set is identical.
 ##
-## Linux x86-64 only; elsewhere every entry point reports "no table".
+## Linux x86-64 only, because the inline scan is: the encoder and the format
+## constants are portable, but the producer (`computeSiteTable`,
+## `createSealedSiteTableFile`), the host's check (`sealedSiteTableIdentity`)
+## and the shim's reader (`SiteTableView`, `openSiteTableView`,
+## `serveSitesFromTable`) are declared only under
+## `when defined(linux) and defined(amd64)`, and every caller must sit under
+## the same condition. On other targets `io-mon run` names no table to the
+## tree and the shim ignores `REPRO_MONITOR_SITE_TABLES`.
 
 import std/[posix, strutils]
 import io_mon/types
