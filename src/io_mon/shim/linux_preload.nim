@@ -1,6 +1,19 @@
 when not defined(linux):
   {.error: "repro_monitor_shim/linux_preload is Linux-only".}
 
+# 32-bit x86 is not a target of the Linux shim (the targets are x86-64,
+# AArch64 and 32-bit ARM; docs/contributors/architecture.md, "Supported CPUs").
+# Nothing builds, tests or ships an i386 shim, and nothing needs one: a 32-bit
+# x86 program started by a monitored x86-64 process is an image the 64-bit
+# shim cannot enter, which the monitor reports as event-loss
+# ("uninjectable image"), so its step is re-run rather than cached. Refuse it
+# here by name, as the first error, instead of on whichever undeclared
+# per-architecture symbol (the syscall table below) the compiler meets first.
+when defined(linux) and defined(i386):
+  {.error: "io-mon's Linux shim does not support 32-bit x86 (i386); its " &
+    "Linux targets are x86-64, AArch64 and 32-bit ARM. See " &
+    "docs/contributors/architecture.md, \"Supported CPUs\".".}
+
 # The shim is loaded into processes whose threads it does not own, and Nim's
 # default allocator owns one heap per thread: a cell freed on a thread other
 # than its allocator's is handed back through a pointer into the OWNING

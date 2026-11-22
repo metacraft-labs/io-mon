@@ -21,10 +21,21 @@
 ## does not prove the C translation units compile for the target, nor
 ## anything about run-time behaviour on it.
 ##
+## It also grades the refusal of 32-bit x86 (i386), which the shim does not
+## support (docs/contributors/architecture.md, "Supported CPUs"): the check
+## must fail, and its FIRST error must be the shim's own refusal naming the
+## CPU. Before the refusal existed, an i386 build stopped on whichever
+## per-architecture symbol it met first (`LinuxSysMmap2`, `LinuxSysCreat`,
+## `repro_vdso_time`, later a generic "needs this architecture's syscall
+## numbers"), which told a builder nothing about whether i386 was meant to
+## work.
+##
 ## Falsifying mutation: moving the `siteTableView` declaration in
 ## `src/io_mon/hooks/linux_preload_runtime.nim` out of its
 ## `when defined(linux) and defined(amd64)` block fails the arm64 and arm
-## cases with the error above.
+## cases with the error above. Deleting the `defined(i386)` refusal at the top
+## of `src/io_mon/shim/linux_preload.nim` fails the i386 case: the first
+## error becomes the syscall table's generic one.
 ##
 ## No mocks: the real compiler over the real sources.
 
@@ -58,8 +69,17 @@ proc checkFor(project, cpu: string; extra: openArray[string]):
   execCmdEx(quoteShellCommand(args), workingDir = repoRoot)
 
 const linuxShimCpus = ["amd64", "arm64", "arm"]
-  ## The Linux targets the shim supports (docs/contributors/architecture.md:
-  ## x86_64, AArch64, armhf).
+  ## The Linux targets the shim supports (docs/contributors/architecture.md,
+  ## "Supported CPUs": x86_64, AArch64, armhf).
+
+const i386Refusal = "io-mon's Linux shim does not support 32-bit x86 (i386)"
+  ## The leading text of the shim's i386 refusal.
+
+proc firstError(output: string): string =
+  ## The first compiler error line of `output`, or "" when there is none.
+  for line in output.splitLines():
+    if "Error:" in line:
+      return line
 
 suite "the Linux shim type-checks for every supported CPU":
   for cpu in linuxShimCpus:
@@ -78,3 +98,11 @@ suite "the Linux shim type-checks for every supported CPU":
       checkpoint(output)
       check code == 0
       check "Error:" notin output
+
+suite "the Linux shim refuses unsupported CPUs by name":
+  test "linux_preload.nim for i386 is refused, and the refusal is first":
+    let (output, code) = checkFor("src/io_mon/shim/linux_preload.nim", "i386",
+      ["-d:useMalloc", "--app:lib"])
+    checkpoint(output)
+    check code != 0
+    check i386Refusal in firstError(output)

@@ -126,6 +126,23 @@ three nesting levels, inner loss, interruption and real filesystem failures.
   real `dlsym` without going through the shim's own exports, and a build and
   test arm for that libc. Test:
   `tests/linux/test_io_mon_linux_shim_refuses_non_glibc.nim`.
+- **Supported CPUs**: the Linux shim is built for x86-64, AArch64 and 32-bit
+  ARM (armhf), and for no other CPU. Its raw syscall numbers are spelled out
+  per architecture in `src/io_mon/shim/linux_preload.nim`, and the inline
+  `syscall` scan exists on x86-64 and 32-bit ARM only. **32-bit x86 (i386 /
+  i686) is not supported**, and the shim refuses to compile for it with an
+  error that says so, rather than on the first per-architecture symbol it
+  lacks. Nothing needs an i386 shim: a 32-bit x86 program started by a
+  monitored x86-64 process is an image the 64-bit shim cannot enter (glibc's
+  loader ignores the preload with `wrong ELF class`), and the monitor
+  reports it as event-loss (`uninjectable image`, see "Linux: 32-bit and
+  Static Programs" in the user guide), so the step is re-run rather than
+  cached on an incomplete dependency set. Unlike Windows, where an i686
+  companion shim is injected into 32-bit (WOW64) children, Linux ships no
+  32-bit x86 companion. Adding i386 is a spec change: a syscall table, a
+  build and test arm, and a decision on injecting a companion shim into
+  32-bit children. Test: `tests/portable/test_linux_shim_compiles_for_every_target.nim`
+  (every supported CPU type-checks; i386 is refused by name).
 - **One active shim per process**: nested monitors can preload two distinct
   shim builds into one child (an inner host puts its shim in front of the
   list it inherited, or an outer exec hook meets a route that names another
