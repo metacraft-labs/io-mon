@@ -189,10 +189,10 @@ jobs:
           env-flavor: ${{ matrix.env }}
           repro-from-source: ${{ matrix.env == 'reprobuild' }}
           # The same engine, and its own flake-lock RunQuota and io-mon
-          # bootstrap inputs, as ci-reprobuild.yml: reprobuild v0.2.29 (99798461). An
+          # bootstrap inputs, as ci-reprobuild.yml: reprobuild v0.2.31 (7618e3cb). An
           # older engine rejects the committed v3 `repro.lock`
           # (tests/test_ci_engine_reads_committed_lock.py checks both files).
-          repro-build-pin: 9979846112d606818f13f5952d808cb4da5bba0b
+          repro-build-pin: 7618e3cb21ce17f5c86fbd290f501d60d52e9be1
           repro-runquota-pin: 6ff973131e7f715f0237cb0f08b8dd16cbeba0dc
           repro-io-mon-pin: 8b8faa81bb0cad5d2d91fae80ceaaa7092782ec2
           gh-token: ${{ steps.app-token.outputs.token }}
