@@ -2039,9 +2039,13 @@ proc stampRunId(record: var MonitorRecord) {.raises: [].} =
     record.detail.add " "
   record.detail.add "run=" & runId
 
-proc emitRecord(record: MonitorRecord) {.raises: [].} =
+proc publishRecord(record: MonitorRecord): bool {.raises: [].} =
+  ## `emitRecord`, answering whether the record was handed to the transport
+  ## (true), or a gate below dropped it (false). A transport failure past the
+  ## hand-off is reported as loss by the transport itself, so it counts as
+  ## handed off. The resolution dedup remembers only a handed-off record.
   if not initialized or fragmentDir.len == 0 or shouldBypass():
-    return
+    return false
   # Event-interest gate (docs/contributors/event-interest-filter.md §4.1). Skip
   # the whole record — construction already happened at the call site, but the
   # expensive publish (gset insert + dedup, or fragment write) is avoided — for a
@@ -2049,7 +2053,7 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
   # META/loss kinds, so a suppressed interest can never drop an `mrEventLoss`
   # (LF-1: that would risk a false `mcComplete`).
   if not recordWanted(gInterest, record.kind):
-    return
+    return false
   # DA-1i — evidence-scope gate, RIGHT HERE and not at the host, because the
   # whole point of `--evidence=reads-only` is to MEASURE what the records cost:
   # a mode that publishes the record and filters it later saves nothing and
@@ -2069,7 +2073,7 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
   # exhaustively over `MonitorRecordKind` in
   # `tests/portable/test_io_mon_evidence_scope.nim`, not left to this comment.
   if not recordInEvidenceScope(gEvidenceScope, record):
-    return
+    return false
   # M9.R.62.2 — refresh the diagnostic context on every emit so an
   # unmatched pending marker carries the LAST-observed record kind
   # instead of the stale "phase=init" from the constructor. A process
@@ -2119,6 +2123,10 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
     # batch (flushed by the process-exit destructor / registry sweep).
     if mainThreadId != 0 and record.threadId != mainThreadId:
       flushFragmentBatch()
+  true
+
+proc emitRecord(record: MonitorRecord) {.raises: [].} =
+  discard publishRecord(record)
 
 proc markTreeLedgerEntry(pid: cint; startTicks: uint64) {.raises: [].} =
   ## Write the tree-ledger entry for (pid, startTicks) (`io_mon/tree_ledger`):
@@ -5702,6 +5710,49 @@ proc pushResolutionComponents(pending: var seq[string]; spelled: string)
     if parts[i].len > 0 and parts[i] != ".":
       pending.add parts[i]
 
+proc emitResolutionProbe(path: string; exists: bool; detail = "")
+    {.raises: [].} =
+  ## Record one observation of the resolution replay below, once per process
+  ## (Monitor-Hook-Shim.md §"Resolution evidence", "Each observation once
+  ## per process"). Every replay records the directories and links on its
+  ## way, so a process resolving many paths under the same directories (a
+  ## compiler canonicalising each header) would otherwise build, encode and
+  ## publish the same record for every path. Within one process the record's
+  ## set element key varies only by what the key below holds: the walk's
+  ## answer for the name (present or absent), the name, and the link target
+  ## in the detail. The pid and sequence number are not part of it, the
+  ## incarnation is fixed until exec, which starts a fresh table, and the
+  ## run stamp is fixed for the process. So a repeat is the element the
+  ## transport already holds. The walk's `lstat` still runs every time: a
+  ## component replaced between two walks answers differently, has a
+  ## different key, and is recorded.
+  ##
+  ## The key must be unambiguous, not merely carry those fields: a file name
+  ## or a link target may hold any byte but NUL (and a name any byte but
+  ## `/`), so no separator byte can keep the name apart from the detail. A
+  ## directory named `a<US>symlink target=x` and a link `a` to `x<US>` would
+  ## share a separator-joined key, and the second, a different record, would
+  ## be dropped. The name is therefore length-prefixed; the detail runs to
+  ## the end, and the key is a C string, which neither field can contain a
+  ## NUL of.
+  let lengthText = $path.len
+  var key = newStringOfCap(path.len + detail.len + lengthText.len + 2)
+  key.add(if exists: '+' else: '-')
+  key.add lengthText
+  key.add ':'
+  key.add path
+  key.add detail
+  if podResolutionSeen(cstring(key)):
+    return
+  let callResult = (if exists: 0.cint else: -1.cint)
+  var record = baseRecord(mrPathProbe, moPathProbe)
+  record.result = callResult.int64
+  record.probeResult = probeFromResult(callResult)
+  record.path = path
+  record.detail = detail
+  if publishRecord(record):
+    podResolutionRemember(cstring(key))
+
 proc repro_linux_observe_resolution(dirfd: cint; path: cstring;
                                     followFinal: cint) {.cdecl, raises: [].} =
   ## realpath, canonicalize_file_name and the readlink family resolve their
@@ -5753,25 +5804,21 @@ proc repro_linux_observe_resolution(dirfd: cint; path: cstring;
         let n = linuxRealReadlink(cstring(candidate), addr target[0],
           csize_t(target.len - 1))
         if n > 0:
-          var record = baseRecord(mrPathProbe, moPathProbe)
-          record.result = 0
-          record.probeResult = probeFromResult(0)
-          record.path = candidate
-          record.detail = "symlink target=" & target[0 ..< int(n)]
-          emitRecord(record)
+          emitResolutionProbe(candidate, true,
+            "symlink target=" & target[0 ..< int(n)])
       resolved = candidate
       break
     let kind = linuxLstatKind(cstring(candidate))
     if kind < 0:
       # The walk stops where realpath fails: this name is part of the answer.
-      emitProbe(cstring(candidate), -1.cint)
+      emitResolutionProbe(candidate, false)
       return
     if kind == 0:
       # Not a link. The final component of a realpath walk is recorded once,
       # below or by the caller's own probe; a component on the way is
       # recorded here.
       if not isFinal:
-        emitProbe(cstring(candidate), 0.cint)
+        emitResolutionProbe(candidate, true)
       resolved = candidate
       continue
     inc hops
@@ -5783,12 +5830,7 @@ proc repro_linux_observe_resolution(dirfd: cint; path: cstring;
       return
     let link = target[0 ..< int(n)]
     sawLink = true
-    var record = baseRecord(mrPathProbe, moPathProbe)
-    record.result = 0
-    record.probeResult = probeFromResult(0)
-    record.path = candidate
-    record.detail = "symlink target=" & link
-    emitRecord(record)
+    emitResolutionProbe(candidate, true, "symlink target=" & link)
     if link.startsWith("/"):
       resolved = ""
     pushResolutionComponents(pending, link)
@@ -5798,7 +5840,7 @@ proc repro_linux_observe_resolution(dirfd: cint; path: cstring;
     # component is never examined above and may well be absent.
     let final = if resolved.len == 0: "/" else: resolved
     let finalKind = linuxLstatKind(cstring(final))
-    emitProbe(cstring(final), (if finalKind >= 0: 0.cint else: -1.cint))
+    emitResolutionProbe(final, finalKind >= 0)
 
 proc ct_linux_preload_register_resolution_observer(observer: pointer)
   {.importc, cdecl, raises: [].}
