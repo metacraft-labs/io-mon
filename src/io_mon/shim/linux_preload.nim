@@ -40,6 +40,7 @@ from io_mon/paths import anchoredRelativePath, extendedPath,
   startsWithParentRef
 
 import io_mon/types
+import io_mon/linker_flag_probe
 import io_mon/tree_ledger
 import io_mon/posix_connect
 import io_mon/writer
@@ -3205,6 +3206,13 @@ proc recordOpen(path: cstring; flags, mode, fd: cint;
   ## `trackFd` false: the open is classified after the fact (a trapped inline
   ## syscall), when `fd` may already name another file; record it without
   ## entering it into the live descriptor table.
+  ##
+  ## A FAILED open (`fd < 0`) of a bare relative `-l<name>` token is the
+  ## linker probing for a library, not a build input: it is dropped here, at
+  ## capture time, so no record of it reaches the read or write evidence. Every
+  ## other failed open, and every successful open, is recorded as before.
+  if fd < 0 and path != nil and isLinkerFlagProbe($path):
+    return
   let resolved = pathForAt(dirfd, path)
   if resolved.len > 0 and trackFd:
     updateFdPath(fd, cstring(resolved))
