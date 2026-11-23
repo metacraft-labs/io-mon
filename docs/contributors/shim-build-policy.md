@@ -96,9 +96,18 @@ the file's header and `tests/linux/test_io_mon_shim_private_heap.nim`. Other
 platforms retain their existing allocation path.
 
 Linux builds also enable linker `--as-needed` before Nim's automatic system
-library arguments. The shim must not carry unused libc companion libraries:
+library arguments, so the shim's DT_NEEDED is `libc.so.6` and the loader and
+nothing else. The shim must not carry unused libc companion libraries:
 a Nix RUNPATH can otherwise load a newer libm/librt/libdl/libpthread beside an
-older executable's libc and fail before the program starts. The link also
+older executable's libc and fail before the program starts, and a program that
+finds its own C runtime through its DT_RUNPATH cannot resolve them at all,
+because a program's DT_RUNPATH serves only its own direct dependencies, never
+a preloaded library's. Both settings live in
+`src/io_mon/shim/linux_preload.nim.cfg` (as `gcc.linkTmpl` / `clang.linkTmpl`
+and `--passL`), not in `scripts/build_shim.sh`, so a consumer that compiles
+`linux_preload.nim` itself, such as Reprobuild's own shim build, links the
+same way; `tests/linux/test_io_mon_shim_needs_only_the_c_runtime.nim` checks
+both routes. The link also
 uses `-static-libgcc`: Clang links the shared libgcc as
 `--as-needed -lgcc_s --no-as-needed`, which switched `--as-needed` off for the
 `-lpthread` that `-pthread` adds, so a Clang-built shim recorded an empty
