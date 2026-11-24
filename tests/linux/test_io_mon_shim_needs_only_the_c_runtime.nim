@@ -20,8 +20,7 @@
 ## `--gcc.linkTmpl` / `--clang.linkTmpl`, which a `--passL` cannot replace: it
 ## lands after Nim's `-l` flags). A consumer that compiles
 ## `linux_preload.nim` itself -- Reprobuild's own shim edge does -- linked all
-## four satellites in (reprobuild-pm issue 2026-11-14, "the engine-built
-## Linux shim needs unused C-runtime satellites"). The settings now live in
+## four satellites in. The settings now live in
 ## `src/io_mon/shim/linux_preload.nim.cfg`, which every compile of that file
 ## reads.
 ##
