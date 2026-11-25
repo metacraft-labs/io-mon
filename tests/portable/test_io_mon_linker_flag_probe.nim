@@ -13,6 +13,8 @@
 ## cannot be run from a portable test; its wiring is checked by the source
 ## assertion below, and the depfile-level result is measured separately.
 
+import foreign_preload_isolation
+
 import std/[unittest, strutils]
 import io_mon/linker_flag_probe
 
