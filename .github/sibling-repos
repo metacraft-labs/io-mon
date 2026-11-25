@@ -8,7 +8,7 @@
 # commit's own committed `repro.lock` (`lock-store: committed`, the default:
 # the lock's `deps` entry of that name, which must be a full commit id, and a
 # sibling the lock does not pin is refused rather than cloned at a branch
-# tip), which pins c34e3252 — the same revision
+# tip), which pins 0ada76e5 — the same revision
 # `flake.nix` pins `stackable-hooks-src` to. Keep the two in step: a `nim c` in
 # the dev shell resolves `stackable_hooks/...` through the sibling checkout,
 # while `nix build .#default` resolves it through the flake input, and a build

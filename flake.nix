@@ -30,7 +30,14 @@
       # syscall instruction and the return; a CLONE_VM clone forwarded by
       # this shim's syscall(2) replacement no longer writes into its
       # parent's frame when the library is built at -O0.
-      url = "github:metacraft-labs/nim-stackable-hooks/c34e3252d413361a0f250d8921e00c119d30e114";
+      # c34e325 -> 0ada76e (2026-11-25): the Windows on Arm64 backend this
+      # shim's ARM64 build injects and audits with (the ARM64 inline hook,
+      # the ARM64 entry park and borrowed calls), and the root injector's
+      # machine gate: a root no shim of the injecting process can serve,
+      # including a hybrid ARM64X image run as x64, is resumed uninjected
+      # and reported through `monitoringSkipped` instead of failing the
+      # command (reprobuild-pm issue 2026-11-20).
+      url = "github:metacraft-labs/nim-stackable-hooks/0ada76e5f62ba63753a2cadbdcc4249b91482f2e";
       flake = false;
     };
     shm-queue-src = {
