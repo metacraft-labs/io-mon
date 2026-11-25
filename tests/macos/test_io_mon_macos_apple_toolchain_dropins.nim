@@ -166,7 +166,7 @@ else:
         # A monitored compile execs more than the compiler: the driver forks
         # the assembler and the linker, and each of those is its own
         # /usr/bin shim with its own SIP strip.
-        for name in ["cc", "clang", "c++", "cpp", "ld", "as", "ar"]:
+        for name in ["cc", "clang", "c++", "gcc", "g++", "cpp", "ld", "as", "ar"]:
           check dropInRuns(dir / "usr" / "bin" / name,
             resolveAppleToolchainTool(name))
 
@@ -308,3 +308,67 @@ else:
           # evidence like any other input.
           check sourceRead
           check sdkHeaderRead
+
+    test "a monitored root that is a bare gcc on PATH=/usr/bin:/bin is observed":
+      # The defect this guards (reprobuild-pm issues/2026-10-06-c-executable-
+      # link-edge-never-caches-and-grows-a-record-per-build.md): a C edge whose
+      # ROOT is a bare `gcc` that resolves to `/usr/bin/gcc`, the SIP
+      # `xcode_select` shim. With no `gcc` drop-in the root kept its SIP path,
+      # dyld stripped the injection, the capture reported an unknown-scope
+      # loss, and the edge was never cached. No shell here: the host's root
+      # rewrite (`rewriteRootCommandForSip`), not the spawn hook, must redirect
+      # it.
+      withSystemSelection:
+        let defaultSdk = appleDefaultSdk()
+        if resolveAppleToolchainTool("gcc").len == 0 or defaultSdk.len == 0:
+          echo "no developer directory, no gcc in it, or no SDK; nothing to compile with"
+          skip()
+        else:
+          let work = createTempDir("io-mon-toolchain-gcc-root", "")
+          defer: removeDir(work)
+          let source = work / "inc.c"
+          writeFile(source, "#include <stdlib.h>\nint f(void) { return abs(-1); }\n")
+          let objectFile = work / "inc.o"
+          let depfile = work / "capture.iomon"
+          let shim = buildPrivateMacosShim(repoRoot)
+          let oldShim = getEnv("REPRO_MONITOR_SHIM_LIB")
+          let oldSandbox = getEnv("CT_SANDBOX_TOOLS_DIR")
+          let oldPath = getEnv("PATH")
+          defer:
+            if oldShim.len > 0: putEnv("REPRO_MONITOR_SHIM_LIB", oldShim)
+            else: delEnv("REPRO_MONITOR_SHIM_LIB")
+            if oldSandbox.len > 0: putEnv("CT_SANDBOX_TOOLS_DIR", oldSandbox)
+            else: delEnv("CT_SANDBOX_TOOLS_DIR")
+            putEnv("PATH", oldPath)
+          putEnv("REPRO_MONITOR_SHIM_LIB", shim)
+          # A sandbox populated by this run, not an operator bundle.
+          delEnv("CT_SANDBOX_TOOLS_DIR")
+          # The root is resolved against the host's PATH, as posix_spawnp
+          # would resolve it, so the host's PATH must be the one under which
+          # `gcc` is the /usr/bin shim. Populating the sandbox also reads this
+          # PATH for a non-SIP shell to run the drop-in script; that
+          # resolution prefers the sandbox's /bin/sh drop-in and the shipped
+          # bundle, which do not depend on it.
+          putEnv("PATH", "/usr/bin:/bin:" & oldPath)
+          let captured = runMonitored(FsSnoopRequest(
+            command: @["gcc", "-c", source, "-o", objectFile],
+            cwd: work, depFilePath: depfile, streamMode: fsoNone,
+            isolateEnv: true,
+            env: @[("PATH", "/usr/bin:/bin"), ("HOME", work)]))
+          check captured.exitCode == 0
+          check fileExists(objectFile)
+          let evidence = readMonitorDepFile(depfile)
+          var sourceRead = false
+          var losses = 0
+          let sourceSpellings = [source, expandFilename(source)]
+          for record in evidence.records:
+            if record.kind == mrEventLoss:
+              inc losses
+              checkpoint(record.detail)
+            if record.kind in {mrFileOpen, mrFileRead} and
+                record.path in sourceSpellings:
+              sourceRead = true
+          # Observed, and nothing lost: the record that keeps the edge from
+          # being cached is exactly an mrEventLoss.
+          check sourceRead
+          check losses == 0

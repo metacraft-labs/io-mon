@@ -621,6 +621,35 @@ when defined(windows):
 # skip. Coverage only ever makes MORE of the tree observable; it never makes a
 # previously-correct capture wrong.
 
+# The /usr/bin names ``populateAppleToolchainDropIns`` drops in (macOS only).
+# Declared here, outside the macOS block, so a test on any POSIX host can
+# check which names the set covers.
+const AppleToolchainDropIns* = [
+  # Apple's own toolchain, reached at the path Apple already installs it at.
+  # Each of these also exists under /usr/bin as a tiny `xcode_select` SHIM
+  # (`/usr/bin/cc` is 118 KB and signed `com.apple.dt.xcode_select.tool-shim-public`);
+  # the shim is SIP-protected, so exec'ing it strips DYLD_INSERT_LIBRARIES
+  # and the real compiler it then exec's never sees the shim library either.
+  # The compiler ITSELF lives under the active developer directory, outside
+  # every SIP prefix, and is signed with `flags=0x0(none)` — no hardened
+  # runtime, no library validation — so it takes the injection normally.
+  #
+  # Measured: `bash -c '/usr/bin/cc --version'` under the monitor reports one
+  # unknown-scope loss; with `usr/bin/cc` dropped in as a symlink to
+  # `xcrun -f clang` it reports none. On a dev-env activation that one loss
+  # was the difference between a provider compile that publishes to the
+  # action cache and one that recompiles on every new shell (20.5 s).
+  #
+  # `gcc` and `g++` are the same `xcode_select` shims (`/usr/bin/gcc` runs
+  # `xcrun gcc`, Apple clang in gcc driver mode), and builds reach them:
+  # reprobuild's C conventions run a bare `gcc`, and a Nix dev shell's clang
+  # wrapper provides `cc` and `clang` but not `gcc`, so `gcc` resolves to
+  # `/usr/bin/gcc`. Without a drop-in that root keeps its SIP path, the
+  # capture reports an unknown-scope loss, and the edge is never cached.
+  "cc", "clang", "c++", "clang++", "gcc", "g++", "cpp",
+  "ld", "as", "ar", "nm", "strip", "lipo", "libtool",
+]
+
 proc renderAppleToolchainDropIn*(shell, tool, defaultSdk: string): string =
   ## The body of one Apple toolchain drop-in (see
   ## ``populateAppleToolchainDropIns``): a POSIX shell script, run by the
@@ -762,25 +791,6 @@ when defined(macosx):
         continue
       return candidate
     ""
-
-  const appleToolchainDropIns = [
-    # Apple's own toolchain, reached at the path Apple already installs it at.
-    # Each of these also exists under /usr/bin as a tiny `xcode_select` SHIM
-    # (`/usr/bin/cc` is 118 KB and signed `com.apple.dt.xcode_select.tool-shim-public`);
-    # the shim is SIP-protected, so exec'ing it strips DYLD_INSERT_LIBRARIES
-    # and the real compiler it then exec's never sees the shim library either.
-    # The compiler ITSELF lives under the active developer directory, outside
-    # every SIP prefix, and is signed with `flags=0x0(none)` — no hardened
-    # runtime, no library validation — so it takes the injection normally.
-    #
-    # Measured: `bash -c '/usr/bin/cc --version'` under the monitor reports one
-    # unknown-scope loss; with `usr/bin/cc` dropped in as a symlink to
-    # `xcrun -f clang` it reports none. On a dev-env activation that one loss
-    # was the difference between a provider compile that publishes to the
-    # action cache and one that recompiles on every new shell (20.5 s).
-    "cc", "clang", "c++", "clang++", "cpp",
-    "ld", "as", "ar", "nm", "strip", "lipo", "libtool",
-  ]
 
   proc resolveAppleToolchainTool*(name: string): string =
     ## Exported for the test that asserts the resolved path is outside every
@@ -931,7 +941,7 @@ when defined(macosx):
     var sdkResolved = false
     var defaultSdk = ""
     var shell = ""
-    for name in appleToolchainDropIns:
+    for name in AppleToolchainDropIns:
       let destPath = destDir / name
       if fileExists(destPath) or symlinkExists(destPath):
         continue
@@ -2801,4 +2811,3 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
   ## `request.cwd` is not thread-safe there. Linux forks and `chdir`s in the
   ## child and Windows passes `lpCurrentDirectory`, so both are.
   finishMonitor(startMonitor(request))
-
