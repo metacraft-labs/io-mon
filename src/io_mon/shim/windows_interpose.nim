@@ -319,17 +319,6 @@ proc GetCurrentProcess(): HANDLE
 proc QueryFullProcessImageNameW(hProcess: HANDLE; dwFlags: DWORD;
                                 lpExeName: LPWSTR; lpdwSize: ptr DWORD): BOOL
   {.importc, stdcall, dynlib: "kernel32".}
-proc IsWow64Process2(hProcess: HANDLE; processMachine,
-                     nativeMachine: ptr WORD): BOOL
-  {.importc, stdcall, dynlib: "kernel32".}
-type ProcessMachineInformation {.bycopy.} = object
-  processMachine: WORD
-  reserved: WORD
-  machineAttributes: DWORD
-static: doAssert sizeof(ProcessMachineInformation) == 8
-proc GetProcessInformation(hProcess: HANDLE; infoClass: int32;
-    info: pointer; infoSize: DWORD): BOOL
-  {.importc, stdcall, dynlib: "kernel32".}
 
 # ---------------------------------------------------------------------------
 # M5 — Win32 imports for the IPC-connect / external-content / non-determinism
@@ -3538,40 +3527,33 @@ proc injectSpawnedChild(record: var MonitorRecord;
   ## nim-stackable-hooks now waits while the child lives, so a slow
   ## injection is a success and only worth a note -- see its
   ## ``docs/windows-borrowed-call-deadline.md``.
-  # IsWow64Process2 reports processMachine=0/nativeMachine=ARM64 for an
-  # emulated x64 child too. Query the actual process machine on Windows 11;
-  # older systems retain the WOW64 fallback. Never guess x64 on an ARM host:
-  # the injector's x86 entry-point instructions must not enter ARM code.
-  # Leave unsupported children runnable. The durable spawn record without a
-  # matching process-start makes the merged evidence incomplete.
-  const ProcessMachineTypeInfo = 9'i32
-  var machineInfo: ProcessMachineInformation
-  var machine: WORD
-  if GetProcessInformation(pi[].hProcess, ProcessMachineTypeInfo,
-      addr machineInfo, DWORD(sizeof(machineInfo))) != 0:
-    machine = machineInfo.processMachine
-  else:
-    var processMachine, nativeMachine: WORD
-    if IsWow64Process2(pi[].hProcess, addr processMachine,
-        addr nativeMachine) == 0:
-      record.detail.add(" inject=unknown-process-machine")
-      return false
-    machine = if processMachine == 0: nativeMachine else: processMachine
-  # The shim injects children of its own machine (reprobuild-pm
+  # THE MACHINE GATE lives in nim-stackable-hooks, inside
+  # `injectShimIntoChildReport` (`windows_injector.machineGate`), the same
+  # decision the root launcher applies (reprobuild-pm
   # spec/Monitor-Hook-Shim.md, "Windows on Arm64 install backend": "The
-  # engine never injects a shim of the wrong machine"). The x64 build also
-  # serves 32-bit children through its WOW64 helper; the ARM64 build serves
-  # native ARM64 children, and an x64-emulated child of an ARM64 parent is
-  # refused here, since no x64 shim ships beside it.
-  const injectableMachines =
-    when defined(arm64): [0xAA64'u16, 0xAA64'u16]
-    else: [0x8664'u16, 0x014c'u16]
-  if machine notin injectableMachines:
-    record.detail.add(" inject=unsupported-process-machine:" & toHex(machine))
-    return false
+  # engine never injects a shim of the wrong machine"). It reads the child's
+  # actual process machine, the machine of its image FILE and this shim's,
+  # and refuses -- before parking or writing anything -- a child this shim
+  # cannot serve: an x64-emulated child of the ARM64 build (no x64 shim
+  # ships beside it), an ARM64 child of the x64 build, and a hybrid ARM64X
+  # image that the x64 build's process started in x64 mode (System32's
+  # cmd.exe on Windows on Arm, where the x64 park times out and the
+  # remote-thread load fails). The x64 build still serves 32-bit children
+  # through its WOW64 helper. A refused child is left runnable; the durable
+  # spawn record without a matching process-start makes the merged evidence
+  # incomplete. This gate used to be io-mon's own and read the process
+  # machine alone, which admitted the hybrid case.
   let report = shProp.injectShimIntoChildReport(pi[].hProcess,
     selfDllPath(), "repro_runtime_init", spawnInjectionConfig, hThread)
-  if report.outcome != shProp.ioInjected and
+  if report.outcome == shProp.ioUnsupportedMachine:
+    # The token spelling the merge and the tests read, plus the image
+    # machine when it differs (the hybrid case).
+    let gate = report.machineGate
+    record.detail.add(" inject=unsupported-process-machine:" &
+      toHex(gate.child))
+    if gate.image != 0'u16 and gate.image != gate.child:
+      record.detail.add(" image-machine=" & toHex(gate.image))
+  elif report.outcome != shProp.ioInjected and
       report.outcome != shProp.ioAlreadyPresent:
     record.detail.add(" inject=" & $report.outcome)
   if report.waitedMs >= uint64(shProp.SlowInjectionNoticeMs):

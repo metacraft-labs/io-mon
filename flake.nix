@@ -37,7 +37,11 @@
       # including a hybrid ARM64X image run as x64, is resumed uninjected
       # and reported through `monitoringSkipped` instead of failing the
       # command (reprobuild-pm issue 2026-11-20).
-      url = "github:metacraft-labs/nim-stackable-hooks/0ada76e5f62ba63753a2cadbdcc4249b91482f2e";
+      # 0ada76e -> ec6b02d (2026-11-25): grandchild propagation applies the
+      # same machine gate (`injectShimIntoChildReport` returns
+      # `ioUnsupportedMachine`), which this shim's spawn hook now relies on
+      # instead of a process-machine check of its own.
+      url = "github:metacraft-labs/nim-stackable-hooks/ec6b02d45180735d08611c5cece842d57f941966";
       flake = false;
     };
     shm-queue-src = {
