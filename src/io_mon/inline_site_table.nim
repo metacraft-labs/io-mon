@@ -73,7 +73,7 @@ import std/[posix, strutils]
 import io_mon/types
 export types.SiteTableServedDetail
 when defined(linux):
-  import std/[macros, os]
+  import std/macros
   import stackable_hooks/platform/linux_raw_syscalls
   import stackable_hooks/platform/linux_image_code_ranges
 
@@ -107,6 +107,20 @@ when defined(linux):
       n = n[0]
     newLit(n.getImpl.lineInfoObj.filename)
 
+  func hostParentDir(path: string): string =
+    ## The directory part of `path`, a file name the compiler reported in the
+    ## HOST's spelling (`lineInfoObj.filename`). `os.parentDir` cannot be used
+    ## here: at compile time it follows the TARGET's separators, so a Windows
+    ## host cross-checking `--os:linux` splits `C:\...\file.nim` on `/` only
+    ## and the path collapses to "". Both separators are accepted instead; on
+    ## a POSIX host a `\` cannot occur in these repository paths, so the
+    ## result there is the same as `parentDir`'s.
+    var i = path.high
+    while i >= 0 and path[i] notin {'/', '\\'}:
+      dec i
+    doAssert i > 0, "no directory part in compiler-reported path: " & path
+    path[0 ..< i]
+
   const siteTableScannerStamp* = block:
     ## Digest of every source that decides which sites a scan reports: the
     ## instruction-length decoder, the scanner, the code-range geometry and
@@ -116,7 +130,7 @@ when defined(linux):
     const geometry = definingFile(linuxImageCodeRangesFromReader)
     var h = 0xcbf29ce484222325'u64
     fnv1a64(h, staticRead(scanner))
-    fnv1a64(h, staticRead(scanner.parentDir().parentDir() &
+    fnv1a64(h, staticRead(scanner.hostParentDir().hostParentDir() &
       "/inline_hook/windows/length_decoder.c"))
     fnv1a64(h, staticRead(geometry))
     fnv1a64(h, staticRead(currentSourcePath()))
