@@ -84,7 +84,8 @@ serve-docs:
 open-docs *args:
     just -f docs/site/Justfile --working-directory docs/site open-docs {{args}}
 
-# Compile each workflow-selected engine's real reader against the shipping lock.
-# Needs an adjacent Reprobuild Git checkout containing the selected revisions.
+# Compile the CI engine's real reader (the fleet Reprobuild pin) against the
+# shipping lock. Needs adjacent metacraft-github-actions (pins/reprobuild.json)
+# and Reprobuild Git checkouts, the latter containing the pinned revision.
 test-ci-engine-lock:
     python3 tests/test_ci_engine_reads_committed_lock.py

@@ -121,21 +121,35 @@ jobs:
         # repro.lock pins before materialising the env. The first two are io-mon's
         # `uses:` library producers in repro.nim; reprobuild builds each
         # from source and threads their `src/` roots onto io-mon's compile.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@9456226e58b7db8538c96936136fe73a1a12974d
+        id: dev-env
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: reprobuild
-          # Reprobuild v0.2.36 (37a109c4; its catalog is the one repro.lock
-          # pins, 56ffd673). The engine reads the committed v3 lock on
-          # every host and builds on Windows. Keep the
-          # bootstrap libraries at that engine's own flake-lock revisions;
-          # POSIX retains its monitor input without an older override.
-          # Windows ARM64 keeps the existing emulated x64 Reprobuild tools.
-          repro-from-source: true
-          repro-build-pin: 37a109c4e1cf650e6eb79b11d9fadf6e49e64614
-          repro-runquota-pin: 83d89e581d01c96eadb157bee48cecab6aba1866
-          repro-io-mon-pin: 1365943692eedfb0699ce90e59c4602d90317561
-          repro-stackable-hooks-pin: c34e3252d413361a0f250d8921e00c119d30e114
+          # The Reprobuild engine is the fleet pin, the action's default:
+          # `pins/reprobuild.json` in metacraft-labs/metacraft-github-actions,
+          # built against the bootstrap libraries that pinned revision locks.
+          # tests/test_ci_engine_reads_committed_lock.py refuses an override.
           gh-token: ${{ steps.ci_token.outputs.token }}
+
+      - name: Assert the pinned engine
+        # setup-dev-env reports the engine it installed. It is the pin, not an
+        # override, and a source build is a clean checkout of that commit. A
+        # Linux binary-cache hit installs the pinned commit's Nix package and
+        # Windows may install its pin prerelease; neither has a checkout.
+        shell: bash
+        env:
+          REPRO_COMMIT: ${{ steps.dev-env.outputs.repro-commit }}
+          REPRO_ORIGIN: ${{ steps.dev-env.outputs.repro-origin }}
+          REPRO_INSTALL_SOURCE: ${{ steps.dev-env.outputs.repro-install-source }}
+        run: |
+          set -euo pipefail
+          echo "repro ${REPRO_COMMIT} (origin ${REPRO_ORIGIN}, ${REPRO_INSTALL_SOURCE})"
+          [[ "${REPRO_COMMIT}" =~ ^[0-9a-f]{40}$ ]]
+          test "${REPRO_ORIGIN}" = pin
+          if [ "${REPRO_INSTALL_SOURCE}" = source ] && [ "${RUNNER_OS}" != Windows ]; then
+            test "$(git -C .reprobuild-src rev-parse HEAD)" = "${REPRO_COMMIT}"
+            test -z "$(git -C .reprobuild-src status --porcelain)"
+          fi
 
       - name: Point sibling source overrides at the locked checkouts
         # The engine seeds STACKABLE_HOOKS_SRC, SHM_QUEUE_SRC and SHM_GSET_SRC
@@ -158,12 +172,26 @@ jobs:
           done
 
       - name: Verify CI engine reads the committed lock
+        # The reader is compiled from the engine's own source revision. A
+        # source build left it in .reprobuild-src; a binary-cache install did
+        # not, so fetch that one commit.
         if: matrix.os == 'linux'
         shell: bash
-        run: dev-exec python3 tests/test_ci_engine_reads_committed_lock.py --reprobuild .reprobuild-src
+        env:
+          REPRO_COMMIT: ${{ steps.dev-env.outputs.repro-commit }}
+          REPRO_INSTALL_SOURCE: ${{ steps.dev-env.outputs.repro-install-source }}
+        run: |
+          set -euo pipefail
+          source_root=.reprobuild-src
+          if [ "${REPRO_INSTALL_SOURCE}" != source ]; then
+            source_root="${RUNNER_TEMP}/reprobuild-engine-source"
+            git init -q "$source_root"
+            git -C "$source_root" fetch -q --depth 1 https://github.com/metacraft-labs/reprobuild.git "${REPRO_COMMIT}"
+          fi
+          dev-exec python3 tests/test_ci_engine_reads_committed_lock.py --reprobuild "$source_root" --revision "${REPRO_COMMIT}"
 
       - name: Refresh authentication before repro build
-        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@9456226e58b7db8538c96936136fe73a1a12974d
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@dev
         with:
           app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
@@ -177,7 +205,7 @@ jobs:
         run: dev-exec repro build --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }}
 
       - name: Refresh authentication before repro test
-        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@9456226e58b7db8538c96936136fe73a1a12974d
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@dev
         with:
           app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
@@ -268,7 +296,7 @@ jobs:
           PYCODE
 
       - name: Refresh authentication before just build (cross-check)
-        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@9456226e58b7db8538c96936136fe73a1a12974d
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@dev
         with:
           app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
@@ -281,7 +309,7 @@ jobs:
         run: dev-exec just build
 
       - name: Refresh authentication before just test (cross-check)
-        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@9456226e58b7db8538c96936136fe73a1a12974d
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@dev
         with:
           app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}

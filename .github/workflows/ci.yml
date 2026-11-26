@@ -60,7 +60,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@9456226e58b7db8538c96936136fe73a1a12974d
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
@@ -122,7 +122,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@9456226e58b7db8538c96936136fe73a1a12974d
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
@@ -184,17 +184,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@9456226e58b7db8538c96936136fe73a1a12974d
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: ${{ matrix.env }}
-          repro-from-source: ${{ matrix.env == 'reprobuild' }}
-          # The same engine, and its own flake-lock RunQuota and io-mon
-          # bootstrap inputs, as ci-reprobuild.yml: reprobuild v0.2.36 (37a109c4). An
-          # older engine rejects the committed v3 `repro.lock`
+          # The reprobuild leg runs the fleet pin, the action's default, as
+          # ci-reprobuild.yml does: no override, so both run one engine
           # (tests/test_ci_engine_reads_committed_lock.py checks both files).
-          repro-build-pin: 37a109c4e1cf650e6eb79b11d9fadf6e49e64614
-          repro-runquota-pin: 83d89e581d01c96eadb157bee48cecab6aba1866
-          repro-io-mon-pin: 1365943692eedfb0699ce90e59c4602d90317561
           gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: Point sibling source overrides at the locked checkouts
