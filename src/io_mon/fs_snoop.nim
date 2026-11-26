@@ -640,15 +640,38 @@ const AppleToolchainDropIns* = [
   # was the difference between a provider compile that publishes to the
   # action cache and one that recompiles on every new shell (20.5 s).
   #
-  # `gcc` and `g++` are the same `xcode_select` shims (`/usr/bin/gcc` runs
-  # `xcrun gcc`, Apple clang in gcc driver mode), and builds reach them:
+  # `gcc` and `g++` are the same `xcode_select` shims, and builds reach them:
   # reprobuild's C conventions run a bare `gcc`, and a Nix dev shell's clang
   # wrapper provides `cc` and `clang` but not `gcc`, so `gcc` resolves to
   # `/usr/bin/gcc`. Without a drop-in that root keeps its SIP path, the
   # capture reports an unknown-scope loss, and the edge is never cached.
+  # What their drop-ins run is `appleToolchainExecTarget`'s concern.
   "cc", "clang", "c++", "clang++", "gcc", "g++", "cpp",
   "ld", "as", "ar", "nm", "strip", "lipo", "libtool",
 ]
+
+func appleToolchainExecTarget*(name: string): string =
+  ## The developer-directory tool the drop-in for ``/usr/bin/<name>`` runs:
+  ## ``name`` itself, except for ``gcc`` and ``g++``.
+  ##
+  ## ``xcrun -f gcc`` names ``<developer dir>/usr/bin/gcc`` (``g++`` is a
+  ## symlink to it), in an Xcode.app selection and a Command Line Tools one
+  ## alike. That file is not a compiler but a 51-101 KB trampoline signed
+  ## ``com.apple.gcc``: it runs ``/usr/bin/xcode-select -print-path`` and then
+  ## execs ``/usr/bin/xcrun clang`` (``clang++`` when called as ``g++``).
+  ## Both are SIP binaries, so a drop-in that execs the trampoline loses the
+  ## injection one exec later; the capture then reports the trampoline's
+  ## exec as one without a post-exec process start, and the compile goes
+  ## unobserved. The drop-in therefore runs what the trampoline ends up
+  ## running, the toolchain's ``clang`` / ``clang++``. That is the same
+  ## compiler, not a substitute: measured on macOS 26.5 (Xcode 26.6 and
+  ## Command Line Tools selections), ``gcc -### -c x.c`` and
+  ## ``xcrun clang -### -c x.c`` print identical command lines, as do
+  ## ``g++`` and ``xcrun clang++``.
+  case name
+  of "gcc": "clang"
+  of "g++": "clang++"
+  else: name
 
 proc renderAppleToolchainDropIn*(shell, tool, defaultSdk: string): string =
   ## The body of one Apple toolchain drop-in (see
@@ -797,10 +820,14 @@ when defined(macosx):
     ## SIP prefix — the one property the whole mechanism rests on, and one that
     ## cannot be observed from the outside without re-running `xcrun`.
     ##
-    ## Absolute path of ``name`` inside the ACTIVE developer directory, via
-    ## ``xcrun -f``. That is the only correct resolver: the toolchain path
-    ## depends on `xcode-select -p` (Xcode.app vs CommandLineTools) and on the
-    ## selected toolchain, and hardcoding either spelling breaks on the other.
+    ## Absolute path, inside the ACTIVE developer directory, of the binary
+    ## the ``/usr/bin/<name>`` shim ends up running: ``xcrun -f`` of
+    ## ``appleToolchainExecTarget(name)``, which is ``name`` itself except
+    ## for ``gcc`` / ``g++`` (whose developer-directory entry is a trampoline
+    ## back into ``/usr/bin/xcrun clang``; see there). ``xcrun -f`` is the
+    ## only correct resolver: the toolchain path depends on
+    ## `xcode-select -p` (Xcode.app vs CommandLineTools) and on the selected
+    ## toolchain, and hardcoding either spelling breaks on the other.
     ##
     ## ``xcrun`` itself is SIP-protected, which does not matter: this runs in
     ## the monitor host at populate time, not inside a monitored action — the
@@ -808,8 +835,8 @@ when defined(macosx):
     ## developer's own PATH.
     var resolved = ""
     try:
-      let probe = execCmdEx("/usr/bin/xcrun -f " & quoteShell(name) &
-        " 2>/dev/null")
+      let probe = execCmdEx("/usr/bin/xcrun -f " &
+        quoteShell(appleToolchainExecTarget(name)) & " 2>/dev/null")
       if probe.exitCode != 0:
         return ""
       resolved = probe.output.strip()
