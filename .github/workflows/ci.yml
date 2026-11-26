@@ -212,6 +212,27 @@ jobs:
             echo "${pair##*:}=$dir ($(git -C "$dir" rev-parse HEAD))"
           done
 
+      - name: Allow unprivileged user namespaces on the hosted Linux runner
+        # Ubuntu 24.04, the image GitHub-hosted runners use, ships
+        # kernel.apparmor_restrict_unprivileged_userns=1. Under it
+        # `unshare --user --map-root-user` cannot write /proc/self/uid_map, so
+        # the pid-namespace cases of tests/linux/test_io_mon_linux_tree_ledger.nim
+        # (7, 13, 14, 16) skipped on every Linux run and the guarantee they cover
+        # was checked on no lane (reprobuild-pm issue
+        # 2026-11-26-io-mon-pid-namespace-tree-ledger-tests-skip-on-the-hosted-ubuntu-runner-ci-yml-selects).
+        # Hosted runners grant passwordless sudo; self-hosted classes are
+        # configured by their image instead, so the step is limited to hosted
+        # Linux, and to kernels that have the setting at all.
+        if: runner.os == 'Linux' && runner.environment == 'github-hosted'
+        shell: bash
+        run: |
+          knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -e "$knob" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          else
+            echo "$knob is absent; unprivileged user namespaces are not restricted by AppArmor here"
+          fi
+
       - name: Run tests
         # See the note on `Run lint`: without pipefail, `| tee` masks failure.
         shell: bash
