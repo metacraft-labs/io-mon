@@ -46,7 +46,10 @@ proc run(cmd: string; args: seq[string]):
 
 suite "io-mon's command line is clispec's":
   let work = createTempDir("io-mon-cli-grammar", "")
-  let cli = work / ("io-mon" & ExeExt)
+  # `ExeExt` has no leading dot ("exe" on Windows), so it is added with
+  # `addFileExt`: `"io-mon" & ExeExt` named `io-monexe`, and nim then wrote
+  # `io-monexe.exe`, a file the test never looked for.
+  let cli = work / "io-mon".addFileExt(ExeExt)
   let build = execCmdEx(quoteShellCommand(@[findExe("nim"), "c",
     "--hints:off", "--warnings:off", "--threads:on",
     "--nimcache:" & work / "nimcache", "--out:" & cli,

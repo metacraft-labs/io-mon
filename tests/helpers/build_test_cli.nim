@@ -5,7 +5,8 @@ import std/[os, osproc, strutils]
 proc buildTestCli*(repoRoot: string): string =
   let nim = findExe("nim")
   doAssert nim.len > 0, "Nim compiler is required for the CLI fixture"
-  result = repoRoot / "build" / "bin" / ("io-mon" & ExeExt)
+  # `ExeExt` has no leading dot ("exe" on Windows); see addFileExt.
+  result = repoRoot / "build" / "bin" / "io-mon".addFileExt(ExeExt)
   createDir(result.parentDir)
   let (output, code) = execCmdEx(quoteShell(nim) &
     " c --threads:on --out:" & quoteShell(result) & " " &
