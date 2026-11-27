@@ -9,9 +9,12 @@
 #
 #   --fast  (default in `just test-realbuild-oracle`) — fixtures A (cmake+ninja
 #           and cargo) + the class-(a) SET-vs-file transport gate + the D control.
-#           A few seconds; suitable to keep in CI.
-#   --full  — additionally the differentials B (ninja `-t deps` / cargo dep-info)
-#           and C (`strace -f`), plus the SIGKILL-under-load battery D. ~5s.
+#           A few seconds.
+#   --full  — (default when this script is run without a tier) additionally the
+#           differentials B (ninja `-t deps` / cargo dep-info) and C
+#           (`strace -f`), plus the SIGKILL-under-load battery D. ~5s more.
+#           CI runs this tier (`just test-realbuild-oracle --full`, the Linux
+#           Nix leg of ci.yml's Test job).
 #
 # TOOLCHAIN PROVENANCE. Every tool this gate needs — cc, cmake, ninja, cargo,
 # rustc, strace — now comes from io-mon's OWN `flake.nix` devShell, pinned by

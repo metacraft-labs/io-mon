@@ -240,6 +240,22 @@ jobs:
         shell: bash
         run: dev-exec just test-dev-shell 2>&1 | tee -a test.log
 
+      - name: Run real-build completeness oracle
+        # The §4.5(h) cardinal-sin gate: real cmake+ninja and cargo builds run
+        # under the monitor, and the captured inputs are checked against the
+        # fixtures' known closure, the toolchains' own dep data and `strace -f`,
+        # plus a SIGKILL-under-load battery. An under-captured input reported
+        # as complete is the one failure io-mon exists to prevent, and no other
+        # test drives a real build. Linux only: differential C is `strace -f`,
+        # which macOS does not have. Nix flavour only: the
+        # oracle needs this repo's dev shell (cc, cmake, ninja, cargo, rustc,
+        # strace from flake.nix). The full tier costs about 6 s over --fast.
+        # tests/portable/test_ci_runs_every_test_recipe.nim fails if no
+        # workflow runs this recipe.
+        if: matrix.env == 'nix' && matrix.slug == 'linux-x64'
+        shell: bash
+        run: dev-exec just test-realbuild-oracle --full 2>&1 | tee -a test.log
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4

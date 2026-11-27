@@ -212,6 +212,48 @@ set `IO_MON_TEST_REPRO=/absolute/path/to/repro`; otherwise it uses `repro`
 on PATH. Reports and compiler logs remain in
 `build/compiler-selection-regression/`.
 
+### Check capture against real builds (the completeness oracle)
+
+```sh
+nix develop . -c just test-realbuild-oracle          # fast tier
+nix develop . -c just test-realbuild-oracle --full   # what CI runs
+```
+
+The real-build completeness oracle (`tests/realbuild/run_oracle.sh`,
+`tests/realbuild/oracle.nim`) builds the shim and the CLI, runs real
+cmake+ninja and cargo builds of committed fixtures under the monitor, and
+fails if the captured inputs miss any part of the fixture's known closure
+while the edge is reported complete. That is the failure io-mon exists to
+prevent: a consumer would take a missed input as a valid cache hit. The fast
+tier runs the fixtures, the set-vs-file transport check and the control for
+the SIGKILL battery. `--full` adds two differentials, the toolchains' own
+dependency data (`ninja -t deps`, cargo dep-info) and `strace -f`, plus the
+SIGKILL-under-load battery itself. It costs about 6 s more than the fast tier.
+
+Run it inside this repository's dev shell. The builds need `cc`, `cmake`,
+`ninja`, `cargo`, `rustc` and, for `--full`, `strace`, and `flake.nix` pins
+all of them. From a shell without them the script stops and names the
+missing tool, so a missing tool is never reported as a capture gap. CI runs
+`--full` on Linux in the Nix-flavoured _Test_ job (`.github/workflows/ci.yml`,
+step _Run real-build completeness oracle_). It does not run on macOS, because
+`strace` is Linux-only.
+
+### Every test recipe runs in CI
+
+Every Justfile recipe whose name starts with `test` runs in some workflow
+under `.github/workflows/`. The workflow either calls `just <recipe>` or runs
+the recipe's commands directly. The only other case is a recipe that runs a
+strict subset of another scheduled recipe: `test-portable` and
+`test-platform` are arms of `scripts/run_tests.nims`, and `just test` runs
+all of it. `tests/portable/test_ci_runs_every_test_recipe.nim` enforces this
+on every OS as part of `just test`. Its failure names each unscheduled
+recipe.
+
+When you add a test recipe, add the CI step with it. A recipe may skip CI
+only if it needs hardware that CI does not have. List such a recipe here as
+manual-only, give the reason, and extend the test with an explicit table for
+it. Do not loosen the matcher. No recipe is manual-only today.
+
 ---
 
 ## 4. Memory safety: the sanitizer arm

@@ -18,8 +18,10 @@ build-snoop:
 test:
     nim e scripts/run_tests.nims
 
-# Real-build completeness oracle (§4.5(h)) — fast fixtures + class-(a) gate.
-# The heavier B/C/D differentials run with: tests/realbuild/run_oracle.sh --full
+# Real-build completeness oracle (§4.5(h)) — fast fixtures + class-(a) gate by
+# default. `just test-realbuild-oracle --full` adds the B/C/D differentials
+# (toolchain dep data, `strace -f`, the SIGKILL battery); CI runs `--full` on
+# the Linux Nix leg of ci.yml's Test job.
 #
 # Needs io-mon's OWN devShell: the real builds it drives use cc, cmake, ninja,
 # cargo, rustc (+ strace for --full), and those are pinned in this repo's
@@ -27,8 +29,8 @@ test:
 #   nix develop <io-mon> -c just test-realbuild-oracle
 # From a shell without them the script aborts naming the missing tool, so an
 # environment gap can never be misread as an io-mon capture gap.
-test-realbuild-oracle:
-    tests/realbuild/run_oracle.sh --fast
+test-realbuild-oracle tier="--fast":
+    tests/realbuild/run_oracle.sh {{tier}}
 
 # Run portable tests only
 test-portable:
