@@ -19,6 +19,7 @@ on:
     paths:
       - "docs/site/**"
       - ".github/workflows/docs-pages.yml"
+      - "tests/test_docs_site_flake_is_locked.py"
   workflow_dispatch:
 
 permissions:
@@ -49,6 +50,16 @@ jobs:
         # FlakeHub authentication `##[error]` that was not the failure.
         with:
           use-flakehub: false
+
+      - name: Check the site builds from its committed lock
+        # The body of `just test-docs-site`, run directly because this job has
+        # Nix but no dev shell (the script runs `nix develop` itself). It fails
+        # on an untracked or stale docs/site/flake.lock, on a build step here
+        # that may re-resolve the inputs, and on a site that does not build
+        # from git-tracked files alone. Every test recipe runs in some workflow
+        # (docs/contributors/building-and-testing.md, enforced by
+        # tests/portable/test_ci_runs_every_test_recipe.nim).
+        run: python3 tests/test_docs_site_flake_is_locked.py --build
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
