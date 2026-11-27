@@ -110,6 +110,39 @@ three nesting levels, inner loss, interruption and real filesystem failures.
 ### Linux
 
 - **`LD_PRELOAD` Shim**: Injects wrapper symbols that route filesystem activity to the monitor.
+- **glibc only**: the Linux shim supports glibc, the C library of every
+  supported Linux target (x86_64, AArch64, armhf), and refuses to compile
+  against any other. Both of the shim's C translation units check it: the
+  hook runtime (`src/io_mon/hooks/linux_preload_runtime.nim`) and the private
+  heap (`src/io_mon/shim/linux_private_heap.c`), each with an `#error` that
+  names the reason, so the build stops on that message and not on an
+  unrelated glibc-only type. The check reads `__GLIBC__` from the libc
+  headers the compiler uses, not from the build host, so a musl compiler on a
+  glibc host is refused too. The refusal is deliberate: nothing builds or tests the
+  shim against another libc, and the one path once written for one found the
+  real `dlsym` through the shim's own exported `dlsym`, which never returns.
+  The shim reaches the real `dlsym` with glibc's `dlvsym`, which avoids that
+  loop. Supporting a second libc is a spec change: it needs a way to find the
+  real `dlsym` without going through the shim's own exports, and a build and
+  test arm for that libc. Test:
+  `tests/linux/test_io_mon_linux_shim_refuses_non_glibc.nim`.
+- **Supported CPUs**: the Linux shim is built for x86-64, AArch64 and 32-bit
+  ARM (armhf), and for no other CPU. Its raw syscall numbers are spelled out
+  per architecture in `src/io_mon/shim/linux_preload.nim`, and the inline
+  `syscall` scan exists on x86-64 and 32-bit ARM only. **32-bit x86 (i386 /
+  i686) is not supported**, and the shim refuses to compile for it with an
+  error that says so, rather than on the first per-architecture symbol it
+  lacks. Nothing needs an i386 shim: a 32-bit x86 program started by a
+  monitored x86-64 process is an image the 64-bit shim cannot enter (glibc's
+  loader ignores the preload with `wrong ELF class`), and the monitor
+  reports it as event-loss (`uninjectable image`, see "Linux: 32-bit and
+  Static Programs" in the user guide), so the step is re-run rather than
+  cached on an incomplete dependency set. Unlike Windows, where an i686
+  companion shim is injected into 32-bit (WOW64) children, Linux ships no
+  32-bit x86 companion. Adding i386 is a spec change: a syscall table, a
+  build and test arm, and a decision on injecting a companion shim into
+  32-bit children. Test: `tests/portable/test_linux_shim_compiles_for_every_target.nim`
+  (every supported CPU type-checks; i386 is refused by name).
 - **One active shim per process**: nested monitors can preload two distinct
   shim builds into one child (an inner host puts its shim in front of the
   list it inherited, or an outer exec hook meets a route that names another
@@ -129,6 +162,7 @@ three nesting levels, inner loss, interruption and real filesystem failures.
   (`src/io_mon/nested_capture.nim`). Test:
   `tests/linux/test_io_mon_linux_nested_distinct_shims.nim`.
 - **Raw Syscall Hooking**: Uses a raw-syscall SIGTRAP substrate to intercept inline `0f 05` assembly instructions inside main executable pages and custom dynamic libraries. Only the image's executable sections (`SHF_EXECINSTR`, read from its ELF section table through `linux_image_code_ranges`) are scanned: an `R E` segment can also carry `.rodata`/`.eh_frame` (BOLT output, `-z noseparate-code`), and decoding that data once INT3-patched a jump-table entry of rustc 1.94.0. An image whose section table cannot be read is left unscanned and reported as event loss (`skipped image without a readable executable-section table`).
+  - **A trapped call runs as it would unmonitored.** The SIGTRAP handler replays a trapped call itself and writes its result back into the interrupted context, with one exception: a `clone` or `clone3` that names a child stack. The kernel starts that child at the instruction after the system call, on the stack it names, so a call issued from inside the handler would start the child inside the handler with none of the handler's frames on its stack. The handler therefore does that call's pre-call bookkeeping (in-flight count, armed loss, the fork child's thread-count sample) and returns from the signal to a resume stub of the trapped site, `syscall; int3`, in the shim's own text (`ct_inline_clone_stubs`, which the scanner never patches). The kernel restores the program's whole state on that return, including the FPU/SIMD state and the signal mask, and the stub issues the call with it. Both sides stop at the stub's `int3`, the child on its new stack with the program's registers: the parent records the call and, for a CLONE_VM process, writes the child's tree-ledger entry and the CLONE_VM-process loss before the clone returns to it, as the `syscall(2)` route does; a fork-like child reclaims the shim state it inherited, as a replayed fork's child does; a child that shares the parent's memory (a thread, a vfork child, a CLONE_VM process) touches nothing. Each then resumes after the site's `syscall`. Nothing in the registers names the site or the call at that second trap, and a child sharing memory cannot be handed per-call memory, so each site has one stub per call (`clone`, `clone3`) and class of child (fork-like, CLONE_VM process, other CLONE_VM), and the stub's address is the whole message. A clone without a child stack (the shape `fork` uses) is replayed in the handler like any other call: its child continues on a copy of the handler's stack. One child still does not survive: a `clone3` with `CLONE_CLEAR_SIGHAND` starts the child with every handler reset to the default, so the child is killed by SIGTRAP at the stub's `int3`. This is the x86_64 trap path; the 32-bit ARM one still replays a clone that names a child stack inside its SIGILL handler, and such a child does not survive there yet. Test: `tests/linux/test_io_mon_shim_inline_clone_child_stack.nim`.
 - **Library-Load Observation (`dl_iterate_phdr`)**: `ld.so` maps a shared object through
   internal `__mmap` / `__open64_nocancel` calls that do **not** traverse `LD_PRELOAD`
   symbol interposition, so no file hook can ever see a loader-driven load. io-mon
@@ -182,6 +216,30 @@ three nesting levels, inner loss, interruption and real filesystem failures.
   without injection, with an unsupported-machine spawn diagnostic and missing
   process-start loss evidence. Its capture remains incomplete; this does not
   provide a native Windows ARM64 backend.
+
+### In-tree local-fd creation records
+
+A read of a descriptor the monitored tree did not open (an inherited pipe or
+socket, or any fd whose number was open when the shim initialised) is graded
+as an out-of-tree content channel unless the merge finds a
+`chan=localfd role=create` record for the same kernel object, `(dev,ino)`.
+The Linux shim records that create for `pipe`, `pipe2`, `socketpair`, `eventfd`
+and `timerfd_create`, and for a socket at the moment a `connect` on it is made
+or in flight, which is also when the connect record judges its peer. A connect that names
+no address family (`connect(AF_UNSPEC)`, which dissolves a datagram socket's
+peer) judges no peer and records no create. A read
+through any descriptor number, including one `dup2`ed onto fd 0 (as bash does
+for `read <&4`), therefore pairs.
+
+A create is recorded only where the channel's peer is judged. `socket(2)`
+alone records none: a socket that is only bound (UDP, a datagram AF_UNIX
+socket) has no judged peer, and a create there would pair its reads and hide an
+out-of-tree sender. `accept`/`accept4` record none either: the accepted peer
+may be out of tree (a server accepting from an inherited listener). An accepted
+AF_UNIX connection is judged by the kernel-attested peer pid (`SO_PEERCRED`)
+against the monitored tree, and an accepted TCP connection, or a bound-only
+socket, read through an inherited descriptor number stays a conservative
+out-of-tree downgrade. A failed call records nothing.
 
 ---
 

@@ -73,6 +73,8 @@
 ## ignores the ledger) — 3, 4, 5 come back `mcComplete` and 6 loses the
 ## daemon's read; `noshimmark` (the shim writes no entry) — every case fails
 ## closed with "the tree ledger has no entry for the root".
+import foreign_preload_isolation
+
 import std/[monotimes, os, osproc, posix, sequtils, streams, strutils, tempfiles,
   times, unittest]
 import io_mon
@@ -131,6 +133,28 @@ static char **g_argv;
 static void clobber_needles(void) {
   for (char **e = environ; e && *e; e++)
     if (!strncmp(*e, "REPRO_MONITOR_", 14)) memset(*e, 'x', strlen(*e));
+}
+
+/* Every process that waits for the test to release it (SIGUSR1) or parks
+   forever calls this first. The test reaps them in `finally`, but a test
+   that dies before that (killed, or a crash in the harness) would leave
+   them running: one survived 2.4 days. A parent-death signal cannot bound
+   them, because outliving their creator is what they are for, so each one
+   gets its own deadline instead (alarm(2) is per process and is not
+   inherited across fork). SIGALRM gets a handler rather than its default
+   action: the first process of a new pid namespace (the pidns children) is
+   that namespace's init, which the kernel shields from every signal whose
+   action is the default, so a default SIGALRM would not end it. */
+#ifndef KEEP_ALIVE_LIMIT_S
+#define KEEP_ALIVE_LIMIT_S 600
+#endif
+static void keep_alive_limit_reached(int sig) {
+  (void)sig;
+  _exit(124);
+}
+static void bound_lifetime(void) {
+  signal(SIGALRM, keep_alive_limit_reached);
+  alarm(KEEP_ALIVE_LIMIT_S);
 }
 
 /* PostgreSQL's ps_status.c (PS_USE_CLOBBER_ARGV): find the contiguous
@@ -212,6 +236,7 @@ static int daemonize(const char *in, const char *proof, const char *pidfile,
   close(p[1]);
   if (gated) {
     int sig = 0;
+    bound_lifetime();
     if (sigwait(&set, &sig) != 0) _exit(14);
     _exit(0);
   }
@@ -261,6 +286,7 @@ static int lockfork(const char *pidfile) {
     if (write(p[1], "r", 1) != 1) _exit(13);
     close(p[1]);
     int sig = 0;
+    bound_lifetime();
     if (sigwait(&set, &sig) != 0) _exit(14);
     _exit(0);
   }
@@ -285,6 +311,7 @@ static void linger(const char *pidfile) {
   snprintf(text, sizeof(text), "%ld\n", (long)getpid());
   write_text(pidfile, text);
   int sig = 0;
+  bound_lifetime();
   sigwait(&set, &sig);
   _exit(0);
 }
@@ -297,6 +324,7 @@ static int clone_child(void *arg) {
 }
 static int vm_child(void *arg) {
   (void)arg;
+  bound_lifetime();
   for (;;) pause();
   return 0;
 }
@@ -421,7 +449,12 @@ static int pidns(const char *how, const char *pidfile, int keep) {
   if (unshare(CLONE_NEWPID) != 0) return 70;
   if (!strcmp(how, "daemon3")) {
     if (daemon(1, 1) != 0) return 71;
-    if (keep) { int sig = 0; clobber_needles(); sigwait(&set, &sig); }
+    if (keep) {
+      int sig = 0;
+      clobber_needles();
+      bound_lifetime();
+      sigwait(&set, &sig);
+    }
     _exit(0);
   }
   if (!strcmp(how, "forkpty")) {
@@ -438,6 +471,7 @@ static int pidns(const char *how, const char *pidfile, int keep) {
         int sig = 0;
         clobber_needles();
         if (write(1, "r", 1) != 1) _exit(13);
+        bound_lifetime();
         sigwait(&set, &sig);
       }
       _exit(0);
@@ -454,7 +488,12 @@ static int pidns(const char *how, const char *pidfile, int keep) {
     long pid = syscall(SYS_clone, SIGCHLD, 0, 0, 0, 0);
     if (pid < 0) return 72;
     if (pid == 0) {
-      if (keep) { int sig = 0; clobber_needles(); sigwait(&set, &sig); }
+      if (keep) {
+        int sig = 0;
+        clobber_needles();
+        bound_lifetime();
+        sigwait(&set, &sig);
+      }
       _exit(0);
     }
     if (!keep) return wait_child((pid_t)pid) == 0 ? 0 : 73;
@@ -478,6 +517,7 @@ static int pidns(const char *how, const char *pidfile, int keep) {
    syscall(2) route, is the child's only one. */
 __attribute__((force_align_arg_pointer, noreturn))
 static void vm_child_entry(void) {
+  bound_lifetime();
   for (;;) pause();
 }
 static char g_vm_stack[256 * 1024] __attribute__((aligned(16)));
@@ -787,7 +827,7 @@ suite "Linux descendant guard: the tree ledger":
           inc serial
           var args = @[unshare, "--user", "--map-root-user", "--pid",
             "--fork"]
-          if mountProc: args.add "--mount-proc"
+          if mountProc: args.add @["--mount-proc", "--propagation", "slave"]
           args.add @["sh", "-c", "true"]
           let req = FsSnoopRequest(command: args,
             depFilePath: work / ("capture-" & $serial & ".iomon"))
@@ -876,7 +916,12 @@ suite "Linux descendant guard: the tree ledger":
 
   proc unprivilegedNamespaces(extra: varargs[string]): bool =
     ## Whether this host lets an unprivileged user create a user namespace
-    ## (plus `extra` unshare flags) and run a command in it.
+    ## (plus `extra` unshare flags) and run a command in it. A mount
+    ## namespace is always asked for with `--propagation slave`: util-linux
+    ## defaults to private, and a private copy keeps every host mount it
+    ## copied mounted until the namespace ends, because the host's unmount
+    ## never reaches it (and, locked by the user namespace, nothing inside
+    ## can unmount it either).
     let unshare = findExe("unshare")
     if unshare.len == 0:
       echo "    SKIP: no unshare on PATH"
@@ -1000,14 +1045,15 @@ suite "Linux descendant guard: the tree ledger":
     # hook, so no parent entry naming the child by the host's pid, and
     # nothing in the child that needs /proc) nothing else reported it, and
     # the capture could be graded complete with the survivor running.
-    if unprivilegedNamespaces("--mount", "sh", "-c",
+    if unprivilegedNamespaces("--mount", "--propagation", "slave",
+        "sh", "-c",
         "mount -t tmpfs none /proc && test ! -e /proc/self"):
       for how in ["forkpty", "syscall-fork"]:
         checkpoint(how)
         let pidFile = work / ("hidden-proc-" & how & ".pid")
         inc serial
         let req = FsSnoopRequest(command: @[findExe("unshare"), "--user",
-          "--map-root-user", "--mount", "sh", "-c",
+          "--map-root-user", "--mount", "--propagation", "slave", "sh", "-c",
           "mount -t tmpfs none /proc && exec \"$0\" pidns " & how &
             " \"$1\" 1",
           fixture, pidFile],
@@ -1070,15 +1116,16 @@ suite "Linux descendant guard: the tree ledger":
     # That write cannot read the pid namespace, so it fails, and the loss
     # must say so. The tree makes no fork, so a fork child's skipped-evidence
     # loss would name a cause that did not happen.
-    if unprivilegedNamespaces("--mount", "sh", "-c",
+    if unprivilegedNamespaces("--mount", "--propagation", "slave",
+        "sh", "-c",
         "mount -t tmpfs none /proc && test ! -e /proc/self"):
       for how in ["vm-clone", "clone", "clone3"]:
         checkpoint(how)
         let pidFile = work / ("hidden-proc-vm-" & how & ".pid")
         inc serial
         let req = FsSnoopRequest(command: @[findExe("unshare"), "--user",
-          "--map-root-user", "--mount", fixture, "hidden-proc-vm", how,
-          pidFile], depFilePath: work / ("capture-" & $serial & ".iomon"))
+          "--map-root-user", "--mount", "--propagation", "slave", fixture,
+          "hidden-proc-vm", how, pidFile], depFilePath: work / ("capture-" & $serial & ".iomon"))
         var child = Pid(0)
         try:
           let res = capture(req, false)

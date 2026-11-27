@@ -37,6 +37,8 @@
 ##
 ## Mocks: none. The real shim is built by the real `scripts/build_shim.sh`.
 
+import foreign_preload_isolation
+
 import std/[os, sequtils, strutils, unittest]
 
 import build_test_shim

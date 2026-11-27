@@ -43,6 +43,8 @@
 ## library; the selftest forges lock states because the races it stands in
 ## for cannot be scheduled from outside.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon

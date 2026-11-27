@@ -90,6 +90,8 @@ when defined(linux):
   import ./repro_support/getconf
   when defined(amd64):
     import ./repro_support/i686_shell
+  when defined(amd64) or defined(arm64):
+    import ./repro_support/musl_cc
   import ./repro_support/shim_publication_tools
   import ./repro_support/strace
 
@@ -132,11 +134,19 @@ package io_mon:
       "node"
       "getconf"
       "grep"
+      # scripts/build_shim.sh reads the Linux shim's dynamic section with
+      # `readelf` and extracts any DT_RUNPATH with `sed`, and refuses to
+      # publish when either is missing.
+      "sed"
+      "readelf"
       "nm"
       "strace"
       "patchelf"
       when defined(amd64):
         "io-mon-test-i686-sh"
+      when defined(amd64) or defined(arm64):
+        # tests/linux/test_io_mon_linux_shim_refuses_non_glibc.nim
+        "io-mon-test-musl-cc"
     # The C-family compiler ``nim c`` shells out to for the C backend. macOS
     # builds (and the shim's arm64/arm64e fat link) use Apple ``clang``; Linux
     # and Windows (``--cc:gcc`` for the shim DLL) use ``gcc``. The user supplies
@@ -160,6 +170,12 @@ package io_mon:
     # shim edge still resolves ``$STACKABLE_HOOKS_SRC`` itself.
     "nim-stackable-hooks"
     "nim-shm-queue"
+    # The clispec library (its ``library clispec``): ``src/io_mon/cli.nim``
+    # generates the ``io-mon`` binary's parser and help from the description
+    # in ``src/io_mon/cli_description.nim``. A leaf library that depends on
+    # nothing but the standard library, so io-mon still depends on neither
+    # of its consumers.
+    "nim-cli-spec"
 
   # The package itself — every ``.nim`` under ``src`` is importable when a
   # consumer expresses ``uses: "io-mon"``; ``src/io_mon.nim`` is the umbrella
@@ -226,7 +242,8 @@ package io_mon:
     when defined(macosx):
       appendRegisteredActionToolIdentityRefs(shimBuild.id, ["cctools"])
     when defined(linux):
-      appendRegisteredActionToolIdentityRefs(shimBuild.id, ["getconf", "mv", "rmdir"])
+      appendRegisteredActionToolIdentityRefs(shimBuild.id,
+        ["getconf", "mv", "rmdir", "sed", "readelf"])
     discard collect("shim", @[shimBuild])
     when defined(linux):
       # Keep the monitor used for this project's tests separate from the
@@ -240,7 +257,8 @@ package io_mon:
           ("IO_MON_SHIM_OUT_DIR", "build/monitor-test-runtime"),
           ("IO_MON_SHIM_NIMCACHE_DIR", "build/nimcache/monitor-test-runtime")])
       appendRegisteredActionToolIdentityRefs(testMonitor.id,
-        ["bash", "nim", backendCompiler, "mkdir", "dirname", "uname", "getconf", "mv", "rmdir"])
+        ["bash", "nim", backendCompiler, "mkdir", "dirname", "uname", "getconf", "mv", "rmdir",
+         "sed", "readelf"])
       discard collect("test-monitor-runtime", @[testMonitor])
 
     # ---- Standalone CLI (``io-mon`` / the ``default`` collection) -----------
@@ -386,6 +404,10 @@ package io_mon:
           # those under a private shim; an outer shim is itself an
           # interposer in the lookup order the test asserts.
           "test_io_mon_foreign_preload_rtld_next.nim",
+          # Preloads a stand-in for agent-harbor's self-propagating shim into
+          # probe children and asserts their exact LD_PRELOAD and mappings;
+          # an outer shim re-injected across exec would be one more entry.
+          "test_io_mon_foreign_preload_isolation.nim",
           # Builds two distinct shims and asserts that a nested capture
           # carries exactly one active image; an enclosing shim is a third
           # image in that loader closure. It also needs `patchelf` (below).
@@ -475,7 +497,7 @@ package io_mon:
           appendRegisteredActionToolIdentityRefs(executeEdge.id, ["python3"])
       when defined(linux):
         appendRegisteredActionToolIdentityRefs(executeEdge.id,
-          ["strace", "nm", "getconf", "grep", "mv", "rmdir"])
+          ["strace", "nm", "getconf", "grep", "mv", "rmdir", "sed", "readelf"])
         if stem == "test_io_mon_linux_nested_distinct_shims":
           # Gives its second shim its own SONAME (`patchelf --set-soname`).
           appendRegisteredActionToolIdentityRefs(executeEdge.id, ["patchelf"])
@@ -486,6 +508,10 @@ package io_mon:
               ["io-mon-test-i686-sh"])
         if stem == "test_io_mon_shim_static_tls_small_stack_threads":
           appendRegisteredActionToolIdentityRefs(executeEdge.id, ["node"])
+        when defined(amd64) or defined(arm64):
+          if stem == "test_io_mon_linux_shim_refuses_non_glibc":
+            appendRegisteredActionToolIdentityRefs(executeEdge.id,
+              ["io-mon-test-musl-cc"])
       testExecuteActions.add(executeEdge)
 
     # Portable tests — always in the graph.

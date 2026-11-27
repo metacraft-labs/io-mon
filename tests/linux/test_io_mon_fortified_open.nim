@@ -2,6 +2,8 @@
 ## perform real failed/read/write opens, and inspect the public host's records.
 ## The fixture has a CPU-time limit so a self-jump fails without a wall-clock
 ## cutoff that would confuse host contention with lack of forward progress.
+import foreign_preload_isolation
+
 import std/[os, posix, osproc, sequtils, strtabs, tempfiles, unittest]
 import io_mon
 import build_test_shim, unmonitored_env

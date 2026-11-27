@@ -39,7 +39,7 @@
 ##   - BuildXL's lossy-ES prior art (cross-platform.md / ESClient.mm) — ES can
 ##     DROP events under load; a detected drop MUST conservatively invalidate.
 
-import std/sets
+import std/[hashes, strutils, tables]
 
 import io_mon/types
 
@@ -61,16 +61,59 @@ type
       ## Human-readable reason when `ok` is false (e.g. the `es_new_client`
       ## result name, or "not compiled with -d:ioMonEndpointSecurity").
 
+  EsAuditToken* = object
+    ## Process identity as ES reports it: the `audit_token_t` of an
+    ## `es_process_t`, reduced to the two fields that identify a process
+    ## instance — the pid and its pidversion (`audit_token_to_pid`,
+    ## `audit_token_to_pidversion`). A bare pid wraps and is reused; the pair is
+    ## not, so a process that inherits a member's pid is a DIFFERENT key
+    ## (MacOS-EndpointSecurity-Backend.md §4, "Identity is the audit token, not
+    ## the pid").
+    pid*: uint64
+    pidversion*: uint32
+
+  EsMemberState* = enum
+    esmLive    ## admitted and not yet seen to exit on this view's stream
+    esmExited  ## EXIT delivered; kept until the capture is fenced (§5.1)
+
+  EsFilterVerdict* = enum
+    efAdmit   ## the process is a member: map and deliver the event now
+    efReject  ## not in the subtree: drop the event
+    efHold    ## unknown on this view's lifecycle stream: held until resolved
+
   EsProcessTree* = object
-    ## Process-subtree filter. ES is SYSTEM-GLOBAL — it delivers events for every
-    ## process on the host. A build monitor must keep ONLY the events for the
-    ## build's own process subtree (the monitored root pid + its transitive
-    ## descendants), discarding the rest. The tree is seeded with the root pid and
-    ## grows as `ES_EVENT_TYPE_NOTIFY_FORK`/`EXEC` events name new children whose
-    ## parent is already a member. (EXEC keeps the same pid; FORK introduces a new
-    ## child pid — both must be folded in before that pid's file events arrive,
-    ## which the kernel ordering guarantees: a child's events follow its FORK.)
-    members*: HashSet[uint64]
+    ## Process-subtree VIEW. ES is SYSTEM-GLOBAL — it delivers events for every
+    ## process on the host — and orders messages within ONE client only. A
+    ## build monitor keeps only the events of the build's own subtree, and it
+    ## filters each client's file events against a view built from lifecycle
+    ## events (FORK, EXEC, EXIT) delivered on that SAME client
+    ## (`holdUnknown = false`). A topology that cannot do that filters against
+    ## another client's view with `holdUnknown = true`: an event of a process
+    ## the view does not yet know is held, not rejected, until a FORK/EXEC on
+    ## the lifecycle stream admits its token or the fence (§5.1) proves it is
+    ## out of the tree.
+    ##
+    ## Seeded with the token of a monitor-owned spawn helper BEFORE the helper
+    ## forks the action root; the root is then admitted by its own FORK.
+    ## Members are keyed on the audit token and kept after EXIT (as exited)
+    ## until the capture is fenced, so the fence can require that every member
+    ## has exited, and a later process that reuses a member's pid is never
+    ## admitted by accident (MacOS-EndpointSecurity-Backend.md §4, §5.1).
+    members*: Table[EsAuditToken, EsMemberState]
+    preExec*: Table[EsAuditToken, EsAuditToken]
+      ## post-exec token → the token the process ran under before that exec,
+      ## so an EXIT (which names the post-exec token) also finishes the
+      ## pre-exec token it was admitted under.
+    holdUnknown*: bool
+    held*: Table[EsAuditToken, seq[MonitorRecord]]
+      ## Records whose process this view did not yet know when they arrived,
+      ## per token in arrival order. Only a view built from ANOTHER client's
+      ## lifecycle stream holds (§4, the hold-until-resolved rule); a
+      ## same-client view rejects. Keyed so an admission releases its own
+      ## token's records without scanning every unknown process on the host.
+    fenced*: bool
+      ## Set by `closeAtFence`. A fenced view is closed: it admits nothing new
+      ## and rejects every further event.
 
   EsSeqTracker* = object
     ## Event-loss detector. Each `es_message_t` carries a monotonic `seq_num`
@@ -91,6 +134,8 @@ type
     ## bookkeeping (tree + seq tracker + sink) exists, so the module compiles and
     ## the mapping is unit-testable without the entitlement.
     tree*: EsProcessTree
+      ## The single-client topology's one view. A partitioned topology keeps
+      ## one `EsProcessTree` and one `EsSeqTracker` per client.
     seqTracker*: EsSeqTracker
     sink*: EsRecordSink
     started*: bool
@@ -99,36 +144,164 @@ type
 # Process-subtree filtering (pure; testable without ES).
 # ---------------------------------------------------------------------------
 
-proc initEsProcessTree*(rootPid: uint64): EsProcessTree =
-  ## Seed the monitored subtree with the build's root pid.
-  result.members = initHashSet[uint64]()
-  if rootPid != 0:
-    result.members.incl rootPid
+proc hash*(t: EsAuditToken): Hash =
+  !$(hash(t.pid) !& hash(t.pidversion))
 
-proc inSubtree*(tree: EsProcessTree; pid: uint64): bool =
-  ## True iff `pid` belongs to the monitored build subtree. Events for any other
-  ## pid (the rest of the system ES also reports) are dropped.
-  pid in tree.members
+proc `$`*(t: EsAuditToken): string =
+  $t.pid & "/" & $t.pidversion
 
-proc onFork*(tree: var EsProcessTree; parentPid, childPid: uint64) =
-  ## Fold a forked child into the subtree iff its parent is already monitored.
-  ## ES delivers the child's own events only AFTER its FORK, so this admission
-  ## happens in time (kernel-ordered per process).
-  if parentPid in tree.members and childPid != 0:
-    tree.members.incl childPid
+proc initEsProcessTree*(helperToken: EsAuditToken;
+                        holdUnknown = false): EsProcessTree =
+  ## Seed one subtree view with the audit token of the monitor-owned spawn
+  ## helper. The monitor seeds EVERY client's view with it before releasing the
+  ## helper to fork the action root; the root's FORK then arrives on each
+  ## client's stream and admits it (`onFork`). The root's own token cannot be
+  ## seeded race-free: it is known only after the spawn, by which time the root
+  ## may already have forked or opened files, and an exec changes it.
+  ## `holdUnknown` selects the hold-until-resolved rule for a view that filters
+  ## another client's events (see `EsProcessTree`).
+  result.members = initTable[EsAuditToken, EsMemberState]()
+  result.preExec = initTable[EsAuditToken, EsAuditToken]()
+  result.held = initTable[EsAuditToken, seq[MonitorRecord]]()
+  result.holdUnknown = holdUnknown
+  result.members[helperToken] = esmLive
 
-proc onExec*(tree: var EsProcessTree; pid: uint64) =
-  ## EXEC replaces the image but keeps the pid, so a pid already in the subtree
-  ## stays in it across exec (including an exec into a hardened/SIP binary — the
-  ## key win over injection, which such a binary strips). Idempotent.
-  if pid != 0:
-    tree.members.incl pid
+proc inSubtree*(tree: EsProcessTree; token: EsAuditToken): bool =
+  ## True iff the process with this audit token belongs to the monitored
+  ## subtree (live, or exited and not yet fenced). Another process holding the
+  ## same pid with a different pidversion is NOT a member. A fenced view is
+  ## closed and answers false for every token, as `filterEvent` rejects them.
+  not tree.fenced and token in tree.members
 
-proc onExit*(tree: var EsProcessTree; pid: uint64) =
-  ## Drop an exited pid. Retained for completeness; pid reuse within a single
-  ## short-lived build is unlikely, but removing the entry avoids a stale match
-  ## if the OS recycles the pid for an out-of-tree process later in the build.
-  tree.members.excl pid
+proc isLive*(tree: EsProcessTree; token: EsAuditToken): bool =
+  ## True iff `token` is a member whose EXIT this view has not yet seen.
+  tree.members.getOrDefault(token, esmExited) == esmLive
+
+proc liveMembers*(tree: EsProcessTree): seq[EsAuditToken] =
+  ## Members not yet seen to exit on this view's stream.
+  for token, state in tree.members:
+    if state == esmLive:
+      result.add token
+
+proc allMembersExited*(tree: EsProcessTree): bool =
+  ## The fence's precondition (§5.1 step 1): every admitted member has a
+  ## delivered EXIT on this view's stream.
+  tree.liveMembers.len == 0
+
+proc heldCount*(tree: EsProcessTree): int =
+  ## Number of records currently held, across all unresolved tokens.
+  for records in tree.held.values:
+    result += records.len
+
+proc releaseHeld(tree: var EsProcessTree; token: EsAuditToken): seq[MonitorRecord] =
+  ## Hand back, in arrival order, the held records of a token just admitted;
+  ## every other token's records stay held.
+  if tree.held.pop(token, result):
+    discard
+
+proc admit(tree: var EsProcessTree; token: EsAuditToken): seq[MonitorRecord] =
+  ## An exited member is not revived: an audit token names one process
+  ## instance and is never reused, so a second admission of it is a no-op.
+  if token notin tree.members:
+    tree.members[token] = esmLive
+  tree.releaseHeld(token)
+
+proc onFork*(tree: var EsProcessTree;
+             parent, child: EsAuditToken): seq[MonitorRecord] =
+  ## ES_EVENT_TYPE_NOTIFY_FORK: admit the child's token (`event.fork.child`)
+  ## iff the parent (the message's `process`) is already a member. Returns the
+  ## child's held events, now admitted, for the caller to map and deliver
+  ## (always empty on a same-client view, which never holds).
+  if parent in tree.members and not tree.fenced:
+    result = tree.admit(child)
+
+proc onExec*(tree: var EsProcessTree;
+             process, target: EsAuditToken): seq[MonitorRecord] =
+  ## ES_EVENT_TYPE_NOTIFY_EXEC: if the message's `process` is a member, admit
+  ## the token of `event.exec.target` as well. The exec keeps the pid, but its
+  ## token need not be the pre-exec one; keeping only the pre-exec token would
+  ## lose the post-exec image (the hardened/SIP-binary exec injection cannot
+  ## follow). Returns the target's held events, now admitted.
+  if process in tree.members and not tree.fenced:
+    if target != process:
+      tree.preExec[target] = process
+    result = tree.admit(target)
+
+proc onExit*(tree: var EsProcessTree; token: EsAuditToken) =
+  ## ES_EVENT_TYPE_NOTIFY_EXIT: the member is finished. Its token, and every
+  ## pre-exec token it was admitted under, are marked exited but KEPT until the
+  ## fence, which needs to know that every member has exited. A later process
+  ## reusing the pid has a different token and is never admitted by accident.
+  ## The walk runs post-exec → pre-exec only, because ES names a process's
+  ## current (post-exec) token on its EXIT. An EXIT naming a superseded token
+  ## leaves the later token live, which the fence reports as a loss: the safe
+  ## direction. The step bound guards a cyclic `preExec` chain.
+  var t = token
+  var steps = 0
+  while t in tree.members and steps <= tree.preExec.len:
+    tree.members[t] = esmExited
+    if t notin tree.preExec:
+      break
+    t = tree.preExec[t]
+    inc steps
+
+proc filterEvent*(tree: var EsProcessTree; token: EsAuditToken;
+                  record: MonitorRecord): EsFilterVerdict =
+  ## Decide one file event before it is mapped. A member's event is admitted.
+  ## On a same-client view an unknown token is rejected: one client's stream
+  ## is ordered, so the FORK/EXEC that would admit it has already been seen. On
+  ## a view built from another client's stream (`holdUnknown`) an unknown token
+  ## is HELD — rejecting it would lose it with no sequence gap to report it —
+  ## until `onFork`/`onExec` admits it or `closeAtFence` discards it. A fenced
+  ## view is closed and rejects every event.
+  if tree.fenced:
+    efReject
+  elif token in tree.members:
+    efAdmit
+  elif tree.holdUnknown:
+    tree.held.mgetOrPut(token, @[]).add record
+    efHold
+  else:
+    efReject
+
+proc fenceLossRecord(detail: string): MonitorRecord =
+  MonitorRecord(kind: mrEventLoss, observationKind: moEventLoss,
+    detail: "endpoint-security end-of-capture fence: " & detail)
+
+proc closeAtFence*(tree: var EsProcessTree;
+                   markerDelivered: bool): seq[MonitorRecord] =
+  ## Close this view at the end-of-capture fence (§5.1) and return the loss
+  ## records the capture must carry; empty means the view closed complete.
+  ##   - A member still live (no delivered EXIT once the grace has ended, e.g. a
+  ##     daemonized compiler server) makes the capture incomplete: its later
+  ##     events, and a fork it makes after the marker, could not be captured.
+  ##   - A client that did not deliver the marker within its bounded wait makes
+  ##     the capture incomplete; it is never finalized as complete.
+  ## Pass `markerDelivered = true` only when every client this view depends on
+  ## delivered its marker: the client whose file events it filters and, for a
+  ## `holdUnknown` view, also the client whose lifecycle stream it is built
+  ## from.
+  ## Loss BEFORE the marker is reported by `observeSeq` as a forward
+  ## `global_seq_num` gap at the marker at the latest. Held events whose token
+  ## is still unknown are out of the tree and are discarded: the fence follows
+  ## the exit of every member, so no admission can still precede them. The view
+  ## is closed afterwards; a second call returns nothing.
+  if tree.fenced:
+    return
+  let live = tree.liveMembers
+  if live.len > 0:
+    var names: seq[string]
+    for t in live:
+      names.add $t
+    result.add fenceLossRecord($live.len &
+      " subtree member(s) still live at the fence (pid/pidversion " &
+      names.join(", ") & ") — their later events cannot be captured")
+  if not markerDelivered:
+    result.add fenceLossRecord(
+      "the marker event was not delivered within the bounded wait — " &
+      "events before it may be lost")
+  tree.held.clear()
+  tree.fenced = true
 
 # ---------------------------------------------------------------------------
 # Event-loss detection (pure; testable without ES).
@@ -281,11 +454,12 @@ proc esForkRecord*(pid, ppid, childPid: uint64): MonitorRecord =
 # client lives ONLY inside the `when defined(ioMonEndpointSecurity)` branch.
 # ---------------------------------------------------------------------------
 
-proc newEsBackend*(rootPid: uint64; sink: EsRecordSink): EsBackend =
-  ## Construct an (un-started) ES backend rooted at `rootPid`, delivering mapped
-  ## records to `sink`. Pure — no ES client is created until `start`.
+proc newEsBackend*(helperToken: EsAuditToken; sink: EsRecordSink): EsBackend =
+  ## Construct an (un-started) ES backend whose subtree view is seeded with the
+  ## monitor-owned spawn helper's audit token (§4), delivering mapped records to
+  ## `sink`. Pure — no ES client is created until `start`.
   EsBackend(
-    tree: initEsProcessTree(rootPid),
+    tree: initEsProcessTree(helperToken),
     seqTracker: EsSeqTracker(),
     sink: sink,
     started: false)
@@ -310,13 +484,20 @@ when defined(ioMonEndpointSecurity):
   # it is the production-backend work that is GATED on the entitlement and out of
   # scope for this design phase. The block exists so the build can be exercised
   # with `-d:ioMonEndpointSecurity` against a real SDK and so the integration
-  # seam is unambiguous. The handler would, per received `es_message_t`:
-  #   1. fold FORK/EXEC into `backend.tree` (process-subtree filter);
-  #   2. drop the message unless `inSubtree(backend.tree, msg.process->audit_token pid)`;
-  #   3. call `observeSeq(backend.seqTracker, msg->global_seq_num)` and, on a
-  #      non-zero return, `backend.sink(eventLossRecord(dropped))`;
-  #   4. dispatch on `msg->event_type` to the matching `es*Record` builder and
-  #      `backend.sink(...)` the result.
+  # seam is unambiguous. The handler would, per received `es_message_t`, on
+  # the view and tracker of the CLIENT that delivered it:
+  #   1. call `observeSeq(tracker, msg->global_seq_num)` and, on a non-zero
+  #      return, `backend.sink(eventLossRecord(dropped))`;
+  #   2. fold FORK/EXEC/EXIT into that client's view (`onFork`, `onExec`,
+  #      `onExit`), keyed on `msg->process->audit_token` and
+  #      `event.fork.child` / `event.exec.target` tokens — never the bare pid —
+  #      mapping and sinking any held records they release;
+  #   3. for a file event, build the record with the `es*Record` builder that
+  #      matches `msg->event_type`, then `filterEvent(view,
+  #      msg->process->audit_token, record)` and sink it only on `efAdmit`.
+  # Before the capture is finalized: wait (bounded) for `allMembersExited` on
+  # every view, run the marker, wait per client for its marker event, then
+  # `closeAtFence` each view and sink the loss records it returns (§5.1).
   proc startEsClient(backend: var EsBackend): EsStartResult =
     ## PLACEHOLDER for the real `es_new_client`/`es_subscribe` start path. Kept as
     ## an explicit stub so an accidental enable of the define does not masquerade

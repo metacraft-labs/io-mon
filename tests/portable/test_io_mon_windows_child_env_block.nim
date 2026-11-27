@@ -37,6 +37,8 @@
 ## cannot tell "the repair works" from "there was nothing to repair", so the
 ## unrepaired pair is asserted to raise.
 
+import foreign_preload_isolation
+
 import std/unittest
 import stackable_hooks/windows_env_block
 

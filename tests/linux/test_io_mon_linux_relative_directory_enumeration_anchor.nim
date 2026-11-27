@@ -50,6 +50,8 @@
 ## records for real relative-path directory enumerations; a synthetic record
 ## set would assert only what its author believed the shim does.
 
+import foreign_preload_isolation
+
 import std/[os, strutils, unittest]
 import io_mon
 

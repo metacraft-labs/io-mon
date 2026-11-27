@@ -24,6 +24,8 @@
 ## nim-shm-gset producer API, standing in for a shim whose loss element did
 ## not fit.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon

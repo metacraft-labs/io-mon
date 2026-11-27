@@ -4,6 +4,8 @@
 ## The live behaviour is pinned by case 10 of
 ## tests/macos/test_io_mon_macos_tree_lifetime_guard.nim; this file pins the
 ## pure parts on every OS.
+import foreign_preload_isolation
+
 import std/[os, tempfiles, unittest]
 import io_mon/tree_ledger
 

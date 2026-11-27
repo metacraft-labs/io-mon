@@ -60,7 +60,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@9456226e58b7db8538c96936136fe73a1a12974d
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@648b34cb917967a71048b7486f5f1ed0a2726dd6
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
@@ -83,7 +83,7 @@ jobs:
       - name: Mirror logs to S3 (non-blocking)
         if: always()
         continue-on-error: true
-        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@9456226e58b7db8538c96936136fe73a1a12974d
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@648b34cb917967a71048b7486f5f1ed0a2726dd6
         with:
           path: lint.log
           prefix: lint-logs/${{ github.run_id }}
@@ -122,7 +122,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@9456226e58b7db8538c96936136fe73a1a12974d
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@648b34cb917967a71048b7486f5f1ed0a2726dd6
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
@@ -142,7 +142,7 @@ jobs:
       - name: Mirror logs to S3 (non-blocking)
         if: always()
         continue-on-error: true
-        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@9456226e58b7db8538c96936136fe73a1a12974d
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@648b34cb917967a71048b7486f5f1ed0a2726dd6
         with:
           path: build.log
           prefix: build-logs-${{ matrix.slug }}/${{ github.run_id }}
@@ -184,17 +184,17 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@9456226e58b7db8538c96936136fe73a1a12974d
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@648b34cb917967a71048b7486f5f1ed0a2726dd6
         with:
           env-flavor: ${{ matrix.env }}
           repro-from-source: ${{ matrix.env == 'reprobuild' }}
           # The same engine, and its own flake-lock RunQuota and io-mon
-          # bootstrap inputs, as ci-reprobuild.yml: reprobuild v0.2.23. An
+          # bootstrap inputs, as ci-reprobuild.yml: reprobuild v0.2.36 (37a109c4). An
           # older engine rejects the committed v3 `repro.lock`
           # (tests/test_ci_engine_reads_committed_lock.py checks both files).
-          repro-build-pin: 9dbf4e710d7cc0b9a79a4bcd54c931afb6849dd0
-          repro-runquota-pin: 9818dc0c90be8ba7993424a7bbfbb6e009ffa965
-          repro-io-mon-pin: 7a9b2f331024f4bc0b952bcab89b1dc48525d804
+          repro-build-pin: 37a109c4e1cf650e6eb79b11d9fadf6e49e64614
+          repro-runquota-pin: 83d89e581d01c96eadb157bee48cecab6aba1866
+          repro-io-mon-pin: 1365943692eedfb0699ce90e59c4602d90317561
           gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: Point sibling source overrides at the locked checkouts
@@ -210,12 +210,33 @@ jobs:
         shell: bash
         run: |
           parent="$(cd .. && pwd)"
-          for pair in nim-stackable-hooks:STACKABLE_HOOKS_SRC nim-shm-queue:SHM_QUEUE_SRC nim-shm-gset:SHM_GSET_SRC; do
+          for pair in nim-stackable-hooks:STACKABLE_HOOKS_SRC nim-shm-queue:SHM_QUEUE_SRC nim-shm-gset:SHM_GSET_SRC nim-cli-spec:CLI_SPEC_SRC; do
             dir="$parent/${pair%%:*}/src"
             test -d "$dir"
             echo "${pair##*:}=$dir" >> "$GITHUB_ENV"
             echo "${pair##*:}=$dir ($(git -C "$dir" rev-parse HEAD))"
           done
+
+      - name: Allow unprivileged user namespaces on the hosted Linux runner
+        # Ubuntu 24.04, the image GitHub-hosted runners use, ships
+        # kernel.apparmor_restrict_unprivileged_userns=1. Under it
+        # `unshare --user --map-root-user` cannot write /proc/self/uid_map, so
+        # the pid-namespace cases of tests/linux/test_io_mon_linux_tree_ledger.nim
+        # (7, 13, 14, 16) skipped on every Linux run and the guarantee they cover
+        # was checked on no lane (reprobuild-pm issue
+        # 2026-11-26-io-mon-pid-namespace-tree-ledger-tests-skip-on-the-hosted-ubuntu-runner-ci-yml-selects).
+        # Hosted runners grant passwordless sudo; self-hosted classes are
+        # configured by their image instead, so the step is limited to hosted
+        # Linux, and to kernels that have the setting at all.
+        if: runner.os == 'Linux' && runner.environment == 'github-hosted'
+        shell: bash
+        run: |
+          knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -e "$knob" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          else
+            echo "$knob is absent; unprivileged user namespaces are not restricted by AppArmor here"
+          fi
 
       - name: Run tests
         # See the note on `Run lint`: without pipefail, `| tee` masks failure.
@@ -255,7 +276,7 @@ jobs:
       - name: Mirror logs to S3 (non-blocking)
         if: always()
         continue-on-error: true
-        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@9456226e58b7db8538c96936136fe73a1a12974d
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@648b34cb917967a71048b7486f5f1ed0a2726dd6
         with:
           path: test.log
           prefix: test-logs-${{ matrix.env }}-${{ matrix.slug }}/${{ github.run_id }}
@@ -289,7 +310,7 @@ jobs:
         with:
           repository: metacraft-labs/nim-stackable-hooks
           # Keep in lockstep with stackable-hooks-src in flake.nix.
-          ref: 059c549306621e2f769adf75630b0b7f29018dca
+          ref: ec6b02d45180735d08611c5cece842d57f941966
           path: nim-stackable-hooks
           token: ${{ steps.app-token.outputs.token }}
       - uses: actions/checkout@v4
@@ -301,10 +322,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: metacraft-labs/nim-shm-gset
-          # Same revision as .github/sibling-repos and shm-gset-src in flake.nix:
-          # src/io_mon/writer.nim calls `emitNoGrow`, which arrived in 7bc81ad2.
-          ref: 7bc81ad2440860a8a9254eb2757c585df9652438
+          # Same revision as .github/sibling-repos and shm-gset-src in flake.nix
+          # (src/io_mon/writer.nim calls `emitNoGrow`, which arrived in 7bc81ad2).
+          ref: 803a4faa23f985ad9697437603436f2f784072be
           path: nim-shm-gset
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: metacraft-labs/nim-cli-spec
+          # Same revision as .github/sibling-repos and cli-spec-src in flake.nix:
+          # the `io-mon` binary's command line is a clispec description.
+          ref: 6e0b4e78d96c4118103f2be571e1edd6ff0c938d
+          path: nim-cli-spec
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Build payload and run every portable and Windows test

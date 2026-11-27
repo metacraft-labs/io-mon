@@ -1,6 +1,8 @@
 ## Actual Linux public monitor host inside an actual outer monitored process.
 ## Real nested data is published through pending/checked-close/rename handoff;
 ## dropping the handle must keep the parent loss marker, not forge completion.
+import foreign_preload_isolation
+
 import std/[os, sequtils, sets, strutils, unittest]
 import io_mon
 import ../helpers/capture_control_fixtures

@@ -38,6 +38,8 @@
 ## NO MOCKS. A real shim built from source, a real C fixture performing real
 ## syscalls with known results, real `.iomon-frag` bytes, and the real merge.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, unittest]
 
 import io_mon

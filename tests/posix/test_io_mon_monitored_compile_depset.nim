@@ -29,6 +29,8 @@
 ## `mcComplete`. Keeping the two domains in separate tests keeps each one's
 ## ground truth independent of io-mon.
 
+import foreign_preload_isolation
+
 import descendant_guard_expectations
 import unmonitored_env
 import std/[os, osproc, sequtils, sets, streams, strtabs, strutils, unittest]

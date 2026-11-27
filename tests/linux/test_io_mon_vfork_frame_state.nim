@@ -8,6 +8,8 @@
 ## This directly covers the state that a repeated-vfork workload may overwrite
 ## without crashing. Capture completeness is covered by the propagation suite.
 ## No mocks. All processes, compiler invocations and the loaded library are real.
+import foreign_preload_isolation
+
 import std/[os, osproc, strtabs, strutils, tempfiles, unittest]
 
 const repoRoot = currentSourcePath().parentDir().parentDir().parentDir()

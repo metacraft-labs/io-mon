@@ -67,6 +67,8 @@
 ## the exact `pthread_attr_setstacksize` + `pthread_create` sequence a host
 ## runtime does and make the calls a host thread makes.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, strutils, tables,
             unittest]
 

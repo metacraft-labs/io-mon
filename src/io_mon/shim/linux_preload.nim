@@ -1,6 +1,19 @@
 when not defined(linux):
   {.error: "repro_monitor_shim/linux_preload is Linux-only".}
 
+# 32-bit x86 is not a target of the Linux shim (the targets are x86-64,
+# AArch64 and 32-bit ARM; docs/contributors/architecture.md, "Supported CPUs").
+# Nothing builds, tests or ships an i386 shim, and nothing needs one: a 32-bit
+# x86 program started by a monitored x86-64 process is an image the 64-bit
+# shim cannot enter, which the monitor reports as event-loss
+# ("uninjectable image"), so its step is re-run rather than cached. Refuse it
+# here by name, as the first error, instead of on whichever undeclared
+# per-architecture symbol (the syscall table below) the compiler meets first.
+when defined(linux) and defined(i386):
+  {.error: "io-mon's Linux shim does not support 32-bit x86 (i386); its " &
+    "Linux targets are x86-64, AArch64 and 32-bit ARM. See " &
+    "docs/contributors/architecture.md, \"Supported CPUs\".".}
+
 # The shim is loaded into processes whose threads it does not own, and Nim's
 # default allocator owns one heap per thread: a cell freed on a thread other
 # than its allocator's is handed back through a pointer into the OWNING
@@ -27,10 +40,12 @@ from io_mon/paths import anchoredRelativePath, extendedPath,
   startsWithParentRef
 
 import io_mon/types
+import io_mon/linker_flag_probe
 import io_mon/tree_ledger
 import io_mon/posix_connect
 import io_mon/writer
 import io_mon/hooks/linux_preload_runtime
+import io_mon/inline_site_table
 import io_mon/shim/linux_pod_tables
 import stackable_hooks/platform/linux_raw_syscalls
 
@@ -2024,9 +2039,13 @@ proc stampRunId(record: var MonitorRecord) {.raises: [].} =
     record.detail.add " "
   record.detail.add "run=" & runId
 
-proc emitRecord(record: MonitorRecord) {.raises: [].} =
+proc publishRecord(record: MonitorRecord): bool {.raises: [].} =
+  ## `emitRecord`, answering whether the record was handed to the transport
+  ## (true), or a gate below dropped it (false). A transport failure past the
+  ## hand-off is reported as loss by the transport itself, so it counts as
+  ## handed off. The resolution dedup remembers only a handed-off record.
   if not initialized or fragmentDir.len == 0 or shouldBypass():
-    return
+    return false
   # Event-interest gate (docs/contributors/event-interest-filter.md §4.1). Skip
   # the whole record — construction already happened at the call site, but the
   # expensive publish (gset insert + dedup, or fragment write) is avoided — for a
@@ -2034,7 +2053,7 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
   # META/loss kinds, so a suppressed interest can never drop an `mrEventLoss`
   # (LF-1: that would risk a false `mcComplete`).
   if not recordWanted(gInterest, record.kind):
-    return
+    return false
   # DA-1i — evidence-scope gate, RIGHT HERE and not at the host, because the
   # whole point of `--evidence=reads-only` is to MEASURE what the records cost:
   # a mode that publishes the record and filters it later saves nothing and
@@ -2054,7 +2073,7 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
   # exhaustively over `MonitorRecordKind` in
   # `tests/portable/test_io_mon_evidence_scope.nim`, not left to this comment.
   if not recordInEvidenceScope(gEvidenceScope, record):
-    return
+    return false
   # M9.R.62.2 — refresh the diagnostic context on every emit so an
   # unmatched pending marker carries the LAST-observed record kind
   # instead of the stale "phase=init" from the constructor. A process
@@ -2104,6 +2123,10 @@ proc emitRecord(record: MonitorRecord) {.raises: [].} =
     # batch (flushed by the process-exit destructor / registry sweep).
     if mainThreadId != 0 and record.threadId != mainThreadId:
       flushFragmentBatch()
+  true
+
+proc emitRecord(record: MonitorRecord) {.raises: [].} =
+  discard publishRecord(record)
 
 proc markTreeLedgerEntry(pid: cint; startTicks: uint64) {.raises: [].} =
   ## Write the tree-ledger entry for (pid, startTicks) (`io_mon/tree_ledger`):
@@ -2397,10 +2420,23 @@ var lateUnscannedImagesReported = 0
   ## an image reported at startup is not reported a second time on the first
   ## `dlopen`.
 
+var inlineSiteTableServedReported = false
+
+proc reportInlineSiteTableServed(status: InlineSyscallPatchStatus) {.raises: [].} =
+  ## Once per process, when a mapping was patched from a site table: name the
+  ## table. The record is an event loss unless the host recognises the table
+  ## as the one it issued (`mergeFragments`' `acceptedSiteTable`), so a table
+  ## any other party supplied leaves the capture incomplete.
+  if status.tableServedMappings <= 0 or inlineSiteTableServedReported:
+    return
+  inlineSiteTableServedReported = true
+  emitEventLoss(SiteTableServedDetail & " table=" & inlineSiteTableIdentity())
+
 proc recordInlineSyscallCoverage(status: InlineSyscallPatchStatus) {.raises: [].} =
   if inlineSyscallCoverageRecorded:
     return
   inlineSyscallCoverageRecorded = true
+  reportInlineSiteTableServed(status)
   emitThumbUnscannedLoss(status, "startup")
   emitUnscannedImagesLoss(status, "startup")
   lateUnscannedImagesReported = status.imagesUnscanned
@@ -2418,6 +2454,7 @@ var lateThumbUnscannedReported = 0
 
 proc recordLateInlineSyscallScanCoverage(status: InlineSyscallPatchStatus;
                                          source: string) {.raises: [].} =
+  reportInlineSiteTableServed(status)
   # A late scan carries the cumulative count; report only what is new.
   if status.thumbUnscanned > lateThumbUnscannedReported:
     lateThumbUnscannedReported = status.thumbUnscanned
@@ -3052,6 +3089,12 @@ proc repro_monitor_shim_init*(configPath: cstring): cint
       # bytes only — `decodeDepRecord` ignores everything past the framed record.
       setDepSetIncarnationImage(img & '\x1f' & $int(currentExecGen))
     rememberInheritedOpenFds()
+    # The host's inline site table, mapped before the startup scan below uses
+    # it. Read here, muted, so neither the variable nor the table's descriptor
+    # becomes evidence (the table is opened with raw system calls as well).
+    let siteTablePath = getEnv(SiteTableEnv)
+    if siteTablePath.len > 0:
+      useInlineSiteTable(siteTablePath)
   initialized = true
   mainThreadId = currentThreadId()
   # M9.R.64.1 — publish the deep shim-state bitmap early so a
@@ -3171,6 +3214,13 @@ proc recordOpen(path: cstring; flags, mode, fd: cint;
   ## `trackFd` false: the open is classified after the fact (a trapped inline
   ## syscall), when `fd` may already name another file; record it without
   ## entering it into the live descriptor table.
+  ##
+  ## A FAILED open (`fd < 0`) of a bare relative `-l<name>` token is the
+  ## linker probing for a library, not a build input: it is dropped here, at
+  ## capture time, so no record of it reaches the read or write evidence. Every
+  ## other failed open, and every successful open, is recorded as before.
+  if fd < 0 and path != nil and isLinkerFlagProbe($path):
+    return
   let resolved = pathForAt(dirfd, path)
   if resolved.len > 0 and trackFd:
     updateFdPath(fd, cstring(resolved))
@@ -4359,10 +4409,14 @@ proc repro_hook_fclose*(ctx: var FcloseContext) {.raises: [].} =
     removeFdPath(fd)
   c_set_errno(savedErrno)
 
-proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32) {.raises: [].} =
+proc recordIpcConnect(fd: cint; address: pointer;
+                      addrLen: uint32): bool {.raises: [].} =
+  ## Records the connect and returns whether it did: false when the address
+  ## names no family (AF_UNSPEC, which dissolves a datagram socket's peer, or
+  ## an unreadable or short address), where no peer was judged.
   let family = c_sockaddr_family(address, addrLen)
   if family == 0:
-    return
+    return false
   var peerPid: uint64 = 0
   var peerUid: clong = -1
   var endpoint = ""
@@ -4409,6 +4463,7 @@ proc recordIpcConnect(fd: cint; address: pointer; addrLen: uint32) {.raises: [].
     (if peerPid == 0: " peer=unknown" else: " peer=" & $peerPid) &
     (if peerUid >= 0: " peeruid=" & $peerUid else: "")
   emitRecord(record)
+  true
 
 proc recordConnectAttempt(address: pointer; addrLen: uint32;
                           callResult: cint; err: cint) {.raises: [].} =
@@ -4441,7 +4496,19 @@ proc repro_hook_connect*(ctx: var ConnectContext) {.raises: [].} =
   # failure (EFAULT, EINVAL, EBADF, ...) may mean the address was never
   # readable, so it is not touched (`io_mon/posix_connect`).
   if ctx.result == 0 or c_errno_is_connect_in_progress(savedErrno) != 0:
-    recordIpcConnect(ctx.fd, ctx.address, ctx.addrLen)
+    let judged = recordIpcConnect(ctx.fd, ctx.address, ctx.addrLen)
+    # The socket this process made and connected is now a local channel whose
+    # remote peer the record above has just judged (an out-of-tree peer is a
+    # loss of its own), so a later read of it through an inherited descriptor
+    # number (bash `read <&4` after `exec 4<>/dev/tcp/…`) pairs with this
+    # create instead of being graded an out-of-tree content channel. The create
+    # is recorded HERE and not at `socket(2)`: a socket that was only bound
+    # (UDP, a datagram AF_UNIX socket) has no judged peer, and a create at
+    # `socket` would pair its reads and hide an out-of-tree sender. A connect
+    # that named no family (`connect(AF_UNSPEC)` un-associates a UDP socket)
+    # judged no peer, so it records no create either.
+    if judged:
+      recordLocalFdCreate(ctx.fd)
   elif connectFailureReadAddress(savedErrno):
     recordConnectAttempt(ctx.address, ctx.addrLen, ctx.result, savedErrno)
   c_set_errno(savedErrno)
@@ -5404,10 +5471,21 @@ proc repro_hook_execve*(ctx: var ExecveContext) {.raises: [].} =
   emitRecord(failRecord)
   c_set_errno(execFailedErrno)
 
-proc recordPosixSpawn(ctx: var PosixSpawnContext; usePath: bool)
-    {.raises: [].} =
+proc spawnEntryName(usePath, pidfd: bool): string =
+  ## The name a spawn record and a loss detail give the entry point.
+  if pidfd:
+    (if usePath: "pidfd_spawnp" else: "pidfd_spawn")
+  else:
+    (if usePath: "posix_spawnp" else: "posix_spawn")
+
+proc recordPosixSpawn(ctx: var PosixSpawnContext; usePath: bool;
+                      pidfd = false) {.raises: [].} =
   ## The body of the posix_spawn and posix_spawnp hooks (`usePath`: the
-  ## latter, which searches the caller's PATH).
+  ## latter, which searches the caller's PATH) and of pidfd_spawn and
+  ## pidfd_spawnp (`pidfd`), which take the same arguments but return a pidfd
+  ## through `ctx.pid` instead of a pid. The child's pid is then read from
+  ## the descriptor, and a descriptor lent to a caller that asked for none is
+  ## closed again.
   ensureInitializedPreservingErrno()
   let routeStatus = childCaptureRouteStatus(ctx.envp)
   if routeStatus != 0:
@@ -5429,7 +5507,13 @@ proc recordPosixSpawn(ctx: var PosixSpawnContext; usePath: bool)
     ctx.pid = addr lentPid
   callNext(ctx)
   let savedErrno = c_get_errno()
-  let childPid = int(ctx.pid[])
+  let pidfdResult = if pidfd and ctx.result == 0: ctx.pid[] else: -1
+  let childPid = if pidfd:
+    (if pidfdResult >= 0: pidfdChildPid(pidfdResult) else: 0)
+  else:
+    int(ctx.pid[])
+  if pidfd and callerPid == nil and pidfdResult >= 0:
+    discard realClose(pidfdResult)
   ctx.pid = callerPid
   freeOwnedEnv(preparedEnv, originalEnv)
   ctx.envp = originalEnv
@@ -5444,24 +5528,27 @@ proc recordPosixSpawn(ctx: var PosixSpawnContext; usePath: bool)
     uninjectable = spawnImageUninjectable(ctx.path, usePath, childPid)
   if ctx.result == 0 and childPid > 0:
     markChildInTreeLedger(childPid)
-  if ctx.result == 0 and ctx.pid != nil:
+  if ctx.result == 0 and pidfd and childPid <= 0:
+    # Without the pid there is no ledger entry or spawn record for the child.
+    emitEventLoss("pidfd spawn child pid unreadable: " &
+      spawnEntryName(usePath, pidfd))
+  if ctx.result == 0 and (ctx.pid != nil or pidfd) and childPid > 0:
     var record = baseRecord(mrProcessSpawn, moExecute)
-    record.childOsPid = uint64(ctx.pid[])
+    record.childOsPid = uint64(childPid)
     record.result = ctx.result.int64
     if ctx.path != nil:
       record.path = $ctx.path
-    record.detail = if usePath: "posix_spawnp" else: "posix_spawn"
+    record.detail = spawnEntryName(usePath, pidfd)
     emitRecord(record)
   # Not inside the branch above: a caller may pass a NULL pid pointer, and
   # the child it started is just as unobserved.
   if ctx.result == 0 and uninjectable.len > 0:
-    emitEventLoss("uninjectable image: " &
-      (if usePath: "posix_spawnp" else: "posix_spawn") & ": " & uninjectable &
-      (if ctx.pid != nil: " child=" & $ctx.pid[] else: ""))
+    emitEventLoss("uninjectable image: " & spawnEntryName(usePath, pidfd) &
+      ": " & uninjectable & (if childPid > 0: " child=" & $childPid else: ""))
   c_set_errno(savedErrno)
 
-proc spawnWithoutRecording(ctx: var PosixSpawnContext; usePath: bool)
-    {.raises: [].} =
+proc spawnWithoutRecording(ctx: var PosixSpawnContext; usePath: bool;
+                           pidfd = false) {.raises: [].} =
   ## The posix_spawn hooks when this context cannot record (see
   ## `repro_hook_execve`): a spawn into an image the shim cannot enter is
   ## still reported, through the unnamed frame, once the spawn succeeded.
@@ -5473,7 +5560,13 @@ proc spawnWithoutRecording(ctx: var PosixSpawnContext; usePath: bool)
     ctx.pid = addr lentPid
   callNext(ctx)
   let savedErrno = c_get_errno()
-  let childPid = int(ctx.pid[])
+  let pidfdResult = if pidfd and ctx.result == 0: ctx.pid[] else: -1
+  let childPid = if pidfd:
+    (if pidfdResult >= 0: pidfdChildPid(pidfdResult) else: 0)
+  else:
+    int(ctx.pid[])
+  if pidfd and callerPid == nil and pidfdResult >= 0:
+    discard realClose(pidfdResult)
   ctx.pid = callerPid
   reportSpawnEntryUnrecorded(ctx.path, usePath, preFlagged,
     succeeded = ctx.result == 0, hasFileActions = ctx.fileActions != nil,
@@ -5491,6 +5584,62 @@ proc repro_hook_posix_spawnp*(ctx: var PosixSpawnContext) {.raises: [].} =
     spawnWithoutRecording(ctx, usePath = true)
     return
   recordPosixSpawn(ctx, usePath = true)
+
+proc repro_hook_pidfd_spawn*(ctx: var PosixSpawnContext) {.raises: [].} =
+  if shouldBypass():
+    spawnWithoutRecording(ctx, usePath = false, pidfd = true)
+    return
+  recordPosixSpawn(ctx, usePath = false, pidfd = true)
+
+proc repro_hook_pidfd_spawnp*(ctx: var PosixSpawnContext) {.raises: [].} =
+  if shouldBypass():
+    spawnWithoutRecording(ctx, usePath = true, pidfd = true)
+    return
+  recordPosixSpawn(ctx, usePath = true, pidfd = true)
+
+const
+  wordexpNoCmd = 1 shl 2
+    ## WRDE_NOCMD (<wordexp.h>): the expansion refuses a command
+    ## substitution and starts nothing.
+  wordexpShell = cstring("/bin/sh")
+    ## `_PATH_BSHELL`, the image glibc's exec_comm runs for a substitution.
+
+proc wordsHaveCommandSubstitution(words: cstring): bool {.raises: [].} =
+  ## Whether `words` can make wordexp start its shell: a backquote or `$(`
+  ## anywhere in it. Conservative on purpose (a quoted or escaped one is
+  ## counted, as is the `$((` of an arithmetic expansion): the answer only
+  ## decides whether the shell image is classified, and a classified shell
+  ## that the shim can enter records nothing.
+  if words == nil:
+    return false
+  let text = cast[ptr UncheckedArray[char]](words)
+  var i = 0
+  while text[i] != '\0':
+    if text[i] == '`' or (text[i] == '$' and text[i + 1] == '('):
+      return true
+    inc i
+  false
+
+proc repro_hook_wordexp*(ctx: var WordexpContext) {.raises: [].} =
+  ## wordexp(3) runs every command substitution as `/bin/sh -c` through an
+  ## internal spawn that reaches no exported spawn hook, so a shell the shim
+  ## cannot enter would run unobserved. Classify it at the entry, as the
+  ## spec's "Entering An Image The Shim Cannot Enter" requires of every
+  ## entry; a shell the shim can enter records itself.
+  if (ctx.flags and wordexpNoCmd) == 0 and
+      wordsHaveCommandSubstitution(ctx.words):
+    if shouldBypass():
+      let preFlagged = spawnEntryUnrecordedPre(wordexpShell, false)
+      reportSpawnEntryUnrecorded(wordexpShell, false, preFlagged,
+        succeeded = true, hasFileActions = false, childPid = 0)
+    else:
+      ensureInitializedPreservingErrno()
+      let uninjectable = spawnImageUninjectable(wordexpShell, false)
+      if uninjectable.len > 0:
+        let savedErrno = c_get_errno()
+        emitEventLoss("uninjectable image: wordexp: " & uninjectable)
+        c_set_errno(savedErrno)
+  callNext(ctx)
 
 proc repro_hook_exit*(ctx: var ExitContext) {.raises: [].} =
   sampleKillDiag("exit-enter")
@@ -5561,6 +5710,49 @@ proc pushResolutionComponents(pending: var seq[string]; spelled: string)
     if parts[i].len > 0 and parts[i] != ".":
       pending.add parts[i]
 
+proc emitResolutionProbe(path: string; exists: bool; detail = "")
+    {.raises: [].} =
+  ## Record one observation of the resolution replay below, once per process
+  ## (Monitor-Hook-Shim.md §"Resolution evidence", "Each observation once
+  ## per process"). Every replay records the directories and links on its
+  ## way, so a process resolving many paths under the same directories (a
+  ## compiler canonicalising each header) would otherwise build, encode and
+  ## publish the same record for every path. Within one process the record's
+  ## set element key varies only by what the key below holds: the walk's
+  ## answer for the name (present or absent), the name, and the link target
+  ## in the detail. The pid and sequence number are not part of it, the
+  ## incarnation is fixed until exec, which starts a fresh table, and the
+  ## run stamp is fixed for the process. So a repeat is the element the
+  ## transport already holds. The walk's `lstat` still runs every time: a
+  ## component replaced between two walks answers differently, has a
+  ## different key, and is recorded.
+  ##
+  ## The key must be unambiguous, not merely carry those fields: a file name
+  ## or a link target may hold any byte but NUL (and a name any byte but
+  ## `/`), so no separator byte can keep the name apart from the detail. A
+  ## directory named `a<US>symlink target=x` and a link `a` to `x<US>` would
+  ## share a separator-joined key, and the second, a different record, would
+  ## be dropped. The name is therefore length-prefixed; the detail runs to
+  ## the end, and the key is a C string, which neither field can contain a
+  ## NUL of.
+  let lengthText = $path.len
+  var key = newStringOfCap(path.len + detail.len + lengthText.len + 2)
+  key.add(if exists: '+' else: '-')
+  key.add lengthText
+  key.add ':'
+  key.add path
+  key.add detail
+  if podResolutionSeen(cstring(key)):
+    return
+  let callResult = (if exists: 0.cint else: -1.cint)
+  var record = baseRecord(mrPathProbe, moPathProbe)
+  record.result = callResult.int64
+  record.probeResult = probeFromResult(callResult)
+  record.path = path
+  record.detail = detail
+  if publishRecord(record):
+    podResolutionRemember(cstring(key))
+
 proc repro_linux_observe_resolution(dirfd: cint; path: cstring;
                                     followFinal: cint) {.cdecl, raises: [].} =
   ## realpath, canonicalize_file_name and the readlink family resolve their
@@ -5612,25 +5804,21 @@ proc repro_linux_observe_resolution(dirfd: cint; path: cstring;
         let n = linuxRealReadlink(cstring(candidate), addr target[0],
           csize_t(target.len - 1))
         if n > 0:
-          var record = baseRecord(mrPathProbe, moPathProbe)
-          record.result = 0
-          record.probeResult = probeFromResult(0)
-          record.path = candidate
-          record.detail = "symlink target=" & target[0 ..< int(n)]
-          emitRecord(record)
+          emitResolutionProbe(candidate, true,
+            "symlink target=" & target[0 ..< int(n)])
       resolved = candidate
       break
     let kind = linuxLstatKind(cstring(candidate))
     if kind < 0:
       # The walk stops where realpath fails: this name is part of the answer.
-      emitProbe(cstring(candidate), -1.cint)
+      emitResolutionProbe(candidate, false)
       return
     if kind == 0:
       # Not a link. The final component of a realpath walk is recorded once,
       # below or by the caller's own probe; a component on the way is
       # recorded here.
       if not isFinal:
-        emitProbe(cstring(candidate), 0.cint)
+        emitResolutionProbe(candidate, true)
       resolved = candidate
       continue
     inc hops
@@ -5642,12 +5830,7 @@ proc repro_linux_observe_resolution(dirfd: cint; path: cstring;
       return
     let link = target[0 ..< int(n)]
     sawLink = true
-    var record = baseRecord(mrPathProbe, moPathProbe)
-    record.result = 0
-    record.probeResult = probeFromResult(0)
-    record.path = candidate
-    record.detail = "symlink target=" & link
-    emitRecord(record)
+    emitResolutionProbe(candidate, true, "symlink target=" & link)
     if link.startsWith("/"):
       resolved = ""
     pushResolutionComponents(pending, link)
@@ -5657,7 +5840,7 @@ proc repro_linux_observe_resolution(dirfd: cint; path: cstring;
     # component is never examined above and may well be absent.
     let final = if resolved.len == 0: "/" else: resolved
     let finalKind = linuxLstatKind(cstring(final))
-    emitProbe(cstring(final), (if finalKind >= 0: 0.cint else: -1.cint))
+    emitResolutionProbe(final, finalKind >= 0)
 
 proc ct_linux_preload_register_resolution_observer(observer: pointer)
   {.importc, cdecl, raises: [].}
@@ -5913,6 +6096,9 @@ registerForkHook(repro_hook_fork)
 registerExecveHook(repro_hook_execve)
 registerPosixSpawnHook(repro_hook_posix_spawn)
 registerPosixSpawnpHook(repro_hook_posix_spawnp)
+registerPidfdSpawnHook(repro_hook_pidfd_spawn)
+registerPidfdSpawnpHook(repro_hook_pidfd_spawnp)
+registerWordexpHook(repro_hook_wordexp)
 registerExitHook(repro_hook_exit)
 registerRawSyscallHook(repro_hook_raw_syscall)
 registerInlineRawSyscallDrain(repro_linux_drain_inline_events)

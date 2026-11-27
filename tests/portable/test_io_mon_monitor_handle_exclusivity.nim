@@ -41,6 +41,8 @@
 ##       DH-2 exists to enable (`seq[MonitorHandle]`, `pollMonitor` on an
 ##       element, `finishMonitor(move(…))` out of it).
 
+import foreign_preload_isolation
+
 import std/[os, osproc, strutils, unittest]
 
 const

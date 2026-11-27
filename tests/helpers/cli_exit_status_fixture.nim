@@ -38,6 +38,26 @@ suite "standalone CLI preserves native exit status bits":
       [0'u32, 7'u32, 0x80000000'u32, 0xc0000005'u32, 0xffffffff'u32]
     else:
       [0'u32, 7'u32, 127'u32, 128'u32, 200'u32, 255'u32]
+    # The bare form (`[flags] -- <command>`, no `run`), which callers that
+    # predate `run` still write, must run the same monitor: same status, same
+    # evidence. Dropping the description's `call:` refuses it as a usage
+    # error (exit 2) and fails this case.
+    block bareForm:
+      let args = @["--cli-exit-child", "7", marker]
+      let depfile = work / "bare.iomon"
+      let monitored = startProcess(cli, args =
+        @["--depfile", depfile, "--", getAppFilename()] & args,
+        options={poParentStreams})
+      let monitoredCode = monitored.waitForExit()
+      monitored.close()
+      check monitoredCode == 7
+      require fileExists(depfile)
+      var sawRead = false
+      for record in readMonitorDepFile(depfile).records:
+        if record.kind == mrFileRead and
+            record.path.toLowerAscii.endsWith("cli-exit-marker.txt"):
+          sawRead = true
+      check sawRead
     for code in codes:
       checkpoint("native status=" & $code)
       let args = @["--cli-exit-child", $code, marker]

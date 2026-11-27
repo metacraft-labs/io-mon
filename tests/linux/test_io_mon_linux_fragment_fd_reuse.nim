@@ -1,3 +1,5 @@
+import foreign_preload_isolation
+
 import std/[os, osproc, streams, strtabs, unittest]
 
 import io_mon

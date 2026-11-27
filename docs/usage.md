@@ -13,8 +13,25 @@ for the standalone build, see _Building and testing_ in the README.
 
 The CLI (`cmd/io_mon_snoop.nim`, built to `build/bin/io-mon` by
 `nimble buildSnoop`) is a thin entry point over the `runFsSnoopCli` driver in
-`src/io_mon/fs_snoop.nim`. It has two verbs: **`run`** (capture) and
+`src/io_mon/cli.nim`. It has two verbs: **`run`** (capture) and
 **`inspect`** (render an existing depfile).
+
+The command line is declared once, in the
+[clispec](https://github.com/metacraft-labs/nim-cli-spec) `cli:` language
+(`src/io_mon/cli_description.nim`), and parsed by the parser clispec generates
+from that declaration. `io-mon --help`, `io-mon run --help` and
+`io-mon inspect --help` print the help generated from it, so they always list
+exactly the flags the parser accepts. A command line the parser rejects (an
+unknown flag, a flag without its value, a value outside a flag's set, a
+missing command after `--`) is a usage error: clispec's `error:` block on
+stderr and **exit 2**. A command line that parses but cannot run (no shim, an
+unreadable depfile, an `--interest` or `--evidence` value that names nothing)
+is reported as `io-mon: error: <message>` with exit 1.
+
+A program that offers io-mon's command line under a command of its own splices
+the same declaration (`ioMonCommandLineDescription()`, a compile-time proc that
+imports only `std/macros`) into its own clispec description and hands the words
+after its command to `io_mon/cli.runFsSnoopCli`, so both accept the same words.
 
 ### `io-mon run` — capture a command's dependencies
 
@@ -32,18 +49,21 @@ exit so an out-of-process caller can fail-safe).
 
 The `run` verb is optional for backward compatibility: a bare
 `io-mon --depfile <out> -- <command>` works identically (the legacy
-reprobuild `repro internal io monitor` form).
+reprobuild `repro internal io monitor` form). The bare form takes the same
+flags; they are declared `internal`, so help lists only `run` and `inspect`.
 
-Options (each accepts both `--flag value` and `--flag=value`):
+Options (each accepts both `--flag value` and `--flag=value`; given twice, the
+last one wins):
 
 | Option                      | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--depfile PATH`            | Where to write the captured iomon depfile. If omitted, a temp file is used and discarded after rendering.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `--events MODE`             | Stream the captured records in MODE. One of `none` (default), `text`, `jsonl`, `binary` / `binary-stream`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `--events MODE`             | Stream the captured records in MODE. One of `none` (default), `text`, `jsonl`, `binary` / `binary-stream`; any other value is a usage error.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `--format MODE`             | Alias for `--events` (same `FsSnoopOutputMode` values).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `--event-stream PATH`       | Write the streamed events to PATH instead of stderr. **Required** when MODE is `binary`/`binary-stream` (so the binary stream stays separate from child output).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `--interest TOKENS`         | The event categories to capture, as a comma-separated subset of `file-reads,path-probes,file-writes,proc,lib,env,entropy,ambient` (the `REPRO_MONITOR_INTEREST` vocabulary — see [event-interest-filter.md](contributors/event-interest-filter.md)). **Omitting the flag, or passing an empty value in either spelling (`--interest ""` and `--interest=` alike), means all categories**, so every existing invocation keeps its current behaviour and a consumer that wants a reduced set must ask for one on each run; forgetting costs capture work, never a missed dependency. An unknown token alongside known ones is ignored (a newer consumer may name a category this build does not have); a value naming _no_ known token is refused rather than silently widened to "all". The pre-DA-5 spellings `file` / `proc` / `lib` / `nondet` / `ipc` are still accepted and expand to the categories their record kinds moved into; `ipc` expands to nothing, because `mrIpcConnect` is now captured unconditionally, and a value naming only such retired tokens is refused with its own diagnostic. The value io-mon then hands the monitored child is deliberately **not** the same string: `REPRO_MONITOR_INTEREST` carries the categories you asked for and then, after a `legacy-padding` marker, the pre-DA-5 spellings a shim built before the split needs in order not to record _less_ than you asked for. `legacy-padding` is a wire marker rather than a category and is refused on this flag. |
 | `--evidence SCOPE`          | How much of what the monitor observes is **written down**. One of `full` (default) or `reads-only`. See [Evidence scope](#evidence-scope--how-much-of-what-is-observed-is-recorded) below (and [evidence-scope.md](contributors/evidence-scope.md)) — **`reads-only` carries a named hazard**. An unknown value is refused rather than widened to `full`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `--inline-site-tables PATH` | Linux x86-64: a sealed table of inline `syscall` sites, produced by the calling process (which must not itself be monitored), that spares each monitored process the start-up scan of an image the table covers. See [Inline site tables](#inline-site-tables) below. Omitted, or naming a table this build cannot use: every image is scanned, as without the flag.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `--capture-stdio`           | Capture the child's merged stdout+stderr instead of inheriting the parent's stdio (mirrors how the reprobuild engine launches monitored actions).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `--capture-stdio-path PATH` | Like `--capture-stdio`, but dump the captured bytes to PATH (implies `--capture-stdio`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `--`                        | End of options; everything after is the command + args to run. **Required.**                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
@@ -169,11 +189,12 @@ io-mon inspect <depfile> [--format text|json]
 
 `inspect` decodes and prints a previously captured iomon depfile. The format
 defaults to `text`; `json` emits the full structured form. (`--events` is
-accepted as an alias for `--format` here.)
+accepted as an alias for `--format` here.) The flag and the path may come in
+either order.
 
 > **Note:** `inspect` supports only `text` and `json`. `jsonl` is a _streaming_
 > mode for `run --events jsonl`, not an `inspect` format — passing
-> `--format jsonl` to `inspect` errors. (`renderMonitorDepFile` in
+> `--format jsonl` to `inspect` is a usage error. (`renderMonitorDepFile` in
 > `src/io_mon/render.nim` only implements `text` and `json`.)
 
 Sample `text` output:
@@ -235,7 +256,11 @@ importable API.)
   `profile`, `capabilityGaps`, `summary`, and `records: seq[MonitorRecord]`.
 - `MonitorRecord` — one observation: `kind: MonitorRecordKind`,
   `observationKind`, `seq`, `osPid`, `parentOsPid`, `threadId`, `childOsPid`,
-  `result`, `flags`, `probeResult`, `path`, `detail`.
+  `result`, `flags`, `probeResult`, `path`, `detail`. The observer fields
+  (`osPid`, `parentOsPid`, `threadId`, `childOsPid`) are `0` on library loads,
+  environment, sysctl and clock reads everywhere, and on file opens, reads,
+  probes and directory enumerations that travelled Linux's set transport; see
+  "Observer Attribution" in `docs/site/content/reference/depfile-format.md`.
 - `MonitorRecordKind` — `mrProcessStart`, `mrProcessExec`, `mrProcessSpawn`,
   `mrFileOpen`, `mrFileRead`, `mrPathProbe`, `mrFileWrite`, `mrEventLoss`,
   `mrDirectoryEnumerate`, `mrBackendProfile`, `mrCapabilityGap`,
@@ -356,11 +381,29 @@ else:
 - `renderMonitorStreamItemText` / `renderMonitorStreamItemJsonl` — render a
   single stream item.
 
+### The command line (`io_mon/cli`, `io_mon/cli_description`)
+
+Not re-exported by `import io_mon`: the library API carries no command-line
+dependency. These two modules need the clispec library
+([nim-cli-spec](https://github.com/metacraft-labs/nim-cli-spec), a leaf that
+depends on nothing but the standard library); `cli_description` needs only
+`std/macros`.
+
+- `runFsSnoopCli(programName, args): int` (`io_mon/cli`) — the full CLI as a
+  library call (what `cmd/io_mon_snoop.nim` delegates to). Never raises;
+  returns the exit code: 0 for a help request, 2 for a usage error, 1 for any
+  other failure (`<programName>: error: <message>`), else the monitored
+  command's status.
+- `parseFsSnoopArgs(args): ParsedFsSnoopCommand` / `fsSnoopCommandOf(conf)`
+  (`io_mon/cli`) — the generated parser's result as the `FsSnoopRequest` (or
+  the `inspect` call) the driver runs; `IoMonCommandLine` is the generated
+  configuration object (`load`, `helpText`, `printHelp`, `printError`, ...).
+- `ioMonCommandLineDescription(): NimNode` (`io_mon/cli_description`,
+  compile time) — the `cli:` body of the command line, to splice under a
+  command of another program's clispec description.
+
 ### Driving a capture (`io_mon/fs_snoop`)
 
-- `runFsSnoopCli(programName, args): int` — the full CLI grammar as a library
-  call (what `cmd/io_mon_snoop.nim` delegates to). Never raises; returns the
-  exit code.
 - `findShimLibrary(): string` — resolve the shim shared library
   (`$REPRO_MONITOR_SHIM_LIB` first, then the canonical build layout); empty
   string if no discovery candidate is found. If `$REPRO_MONITOR_SHIM_LIB` is
@@ -540,7 +583,10 @@ chroot) reports the write as failed for that reason. A process created with
 CLONE_VM that is neither a thread nor a vfork child shares its creator's
 memory and thread state, which the shim cannot keep apart, so its creator
 publishes `linux CLONE_VM process (not a thread or vfork child): …` once per
-process, beside the child's ledger entry. The creator writes that entry, and
+process, beside the child's ledger entry, whichever way the process was
+created: glibc's `clone(3)`, `syscall(2)`, or the program's own inline
+`clone` / `clone3` instruction on x86_64 (pinned for that route by
+`tests/linux/test_io_mon_shim_inline_clone_child_stack.nim`). The creator writes that entry, and
 when the write fails it publishes
 `linux tree ledger write failed in the creator of a CLONE_VM process (…)`
 instead of the `errno=`/`pid=` form: the parenthesis says either that the
@@ -892,7 +938,45 @@ execs a monitored image in the same pid (`i686-bash -c 'gcc …'`, a static
 satisfied. So the spawn site classifies the root image before starting it and
 records an event-loss naming it (`uninjectable image: root spawn: <reason>
 image=<path>`); the shim does the same for every exec, `posix_spawn` and raw
-`execve` it sees. The built-in launchers do this; a custom Linux launcher must
+`execve` it sees, and for the `/bin/sh` that `system(3)` and `popen(3)` start
+(`uninjectable image: system: …` / `popen: …`), which libc spawns through an
+internal call no exported hook reaches. The built-in launchers do this; a custom Linux launcher must
 classify its root with `io_mon/exec_image_injectability.uninjectableImageDetail`
 (resolving the command with `resolveSpawnTarget` when it searches `PATH`) and
 record a non-empty answer as an event-loss for the run.
+
+## Inline site tables
+
+On Linux x86-64 the shim traps the raw `syscall` instructions of every image a
+monitored process runs, so that a file opened by a raw system call is recorded
+like one opened through the C library. It finds them at start-up by decoding
+the image's executable sections, which costs time in proportion to the code:
+about a tenth of a second for a large compiler such as GCC's `cc1`, paid again
+by every process that runs it.
+
+A caller that runs the same images many times (a build tool) can compute that
+result once per image and pass it with `--inline-site-tables`:
+
+- The caller, which must not be monitored, computes each image's table with
+  `computeSiteTable` (module `io_mon/inline_site_table`), encodes the set with
+  `encodeSiteTables` and seals it into a memfd with
+  `createSealedSiteTableFile`, so that no process can change it afterwards.
+  It passes `/proc/<its pid>/fd/<fd>`.
+- `io-mon run` opens the table itself, ignores it unless it is sealed and was
+  built by the same scanner, and names its own descriptor to the monitored
+  tree.
+- A shim uses the table for a mapping only when the file is the one the table
+  describes (device, inode, size, modification and change times), the code
+  ranges match, and no code page has been written in the process. Otherwise
+  it decodes the image, as it always did. A process patched from the table is
+  patched at exactly the sites the decode would have found.
+- A shim that used a table names it in the capture. `io-mon run` accepts only
+  the table it was given; a table any other party supplied (a monitored
+  process can hand its own children a different one) leaves the capture
+  incomplete.
+- A file changed less than two seconds before the table is computed gets no
+  table, because file timestamps come from a coarse clock.
+- On other architectures (Linux AArch64, 32-bit ARM) there is no inline scan
+  to spare. `io-mon run` ignores `--inline-site-tables` and names no table to
+  the tree, the shim ignores `REPRO_MONITOR_SITE_TABLES` if anything else sets
+  it, and the producer functions above are not compiled.

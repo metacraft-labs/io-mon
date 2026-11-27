@@ -30,6 +30,8 @@
 ## (Linux + macOS); the Windows arm is
 ## `tests/windows/test_io_mon_windows_process_start_image.nim`.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon

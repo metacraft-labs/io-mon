@@ -5,6 +5,8 @@
 ## helper, and checks environment lookup and real file I/O. The parent bounds
 ## startup, including constructors that run before main. No mocks. This covers
 ## loader forwarding; the propagation suite checks complete capture separately.
+import foreign_preload_isolation
+
 import std/[os, osproc, streams, strtabs, strutils, tempfiles, unittest]
 import build_test_shim
 

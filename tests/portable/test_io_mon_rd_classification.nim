@@ -30,6 +30,8 @@
 ## file MUST stay mcComplete, with all non-file observations preserved. Only
 ## actual monitoring loss downgrades to mcIncomplete.
 
+import foreign_preload_isolation
+
 import std/[os, sequtils, unittest]
 import io_mon
 

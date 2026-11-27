@@ -6,6 +6,7 @@ source "${RELEASE_TOOLS:?}/common.sh" "$@"
 export STACKABLE_HOOKS_SRC="${RELEASE_STACKABLE_HOOKS_SRC:?}"
 export SHM_QUEUE_SRC="${RELEASE_SHM_QUEUE_SRC:?}"
 export SHM_GSET_SRC="${RELEASE_SHM_GSET_SRC:?}"
+export CLI_SPEC_SRC="${RELEASE_CLI_SPEC_SRC:?}"
 export IO_MON_BUILD_MODE=release IO_MON_TARGET_CPU="$release_cpu"
 IO_MON_SHIM_NIMCACHE_DIR="$(pwd)/build/nimcache/release-$release_target"
 export IO_MON_SHIM_NIMCACHE_DIR

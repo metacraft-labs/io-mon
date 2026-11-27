@@ -58,6 +58,8 @@
 ##       consumer is alive (positive control: the emit lands), the monitor is
 ##       then finished, and the same producer emits again.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strutils, unittest]
 
 import io_mon                            # the PUBLIC host API

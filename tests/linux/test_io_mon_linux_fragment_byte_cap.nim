@@ -21,6 +21,8 @@
 ## `flushFragmentBatch`, `mergeFragments`) against a real on-disk fragment and,
 ## for defect B, against a real UNLINKED inode observed through `/proc/self/fd`.
 
+import foreign_preload_isolation
+
 import std/[os, strutils, unittest]
 
 import io_mon

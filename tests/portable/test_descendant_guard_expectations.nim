@@ -1,4 +1,6 @@
 ## Adversarial controls for the test-only normalization used by live suites.
+import foreign_preload_isolation
+
 import std/[strutils, unittest]
 import io_mon
 import descendant_guard_expectations

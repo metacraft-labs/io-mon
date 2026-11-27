@@ -32,6 +32,8 @@
 ## the live shim tests, which cannot run in the portable tier. What is real here
 ## is the composition, the codec and the algorithm, i.e. everything M6b touches.
 
+import foreign_preload_isolation
+
 import std/[algorithm, os, sets, strutils, unittest]
 import io_mon
 import io_mon/shm/dep_queue

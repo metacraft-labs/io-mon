@@ -27,6 +27,8 @@
 ## flipped to "expected pass" after Phase C lands the policy refinement /
 ## SIGTRAP-handler flush wiring.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon

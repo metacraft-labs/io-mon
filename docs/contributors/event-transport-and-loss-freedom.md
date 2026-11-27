@@ -479,7 +479,7 @@ library API**, not only a CLI:
   `REPRO_MONITOR_APP_ID`, **spawns** the tree, **snapshots** the deduped set,
   **writes** the canonical depfile (with the spawned root pid as the R1
   root-guard), and on **finish** calls `markConsumerGone` + detach. The CLI
-  `runFsSnoopCli` is now a thin wrapper over it (`runMonitored(req).exitCode`) —
+  `runFsSnoopCli` (`io_mon/cli`) is now a thin wrapper over it (`runMonitored(req).exitCode`) —
   no duplicated lifecycle. Because the consumer structure is created, named, and
   torn down inside this proc, **LF-2** (no orphan spill: a producer never runs
   without a consumer) and **LF-4** (consumer liveness) hold _by construction_

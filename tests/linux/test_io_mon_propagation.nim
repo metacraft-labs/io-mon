@@ -54,6 +54,8 @@
 ## (and correct, honestly-reported) behaviour; folding it in here would make the
 ## test pass for the wrong reason.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon

@@ -142,7 +142,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@9456226e58b7db8538c96936136fe73a1a12974d
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@648b34cb917967a71048b7486f5f1ed0a2726dd6
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}

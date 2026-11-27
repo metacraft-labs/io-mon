@@ -9,6 +9,7 @@ import stackable_hooks/platform/linux_image_code_ranges
 import io_mon/hooks/linux_arm_image
 import ./linux_mapping_policy
 import ../exec_image_header
+import ../inline_site_table
 
 export linux_mapping_policy
 
@@ -29,7 +30,8 @@ type
   LinuxHookSymbol = enum
     lhsOpen, lhsOpen64, lhsOpenat, lhsOpenat64, lhsClose, lhsRead, lhsWrite,
     lhsStat, lhsLstat, lhsOpendir, lhsReaddir, lhsClosedir, lhsFork,
-    lhsExecve, lhsPosixSpawn, lhsPosixSpawnp, lhsFopen, lhsFopen64, lhsConnect,
+    lhsExecve, lhsPosixSpawn, lhsPosixSpawnp, lhsPidfdSpawn, lhsPidfdSpawnp,
+    lhsWordexp, lhsFopen, lhsFopen64, lhsConnect,
     lhsDlopen, lhsDlmopen, lhsPread, lhsReadv, lhsPreadv, lhsSendfile,
     lhsCopyFileRange, lhsSplice, lhsLink, lhsLinkat, lhsRename, lhsRenameat,
     lhsRenameat2, lhsGetenv, lhsUname, lhsSysconf, lhsClockGettime,
@@ -362,6 +364,16 @@ type
     symbol: LinuxHookSymbol
     nextIndex: int
 
+  WordexpContext* = object
+    ## `wordexp(words, pwordexp, flags)`. glibc runs each command
+    ## substitution in `words` as `/bin/sh -c`, through an internal spawn no
+    ## exported spawn hook reaches.
+    words*: cstring
+    pwordexp*: pointer
+    flags*: cint
+    result*: cint
+    nextIndex: int
+
   ExitContext* = object
     status*: cint
     nextIndex: int
@@ -416,6 +428,11 @@ type
     firstUnscannedImage*: array[256, char]
       ## The first such mapping's path with the diagnostic and errno, for the
       ## loss record. A fixed buffer for the same reason as `firstThumbPath`.
+    tableServedMappings*: int
+      ## How many file-backed mappings were patched from the inline site table
+      ## the host handed this process (`io_mon/inline_site_table`) instead of
+      ## being decoded. Each one received exactly the sites a decode would
+      ## have found; the shim reports the table it used once per process.
 
   AnonymousExecutableRange = object
     start: uint
@@ -465,6 +482,9 @@ type
   ForkHook* = proc(ctx: var ForkContext) {.raises: [].}
   ExecveHook* = proc(ctx: var ExecveContext) {.raises: [].}
   PosixSpawnHook* = proc(ctx: var PosixSpawnContext) {.raises: [].}
+    ## Also the shape of a `pidfd_spawn{,p}` hook, whose context `pid` points
+    ## at the caller's pidfd result rather than a pid.
+  WordexpHook* = proc(ctx: var WordexpContext) {.raises: [].}
   ExitHook* = proc(ctx: var ExitContext) {.raises: [].}
   RawSyscallHook* = proc(number, a1, a2, a3, a4, a5, a6, result: clong;
                          inlineTrap: cint) {.raises: [].}
@@ -601,6 +621,9 @@ type
   PosixSpawnHookEntry = object
     priority: int
     callback: PosixSpawnHook
+  WordexpHookEntry = object
+    priority: int
+    callback: WordexpHook
   ExitHookEntry = object
     priority: int
     callback: ExitHook
@@ -622,6 +645,7 @@ when defined(ioMonInlineWindowTest):
 #include <glob.h>
 #include <limits.h>
 #include <link.h>
+#include <paths.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdarg.h>
@@ -641,6 +665,21 @@ when defined(ioMonInlineWindowTest):
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
+
+/* The Linux shim is built for glibc only (docs/contributors/architecture.md,
+ * "glibc only"). Every supported Linux target is glibc, and nothing builds or
+ * tests the shim against another libc, so a path written for one would ship
+ * unexercised. That has already gone wrong once: the real dlsym was found
+ * through ct_resolve on a non-glibc libc, which reaches the shim's own
+ * exported dlsym and recursed without end. The refusal is made here, from the
+ * libc headers the compiler actually uses (<features.h>, included by every
+ * header above, defines __GLIBC__), rather than from the build host, so a
+ * cross or musl compiler on a glibc host is refused too. It also comes before
+ * the first glibc-only type below, so the build fails with this message and
+ * not with an unrelated "unknown type name". */
+#ifndef __GLIBC__
+#error "io-mon: the Linux shim supports glibc only; this compiler's C library is not glibc (see docs/contributors/architecture.md)"
+#endif
 
 extern char **environ;
 """.}
@@ -711,6 +750,9 @@ typedef pid_t (*ct_fork_hook_fn)(void);
 typedef int (*ct_execve_hook_fn)(char *, char **, char **);
 typedef int (*ct_posix_spawn_hook_fn)(pid_t *, char *, void *, void *,
                                       char **, char **);
+/* pidfd_spawn/pidfd_spawnp (glibc 2.39+) take posix_spawn's arguments, but
+ * return a pidfd through the first one; `int *` is `pid_t *` in the type. */
+typedef int (*ct_wordexp_hook_fn)(char *, void *, int);
 typedef void (*ct_exit_hook_fn)(int);
 
 typedef int (*ct_open_real_fn)(const char *, int, ...);
@@ -769,6 +811,7 @@ typedef int (*ct_execvpe_real_fn)(const char *, char *const [], char *const []);
 typedef int (*ct_fexecve_real_fn)(int, char *const [], char *const []);
 typedef int (*ct_execveat_real_fn)(int, const char *, char *const [],
                                    char *const [], int);
+typedef int (*ct_wordexp_real_fn)(const char *, void *, int);
 typedef int (*ct_posix_spawn_real_fn)(pid_t *, const char *,
                                       const posix_spawn_file_actions_t *,
                                       const posix_spawnattr_t *,
@@ -829,6 +872,9 @@ static ct_fork_hook_fn ct_fork_hook = NULL;
 static ct_execve_hook_fn ct_execve_hook = NULL;
 static ct_posix_spawn_hook_fn ct_posix_spawn_hook = NULL;
 static ct_posix_spawn_hook_fn ct_posix_spawnp_hook = NULL;
+static ct_posix_spawn_hook_fn ct_pidfd_spawn_hook = NULL;
+static ct_posix_spawn_hook_fn ct_pidfd_spawnp_hook = NULL;
+static ct_wordexp_hook_fn ct_wordexp_hook = NULL;
 static ct_exit_hook_fn ct_exit_hook = NULL;
 typedef void (*ct_raw_syscall_hook_fn)(long, long, long, long, long, long, long,
                                        long, int);
@@ -943,6 +989,10 @@ static ct_xstat_real_fn real_lxstat_ptr = NULL;
 static ct_opendir_real_fn real_opendir_ptr = NULL;
 static ct_readdir_real_fn real_readdir_ptr = NULL;
 static ct_closedir_real_fn real_closedir_ptr = NULL;
+typedef int (*ct_system_real_fn)(const char *);
+typedef FILE *(*ct_popen_real_fn)(const char *, const char *);
+static ct_system_real_fn real_system_ptr = NULL;
+static ct_popen_real_fn real_popen_ptr = NULL;
 static ct_fopen_real_fn real_fopen_ptr = NULL;
 static ct_fopen_real_fn real_fopen64_ptr = NULL;
 static ct_fread_real_fn real_fread_ptr = NULL;
@@ -985,6 +1035,9 @@ static ct_fexecve_real_fn real_fexecve_ptr = NULL;
 static ct_execveat_real_fn real_execveat_ptr = NULL;
 static ct_posix_spawn_real_fn real_posix_spawn_ptr = NULL;
 static ct_posix_spawn_real_fn real_posix_spawnp_ptr = NULL;
+static ct_posix_spawn_real_fn real_pidfd_spawn_ptr = NULL;
+static ct_posix_spawn_real_fn real_pidfd_spawnp_ptr = NULL;
+static ct_wordexp_real_fn real_wordexp_ptr = NULL;
 
 /* Entry points that are only OBSERVED (no hook chain): the real call runs,
  * then one observer callback records what it means. See "OBSERVE-ONLY
@@ -1099,6 +1152,14 @@ static ct_ilp32_time64_fn real_time64_ptr = NULL;
 
 #define CT_INLINE_SYSCALL_SITE_CAP 4096
 static unsigned long ct_inline_syscall_sites[CT_INLINE_SYSCALL_SITE_CAP];
+/* Up to CT_INLINE_SYSCALL_TAIL_BYTES bytes that followed each site's two
+ * patched bytes when it was recorded, and how many were taken. A site is only
+ * a real patch while those bytes still follow it
+ * (ct_linux_inline_syscall_site_tail_matches). */
+#define CT_INLINE_SYSCALL_TAIL_BYTES 4
+static unsigned char ct_inline_syscall_tails[CT_INLINE_SYSCALL_SITE_CAP]
+                                            [CT_INLINE_SYSCALL_TAIL_BYTES];
+static unsigned char ct_inline_syscall_tail_lens[CT_INLINE_SYSCALL_SITE_CAP];
 static volatile sig_atomic_t ct_inline_syscall_site_count_value = 0;
 static volatile sig_atomic_t ct_inline_syscall_trap_count_value = 0;
 static volatile sig_atomic_t ct_inline_syscall_failure_count_value = 0;
@@ -1171,8 +1232,14 @@ extern void repro_linux_sig_safe_flush(void);
 /* Provided by shim/linux_preload.nim beside it: the same flush for an image
  * a signal is about to terminate. It first reports trapped inline events
  * still queued (ct_linux_report_inline_events_at_signal_death) and writes
- * the committed marker only when nothing is left unreported. */
-extern void repro_linux_sig_safe_flush_at_signal_death(void);
+ * the committed marker only when nothing is left unreported. Weak: a hook
+ * library that builds this runtime without the shim supplies only
+ * repro_linux_sig_safe_flush, and a strong reference here left it with an
+ * undefined symbol at load. Without it the trap handler still reports the
+ * queued inline events itself before the plain flush; only the shim's
+ * fragment second channel and its withheld marker are absent. */
+extern void repro_linux_sig_safe_flush_at_signal_death(void)
+    __attribute__((weak));
 /* Provided by shim/linux_preload.nim (Nim exportc, hence weak, as for
  * repro_linux_sig_safe_note_signal below): the calling thread's fragment slot,
  * read as plain data. Async-signal-safe. */
@@ -1920,6 +1987,9 @@ void ct_linux_report_fork_child_skipped_evidence(void) {
  *     for execvp): ct_linux_exec_hook_image_uninjectable;
  *   - posix_spawn/posix_spawnp, through their hooks, after a successful
  *     spawn: ct_linux_spawn_image_uninjectable;
+ *   - system(3) and popen(3), whose `/bin/sh` libc starts through its own
+ *     internal spawn, which reaches none of the hooks above:
+ *     ct_report_shell_entry, below;
  *   - a raw execve/execveat (syscall(2), its patched replacement, and an
  *     inline `syscall` instruction the trap handler replays), which reach no
  *     exec hook: ct_linux_check_raw_exec_entry, below.
@@ -2113,6 +2183,48 @@ static void ct_report_uninjectable_exec(const char *entry,
     errno = saved_errno;
   }
   ct_linux_report_uninjectable_exec_frame();
+}
+
+/* SYSTEM(3) AND POPEN(3) START A SHELL NO OTHER HOOK SEES.
+ *
+ * Both run `/bin/sh -c COMMAND`, and libc starts that shell from inside
+ * itself: glibc's do_system and popen call posix_spawn by a direct,
+ * PLT-less call (glibc 2.42: `call posix_spawn@@GLIBC_2.15` in do_system),
+ * and musl's do the same, so the exported posix_spawn hook never runs. When
+ * /bin/sh loads this shim, the shell records itself at shim init and nothing
+ * is missed. When it cannot (a static shell, or one of another ELF class),
+ * the shell and everything it starts ran unobserved and the capture could be
+ * graded complete. So system and popen are interposed (their exported
+ * wrappers, beside posix_spawn's) and classify the shell first, as every
+ * other entry does.
+ *
+ * The shell is the file libc names, `_PATH_BSHELL` from <paths.h> of the
+ * same libc, looked up as the kernel will (a symlink is followed, a `#!`
+ * file's interpreter classified). A missing or non-executable /bin/sh is not
+ * flagged: the spawn fails and nothing ran.
+ *
+ * system() reports at its entry, before the shell starts, the way the execve
+ * hook does: the caller then waits for the whole shell, and a process killed
+ * in that wait would otherwise never report it. A spawn that then fails (no
+ * memory, no pids) leaves a loss for a shell that never ran, which grades the
+ * capture incomplete without cause but never complete with one. popen()
+ * reports once it has returned a stream: it returns as soon as the shell
+ * started, and it can fail without spawning (an invalid mode), which a
+ * report at the entry would turn into a false loss. errno is preserved. */
+static void ct_report_shell_entry(const char *entry) {
+  /* Nothing to report to: a shim family or test program that registered no
+   * recorder and armed no frame. */
+  if (__atomic_load_n(&ct_uninjectable_exec_observer, __ATOMIC_ACQUIRE) ==
+          NULL &&
+      __atomic_load_n(&ct_uninjectable_exec_loss.len, __ATOMIC_ACQUIRE) <= 0)
+    return;
+  int saved_errno = errno;
+  char detail[CT_EXEC_DETAIL_CAP];
+  if (iomon_exec_image_classify(&ct_exec_raw_io, AT_FDCWD, _PATH_BSHELL, 0,
+                                NULL, detail, sizeof(detail)) !=
+      IOMON_EXEC_INJECTABLE)
+    ct_report_uninjectable_exec(entry, detail);
+  errno = saved_errno;
 }
 
 /* A raw execve(path, ...) or execveat(dirfd, path, ..., flags) is about to
@@ -2908,7 +3020,8 @@ void ct_linux_inline_syscall_reset(void) {
   ct_raw_syscall_event_overflow_value = 0;
 }
 
-int ct_linux_inline_syscall_record_site(unsigned long address) {
+int ct_linux_inline_syscall_record_site(unsigned long address,
+                                        unsigned long limit) {
   if (address == 0) return -1;
   if (ct_inline_syscall_site_index(address) >= 0) return 0;
   sig_atomic_t count = ct_inline_syscall_site_count_value;
@@ -2916,9 +3029,49 @@ int ct_linux_inline_syscall_record_site(unsigned long address) {
     ct_inline_syscall_overflow_value = 1;
     return -2;
   }
+  /* `limit` is the end of the mapping the site is in: the tail is read only
+   * below it. The bytes after the two patched ones are the original code's.
+   * Written before the count is raised, so the trap handler (which reads the
+   * count) never sees a half-recorded site. */
+  unsigned long tail_start = address + 2;
+  unsigned char tail_len = 0;
+  if (limit > tail_start) {
+    unsigned long avail = limit - tail_start;
+    tail_len = avail < CT_INLINE_SYSCALL_TAIL_BYTES
+                   ? (unsigned char)avail : CT_INLINE_SYSCALL_TAIL_BYTES;
+    memcpy(ct_inline_syscall_tails[count], (const void *)tail_start, tail_len);
+  }
+  ct_inline_syscall_tail_lens[count] = tail_len;
   ct_inline_syscall_sites[count] = address;
   ct_inline_syscall_site_count_value = count + 1;
   return 0;
+}
+
+/* Whether the site at registry `index` still has, in memory below `limit`, the
+ * bytes that followed it when it was patched. A registry entry outlives the
+ * code it describes (an unmapped image, a JIT page rewritten in place), and a
+ * real one-byte `int3` followed by `05 ...` reads like a patched site; the
+ * code after it is what tells them apart. Only bytes below `limit` are read,
+ * so a stale address is never read past the mapping the scan is in. */
+int ct_linux_inline_syscall_site_tail_matches(long index, unsigned long limit) {
+  if (index < 0 || index >= (long)ct_inline_syscall_site_count_value) return 0;
+  unsigned long tail_start = ct_inline_syscall_sites[index] + 2;
+  unsigned long n = ct_inline_syscall_tail_lens[index];
+  if (limit <= tail_start) return 1;
+  if (limit - tail_start < n) n = limit - tail_start;
+  const unsigned char *now = (const unsigned char *)tail_start;
+  for (unsigned long i = 0; i < n; i++) {
+    unsigned char was = ct_inline_syscall_tails[index][i];
+    if (now[i] == was) continue;
+    /* A site patched after this one was recorded (the scan patches in address
+     * order, and this tail was taken before it) turned its `0f` into `cc`:
+     * that is this site's own code, not a rewrite. */
+    if (was == 0x0f && now[i] == 0xcc &&
+        ct_inline_syscall_site_index(tail_start + i) >= 0)
+      continue;
+    return 0;
+  }
+  return 1;
 }
 
 #if defined(__x86_64__) || defined(__arm__)
@@ -2951,10 +3104,211 @@ static int ct_raw_process_is_single_threaded(void) {
   return p[1] == '1' && p[2] == ' ';
 }
 
+#if defined(__x86_64__)
+/* A TRAPPED CLONE THAT NAMES A CHILD STACK RUNS OUTSIDE THE HANDLER.
+ *
+ * Every other trapped call is replayed inside the SIGTRAP handler. A
+ * `clone` / `clone3` that names a child stack cannot be: the kernel starts
+ * the child at the instruction after the system call, which would be inside
+ * the handler, on the stack the program passed, where none of the handler's
+ * frames are; the child crashed as soon as the handler returned. (A clone
+ * without a child stack is not affected: its child continues on a copy of
+ * the handler's stack, as a fork child does.)
+ *
+ * So the handler does not replay such a call. It does the bookkeeping that
+ * precedes the call, then returns from the signal to a RESUME STUB that
+ * belongs to the trapped site: `syscall; int3`. The kernel restores the
+ * program's complete state on the way (every register, the FPU/SIMD state,
+ * the signal mask), the stub's `syscall` issues the call with it, and both
+ * the parent and the child (the child on its new stack, with the program's
+ * registers, as unmonitored) stop at the stub's `int3`. That second trap
+ * (ct_inline_clone_stub_trap) finishes the call: the parent records it and,
+ * for a CLONE_VM process, writes the child's tree-ledger entry; a fork-like
+ * child reclaims the shim state it inherited; a child that shares the
+ * parent's memory touches nothing. Each then resumes after the trapped
+ * site's `syscall` instruction.
+ *
+ * The stub must be the SITE'S own, and must say what the call was: at the
+ * second trap nothing in the registers names the site (the call's result
+ * replaced the number in rax, and `syscall` overwrote rcx and r11), the
+ * child cannot be given a pointer to per-call memory (a CLONE_VM child
+ * shares memory the parent reuses at once), and a clone3's flags live in
+ * program memory that a child sharing it may already have changed. Only the
+ * address the stub trapped at survives. So there is one stub per site, call
+ * (clone, clone3) and class of child (below), at index
+ * CT_INLINE_CLONE_STUBS_PER_SITE * site + CT_INLINE_CLONE_CLASSES * kind +
+ * class, CT_INLINE_CLONE_STUB_SIZE bytes each. The table is part of the
+ * shim's own text, which the inline scanner never patches (the image that
+ * contains this file's trap handler: OwnImage / isOwnImageMapping).
+ *
+ * The child's stop at the stub's `int3` runs this file's SIGTRAP handler in
+ * the child. A clone3 with CLONE_CLEAR_SIGHAND resets the child's handlers to
+ * the default first, so that child is killed by SIGTRAP instead (issue
+ * 2026-11-14-linux-inline-clone3-clear-sighand-child-dies-at-the-resume-stub).
+ * It did not survive the in-handler replay either. */
+#define CT_INLINE_CLONE_STUB_SIZE 4
+#define CT_INLINE_CLONE_STUB_TRAP_OFFSET 3 /* after `syscall` (2) + `int3` */
+#define CT_INLINE_CLONE_KIND_CLONE 0
+#define CT_INLINE_CLONE_KIND_CLONE3 1
+/* The class of child, decided from the flags before the call runs: */
+#define CT_INLINE_CLONE_FORK 0       /* no CLONE_VM: a private copy */
+#define CT_INLINE_CLONE_VM_PROCESS 1 /* ct_clone_flags_make_vm_process */
+#define CT_INLINE_CLONE_VM_SHARED 2  /* a CLONE_VM thread or vfork child */
+#define CT_INLINE_CLONE_CLASSES 3
+#define CT_INLINE_CLONE_STUBS_PER_SITE (2 * CT_INLINE_CLONE_CLASSES)
+#define CT_INLINE_CLONE_STUB_COUNT \
+  (CT_INLINE_CLONE_STUBS_PER_SITE * CT_INLINE_SYSCALL_SITE_CAP)
+#define CT_STR2(x) #x
+#define CT_STR(x) CT_STR2(x)
+extern const unsigned char ct_inline_clone_stubs[]
+    __attribute__((visibility("hidden")));
+__asm__(
+  ".pushsection .text.ct_inline_clone_stubs, \"ax\", @progbits\n"
+  ".p2align 4\n"
+  ".globl ct_inline_clone_stubs\n"
+  ".hidden ct_inline_clone_stubs\n"
+  ".type ct_inline_clone_stubs, @function\n"
+  "ct_inline_clone_stubs:\n"
+  ".rept 6 * " CT_STR(CT_INLINE_SYSCALL_SITE_CAP) "\n"
+  "  syscall\n"
+  "  int3\n"
+  "  int3\n"
+  ".endr\n"
+  ".size ct_inline_clone_stubs, .-ct_inline_clone_stubs\n"
+  ".popsection\n");
+_Static_assert(CT_INLINE_CLONE_STUBS_PER_SITE == 6,
+               "the .rept count above spells CT_INLINE_CLONE_STUBS_PER_SITE");
+
+/* Per site and kind, the tid of the thread that last sent a fork-like clone
+ * through it if that thread was its process's only one, else 0. The child
+ * reads it from its copy of the parent's memory, taken when the call ran: it
+ * equals the child's getppid() only when the parent was single-threaded (its
+ * only thread's tid is its pid), so any other value (a sibling's write, a
+ * CLONE_PARENT child) takes the conservative multi-threaded path. */
+static volatile long ct_inline_clone_single_tid[2 * CT_INLINE_SYSCALL_SITE_CAP];
+
+/* `struct clone_args` (clone(2)): the fields this file reads. */
+#define CT_CLONE3_ARGS_SIZE_VER0 64
+#define CT_CLONE3_FLAGS_OFFSET 0
+#define CT_CLONE3_STACK_OFFSET 40
+
+/* Whether this trapped call is a clone that names a child stack, and its
+ * kind and class of child, read before the call as the kernel reads them.
+ * A clone3 whose argument block is smaller than the first version the
+ * kernel accepts is replayed in place: the kernel refuses it (EINVAL), and
+ * its stack field may not be part of it. */
+static int ct_inline_clone_names_child_stack(long nr, const long *args,
+                                             int *kind, int *child_class) {
+  unsigned long long flags = 0;
+  int named = 0;
+#ifdef SYS_clone
+  if (nr == SYS_clone) {
+    *kind = CT_INLINE_CLONE_KIND_CLONE;
+    flags = (unsigned long)args[0];
+    named = args[1] != 0;
+  }
+#endif
+#ifdef SYS_clone3
+  if (nr == SYS_clone3 && args[0] != 0 &&
+      (unsigned long)args[1] >= CT_CLONE3_ARGS_SIZE_VER0) {
+    unsigned long long stack = 0;
+    memcpy(&flags, (const char *)args[0] + CT_CLONE3_FLAGS_OFFSET,
+           sizeof(flags));
+    memcpy(&stack, (const char *)args[0] + CT_CLONE3_STACK_OFFSET,
+           sizeof(stack));
+    *kind = CT_INLINE_CLONE_KIND_CLONE3;
+    named = stack != 0;
+  }
+#endif
+  if (!named) return 0;
+  *child_class = (flags & CLONE_VM) == 0 ? CT_INLINE_CLONE_FORK
+                 : ct_clone_flags_make_vm_process(flags)
+                     ? CT_INLINE_CLONE_VM_PROCESS
+                     : CT_INLINE_CLONE_VM_SHARED;
+  return 1;
+}
+
+/* The stub index a trap at `trap_rip` came from, or -1. */
+static long ct_inline_clone_stub_index(unsigned long trap_rip) {
+  unsigned long base = (unsigned long)ct_inline_clone_stubs;
+  if (trap_rip < base + CT_INLINE_CLONE_STUB_TRAP_OFFSET) return -1;
+  unsigned long offset = trap_rip - CT_INLINE_CLONE_STUB_TRAP_OFFSET - base;
+  if (offset % CT_INLINE_CLONE_STUB_SIZE != 0) return -1;
+  unsigned long index = offset / CT_INLINE_CLONE_STUB_SIZE;
+  if (index >= (unsigned long)CT_INLINE_CLONE_STUB_COUNT) return -1;
+  return (long)index;
+}
+
+/* The second trap of a clone sent through its site's stub (see above).
+ * `stub_regs` was captured at the stub: its `nr` is the call's result (rax),
+ * and its arguments are the call's own, which `syscall` preserves. */
+static void ct_inline_clone_stub_trap(
+    const struct stackable_linux_syscall_regs *stub_regs, long index,
+    void *ucontext) {
+  long site = index / CT_INLINE_CLONE_STUBS_PER_SITE;
+  int kind = (int)(index % CT_INLINE_CLONE_STUBS_PER_SITE) /
+             CT_INLINE_CLONE_CLASSES;
+  int child_class = (int)(index % CT_INLINE_CLONE_CLASSES);
+  long nr = kind == CT_INLINE_CLONE_KIND_CLONE3 ? SYS_clone3 : SYS_clone;
+  long result = stub_regs->nr;
+  unsigned long site_address = ct_inline_syscall_sites[site];
+  unsigned long resume = site_address + 2; /* past the `0f 05` it replaced */
+  if (result == 0 && child_class != CT_INLINE_CLONE_FORK) {
+    /* A child sharing the parent's memory (a thread, a vfork child or a
+     * CLONE_VM process) and, without CLONE_SETTLS, its thread-local state
+     * too: the parent does all the bookkeeping, and the child touches
+     * nothing, not even a counter. */
+    stackable_linux_write_syscall_result_to_ucontext(ucontext, 0, resume);
+    return;
+  }
+  if (result == 0) {
+    /* A fork-like child, as the in-place replay's child (the trap handler
+     * below): reclaim inherited locks, then the fork-child callback with the
+     * parent's thread count sampled before the call. Its memory is a private
+     * copy taken when the call ran, so the clone3 flags
+     * ct_raw_owner_after_raw_fork reads are the ones the call used. */
+    long ppid = ct_raw_syscall6(SYS_getppid, 0, 0, 0, 0, 0, 0);
+    int parent_single =
+        ppid > 0 && ct_inline_clone_single_tid[2 * site + kind] == ppid;
+    ct_raw_owner_after_raw_fork(nr, stub_regs->args[0], 0);
+    if (ct_raw_fork_child != NULL) ct_raw_fork_child(parent_single);
+    /* This thread, still in flight, is the only one: drop the counts the
+     * parent's other threads held at the call. */
+    __atomic_store_n(&ct_inline_in_flight, 1, __ATOMIC_SEQ_CST);
+    ct_inline_arm_loss();
+  } else if (result > 0 && child_class == CT_INLINE_CLONE_VM_PROCESS) {
+    /* Before the clone returns to its creator, as on the syscall(2) route
+     * (ct_linux_preload_after_raw_fork_syscall). */
+    ct_note_vm_process_parent(result);
+  }
+  long args[6];
+  memcpy(args, stub_regs->args, sizeof(args));
+  ct_record_raw_syscall_event(nr, args, result, CT_RAW_SYSCALL_SOURCE_INLINE,
+                              site_address);
+  __atomic_sub_fetch(&ct_inline_in_flight, 1, __ATOMIC_RELEASE);
+  if (stackable_linux_write_syscall_result_to_ucontext(ucontext, result,
+                                                       resume) == 0) {
+    ct_inline_syscall_trap_count_value++;
+  } else {
+    ct_inline_syscall_failure_count_value++;
+  }
+}
+#endif /* __x86_64__ */
+
 static void ct_linux_inline_syscall_sigtrap_handler(
     int signum, siginfo_t *info, void *ucontext) {
   struct stackable_linux_syscall_regs regs;
   int rc = stackable_linux_capture_syscall_regs_from_ucontext(ucontext, &regs);
+#if defined(__x86_64__)
+  if (rc == 0) {
+    long stub = ct_inline_clone_stub_index(regs.trap_rip);
+    if (stub >= 0 && stub / CT_INLINE_CLONE_STUBS_PER_SITE <
+                         (long)ct_inline_syscall_site_count_value) {
+      ct_inline_clone_stub_trap(&regs, stub, ucontext);
+      return;
+    }
+  }
+#endif
   if (rc != 0 || ct_inline_syscall_site_index(regs.syscall_address) < 0) {
     rc = stackable_linux_chain_sigtrap(signum, info, ucontext);
     if (rc != 0) {
@@ -2969,7 +3323,12 @@ static void ct_linux_inline_syscall_sigtrap_handler(
        * the slot is closed. */
       if (repro_linux_sig_safe_note_signal != NULL)
         repro_linux_sig_safe_note_signal((long)signum);
-      repro_linux_sig_safe_flush_at_signal_death();
+      if (repro_linux_sig_safe_flush_at_signal_death != NULL) {
+        repro_linux_sig_safe_flush_at_signal_death();
+      } else {
+        (void)ct_linux_report_inline_events_at_signal_death();
+        repro_linux_sig_safe_flush();
+      }
       signal(signum, SIG_DFL);
       raise(signum);
     }
@@ -3057,6 +3416,29 @@ static void ct_linux_inline_syscall_sigtrap_handler(
     trap_pid = ct_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
     exec_starttime = ct_inline_exec_arm(trap_pid);
   }
+#if defined(__x86_64__)
+  /* A clone that names a child stack is issued from the site's resume stub,
+   * outside this handler (see "A TRAPPED CLONE THAT NAMES A CHILD STACK RUNS
+   * OUTSIDE THE HANDLER"). It stays in flight and armed until the stub's
+   * trap finishes it. rax still holds the call's number. */
+  int clone_kind = 0, clone_class = 0;
+  if (!read_only && ct_inline_clone_names_child_stack(
+                        regs.nr, regs.args, &clone_kind, &clone_class)) {
+    long site = ct_inline_syscall_site_index(regs.syscall_address);
+    long stub = CT_INLINE_CLONE_STUBS_PER_SITE * site +
+                CT_INLINE_CLONE_CLASSES * clone_kind + clone_class;
+    ct_inline_clone_single_tid[2 * site + clone_kind] =
+        forks && parent_single
+            ? ct_raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0)
+            : 0;
+    rc = stackable_linux_write_syscall_result_to_ucontext(
+        ucontext, regs.nr,
+        (unsigned long)ct_inline_clone_stubs +
+            (unsigned long)stub * CT_INLINE_CLONE_STUB_SIZE);
+    if (rc != 0) ct_inline_syscall_failure_count_value++;
+    return;
+  }
+#endif
 #ifdef CT_INLINE_WINDOW_TEST
   /* Test-only (-d:ioMonInlineWindowTest): a marker `close(-4242)` holds its
    * in-flight count for 100 ms, so a test can fork while another thread is
@@ -3112,6 +3494,12 @@ void *ct_linux_inline_syscall_handler_address(void) { return NULL; }
 
 long ct_linux_inline_syscall_site_count(void) {
   return (long)ct_inline_syscall_site_count_value;
+}
+
+/* The address of the `index`th site this process patched, 0 out of range. */
+unsigned long ct_linux_inline_syscall_site_at(long index) {
+  if (index < 0 || index >= (long)ct_inline_syscall_site_count_value) return 0;
+  return ct_inline_syscall_sites[index];
 }
 
 long ct_linux_inline_syscall_trap_count(void) {
@@ -3619,6 +4007,9 @@ void ct_linux_preload_register_fork_hook(ct_fork_hook_fn hook) { ct_fork_hook = 
 void ct_linux_preload_register_execve_hook(ct_execve_hook_fn hook) { ct_execve_hook = hook; }
 void ct_linux_preload_register_posix_spawn_hook(ct_posix_spawn_hook_fn hook) { ct_posix_spawn_hook = hook; }
 void ct_linux_preload_register_posix_spawnp_hook(ct_posix_spawn_hook_fn hook) { ct_posix_spawnp_hook = hook; }
+void ct_linux_preload_register_pidfd_spawn_hook(ct_posix_spawn_hook_fn hook) { ct_pidfd_spawn_hook = hook; }
+void ct_linux_preload_register_pidfd_spawnp_hook(ct_posix_spawn_hook_fn hook) { ct_pidfd_spawnp_hook = hook; }
+void ct_linux_preload_register_wordexp_hook(ct_wordexp_hook_fn hook) { ct_wordexp_hook = hook; }
 void ct_linux_preload_register_exit_hook(ct_exit_hook_fn hook) { ct_exit_hook = hook; }
 void ct_linux_preload_register_raw_syscall_hook(ct_raw_syscall_hook_fn hook) {
   __atomic_store_n(&ct_raw_user_hook, hook, __ATOMIC_RELEASE);
@@ -4891,13 +5282,13 @@ void *ct_linux_preload_dlsym_entry_real = NULL;
 
 static ct_dlsym_real_fn ct_real_dlsym_fn(void) {
   if (real_dlsym_ptr == NULL) {
-#ifdef __GLIBC__
+    /* dlvsym does not pass through the shim's exported dlsym. Never fall
+     * back to ct_resolve: it calls dlsym(RTLD_NEXT, ...), which the shim's
+     * own calls bind to the shim's export, whose entry stub calls back here
+     * while the pointer is unpublished -- unbounded recursion. That is why
+     * the shim refuses any libc but glibc (the glibc-only #error at the top
+     * of this file). ARM64's baseline is 2.17, not x86_64's 2.2.5. */
     real_dlsym_ptr = (ct_dlsym_real_fn)dlvsym(RTLD_NEXT, "dlsym", CT_DLSYM_GLIBC_BASE);
-    /* Never retry through ct_resolve on glibc: that calls our interposed
-     * dlsym again. ARM64's baseline is 2.17, not x86_64's 2.2.5. */
-#else
-    real_dlsym_ptr = (ct_dlsym_real_fn)ct_resolve("dlsym");
-#endif
     if (real_dlsym_ptr != NULL)
       __atomic_store_n(&ct_linux_preload_dlsym_entry_real,
                        (void *)real_dlsym_ptr, __ATOMIC_RELEASE);
@@ -5375,6 +5766,75 @@ int ct_linux_preload_real_posix_spawnp(pid_t *pid, char *file,
   return real_posix_spawnp_ptr(pid, file, file_actions, attrp, argv, envp);
 }
 
+/* The pid a pidfd names, read from the "Pid:" line of /proc/self/fdinfo/<fd>
+ * (proc(5)) with raw system calls, as the posix_spawn hooks need the child's
+ * pid and pidfd_spawn returns only a descriptor. 0 when it cannot be read.
+ * Allocation-free; errno is preserved. */
+long ct_linux_pidfd_child_pid(int pidfd)
+    __attribute__((visibility("hidden")));
+long ct_linux_pidfd_child_pid(int pidfd) {
+  static const char prefix[] = "/proc/self/fdinfo/";
+  char path[sizeof(prefix) + 12];
+  char buf[512];
+  int saved_errno = errno;
+  long pid = 0;
+  size_t n = sizeof(prefix) - 1;
+  if (pidfd < 0) return 0;
+  memcpy(path, prefix, n);
+  {
+    char digits[12];
+    int count = 0;
+    unsigned int v = (unsigned int)pidfd;
+    do { digits[count++] = (char)('0' + v % 10); v /= 10; } while (v != 0);
+    while (count > 0) path[n++] = digits[--count];
+    path[n] = '\0';
+  }
+  long fd = ct_raw_syscall6(SYS_openat, AT_FDCWD, (long)path,
+                            O_RDONLY | O_CLOEXEC, 0, 0, 0);
+  if (fd < 0) { errno = saved_errno; return 0; }
+  long got = ct_raw_syscall6(SYS_read, fd, (long)buf, sizeof(buf) - 1, 0, 0, 0);
+  ct_raw_syscall6(SYS_close, fd, 0, 0, 0, 0, 0);
+  if (got > 0) {
+    buf[got] = '\0';
+    for (long i = 0; i + 4 < got; i++) {
+      if ((i == 0 || buf[i - 1] == '\n') && memcmp(buf + i, "Pid:", 4) == 0) {
+        long j = i + 4;
+        while (buf[j] == ' ' || buf[j] == '\t') j++;
+        int negative = buf[j] == '-';
+        if (negative) j++;
+        while (buf[j] >= '0' && buf[j] <= '9') pid = pid * 10 + (buf[j++] - '0');
+        if (negative) pid = 0;
+        break;
+      }
+    }
+  }
+  errno = saved_errno;
+  return pid;
+}
+
+/* pidfd_spawn/pidfd_spawnp exist only in glibc 2.39+; on a libc without them
+ * the slot stays NULL, CT_REAL fails the call with ENOSYS (the shim exports
+ * the names, so a caller that probes for them must see the same answer the
+ * kernel-less libc would give) and no hook ever runs. */
+int ct_linux_preload_real_pidfd_spawn(int *pidfd, char *path,
+                                      void *file_actions, void *attrp,
+                                      char **argv, char **envp) {
+  CT_REAL("pidfd_spawn", real_pidfd_spawn_ptr, ct_posix_spawn_real_fn);
+  return real_pidfd_spawn_ptr(pidfd, path, file_actions, attrp, argv, envp);
+}
+
+int ct_linux_preload_real_pidfd_spawnp(int *pidfd, char *file,
+                                       void *file_actions, void *attrp,
+                                       char **argv, char **envp) {
+  CT_REAL("pidfd_spawnp", real_pidfd_spawnp_ptr, ct_posix_spawn_real_fn);
+  return real_pidfd_spawnp_ptr(pidfd, file, file_actions, attrp, argv, envp);
+}
+
+int ct_linux_preload_real_wordexp(char *words, void *pwordexp, int flags) {
+  CT_REAL("wordexp", real_wordexp_ptr, ct_wordexp_real_fn);
+  return real_wordexp_ptr(words, pwordexp, flags);
+}
+
 /* Resolve EVERY real_*_ptr slot now, from the shim's constructor, instead of
  * on the first hooked call.
  *
@@ -5464,6 +5924,11 @@ void ct_linux_preload_prime_real_functions(void) {
   CT_PRIME(real_execveat_ptr, ct_execveat_real_fn, "execveat");
   CT_PRIME(real_posix_spawn_ptr, ct_posix_spawn_real_fn, "posix_spawn");
   CT_PRIME(real_posix_spawnp_ptr, ct_posix_spawn_real_fn, "posix_spawnp");
+  CT_PRIME(real_pidfd_spawn_ptr, ct_posix_spawn_real_fn, "pidfd_spawn");
+  CT_PRIME(real_pidfd_spawnp_ptr, ct_posix_spawn_real_fn, "pidfd_spawnp");
+  CT_PRIME(real_wordexp_ptr, ct_wordexp_real_fn, "wordexp");
+  CT_PRIME(real_system_ptr, ct_system_real_fn, "system");
+  CT_PRIME(real_popen_ptr, ct_popen_real_fn, "popen");
   CT_PRIME(real_access_ptr, ct_access_real_fn, "access");
   CT_PRIME(real_faccessat_ptr, ct_faccessat_real_fn, "faccessat");
   CT_PRIME(real_readlink_ptr, ct_readlink_real_fn, "readlink");
@@ -5555,7 +6020,7 @@ ssize_t pread(int fd, void *buf, size_t count, off_t offset) {
 
 /* ILP32 glibc: pread64 is not pread there (off64_t), so it is defined with
  * the other ILP32 entry points below. */
-#if defined(__LP64__) || !defined(__GLIBC__)
+#ifdef __LP64__
 ssize_t pread64(int fd, void *buf, size_t count, off64_t offset)
     __attribute__((visibility("default")));
 ssize_t pread64(int fd, void *buf, size_t count, off64_t offset) {
@@ -5584,7 +6049,7 @@ ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset) {
 }
 
 /* ILP32 glibc: defined with the other ILP32 entry points below. */
-#if defined(__LP64__) || !defined(__GLIBC__)
+#ifdef __LP64__
 ssize_t preadv64(int fd, const struct iovec *iov, int iovcnt, off64_t offset)
     __attribute__((visibility("default")));
 ssize_t preadv64(int fd, const struct iovec *iov, int iovcnt, off64_t offset) {
@@ -6089,7 +6554,6 @@ __asm__(
 /* The aliases and versions the C definition below gives an architecture
  * without a stub. GCC rejects an alias attribute whose target only assembly
  * defines, so they are made in assembly too. */
-#ifdef __GLIBC__
 __asm__(
   ".globl ct_linux_preload_public_dlsym_glibc_base\n"
   ".type ct_linux_preload_public_dlsym_glibc_base, %function\n"
@@ -6099,19 +6563,12 @@ __asm__(
   ".set ct_linux_preload_public_dlsym_glibc_2_34, ct_linux_preload_public_dlsym\n"
   ".symver ct_linux_preload_public_dlsym_glibc_base,dlsym@" CT_DLSYM_GLIBC_BASE "\n"
   ".symver ct_linux_preload_public_dlsym_glibc_2_34,dlsym@@GLIBC_2.34\n");
-#else
-__asm__(
-  ".globl dlsym\n"
-  ".type dlsym, %function\n"
-  ".set dlsym, ct_linux_preload_public_dlsym\n");
-#endif
 #else /* !CT_DLSYM_ENTRY_STUB */
 void *ct_linux_preload_public_dlsym(void *handle, const char *name)
     __attribute__((visibility("default")));
 void *ct_linux_preload_public_dlsym(void *handle, const char *name) {
   return ct_linux_preload_hooked_dlsym(handle, name);
 }
-#ifdef __GLIBC__
 void *ct_linux_preload_public_dlsym_glibc_base(void *handle, const char *name)
     __attribute__((alias("ct_linux_preload_public_dlsym"),
                    visibility("default")));
@@ -6120,11 +6577,6 @@ void *ct_linux_preload_public_dlsym_glibc_2_34(void *handle, const char *name)
                    visibility("default")));
 __asm__(".symver ct_linux_preload_public_dlsym_glibc_base,dlsym@" CT_DLSYM_GLIBC_BASE);
 __asm__(".symver ct_linux_preload_public_dlsym_glibc_2_34,dlsym@@GLIBC_2.34");
-#else
-void *dlsym(void *handle, const char *name)
-    __attribute__((alias("ct_linux_preload_public_dlsym"),
-                   visibility("default")));
-#endif
 #endif /* CT_DLSYM_ENTRY_STUB */
 
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
@@ -7673,6 +8125,77 @@ int posix_spawnp(pid_t *pid, const char *file, const posix_spawn_file_actions_t 
                                            (void *)attrp, (char **)argv, (char **)envp));
 }
 
+/* glibc's pidfd_spawn/pidfd_spawnp (2.39+) start a process through the
+ * internal __spawni, which no exported posix_spawn hook reaches. They are
+ * interposed so the spawn is classified, given the capture route and
+ * recorded as posix_spawn is. Declared here, not taken from <spawn.h>, which
+ * has them only on a glibc that provides them. */
+int pidfd_spawn(int *pidfd, const char *path, const posix_spawn_file_actions_t *file_actions,
+                const posix_spawnattr_t *attrp, char *const argv[], char *const envp[])
+    __attribute__((visibility("default")));
+int pidfd_spawn(int *pidfd, const char *path, const posix_spawn_file_actions_t *file_actions,
+                const posix_spawnattr_t *attrp, char *const argv[], char *const envp[]) {
+  if (CT_BYPASS() || ct_pidfd_spawn_hook == NULL)
+    return ct_linux_preload_real_pidfd_spawn(pidfd, (char *)path, (void *)file_actions,
+                                             (void *)attrp, (char **)argv, (char **)envp);
+  return CT_CALL_HOOK(ct_pidfd_spawn_hook((pid_t *)pidfd, (char *)path, (void *)file_actions,
+                                          (void *)attrp, (char **)argv, (char **)envp));
+}
+
+int pidfd_spawnp(int *pidfd, const char *file, const posix_spawn_file_actions_t *file_actions,
+                 const posix_spawnattr_t *attrp, char *const argv[], char *const envp[])
+    __attribute__((visibility("default")));
+int pidfd_spawnp(int *pidfd, const char *file, const posix_spawn_file_actions_t *file_actions,
+                 const posix_spawnattr_t *attrp, char *const argv[], char *const envp[]) {
+  if (CT_BYPASS() || ct_pidfd_spawnp_hook == NULL)
+    return ct_linux_preload_real_pidfd_spawnp(pidfd, (char *)file, (void *)file_actions,
+                                              (void *)attrp, (char **)argv, (char **)envp);
+  return CT_CALL_HOOK(ct_pidfd_spawnp_hook((pid_t *)pidfd, (char *)file, (void *)file_actions,
+                                           (void *)attrp, (char **)argv, (char **)envp));
+}
+
+/* glibc's wordexp runs each command substitution as `/bin/sh -c` through an
+ * internal posix_spawn call, which no exported spawn hook reaches. */
+int wordexp(const char *words, void *pwordexp, int flags)
+    __attribute__((visibility("default")));
+int wordexp(const char *words, void *pwordexp, int flags) {
+  if (CT_BYPASS() || ct_wordexp_hook == NULL)
+    return ct_linux_preload_real_wordexp((char *)words, pwordexp, flags);
+  return CT_CALL_HOOK(ct_wordexp_hook((char *)words, pwordexp, flags));
+}
+
+/* system(3) and popen(3): see "SYSTEM(3) AND POPEN(3) START A SHELL NO OTHER
+ * HOOK SEES". Only a standing-down image skips the report, leaving it to the
+ * active one, whose wrapper the real call below reaches (the next
+ * definition). A thread inside a hook still reports, through the unnamed
+ * frame (ct_report_uninjectable_exec): this shim never calls either, so such
+ * a call is a host signal handler's. */
+static int ct_shell_entry_reportable(void) {
+  ct_restore_vfork_exec_guard();
+  return ct_linux_preload_image_active == NULL ||
+         ct_linux_preload_image_active();
+}
+
+int system(const char *command) __attribute__((visibility("default")));
+int system(const char *command) {
+  /* system(NULL) asks whether a shell is available by running one. */
+  if (ct_shell_entry_reportable()) ct_report_shell_entry("system");
+  CT_REAL("system", real_system_ptr, ct_system_real_fn);
+  return real_system_ptr(command);
+}
+
+FILE *popen(const char *command, const char *mode)
+    __attribute__((visibility("default")));
+FILE *popen(const char *command, const char *mode) {
+  if (real_popen_ptr == NULL)
+    real_popen_ptr = (ct_popen_real_fn)ct_resolve("popen");
+  if (real_popen_ptr == NULL) { errno = ENOSYS; return NULL; }
+  int reportable = ct_shell_entry_reportable();
+  FILE *stream = real_popen_ptr(command, mode);
+  if (stream != NULL && reportable) ct_report_shell_entry("popen");
+  return stream;
+}
+
 void _exit(int status) __attribute__((visibility("default"), noreturn));
 void _exit(int status) {
   if (!CT_BYPASS() && ct_exit_hook != NULL) {
@@ -7914,6 +8437,14 @@ proc realPosixSpawn*(pid: ptr PidT; path: cstring; fileActions, attrp: pointer;
 proc realPosixSpawnp*(pid: ptr PidT; path: cstring; fileActions, attrp: pointer;
                       argv, envp: cstringArray): cint
   {.importc: "ct_linux_preload_real_posix_spawnp", raises: [].}
+proc realPidfdSpawn*(pidfd: ptr PidT; path: cstring; fileActions, attrp: pointer;
+                     argv, envp: cstringArray): cint
+  {.importc: "ct_linux_preload_real_pidfd_spawn", raises: [].}
+proc realPidfdSpawnp*(pidfd: ptr PidT; path: cstring; fileActions, attrp: pointer;
+                      argv, envp: cstringArray): cint
+  {.importc: "ct_linux_preload_real_pidfd_spawnp", raises: [].}
+proc realWordexp*(words: cstring; pwordexp: pointer; flags: cint): cint
+  {.importc: "ct_linux_preload_real_wordexp", raises: [].}
 proc realExit*(status: cint) {.importc: "ct_linux_preload_real_exit",
   raises: [], noreturn.}
 
@@ -8002,6 +8533,8 @@ type
   PosixSpawnDispatch = proc(pid: ptr PidT; path: cstring; fileActions,
                            attrp: pointer; argv, envp: cstringArray): cint
     {.cdecl, raises: [].}
+  WordexpDispatch = proc(words: cstring; pwordexp: pointer; flags: cint): cint
+    {.cdecl, raises: [].}
   ExitDispatch = proc(status: cint) {.cdecl, raises: [].}
   RawSyscallDispatch = proc(number, a1, a2, a3, a4, a5, a6, result: clong;
                             inlineTrap: cint) {.cdecl, raises: [].}
@@ -8024,12 +8557,16 @@ proc cRawSyscallOwnerJoin(target: pointer): cint
   {.importc: "ct_linux_preload_raw_owner_join", raises: [].}
 proc cInlineSyscallReset()
   {.importc: "ct_linux_inline_syscall_reset", raises: [].}
-proc cInlineSyscallRecordSite(address: culong): cint
+proc cInlineSyscallRecordSite(address, limit: culong): cint
   {.importc: "ct_linux_inline_syscall_record_site", raises: [].}
 proc cInlineSyscallHandlerAddress(): pointer
   {.importc: "ct_linux_inline_syscall_handler_address", raises: [].}
 proc cInlineSyscallSiteCount(): clong
   {.importc: "ct_linux_inline_syscall_site_count", raises: [].}
+proc cInlineSyscallSiteTailMatches(index: clong; limit: culong): cint
+  {.importc: "ct_linux_inline_syscall_site_tail_matches", raises: [].}
+proc cInlineSyscallSiteAt(index: clong): culong
+  {.importc: "ct_linux_inline_syscall_site_at", raises: [].}
 proc cInlineSyscallTrapCount(): clong
   {.importc: "ct_linux_inline_syscall_trap_count", raises: [].}
 proc cInlineSyscallFailureCount(): clong
@@ -8107,6 +8644,8 @@ proc cSpawnEntryUnrecordedPre(file: cstring; usePath: cint): cint
 proc cSpawnEntryUnrecordedPost(file: cstring; usePath, preFlagged, succeeded,
                                hasFileActions: cint; childPid: clong)
   {.importc: "ct_linux_spawn_entry_unrecorded_post", nodecl, raises: [].}
+proc cPidfdChildPid(pidfd: cint): clong
+  {.importc: "ct_linux_pidfd_child_pid", nodecl, raises: [].}
 proc cReportForkChildSkippedEvidence()
   {.importc: "ct_linux_report_fork_child_skipped_evidence", nodecl,
     raises: [].}
@@ -8217,6 +8756,12 @@ proc installPosixSpawnDispatcher(dispatch: PosixSpawnDispatch)
   {.importc: "ct_linux_preload_register_posix_spawn_hook", raises: [].}
 proc installPosixSpawnpDispatcher(dispatch: PosixSpawnDispatch)
   {.importc: "ct_linux_preload_register_posix_spawnp_hook", raises: [].}
+proc installPidfdSpawnDispatcher(dispatch: PosixSpawnDispatch)
+  {.importc: "ct_linux_preload_register_pidfd_spawn_hook", raises: [].}
+proc installPidfdSpawnpDispatcher(dispatch: PosixSpawnDispatch)
+  {.importc: "ct_linux_preload_register_pidfd_spawnp_hook", raises: [].}
+proc installWordexpDispatcher(dispatch: WordexpDispatch)
+  {.importc: "ct_linux_preload_register_wordexp_hook", raises: [].}
 proc installExitDispatcher(dispatch: ExitDispatch)
   {.importc: "ct_linux_preload_register_exit_hook", raises: [].}
 proc installRawSyscallDispatcher(dispatch: RawSyscallDispatch)
@@ -8278,6 +8823,9 @@ var
   execveHooks: seq[ExecveHookEntry] = @[]
   posixSpawnHooks: seq[PosixSpawnHookEntry] = @[]
   posixSpawnpHooks: seq[PosixSpawnHookEntry] = @[]
+  pidfdSpawnHooks: seq[PosixSpawnHookEntry] = @[]
+  pidfdSpawnpHooks: seq[PosixSpawnHookEntry] = @[]
+  wordexpHooks: seq[WordexpHookEntry] = @[]
   exitHooks: seq[ExitHookEntry] = @[]
   rawSyscallHook: RawSyscallHook = nil
   rawSyscallPatchAttempted = false
@@ -8664,6 +9212,27 @@ proc registerPosixSpawnpHook*(hook: PosixSpawnHook; priority = 100) {.raises: []
   posixSpawnpHooks.sort(proc(a, b: PosixSpawnHookEntry): int =
     cmp(a.priority, b.priority))
 
+proc registerPidfdSpawnHook*(hook: PosixSpawnHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  pidfdSpawnHooks.add(PosixSpawnHookEntry(priority: priority, callback: hook))
+  pidfdSpawnHooks.sort(proc(a, b: PosixSpawnHookEntry): int =
+    cmp(a.priority, b.priority))
+
+proc registerPidfdSpawnpHook*(hook: PosixSpawnHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  pidfdSpawnpHooks.add(PosixSpawnHookEntry(priority: priority, callback: hook))
+  pidfdSpawnpHooks.sort(proc(a, b: PosixSpawnHookEntry): int =
+    cmp(a.priority, b.priority))
+
+proc registerWordexpHook*(hook: WordexpHook; priority = 100) {.raises: [].} =
+  if hook == nil:
+    return
+  wordexpHooks.add(WordexpHookEntry(priority: priority, callback: hook))
+  wordexpHooks.sort(proc(a, b: WordexpHookEntry): int =
+    cmp(a.priority, b.priority))
+
 proc registerExitHook*(hook: ExitHook; priority = 100) {.raises: [].} =
   if hook == nil:
     return
@@ -8874,6 +9443,11 @@ proc reportSpawnEntryUnrecorded*(file: cstring; usePath, preFlagged,
   ## and started an image the shim cannot enter. Allocation-free.
   cSpawnEntryUnrecordedPost(file, cint(usePath), cint(preFlagged),
     cint(succeeded), cint(hasFileActions), clong(childPid))
+
+proc pidfdChildPid*(pidfd: cint): int {.raises: [].} =
+  ## The pid the pidfd `pidfd_spawn{,p}` returned names, or 0 when it cannot
+  ## be read. Raw system calls only; errno is preserved.
+  int(cPidfdChildPid(pidfd))
 
 proc reportForkChildSkippedEvidence*() {.raises: [].} =
   ## Report, once per process, that this fork child skipped a hook that
@@ -9295,6 +9869,105 @@ proc noteUnscannedImage(mapping: LinuxExecutableMapping;
     if n > 0: copyMem(addr status.firstUnscannedImage[0], unsafeAddr text[0], n)
     status.firstUnscannedImage[n] = '\0'
 
+when defined(linux) and defined(amd64):
+  # Site tables exist only where the inline `syscall` scan does: on x86-64.
+  # `SiteTableView` is declared under the same condition in
+  # `io_mon/inline_site_table`, so this global and every use of it stay inside
+  # that condition; elsewhere the two entry points below are no-ops.
+  # `tests/portable/test_linux_shim_compiles_for_every_target` type-checks the
+  # shim for each Linux target so a use outside the guard fails there.
+  var siteTableView: SiteTableView
+    ## The sealed site table the host named in `REPRO_MONITOR_SITE_TABLES`,
+    ## mapped by the constructor (`useInlineSiteTable`); `base` nil when there
+    ## is none. Plain old data with a zero initializer, like the patch-status
+    ## globals (`tests/linux/test_io_mon_shim_globals_are_static`).
+
+proc useInlineSiteTable*(path: string) {.raises: [].} =
+  ## Map the table at `path` for every later scan of this process. Called by
+  ## the shim's constructor, before the startup scan, with the process's own
+  ## libc hooks muted. A path that does not name a sealed table of this
+  ## build's scanner leaves the process without one: every mapping is decoded.
+  ## On targets other than x86-64 there is no inline scan to serve, so the
+  ## call ignores `path` (the host never names a table there either).
+  when defined(linux) and defined(amd64):
+    if siteTableView.base == nil:
+      siteTableView = openSiteTableView(path)
+  else:
+    discard path
+
+proc inlineSiteTableIdentity*(): string {.raises: [].} =
+  ## `<dev>:<ino>` of the table this process uses, "" when none.
+  when defined(linux) and defined(amd64):
+    if siteTableView.base != nil:
+      return identityText(siteTableView)
+  ""
+
+when defined(amd64):
+  proc ctIldDecodeLength(code: pointer; maxLen: csize_t): cint
+    {.importc: "ct_ild_decode", cdecl, raises: [].}
+    ## The scanner's own length decoder (nim-stackable-hooks
+    ## `inline_hook/windows/length_decoder.c`, linked into the shim).
+
+proc visitAroundOwnPatches(start, stop: uint;
+                           visitor: proc(site: LinuxSyscallSite): bool
+                             {.closure, raises: [].}) {.raises: [].} =
+  ## Decode `[start, stop)` as it decoded before this process patched it.
+  ## A site the shim patched reads `cc 05` where the scan read `0f 05`; the
+  ## length decoder takes the `cc` as a one-byte `int3` and the `05` as a
+  ## five-byte `add eax, imm32`, so it would resume four bytes past the
+  ## original `syscall`, possibly inside the next instruction, and could
+  ## patch a `0f 05` there (reprobuild-pm issue 2026-11-16, "a late
+  ## inline-syscall scan decodes code it already patched").
+  ##
+  ## So a patched site cuts the range, but only where the sweep lands on it:
+  ## the registry outlives the code it describes (an unmapped image, a JIT
+  ## page rewritten in place), and a `cc 05` that happens to sit at a stale
+  ## address inside a new instruction must be decoded through, as before. So
+  ## must a real `int3` at a stale address that is an instruction boundary:
+  ## a site counts only while the bytes recorded after it when it was patched
+  ## still follow it (`ct_linux_inline_syscall_site_tail_matches`). A
+  ## walk with the scanner's own stepping (the decoded length, or one byte
+  ## when a byte does not decode) finds the landed sites. The range is then
+  ## decoded in pieces that end just past each landed site's `int3` (the
+  ## sweep stops there: fewer than three bytes remain) and restart two bytes
+  ## past it, where the sweep over the unpatched bytes resumed. The decoder
+  ## succeeds exactly when an instruction fits in its `maxLen`, so a piece
+  ## that ends at a landed site decodes every earlier instruction as the walk
+  ## did. The walk costs one more decode of a range that holds a patched
+  ## site, on late scans only.
+  if stop <= start:
+    return
+  when defined(amd64):
+    var candidates: seq[uint] = @[]
+    let count = int(cInlineSyscallSiteCount())
+    for k in 0 ..< count:
+      let site = uint(cInlineSyscallSiteAt(clong(k)))
+      if site < start or site + 2 > stop:
+        continue
+      let p = cast[ptr UncheckedArray[byte]](site)
+      if p[0] == linuxInt3Opcode and p[1] == linuxSyscallOpcode1 and
+         cInlineSyscallSiteTailMatches(clong(k), culong(stop)) != 0:
+        candidates.add site
+    if candidates.len > 0:
+      candidates.sort()
+      var at = start
+      var i = start
+      for site in candidates:
+        while i < site:
+          let ilen = int(ctIldDecodeLength(cast[pointer](i),
+                                           csize_t(min(stop - i, 15'u))))
+          i += (if ilen <= 0: 1'u else: uint(ilen))
+        if i != site:
+          continue                   # the sweep steps over it: no cut
+        visitLinuxX8664SyscallMemory(cast[pointer](at), int(site + 2 - at),
+                                     visitor)
+        at = site + 2
+        i = at
+      if at < stop:
+        visitLinuxX8664SyscallMemory(cast[pointer](at), int(stop - at), visitor)
+      return
+  visitLinuxX8664SyscallMemory(cast[pointer](start), int(stop - start), visitor)
+
 proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
                                status: var InlineSyscallPatchStatus)
     {.raises: [].} =
@@ -9303,7 +9976,8 @@ proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
   let patchSite = proc(site: LinuxSyscallSite): bool {.closure, raises: [].} =
     let tx = installInt3SyscallPatchTransaction(cast[pointer](site.address))
     if tx.diagnostic == lrsOk and tx.patchLive:
-      if cInlineSyscallRecordSite(culong(site.address)) == 0:
+      if cInlineSyscallRecordSite(culong(site.address),
+                                  culong(mapping.stop)) == 0:
         inc statusPtr[].patchedSites
     elif statusPtr[].firstPatchDiagnostic == lrsOk:
       statusPtr[].firstPatchDiagnostic = tx.diagnostic
@@ -9314,7 +9988,11 @@ proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
   if mapping.path.len == 0 or mapping.path[0] != '/':
     # An anonymous (JIT) range has no image to consult; the caller established
     # through the mmap wrapper that the program created it as code.
-    visitLinuxExecutableMappingSyscalls(mapping, patchSite)
+    when defined(amd64):
+      if mapping.readable and mapping.executable:
+        visitAroundOwnPatches(mapping.start, mapping.stop, patchSite)
+    else:
+      visitLinuxExecutableMappingSyscalls(mapping, patchSite)
     return
   # A file-backed mapping is scanned only over the image's executable
   # sections. The rest of an `R E` segment can be read-only data -- BOLT and
@@ -9323,15 +10001,30 @@ proc patchInlineSyscallMapping(mapping: LinuxExecutableMapping;
   # `syscall`; patching one corrupted the table and killed rustc 1.94.0 with
   # SIGILL. See `linux_image_code_ranges` for the ELF facts. No table, no scan:
   # the gap is reported as event loss (`emitUnscannedImagesLoss`).
+  when defined(linux) and defined(amd64):
+    if siteTableView.base != nil:
+      # Same section table, read through the same calls, plus the identity of
+      # the file it came from: a table is served only for that file, and only
+      # when its ranges, its identity and the untouched code pages show that
+      # memory holds the bytes the table was computed from
+      # (`serveSitesFromTable`). Anything else falls through to the decode.
+      let probed = imageCodeRangesWithIdentity(mapping)
+      if probed.ranges.diagnostic != licrOk:
+        noteUnscannedImage(mapping, probed.ranges, status)
+        return
+      if probed.statOk and serveSitesFromTable(siteTableView, mapping,
+          probed.st, probed.ranges.ranges, patchSite):
+        inc status.tableServedMappings
+        return
+      for r in probed.ranges.ranges:
+        visitAroundOwnPatches(r.start, r.stop, patchSite)
+      return
   let ranges = linuxImageCodeRanges(mapping)
   if ranges.diagnostic != licrOk:
     noteUnscannedImage(mapping, ranges, status)
     return
   for r in ranges.ranges:
-    if r.stop <= r.start:
-      continue
-    visitLinuxX8664SyscallMemory(cast[pointer](r.start), int(r.stop - r.start),
-                                 patchSite)
+    visitAroundOwnPatches(r.start, r.stop, patchSite)
 
 proc installInlineSyscallPatches*(): InlineSyscallPatchStatus {.raises: [].}
 
@@ -9490,6 +10183,13 @@ proc scanInlineSyscallPatchesForTrackedMprotectRange*(start: pointer;
 # regression. See the M9.R.64.2 note at the (former) call site in
 # `installInlineSyscallPatches` below.
 
+proc runtimeOwnImage(mappings: openArray[LinuxExecutableMapping]): OwnImage
+    {.raises: [].} =
+  ## The image this runtime was loaded from, located by the address of its
+  ## SIGTRAP handler: the shim under whatever name it was preloaded as, or the
+  ## hook library that embeds the runtime. The scan never patches it.
+  ownImageOf(mappings, cast[uint](cInlineSyscallHandlerAddress()))
+
 proc installInlineSyscallPatches*(): InlineSyscallPatchStatus {.raises: [].} =
   if inlineSyscallPatchAttempted:
     return inlineSyscallPatchStatus
@@ -9527,8 +10227,9 @@ proc installInlineSyscallPatches*(): InlineSyscallPatchStatus {.raises: [].} =
     inlineSyscallPatchStatus = status
     return status
 
-  for mapping in mappings.mappings:
-    if not shouldPatchInlineSyscallMapping(mapping, executablePath):
+  let own = runtimeOwnImage(mappings.mappings)
+  for mapping in coalesceSplitImageMappings(mappings.mappings):
+    if not shouldPatchInlineSyscallMapping(mapping, executablePath, own):
       continue
     patchInlineSyscallMapping(mapping, status)
   # M9.R.64.2 revert of M9.R.63.5 — the targeted INT3 patch on libc's
@@ -9583,8 +10284,9 @@ proc scanInlineSyscallPatchesForNewMappings*(): InlineSyscallPatchStatus
   if mappings.diagnostic != lrsOk:
     inlineSyscallPatchStatus = status
     return status
-  for mapping in mappings.mappings:
-    if not shouldPatchInlineSyscallMapping(mapping, executablePath):
+  let own = runtimeOwnImage(mappings.mappings)
+  for mapping in coalesceSplitImageMappings(mappings.mappings):
+    if not shouldPatchInlineSyscallMapping(mapping, executablePath, own):
       continue
     patchInlineSyscallMapping(mapping, status)
   status.patchedSites = int(cInlineSyscallSiteCount())
@@ -9772,8 +10474,17 @@ proc callReal*(ctx: var ForkContext) {.raises: [].} =
 proc callReal*(ctx: var ExecveContext) {.raises: [].} =
   ctx.result = realExecve(ctx.path, ctx.argv, ctx.envp)
 
+proc callReal*(ctx: var WordexpContext) {.raises: [].} =
+  ctx.result = realWordexp(ctx.words, ctx.pwordexp, ctx.flags)
+
 proc callReal*(ctx: var PosixSpawnContext) {.raises: [].} =
   case ctx.symbol
+  of lhsPidfdSpawn:
+    ctx.result = realPidfdSpawn(ctx.pid, ctx.path, ctx.fileActions,
+                                ctx.attrp, ctx.argv, ctx.envp)
+  of lhsPidfdSpawnp:
+    ctx.result = realPidfdSpawnp(ctx.pid, ctx.path, ctx.fileActions,
+                                 ctx.attrp, ctx.argv, ctx.envp)
   of lhsPosixSpawnp:
     ctx.result = realPosixSpawnp(ctx.pid, ctx.path, ctx.fileActions,
                                  ctx.attrp, ctx.argv, ctx.envp)
@@ -10173,8 +10884,30 @@ proc callNext*(ctx: var ExecveContext) {.raises: [].} =
   else:
     callReal(ctx)
 
+proc callNext*(ctx: var WordexpContext) {.raises: [].} =
+  if ctx.nextIndex < wordexpHooks.len:
+    let index = ctx.nextIndex
+    inc ctx.nextIndex
+    wordexpHooks[index].callback(ctx)
+  else:
+    callReal(ctx)
+
 proc callNext*(ctx: var PosixSpawnContext) {.raises: [].} =
   case ctx.symbol
+  of lhsPidfdSpawn:
+    if ctx.nextIndex < pidfdSpawnHooks.len:
+      let index = ctx.nextIndex
+      inc ctx.nextIndex
+      pidfdSpawnHooks[index].callback(ctx)
+    else:
+      callReal(ctx)
+  of lhsPidfdSpawnp:
+    if ctx.nextIndex < pidfdSpawnpHooks.len:
+      let index = ctx.nextIndex
+      inc ctx.nextIndex
+      pidfdSpawnpHooks[index].callback(ctx)
+    else:
+      callReal(ctx)
   of lhsPosixSpawnp:
     if ctx.nextIndex < posixSpawnpHooks.len:
       let index = ctx.nextIndex
@@ -10529,6 +11262,29 @@ proc dispatchPosixSpawnp(pid: ptr PidT; path: cstring; fileActions, attrp: point
   callNext(ctx)
   result = ctx.result
 
+proc dispatchPidfdSpawn(pid: ptr PidT; path: cstring; fileActions, attrp: pointer;
+                        argv, envp: cstringArray): cint {.cdecl, raises: [].} =
+  var ctx = PosixSpawnContext(pid: pid, path: path, fileActions: fileActions,
+                              attrp: attrp, argv: argv, envp: envp, result: -1,
+                              symbol: lhsPidfdSpawn)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchPidfdSpawnp(pid: ptr PidT; path: cstring; fileActions, attrp: pointer;
+                         argv, envp: cstringArray): cint {.cdecl, raises: [].} =
+  var ctx = PosixSpawnContext(pid: pid, path: path, fileActions: fileActions,
+                              attrp: attrp, argv: argv, envp: envp, result: -1,
+                              symbol: lhsPidfdSpawnp)
+  callNext(ctx)
+  result = ctx.result
+
+proc dispatchWordexp(words: cstring; pwordexp: pointer; flags: cint): cint
+    {.cdecl, raises: [].} =
+  var ctx = WordexpContext(words: words, pwordexp: pwordexp, flags: flags,
+                           result: -1)
+  callNext(ctx)
+  result = ctx.result
+
 proc dispatchExit(status: cint) {.cdecl, raises: [].} =
   var ctx = ExitContext(status: status)
   callNext(ctx)
@@ -10586,6 +11342,9 @@ installForkDispatcher(dispatchFork)
 installExecveDispatcher(dispatchExecve)
 installPosixSpawnDispatcher(dispatchPosixSpawn)
 installPosixSpawnpDispatcher(dispatchPosixSpawnp)
+installPidfdSpawnDispatcher(dispatchPidfdSpawn)
+installPidfdSpawnpDispatcher(dispatchPidfdSpawnp)
+installWordexpDispatcher(dispatchWordexp)
 installExitDispatcher(dispatchExit)
 installRawSyscallDispatcher(rawSyscallDispatcher)
 

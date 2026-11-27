@@ -8,7 +8,7 @@
 # commit's own committed `repro.lock` (`lock-store: committed`, the default:
 # the lock's `deps` entry of that name, which must be a full commit id, and a
 # sibling the lock does not pin is refused rather than cloned at a branch
-# tip), which pins c34e3252 — the same revision
+# tip), which pins ec6b02d4 — the same revision
 # `flake.nix` pins `stackable-hooks-src` to. Keep the two in step: a `nim c` in
 # the dev shell resolves `stackable_hooks/...` through the sibling checkout,
 # while `nix build .#default` resolves it through the flake input, and a build
@@ -44,14 +44,17 @@ nim-shm-queue
 # same gap.) The durable fix is to add nim-shm-gset to io-mon's develop set
 # (its `depends` edges in the workspace manifest), so `repro lock refresh`
 # pins it alongside its siblings; this pin should be dropped then.
-# 7bc81ad2 is the revision `flake.nix` pins `shm-gset-src` to, so the ordinary
+# 803a4faa is the revision `flake.nix` pins `shm-gset-src` to, so the ordinary
 # checkout and `nix build .#default` compile the same nim-shm-gset (keep the
 # two in step, as for nim-stackable-hooks above). It moved from 43a61120 to
 # 6333cc91 on 2026-10-30 (shard files are preallocated so a full tmpfs is
 # ENOSPC at creation, not SIGBUS at the first store) and to 7bc81ad2 with
 # c8bc874, whose `repro_dep_set_signal_loss` calls `emitNoGrow`; that commit
 # moved only the flake pin, so every lane that cloned 6333cc91 failed to
-# compile `src/io_mon/writer.nim`.
+# compile `src/io_mon/writer.nim`. It moved to 803a4faa on 2026-11-27, the
+# revision reprobuild v0.2.36 (ci-reprobuild.yml's engine) pins: that engine
+# refuses a ../nim-shm-gset sibling behind its own pin ("no acceptable
+# source for SHM_GSET_SRC").
 #
 # Spelled '!=' rather than '='. It was added when a record-store lock did pin
 # nim-shm-gset (at 8a9f2f13), which made a plain '=' an unacknowledged
@@ -61,4 +64,15 @@ nim-shm-queue
 # pin this repo"), and '!=' and '=' behave identically. Once the lock pins it,
 # drop this entry as the paragraph above says, rather than keep an
 # acknowledged override.
-nim-shm-gset!=7bc81ad2440860a8a9254eb2757c585df9652438
+nim-shm-gset!=803a4faa23f985ad9697437603436f2f784072be
+
+# nim-cli-spec (the clispec library) is required by `src/io_mon/cli.nim`, the
+# generated parser and help of the `io-mon` binary. It is pinned here
+# explicitly, to 6e0b4e78, the revision `flake.nix` pins `cli-spec-src` to and
+# the committed `repro.lock` pins too (`clone-siblings` reports the entry as
+# `explicit-agrees`); keep the three in step. 6e0b4e78 (2026-11-27) is also
+# the revision reprobuild v0.2.36 (ci-reprobuild.yml's engine) pins, and that
+# engine refuses a ../nim-cli-spec sibling behind its own pin. Now that the
+# lock pins it, this entry can become the bare name once nothing else reads
+# the revision here.
+nim-cli-spec!=6e0b4e78d96c4118103f2be571e1edd6ff0c938d

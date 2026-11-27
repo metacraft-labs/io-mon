@@ -1,5 +1,14 @@
 import std/[options, strutils]
 
+const
+  SiteTableServedDetail* = "inline syscall site table served"
+    ## Prefix of the event-loss record a Linux shim emits once it has patched
+    ## a mapping from an inline site table (`io_mon/inline_site_table`),
+    ## followed by `table=<dev>:<ino>` of the table file it read. The host
+    ## drops the record when that identity is the table it issued
+    ## (`mergeFragments`' `acceptedSiteTable`); from any other table it stays
+    ## an event loss and the capture is incomplete.
+
 type
   MonitorRecordKind* = enum
     mrProcessStart = 1
@@ -827,6 +836,25 @@ type
       ## reaches the child, and whatever the child reads from it is an input
       ## nobody recorded. Executable resolution is unaffected (see `env`
       ## above), so pass an absolute `command[0]`.
+    inlineSiteTables*: string
+      ## Linux x86-64: a path this host can open (normally
+      ## `/proc/<pid>/fd/<n>`) naming a SEALED inline site table file produced
+      ## by a process that is not monitored (`io_mon/inline_site_table`). The
+      ## host checks the seals and the scanner stamp, keeps its own descriptor
+      ## for the life of the monitor, and names that descriptor to the tree;
+      ## the shim then patches a mapping of an image the table covers from the
+      ## table instead of decoding it, and the capture accepts only this
+      ## table's served-records. Empty, unusable or ignored elsewhere: every
+      ## image is decoded, as before.
+    unsetEnv*: seq[string]
+      ## Names removed from the hosting process's environment before `env` and
+      ## io-mon's injection are layered over it, for a child that inherits
+      ## (`isolateEnv` false). A host that must keep a variable away from the
+      ## monitored child, and cannot copy its whole environment across without
+      ## bypassing the injection rules `childEnv` owns, names it here. Matched
+      ## exactly, case-insensitively on Windows. Ignored when `isolateEnv` is
+      ## true, which already starts the child from `env` alone. A name also set
+      ## in `env` takes the `env` value.
     # IoMon-Decomposed-Host-API DH-1 — PER-CALL working directory for the
     # monitored child. Empty means "inherit the hosting process's cwd"
     # (the historical behaviour). Set per-call rather than by `chdir`-ing

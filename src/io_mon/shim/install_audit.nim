@@ -108,7 +108,7 @@ var gAuditRan {.global.}: bool = false
 
 type
   InstallShape = enum
-    isOverwrite,    ## target[0..4] == E9 ?? ?? ?? ??
+    isOverwrite,    ## target[0..4] == E9 ?? ?? ?? ?? (ARM64: one `B` word)
     isHotpatch,     ## target[0..1] == EB F9; target[-5..-1] == E9 ?? ?? ?? ??
     isNeither       ## first five bytes don't match either inline shape
 
@@ -125,6 +125,15 @@ proc classifyInstallShape*(target: pointer): InstallShape =
   ## a target near a page boundary outside kernel32's text section,
   ## extending the audit to query page protections becomes necessary.
   if target == nil:
+    return isNeither
+  when defined(arm64):
+    # Windows on Arm64 (reprobuild-pm spec/Monitor-Hook-Shim.md, "Windows on
+    # Arm64 install backend"): the only installed shape is one aligned `B`
+    # (opcode bits 31:26 = 000101) to the forwarding stub. There is no
+    # hot-patch shape on ARM64.
+    let word = cast[ptr uint32](target)[]
+    if (word and 0xFC00_0000'u32) == 0x1400_0000'u32:
+      return isOverwrite
     return isNeither
   let p = cast[ptr UncheckedArray[uint8]](target)
 

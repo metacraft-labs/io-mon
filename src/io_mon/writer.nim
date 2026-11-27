@@ -798,6 +798,31 @@ proc ensureRegistryLock() {.raises: [].} =
     initLock(registryLock)
     registryLockReady = true
 
+proc resetFragmentRegistryLockAfterFork*() {.raises: [].} =
+  ## In a fork CHILD, from its atfork child handler: re-initialise the registry
+  ## lock if a parent thread held it at the fork instant. That thread does not
+  ## exist in the child, so the inherited copy would stay locked forever, and
+  ## the child's first record would wait on it while (un)registering its slot.
+  ## What the lock guards is reset by the child anyway
+  ## (`discardFragmentSlotAfterFork`), so nothing half-updated is used. Only the
+  ## macOS shim calls it: POSIX leaves re-initialising a locked mutex undefined
+  ## (https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_mutex_init.html),
+  ## Darwin's `pthread_mutex_init` rewrites the mutex in place, and a fork child
+  ## has a single thread, so nothing else is using the old state.
+  if not registryLockReady:
+    return
+  if tryAcquire(registryLock):
+    release(registryLock)
+  else:
+    registryLockReady = false   # `ensureRegistryLock` re-initialises it
+
+when defined(ioMonShimForkLockTest):
+  proc fragmentRegistryTestHoldLock*(take: bool) {.raises: [].} =
+    ## Test-only (`-d:ioMonShimForkLockTest`): take or give back the registry
+    ## lock on the calling thread, so a test can fork while it is held.
+    ensureRegistryLock()
+    if take: acquire(registryLock) else: release(registryLock)
+
 proc registerFragmentSlot(slot: ptr FragmentSlot) {.raises: [].} =
   ## DEP-FLUSH-1 — self-register the CALLING thread's slot in the process-
   ## global registry on first open. Idempotent (a slot already carrying a
@@ -3372,7 +3397,14 @@ proc mergeFragments*(fragmentDir, outputPath: string;
     currentRunId = "";
     setRecords: openArray[MonitorRecord] = @[];
     observedInterest: set[EventCategory] = {};
-    observedEvidenceScope: EvidenceScope = esFull): MonitorDepFile =
+    observedEvidenceScope: EvidenceScope = esFull;
+    acceptedSiteTable = ""): MonitorDepFile =
+  ## `acceptedSiteTable` is the `<dev>:<ino>` of the sealed inline site table
+  ## this capture's host issued (`FsSnoopRequest.inlineSiteTables`). A shim
+  ## that patched a mapping from a table reports it with an event-loss record
+  ## (`SiteTableServedDetail`); the record is dropped when it names this table
+  ## and kept, as a loss, when it names any other or the host issued none.
+  ##
   ## io-mon-Lossless-Event-Capture M3 — `setRecords` are the DISTINCT records the
   ## consumer decoded from the edge's shared-memory SET (nim-shm-gset) snapshot
   ## (the sole Linux dependency transport; see fs_snoop). They are folded into the
@@ -3497,6 +3529,14 @@ proc mergeFragments*(fragmentDir, outputPath: string;
   let runScope =
     if currentRunId.len > 0: currentRunId else: getEnv("REPRO_MONITOR_SESSION")
   records = dropStaleRunRecords(records, runScope)
+  if acceptedSiteTable.len > 0:
+    var kept = newSeqOfCap[MonitorRecord](records.len)
+    for r in records:
+      if not (r.kind == mrEventLoss and
+          r.detail.startsWith(SiteTableServedDetail & " ") and
+          detailToken(r.detail, "table") == acceptedSiteTable):
+        kept.add r
+    records = move(kept)
   # DA-10 — FOLD THE FACT-SCOPED OBSERVATIONS, whichever transport carried them.
   # The `.iomon-frag` writer has no dedup step at all, so every backend without a
   # set producer wrote one record per observing process; `foldObservationIdentity`

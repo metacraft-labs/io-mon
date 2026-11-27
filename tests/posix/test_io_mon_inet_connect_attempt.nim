@@ -42,6 +42,8 @@
 ## against real sockets owned by this test process. POSIX (Linux + macOS); the
 ## Windows shim's arm is `tests/windows/test_io_mon_windows_ipc_connect.nim`.
 
+import foreign_preload_isolation
+
 import std/[net, os, osproc, sequtils, streams, strtabs, strutils, unittest]
 from std/posix import ECONNREFUSED, ENETUNREACH, EHOSTUNREACH, ETIMEDOUT,
   EACCES, EPERM, EADDRNOTAVAIL, EFAULT, EINVAL, EBADF, ENOTSOCK, EISCONN

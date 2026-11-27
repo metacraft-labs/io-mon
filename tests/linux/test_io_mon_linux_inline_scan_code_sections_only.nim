@@ -43,6 +43,8 @@
 ## x86_64 only: no other architecture has the inline-syscall trap backend.
 ## Mocks: none. Real shim, real host, real linker layout.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon

@@ -3,6 +3,7 @@ param([Parameter(Mandatory = $true)][string]$Target)
 Get-ReleaseDependency 'stackable-hooks-src' 'STACKABLE_HOOKS_SRC'
 Get-ReleaseDependency 'shm-queue-src' 'SHM_QUEUE_SRC'
 Get-ReleaseDependency 'shm-gset-src' 'SHM_GSET_SRC'
+Get-ReleaseDependency 'cli-spec-src' 'CLI_SPEC_SRC'
 $env:IO_MON_BUILD_MODE = 'release'
 $env:IO_MON_SHIM_NIMCACHE_DIR = Join-Path (Get-Location) "build/nimcache/shim-$Target"
 & bash scripts/build_shim.sh @ReleaseFlags

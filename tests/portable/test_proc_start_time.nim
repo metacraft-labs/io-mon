@@ -1,6 +1,8 @@
 ## The strict Linux descendant-prune boundary. No mocks: this exercises the
 ## pure predicate used by the actual /proc scan with exact timestamp values.
 ## Real detached-process and quiescent controls remain in the Linux suite.
+import foreign_preload_isolation
+
 import std/unittest
 import io_mon/proc_start_time
 

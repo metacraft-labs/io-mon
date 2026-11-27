@@ -2,6 +2,8 @@
 ## helper builds this checkout and returns its exact library path, independent
 ## of an enclosing build monitor's REPRO_MONITOR_SHIM_LIB. Build errors remain
 ## fatal in that helper; every capture and completeness assertion stays here.
+import foreign_preload_isolation
+
 import std/[net, os, osproc, sequtils, streams, strtabs, strutils, unittest]
 from std/posix import getuid
 

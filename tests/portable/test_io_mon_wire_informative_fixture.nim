@@ -36,6 +36,8 @@
 ## Pure `io_mon/{types,codec,encode,reader}` — no shim, no shared memory, no
 ## platform API — so this runs on every OS (portable tier).
 
+import foreign_preload_isolation
+
 import std/[os, strutils, unittest]
 
 import io_mon/types

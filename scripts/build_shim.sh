@@ -62,13 +62,68 @@ fi
 
 nim_mode_flags=()
 case "${IO_MON_BUILD_MODE:-debug}" in
-  debug) ;;
-  release) nim_mode_flags+=("-d:release") ;;
+  debug)
+    c_optimisation_level=0
+    ;;
+  release)
+    nim_mode_flags+=("-d:release")
+    c_optimisation_level=3
+    ;;
   *)
     echo "unsupported IO_MON_BUILD_MODE=${IO_MON_BUILD_MODE}; expected debug or release" >&2
     exit 2
     ;;
 esac
+
+# The C compiler's optimisation level and _FORTIFY_SOURCE are stated here,
+# for every shim image, because otherwise the compiler wrapper picks them.
+#
+# nixpkgs' cc-wrapper turns its `fortify`/`fortify3` hardening flags into
+# `-O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=<n>` placed BEFORE the caller's
+# arguments (`hardeningCFlagsBefore` in pkgs/build-support/cc-wrapper/
+# add-hardening.sh), and it reads NIX_HARDENING_ENABLE only for the roles a
+# stdenv shell activates. A debug build passes Nim no `-O` at all, so the
+# same `repro build` produced a shim at -O2 with fortify from a `nix
+# develop` shell and at -O0 without either from a plain shell: the -O0 one
+# crashed on a nim-stackable-hooks raw-syscall defect the -O2 one hid.
+#
+#   * debug is -O0. It is the lane that exposes code relying on what the
+#     optimiser happens to keep in registers, so it stays unoptimised.
+#   * release is -O3, the level Nim's -d:release (--opt:speed) already asks
+#     for; it is restated so the level is read here, not from a config file.
+#   * _FORTIFY_SOURCE is off in both. It has no effect at -O0, so leaving it
+#     to the toolchain in release would make the two lanes call different
+#     libc entry points (`__read_chk` for `read`, ...). The non-Nix
+#     toolchains the shim is also built with never enabled it. It is set to
+#     0 rather than only undefined because Apple's SDK headers define it
+#     themselves when it is absent.
+#
+# The `-O` level is a compiler argument: the wrapper's `-O2` comes before
+# ours, and the last `-O` wins. `_FORTIFY_SOURCE` cannot be settled that way,
+# because the wrapper appends its `-D_FORTIFY_SOURCE=<n>` AFTER the caller's
+# arguments (`hardeningCFlagsAfter`). So `fortify` and `fortify3` are removed
+# from every NIX_HARDENING_ENABLE* variable for the shim's compiles, which
+# also withdraws the wrapper's `-O2`. The other hardening flags are left as
+# the toolchain sets them; they do not change what the code computes.
+#
+# tests/linux/test_io_mon_shim_optimisation_level_is_stated.nim builds the
+# shim with and without the wrapper's fortify hardening and requires the
+# same code from both.
+nim_c_level_flags=(
+  "--passC:-O${c_optimisation_level}"
+  "--passC:-U_FORTIFY_SOURCE"
+  "--passC:-D_FORTIFY_SOURCE=0"
+)
+for hardening_var in ${!NIX_HARDENING_ENABLE@}; do
+  hardening_kept=()
+  for hardening_flag in ${!hardening_var}; do
+    case "$hardening_flag" in
+      fortify|fortify3) ;;
+      *) hardening_kept+=("$hardening_flag") ;;
+    esac
+  done
+  export "$hardening_var=${hardening_kept[*]-}"
+done
 
 # The shim runs on threads it does not own, so it must not own a heap per
 # thread.
@@ -170,6 +225,7 @@ case "${io_mon_host_platform_name}" in
     nim c \
       ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
       ${nim_shim_alloc_flags[@]+"${nim_shim_alloc_flags[@]}"} \
+      ${nim_c_level_flags[@]+"${nim_c_level_flags[@]}"} \
       ${macos_shim_arch_flags[@]+"${macos_shim_arch_flags[@]}"} \
       --app:lib \
       --threads:on \
@@ -183,26 +239,12 @@ case "${io_mon_host_platform_name}" in
       src/io_mon/shim/macos_interpose.nim
     ;;
   linux)
-    # Put --as-needed BEFORE Nim's automatic -lm/-lrt/-ldl/-pthread flags.
-    # Otherwise unused companion libraries from the build host's glibc can
-    # be loaded into an older monitored process and fail its libc ABI checks.
-    # These variables are expanded by Nim when rendering its linker command.
-    # shellcheck disable=SC2016
-    #
-    # `-static-libgcc` keeps that state in force for the `-lpthread` the
-    # driver adds for `-pthread`. Clang links the shared libgcc as
-    # `--as-needed -lgcc_s --no-as-needed`, and that trailing
-    # `--no-as-needed` applies to the `-lpthread -lc` after it, so the dev
-    # shell's Clang recorded libpthread.so.0 as NEEDED although glibc >= 2.34
-    # puts nothing in it. A host `/bin/sh` on an older glibc then loaded the
-    # store's libpthread through RUNPATH and died on its
-    # GLIBC_ABI_DT_X86_64_PLT check. The static libgcc adds code only for
-    # libgcc symbols the shim references; it imports no unwinder today.
-    linux_shim_link_flags=(
-      '--gcc.linkTmpl:-Wl,--as-needed $buildgui $builddll -o $exefile $objfiles $options'
-      '--clang.linkTmpl:-Wl,--as-needed $buildgui $builddll -o $exefile $objfiles $options'
-      '--passL:-static-libgcc'
-    )
+    # The link template that puts --as-needed ahead of Nim's automatic
+    # -lm/-lrt/-ldl/-pthread, and -static-libgcc, are NOT set here: they are
+    # in src/io_mon/shim/linux_preload.nim.cfg, which every compile of the
+    # shim reads, so a consumer that compiles linux_preload.nim without this
+    # script links the same way (that file says why each is needed).
+    linux_shim_link_flags=()
     if getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
       linux_shim_link_flags+=(
         "-d:ioMonGlibcPrivateHeap"
@@ -217,9 +259,76 @@ case "${io_mon_host_platform_name}" in
     linux_private_cache="${linux_cache_parent}/build-${linux_build_id}"
     linux_publish_dir="${out_dir}/.io-mon-publish-${linux_build_id}"
     mkdir "$linux_private_cache" "$linux_publish_dir"
+    # Both directories belong to this run alone: the build id is random, so
+    # no later run reuses the cache, and the publish directory exists only
+    # to stage the image before its atomic rename. Remove them however the
+    # run ends; otherwise every build leaves its object files behind and
+    # every failed or refused link leaves a staged image in the output
+    # directory.
+    linux_discard_private_dirs() {
+      rm -rf -- "$linux_private_cache" "$linux_publish_dir"
+    }
+    trap linux_discard_private_dirs EXIT
+    # No search path of the linker wrapper's making. The shim is LD_PRELOADed
+    # into programs built elsewhere, so its C-runtime dependencies must
+    # resolve through the program that loads it, and ANY DT_RUNPATH on it
+    # stops that: glibc's loader consults the DT_RPATHs of the requesting
+    # object's loaders (the program included) only when the requesting
+    # object has no DT_RUNPATH (ld.so(8),
+    # https://man7.org/linux/man-pages/man8/ld.so.8.html). A program that
+    # finds its own glibc through its DT_RPATH then dies before main with
+    # "libm.so.6: cannot open shared object file". A nixpkgs dev shell adds
+    # two runpaths to every link: the `ld` wrapper's entry for each `-L`
+    # directory, the C runtime's included (NIX_DONT_SET_RPATH=1 stops it),
+    # and stdenv's `-rpath $out/lib` in NIX_LDFLAGS, `$out` being the
+    # nonexistent `<checkout>/outputs/out` (removed with every NIX_LDFLAGS*
+    # variable; the shim's link needs nothing they carry). Both are inert
+    # under other toolchains; the check after the link is the guarantee.
+    #
+    # The wrapper does not read NIX_DONT_SET_RPATH itself. It reads
+    # NIX_DONT_SET_RPATH_<suffix>, <suffix> being its target triple with `-`
+    # and `.` turned into `_`, and its add-flags.sh copies the unsuffixed
+    # value there only for the roles a stdenv shell activates
+    # (NIX_BINTOOLS_WRAPPER_TARGET_{BUILD,HOST,TARGET}_<suffix>). A plain
+    # shell activates none, nor does a `repro` action launched from one, so
+    # there the unsuffixed name alone is ignored and the runpath comes back.
+    # Set the suffixed name too, for every wrapper this link can run: each
+    # names its own suffix in its script, as the guard
+    # NIX_BINTOOLS_WRAPPER_FLAGS_SET_<suffix> (the compiler wrapper sources
+    # the linker wrapper's add-flags.sh under that guard, so the compiler's
+    # script carries the linker's suffix). A suffix no wrapper of this link
+    # reads is harmless, which is why the candidate list may over-approximate.
+    linux_link_env=(NIX_DONT_SET_RPATH=1)
+    linux_link_drivers=(gcc clang cc ld)
+    [ -n "${CC:-}" ] && linux_link_drivers+=("$CC")
+    for linux_arg in "$@"; do
+      # The compiler and linker executables the caller binds explicitly:
+      # `--gcc.exe:gcc`, `--clang.linkerexe:/path/clang`, ...
+      case "$linux_arg" in
+        --*.exe:*|--*.linkerexe:*) linux_link_drivers+=("${linux_arg#*:}") ;;
+      esac
+    done
+    for linux_driver in "${linux_link_drivers[@]}"; do
+      linux_driver_path="$(command -v -- "$linux_driver" 2>/dev/null)" || continue
+      [ -f "$linux_driver_path" ] && [ -r "$linux_driver_path" ] || continue
+      # Wrappers are bash scripts; skip compiled drivers without scanning them.
+      # Bash builtins only: the shim action does not declare grep.
+      IFS= read -r linux_line <"$linux_driver_path" || true
+      [ "${linux_line:0:2}" = '#!' ] || continue
+      while IFS= read -r linux_line || [ -n "$linux_line" ]; do
+        if [[ "$linux_line" =~ NIX_BINTOOLS_WRAPPER_FLAGS_SET_([A-Za-z0-9_]+) ]]; then
+          linux_link_env+=("NIX_DONT_SET_RPATH_${BASH_REMATCH[1]}=1")
+        fi
+      done <"$linux_driver_path"
+    done
+    for linux_ldflags_var in ${!NIX_LDFLAGS@}; do
+      linux_link_env=(-u "$linux_ldflags_var" "${linux_link_env[@]}")
+    done
+    env "${linux_link_env[@]}" \
     nim c \
       ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
       ${nim_shim_alloc_flags[@]+"${nim_shim_alloc_flags[@]}"} \
+      ${nim_c_level_flags[@]+"${nim_c_level_flags[@]}"} \
       ${linux_shim_link_flags[@]+"${linux_shim_link_flags[@]}"} \
       --app:lib \
       --threads:on \
@@ -231,6 +340,20 @@ case "${io_mon_host_platform_name}" in
       --out:"${linux_publish_dir}/librepro_monitor_shim.so" \
       "$@" \
       src/io_mon/shim/linux_preload.nim
+    # Refuse to publish a shim that carries a DT_RUNPATH, whatever it names
+    # (see above). `readelf` names the tag; when it is missing the check is
+    # refused rather than skipped, because a shim with a runpath loads fine
+    # into every program built here and fails only in somebody else's.
+    if ! command -v readelf >/dev/null 2>&1; then
+      echo "build_shim.sh: readelf is not on PATH, so the built shim cannot be checked for a DT_RUNPATH" >&2
+      exit 1
+    fi
+    linux_runpath="$(LC_ALL=C readelf -d -W "${linux_publish_dir}/librepro_monitor_shim.so" |
+      sed -n 's/.*(RUNPATH).*Library runpath: \[\(.*\)\]/\1/p')"
+    if [ -n "$linux_runpath" ]; then
+      echo "build_shim.sh: the built shim carries DT_RUNPATH ${linux_runpath}; a preloaded library must carry none, or programs that find their C runtime through their own DT_RPATH cannot load it. The link must not add one." >&2
+      exit 1
+    fi
     mv --no-copy -f -- "${linux_publish_dir}/librepro_monitor_shim.so" "${out_dir}/librepro_monitor_shim.so"
     rmdir -- "$linux_publish_dir"
     ;;
@@ -247,6 +370,7 @@ case "${io_mon_host_platform_name}" in
     nim c \
       ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
       ${nim_shim_alloc_flags[@]+"${nim_shim_alloc_flags[@]}"} \
+      ${nim_c_level_flags[@]+"${nim_c_level_flags[@]}"} \
       --app:lib \
       --threads:on \
       --mm:orc \
@@ -320,6 +444,7 @@ case "${io_mon_host_platform_name}" in
       nim c \
         ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
         ${nim_shim_alloc_flags[@]+"${nim_shim_alloc_flags[@]}"} \
+        ${nim_c_level_flags[@]+"${nim_c_level_flags[@]}"} \
         --app:lib \
         --threads:on \
         --mm:orc \

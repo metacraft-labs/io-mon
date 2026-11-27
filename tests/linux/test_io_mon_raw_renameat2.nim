@@ -1,6 +1,8 @@
 ## Real filesystem + compiler + production shim; no mocks. The libc arm works
 ## on every supported Linux architecture. x86_64 also exercises deferred inline
 ## classification after both pathname buffers and directory fds have expired.
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, strtabs, strutils, tempfiles, unittest]
 import io_mon
 import build_test_shim

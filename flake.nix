@@ -30,14 +30,25 @@
       # syscall instruction and the return; a CLONE_VM clone forwarded by
       # this shim's syscall(2) replacement no longer writes into its
       # parent's frame when the library is built at -O0.
-      url = "github:metacraft-labs/nim-stackable-hooks/c34e3252d413361a0f250d8921e00c119d30e114";
+      # c34e325 -> 0ada76e (2026-11-25): the Windows on Arm64 backend this
+      # shim's ARM64 build injects and audits with (the ARM64 inline hook,
+      # the ARM64 entry park and borrowed calls), and the root injector's
+      # machine gate: a root no shim of the injecting process can serve,
+      # including a hybrid ARM64X image run as x64, is resumed uninjected
+      # and reported through `monitoringSkipped` instead of failing the
+      # command (reprobuild-pm issue 2026-11-20).
+      # 0ada76e -> ec6b02d (2026-11-25): grandchild propagation applies the
+      # same machine gate (`injectShimIntoChildReport` returns
+      # `ioUnsupportedMachine`), which this shim's spawn hook now relies on
+      # instead of a process-machine check of its own.
+      url = "github:metacraft-labs/nim-stackable-hooks/ec6b02d45180735d08611c5cece842d57f941966";
       flake = false;
     };
     shm-queue-src = {
       # Bumped a3564c13 -> 84fd76b (2026-10-30, `agents`): a new segment file is
       # preallocated, so a full filesystem is ENOSPC at creation instead of
       # SIGBUS at the first header store.
-      url = "github:metacraft-labs/nim-shm-queue/84fd76b174d4868e703ba3d599668ee340e0b6ea";
+      url = "github:metacraft-labs/nim-shm-queue/0d6049997d77421b6e4748f819657cf6042e9508";
       flake = false;
     };
     shm-gset-src = {
@@ -49,7 +60,26 @@
       # Bumped 6333cc9 -> 7bc81ad (`agents`): `emitNoGrow`, the
       # async-signal-safe set insert the Linux shim's inline-syscall loss
       # report uses when no armed-loss file can be created.
-      url = "github:metacraft-labs/nim-shm-gset/7bc81ad2440860a8a9254eb2757c585df9652438";
+      # Bumped 7bc81ad -> 803a4fa (2026-11-27, promotion agents-to-dev-2026-11-26):
+      # the revision reprobuild v0.2.36 (37a109c4, ci-reprobuild.yml's engine)
+      # pins. That engine judges this checkout's ../nim-shm-gset sibling against
+      # its own pin and refuses one behind it ("no acceptable source for
+      # SHM_GSET_SRC"); 803a4fa adds four reader/flatten/insert fixes.
+      url = "github:metacraft-labs/nim-shm-gset/803a4faa23f985ad9697437603436f2f784072be";
+      flake = false;
+    };
+    cli-spec-src = {
+      # The clispec library (the `cli:` description language, its generated
+      # parser and help) the `io-mon` binary's command line is declared in
+      # (`src/io_mon/cli_description.nim`, `src/io_mon/cli.nim`). A leaf
+      # library: it depends on nothing but the standard library. fcd5b30 was
+      # the first revision with `clispec/splice` (`cliUnbound`), which the
+      # description uses. 6e0b4e7 (2026-11-27, promotion
+      # agents-to-dev-2026-11-26) is the revision reprobuild v0.2.36
+      # (37a109c4), which mounts the same description, pins: completion,
+      # errors and program fixes on top of fcd5b30, without the API change of
+      # f1abde5. That engine refuses a ../nim-cli-spec sibling behind its pin.
+      url = "github:metacraft-labs/nim-cli-spec/6e0b4e78d96c4118103f2be571e1edd6ff0c938d";
       flake = false;
     };
   };
@@ -183,6 +213,19 @@
                 extraPackages = map (p: if p.outPath == crt.outPath then patched else p) old.extraPackages;
               }
           );
+          # A C compiler that targets musl, for
+          # tests/linux/test_io_mon_linux_shim_refuses_non_glibc.nim. A CROSS
+          # compiler (it runs on glibc, targets musl), not pkgsMusl's native
+          # one: a musl-hosted gcc cannot start under a glibc LD_PRELOAD, such
+          # as a command tracer that re-injects itself into every child. The
+          # test only compiles, so the compiler's own host libc is irrelevant.
+          muslTestCc =
+            if system == "x86_64-linux" then
+              "${pkgs.pkgsCross.musl64.stdenv.cc}/bin/x86_64-unknown-linux-musl-gcc"
+            else if system == "aarch64-linux" then
+              "${pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc}/bin/aarch64-unknown-linux-musl-gcc"
+            else
+              null;
           # The dev shell's `cc`/`clang`, and so the sanitizer arm's, is
           # darwinSanitizerCc on Darwin.
           mkDevShell =
@@ -223,6 +266,7 @@
               STACKABLE_HOOKS_SRC = "${inputs.stackable-hooks-src}/src";
               SHM_QUEUE_SRC = "${inputs.shm-queue-src}/src";
               SHM_GSET_SRC = "${inputs.shm-gset-src}/src";
+              CLI_SPEC_SRC = "${inputs.cli-spec-src}/src";
 
               postPatch = ''
                 patchShebangs scripts/build_shim.sh
@@ -256,6 +300,15 @@
               mkdir -p "$out/bin"
               ln -s ${pkgs.pkgsi686Linux.bash}/bin/bash "$out/bin/io-mon-test-i686-sh"
             '';
+          }
+          // pkgs.lib.optionalAttrs (system == "x86_64-linux" || system == "aarch64-linux") {
+            # A musl C compiler, for the test that the Linux shim refuses a
+            # libc other than glibc. A distinct name keeps it from shadowing
+            # the glibc `gcc` every other edge compiles with.
+            io-mon-test-musl-cc = pkgs.runCommand "io-mon-test-musl-cc" { } ''
+              mkdir -p "$out/bin"
+              ln -s ${muslTestCc} "$out/bin/io-mon-test-musl-cc"
+            '';
           };
 
           devShells.default = mkDevShell {
@@ -267,6 +320,7 @@
             RELEASE_STACKABLE_HOOKS_SRC = "${inputs.stackable-hooks-src}/src";
             RELEASE_SHM_QUEUE_SRC = "${inputs.shm-queue-src}/src";
             RELEASE_SHM_GSET_SRC = "${inputs.shm-gset-src}/src";
+            RELEASE_CLI_SPEC_SRC = "${inputs.cli-spec-src}/src";
             # A dynamically linked 32-bit (i686) shell. glibc's loader refuses a
             # 64-bit LD_PRELOAD object in it ("wrong ELF class: ignored") and
             # runs it anyway, so it is the canonical image the shim cannot
@@ -275,6 +329,10 @@
             # there) and skips on every other system, where it is empty.
             IO_MON_TEST_I686_SH =
               if system == "x86_64-linux" then "${pkgs.pkgsi686Linux.bash}/bin/bash" else "";
+            # A musl C compiler. tests/linux/test_io_mon_linux_shim_refuses_non_glibc.nim
+            # requires it on x86_64-linux and aarch64-linux (a missing value
+            # fails that test there) and skips elsewhere, where it is empty.
+            IO_MON_TEST_MUSL_CC = if muslTestCc == null then "" else "${muslTestCc}";
             # Paired workspace editing keeps using siblings. Release scripts
             # explicitly select the immutable inputs exported above.
             shellHook = ''
@@ -298,6 +356,13 @@
                   export SHM_GSET_SRC="$(cd ../nim-shm-gset/src && pwd)"
                 else
                   export SHM_GSET_SRC="$RELEASE_SHM_GSET_SRC"
+                fi
+              fi
+              if [ -z "''${CLI_SPEC_SRC:-}" ]; then
+                if [ -d ../nim-cli-spec/src ]; then
+                  export CLI_SPEC_SRC="$(cd ../nim-cli-spec/src && pwd)"
+                else
+                  export CLI_SPEC_SRC="$RELEASE_CLI_SPEC_SRC"
                 fi
               fi
             '';

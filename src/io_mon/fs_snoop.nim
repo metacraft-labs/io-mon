@@ -41,6 +41,7 @@ when defined(linux) or defined(windows) or defined(macosx):
 when defined(linux):
   import std/[algorithm, monotimes, posix, sequtils]
   import io_mon/tree_ledger
+  import io_mon/inline_site_table
   from io_mon/proc_start_time import predatesRoot
   import io_mon/exec_image_injectability
 
@@ -619,6 +620,97 @@ when defined(windows):
 # the monitored action re-runs — never a fabricated/false "captured nothing"
 # skip. Coverage only ever makes MORE of the tree observable; it never makes a
 # previously-correct capture wrong.
+
+# The /usr/bin names ``populateAppleToolchainDropIns`` drops in (macOS only).
+# Declared here, outside the macOS block, so a test on any POSIX host can
+# check which names the set covers.
+const AppleToolchainDropIns* = [
+  # Apple's own toolchain, reached at the path Apple already installs it at.
+  # Each of these also exists under /usr/bin as a tiny `xcode_select` SHIM
+  # (`/usr/bin/cc` is 118 KB and signed `com.apple.dt.xcode_select.tool-shim-public`);
+  # the shim is SIP-protected, so exec'ing it strips DYLD_INSERT_LIBRARIES
+  # and the real compiler it then exec's never sees the shim library either.
+  # The compiler ITSELF lives under the active developer directory, outside
+  # every SIP prefix, and is signed with `flags=0x0(none)` — no hardened
+  # runtime, no library validation — so it takes the injection normally.
+  #
+  # Measured: `bash -c '/usr/bin/cc --version'` under the monitor reports one
+  # unknown-scope loss; with `usr/bin/cc` dropped in as a symlink to
+  # `xcrun -f clang` it reports none. On a dev-env activation that one loss
+  # was the difference between a provider compile that publishes to the
+  # action cache and one that recompiles on every new shell (20.5 s).
+  #
+  # `gcc` and `g++` are the same `xcode_select` shims, and builds reach them:
+  # reprobuild's C conventions run a bare `gcc`, and a Nix dev shell's clang
+  # wrapper provides `cc` and `clang` but not `gcc`, so `gcc` resolves to
+  # `/usr/bin/gcc`. Without a drop-in that root keeps its SIP path, the
+  # capture reports an unknown-scope loss, and the edge is never cached.
+  # What their drop-ins run is `appleToolchainExecTarget`'s concern.
+  "cc", "clang", "c++", "clang++", "gcc", "g++", "cpp",
+  "ld", "as", "ar", "nm", "strip", "lipo", "libtool",
+]
+
+func appleToolchainExecTarget*(name: string): string =
+  ## The developer-directory tool the drop-in for ``/usr/bin/<name>`` runs:
+  ## ``name`` itself, except for ``gcc`` and ``g++``.
+  ##
+  ## ``xcrun -f gcc`` names ``<developer dir>/usr/bin/gcc`` (``g++`` is a
+  ## symlink to it), in an Xcode.app selection and a Command Line Tools one
+  ## alike. That file is not a compiler but a 51-101 KB trampoline signed
+  ## ``com.apple.gcc``: it runs ``/usr/bin/xcode-select -print-path`` and then
+  ## execs ``/usr/bin/xcrun clang`` (``clang++`` when called as ``g++``).
+  ## Both are SIP binaries, so a drop-in that execs the trampoline loses the
+  ## injection one exec later; the capture then reports the trampoline's
+  ## exec as one without a post-exec process start, and the compile goes
+  ## unobserved. The drop-in therefore runs what the trampoline ends up
+  ## running, the toolchain's ``clang`` / ``clang++``. That is the same
+  ## compiler, not a substitute: measured on macOS 26.5 (Xcode 26.6 and
+  ## Command Line Tools selections), ``gcc -### -c x.c`` and
+  ## ``xcrun clang -### -c x.c`` print identical command lines, as do
+  ## ``g++`` and ``xcrun clang++``.
+  case name
+  of "gcc": "clang"
+  of "g++": "clang++"
+  else: name
+
+proc renderAppleToolchainDropIn*(shell, tool, defaultSdk: string): string =
+  ## The body of one Apple toolchain drop-in (see
+  ## ``populateAppleToolchainDropIns``): a POSIX shell script, run by the
+  ## non-SIP ``shell``, that applies the environment the ``xcode_select`` shim
+  ## at ``/usr/bin/<tool>`` would have applied and then execs ``tool``, the
+  ## compiler, linker or assembler that shim would have exec'd.
+  ##
+  ## What the shim applies, measured through ``/usr/bin/xcrun env`` (the same
+  ## code path) with Xcode 26.6 selected on macOS 26.5; a Command Line Tools
+  ## selection has not been measured:
+  ##
+  ## * ``SDKROOT`` unset or empty: ``SDKROOT`` becomes the active developer
+  ##   directory's default SDK (``xcrun --show-sdk-path``), and
+  ##   ``/usr/local/include`` / ``/usr/local/lib`` are APPENDED to ``CPATH`` /
+  ##   ``LIBRARY_PATH``, keeping any value already there in front.
+  ## * ``SDKROOT`` set: it is kept, and nothing else changes.
+  ##
+  ## The toolchain binaries have no built-in SDK of their own, so without the
+  ## first case a compile run with ``SDKROOT`` unset cannot find
+  ## ``<stdlib.h>``. ``defaultSdk`` is that default SDK, resolved once by the
+  ## caller. A non-path ``SDKROOT`` (an SDK *name* such as ``macosx``, which
+  ## xcrun would turn into a path) is passed through unchanged; resolving it
+  ## would mean running xcrun inside the monitored action.
+  ##
+  ## Platform-neutral so the shell semantics can be exercised on any POSIX
+  ## host; only macOS populates drop-ins with it.
+  result = "#!" & shell & "\n" &
+    "# io-mon Apple toolchain drop-in. Generated; do not edit.\n" &
+    "# Applies the SDK selection of the /usr/bin xcode_select shim, then\n" &
+    "# execs the toolchain binary that shim would have run.\n" &
+    "if [ -z \"${SDKROOT:-}\" ]; then\n" &
+    "  SDKROOT=" & quoteShellPosix(defaultSdk) & "\n" &
+    "  CPATH=\"${CPATH:+$CPATH:}/usr/local/include\"\n" &
+    "  LIBRARY_PATH=\"${LIBRARY_PATH:+$LIBRARY_PATH:}/usr/local/lib\"\n" &
+    "  export SDKROOT CPATH LIBRARY_PATH\n" &
+    "fi\n" &
+    "exec " & quoteShellPosix(tool) & " \"$@\"\n"
+
 when defined(macosx):
   import stackable_hooks/propagation as ct_propagation
   # The macOS tree-lifetime guard's census. Its DECISIONS stay in
@@ -723,34 +815,19 @@ when defined(macosx):
       return candidate
     ""
 
-  const appleToolchainDropIns = [
-    # Apple's own toolchain, reached at the path Apple already installs it at.
-    # Each of these also exists under /usr/bin as a tiny `xcode_select` SHIM
-    # (`/usr/bin/cc` is 118 KB and signed `com.apple.dt.xcode_select.tool-shim-public`);
-    # the shim is SIP-protected, so exec'ing it strips DYLD_INSERT_LIBRARIES
-    # and the real compiler it then exec's never sees the shim library either.
-    # The compiler ITSELF lives under the active developer directory, outside
-    # every SIP prefix, and is signed with `flags=0x0(none)` — no hardened
-    # runtime, no library validation — so it takes the injection normally.
-    #
-    # Measured: `bash -c '/usr/bin/cc --version'` under the monitor reports one
-    # unknown-scope loss; with `usr/bin/cc` dropped in as a symlink to
-    # `xcrun -f clang` it reports none. On a dev-env activation that one loss
-    # was the difference between a provider compile that publishes to the
-    # action cache and one that recompiles on every new shell (20.5 s).
-    "cc", "clang", "c++", "clang++", "cpp",
-    "ld", "as", "ar", "nm", "strip", "lipo", "libtool",
-  ]
-
   proc resolveAppleToolchainTool*(name: string): string =
     ## Exported for the test that asserts the resolved path is outside every
     ## SIP prefix — the one property the whole mechanism rests on, and one that
     ## cannot be observed from the outside without re-running `xcrun`.
     ##
-    ## Absolute path of ``name`` inside the ACTIVE developer directory, via
-    ## ``xcrun -f``. That is the only correct resolver: the toolchain path
-    ## depends on `xcode-select -p` (Xcode.app vs CommandLineTools) and on the
-    ## selected toolchain, and hardcoding either spelling breaks on the other.
+    ## Absolute path, inside the ACTIVE developer directory, of the binary
+    ## the ``/usr/bin/<name>`` shim ends up running: ``xcrun -f`` of
+    ## ``appleToolchainExecTarget(name)``, which is ``name`` itself except
+    ## for ``gcc`` / ``g++`` (whose developer-directory entry is a trampoline
+    ## back into ``/usr/bin/xcrun clang``; see there). ``xcrun -f`` is the
+    ## only correct resolver: the toolchain path depends on
+    ## `xcode-select -p` (Xcode.app vs CommandLineTools) and on the selected
+    ## toolchain, and hardcoding either spelling breaks on the other.
     ##
     ## ``xcrun`` itself is SIP-protected, which does not matter: this runs in
     ## the monitor host at populate time, not inside a monitored action — the
@@ -758,8 +835,8 @@ when defined(macosx):
     ## developer's own PATH.
     var resolved = ""
     try:
-      let probe = execCmdEx("/usr/bin/xcrun -f " & quoteShell(name) &
-        " 2>/dev/null")
+      let probe = execCmdEx("/usr/bin/xcrun -f " &
+        quoteShell(appleToolchainExecTarget(name)) & " 2>/dev/null")
       if probe.exitCode != 0:
         return ""
       resolved = probe.output.strip()
@@ -773,20 +850,114 @@ when defined(macosx):
       return ""
     resolved
 
+  proc resolveAppleDefaultSdk(): string =
+    ## The SDK the ``/usr/bin`` shims select when the environment names none:
+    ## the active developer directory's default, ``xcrun --show-sdk-path``
+    ## with ``SDKROOT`` removed from the probe's environment (an ``SDKROOT``
+    ## inherited by the monitor host says nothing about the action, whose
+    ## own ``SDKROOT``, if any, the drop-in honours at run time).
+    ##
+    ## Empty when there is no developer directory or no SDK in it.
+    var resolved = ""
+    try:
+      let probe = execCmdEx("/usr/bin/env -u SDKROOT /usr/bin/xcrun " &
+        "--show-sdk-path 2>/dev/null")
+      if probe.exitCode != 0:
+        return ""
+      resolved = probe.output.strip()
+    except CatchableError, Defect:
+      return ""
+    if resolved.len == 0 or not resolved.isAbsolute or
+        not dirExists(extendedPath(resolved)):
+      return ""
+    resolved
+
+  proc resolveAppleDropInShell(sandboxDir: string): string =
+    ## A non-SIP POSIX shell to run the drop-in scripts, by canonical path.
+    ## The shebang must name it directly: the kernel, not the shim, resolves
+    ## a script's interpreter, so a ``#!/bin/sh`` would run the SIP shell,
+    ## strip the injection, and leave the compile it then execs unobserved.
+    ## The sandbox's own ``/bin/sh`` drop-in, the operator bundle and the
+    ## shipped bundle are tried first (``resolveSipReplacement``), then the
+    ## caller's ``PATH``, as ``populateReproSandboxTools`` does. Empty when
+    ## there is none.
+    var candidates: seq[string] = @[]
+    let replacement = ct_propagation.resolveSipReplacement("/bin/sh",
+      sandboxDir)
+    if replacement != "/bin/sh":
+      candidates.add(replacement)
+    candidates.add(findNonSipAlternative("sh"))
+    candidates.add(findNonSipAlternative("bash"))
+    for candidate in candidates:
+      if candidate.len == 0 or
+          not ct_propagation.isValidSipReplacement(candidate):
+        continue
+      try:
+        let canonical = expandFilename(candidate)
+        # A path with whitespace cannot be named on a `#!` line.
+        if canonical.len > 0 and not canonical.contains({' ', '\t', '\n'}):
+          return canonical
+      except OSError:
+        discard
+    ""
+
+  # Separates the staging names of concurrent populates of one sandbox: an
+  # operator's CT_SANDBOX_TOOLS_DIR is shared by every monitor that names it,
+  # including monitors running concurrently in this process.
+  var dropInStagingNonce: Atomic[uint64]
+
+  proc writeAppleToolchainDropIn(destPath, body: string): bool =
+    ## Write one drop-in script, executable, or report failure. The file is
+    ## written beside its final name and renamed into place, so a monitored
+    ## process that resolves the drop-in never execs a partial script, and a
+    ## concurrent populate never writes into this one's staging file.
+    let nonce = dropInStagingNonce.fetchAdd(1'u64) + 1'u64
+    let staging = destPath & ".partial-" & $getCurrentProcessId() & "-" &
+      $nonce
+    try:
+      writeFile(extendedPath(staging), body)
+      setFilePermissions(extendedPath(staging), {fpUserRead, fpUserWrite,
+        fpUserExec, fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
+      moveFile(extendedPath(staging), extendedPath(destPath))
+      true
+    except OSError, IOError:
+      try:
+        removeFile(extendedPath(staging))
+      except OSError:
+        discard
+      false
+
   proc populateAppleToolchainDropIns*(sandboxDir: string) =
-    ## Symlink each Apple toolchain tool into the sandbox at its /usr/bin
+    ## Drop each Apple toolchain tool into the sandbox at its /usr/bin
     ## spelling, so ``rewriteSipPath("/usr/bin/cc", dir)`` resolves.
     ##
-    ## These are SYMLINKS TO APPLE'S OWN BINARY, which is what makes this
-    ## sound where a substitution would not be: the monitored action runs the
-    ## same compiler, linker and assembler it would have run through the shim,
-    ## with the same SDK resolution and the same defaults. Nothing about the
-    ## build changes; only whether we can see it. Substituting a DIFFERENT
-    ## compiler (a nixpkgs clang, say) would change what gets built, and is
-    ## deliberately not what happens here.
+    ## Each drop-in runs APPLE'S OWN BINARY, the one the shim would have
+    ## exec'd, which is what makes this sound where a substitution would not
+    ## be: the monitored action runs the same compiler, linker and assembler
+    ## it would have run through the shim, with the same SDK resolution and
+    ## the same defaults. Nothing about the build changes; only whether we can
+    ## see it. Substituting a DIFFERENT compiler (a nixpkgs clang, say) would
+    ## change what gets built, and is deliberately not what happens here.
+    ##
+    ## "The same SDK resolution" is the reason a drop-in is a script and not
+    ## a symlink. The shim sets ``SDKROOT`` before exec'ing the toolchain
+    ## binary, and that binary has no default SDK of its own: a symlink
+    ## straight to it, run with ``SDKROOT`` unset (as an action environment
+    ## that scrubs ``SDKROOT`` runs it), fails on the first libc header. The
+    ## script applies what the shim applies (``renderAppleToolchainDropIn``)
+    ## and then execs the binary. The default SDK path in it is resolved once
+    ## here. The SDK stays visible to the monitor the ordinary way: the
+    ## compiler opens its headers and the linker its stubs, and those reads
+    ## are recorded like any other.
     ##
     ## Absent toolchain, absent entry: a host with no developer directory
     ## simply gets no drop-in, exactly as for any other unresolvable tool.
+    ## With a toolchain but no SDK, the drop-in is a plain symlink: there is
+    ## no SDK for it to carry, and the shim would supply none either. With an
+    ## SDK but no non-SIP shell to run the script, the tool gets no drop-in:
+    ## its exec then goes through the shim, which builds correctly but
+    ## unobserved, and the capture reports that loss instead of a compile
+    ## that cannot find its headers.
     if sandboxDir.len == 0:
       return
     let destDir = sandboxDir / "usr" / "bin"
@@ -794,17 +965,30 @@ when defined(macosx):
       createDir(extendedPath(destDir))
     except OSError, IOError:
       return
-    for name in appleToolchainDropIns:
+    var sdkResolved = false
+    var defaultSdk = ""
+    var shell = ""
+    for name in AppleToolchainDropIns:
       let destPath = destDir / name
       if fileExists(destPath) or symlinkExists(destPath):
         continue
       let resolved = resolveAppleToolchainTool(name)
       if resolved.len == 0:
         continue
-      try:
-        createSymlink(resolved, destPath)
-      except OSError, IOError:
-        discard
+      if not sdkResolved:
+        # Once per populate, and only when some tool needs a drop-in.
+        sdkResolved = true
+        defaultSdk = resolveAppleDefaultSdk()
+        if defaultSdk.len > 0:
+          shell = resolveAppleDropInShell(sandboxDir)
+      if defaultSdk.len == 0:
+        try:
+          createSymlink(resolved, destPath)
+        except OSError, IOError:
+          discard
+      elif shell.len > 0:
+        discard writeAppleToolchainDropIn(destPath,
+          renderAppleToolchainDropIn(shell, resolved, defaultSdk))
 
   proc populateReproSandboxTools(sandboxDir: string) =
     ## Drop in a non-SIP instance of every entry in ``reproSandboxBinaries``
@@ -953,13 +1137,44 @@ when defined(macosx):
     if command.len > 1:
       result.add(command[1 .. ^1])
 
-type
-  ParsedFsSnoopCommand = object
-    inspectMode: bool
-    inspectPath: string
-    inspectFormat: string
-    request: FsSnoopRequest
-    depfileWasExplicit: bool
+  proc rewriteRootCommandForSip(command: seq[string];
+                                sandboxDir: string): seq[string] =
+    ## The monitored ROOT's spawn boundary. The shim's spawn hook rewrites
+    ## every SIP-protected exec *inside* the monitored tree to its non-SIP
+    ## drop-in, but the root is spawned here, by the host, where no hook
+    ## runs. So the same rewrite is applied to the root itself:
+    ##
+    ## * ``command[0]`` (after PATH resolution, as ``posix_spawnp`` would
+    ##   resolve it) is itself a SIP-protected executable — ``/bin/sh``,
+    ##   ``/bin/cat``, ``/usr/bin/env`` … — so the kernel would strip
+    ##   ``DYLD_INSERT_LIBRARIES`` and the root, with its whole tree, would
+    ##   run unobserved. It is replaced by the drop-in the propagation
+    ##   resolver names (``resolveSipReplacement``: this invocation's
+    ##   sandbox, then ``STACKABLE_HOOKS_TOOLS_DIR``, then the shipped
+    ##   bundle), keeping the remaining arguments.
+    ## * otherwise ``command[0]`` may be a script whose shebang names a SIP
+    ##   interpreter; ``rewriteScriptCommandForSip`` handles that.
+    ##
+    ## A SIP root with no valid replacement (for itself or, for a script, for
+    ## its interpreter) keeps its original path, so the
+    ## merge's missing-root accounting still reports the run incomplete:
+    ## a root the monitor cannot observe fails closed rather than being
+    ## spawned some other way.
+    if command.len == 0 or sandboxDir.len == 0:
+      return command
+    let resolved = resolveExecutableInPath(command[0])
+    if resolved.len > 0 and ct_propagation.isSipProtected(resolved):
+      let replacement = ct_propagation.resolveSipReplacement(resolved,
+        sandboxDir)
+      if replacement != resolved:
+        result = @[replacement]
+        if command.len > 1:
+          result.add(command[1 .. ^1])
+        return
+    # Not SIP, or SIP without a drop-in of its own: a SIP-protected script
+    # (``/usr/bin/<tool>`` with ``#!/bin/sh``) is still observable through
+    # its interpreter's drop-in.
+    rewriteScriptCommandForSip(command, sandboxDir)
 
 # DH-1 — ATOMIC, because `runMonitored` is now a concurrently-callable host API.
 # Two monitors racing in one process must not be handed the same scratch name;
@@ -968,14 +1183,18 @@ type
 var tempDirNonce: Atomic[uint64]
 tempDirNonce.store(uint64(getCurrentProcessId()))
 
-proc createLocalTempDir(prefix: string): string =
+proc createLocalTempDir*(prefix: string): string =
+  ## A fresh directory under the temporary directory, named `<prefix>-<pid>-
+  ## <time>-<nonce>` so concurrent callers in one process never share one.
+  ## Exported for the CLI (`io_mon/cli`), which keeps a `run` without
+  ## `--depfile` in such a directory.
   let nonce = tempDirNonce.fetchAdd(1'u64) + 1'u64
   let now = getTime()
   result = getTempDir() / (prefix & "-" & $getCurrentProcessId() & "-" &
     $now.toUnix & "-" & $now.nanosecond & "-" & $nonce)
   createDir(extendedPath(result))
 
-proc removeLocalTempDir(path: string) =
+proc removeLocalTempDir*(path: string) =
   ## Recursive deletion can race a recently-exited Windows producer or a file
   ## scanner that briefly holds a fragment without delete sharing. Cleanup must
   ## not replace the monitored command's result after evidence was finalized.
@@ -1009,7 +1228,10 @@ proc removeLocalTempDir(path: string) =
   else:
     removeDir(extendedPath(path))
 
-proc parseOutputMode(value: string): FsSnoopOutputMode =
+proc parseOutputMode*(value: string): FsSnoopOutputMode =
+  ## Decode a `--format` (`--events`) value of `io-mon run`: `none`, `text`,
+  ## `jsonl`, `binary` or its synonym `binary-stream`. The CLI declares the
+  ## same five values, so its parser refuses anything else first.
   case value
   of "none":
     fsoNone
@@ -1022,7 +1244,7 @@ proc parseOutputMode(value: string): FsSnoopOutputMode =
   else:
     raise newException(ValueError, "unsupported event mode: " & value)
 
-proc parseInterestFlag(value: string): set[EventCategory] =
+proc parseInterestFlag*(value: string): set[EventCategory] =
   ## Decode `--interest`'s value — the SAME comma-separated token vocabulary
   ## `REPRO_MONITOR_INTEREST` uses (`file-reads`, `path-probes`, `file-writes`,
   ## `proc`, `lib`, `env`, `entropy`, `ambient`, plus the pre-DA-5 aliases
@@ -1042,7 +1264,7 @@ proc parseInterestFlag(value: string): set[EventCategory] =
   ## which `normalizeInterest` already turns into "capture everything", so every
   ## caller that does not pass the flag keeps EXACTLY the behaviour it has today
   ## — `io-mon run`, the `run`-less legacy form, and every embedder of
-  ## `runFsSnoopCli`. The cost is that a consumer wanting a reduced set must SAY
+  ## `io_mon/cli.runFsSnoopCli`. The cost is that a consumer wanting a reduced set must SAY
   ## so on every invocation; that is the right way round, because the failure
   ## mode of forgetting is over-capture (a slower, larger, still-honest
   ## dependency set) and never under-capture (a missing input under
@@ -1117,7 +1339,7 @@ proc parseInterestFlag(value: string): set[EventCategory] =
       " (expected a comma-separated subset of " &
       interestToTokens(FullInterest) & ")")
 
-proc parseEvidenceScopeFlag(value: string): EvidenceScope =
+proc parseEvidenceScopeFlag*(value: string): EvidenceScope =
   ## Decode `--evidence`'s value — the SAME token vocabulary
   ## `REPRO_MONITOR_EVIDENCE` and the depfile's `evidence=` stamp use
   ## (`full`, `reads-only`), so the CLI, the env channel and the wire format are
@@ -1141,7 +1363,7 @@ proc parseEvidenceScopeFlag(value: string): EvidenceScope =
   ## AN EMPTY VALUE IS REFUSED TOO, AND IN THE SCOPE VOCABULARY. `--evidence=`
   ## and `--evidence ""` are not the absent flag: the operator WROTE the flag and
   ## named no scope, so the honest diagnostic is the one this flag owns rather
-  ## than the parser's generic "unsupported fs-snoop argument", which told them
+  ## than a generic "unsupported argument" refusal, which told them
   ## the flag does not exist when in fact only the value was missing. BOTH
   ## spellings, because the two forms of every other flag here mean the same
   ## thing and a diagnostic that depended on which one was typed would be its own
@@ -1173,169 +1395,6 @@ proc parseEvidenceScopeFlag(value: string): EvidenceScope =
       "--evidence names no known evidence scope: " & value &
       " (expected one of " & evidenceScopeToken(esFull) & ", " &
       evidenceScopeToken(esReadsOnly) & ")")
-
-proc requireValue(args: seq[string]; index: var int; flag: string): string =
-  if index + 1 >= args.len:
-    raise newException(ValueError, flag & " requires a value")
-  inc index
-  args[index]
-
-proc splitFlagValue(arg, flag: string): string =
-  let prefix = flag & "="
-  if arg.startsWith(prefix):
-    arg[prefix.len .. ^1]
-  else:
-    ""
-
-proc parseInspect(args: seq[string]): ParsedFsSnoopCommand =
-  if args.len < 2:
-    raise newException(ValueError, "inspect requires an iomon path")
-  result.inspectMode = true
-  result.inspectPath = args[1]
-  result.inspectFormat = "text"
-  var i = 2
-  while i < args.len:
-    let arg = args[i]
-    case arg
-    of "--format":
-      result.inspectFormat = requireValue(args, i, "--format")
-    of "--events":
-      result.inspectFormat = requireValue(args, i, "--events")
-    else:
-      let formatValue = splitFlagValue(arg, "--format")
-      if formatValue.len > 0:
-        result.inspectFormat = formatValue
-      else:
-        raise newException(ValueError, "unsupported inspect argument: " & arg)
-    inc i
-
-proc parseRun(args: seq[string]): ParsedFsSnoopCommand =
-  result.inspectMode = false
-  result.request.streamMode = fsoNone
-  result.request.passthroughChildStdout = true
-  result.request.passthroughChildStderr = true
-
-  var i = 0
-  var commandStart = -1
-  while i < args.len:
-    let arg = args[i]
-    if arg == "--":
-      commandStart = i + 1
-      break
-    case arg
-    of "--depfile":
-      result.request.depFilePath = requireValue(args, i, "--depfile")
-      result.depfileWasExplicit = true
-    of "--events":
-      result.request.streamMode = parseOutputMode(requireValue(args, i, "--events"))
-    of "--format":
-      result.request.streamMode = parseOutputMode(requireValue(args, i, "--format"))
-    of "--event-stream":
-      result.request.eventStreamPath = requireValue(args, i, "--event-stream")
-    of "--interest":
-      # The consumer's event-interest categories. Without this the request
-      # carried `{}` -> `FullInterest` and `childEnv` then wrote that over
-      # whatever `REPRO_MONITOR_INTEREST` the caller had put in this process's
-      # environment, because the injection deliberately wins over any inherited
-      # value. So an out-of-process consumer had NO way to ask for a reduced
-      # set: the env channel is the shim's, not the CLI's. See
-      # `parseInterestFlag` for the absent-flag semantics.
-      result.request.interest =
-        parseInterestFlag(requireValue(args, i, "--interest"))
-    of "--evidence":
-      # DA-1i — how much of what the monitor observes gets written down.
-      # `--evidence=reads-only` records only lookups that FOUND something.
-      # HAZARD, named here because an operator choosing this flag is accepting a
-      # specific one: a file ADDED that shadows one earlier in a search path
-      # will NOT invalidate the action, so `repro build` can report "up to date"
-      # while the previous artefacts were compiled against the shadowed file.
-      # Modified and deleted inputs are still detected. This is ninja's own
-      # stale-build failure mode, reproduced deliberately so the two evidence
-      # models can be compared like for like.
-      result.request.evidenceScope =
-        parseEvidenceScopeFlag(requireValue(args, i, "--evidence"))
-    of "--capture-stdio":
-      # Flag form (no value) — turn capture on; subsequent
-      # ``--capture-stdio-path=…`` controls where the captured bytes
-      # are written.
-      result.request.captureChildStdio = true
-    of "--capture-stdio-path":
-      result.request.captureStdioPath = requireValue(args, i,
-        "--capture-stdio-path")
-      result.request.captureChildStdio = true
-    else:
-      let depValue = splitFlagValue(arg, "--depfile")
-      let eventsValue = splitFlagValue(arg, "--events")
-      let formatValue = splitFlagValue(arg, "--format")
-      let streamValue = splitFlagValue(arg, "--event-stream")
-      let interestValue = splitFlagValue(arg, "--interest")
-      let evidenceValue = splitFlagValue(arg, "--evidence")
-      # PRESENCE, not a non-empty value — for BOTH flags whose parser gives the
-      # empty value a MEANING of its own. `splitFlagValue` cannot tell
-      # `--interest=` / `--evidence=` (the flag written with no value) from an
-      # argument that is not that flag at all, so dispatching on
-      # `value.len > 0` sends the empty form to the catch-all, where it is
-      # refused as an "unsupported fs-snoop argument" — telling the operator the
-      # flag does not exist when only its value was missing.
-      #
-      # The arm decides only WHO ANSWERS; the two flags then answer differently,
-      # and that is the point rather than an inconsistency.
-      # `parseInterestFlag("")` widens to `FullInterest` (an empty value means
-      # the same as an absent flag — the documented back-compat rule, and
-      # `--interest` names a SET, of which the empty one is a legal value);
-      # `parseEvidenceScopeFlag("")` refuses in the scope vocabulary (there is
-      # no empty scope). MEASURED at the binary before this: `--interest ""`
-      # exited 0 and stamped full interest while `--interest=` exited 1 with
-      # "unsupported fs-snoop argument: --interest=", so one flag had two
-      # meanings decided by which spelling was typed — and the rule the graded
-      # case is named after held for only one of them.
-      #
-      # The other value-bearing flags here (`--depfile`, `--events`,
-      # `--format`, `--event-stream`, `--capture-stdio-path`) are deliberately
-      # NOT presence-dispatched: an empty path or an empty output mode is not a
-      # value their parsers give a meaning to, so there is nothing for them to
-      # answer and the generic refusal is the end of the matter.
-      let interestGiven = arg.startsWith("--interest=")
-      let evidenceGiven = arg.startsWith("--evidence=")
-      let stdioPathValue = splitFlagValue(arg, "--capture-stdio-path")
-      if depValue.len > 0:
-        result.request.depFilePath = depValue
-        result.depfileWasExplicit = true
-      elif eventsValue.len > 0:
-        result.request.streamMode = parseOutputMode(eventsValue)
-      elif formatValue.len > 0:
-        result.request.streamMode = parseOutputMode(formatValue)
-      elif streamValue.len > 0:
-        result.request.eventStreamPath = streamValue
-      elif interestGiven:
-        result.request.interest = parseInterestFlag(interestValue)
-      elif evidenceGiven:
-        result.request.evidenceScope = parseEvidenceScopeFlag(evidenceValue)
-      elif stdioPathValue.len > 0:
-        result.request.captureStdioPath = stdioPathValue
-        result.request.captureChildStdio = true
-      else:
-        raise newException(ValueError, "unsupported fs-snoop argument: " & arg)
-    inc i
-
-  if commandStart < 0 or commandStart >= args.len:
-    raise newException(ValueError, "missing command; use -- <command> [args...]")
-  result.request.command = args[commandStart .. ^1]
-
-proc parseFsSnoopCommand(args: seq[string]): ParsedFsSnoopCommand =
-  if args.len > 0 and args[0] == "inspect":
-    parseInspect(args)
-  elif args.len > 0 and args[0] == "run":
-    # Accept an explicit ``run`` subcommand so the snoop grammar reads
-    # ``io-mon run --depfile <out> -- <command>`` (the verb form the
-    # standalone CLI and the CodeTracer runner's live-capture call site use),
-    # while still supporting the bare ``--depfile … -- <command>`` form for
-    # backward compatibility with reprobuild's ``repro internal io monitor`` which
-    # dispatched the verb itself before delegating. The ``run`` token is
-    # stripped before the option parser sees it.
-    parseRun(args[1 .. ^1])
-  else:
-    parseRun(args)
 
 proc ensureParentDir(path: string) =
   let parent = parentDir(path)
@@ -1454,6 +1513,19 @@ proc addHostEnvEntry(dest: StringTableRef; key, value: string) =
 const ChildEnvMode =
   when defined(windows): modeCaseInsensitive else: modeCaseSensitive
 
+proc unsetEnvHas(names: openArray[string]; key: string;
+                 mode: StringTableMode): bool =
+  ## Is `key` one of the host names `FsSnoopRequest.unsetEnv` removes? Compared
+  ## the way the child's table compares names, so Windows folds case and POSIX
+  ## keeps it.
+  for name in names:
+    if mode == modeCaseInsensitive:
+      if cmpIgnoreCase(name, key) == 0:
+        return true
+    elif name == key:
+      return true
+  false
+
 proc childEnv(request: FsSnoopRequest;
               injected: openArray[(string, string)];
               mode: StringTableMode = ChildEnvMode): StringTableRef =
@@ -1491,7 +1563,12 @@ proc childEnv(request: FsSnoopRequest;
   result = newStringTable(mode)
   if not request.isolateEnv:
     for key, value in envPairs():
-      addHostEnvEntry(result, key, value)
+      # `unsetEnv` removes host names before anything is layered, so a name the
+      # caller removes is absent and a name it also sets comes from `env`. Only
+      # the host copy is filtered: the injection below still wins, and no
+      # needle is ever copied in from anywhere but this loop.
+      if not unsetEnvHas(request.unsetEnv, key, mode):
+        addHostEnvEntry(result, key, value)
   for (key, value) in request.env:
     result[key] = value
   for (key, value) in injected:
@@ -1756,6 +1833,11 @@ type
                                ## descendants — see `liveInjectedDescendants`.
                                ## `0` means "unknown", which disables the skip
                                ## and restores the exhaustive sweep.
+      siteTableFd: cint        ## This host's descriptor of the sealed inline
+                               ## site table it names to the tree, -1 (or 0
+                               ## in a default handle, never opened) when none.
+      siteTableIdentity: string ## `<dev>:<ino>` of that table: the only table
+                               ## whose served-records the merge accepts.
       rootUninjectable: bool   ## The root image is one the loader will not
                                ## preload the shim into, and that loss is
                                ## already published: its shim init cannot have
@@ -2015,6 +2097,9 @@ proc releaseMonitor(h: var MonitorHandle) =
     return
   h.active = false
   when defined(linux):
+    if h.siteTableFd > 0:
+      discard posix.close(h.siteTableFd)
+      h.siteTableFd = -1
     if h.depSetLive:
       h.depSetLive = false
       # Announce the consumer is gone (a late orphan `emit` then fast-fails with
@@ -2130,16 +2215,16 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
       spawnEnv["REPRO_MONITOR_INTEREST"] = interestToShimTokens(FullInterest)
       # Keep the requesting child's public evidence scope unchanged.
 
-    # SIP shebang bypass: if the target is a shell script whose
-    # interpreter (``#!/bin/sh`` etc.) lives under a SIP-protected
-    # prefix, ``posix_spawnp`` would let the kernel re-exec into the
-    # SIP-protected interpreter, stripping ``DYLD_INSERT_LIBRARIES`` so
-    # the shim never loads. Rewriting the invocation to the non-SIP
-    # sandbox interpreter (typically a symlink to a Nix or Homebrew
-    # shell, dropped into ``CT_SANDBOX_TOOLS_DIR`` by
-    # ``populateReproSandboxTools``) sidesteps that strip — the shim
-    # loads in the interpreter and observes the script's reads/writes.
-    let effectiveCommand = rewriteScriptCommandForSip(request.command,
+    # SIP root bypass: if the root is itself a SIP-protected executable
+    # (``/bin/sh -c …``), or a script whose interpreter (``#!/bin/sh``
+    # etc.) lives under a SIP-protected prefix, ``posix_spawnp`` would
+    # exec — directly or through the kernel's shebang re-exec — a SIP
+    # image, stripping ``DYLD_INSERT_LIBRARIES`` so the shim never loads
+    # anywhere in the tree. Rewriting the invocation to the non-SIP
+    # drop-in (typically a symlink to a Nix or Homebrew tool, dropped into
+    # ``CT_SANDBOX_TOOLS_DIR`` by ``populateReproSandboxTools``) sidesteps
+    # that strip, exactly as the shim's spawn hook does for descendants.
+    let effectiveCommand = rewriteRootCommandForSip(request.command,
       sandboxDir)
     let childArgs =
       if effectiveCommand.len > 1:
@@ -2227,6 +2312,25 @@ proc startMonitorInner(h: var MonitorHandle; request: FsSnoopRequest) =
         # host owning the whole structure lifecycle, not just naming it.
         injected.add ("REPRO_MONITOR_APP_ID", depSetAppId)
     injected.add ("REPRO_MONITOR_SHIM_LIB", shimLib)
+    # The inline site table, when the caller supplied a usable one: opened by
+    # THIS process, checked to be sealed and of this build's scanner, and named
+    # to the tree through this process's own descriptor, so what the tree
+    # reads cannot change while it runs. A table the host cannot use is not
+    # named at all: the shim then decodes every image, as without one.
+    h.siteTableFd = -1
+    when defined(amd64):
+      if request.inlineSiteTables.len > 0:
+        let fd = posix.open(cstring(request.inlineSiteTables),
+                            O_RDONLY or O_CLOEXEC)
+        if fd >= 0:
+          let identity = sealedSiteTableIdentity(fd)
+          if identity.ok:
+            h.siteTableFd = fd
+            h.siteTableIdentity = $identity.dev & ":" & $identity.ino
+            injected.add (SiteTableEnv,
+              "/proc/" & $getCurrentProcessId() & "/fd/" & $fd)
+          else:
+            discard posix.close(fd)
     let spawnEnv = childEnv(request, injected)
     if h.nestedCapture.active:
       # Observe the enclosing run's full evidence before the existing inner
@@ -2530,7 +2634,8 @@ proc collectMonitorEvidence(h: var MonitorHandle): MonitorDepFile =
       expectedRootPid = h.rootPid, currentRunId = h.runId,
       setRecords = depDrained,
       observedInterest = normalizeInterest(h.request.interest),
-      observedEvidenceScope = h.request.evidenceScope)
+      observedEvidenceScope = h.request.evidenceScope,
+      acceptedSiteTable = h.siteTableIdentity)
   elif defined(windows):
     var launcherRecords: seq[MonitorRecord] = @[]
     if h.injection.monitoringSkipped:
@@ -2733,40 +2838,3 @@ proc runMonitored*(request: FsSnoopRequest): MonitorResult =
   ## `request.cwd` is not thread-safe there. Linux forks and `chdir`s in the
   ## child and Windows passes `lpCurrentDirectory`, so both are.
   finishMonitor(startMonitor(request))
-
-proc runFsSnoopCli*(programName: string; args: seq[string]): int =
-  try:
-    var parsed = parseFsSnoopCommand(args)
-    if parsed.inspectMode:
-      echo renderMonitorDepFile(parsed.inspectPath, parsed.inspectFormat)
-      return 0
-
-    var tempRoot = ""
-    if parsed.request.depFilePath.len == 0:
-      tempRoot = createLocalTempDir("repro-fs-snoop")
-      parsed.request.depFilePath = tempRoot / "evidence.iomon"
-    try:
-      # The CLI is a thin wrapper over the public batch host API — no duplicated
-      # lifecycle. `runMonitored` owns the shm/consumer setup; we only surface
-      # its exit code (the depfile it wrote is inspected out-of-band).
-      result = runMonitored(parsed.request).exitCode
-    finally:
-      if tempRoot.len > 0:
-        # Best-effort cleanup. On Windows the monitor shim's lingering
-        # handles (file-handle reuse, deferred delete on close) can
-        # leave directory entries that the regular ``removeDir`` cannot
-        # immediately unlink — Windows reports "the directory is not
-        # empty" even when the rdep / metadata files have already been
-        # opened+closed cleanly. Surfacing that as an action failure
-        # masks the underlying build's actual exit status (the cargo
-        # build that just succeeded), so suppress the diagnostic and
-        # let the OS reap the temp tree on the next scratch sweep. The
-        # temp directory's contents are evidence-only and never
-        # cross-process consumed.
-        try:
-          removeLocalTempDir(tempRoot)
-        except OSError:
-          discard
-  except CatchableError as err:
-    stderr.writeLine(programName & ": error: " & err.msg)
-    result = 1

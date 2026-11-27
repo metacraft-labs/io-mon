@@ -57,6 +57,8 @@
 ##
 ## Pure `io_mon/{types,codec,encode,reader}` — portable tier, every OS.
 
+import foreign_preload_isolation
+
 import std/[options, os, unittest]
 
 import io_mon/types

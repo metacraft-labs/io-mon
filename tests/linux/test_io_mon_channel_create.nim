@@ -40,6 +40,8 @@
 ## No mocks: the live `LD_PRELOAD` shim is rebuilt from source and the assertions
 ## read the canonical depfile the monitor writes.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon
@@ -238,3 +240,149 @@ suite "io-mon Linux channel-create records (IoMon-Pipeline-Capture IM-3)":
     let created = channelKeys(dep, "localfd", "create")
     check consumed.anyIt(it in created)
     check consumed.anyIt(it notin created)
+
+## A monitored client that creates its own TCP connection (`socket`)
+## and reads the connecting end through descriptor 0. Descriptor 0 is open when
+## the shim initialises, so the read is classified as an INHERITED descriptor
+## and records `chan=opaque role=read` with the socket's (dev,ino) — exactly
+## what bash's `read -r line <&4` does after `exec 4<>/dev/tcp/…`. The only
+## thing that can pair it is a `chan=localfd role=create` for the same object,
+## which needs a hook on `socket`.
+const selfSocketSrc = """
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+int main(int argc, char **argv) {
+  /* AF_UNIX: the kernel names the peer (SO_PEERCRED), so the connect itself
+   * is judged in-tree and the only open question is the read's pairing. */
+  int l = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (l < 0 || argc < 2) return 1;
+  struct sockaddr_un a;
+  memset(&a, 0, sizeof a);
+  a.sun_family = AF_UNIX;
+  strncpy(a.sun_path, argv[1], sizeof a.sun_path - 1);
+  unlink(argv[1]);
+  if (bind(l, (struct sockaddr *)&a, sizeof a) != 0) return 2;
+  if (listen(l, 1) != 0) return 3;
+  int c = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (c < 0) return 5;
+  if (connect(c, (struct sockaddr *)&a, sizeof a) != 0) return 6;
+  int s = accept(l, NULL, NULL);
+  if (s < 0) return 7;
+  if (write(s, "hello\n", 6) != 6) return 8;
+  /* Read the connecting end (made by socket(2)) through the inherited
+   * descriptor number 0, as bash does for `read <&4`. */
+  if (dup2(c, 0) != 0) return 9;
+  char buf[16];
+  ssize_t n = read(0, buf, sizeof buf);
+  return n == 6 ? 0 : 10;
+}
+"""
+
+suite "io-mon Linux channel-create records for connected sockets":
+  let work = getTempDir() / ("io-mon-chan-create-sock-" & $getCurrentProcessId())
+  createDir(work)
+
+  test "self_created_socket_read_through_inherited_fd_number_does_not_downgrade":
+    let snoopBin = ensureSnoop(work)
+    let shimLib = ensureShim()
+    let client = buildC(work, "self_socket_client", selfSocketSrc)
+    let depfile = work / "self-socket.iomon"
+
+    let cap = run(snoopBin, @["run", "--depfile", depfile, "--", client,
+      work / "self.sock"], monitorEnv(shimLib))
+    checkpoint(cap.output)
+    check cap.code == 0
+
+    let dep = readMonitorDepFile(depfile)
+
+    # The read really was an opaque channel read (else the next checks are
+    # vacuous), and it is paired with an in-tree create of the same object.
+    let consumed = channelKeys(dep, "opaque", "read")
+    check consumed.len >= 1
+    let created = channelKeys(dep, "localfd", "create")
+    for key in consumed:
+      check key in created
+
+    check externalLosses(dep).len == 0
+    check dep.completeness == mcComplete
+
+## A bound-only UDP socket read through fd 0, fed by a sender OUTSIDE the
+## monitored tree. No connect is ever made, so no peer is judged and nothing
+## may pair the read: it must still downgrade. This pins that the create is
+## recorded at `connect`, not at `socket(2)`.
+const boundUdpSrc = """
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+int main(int argc, char **argv) {
+  int u = socket(AF_INET, SOCK_DGRAM, 0);
+  if (u < 0 || argc < 3) return 1;
+  struct sockaddr_in a;
+  memset(&a, 0, sizeof a);
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  a.sin_port = htons((unsigned short)atoi(argv[1]));
+  if (bind(u, (struct sockaddr *)&a, sizeof a) != 0) return 2;
+  /* argv[3] == "unspec": connect(AF_UNSPEC) dissolves a datagram socket's peer
+   * and returns 0 without naming any peer, so it must not count as one. */
+  if (argc > 3) {
+    struct sockaddr un;
+    memset(&un, 0, sizeof un);
+    un.sa_family = AF_UNSPEC;
+    if (connect(u, &un, sizeof un) != 0) return 6;
+  }
+  /* Signal readiness, then block until the out-of-tree sender delivers. */
+  FILE *f = fopen(argv[2], "w"); if (!f) return 3; fputs("ready", f); fclose(f);
+  if (dup2(u, 0) != 0) return 4;
+  char buf[64];
+  ssize_t n = read(0, buf, sizeof buf);
+  return n > 0 ? 0 : 5;
+}
+"""
+
+suite "io-mon Linux socket(2) alone records no create":
+  let work = getTempDir() / ("io-mon-chan-create-udp-" & $getCurrentProcessId())
+  createDir(work)
+
+  for unspec in [false, true]:
+   test "bound_udp_socket_fed_from_outside_the_tree_still_downgrades" &
+       (if unspec: "_after_connect_af_unspec" else: ""):
+    let snoopBin = ensureSnoop(work)
+    let shimLib = ensureShim()
+    let client = buildC(work, "bound_udp_client", boundUdpSrc.replace(
+      "#include <stdio.h>", "#include <stdio.h>\n#include <stdlib.h>"))
+    let depfile = work / ("bound-udp" & $unspec & ".iomon")
+    let ready = work / ("udp" & $unspec & ".ready")
+    let port = if unspec: "47614" else: "47613"
+    removeFile(ready)
+
+    let p = startProcess(snoopBin, args = @["run", "--depfile", depfile, "--",
+      client, port, ready] & (if unspec: @["unspec"] else: @[]), env = monitorEnv(shimLib),
+      options = {poStdErrToStdOut})
+    var waited = 0
+    while not fileExists(ready) and waited < 200:
+      sleep(50)
+      inc waited
+    check fileExists(ready)
+    # The sender is this test process: outside the monitored tree.
+    let sender = run("python3", @["-c",
+      "import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);" &
+      "s.sendto(b'OUT_OF_TREE_SECRET',('127.0.0.1'," & port & "))"])
+    check sender.code == 0
+    check p.waitForExit() == 0
+    p.close()
+
+    let dep = readMonitorDepFile(depfile)
+    let consumed = channelKeys(dep, "opaque", "read")
+    check consumed.len >= 1
+    let created = channelKeys(dep, "localfd", "create")
+    for key in consumed:
+      check key notin created
+    check externalLosses(dep).len == 1
+    check dep.completeness == mcIncomplete

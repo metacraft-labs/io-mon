@@ -62,6 +62,8 @@
 ## cannot be obtained any other way — it is built from this repo's own sources by
 ## this repo's own compiler, differing by one deleted gate.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strtabs, strutils, unittest]
 
 import io_mon
@@ -71,12 +73,20 @@ const
   workspaceRoot = repoRoot.parentDir()
   fixtureC = repoRoot / "tests" / "fixtures" / "evidence_scope_tool" /
     "evidence_scope_tool.c"
-  GateAnchor = """
-  if not recordInEvidenceScope(gEvidenceScope, record):
-    return
-"""
-    ## The evidence gate in `emitRecord`, verbatim. If this ever stops matching,
-    ## the test FAILS rather than silently building a shim that still gates.
+  GateCondition = "  if not recordInEvidenceScope(gEvidenceScope, record):\n"
+    ## The evidence gate's `if` line in `publishRecord`, verbatim.
+  GateBody = "    return false\n"
+    ## The gate's body, verbatim. `publishRecord` returns `bool` (whether the
+    ## record was published), so the gate answers `false`. Deleting the gate
+    ## leaves the rest of `publishRecord` to run and answer `true`, which is
+    ## exactly what a shim built before the gate existed did.
+  GateAnchor = GateCondition & GateBody
+    ## The whole evidence gate, verbatim: what the copy has deleted. If this
+    ## ever stops matching, the test FAILS rather than silently building a shim
+    ## that still gates. The condition and the body are counted separately so
+    ## the failure says WHICH of them changed: a changed body (as when
+    ## `emitRecord` became `publishRecord` and the bare `return` became
+    ## `return false`) is reported as such instead of as a bare count of 0.
   Misses = 200
     ## Must match `EVIDENCE_SCOPE_MISSES` in the fixture.
 
@@ -107,8 +117,19 @@ suite "io-mon evidence-scope filter on the host (DA-1i, older shim)":
 
     let preload = repoCopy / "src" / "io_mon" / "shim" / "linux_preload.nim"
     let before = readFile(preload)
+    let conditions = before.count(GateCondition)
     let occurrences = before.count(GateAnchor)
+    checkpoint("gate condition occurrences in the copied shim: " & $conditions)
     checkpoint("gate anchor occurrences in the copied shim: " & $occurrences)
+    if conditions != 1:
+      checkpoint("the evidence gate's `if` line (GateCondition) must occur " &
+        "exactly once in linux_preload.nim; the gate was moved, renamed or " &
+        "duplicated, so update GateCondition to it")
+    elif occurrences != 1:
+      checkpoint("the evidence gate's `if` line is present but is not " &
+        "followed by GateBody (" & GateBody.strip() & "); the gate's body " &
+        "changed, so update GateBody to it")
+    require conditions == 1
     require occurrences == 1
     writeFile(preload, before.replace(GateAnchor,
       "  # OLDER SHIM (test fixture): the DA-1i evidence gate does not exist.\n"))

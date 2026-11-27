@@ -32,6 +32,8 @@
 ## Falsifiable: dropping any field from `decodeDepRecord` (verified in review by
 ## breaking `childOsPid`/`flags` in a scratch copy) fails the matching `check`.
 
+import foreign_preload_isolation
+
 import std/[strutils, unittest]
 
 import io_mon/types

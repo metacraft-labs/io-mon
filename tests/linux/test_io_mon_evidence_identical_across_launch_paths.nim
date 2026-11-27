@@ -120,6 +120,8 @@
 ##      demands the two paths agree on a NON-ZERO status, which is where a
 ##      divergence would actually show.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, sequtils, streams, strutils, tables, unittest]
 
 import io_mon                            # the PUBLIC host API

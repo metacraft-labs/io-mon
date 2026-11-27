@@ -15,6 +15,8 @@
 ## of the fragment (`decodeFramesTolerant` drops it + flags the fragment
 ## dirty). Either failure mode reopens the M9.R.61 residual.
 
+import foreign_preload_isolation
+
 import std/[os, streams, tempfiles, unittest]
 
 when defined(posix):

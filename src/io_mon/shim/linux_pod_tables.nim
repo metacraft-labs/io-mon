@@ -48,6 +48,15 @@ const
   ptrMapMask = ptrMapCap - 1
   observedCap = 32768        # must be power of two
   observedMask = observedCap - 1
+  # The resolution-observation dedup set (`podResolutionSeen`): one entry per
+  # distinct probe the realpath/readlink replay emitted in this process. A
+  # compile emits a few hundred; the cap bounds the memory a process that
+  # resolves far more can pin, and a lookup scans at most
+  # `resolutionMaxScan` slots, so a full or clustered table costs a bounded
+  # scan and then EMITS (never skips) the observation.
+  resolutionCap = 16384      # must be power of two
+  resolutionMask = resolutionCap - 1
+  resolutionMaxScan = 64
   fdBitWords = fdPathCap div 8
 
 type
@@ -74,6 +83,10 @@ var
   dirMap: PtrPathMap
   streamMap: PtrPathMap
   observed: ObservedSet
+  # Guarded by `observed.lock`, which already covers the other dedup set, so
+  # the fork-child lock audit (`podTablesLocksFree`) needs no new lock.
+  resolutionKeys: array[resolutionCap, cstring]  # libc-malloc'd; nil == empty
+  resolutionHashes: array[resolutionCap, uint]
 
   fdSetLock: Lock
   emptyFdBits: array[fdBitWords, uint8]
@@ -328,6 +341,68 @@ proc podObservedInsertIsNew*(key: cstring): bool {.raises: [].} =
       inc observed.count
   release(observed.lock)
   newlyInserted
+
+# ── resolution-observation dedup set (grow-only, bounded scan) ──────────
+#
+# Monitor-Hook-Shim.md §"Resolution evidence", "Each observation once per
+# process". The realpath/readlink replay records the same directories again
+# for every path a process resolves under them (a compiler canonicalising
+# each header walks its include directories each time). A repeat whose key is
+# identical is the same SET element the transport already holds, so the shim
+# skips building and publishing it. The key holds everything the record's
+# element key varies by within one process (outcome, path, detail), so a
+# component that changed between two walks answers a different key and is
+# recorded again.
+
+proc resolutionFind(key: cstring; n: int; h: uint): int {.raises: [].} =
+  ## Under `observed.lock`: the slot holding `key` (>= 0), or `-1 - free`
+  ## where `free` is the first empty slot within the scan bound, or
+  ## `low(int)` when the bound is reached with neither.
+  var idx = int(h and uint(resolutionMask))
+  for _ in 0 ..< resolutionMaxScan:
+    let held = resolutionKeys[idx]
+    if held == nil:
+      return -1 - idx
+    if resolutionHashes[idx] == h and cstrEq(held, key, n):
+      return idx
+    idx = (idx + 1) and resolutionMask
+  low(int)
+
+proc podResolutionSeen*(key: cstring): bool {.raises: [].} =
+  ## Whether this process already published the resolution observation
+  ## `key` (`podResolutionRemember`). False for a key never remembered, and
+  ## for every key once the table cannot place it, so a caller that skips on
+  ## true never skips an observation it did not publish.
+  if key == nil:
+    return false
+  var n = 0
+  while key[n] != '\0': inc n
+  let h = fnv1a(key, n)
+  acquire(observed.lock)
+  result = resolutionFind(key, n, h) >= 0
+  release(observed.lock)
+
+proc podResolutionRemember*(key: cstring) {.raises: [].} =
+  ## Record that the observation `key` was published. Call only after the
+  ## record reached the transport: a key remembered for a record that was
+  ## not published would suppress that fact. A table that cannot place the
+  ## key (bound reached, or out of memory) leaves it unremembered, so the
+  ## next repeat is emitted again: a duplicate, never a loss.
+  if key == nil:
+    return
+  var n = 0
+  while key[n] != '\0': inc n
+  let h = fnv1a(key, n)
+  acquire(observed.lock)
+  let found = resolutionFind(key, n, h)
+  if found < 0 and found != low(int):
+    let slot = -1 - found
+    var cn = 0
+    let copy = dupCString(key, cn)
+    if copy != nil:
+      resolutionHashes[slot] = h
+      resolutionKeys[slot] = copy
+  release(observed.lock)
 
 # ── fd bitsets: emptyFdClassified + inheritedOpenFds ────────────────────
 

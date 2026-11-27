@@ -27,6 +27,8 @@
 ## and exports the right ABI, which is the strongest standalone-relocation proof
 ## runnable on a build host.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, strutils, tempfiles, unittest]
 
 const

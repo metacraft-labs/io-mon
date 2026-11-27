@@ -16,6 +16,8 @@
 ## un-bookkeeped — a kill-before-flush in the child on any of those
 ## cycles went silently un-detected.
 
+import foreign_preload_isolation
+
 import std/[os, tempfiles, unittest]
 
 import io_mon

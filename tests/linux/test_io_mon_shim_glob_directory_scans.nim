@@ -54,6 +54,8 @@
 ##
 ## Mocks: none. Real programs, real shim, real directories.
 
+import foreign_preload_isolation
+
 import std/[algorithm, os, osproc, sequtils, streams, strtabs, strutils,
   unittest]
 

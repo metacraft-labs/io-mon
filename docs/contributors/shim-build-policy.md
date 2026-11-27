@@ -41,6 +41,32 @@ Windows build keeps `--mm:orc`, and its trace settings are unchanged.
 - `--mm:arc` — deterministic reference counting, no background cycle-collector
   thread; more C-like than `orc`. The shim's data has no reference cycles.
 - `--threads:on` — required: the shim records from every host thread.
+- **C optimisation level `-O0` in debug (`IO_MON_BUILD_MODE=debug`, the
+  default) and `-O3` in release, with `_FORTIFY_SOURCE` off in both** — stated
+  by `scripts/build_shim.sh` for every shim image, never left to the compiler
+  wrapper. nixpkgs' cc-wrapper turns its `fortify`/`fortify3` hardening flags
+  into `-O2` plus `_FORTIFY_SOURCE`, and applies them only where a stdenv
+  shell has activated its roles, so before this rule the same `repro build`
+  compiled the debug shim at -O2 from `nix develop` and at -O0 from a plain
+  shell. The -O0 build crashed on a nim-stackable-hooks raw-syscall defect
+  (a `CLONE_VM` child overwrote its parent's stack frame) that the -O2 build
+  hid. The debug lane therefore stays at -O0 everywhere: it is the lane that
+  catches code relying on what the optimiser keeps in registers. Fortify is
+  off because it does nothing at -O0, so enabling it only in release would
+  give the two lanes different libc entry points (`__read_chk` for `read`);
+  the non-Nix toolchains never enabled it. The wrapper appends its
+  `-D_FORTIFY_SOURCE=<n>` after the caller's arguments, so the script removes
+  `fortify`/`fortify3` from `NIX_HARDENING_ENABLE*` instead of overriding the
+  macro; the wrapper's other hardening flags stay as the toolchain sets them.
+  `tests/linux/test_io_mon_shim_optimisation_level_is_stated.nim` builds the
+  shim in both modes with and without the wrapper's fortify hardening and
+  requires identical code, no fortified libc imports, and the mode's level as
+  the last `-O` of every C compile Nim lists (`--listCmd`).
+- **Each Linux build's private compiler cache and staging directory are
+  removed when `scripts/build_shim.sh` exits**, whether the build succeeded,
+  failed to compile, or was refused for carrying a `DT_RUNPATH`. Both are
+  named by a random build id, so no later build reuses them; kept, they piled
+  up one object tree per build and one staged image per failed build.
 
 On Linux, a successful exec in a `vfork` child cannot unwind Nim trace frames.
 The suspended parent shares the child's TLS, so retaining `framePtr` can leave
@@ -70,9 +96,18 @@ the file's header and `tests/linux/test_io_mon_shim_private_heap.nim`. Other
 platforms retain their existing allocation path.
 
 Linux builds also enable linker `--as-needed` before Nim's automatic system
-library arguments. The shim must not carry unused libc companion libraries:
+library arguments, so the shim's DT_NEEDED is `libc.so.6` and the loader and
+nothing else. The shim must not carry unused libc companion libraries:
 a Nix RUNPATH can otherwise load a newer libm/librt/libdl/libpthread beside an
-older executable's libc and fail before the program starts. The link also
+older executable's libc and fail before the program starts, and a program that
+finds its own C runtime through its DT_RUNPATH cannot resolve them at all,
+because a program's DT_RUNPATH serves only its own direct dependencies, never
+a preloaded library's. Both settings live in
+`src/io_mon/shim/linux_preload.nim.cfg` (as `gcc.linkTmpl` / `clang.linkTmpl`
+and `--passL`), not in `scripts/build_shim.sh`, so a consumer that compiles
+`linux_preload.nim` itself, such as Reprobuild's own shim build, links the
+same way; `tests/linux/test_io_mon_shim_needs_only_the_c_runtime.nim` checks
+both routes. The link also
 uses `-static-libgcc`: Clang links the shared libgcc as
 `--as-needed -lgcc_s --no-as-needed`, which switched `--as-needed` off for the
 `-lpthread` that `-pthread` adds, so a Clang-built shim recorded an empty

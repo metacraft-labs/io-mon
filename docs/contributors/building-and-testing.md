@@ -80,8 +80,8 @@ after a task exception.
 `repro build .#test-monitor-isolation --write-report=build/monitor-isolation-repeat.json`
 reruns the programs whose fixture must own its monitor environment. Their
 compilation stays monitored and their execution stays uncached. CI requires
-all selected programs to launch and succeed on the repeat: 51 on macOS
-(every `tests/macos` program plus eight named ones), 27 on Linux and eleven
+all selected programs to launch and succeed on the repeat: 53 on macOS
+(every `tests/macos` program plus eight named ones), 28 on Linux and eleven
 on Windows. Update that explicit inventory when adding an isolated program,
 including a new `tests/macos` program, which is isolated by directory; keep
 the complete report among failure artifacts.
@@ -90,7 +90,15 @@ The Linux uninjectable-image oracle also owns its shim: its disabled-thread
 controls require an unnamed loss, which an enclosing monitor changes by
 recording the same entry by name. Its execute edge therefore follows the
 same non-cacheable isolation policy and declares both the ELF editor and,
-on x86_64, the real i686 shell it needs.
+on x86_64, the real i686 shell it needs. Its `system(3)` and `popen(3)`
+cases need `/bin/sh` itself to be that i686 shell, so they bind-mount it over
+`/bin/sh` inside an unprivileged user and mount namespace. On a host that
+refuses unprivileged user namespaces they report an explicit skip. They
+need no outer preload either: an enclosing shim that exports its own
+`system` or `popen` (agent-harbor's command-trace shim does) routes the shell
+through the public `posix_spawn`, where the posix_spawn hook already reports
+it, so those cases would pass without the fix they guard. The
+foreign-preload isolation described below removes that shim.
 
 A Linux test that runs a bare (shim-free) control, or loads a shim under test
 into its own children, must be in the isolation list (`isolatesMonitor` in
@@ -122,6 +130,36 @@ its `CreateProcessW` hook. The borrowed call then fails with
 that only runs with an MSYS2 or Cygwin `sh` can hide this for a long time:
 it skips wherever `sh` has no `msys-2.0.dll` beside it, as Git for Windows'
 `bin/sh.exe` launcher does not.
+
+### Tests run without agent-harbor's command-trace shim
+
+In an agent-harbor session every process carries agent-harbor's
+command-trace shim (`libah_command_trace_shim.so`). It adds itself to the
+`LD_PRELOAD` of every child again, whatever environment the parent passes,
+unless `AH_CMDTRACE_DISABLE_AUTO_PROPAGATION` was set when the shim was
+initialised. A test run from such a session (by `just test`, `repro test` or a
+bare `nim c -r`) would measure two interposers: its bare controls are not
+bare, and its own I/O, locks and memory show up in what the test measures.
+Eleven tests failed that way alone on agent-harbor-cli 0.6.17.
+
+So every test in `tests/portable/`, `tests/posix/` and `tests/linux/` starts
+with
+
+```nim
+import foreign_preload_isolation
+```
+
+before any other import. On Linux, when the shim is mapped into the test
+process, the module sets the switch, removes the shim from `LD_PRELOAD` and
+re-execs the test (twice: the first re-exec still gets the shim back, with
+propagation now off). Other `LD_PRELOAD` entries, such as the outer monitor
+`repro test` chose, are kept. Outside an agent session it does nothing. It
+does nothing on other operating systems either. If the shim is still mapped
+after two re-execs, the test stops with a message instead of running.
+`tests/portable/test_live_tests_isolate_foreign_preloads.nim` fails for a test
+file that does not import it first, and
+`tests/linux/test_io_mon_foreign_preload_isolation.nim` tests the module itself
+against a stand-in, and against the real shim when it is loaded.
 
 At `40a0adc` plus the workflow inventory repair, the macOS repeat passes all
 137 actions and launches all 45 isolated programs. The previous expectation

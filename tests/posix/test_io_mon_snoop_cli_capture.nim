@@ -20,6 +20,8 @@
 ## interpose-vs-body-patch contrast lives in
 ## `tests/macos/test_io_mon_macos_bodypatch.nim`.)
 
+import foreign_preload_isolation
+
 import std/[os, osproc, streams, strtabs, strutils, unittest]
 
 import io_mon  # readMonitorDepFile, MonitorObservationKind, findShimLibrary

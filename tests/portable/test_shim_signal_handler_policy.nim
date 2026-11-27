@@ -17,6 +17,8 @@
 ##
 ## No mocks.
 
+import foreign_preload_isolation
+
 import std/[os, osproc, strutils, unittest]
 
 const shimDir = currentSourcePath().parentDir().parentDir().parentDir() /
