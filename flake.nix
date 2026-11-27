@@ -60,18 +60,26 @@
       # Bumped 6333cc9 -> 7bc81ad (`agents`): `emitNoGrow`, the
       # async-signal-safe set insert the Linux shim's inline-syscall loss
       # report uses when no armed-loss file can be created.
-      url = "github:metacraft-labs/nim-shm-gset/7bc81ad2440860a8a9254eb2757c585df9652438";
+      # Bumped 7bc81ad -> 803a4fa (2026-11-27, promotion agents-to-dev-2026-11-26):
+      # the revision reprobuild v0.2.36 (37a109c4, ci-reprobuild.yml's engine)
+      # pins. That engine judges this checkout's ../nim-shm-gset sibling against
+      # its own pin and refuses one behind it ("no acceptable source for
+      # SHM_GSET_SRC"); 803a4fa adds four reader/flatten/insert fixes.
+      url = "github:metacraft-labs/nim-shm-gset/803a4faa23f985ad9697437603436f2f784072be";
       flake = false;
     };
     cli-spec-src = {
       # The clispec library (the `cli:` description language, its generated
       # parser and help) the `io-mon` binary's command line is declared in
       # (`src/io_mon/cli_description.nim`, `src/io_mon/cli.nim`). A leaf
-      # library: it depends on nothing but the standard library. fcd5b30 is
+      # library: it depends on nothing but the standard library. fcd5b30 was
       # the first revision with `clispec/splice` (`cliUnbound`), which the
-      # description uses, and the revision reprobuild pins, which mounts the
-      # same description.
-      url = "github:metacraft-labs/nim-cli-spec/fcd5b309c2cb38656d8d2c3b39a7c4e72b5dfb3a";
+      # description uses. 6e0b4e7 (2026-11-27, promotion
+      # agents-to-dev-2026-11-26) is the revision reprobuild v0.2.36
+      # (37a109c4), which mounts the same description, pins: completion,
+      # errors and program fixes on top of fcd5b30, without the API change of
+      # f1abde5. That engine refuses a ../nim-cli-spec sibling behind its pin.
+      url = "github:metacraft-labs/nim-cli-spec/6e0b4e78d96c4118103f2be571e1edd6ff0c938d";
       flake = false;
     };
   };

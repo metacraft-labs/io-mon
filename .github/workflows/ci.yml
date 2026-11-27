@@ -322,9 +322,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: metacraft-labs/nim-shm-gset
-          # Same revision as .github/sibling-repos and shm-gset-src in flake.nix:
-          # src/io_mon/writer.nim calls `emitNoGrow`, which arrived in 7bc81ad2.
-          ref: 7bc81ad2440860a8a9254eb2757c585df9652438
+          # Same revision as .github/sibling-repos and shm-gset-src in flake.nix
+          # (src/io_mon/writer.nim calls `emitNoGrow`, which arrived in 7bc81ad2).
+          ref: 803a4faa23f985ad9697437603436f2f784072be
           path: nim-shm-gset
           token: ${{ steps.app-token.outputs.token }}
       - uses: actions/checkout@v4
@@ -332,7 +332,7 @@ jobs:
           repository: metacraft-labs/nim-cli-spec
           # Same revision as .github/sibling-repos and cli-spec-src in flake.nix:
           # the `io-mon` binary's command line is a clispec description.
-          ref: fcd5b309c2cb38656d8d2c3b39a7c4e72b5dfb3a
+          ref: 6e0b4e78d96c4118103f2be571e1edd6ff0c938d
           path: nim-cli-spec
           token: ${{ steps.app-token.outputs.token }}
 
