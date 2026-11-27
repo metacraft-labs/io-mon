@@ -291,6 +291,14 @@ action pass a descriptor or a directory the exec record does not name; and
 `CreateProcessW` without an application name searches for the command line's
 first token. The child's process-start answers all of these the same way.
 
+A successful `posix_spawn` or `posix_spawnp` writes its `mrProcessSpawn`
+(`childOsPid` = the child) whether or not the caller passed a pid pointer.
+POSIX allows a NULL one, and the shim lends the call a slot of its own, so
+fire-and-forget callers and callers that reap with `wait` are recorded like
+any other. On Linux it is the only record the spawning process writes that
+names the image a `posix_spawn` child runs, because glibc performs the child's
+`execve` below the interposed symbol (`tests/posix/test_io_mon_spawn_record_without_pid.nim`).
+
 What a consumer should know:
 
 - **Physical, so judge it as one.** Symlinks are resolved and there is no `..`,

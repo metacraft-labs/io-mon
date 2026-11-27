@@ -4280,14 +4280,23 @@ proc spawnForward(tramp: pointer; pid: ptr PidT; path: cstring;
   ## Recording the spawn once, at the OUTERMOST forward only, keeps a single
   ## source of truth for the record (no duplication, no double-record under
   ## `both`, and no spurious record for the internal re-invocation).
+  ##
+  ## The record needs the child's pid even when the caller passes a NULL pid
+  ## pointer, which POSIX permits: the outermost forward lends the call a slot
+  ## then, so the spawn is recorded whether or not the caller asked for the pid.
+  ## The caller never sees the slot: it is local to this frame, and an internal
+  ## re-invocation (depth > 0) forwards whatever pointer it was handed, which
+  ## under body-patch is the lent one.
   let outermost = inSpawnForward == 0
+  var lentPid: PidT
+  let callPid = if outermost and pid == nil: addr lentPid else: pid
   if tramp == nil:
     # Interpose-only backend: the named ``posix_spawn`` symbol is NOT patched,
     # and dyld's __interpose tuples do not apply to the shim's OWN image-local
     # lookup, so the by-name real forwarder reaches the genuine libsystem entry
     # and is re-entry-free. (Pre-rewrite is skipped here: the by-name forwarder
     # rewrites env+path itself, exactly once.)
-    result = byName(pid, path, fileActions, attrp, argv, envp)
+    result = byName(callPid, path, fileActions, attrp, argv, envp)
   else:
     # Body-patch active (``both`` / ``bodypatch``). The libsystem ``posix_spawn``
     # body is patched IN PLACE, so the by-name "real" forwarder is NOT re-entry
@@ -4306,17 +4315,17 @@ proc spawnForward(tramp: pointer; pid: ptr PidT; path: cstring;
         var effectiveEnvp: cstringArray = nil
         let effectivePath =
           ct_macos_bodypatch_spawn_rewrite(path, envp, addr effectiveEnvp)
-        result = ct_macos_bodypatch_call_posix_spawn(tramp, pid, effectivePath,
-          fileActions, attrp, argv, effectiveEnvp)
+        result = ct_macos_bodypatch_call_posix_spawn(tramp, callPid,
+          effectivePath, fileActions, attrp, argv, effectiveEnvp)
       else:
         # Internal re-invocation of the already-rewritten spawn: forward verbatim
         # through the trampoline (no second rewrite, no re-entry into the patch).
-        result = ct_macos_bodypatch_call_posix_spawn(tramp, pid, path,
+        result = ct_macos_bodypatch_call_posix_spawn(tramp, callPid, path,
           fileActions, attrp, argv, envp)
     finally:
       dec inSpawnForward
-  if outermost and result == 0 and pid != nil:
-    recordSpawn(pid[], result, path, detail, pathSearched)
+  if outermost and result == 0 and callPid[] > 0:
+    recordSpawn(callPid[], result, path, detail, pathSearched)
 
 proc spawnForwardMuted(tramp: pointer; pid: ptr PidT; path: cstring;
     fileActions, attrp: pointer; argv, envp: cstringArray;

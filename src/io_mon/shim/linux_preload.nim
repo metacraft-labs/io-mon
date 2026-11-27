@@ -5532,7 +5532,12 @@ proc recordPosixSpawn(ctx: var PosixSpawnContext; usePath: bool;
     # Without the pid there is no ledger entry or spawn record for the child.
     emitEventLoss("pidfd spawn child pid unreadable: " &
       spawnEntryName(usePath, pidfd))
-  if ctx.result == 0 and (ctx.pid != nil or pidfd) and childPid > 0:
+  # Gated on the child's pid, not on the caller's pointer: POSIX lets a caller
+  # pass a NULL pid (fire-and-forget, or reaping with `wait`), and the slot
+  # lent above names the child all the same. On Linux this record is the only
+  # one naming the image a posix_spawn child runs (glibc's execve happens
+  # below the interposed symbol), so a caller's NULL must not drop it.
+  if ctx.result == 0 and childPid > 0:
     var record = baseRecord(mrProcessSpawn, moExecute)
     record.childOsPid = uint64(childPid)
     record.result = ctx.result.int64
@@ -5540,8 +5545,8 @@ proc recordPosixSpawn(ctx: var PosixSpawnContext; usePath: bool;
       record.path = $ctx.path
     record.detail = spawnEntryName(usePath, pidfd)
     emitRecord(record)
-  # Not inside the branch above: a caller may pass a NULL pid pointer, and
-  # the child it started is just as unobserved.
+  # Not inside the branch above: the child's pid may be unknown (a pidfd that
+  # could not be read), and the child it started is just as unobserved.
   if ctx.result == 0 and uninjectable.len > 0:
     emitEventLoss("uninjectable image: " & spawnEntryName(usePath, pidfd) &
       ": " & uninjectable & (if childPid > 0: " child=" & $childPid else: ""))
