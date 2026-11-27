@@ -110,6 +110,7 @@ const fixtureSrc = """
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <dlfcn.h>
@@ -192,6 +193,22 @@ static void write_text(const char *path, const char *text) {
   if (fd < 0) return;
   if (write(fd, text, strlen(text)) < 0) {}
   close(fd);
+}
+
+/* Wait (up to 60 s) until `linger` has written its pid file, which it does
+   only AFTER clearing its needles. A root that waits for it before exiting
+   leaves the guard a child only the tree ledger can find, however long the
+   child took to be scheduled: without the wait, a child still carrying its
+   needles when the grace window closed was reported by the needle sweep
+   instead, on a loaded host, and the case asserting the ledger's report
+   failed for a reason that was about the scheduler. 0 when written. */
+static int await_pidfile(const char *path) {
+  for (int i = 0; i < 60000; i++) {
+    struct stat st;
+    if (stat(path, &st) == 0 && st.st_size > 0) return 0;
+    usleep(1000);
+  }
+  return -1;
 }
 
 static int wait_child(pid_t pid) {
@@ -337,28 +354,37 @@ static int internal_fork(const char *how, const char *pidfile, const char *self)
   sigaddset(&set, SIGUSR1);
   if (sigprocmask(SIG_BLOCK, &set, NULL) != 0) return 41;
   if (!strcmp(how, "daemon3")) {
-    /* glibc's daemon(3) forks through its internal __fork. */
-    if (daemon(1, 1) != 0) return 50;
-    linger(pidfile);
+    /* glibc's daemon(3) forks through its internal __fork. Its caller exits
+       inside daemon(3), so it runs in a child of the root, and the root
+       waits for the daemon's pid file (`await_pidfile`). */
+    pid_t m = fork();
+    if (m < 0) return 50;
+    if (m == 0) {
+      if (daemon(1, 1) != 0) _exit(50);
+      linger(pidfile);
+    }
+    if (await_pidfile(pidfile) != 0) return 58;
+    return wait_child(m);
   }
 #if defined(__GLIBC__) && __GLIBC_PREREQ(2, 34)
   if (!strcmp(how, "underscore-fork")) {
     pid_t pid = _Fork();
     if (pid < 0) return 51;
     if (pid == 0) linger(pidfile);
-    return 0;
+    return await_pidfile(pidfile) == 0 ? 0 : 58;
   }
 #endif
   if (!strcmp(how, "syscall-fork")) {
     long pid = syscall(SYS_clone, SIGCHLD, 0, 0, 0, 0);
     if (pid < 0) return 52;
     if (pid == 0) linger(pidfile);
-    return 0;
+    return await_pidfile(pidfile) == 0 ? 0 : 58;
   }
   if (!strcmp(how, "glibc-clone")) {
     pid_t pid = clone(clone_child, g_clone_stack + sizeof(g_clone_stack),
                       SIGCHLD, NULL);
-    return pid < 0 ? 53 : 0;
+    if (pid < 0) return 53;
+    return await_pidfile(pidfile) == 0 ? 0 : 58;
   }
   if (!strcmp(how, "vm-clone")) {
     /* A process sharing this memory, neither a thread nor a vfork child.
@@ -384,7 +410,8 @@ static int internal_fork(const char *how, const char *pidfile, const char *self)
   }
   if (!strcmp(how, "system")) {
     snprintf(cmd, sizeof(cmd), "'%s' linger '%s' &", self, pidfile);
-    return system(cmd) == 0 ? 0 : 56;
+    if (system(cmd) != 0) return 56;
+    return await_pidfile(pidfile) == 0 ? 0 : 58;
   }
   return 57;
 }
@@ -415,7 +442,8 @@ static int unledger(void) {
    inside daemon(3), which never reaches the fork hook, so the parent writes
    no entry either: the atfork child handler's entry, written although another
    thread held a shim lock, is the child's only one. The daemon(3) parent
-   _exits at once; the child lingers. */
+   _exits at once; the child lingers. The daemon(3) caller is a child of the
+   root, which waits for the daemon's pid file (`await_pidfile`). */
 static int lockdaemon(const char *pidfile) {
   hold_lock = (hold_fn)dlsym(RTLD_DEFAULT, "repro_test_fork_hold_lock");
   if (hold_lock == NULL) return 40;
@@ -423,12 +451,17 @@ static int lockdaemon(const char *pidfile) {
   sigemptyset(&set);
   sigaddset(&set, SIGUSR1);
   if (sigprocmask(SIG_BLOCK, &set, NULL) != 0) return 41;
-  pthread_t t;
-  if (pthread_create(&t, NULL, lock_holder, NULL) != 0) return 43;
-  while (!__atomic_load_n(&lock_held, __ATOMIC_ACQUIRE)) {}
-  if (daemon(1, 1) != 0) return 50;
-  linger(pidfile);
-  return 0;
+  pid_t m = fork();
+  if (m < 0) return 44;
+  if (m == 0) {
+    pthread_t t;
+    if (pthread_create(&t, NULL, lock_holder, NULL) != 0) _exit(43);
+    while (!__atomic_load_n(&lock_held, __ATOMIC_ACQUIRE)) {}
+    if (daemon(1, 1) != 0) _exit(50);
+    linger(pidfile);
+  }
+  if (await_pidfile(pidfile) != 0) return 58;
+  return wait_child(m);
 }
 
 /* pidns <how> <pidfile> <linger>: enter a new pid namespace (the caller runs

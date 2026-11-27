@@ -48,6 +48,10 @@ when defined(linux):
   const
     LinuxInjectedDescendantGraceMsDefault = 500
     LinuxInjectedDescendantPollMsDefault = 25
+    LinuxInjectedDescendantGraceCeilingMsDefault = 5000
+      ## The hard ceiling on the extended window (see
+      ## `waitForLinuxInjectedDescendants`, "WHY A ROUND THAT ONLY SAW THE
+      ## LEDGER GROW DOES NOT END THE WINDOW"). Never below the grace window.
     ## `/proc/<pid>/stat` is one generated line: a 16-byte comm plus ~50 numeric
     ## fields, so 4 KiB holds it with room to spare. A pid whose line somehow did
     ## NOT fit still yields its run state (field 3, immediately after the comm)
@@ -462,6 +466,18 @@ when defined(linux):
         continue
       result.add e.pid
 
+  when defined(ioMonLinuxTreeGuardFaultTest):
+    var linuxTreeGuardRoundHook*: proc (fragmentDir: string; round: int)
+      {.nimcall, gcsafe, raises: [].}
+      ## TEST SEAM, compiled only under `-d:ioMonLinuxTreeGuardFaultTest`
+      ## (`tests/linux/test_io_mon_linux_tree_guard_settle.nims`), so it is
+      ## absent from every shipped artefact and every other test binary. Called
+      ## in each guard round after the first ledger read has been checked and
+      ## before the second read, which is exactly where a tree process that
+      ## writes its own entry (a fork child before it runs program code) can
+      ## land on a loaded host. The hook lets a test put an entry there on a
+      ## chosen round instead of waiting for the scheduler to do it.
+
   proc waitForLinuxInjectedDescendants(fragmentDir, runId: string;
       rootPid: uint64; minStartTicks: uint64; depSetPath0 = "";
       rootUninjectable = false) =
@@ -486,12 +502,36 @@ when defined(linux):
     ## already reported as an image the shim cannot enter
     ## (`rootUninjectable`): its missing entry is that loss, not a second
     ## one, and the guard goes on to check the descendants it can see.
+    ##
+    ## WHY A ROUND THAT ONLY SAW THE LEDGER GROW DOES NOT END THE WINDOW. An
+    ## entry the second read finds and the first did not belongs to a process
+    ## this round has not checked: a fork child writes its own entry before it
+    ## runs program code, and may clear its needles right after, so the round
+    ## can see neither its needles nor its entry. Such a round says nothing
+    ## about the new entries, and ending the window on it reported a live
+    ## descendant as "could not settle" whenever the scheduler put that write
+    ## at the end of the window (a loaded host). So once the window has
+    ## closed, a round whose ONLY obstacle is ledger growth is followed by
+    ## another, until a round reads the same ledger twice and is classified
+    ## like any other, or until the ceiling `IO_MON_LINUX_DESCENDANT_GRACE_
+    ## CEILING_MS` (never below the window). The ledger can only keep growing
+    ## while some process of the tree is alive to write entries, and that
+    ## process is checked in every round, so the ceiling is reached only by a
+    ## tree that keeps creating processes faster than a round runs while none
+    ## of them is caught live. The extension cannot complete a capture by
+    ## itself: completion still needs a round with no carrier, no live entry
+    ## and no growth, exactly as within the window. A live carrier or live
+    ## entry ends the window as before.
     let graceMs = envInt("IO_MON_LINUX_DESCENDANT_GRACE_MS",
       LinuxInjectedDescendantGraceMsDefault, 0)
     let pollMs = envInt("IO_MON_LINUX_DESCENDANT_POLL_MS",
       LinuxInjectedDescendantPollMsDefault, 1)
+    let ceilingMs = max(graceMs,
+      envInt("IO_MON_LINUX_DESCENDANT_GRACE_CEILING_MS",
+        LinuxInjectedDescendantGraceCeilingMsDefault, 0))
     let start = getMonoTime()
     let ownPidNs = linuxSelfPidNamespace()
+    var round = 0
     while true:
       var before, after: seq[TreeLedgerEntry]
       if not readTreeLedger(fragmentDir, before):
@@ -540,6 +580,10 @@ when defined(linux):
           "linux injected-descendant /proc scan failed", depSetPath0)
         return
       let recorded = liveLedgerEntries(before, rootPid, minStartTicks)
+      when defined(ioMonLinuxTreeGuardFaultTest):
+        if linuxTreeGuardRoundHook != nil:
+          linuxTreeGuardRoundHook(fragmentDir, round)
+      inc round
       if not readTreeLedger(fragmentDir, after):
         appendLauncherEventLoss(fragmentDir, runId,
           "linux descendant guard failed: the tree ledger could not be read",
@@ -548,8 +592,9 @@ when defined(linux):
       let ledgerGrew = after != before
       if live.pids.len == 0 and recorded.len == 0 and not ledgerGrew:
         return
-      let elapsedMs = inMilliseconds(getMonoTime() - start)
-      if elapsedMs >= graceMs:
+      let elapsedMs = int(inMilliseconds(getMonoTime() - start))
+      let onlyGrowth = live.pids.len == 0 and recorded.len == 0
+      if elapsedMs >= graceMs and not (onlyGrowth and elapsedMs < ceilingMs):
         let ledgerOnly = recorded.filterIt(it notin live.pids)
         if live.pids.len > 0:
           var detail = "linux injected descendants still live after root " &
@@ -566,10 +611,14 @@ when defined(linux):
         else:
           appendLauncherEventLoss(fragmentDir, runId,
             "linux descendant guard could not settle the tree ledger: " &
-              "entries kept appearing after root exit entries=" & $after.len,
+              "entries kept appearing after root exit entries=" & $after.len &
+              " grace-ms=" & $elapsedMs & " ceiling-ms=" & $ceilingMs,
             depSetPath0)
         return
-      sleep(min(pollMs, graceMs - int(elapsedMs)))
+      # Past the window, only new entries are left to check: the next round
+      # checks them, after one poll interval (never past the ceiling).
+      let windowEnd = if elapsedMs >= graceMs: ceilingMs else: graceMs
+      sleep(min(pollMs, windowEnd - elapsedMs))
 
 # Windows: pull in the CreateRemoteThread+LoadLibraryW injector that
 # substitutes for the macOS DYLD_INSERT_LIBRARIES env-var injection.

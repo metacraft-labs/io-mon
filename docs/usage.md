@@ -575,7 +575,20 @@ the Linux guard also checks the **tree ledger** the shim keeps, exactly as the
 macOS guard does (see "The macOS tree-lifetime guard" below; on Linux an
 entry's start time is field 22 of `/proc/<pid>/stat`). A live ledger process
 that no longer carries the needles publishes
-`linux recorded descendants still live after root exit pids=<p,...> run=<id>`;
+`linux recorded descendants still live after root exit pids=<p,...> run=<id>`.
+A round of the guard reads the ledger, checks its entries and the needles, and
+reads the ledger again; it is conclusive only when nothing is live and both
+reads agree. A round whose second read found entries the first did not has not
+checked those processes (a fork child writes its own entry before it runs
+program code, and may clear its needles right after), so when the window has
+closed on such a round, and nothing else in it was live, the guard does not
+end there: it runs further rounds, one poll interval apart, until a round
+reads the same ledger twice and is graded like any other, or until
+`IO_MON_LINUX_DESCENDANT_GRACE_CEILING_MS` (default 5000, never below the
+window) has passed since the guard started. Only that ceiling publishes
+`linux descendant guard could not settle the tree ledger: entries kept appearing after root exit entries=<n> grace-ms=<spent> ceiling-ms=<c> run=<id>`.
+The extension cannot complete a capture by itself: completion still needs a
+conclusive round with nothing live;
 a ledger that cannot be read, or has no entry for the root, publishes
 `linux descendant guard failed: …` (a root the spawn site already reported as
 `uninjectable image: root spawn: …` never loaded the shim, so its missing

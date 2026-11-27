@@ -34,11 +34,21 @@ proc selectedTestDirs(): seq[string] =
     result.add "tests/windows"
 
 # Compile + run every `test_*.nim` in the selected directories.
+#
+# A failing program does NOT stop the run: every program is compiled and run,
+# and the failures are reported together at the end, then raised as ONE
+# exception, so the task still fails (callers rely on the exception
+# propagating; see scripts/run_tests.nims). Stopping at the first failure hid
+# every program after it: one load-dependent failure in
+# test_io_mon_linux_tree_ledger hid 36 Linux programs that all passed when run
+# on their own.
 proc runTestDirs(dirs: seq[string]) =
   # config.nims resolves source dependencies from explicit environment paths
   # or sibling checkouts. Keep that choice for tests as well as normal builds.
   # The shared helpers must be importable from every per-OS test directory.
   let flags = "--path:tests/helpers"
+  var failed: seq[string]
+  var ran = 0
   for dir in dirs:
     if not dirExists(dir): continue
     var files: seq[string]
@@ -50,4 +60,15 @@ proc runTestDirs(dirs: seq[string]) =
         files.add f
     sort(files)                         # deterministic, reproducible order.
     for f in files:
-      exec "nim c -r " & flags & " " & f
+      inc ran
+      try:
+        exec "nim c -r " & flags & " " & f
+      except OSError as e:
+        echo "FAILED: ", f, ": ", e.msg
+        failed.add f
+  if failed.len > 0:
+    var report = $failed.len & " of " & $ran & " test programs failed:"
+    for f in failed:
+      report.add "\n  " & f
+    echo report
+    raise newException(OSError, report)
