@@ -86,6 +86,11 @@ serve-docs:
 open-docs *args:
     just -f docs/site/Justfile --working-directory docs/site open-docs {{args}}
 
+# The docs site builds only from its committed flake lock, as the Pages
+# workflow builds it. Runs `nix develop` itself, so run it outside the dev shell.
+test-docs-site:
+    python3 tests/test_docs_site_flake_is_locked.py --build
+
 # Compile the CI engine's real reader (the fleet Reprobuild pin) against the
 # shipping lock. Needs adjacent metacraft-github-actions (pins/reprobuild.json)
 # and Reprobuild Git checkouts, the latter containing the pinned revision.

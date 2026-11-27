@@ -8,11 +8,14 @@ name: Docs — GitHub Pages
 # using the modern Pages flow (configure-pages + upload-pages-artifact +
 # deploy-pages). The site is self-contained: its flake (docs/site/flake.nix)
 # declares the isonim-docs framework + toolchain as inputs, so the build needs
-# no sibling checkouts.
+# no sibling checkouts. Its inputs are locked by docs/site/flake.lock, and the
+# build refuses to re-resolve them (--no-update-lock-file), so the published
+# site changes only when io-mon does. `agents` is not a trigger: pushes to the
+# agent landing branch run no CI.
 
 on:
   push:
-    branches: [dev, stable, agents]
+    branches: [dev, stable]
     paths:
       - "docs/site/**"
       - ".github/workflows/docs-pages.yml"
@@ -42,13 +45,17 @@ jobs:
 
       - name: Nix build cache
         uses: DeterminateSystems/magic-nix-cache-action@main
+        # The GitHub Actions cache only. With FlakeHub on, every run printed a
+        # FlakeHub authentication `##[error]` that was not the failure.
+        with:
+          use-flakehub: false
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
 
       - name: Build static site
         run: |
-          nix develop ./docs/site --command bash -c '
+          nix develop ./docs/site --no-update-lock-file --command bash -c '
             cd docs/site &&
             nim c -r --hints:off -o:build/build src/build.nim
           '

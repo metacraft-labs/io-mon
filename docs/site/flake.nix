@@ -5,7 +5,21 @@
   description = "io-mon docs — self-contained dev shell for the isonim-docs-powered docs site";
 
   inputs = {
-    isonim.url = "github:metacraft-labs/isonim/dev";
+    # Every input below is locked by the committed `flake.lock` beside this
+    # file. Without it each build resolved every input to its branch head, so
+    # the site broke whenever an upstream moved (nim-stew, 2026-10-18), with
+    # no change in io-mon. Move an input with `nix flake update <input>`.
+    #
+    # `agents` carries `isonim/content/*`, which isonim-docs `dev` imports and
+    # isonim `dev` lacks. Return this to `dev` once isonim promotes `agents`.
+    #
+    # Fetched with the git fetcher and `submodules=1` on purpose. The isonim
+    # tree holds a submodule gitlink (`src/isonim/layout/yoga`), and a
+    # `github:` input hashes a tree with an unfetched gitlink differently
+    # across Nix versions (2.28 vs current), so a lock written by one version
+    # fails with a NAR hash mismatch on the other. Fetching the submodules
+    # makes the hash the same in every Nix version.
+    isonim.url = "git+https://github.com/metacraft-labs/isonim?ref=agents&submodules=1";
 
     isonim-docs.url = "github:metacraft-labs/isonim-docs/dev";
     isonim-docs.inputs.isonim.follows = "isonim";
@@ -19,7 +33,11 @@
       flake = false;
     };
     nim-stew = {
-      url = "github:status-im/nim-stew";
+      # Upstream stew removed `readPragma` in
+      # https://github.com/status-im/nim-stew/commit/eeff9f5 ("Drop deprecated
+      # APIs"), which isonim's vendored serialization and chronicles still
+      # call. The Metacraft fork's `codetracer` branch keeps it.
+      url = "github:metacraft-labs/nim-stew/codetracer";
       flake = false;
     };
 
