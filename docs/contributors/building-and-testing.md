@@ -93,7 +93,8 @@ same non-cacheable isolation policy and declares both the ELF editor and,
 on x86_64, the real i686 shell it needs. Its `system(3)` and `popen(3)`
 cases need `/bin/sh` itself to be that i686 shell, so they bind-mount it over
 `/bin/sh` inside an unprivileged user and mount namespace. On a host that
-refuses unprivileged user namespaces they report an explicit skip. They
+refuses unprivileged user namespaces they report an explicit skip (see
+[Tests that need an unprivileged user namespace](#tests-that-need-an-unprivileged-user-namespace)). They
 need no outer preload either: an enclosing shim that exports its own
 `system` or `popen` (agent-harbor's command-trace shim does) routes the shell
 through the public `posix_spawn`, where the posix_spawn hook already reports
@@ -130,6 +131,39 @@ its `CreateProcessW` hook. The borrowed call then fails with
 that only runs with an MSYS2 or Cygwin `sh` can hide this for a long time:
 it skips wherever `sh` has no `msys-2.0.dll` beside it, as Git for Windows'
 `bin/sh.exe` launcher does not.
+
+### Tests that need an unprivileged user namespace
+
+Some Linux cases run part of the experiment in an unprivileged user
+namespace: the pid-namespace cases of `test_io_mon_linux_tree_ledger`
+(7, 13, 14 and 16), the `/bin/sh` swap and `wordexp` cases of
+`test_io_mon_uninjectable_image_entry`, and the overlay layout of
+`test_io_mon_inline_site_table`. A developer's host may refuse such a
+namespace: Ubuntu 23.10 and later set
+`kernel.apparmor_restrict_unprivileged_userns=1`, and a container may set
+`user.max_user_namespaces=0`. There those cases report an explicit skip with
+the reason.
+
+CI is meant to check them, so on a CI lane a refusal is a defect of the
+runner, not a platform limit. Set `IO_MON_TEST_REQUIRE_USERNS=1` and the same
+refusal fails the case, naming its cause. `0` or unset keeps the skip; any
+other value fails the case, so a misspelt setting cannot keep the skips
+quietly. Every Linux job that runs the tests in `ci.yml` and
+`ci-reprobuild.yml` sets it, and the GitHub-hosted Ubuntu legs lift the
+AppArmor restriction with `sysctl` first. A self-hosted Linux runner class
+must allow unprivileged user namespaces in its image.
+`tests/helpers/userns_requirement.nim` holds the probe and the decision, and
+`test_io_mon_userns_requirement` checks both against a real kernel refusal.
+
+`repro test` always requires them. `repro.nim` declares
+`IO_MON_TEST_REQUIRE_USERNS=1` on the execute edges of those four test
+programs (`usesUserNamespaces`), whatever the caller exported, so the value is
+part of their cache key and a result recorded by a run that skipped is never
+replayed. The same edges declare `unshare` and `mount`, because an action
+that declares tools sees only those tools on its `PATH`: without them every
+probe found no `unshare` and the cases skipped under `repro test` on any host.
+On a host that refuses unprivileged user namespaces, use `just test`, which
+keeps the skip.
 
 ### Tests run without agent-harbor's command-trace shim
 

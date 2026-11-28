@@ -94,6 +94,7 @@ when defined(linux):
     import ./repro_support/musl_cc
   import ./repro_support/shim_publication_tools
   import ./repro_support/strace
+  import ./repro_support/unshare
 
 package io_mon:
   # Keep this declaration directly in the package body: the DSL recognizes
@@ -142,6 +143,11 @@ package io_mon:
       "nm"
       "strace"
       "patchelf"
+      # The Linux tests that need an unprivileged user namespace run
+      # `unshare` and, inside the namespace, `mount`
+      # (`usesUserNamespaces` below).
+      "unshare"
+      "mount"
       when defined(amd64):
         "io-mon-test-i686-sh"
       when defined(amd64) or defined(arm64):
@@ -473,6 +479,25 @@ package io_mon:
         testBuildActions.add(depfileEdge)
         executeAfter.add(depfileEdge)
         executePolicy = makeDepfilePolicy(depfile, suppressMonitorShimSeed = true)
+      # These Linux tests run part of their experiment in an unprivileged
+      # user namespace (tests/helpers/userns_requirement.nim). Where the
+      # host refuses one they skip, unless IO_MON_TEST_REQUIRE_USERNS=1 makes
+      # the refusal a failure. This graph is the declared test run that CI
+      # executes, so it declares the variable: a refused namespace under
+      # `repro test` is a host defect to fix, not a pass with skips (reprobuild-pm
+      # issue 2026-11-26-io-mon-pid-namespace-tree-ledger-tests-skip-on-the-hosted-ubuntu-runner-ci-yml-selects).
+      # As a declared value it is also in the cache key, so a result recorded
+      # by a run that skipped is never replayed here. `just test` keeps the
+      # skip for a developer's host that refuses namespaces.
+      let usesUserNamespaces = defined(linux) and
+        source.extractFilename in [
+          "test_io_mon_linux_tree_ledger.nim",
+          "test_io_mon_uninjectable_image_entry.nim",
+          "test_io_mon_inline_site_table.nim",
+          "test_io_mon_userns_requirement.nim"]
+      let executeEnv =
+        if usesUserNamespaces: @[("IO_MON_TEST_REQUIRE_USERNS", "1")]
+        else: newSeq[(string, string)]()
       let executeEdge = testBinary.run(
         actionId = "io-mon.test_execute." & stem,
         requiredBinaries = @[cliOutput],
@@ -480,6 +505,7 @@ package io_mon:
         after = executeAfter,
         cacheable = not isolatesMonitor,
         dependencyPolicy = executePolicy,
+        extraEnv = executeEnv,
         registerImplicitName = false)
       if isolatesMonitor:
         isolatedTestActions.add(executeEdge)
@@ -498,6 +524,9 @@ package io_mon:
       when defined(linux):
         appendRegisteredActionToolIdentityRefs(executeEdge.id,
           ["strace", "nm", "getconf", "grep", "mv", "rmdir", "sed", "readelf"])
+        if usesUserNamespaces:
+          appendRegisteredActionToolIdentityRefs(executeEdge.id,
+            ["unshare", "mount"])
         if stem == "test_io_mon_linux_nested_distinct_shims":
           # Gives its second shim its own SONAME (`patchelf --set-soname`).
           appendRegisteredActionToolIdentityRefs(executeEdge.id, ["patchelf"])

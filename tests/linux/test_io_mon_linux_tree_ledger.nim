@@ -69,6 +69,11 @@
 ##     filter denies exclusive creates) reports THAT cause, not the
 ##     namespace one.
 ##
+## Cases 7, 13, 14 and 16 need an unprivileged user namespace. Where the host
+## refuses one they report an explicit skip with the reason, and a run that
+## sets `IO_MON_TEST_REQUIRE_USERNS=1` (CI does) fails them instead
+## (`tests/helpers/userns_requirement.nim`).
+##
 ## Neuters that turn this file red: `noledgercheck` (the guard
 ## ignores the ledger) — 3, 4, 5 come back `mcComplete` and 6 loses the
 ## daemon's read; `noshimmark` (the shim writes no entry) — every case fails
@@ -79,6 +84,7 @@ import std/[monotimes, os, osproc, posix, sequtils, streams, strutils, tempfiles
   times, unittest]
 import io_mon
 import build_test_shim
+import userns_requirement
 
 const repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
 const StillLive = "linux injected descendants still live after root exit"
@@ -841,16 +847,11 @@ suite "Linux descendant guard: the tree ledger":
       it.path == input)
 
   test "7. a tree that enters another pid namespace fails closed at once":
-    let unshare = findExe("unshare")
-    let probe =
-      if unshare.len == 0: (output: "no unshare on PATH", code: 1)
-      else: run(unshare, @["--user", "--map-root-user", "--pid", "--fork",
-        "true"])
-    if probe.code != 0:
-      echo "    SKIP: unprivileged pid namespaces are unavailable: ",
-        probe.output
-      skip()
+    let refusal = usernsRefusal(["--pid", "--fork"])
+    if refusal.len > 0:
+      skipOrRequireUserns(refusal)
     else:
+      let unshare = findExe("unshare")
       # A long grace window: a guard that still waited for the namespace's
       # pid 1 to "exit" would take all of it.
       putEnv("IO_MON_LINUX_DESCENDANT_GRACE_MS", "5000")
@@ -947,23 +948,16 @@ suite "Linux descendant guard: the tree ledger":
         if child != Pid(0):
           reap(child)
 
-  proc unprivilegedNamespaces(extra: varargs[string]): bool =
+  template unprivilegedNamespaces(extra: varargs[string]): bool =
     ## Whether this host lets an unprivileged user create a user namespace
-    ## (plus `extra` unshare flags) and run a command in it. A mount
-    ## namespace is always asked for with `--propagation slave`: util-linux
-    ## defaults to private, and a private copy keeps every host mount it
-    ## copied mounted until the namespace ends, because the host's unmount
-    ## never reaches it (and, locked by the user namespace, nothing inside
-    ## can unmount it either).
-    let unshare = findExe("unshare")
-    if unshare.len == 0:
-      echo "    SKIP: no unshare on PATH"
-      return false
-    let probe = run(unshare, @["--user", "--map-root-user"] & @extra &
-      @["true"])
-    if probe.code != 0:
-      echo "    SKIP: unprivileged namespaces are unavailable: ", probe.output
-    probe.code == 0
+    ## (plus `extra` unshare flags) and run a command in it
+    ## (`usernsRefusal`). When it does not, this ends the test as
+    ## `skipOrRequireUserns` says: a skip, or a failure on a run that sets
+    ## `IO_MON_TEST_REQUIRE_USERNS=1`. The caller must not `skip()` again.
+    let refusal = usernsRefusal(extra)
+    if refusal.len > 0:
+      skipOrRequireUserns(refusal)
+    refusal.len == 0
 
   test "10. a ledger with no entry for the root fails closed":
     # The root deletes its own entry before it exits, which is what a ledger
@@ -1064,8 +1058,6 @@ suite "Linux descendant guard: the tree ledger":
           check elapsed < 2500
       finally:
         putEnv("IO_MON_LINUX_DESCENDANT_GRACE_MS", "300")
-    else:
-      skip()
 
   test "14. a writer that cannot read its pid namespace is a loss":
     # Inside a mount namespace whose /proc is hidden (a tmpfs over it, as in
@@ -1105,8 +1097,6 @@ suite "Linux descendant guard: the tree ledger":
           if child == Pid(0) and fileExists(pidFile):
             child = awaitPidFile(pidFile)
           if child != Pid(0): reap(child)
-    else:
-      skip()
 
   test "15. a CLONE_VM process created through syscall(2) is found":
     # SYS_clone and SYS_clone3 with CLONE_VM, issued through syscall(2):
@@ -1186,8 +1176,6 @@ suite "Linux descendant guard: the tree ledger":
           if child == Pid(0) and fileExists(pidFile):
             child = awaitPidFile(pidFile)
           if child != Pid(0): reap(child)
-    else:
-      skip()
 
   test "17. a CLONE_VM creator's failed entry write names that cause":
     # A seccomp filter installed after the shim initialised fails every

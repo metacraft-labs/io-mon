@@ -47,8 +47,13 @@
 ## superblock device. The host program
 ## prints both, and every capture checks that they differ, so the run cannot
 ## pass on a layout that does not split them. Where the host
-## refuses an unprivileged user namespace or overlay mount, those cases
-## report an explicit skip, as test_io_mon_linux_tree_ledger does.
+## refuses an unprivileged user namespace or the mounts made in it (a tmpfs
+## and an overlay), those cases report an explicit skip, as
+## test_io_mon_linux_tree_ledger does, and a run that sets
+## `IO_MON_TEST_REQUIRE_USERNS=1` (CI does) fails them instead
+## (`tests/helpers/userns_requirement.nim`): a lane that grants user
+## namespaces but denies their capabilities, the way an AppArmor-restricted
+## Ubuntu does, is the same defect.
 ##
 ## On such a file system the device and inode cannot prove that the file the
 ## shim opened is the mapped one, so the shim serves only when the mapped code
@@ -91,6 +96,7 @@ import stackable_hooks/platform/linux_raw_syscalls
 import stackable_hooks/platform/linux_image_code_ranges
 import build_test_shim
 import unmonitored_env
+import userns_requirement
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
@@ -459,8 +465,7 @@ template siteTableCases(f: Fixture; layout: Layout) =
     else: name
   template inLayout(body: untyped) =
     if not availability.ok:
-      echo "    SKIP: ", availability.why
-      skip()
+      skipOrRequireUserns(availability.why)
     else:
       body
   var scanned: tuple[output: string; code: int; dep: MonitorDepFile]

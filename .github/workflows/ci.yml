@@ -233,6 +233,20 @@ jobs:
             echo "$knob is absent; unprivileged user namespaces are not restricted by AppArmor here"
           fi
 
+      - name: Require unprivileged user namespaces in the Linux tests
+        # The Linux tests that need an unprivileged user namespace
+        # (tests/helpers/userns_requirement.nim) skip where the host refuses
+        # one. A Linux CI lane must provide them, so a refusal here is a runner
+        # defect: IO_MON_TEST_REQUIRE_USERNS=1 makes those cases fail with the
+        # cause instead of skipping. Without it the four tree-ledger
+        # pid-namespace cases skipped unnoticed on every hosted run, and a later
+        # runner change would bring the skips back the same way. This applies
+        # to self-hosted Linux classes too: their images must allow
+        # unprivileged user namespaces.
+        if: runner.os == 'Linux'
+        shell: bash
+        run: echo "IO_MON_TEST_REQUIRE_USERNS=1" >> "$GITHUB_ENV"
+
       - name: Run tests
         # See the note on `Run lint`: without pipefail, `| tee` masks failure.
         shell: bash

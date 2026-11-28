@@ -44,8 +44,10 @@
 ## (`shellSwapSource`); the host's own `/bin/sh` is never touched. A control
 ## swaps in the 64-bit shell the same way and must stay `mcComplete`, so the
 ## namespace itself cannot be what grades those captures incomplete. Where
-## the host refuses unprivileged user namespaces, those cases report an
-## explicit skip, as test_io_mon_linux_tree_ledger does. Like the rest of
+## the host refuses unprivileged user namespaces, those cases and the wordexp
+## ones report an explicit skip, as test_io_mon_linux_tree_ledger does, and a
+## run that sets `IO_MON_TEST_REQUIRE_USERNS=1` (CI does) fails them instead
+## (`tests/helpers/userns_requirement.nim`). Like the rest of
 ## this oracle they must run with no outer preload (repro.nim isolates the
 ## monitor for this test): an outer shim that exports its own `system` or
 ## `popen` and spawns through the public `posix_spawn` would let the
@@ -70,6 +72,7 @@ from std/posix import geteuid
 
 import io_mon
 import build_test_shim
+import userns_requirement
 
 const
   repoRoot = currentSourcePath().parentDir().parentDir().parentDir()
@@ -399,7 +402,8 @@ int main(int argc, char **argv) {
 
 const ShellSwapRefused = 77
   ## shell-swap's exit code when the host refuses an unprivileged user or
-  ## mount namespace: the system/popen cases then skip, explicitly.
+  ## mount namespace: the system/popen cases then skip, explicitly, or fail
+  ## under `IO_MON_TEST_REQUIRE_USERNS=1`.
 
 const shellSwapSource = """
 #define _GNU_SOURCE
@@ -722,16 +726,16 @@ suite "io-mon Linux: entry into an image the shim cannot enter":
 
   let shellSwap = compile("shell-swap", shellSwapSource)
   template shellSwapAvailable(): bool =
-    ## True when shell-swap can make its namespace here; an explicit skip
-    ## when the host refuses unprivileged user namespaces. The probe swaps
-    ## the helper in as /bin/sh and runs it, so a pass also proves the bind
-    ## mount works.
+    ## True when shell-swap can make its namespace here; when the host
+    ## refuses unprivileged user namespaces, an explicit skip, or a failure
+    ## on a run that sets `IO_MON_TEST_REQUIRE_USERNS=1`
+    ## (`skipOrRequireUserns`). The probe swaps the helper in as /bin/sh and
+    ## runs it, so a pass also proves the bind mount works.
     let probe = run(shellSwap, @[helper, helper, input])
     checkpoint("shell-swap probe: " & $probe.code & " " & probe.output)
     if probe.code == ShellSwapRefused:
-      echo "    SKIP: unprivileged user namespaces are unavailable: ",
-        probe.output
-      skip()
+      skipOrRequireUserns("unprivileged user namespaces are unavailable: " &
+        probe.output.strip())
       false
     else:
       require probe.code == 0
@@ -894,8 +898,8 @@ suite "io-mon Linux: entry into an image the shim cannot enter":
         let captured = runCapture(@[host, mode & i686Sh,
           "$(" & helper & " " & input & ")"], "")
         if captured.code == 5:
-          checkpoint("skipped: user and mount namespaces are unavailable")
-          skip()
+          skipOrRequireUserns("user and mount namespaces are unavailable " &
+            "(the fixture exited 5)")
         else:
           check captured.code == 0
           require captured.ok
@@ -909,8 +913,8 @@ suite "io-mon Linux: entry into an image the shim cannot enter":
       let captured = runCapture(@[host, "wordexp-sh=" & i686Sh,
         "`" & helper & " " & input & "`"], "")
       if captured.code == 5:
-        checkpoint("skipped: user and mount namespaces are unavailable")
-        skip()
+        skipOrRequireUserns("user and mount namespaces are unavailable " &
+          "(the fixture exited 5)")
       else:
         check captured.code == 0
         require captured.ok
@@ -921,8 +925,8 @@ suite "io-mon Linux: entry into an image the shim cannot enter":
       let captured = runCapture(@[host, "wordexp-sh=" & i686Sh, "~ $HOME x*"],
         "")
       if captured.code == 5:
-        checkpoint("skipped: user and mount namespaces are unavailable")
-        skip()
+        skipOrRequireUserns("user and mount namespaces are unavailable " &
+          "(the fixture exited 5)")
       else:
         check captured.code == 0
         require captured.ok
@@ -933,8 +937,8 @@ suite "io-mon Linux: entry into an image the shim cannot enter":
       let captured = runCapture(@[host, "wordexp-nocmd-sh=" & i686Sh,
         "plain"], "")
       if captured.code == 5:
-        checkpoint("skipped: user and mount namespaces are unavailable")
-        skip()
+        skipOrRequireUserns("user and mount namespaces are unavailable " &
+          "(the fixture exited 5)")
       else:
         check captured.code == 0
         require captured.ok
